@@ -53,6 +53,23 @@ Committed implementation documentation belongs in `docs/`. Personal notes, desig
 
 Integration-test fixtures and reusable test artifacts belong under `tests/artifacts/`; do not add top-level `examples/` directories for them.
 
+## Test Layout
+
+`docs/TEST_LAYOUT.md` is the source of truth. Quick decision rule:
+
+- Unit tests that need crate-private items → `src/<module>_tests.rs` paired
+  with a real `src/<module>.rs` source file. Declare via `#[cfg(test)]
+  #[path = "<module>_tests.rs"] mod tests;` inside `<module>.rs`. Never create
+  an empty `<module>.rs` just to satisfy the pair convention.
+- Integration / end-to-end tests that only use the crate's public API →
+  `crates/<crate>/tests/<scenario>.rs`. Each file is its own binary and
+  needs no sibling source file. Use this when the scenario is naturally a
+  whole-crate exercise (e.g. host-backed smoke tests, public-API workflows).
+- Cross-crate integration suites → workspace-level `tests/`.
+
+If a new test does not have a natural source-file owner, prefer the
+crate-level `tests/` directory over inventing one.
+
 ## Constraints
 
 - Do not copy code from extracted proprietary reference implementations.

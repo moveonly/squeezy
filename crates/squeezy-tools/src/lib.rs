@@ -5855,8 +5855,5 @@ fn websearch_spec() -> ToolSpec {
 }
 
 #[cfg(test)]
-mod shell_sandbox;
-
-#[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;

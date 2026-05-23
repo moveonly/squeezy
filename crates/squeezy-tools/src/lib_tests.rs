@@ -2907,3 +2907,248 @@ fn shell_approval_summary_no_longer_duplicates_command_or_cwd() {
     assert!(request.summary.contains("description=\"tests\""));
     let _ = fs::remove_dir_all(root);
 }
+
+// ---------------------------------------------------------------------------
+// Shell sandbox planner + runtime-detection unit tests.
+//
+// These cover internal seams (`prepare_shell_sandbox_plan_with_probe`,
+// `shell_sandbox_runtime_unavailable_with_probe`, `ShellSandboxPlan`,
+// `analyze_shell_command`) and therefore must stay in the crate as unit
+// tests. The host-backed smoke tests that exercise the sandboxed
+// `ToolRegistry::execute` path live in
+// `crates/squeezy-tools/tests/shell_sandbox_smoke.rs` so they can use the
+// public API surface only.
+
+fn sandbox_config(
+    mode: ShellSandboxMode,
+    network: ShellSandboxNetworkPolicy,
+) -> ShellSandboxConfig {
+    ShellSandboxConfig {
+        mode,
+        network,
+        ..ShellSandboxConfig::default()
+    }
+}
+
+fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan {
+    ShellSandboxPlan {
+        program: "sh".to_string(),
+        args: vec!["-lc".to_string(), "true".to_string()],
+        backend,
+        mode: if required { "required" } else { "best_effort" },
+        network: "denied",
+        required,
+    }
+}
+
+fn prepare_sandbox_plan_with_probes(
+    command: &str,
+    config: &ShellSandboxConfig,
+    macos_available: bool,
+    linux_available: bool,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    let analysis = analyze_shell_command(command);
+    prepare_shell_sandbox_plan_with_probe(
+        command,
+        &analysis,
+        Path::new("/tmp"),
+        config,
+        macos_available,
+        linux_available,
+    )
+}
+
+#[test]
+fn shell_sandbox_plan_mode_off_returns_direct() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Off,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "off");
+    assert_eq!(plan.program, "sh");
+    assert!(!plan.required);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_plan_required_when_sandbox_exec_absent() {
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect_err("required mode must fail closed");
+
+    assert!(err.contains("/usr/bin/sandbox-exec not found"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "best_effort");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_required_when_userns_unavailable() {
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect_err("required mode must fail closed");
+
+    assert!(err.contains("required shell sandbox unavailable: linux unshare"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "best_effort");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_allow_when_approved() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "curl https://example.com",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::AllowWhenApproved,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "allowed_approved");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_denied_classified() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "curl https://example.com",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "denied_classified");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_denied_non_network() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::AllowWhenApproved,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "denied");
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_detects_macos_exit_71_with_sandbox_apply() {
+    let plan = fake_sandbox_plan("macos-sandbox-exec", true);
+
+    assert!(shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(71),
+        "sandbox_apply: Operation not permitted",
+        true,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_detects_linux_exit_1_empty_stderr_when_userns_gone() {
+    let plan = fake_sandbox_plan("linux-direct-syscalls", true);
+
+    assert!(shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(1),
+        "",
+        false,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_ignores_nonzero_exit_with_stderr() {
+    let linux_plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    let macos_plan = fake_sandbox_plan("macos-sandbox-exec", true);
+
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &linux_plan,
+        Some(1),
+        "command failed",
+        false,
+    ));
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &macos_plan,
+        Some(71),
+        "ordinary exit",
+        true,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
+    let plan = fake_sandbox_plan("none", true);
+
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(1),
+        "",
+        false,
+    ));
+}

@@ -30,7 +30,34 @@ Rules enforced by `python3 scripts/check_test_layout.py`:
 - every `*_tests.rs` file has a sibling source file;
 - every source file with a sibling `*_tests.rs` declares it with both `#[cfg(test)]` and `#[path = "<module>_tests.rs"]`.
 
-Integration tests may still live under crate-level or workspace-level `tests/` directories.
+## Unit vs. integration tests
+
+The `src/<module>.rs` + `src/<module>_tests.rs` pair is for **unit tests** that
+need access to crate-private items (private functions, fields, constructors,
+test seams). Use it only when the source file has real production code; do not
+create an empty `<module>.rs` just to satisfy the layout check.
+
+**Integration tests** live under the crate's own `tests/` directory:
+
+```text
+crates/<crate>/tests/<scenario>.rs
+```
+
+Each `tests/*.rs` file is compiled as a separate binary that depends on the
+crate's public API only. Use this layout when the test scenario is naturally
+end-to-end (driving the public surface), spans multiple modules, or has no
+single source-file owner. There is no requirement to add a sibling source
+file under `src/`.
+
+Pick by access:
+
+- The test reads or constructs crate-private items → unit test in
+  `src/<module>_tests.rs`.
+- The test only uses the crate's public API → integration test in
+  `tests/<scenario>.rs`.
+
+Workspace-level `tests/` directories continue to host cross-crate
+integration suites.
 
 ## Language Modules
 
