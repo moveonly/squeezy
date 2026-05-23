@@ -243,12 +243,15 @@ files and compares top-level declarations against Squeezy's tree-sitter graph.
 The Go report includes symbol TP/FP/FN, precision, recall, unparseable files,
 and heuristic-iteration notes. Production Go navigation does not call `gopls`,
 `go list`, `go build`, or the Go oracle. The refresh probe is language-aware and
-fails when a two-file Go edit causes more files to be reparsed than edited.
-`.github/workflows/go-semantic-graph-benchmark.yml` runs Go smoke on PRs and
-pushes. Manual `workflow_dispatch` with `tier=full`, or a push to
-`benchmark-full/**` after the workflow is present on the default branch, clones
-gin, cobra, prometheus, etcd, and zap. The workflow shape intentionally mirrors
-the shared benchmark workflow while staying separate from
+fails when a two-file Go edit causes more files to be reparsed than edited. The
+Go FP/FN accuracy gate is enforced for the smoke fixture by default and is
+relaxed by `--no-speed-gate` so external corpora can run in reporting-only mode
+without blocking the workflow on upstream parser drift, generated files, or
+build-tag differences. `.github/workflows/go-semantic-graph-benchmark.yml` runs
+Go smoke on PRs and pushes. Manual `workflow_dispatch` with `tier=full`, or a
+push to `benchmark-full/**` after the workflow is present on the default
+branch, clones gin, cobra, prometheus, etcd, and zap. The workflow shape
+intentionally mirrors the shared benchmark workflow while staying separate from
 `.github/workflows/semantic-graph-benchmark.yml` so it does not conflict with
 parallel Rust/C/C++ workflow changes.
 

@@ -9,8 +9,8 @@ use squeezy_core::{
     SymbolId, SymbolKind,
 };
 use squeezy_parse::{
-    BodyHit, BodyHitKind, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
-    ParsedSymbol, ReferenceKind, RustParser, edge_kind_for_call,
+    BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
+    ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
 use squeezy_workspace::{CrawlOptions, FileRecord, WorkspaceCrawler};
 
@@ -741,7 +741,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver) {
+        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
             return None;
         }
         let type_name = last_path_segment(receiver);
@@ -781,7 +781,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver) {
+        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
@@ -1492,7 +1492,7 @@ impl SemanticGraph {
         {
             return None;
         }
-        if path_starts_with_external_root(&reference.text)
+        if path_starts_with_external_root(&reference.text, self.reference_language(reference))
             || self.reference_has_external_scope_prefix(reference)
         {
             return None;
@@ -1615,6 +1615,13 @@ impl SemanticGraph {
         }
     }
 
+    fn reference_language(&self, reference: &ParsedReference) -> LanguageKind {
+        self.files
+            .get(&reference.file_id)
+            .map(|file| file.language)
+            .unwrap_or(LanguageKind::Unknown)
+    }
+
     fn reference_is_in_symbol_package(
         &self,
         symbol: &GraphSymbol,
@@ -1699,7 +1706,8 @@ impl SemanticGraph {
             .iter()
             .filter(|import| import.file_id == reference.file_id)
             .any(|import| {
-                if path_starts_with_external_root(&import.path) {
+                if path_starts_with_external_root(&import.path, self.reference_language(reference))
+                {
                     return false;
                 }
                 let alias_or_name = import
@@ -1739,7 +1747,7 @@ impl SemanticGraph {
         if !self.reference_qualifier_matches_symbol(symbol, reference) {
             return false;
         }
-        if path_starts_with_external_root(&reference.text) {
+        if path_starts_with_external_root(&reference.text, self.reference_language(reference)) {
             return false;
         }
         self.symbol_is_in_reference_scope(symbol, reference)
@@ -1795,7 +1803,9 @@ impl SemanticGraph {
         if reference_path.pop().as_deref() != Some(symbol.name.as_str()) {
             return false;
         }
-        if reference_path.is_empty() || path_starts_with_external_root(&reference.text) {
+        if reference_path.is_empty()
+            || path_starts_with_external_root(&reference.text, self.reference_language(reference))
+        {
             return false;
         }
         if reference_path.first().map(String::as_str) == Some("crate") {
@@ -2122,7 +2132,8 @@ impl SemanticGraph {
             .rev()
             .collect::<String>();
         let scope = scope.trim_end_matches("::");
-        !scope.is_empty() && path_starts_with_external_root(scope)
+        !scope.is_empty()
+            && path_starts_with_external_root(scope, self.reference_language(reference))
     }
 
     fn reference_has_uppercase_scope_prefix(&self, reference: &ParsedReference) -> bool {
@@ -2487,7 +2498,7 @@ pub struct LanguageReport {
 pub struct GraphManager {
     root: PathBuf,
     crawler: WorkspaceCrawler,
-    parser: RustParser,
+    parser: LanguageParser,
     graph: SemanticGraph,
     config: RefreshConfig,
     last_refresh: Instant,
@@ -2505,7 +2516,7 @@ impl GraphManager {
         let root = root.as_ref().to_path_buf();
         let crawler = WorkspaceCrawler::new(CrawlOptions::default());
         let snapshot = crawler.crawl(&root)?;
-        let mut parser = RustParser::new()?;
+        let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let (parsed, parse_summary) = parser.parse_records(&snapshot.files)?;
@@ -2825,29 +2836,24 @@ fn constructor_reference_can_bind_symbol(
         .unwrap_or(false)
 }
 
-fn path_starts_with_external_root(path: &str) -> bool {
-    path.split([':', '.', '/'])
-        .find(|segment| !segment.trim().is_empty())
-        .map(str::trim)
-        .map(|root| {
-            matches!(
-                root,
-                "std"
-                    | "core"
-                    | "alloc"
-                    | "proc_macro"
-                    | "fmt"
-                    | "context"
-                    | "errors"
-                    | "io"
-                    | "net"
-                    | "os"
-                    | "strings"
-                    | "sync"
-                    | "time"
-            )
-        })
-        .unwrap_or(false)
+fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
+    let first_segment = match language {
+        LanguageKind::Rust => path.split("::").next().unwrap_or(path).trim(),
+        LanguageKind::Go => path
+            .split([':', '.', '/'])
+            .find(|segment| !segment.trim().is_empty())
+            .unwrap_or(path)
+            .trim(),
+        LanguageKind::Python | LanguageKind::Unknown | LanguageKind::Unsupported => return false,
+    };
+    let externals: &[&str] = match language {
+        LanguageKind::Rust => &["std", "core", "alloc", "proc_macro"],
+        LanguageKind::Go => &[
+            "fmt", "context", "errors", "io", "net", "os", "strings", "sync", "time",
+        ],
+        _ => &[],
+    };
+    externals.contains(&first_segment)
 }
 
 fn path_segments(path: &str) -> Vec<String> {

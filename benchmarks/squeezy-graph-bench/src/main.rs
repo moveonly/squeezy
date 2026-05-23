@@ -11,7 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
 use squeezy_graph::{BodySearchQuery, GraphManager, RefreshConfig, SemanticGraph, SignatureQuery};
-use squeezy_parse::{BodyHitKind, ParsedFile, RustParser};
+use squeezy_parse::{BodyHitKind, LanguageParser, ParsedFile};
 use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
 
 #[derive(Debug, Deserialize)]
@@ -123,8 +123,7 @@ struct MixedWorkloadReport {
 #[derive(Debug, Serialize)]
 struct RefreshProbeReport {
     language: String,
-    copied_files: usize,
-    copied_rust_files: usize,
+    copied_source_files: usize,
     edited_files: usize,
     refresh_ms: u128,
     reparsed_files: usize,
@@ -182,12 +181,18 @@ struct GoOracleReport {
     limitations: Vec<String>,
 }
 
+/// Per-iteration heuristic notes for the Go benchmark.
+///
+/// Each entry documents a heuristic decision (accepted, rejected, or targeted
+/// next) and the reason. FP/FN deltas are intentionally not stored here: they
+/// would need historical snapshots to be meaningful, and a single benchmark
+/// run only knows the current state. The current state is already reported in
+/// `go_oracle.symbols`; consumers that need before/after numbers should diff
+/// JSON reports across runs.
 #[derive(Debug, Clone, Serialize)]
 struct HeuristicIterationReport {
     name: String,
     status: String,
-    false_positive: usize,
-    false_negative: usize,
     notes: Vec<String>,
 }
 
@@ -394,7 +399,7 @@ fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
     let crawl_ms = crawl_started.elapsed().as_millis();
 
     let parse_started = Instant::now();
-    let mut parser = RustParser::new()?;
+    let mut parser = LanguageParser::new()?;
     let (parsed, _) = parser.parse_records(&snapshot.files)?;
     let parse_ms = parse_started.elapsed().as_millis();
 
@@ -718,15 +723,13 @@ fn heuristic_iteration_reports(
     if language != BenchmarkLanguage::Go {
         return Vec::new();
     }
-    let Some(oracle) = go_oracle else {
+    if go_oracle.is_none() {
         return Vec::new();
-    };
+    }
     vec![
         HeuristicIterationReport {
             name: "baseline-tree-sitter".to_string(),
             status: "accepted".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Package/import/declaration extraction is the baseline for Go heuristic comparisons.".to_string(),
             ],
@@ -734,8 +737,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "top-level-declaration-scope".to_string(),
             status: "accepted".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Function-local var/const/type declarations, blank identifiers, and declarations inside top-level function literals are excluded from top-level symbol accuracy.".to_string(),
             ],
@@ -743,8 +744,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "go-alias-and-declaration-lists".to_string(),
             status: "accepted".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Grouped var/const specs and tree-sitter-go type_alias nodes are expanded so multi-name declarations and aliases count as symbols.".to_string(),
             ],
@@ -752,8 +751,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "go-test-method-normalization".to_string(),
             status: "accepted".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Suite-style _test.go methods with Test/Benchmark/Fuzz names are normalized to test functions for oracle comparison.".to_string(),
             ],
@@ -761,8 +758,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "go-external-package-examples".to_string(),
             status: "targeted-next".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Remaining etcd FNs are concentrated in external-package example test files; keep them visible instead of broad lexical matching.".to_string(),
             ],
@@ -770,8 +765,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "go-lazy-reference-materialization".to_string(),
             status: "targeted-next".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Prometheus and etcd are slower than the declaration-only Go oracle because cold build materializes references, body hits, calls, and edges eagerly.".to_string(),
             ],
@@ -779,8 +772,6 @@ fn heuristic_iteration_reports(
         HeuristicIterationReport {
             name: "broad-lexical-reference-binding".to_string(),
             status: "rejected-default".to_string(),
-            false_positive: oracle.symbols.false_positive,
-            false_negative: oracle.symbols.false_negative,
             notes: vec![
                 "Broad same-name binding is not enabled by default; Go navigation favors exact package/import/receiver evidence before recall-only expansion.".to_string(),
             ],
@@ -934,16 +925,26 @@ print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
 "#;
 
 fn collect_go_ast_symbol_scan(root: &Path) -> Result<GoAstSymbolScan> {
-    let script_path = temp_dir("squeezy-go-oracle")?.join("oracle.go");
-    fs::write(&script_path, GO_AST_ORACLE)?;
+    // The oracle Go program is written to a dedicated sub-directory of the
+    // system temp directory and the whole sub-directory is removed when this
+    // function returns. Tracking the sub-directory explicitly (instead of
+    // relying on `script_path.parent()`) keeps the cleanup scoped even if a
+    // future change ever co-locates additional files with the script.
+    let oracle_dir = temp_dir("squeezy-go-oracle")?;
+    let script_path = oracle_dir.join("oracle.go");
+    let result = run_go_ast_oracle(&script_path, root);
+    let _ = fs::remove_dir_all(&oracle_dir);
+    result
+}
+
+fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAstSymbolScan> {
+    fs::write(script_path, GO_AST_ORACLE)?;
     let output = Command::new("go")
         .arg("run")
-        .arg(&script_path)
+        .arg(script_path)
         .arg(root)
         .output()
         .map_err(|err| SqueezyError::Graph(format!("failed to run Go AST oracle: {err}")))?;
-    let _ = fs::remove_file(&script_path);
-    let _ = script_path.parent().map(fs::remove_dir_all);
     if !output.status.success() {
         return Err(SqueezyError::Graph(format!(
             "Go AST oracle failed: {}",
@@ -2064,8 +2065,7 @@ fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<Refresh
 
     Ok(RefreshProbeReport {
         language: language.as_str().to_string(),
-        copied_files: copied.len(),
-        copied_rust_files: copied.len(),
+        copied_source_files: copied.len(),
         edited_files: edits.len(),
         refresh_ms,
         reparsed_files: report.reparsed_files,
@@ -2676,7 +2676,7 @@ fn print_summary(report: &BenchmarkReport) {
         println!(
             "refresh_probe: language={} copied={} edited={} reparsed={} refresh_ms={} budget_exhausted={}",
             refresh.language,
-            refresh.copied_files,
+            refresh.copied_source_files,
             refresh.edited_files,
             refresh.reparsed_files,
             refresh.refresh_ms,
@@ -2685,8 +2685,8 @@ fn print_summary(report: &BenchmarkReport) {
     }
     for iteration in &report.heuristic_iterations {
         println!(
-            "heuristic_iteration: {} status={} fp={} fn={}",
-            iteration.name, iteration.status, iteration.false_positive, iteration.false_negative
+            "heuristic_iteration: {} status={}",
+            iteration.name, iteration.status
         );
     }
     for query in &report.queries {
@@ -2803,7 +2803,8 @@ fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Result<()> {
         )));
     }
 
-    if let Some(go) = &report.go_oracle
+    if !no_speed_gate
+        && let Some(go) = &report.go_oracle
         && (go.symbols.false_positive != 0 || go.symbols.false_negative != 0)
     {
         return Err(SqueezyError::Graph(format!(

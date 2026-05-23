@@ -225,8 +225,12 @@ Current external-oracle gaps and known losses:
 - Internal symlinked Go files are indexed when their resolved target stays
   inside the workspace root, matching Go parser behavior on repos such as etcd
   without indexing arbitrary external paths.
-- Very large Go body-hit indexes use scan fallback instead of eager trigram
-  indexing; unresolved reference edges are not eagerly materialized.
+- Body-hit trigram indexing is disabled and `body_search` falls back to an
+  exact lower-case scan whenever the workspace contains more than 100,000 body
+  hits. The threshold is language-agnostic and applies to Rust, Python, and Go
+  alike; large repos in any supported language will report
+  `body_hit_trigram_indexed=false` in `GraphStats`/benchmark output so callers
+  can correlate slower body searches with the fallback.
 - Go generated files and remaining full-graph reference/call resolution work
   still need reduced or lazy indexing before full graph cold builds can be
   compared fairly with declaration-only oracles.

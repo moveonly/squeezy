@@ -149,17 +149,18 @@ jobs:
                   refresh = report.get("refresh_probe")
                   if refresh:
                       print(
-                          f"- Refresh probe: copied={refresh['copied_files']} edited={refresh['edited_files']} reparsed={refresh['reparsed_files']} refresh_ms={refresh['refresh_ms']} budget_exhausted={refresh['budget_exhausted']}",
+                          f"- Refresh probe: copied={refresh['copied_source_files']} edited={refresh['edited_files']} reparsed={refresh['reparsed_files']} refresh_ms={refresh['refresh_ms']} budget_exhausted={refresh['budget_exhausted']}",
                           file=out,
                       )
                   iterations = report.get("heuristic_iterations", [])
                   if iterations:
                       print("", file=out)
-                      print("| Heuristic | Status | FP | FN |", file=out)
-                      print("|---|---|---:|---:|", file=out)
+                      print("| Heuristic | Status | Notes |", file=out)
+                      print("|---|---|---|", file=out)
                       for item in iterations:
+                          notes = " ".join(item.get("notes", []))
                           print(
-                              f"| {item['name']} | {item['status']} | {item['false_positive']} | {item['false_negative']} |",
+                              f"| {item['name']} | {item['status']} | {notes} |",
                               file=out,
                           )
                   if report["queries"]:

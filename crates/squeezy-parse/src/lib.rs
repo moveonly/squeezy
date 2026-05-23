@@ -170,14 +170,16 @@ struct CachedParsedFile {
     tree: Tree,
 }
 
-pub struct RustParser {
+pub struct LanguageParser {
     go_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
 }
 
-pub type LanguageParser = RustParser;
+/// Back-compat alias kept while existing call sites migrate from the original
+/// Rust-only name. New code should prefer [`LanguageParser`].
+pub type RustParser = LanguageParser;
 
 #[derive(Debug, Clone)]
 struct ParseJob {
@@ -192,7 +194,7 @@ struct ParseOutput {
     cache: Option<CachedParsedFile>,
 }
 
-impl RustParser {
+impl LanguageParser {
     pub fn new() -> Result<Self> {
         let go_parser = parser_with_go_language()?;
         let rust_parser = parser_with_rust_language()?;
@@ -267,7 +269,7 @@ impl RustParser {
                     Ok(Err(err)) => return Err(err),
                     Err(_) => {
                         return Err(SqueezyError::Parse(
-                            "parallel Rust parse worker panicked".to_string(),
+                            "parallel parse worker panicked".to_string(),
                         ));
                     }
                 }
@@ -588,6 +590,7 @@ fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
         references: Vec::new(),
         body_hits: Vec::new(),
         diagnostics: Vec::new(),
+        go_type_index: HashMap::new(),
     };
     let root = tree.root_node();
     if root.has_error() {
@@ -624,6 +627,7 @@ fn extract_python(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
         references: Vec::new(),
         body_hits: Vec::new(),
         diagnostics: Vec::new(),
+        go_type_index: HashMap::new(),
     };
     let root = tree.root_node();
     if root.has_error() {
@@ -662,6 +666,7 @@ fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
         references: Vec::new(),
         body_hits: Vec::new(),
         diagnostics: Vec::new(),
+        go_type_index: HashMap::new(),
     };
     let root = tree.root_node();
     if root.has_error() {
@@ -673,6 +678,12 @@ fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
 
     let package = go_package_name(root, source);
+    // Pre-scan top-level type declarations so methods declared earlier in
+    // source order than their receiver type still attach to the right parent.
+    // The symbol ids computed here must match the ones produced later by
+    // `go_type_symbol`, so we use the same `symbol_id` inputs (file, parent=None,
+    // kind, name, span).
+    ctx.go_type_index = collect_go_type_index(root, &file, source);
     visit_go_node(root, &mut ctx, None, None);
     dedup_go_facts(&mut ctx);
 
@@ -699,6 +710,7 @@ struct ExtractContext<'source> {
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
     diagnostics: Vec<ParseDiagnostic>,
+    go_type_index: HashMap<String, SymbolId>,
 }
 
 fn visit_go_node(
@@ -920,6 +932,7 @@ fn go_field_symbols(
         return Vec::new();
     };
     let mut names = Vec::new();
+    let mut is_embed = false;
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -935,6 +948,13 @@ fn go_field_symbols(
                 if let Ok(text) = node_text(child, ctx.source) {
                     let text = text.trim();
                     if is_go_identifier(text) {
+                        // A `type_identifier` with no preceding name token is
+                        // a Go embedded field (e.g. `type Runner struct {
+                        // Greeter }`), which promotes the embedded type's
+                        // methods. Tag these so downstream consumers can
+                        // distinguish them from named fields without parsing
+                        // the receiver type themselves.
+                        is_embed = true;
                         names.push((text.to_string(), span_from_node(child)));
                     }
                 }
@@ -946,24 +966,30 @@ fn go_field_symbols(
     names.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
     names
         .into_iter()
-        .map(|(name, span)| ParsedSymbol {
-            id: symbol_id(&ctx.file, Some(&parent_id), SymbolKind::Field, &name, span),
-            file_id: ctx.file.id.clone(),
-            parent_id: Some(parent_id.clone()),
-            name,
-            kind: SymbolKind::Field,
-            span,
-            body_span: None,
-            signature: node_text(node, ctx.source)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-            visibility: go_visibility(node, ctx.source),
-            docs: Vec::new(),
-            attributes: vec!["go:field".to_string()],
-            provenance: Provenance::new("tree-sitter-go", "field declaration"),
-            confidence: Confidence::ExactSyntax,
-            freshness: Freshness::Fresh,
+        .map(|(name, span)| {
+            let mut attributes = vec!["go:field".to_string()];
+            if is_embed {
+                attributes.push("go:embed".to_string());
+            }
+            ParsedSymbol {
+                id: symbol_id(&ctx.file, Some(&parent_id), SymbolKind::Field, &name, span),
+                file_id: ctx.file.id.clone(),
+                parent_id: Some(parent_id.clone()),
+                name,
+                kind: SymbolKind::Field,
+                span,
+                body_span: None,
+                signature: node_text(node, ctx.source)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+                visibility: go_visibility(node, ctx.source),
+                docs: Vec::new(),
+                attributes,
+                provenance: Provenance::new("tree-sitter-go", "field declaration"),
+                confidence: Confidence::ExactSyntax,
+                freshness: Freshness::Fresh,
+            }
         })
         .collect()
 }
@@ -1113,6 +1139,10 @@ fn parse_go_import_spec_text(text: &str) -> Option<(String, Option<String>, bool
 }
 
 fn extract_go_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    // tree-sitter-go's `call_expression` always exposes a `function` field on
+    // healthy parses. The first-named-child fallback only fires if the grammar
+    // we link against ever drops or renames that field, and lets us record a
+    // partial call instead of silently dropping the node.
     let Some(function_node) = node.child_by_field_name("function").or_else(|| {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).next()
@@ -1167,20 +1197,20 @@ fn extract_go_selector_reference(
     if text.is_empty() {
         return;
     }
+    // Record the full selector text as a reference so import-aware resolution
+    // can match `pkg.Fn` against an imported package alias. Body hits for the
+    // operand and the trailing field are produced by `visit_go_children` when
+    // it descends into this selector's identifier/field_identifier children, so
+    // we intentionally avoid emitting an additional wrapper body hit here to
+    // keep selector-heavy files (e.g. etcd, prometheus) from inflating the
+    // body-hit index.
     ctx.references.push(ParsedReference {
-        file_id: ctx.file.id.clone(),
-        owner_id: owner_id.clone(),
-        text: text.clone(),
-        kind: ReferenceKind::Field,
-        span: span_from_node(node),
-        provenance: Provenance::new("tree-sitter-go", "selector reference"),
-    });
-    ctx.body_hits.push(BodyHit {
         file_id: ctx.file.id.clone(),
         owner_id,
         text,
-        kind: BodyHitKind::Identifier,
+        kind: ReferenceKind::Field,
         span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-go", "selector reference"),
     });
 }
 
@@ -1236,6 +1266,13 @@ fn dedup_go_facts(ctx: &mut ExtractContext<'_>) {
             reference.file_id.0, reference.span.start_byte, reference.text, reference.kind
         ))
     });
+    let mut body_hits = HashSet::new();
+    ctx.body_hits.retain(|hit| {
+        body_hits.insert(format!(
+            "{}|{}|{}|{}|{:?}",
+            hit.file_id.0, hit.span.start_byte, hit.span.end_byte, hit.text, hit.kind
+        ))
+    });
 }
 
 fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
@@ -1261,6 +1298,12 @@ fn go_receiver_type(node: Node<'_>, source: &str) -> Option<String> {
 }
 
 fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<SymbolId> {
+    // The prepass populates `ctx.go_type_index` with every top-level type
+    // declaration in the file so methods declared earlier in source order
+    // than their receiver type still attach to the right parent symbol.
+    if let Some(id) = ctx.go_type_index.get(name) {
+        return Some(id.clone());
+    }
     ctx.symbols
         .iter()
         .rev()
@@ -1272,6 +1315,60 @@ fn find_go_type_parent_id(ctx: &ExtractContext<'_>, name: &str) -> Option<Symbol
                 )
         })
         .map(|symbol| symbol.id.clone())
+}
+
+fn collect_go_type_index(
+    root: Node<'_>,
+    file: &FileRecord,
+    source: &str,
+) -> HashMap<String, SymbolId> {
+    let mut index = HashMap::new();
+    collect_go_type_index_in(root, file, source, &mut index);
+    index
+}
+
+fn collect_go_type_index_in(
+    node: Node<'_>,
+    file: &FileRecord,
+    source: &str,
+    index: &mut HashMap<String, SymbolId>,
+) {
+    // We only index top-level types here. Top-level for Go means siblings of
+    // the `package_clause` under `source_file`, plus their nested
+    // `type_declaration` -> `type_spec`/`type_alias` children. Skip anything
+    // inside `func_literal` to mirror the visitor's scope filter.
+    if go_has_ancestor_kind(node, "func_literal") {
+        return;
+    }
+    if matches!(node.kind(), "type_spec" | "type_alias")
+        && let Some((name, span, kind)) = go_type_index_entry(node, source)
+    {
+        let id = symbol_id(file, None, kind, &name, span);
+        index.entry(name).or_insert(id);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_go_type_index_in(child, file, source, index);
+    }
+}
+
+fn go_type_index_entry(node: Node<'_>, source: &str) -> Option<(String, SourceSpan, SymbolKind)> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, source).ok())
+        .map(str::to_string)
+        .or_else(|| first_named_child_text(node, source))
+        .map(|text| text.trim().to_string())
+        .filter(|text| is_go_identifier(text))?;
+    let type_node = node
+        .child_by_field_name("type")
+        .or_else(|| last_named_child(node));
+    let kind = match type_node.map(|child| child.kind()) {
+        Some("struct_type") => SymbolKind::Struct,
+        Some("interface_type") => SymbolKind::Interface,
+        _ => SymbolKind::TypeAlias,
+    };
+    Some((name, span_from_node(node), kind))
 }
 
 fn go_doc_and_semantic_attributes(node: Node<'_>, source: &str) -> Vec<String> {
