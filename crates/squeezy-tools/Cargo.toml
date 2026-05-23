@@ -20,5 +20,6 @@ squeezy-core.workspace = true
 squeezy-graph.workspace = true
 squeezy-skills.workspace = true
 squeezy-vcs.workspace = true
+squeezy-workspace.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

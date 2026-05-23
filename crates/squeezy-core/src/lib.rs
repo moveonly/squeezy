@@ -536,6 +536,22 @@ impl AppConfig {
             "require_indexing_signal = {}\n\n",
             self.graph.require_indexing_signal
         ));
+        output.push_str(&format!(
+            "include = {}\n",
+            toml_string_array(&self.graph.include)
+        ));
+        output.push_str(&format!(
+            "exclude = {}\n",
+            toml_string_array(&self.graph.exclude)
+        ));
+        output.push_str(&format!(
+            "include_classes = {}\n",
+            toml_string_array(&self.graph.include_classes)
+        ));
+        output.push_str(&format!(
+            "exclude_classes = {}\n\n",
+            toml_string_array(&self.graph.exclude_classes)
+        ));
 
         output.push_str("[cache]\n");
         if let Some(root) = &self.cache.root {
@@ -1687,6 +1703,10 @@ pub struct GraphConfig {
     pub max_file_bytes: u64,
     pub include_hidden: bool,
     pub require_indexing_signal: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include_classes: Vec<String>,
+    pub exclude_classes: Vec<String>,
 }
 
 impl GraphConfig {
@@ -1698,6 +1718,10 @@ impl GraphConfig {
             max_file_bytes: settings.max_file_bytes.unwrap_or(1_000_000),
             include_hidden: settings.include_hidden.unwrap_or(false),
             require_indexing_signal: settings.require_indexing_signal.unwrap_or(true),
+            include: settings.include.unwrap_or_default(),
+            exclude: settings.exclude.unwrap_or_default(),
+            include_classes: settings.include_classes.unwrap_or_default(),
+            exclude_classes: settings.exclude_classes.unwrap_or_default(),
         }
     }
 }
@@ -1714,6 +1738,10 @@ pub struct GraphSettings {
     pub max_file_bytes: Option<u64>,
     pub include_hidden: Option<bool>,
     pub require_indexing_signal: Option<bool>,
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+    pub include_classes: Option<Vec<String>>,
+    pub exclude_classes: Option<Vec<String>>,
 }
 
 impl GraphSettings {
@@ -1725,6 +1753,10 @@ impl GraphSettings {
                 "max_file_bytes",
                 "include_hidden",
                 "require_indexing_signal",
+                "include",
+                "exclude",
+                "include_classes",
+                "exclude_classes",
             ],
             source,
             path,
@@ -1749,6 +1781,20 @@ impl GraphSettings {
                 source,
                 &field(path, "require_indexing_signal"),
             )?,
+            include: string_array_value(table, "include", source, &field(path, "include"))?,
+            exclude: string_array_value(table, "exclude", source, &field(path, "exclude"))?,
+            include_classes: string_array_value(
+                table,
+                "include_classes",
+                source,
+                &field(path, "include_classes"),
+            )?,
+            exclude_classes: string_array_value(
+                table,
+                "exclude_classes",
+                source,
+                &field(path, "exclude_classes"),
+            )?,
         })
     }
 
@@ -1760,6 +1806,10 @@ impl GraphSettings {
             &mut self.require_indexing_signal,
             next.require_indexing_signal,
         );
+        replace_if_some(&mut self.include, next.include);
+        replace_if_some(&mut self.exclude, next.exclude);
+        replace_if_some(&mut self.include_classes, next.include_classes);
+        replace_if_some(&mut self.exclude_classes, next.exclude_classes);
     }
 }
 
@@ -2023,15 +2073,19 @@ pub fn project_settings_template() -> &'static str {
 # action = "allow"
 # source = "project"
 
-# `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]` are parsed and
-# round-trip through `squeezy config inspect` but no runtime consumer reads
-# them yet; treat them as v0 reservations.
+# `[graph]` controls workspace indexing. `[tui].status_verbosity` and
+# `[mcp.servers.*]` are parsed and round-trip through `squeezy config inspect`
+# but are still v0 reservations.
 
 # [graph]
 # languages = ["rust", "python"]
 # max_file_bytes = 1000000
 # include_hidden = false
 # require_indexing_signal = true
+# include = ["vendor/allowed/**"]
+# exclude = ["fixtures/generated/**"]
+# include_classes = ["lockfile"]
+# exclude_classes = ["generated"]
 
 [cache]
 # Relative paths are resolved against the project root (the directory
@@ -2852,6 +2906,7 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageKind {
+    Go,
     Python,
     Rust,
     Unsupported,
@@ -2863,6 +2918,7 @@ pub enum SymbolKind {
     Class,
     Crate,
     File,
+    Interface,
     Module,
     Struct,
     Enum,

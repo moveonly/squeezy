@@ -1,0 +1,185 @@
+name: Go Semantic Graph Benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/go-semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+      - "benchmark-full/**"
+    paths:
+      - ".github/workflows/go-semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Benchmark tier"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  go-semantic-graph-smoke:
+    name: Go semantic graph
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run Go semantic graph benchmark
+        run: |
+          mkdir -p target/semantic-graph-benchmark
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language go \
+            --fixture benchmarks/fixtures/go/semantic-cases \
+            --spec benchmarks/specs/go-smoke-queries.json \
+            --report target/semantic-graph-benchmark/go-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external Go comparison
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'full') || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/benchmark-full/')) }}
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/go-real
+          while read -r name url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language go \
+              --fixture "target/benchmark-repos/$name" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/go-real/$name.json" \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          gin https://github.com/gin-gonic/gin
+          cobra https://github.com/spf13/cobra
+          prometheus https://github.com/prometheus/prometheus
+          etcd https://github.com/etcd-io/etcd
+          zap https://github.com/uber-go/zap
+          REPOS
+
+      - name: Write benchmark summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+
+          reports = []
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/**/*.json", recursive=True)):
+              reports.append((path, json.load(open(path))))
+
+          with open("__go_summary.md", "w") as out:
+              print("## Go Semantic Graph Benchmark", file=out)
+              for path, report in reports:
+                  print("", file=out)
+                  print(f"### {path}", file=out)
+                  print(f"- Fixture: {report['fixture']}", file=out)
+                  print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
+                  print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
+                  print(f"- Faster than validation: {report['faster_than_validation']}", file=out)
+                  phases = report.get("build_phases", {})
+                  if phases:
+                      print(
+                          f"- Build phases: crawl={phases.get('crawl_ms')}ms parse={phases.get('parse_ms')}ms declaration_graph={phases.get('declaration_graph_ms')}ms full_graph={phases.get('full_graph_ms')}ms",
+                          file=out,
+                      )
+                  graph = report.get("graph", {})
+                  if graph:
+                      print(
+                          f"- Graph counts: files={graph.get('files')} symbols={graph.get('symbols')} edges={graph.get('edges')} references={graph.get('references')} calls={graph.get('calls')} body_hits={graph.get('body_hits')}",
+                          file=out,
+                      )
+                      print(
+                          f"- Graph indexes: body_hit_trigram_indexed={graph.get('body_hit_trigram_indexed')} body_hit_trigram_terms={graph.get('body_hit_trigram_terms')} reference_index_terms={graph.get('reference_index_terms')}",
+                          file=out,
+                      )
+                  oracle = report.get("go_oracle")
+                  if oracle:
+                      acc = oracle["symbols"]
+                      print(
+                          f"- Go oracle symbols: TP={acc['true_positive']} FP={acc['false_positive']} FN={acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
+                          file=out,
+                      )
+                      print(
+                          f"- Go oracle scope: oracle={acc['rust_analyzer_total']} raw_oracle={acc['rust_analyzer_raw_total']} comparable_squeezy={acc['squeezy_total']} raw_squeezy={acc['squeezy_raw_total']} excluded_squeezy={acc['squeezy_excluded_by_kind']}",
+                          file=out,
+                      )
+                      if oracle.get("oracle_unparseable_files", 0):
+                          print(f"- Go oracle unparseable files: {oracle['oracle_unparseable_files']}", file=out)
+                  refresh = report.get("refresh_probe")
+                  if refresh:
+                      print(
+                          f"- Refresh probe: copied={refresh['copied_source_files']} edited={refresh['edited_files']} reparsed={refresh['reparsed_files']} refresh_ms={refresh['refresh_ms']} budget_exhausted={refresh['budget_exhausted']}",
+                          file=out,
+                      )
+                  iterations = report.get("heuristic_iterations", [])
+                  if iterations:
+                      print("", file=out)
+                      print("| Heuristic | Status | Notes |", file=out)
+                      print("|---|---|---|", file=out)
+                      for item in iterations:
+                          notes = " ".join(item.get("notes", []))
+                          print(
+                              f"| {item['name']} | {item['status']} | {notes} |",
+                              file=out,
+                          )
+                  if report["queries"]:
+                      print("", file=out)
+                      print("| Query | Actual | Missing | Extras |", file=out)
+                      print("|---|---:|---:|---:|", file=out)
+                      for query in report["queries"]:
+                          print(
+                              f"| {query['id']} | {len(query['actual'])} | {len(query['missing'])} | {len(query['extras'])} |",
+                              file=out,
+                          )
+          PY
+          cat __go_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: semantic-graph-benchmark-go-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/**/*.json
+            __go_summary.md
+          if-no-files-found: error

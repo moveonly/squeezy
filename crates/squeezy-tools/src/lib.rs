@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
-    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionCapability, PermissionMode,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionCapability, PermissionMode,
     PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
     Result, SkillsConfig, SqueezyError,
 };
@@ -33,6 +33,9 @@ use squeezy_graph::{
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_vcs::{DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs};
+use squeezy_workspace::{
+    CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
+};
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 
@@ -59,6 +62,7 @@ const MAX_WEB_FETCH_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_WEB_FETCH_OUTPUT_BYTE_CAP: usize = 32_000;
 const MAX_WEB_REDIRECTS: usize = 5;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+const POLICY_PREFIX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -373,6 +377,8 @@ pub struct ToolRegistry {
     vcs: Arc<GitVcs>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
+    crawl_options: Arc<CrawlOptions>,
+    compiled_policy: Arc<CompiledIndexingPolicy>,
 }
 
 #[derive(Debug, Default)]
@@ -410,7 +416,28 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
     ) -> Result<Self> {
-        Self::new_inner(root, output_config, web_config, SkillCatalog::empty())
+        Self::new_inner(
+            root,
+            output_config,
+            web_config,
+            SkillCatalog::empty(),
+            CrawlOptions::default(),
+        )
+    }
+
+    pub fn new_with_graph_config(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        graph_config: &GraphConfig,
+    ) -> Result<Self> {
+        Self::new_inner(
+            root,
+            output_config,
+            web_config,
+            SkillCatalog::empty(),
+            crawl_options_from_graph_config(graph_config),
+        )
     }
 
     pub fn new_with_configs_and_skills(
@@ -418,13 +445,20 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills_config: SkillsConfig,
+        graph_config: &GraphConfig,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
-        Self::new_inner_canonical(root, output_config, web_config, skills)
+        Self::new_inner_canonical(
+            root,
+            output_config,
+            web_config,
+            skills,
+            crawl_options_from_graph_config(graph_config),
+        )
     }
 
     fn new_inner(
@@ -432,12 +466,13 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
+        crawl_options: CrawlOptions,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
-        Self::new_inner_canonical(root, output_config, web_config, skills)
+        Self::new_inner_canonical(root, output_config, web_config, skills, crawl_options)
     }
 
     fn new_inner_canonical(
@@ -445,10 +480,17 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
+        crawl_options: CrawlOptions,
     ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
-        let graph = GraphManager::open(&root).ok();
+        // Compile the policy once up front. Invalid user globs surface as a
+        // `SqueezyError::Config` here instead of silently disabling the
+        // policy on every hot-path call.
+        let compiled_policy = Arc::new(crawl_options.policy.compile()?);
+        let graph =
+            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
+                .ok();
         let vcs = GitVcs::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
@@ -459,6 +501,8 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
+            crawl_options: Arc::new(crawl_options),
+            compiled_policy,
         })
     }
 
@@ -474,7 +518,11 @@ impl ToolRegistry {
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let output_store = ToolOutputStore::new(&root, output_config)?;
-        let graph = GraphManager::open(&root).ok();
+        let crawl_options = CrawlOptions::default();
+        let compiled_policy = Arc::new(crawl_options.policy.compile()?);
+        let graph =
+            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
+                .ok();
         let vcs = GitVcs::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
@@ -485,6 +533,8 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
+            crawl_options: Arc::new(crawl_options),
+            compiled_policy,
         })
     }
 
@@ -519,6 +569,36 @@ impl ToolRegistry {
         }
     }
 
+    /// Cheap permission-scope predicate. Looks only at the user-supplied
+    /// path string: no file I/O, no canonicalization, no glob recompile.
+    /// Files that are excluded by *content* (binary / generated) but live
+    /// at a perfectly normal path still receive the regular Read scope and
+    /// are surfaced to the model via `ignored=true` from `execute_read_file`.
+    fn read_file_targets_ignored_policy(&self, arguments: &Value) -> bool {
+        let Ok(args) = serde_json::from_value::<ReadFileArgs>(arguments.clone()) else {
+            return false;
+        };
+        let normalized = args.path.replace('\\', "/");
+        self.compiled_policy
+            .path_reason(&normalized, false)
+            .is_some()
+    }
+
+    fn policy_exclusion_for_file(
+        &self,
+        path: &Path,
+        rel: &Path,
+        prefix: Option<&[u8]>,
+    ) -> Option<ExclusionReason> {
+        let size_bytes = file_len(path).ok()?;
+        self.compiled_policy.file_reason(
+            &rel.to_string_lossy(),
+            size_bytes,
+            self.crawl_options.max_file_bytes,
+            prefix,
+        )
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             diff_context_spec(),
@@ -546,6 +626,9 @@ impl ToolRegistry {
             "webfetch" | "websearch" => PermissionScope::Web,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
+            "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
+                PermissionScope::IgnoredSearch
+            }
             "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
             | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
             _ => PermissionScope::Read,
@@ -1032,16 +1115,19 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| symbol_context_json(graph, symbol, max_references))
             .collect::<Vec<_>>();
+        let mut payload = serde_json::Map::new();
+        payload.insert("query".to_string(), json!(args.query));
+        payload.insert("mode".to_string(), json!(diff_mode_str(mode)));
+        payload.insert("diff_only".to_string(), json!(diff_only));
+        payload.insert("symbols".to_string(), json!(content));
+        if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
+            payload.insert("coverage".to_string(), coverage);
+        }
+        payload.insert("graph_available".to_string(), json!(true));
         make_result(
             call,
             ToolStatus::Success,
-            json!({
-                "query": args.query,
-                "mode": diff_mode_str(mode),
-                "diff_only": diff_only,
-                "symbols": content,
-                "graph_available": true,
-            }),
+            Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
                 ..ToolCostHint::default()
@@ -1090,17 +1176,49 @@ impl ToolRegistry {
                 })
             })
             .collect::<Vec<_>>();
-        json!({
-            "available": true,
-            "refresh": refresh.map(|report| json!({
-                "refreshed": report.refreshed,
-                "changed_files": report.changed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-                "removed_files": report.removed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
-                "reparsed_files": report.reparsed_files,
-                "budget_exhausted": report.budget_exhausted,
-            })),
-            "files": files,
-        })
+        let mut payload = serde_json::Map::new();
+        payload.insert("available".to_string(), json!(true));
+        if let Some(report) = refresh {
+            let mut refresh_obj = serde_json::Map::new();
+            refresh_obj.insert("refreshed".to_string(), json!(report.refreshed));
+            refresh_obj.insert(
+                "changed_files".to_string(),
+                json!(
+                    report
+                        .changed_files
+                        .iter()
+                        .map(|id| id.0.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            refresh_obj.insert(
+                "removed_files".to_string(),
+                json!(
+                    report
+                        .removed_files
+                        .iter()
+                        .map(|id| id.0.clone())
+                        .collect::<Vec<_>>()
+                ),
+            );
+            refresh_obj.insert("reparsed_files".to_string(), json!(report.reparsed_files));
+            refresh_obj.insert("excluded_files".to_string(), json!(report.excluded_files));
+            refresh_obj.insert("excluded_dirs".to_string(), json!(report.excluded_dirs));
+            refresh_obj.insert("excluded_bytes".to_string(), json!(report.excluded_bytes));
+            if let Some(coverage) = coverage_json(&report.coverage) {
+                refresh_obj.insert("coverage".to_string(), coverage);
+            }
+            refresh_obj.insert(
+                "budget_exhausted".to_string(),
+                json!(report.budget_exhausted),
+            );
+            payload.insert("refresh".to_string(), Value::Object(refresh_obj));
+        }
+        if let Some(coverage) = coverage_json(&manager.build_report().coverage) {
+            payload.insert("coverage".to_string(), coverage);
+        }
+        payload.insert("files".to_string(), json!(files));
+        Value::Object(payload)
     }
 
     async fn execute_load_skill(&self, call: &ToolCall) -> ToolResult {
@@ -1185,6 +1303,9 @@ impl ToolRegistry {
                 continue;
             }
             let rel = self.relative(path);
+            if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
+                continue;
+            }
             if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
                 continue;
             }
@@ -1316,6 +1437,9 @@ impl ToolRegistry {
                 continue;
             }
             let rel = self.relative(path);
+            if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
+                continue;
+            }
             if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
                 continue;
             }
@@ -1336,6 +1460,15 @@ impl ToolRegistry {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
+            if !include_ignored {
+                let head_len = bytes.len().min(POLICY_PREFIX_BYTES);
+                if self
+                    .policy_exclusion_for_file(path, &rel, Some(&bytes[..head_len]))
+                    .is_some()
+                {
+                    continue;
+                }
+            }
             cost.bytes_read += bytes.len() as u64;
             let file_truncated = file_len(path)
                 .map(|len| len > bytes.len() as u64)
@@ -1470,6 +1603,10 @@ impl ToolRegistry {
             Ok(len) => len,
             Err(err) => return tool_error(call, err),
         };
+        let prefix_bytes = read_prefix(&path, POLICY_PREFIX_BYTES).ok();
+        let ignored_reason = self
+            .policy_exclusion_for_file(&path, &rel, prefix_bytes.as_deref())
+            .map(ExclusionReason::as_str);
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
         let bytes = match read_range(&path, offset as u64, limit) {
@@ -1489,18 +1626,25 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
+        let mut payload = serde_json::Map::new();
+        payload.insert("path".to_string(), json!(rel.to_string_lossy()));
+        payload.insert("offset".to_string(), json!(offset));
+        payload.insert("bytes_returned".to_string(), json!(bytes.len()));
+        payload.insert("total_bytes".to_string(), json!(total_bytes));
+        payload.insert("sha256".to_string(), json!(content_sha256));
+        payload.insert("truncated".to_string(), json!(end < total_bytes as usize));
+        if let Some(reason) = ignored_reason {
+            // Keep this opt-in: most reads are not from ignored paths, so
+            // skipping these fields shaves two keys off the common case.
+            payload.insert("ignored".to_string(), json!(true));
+            payload.insert("ignored_reason".to_string(), json!(reason));
+        }
+        payload.insert("content".to_string(), json!(content));
+
         make_result(
             call,
             ToolStatus::Success,
-            json!({
-                "path": rel.to_string_lossy(),
-                "offset": offset,
-                "bytes_returned": bytes.len(),
-                "total_bytes": total_bytes,
-                "sha256": content_sha256,
-                "truncated": end < total_bytes as usize,
-                "content": content,
-            }),
+            Value::Object(payload),
             cost,
             Some(content_sha256),
         )
@@ -2801,6 +2945,47 @@ fn tool_include_ignored(arguments: &Value) -> bool {
         .get("include_ignored")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
+    CrawlOptions {
+        include_hidden: config.include_hidden,
+        max_file_bytes: config.max_file_bytes,
+        require_indexing_signal: config.require_indexing_signal,
+        policy: IndexingPolicy {
+            include: config.include.clone(),
+            exclude: config.exclude.clone(),
+            include_classes: config.include_classes.clone(),
+            exclude_classes: config.exclude_classes.clone(),
+        },
+    }
+}
+
+fn coverage_json(coverage: &IndexCoverage) -> Option<Value> {
+    if coverage.skipped_files == 0 && coverage.skipped_dirs == 0 && coverage.reasons.is_empty() {
+        return None;
+    }
+    let reasons = coverage
+        .reasons
+        .iter()
+        .map(|(reason, coverage)| {
+            (
+                reason.clone(),
+                json!({
+                    "files": coverage.files,
+                    "dirs": coverage.dirs,
+                    "bytes": coverage.bytes,
+                    "samples": coverage.samples,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    Some(json!({
+        "skipped_files": coverage.skipped_files,
+        "skipped_dirs": coverage.skipped_dirs,
+        "skipped_bytes": coverage.skipped_bytes,
+        "reasons": reasons,
+    }))
 }
 
 fn diff_mode_str(mode: DiffMode) -> &'static str {

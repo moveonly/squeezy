@@ -64,9 +64,10 @@ impl Agent {
             output_config.clone(),
             web_config.clone(),
             config.skills.clone(),
+            &config.graph,
         )
         .unwrap_or_else(|_| {
-            ToolRegistry::new_with_configs(".", output_config, web_config)
+            ToolRegistry::new_with_graph_config(".", output_config, web_config, &config.graph)
                 .expect("current directory must be a valid tool root")
         });
         Self {

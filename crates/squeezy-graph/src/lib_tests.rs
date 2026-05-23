@@ -6,8 +6,8 @@ use std::{
 };
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
-use squeezy_parse::{ParsedFile, ReferenceKind, RustParser};
-use squeezy_workspace::{FileRecord, stable_content_hash};
+use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind};
+use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
 
 use super::*;
 
@@ -24,7 +24,7 @@ impl Runner {
 
 fn helper() {}
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -71,7 +71,7 @@ def make():
     greeter = Greeter()
     return greeter.greet("Ada")
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = python_record("app.py", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -94,8 +94,68 @@ def make():
 }
 
 #[test]
+fn graph_answers_go_navigation_queries() {
+    let mut parser = LanguageParser::new().unwrap();
+    let util = go_record(
+        "util/format.go",
+        r#"
+package util
+
+func Format(name string) string {
+    return name
+}
+"#,
+    );
+    let app = go_record(
+        "greeter/runner.go",
+        r#"
+package greeter
+
+import util "example.com/acme/app/util"
+
+type Runner struct {
+    Name string
+}
+
+func NewRunner(name string) Runner {
+    return Runner{Name: name}
+}
+
+func (r Runner) Greet(name string) string {
+    helper()
+    return util.Format(name)
+}
+
+func helper() {}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&util, fs::read_to_string(&util.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .find_symbol_by_name("Runner")
+            .iter()
+            .any(|symbol| symbol.kind == SymbolKind::Struct)
+    );
+    let greet = graph.find_symbol_by_name("Greet").pop().unwrap();
+    let helper = graph.find_symbol_by_name("helper").pop().unwrap();
+    let format = graph.find_symbol_by_name("Format").pop().unwrap();
+    assert!(graph.call_chain(&greet.id, &helper.id, 2).is_some());
+    assert!(graph.call_chain(&greet.id, &format.id, 2).is_some());
+    assert!(!graph.reference_search("Format").is_empty());
+}
+
+#[test]
 fn graph_uses_python_navigation_heuristics() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let greeter = python_record(
         "services/greeter.py",
         r#"
@@ -232,6 +292,44 @@ fn graph_manager_refresh_replaces_changed_file_only() {
 }
 
 #[test]
+fn graph_reports_indexing_policy_coverage() {
+    let root = temp_root("graph-policy-coverage");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("vendor/lib")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn indexed() {}\n").unwrap();
+    fs::write(root.join("vendor/lib/lib.rs"), "pub fn vendored() {}\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "# lock\n").unwrap();
+
+    let manager = GraphManager::open_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+    )
+    .unwrap();
+
+    assert!(!manager.graph().find_symbol_by_name("indexed").is_empty());
+    assert!(manager.graph().find_symbol_by_name("vendored").is_empty());
+    // Cargo.lock is a file-level exclusion; vendor/ is a directory-level
+    // pruning (one entry rather than one entry per file under it).
+    assert!(manager.build_report().excluded_files >= 1);
+    assert!(manager.build_report().excluded_dirs >= 1);
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("vendor")
+    );
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("lockfile")
+    );
+}
+
+#[test]
 fn graph_filters_unsupported_files_from_hierarchy() {
     let mut readme = record("README.md", "# docs\n");
     readme.language = LanguageKind::Unsupported;
@@ -253,7 +351,7 @@ fn beta() -> usize {
     1
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let file_id = record.id.clone();
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
@@ -283,7 +381,7 @@ fn beta() -> usize {
 
 #[test]
 fn graph_binds_references_to_selected_same_name_symbol() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let first = record(
         "src/first.rs",
         r#"
@@ -343,7 +441,7 @@ pub fn caller(map: std::collections::HashMap<String, String>) {
     map.get("key");
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -368,7 +466,7 @@ fn caller() {
     let _ = lookup;
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -395,7 +493,7 @@ fn caller() {
     let _ = Mode::Generate;
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -416,7 +514,7 @@ trait Sink {
     fn finish(&mut self, finish: &usize);
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -427,7 +525,7 @@ trait Sink {
 
 #[test]
 fn graph_symbol_references_are_package_local_until_cargo_resolution_exists() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let source_package = record("crates/source/src/lib.rs", "pub struct Shared;\n");
     let user_package = record(
         "crates/user/src/lib.rs",
@@ -470,7 +568,7 @@ fn caller() -> std::vec::IntoIter<u8> {
     todo!()
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -481,7 +579,7 @@ fn caller() -> std::vec::IntoIter<u8> {
 
 #[test]
 fn graph_resolves_module_qualified_direct_calls() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let output = record("src/output.rs", "pub fn print_entry() {}\n");
     let walk = record(
         "src/walk.rs",
@@ -513,6 +611,60 @@ pub fn scan() {
 }
 
 #[test]
+fn path_starts_with_external_root_is_language_aware() {
+    // Rust paths only match Rust stdlib roots.
+    assert!(path_starts_with_external_root(
+        "std::fmt::Debug",
+        LanguageKind::Rust
+    ));
+    assert!(path_starts_with_external_root(
+        "core::convert::From",
+        LanguageKind::Rust
+    ));
+    // Rust paths that happen to start with Go stdlib package names (e.g.
+    // `sync::Mutex` after `use tokio::sync;`) must NOT be treated as external.
+    for path in [
+        "sync::Mutex",
+        "io::Read",
+        "os::ProcessId",
+        "time::Duration",
+        "fmt::Formatter",
+        "errors::Error",
+    ] {
+        assert!(
+            !path_starts_with_external_root(path, LanguageKind::Rust),
+            "{path} must not be flagged external for Rust",
+        );
+    }
+    // Go paths match Go stdlib roots regardless of separator.
+    for path in [
+        "fmt.Println",
+        "fmt.Errorf",
+        "sync.Mutex",
+        "io.Reader",
+        "os.Getenv",
+        "time.Now",
+        "context.Background",
+    ] {
+        assert!(
+            path_starts_with_external_root(path, LanguageKind::Go),
+            "{path} must be flagged external for Go",
+        );
+    }
+    // Go paths starting with Rust stdlib roots are not Go externals.
+    assert!(!path_starts_with_external_root("std.Foo", LanguageKind::Go));
+    // Python references do not currently classify any path as external.
+    assert!(!path_starts_with_external_root(
+        "os.path.join",
+        LanguageKind::Python
+    ));
+    assert!(!path_starts_with_external_root(
+        "sys.argv",
+        LanguageKind::Python
+    ));
+}
+
+#[test]
 fn graph_resolves_type_qualified_associated_functions() {
     let source = r#"
 pub struct Command;
@@ -527,7 +679,7 @@ pub fn caller() {
     Command::new();
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -545,7 +697,7 @@ pub fn caller() {
 
 #[test]
 fn graph_binds_imported_grouped_type_references() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let lowargs = record(
         "crates/core/flags/lowargs.rs",
         r#"
@@ -583,7 +735,7 @@ pub fn use_context(mode: ContextMode) {
 
 #[test]
 fn graph_binds_grouped_import_clause_to_imported_type() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let lowargs = record(
         "crates/core/flags/lowargs.rs",
         r#"
@@ -626,7 +778,7 @@ mod convert {
     pub fn string() {}
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/flags/defs.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -663,7 +815,7 @@ fn run() {
     Concrete::decode();
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -710,7 +862,7 @@ fn build() -> (FA, FB) {
     (fa, fb)
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -794,7 +946,7 @@ impl crate::a::Decoder for Concrete {
     fn decode() {}
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -866,7 +1018,7 @@ impl Decoder for Concrete {
     fn decode() {}
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -901,7 +1053,7 @@ fn flags() {
     let _ = &Generate;
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -924,7 +1076,7 @@ fn option() -> Option<u8> {
     None
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -942,7 +1094,7 @@ pub trait IntoThing {
     fn convert(self) -> Self::Output;
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -971,7 +1123,7 @@ impl IntoThing for Local {
 
 pub fn consume(_: IntoThing::Output) {}
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -1031,7 +1183,7 @@ impl IntoThing for Local {
     }
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -1059,7 +1211,7 @@ impl IntoThing for Local {
 #[test]
 fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply() {
     let source = "pub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\npub fn third() -> usize { 3 }\n";
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let mut graph = SemanticGraph::from_parsed(vec![parsed]);
@@ -1133,6 +1285,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn go_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Go;
     record
 }
 

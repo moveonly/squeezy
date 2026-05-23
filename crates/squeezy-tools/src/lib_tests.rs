@@ -187,6 +187,100 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
 }
 
 #[tokio::test]
+async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
+    let root = temp_workspace("tool_indexing_policy");
+    fs::create_dir_all(root.join("node_modules/pkg")).expect("mkdir node_modules");
+    fs::write(root.join("visible.rs"), "needle\n").expect("write visible");
+    fs::write(root.join("node_modules/pkg/index.ts"), "needle\n").expect("write ignored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let grep_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(match_paths(&grep_default), vec!["visible.rs"]);
+
+    let grep_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let mut paths = match_paths(&grep_including_ignored);
+    paths.sort();
+    assert_eq!(paths, vec!["node_modules/pkg/index.ts", "visible.rs"]);
+
+    let glob_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_3".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(glob_default.content["paths"], json!([]));
+
+    let glob_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_4".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        glob_including_ignored.content["paths"],
+        json!(["node_modules/pkg/index.ts"])
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_reports_policy_ignored_reason_and_permission_scope() {
+    let root = temp_workspace("read_ignored_policy");
+    fs::create_dir_all(root.join("vendor/lib")).expect("mkdir vendor");
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() {}\n",
+    )
+    .expect("write vendored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let call = ToolCall {
+        call_id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "vendor/lib/generated.rs"}),
+    };
+
+    assert_eq!(
+        registry.permission_scope(&call),
+        PermissionScope::IgnoredSearch
+    );
+    let result = registry.execute(call, CancellationToken::new()).await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["ignored"], true);
+    assert_eq!(result.content["ignored_reason"], "vendor");
+    assert_eq!(result.content["path"], "vendor/lib/generated.rs");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn grep_count_mode_returns_count_without_line_content() {
     let root = temp_workspace("grep_count");
     fs::write(root.join("one.txt"), "needle\nneedle\n").expect("write one");
@@ -1550,6 +1644,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
         },
+        &GraphConfig::default(),
     )
     .expect("registry");
 

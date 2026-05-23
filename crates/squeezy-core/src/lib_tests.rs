@@ -582,6 +582,10 @@ languages = ["rust", "csharp"]
 max_file_bytes = 42
 include_hidden = true
 require_indexing_signal = false
+include = ["vendor/allowed/**"]
+exclude = ["fixtures/generated/**"]
+include_classes = ["lockfile"]
+exclude_classes = ["generated"]
 
 [cache]
 root = ".squeezy/cache"
@@ -613,6 +617,10 @@ env = { TOKEN = "secret" }
     assert!(!config.telemetry.enabled);
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
     assert_eq!(config.graph.languages, vec!["rust", "csharp"]);
+    assert_eq!(config.graph.include, vec!["vendor/allowed/**"]);
+    assert_eq!(config.graph.exclude, vec!["fixtures/generated/**"]);
+    assert_eq!(config.graph.include_classes, vec!["lockfile"]);
+    assert_eq!(config.graph.exclude_classes, vec!["generated"]);
     assert_eq!(
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
