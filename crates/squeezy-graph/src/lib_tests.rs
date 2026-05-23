@@ -692,6 +692,125 @@ fn run() {
 }
 
 #[test]
+fn graph_does_not_bind_impl_decl_across_same_name_traits_in_other_modules() {
+    let source = r#"
+mod a {
+    pub trait Decoder {
+        fn decode();
+    }
+}
+
+mod b {
+    pub trait Decoder {
+        fn decode();
+    }
+}
+
+struct Concrete;
+
+impl crate::a::Decoder for Concrete {
+    fn decode() {}
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let trait_methods: Vec<_> = graph
+        .find_symbol_by_name("decode")
+        .into_iter()
+        .filter(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.kind == SymbolKind::Trait)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(trait_methods.len(), 2);
+
+    let module_of = |trait_method: &GraphSymbol| {
+        trait_method
+            .parent_id
+            .as_ref()
+            .and_then(|id| graph.symbols.get(id))
+            .and_then(|trait_sym| trait_sym.parent_id.as_ref())
+            .and_then(|id| graph.symbols.get(id))
+            .map(|module| module.name.clone())
+            .unwrap_or_default()
+    };
+    let trait_a = trait_methods
+        .iter()
+        .find(|sym| module_of(sym) == "a")
+        .expect("trait a::Decoder::decode");
+    let trait_b = trait_methods
+        .iter()
+        .find(|sym| module_of(sym) == "b")
+        .expect("trait b::Decoder::decode");
+
+    let refs_a = graph.references_to_symbol(&trait_a.id);
+    let refs_b = graph.references_to_symbol(&trait_b.id);
+
+    assert!(
+        refs_a
+            .iter()
+            .any(|hit| hit.reference.text == "decode" && hit.reference.span.start_byte > 80),
+        "impl decode declaration should bind to a::Decoder::decode"
+    );
+    assert!(
+        !refs_b
+            .iter()
+            .any(|hit| hit.reference.text == "decode" && hit.reference.span.start_byte > 80),
+        "impl decode declaration must NOT cross-bind to b::Decoder::decode"
+    );
+}
+
+#[test]
+fn graph_skips_impl_decl_with_multiline_cfg_attribute() {
+    let source = r#"
+pub trait Decoder {
+    fn decode();
+}
+
+struct Concrete;
+
+impl Decoder for Concrete {
+    #[cfg(any(
+        feature = "x",
+        feature = "y",
+    ))]
+    fn decode() {}
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let trait_decode = graph
+        .find_symbol_by_name("decode")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.kind == SymbolKind::Trait)
+                .unwrap_or(false)
+        })
+        .unwrap();
+    let refs = graph.references_to_symbol(&trait_decode.id);
+
+    assert!(
+        !refs
+            .iter()
+            .any(|hit| hit.reference.text == "decode" && hit.reference.span.start_byte > 90),
+        "cfg-gated impl decode declaration must not bind to the trait method"
+    );
+}
+
+#[test]
 fn graph_binds_uppercase_struct_constructor_references() {
     let source = r#"
 struct Generate;

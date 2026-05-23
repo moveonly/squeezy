@@ -1717,13 +1717,66 @@ impl SemanticGraph {
         {
             return false;
         }
-        impl_method
+        let Some(impl_parent) = impl_method
             .parent_id
             .as_ref()
             .and_then(|id| self.symbols.get(id))
             .filter(|parent| parent.kind == SymbolKind::Impl)
-            .map(|parent| impl_header_implements_trait(&parent.name, &trait_symbol.name))
-            .unwrap_or(false)
+        else {
+            return false;
+        };
+        // Name match alone is ambiguous when two traits in different modules
+        // share a name. Require that the impl header's trait path resolves
+        // back to the trait we're testing against.
+        impl_header_implements_trait(&impl_parent.name, &trait_symbol.name)
+            && self.impl_header_trait_resolves_to(&impl_parent.name, trait_symbol, impl_parent)
+    }
+
+    fn impl_header_trait_resolves_to(
+        &self,
+        header: &str,
+        trait_symbol: &GraphSymbol,
+        impl_anchor: &GraphSymbol,
+    ) -> bool {
+        let Some((trait_part, _)) = header.split_once(" for ") else {
+            return false;
+        };
+        let trait_part = trait_part
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
+        let segments = path_segments(trait_part);
+        if segments.last().map(String::as_str) != Some(trait_symbol.name.as_str()) {
+            return false;
+        }
+        if segments.len() == 1 {
+            if trait_symbol.file_id == impl_anchor.file_id {
+                return true;
+            }
+            return self
+                .imports
+                .iter()
+                .filter(|import| import.file_id == impl_anchor.file_id)
+                .any(|import| {
+                    let alias_or_name = import
+                        .alias
+                        .as_deref()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| last_path_segment(&import.path));
+                    alias_or_name == trait_symbol.name
+                        && self.import_module_matches_symbol(import, trait_symbol)
+                });
+        }
+        if segments.first().map(String::as_str) == Some("crate") {
+            let mut expected = self.module_path_for_symbol(trait_symbol);
+            expected.push(trait_symbol.name.clone());
+            return segments == expected;
+        }
+        let receiver = segments[..segments.len() - 1].join("::");
+        self.receiver_module_paths(impl_anchor, &receiver)
+            .into_iter()
+            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
     }
 
     fn reference_is_impl_method_declaration_for_trait(
@@ -1857,15 +1910,37 @@ impl SemanticGraph {
         let Some(prefix) = source.get(..symbol.span.start_byte as usize) else {
             return false;
         };
+        // Walk lines backward, tolerating doc/line comments and multi-line
+        // attributes that close with `)]` or `]` on a continuation line.
+        let mut in_multiline_attribute = false;
         for line in prefix.lines().rev() {
-            let line = line.trim();
-            if line.is_empty() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
                 continue;
             }
-            if line.starts_with("#[") {
-                if line.starts_with("#[cfg") {
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
+                continue;
+            }
+            if in_multiline_attribute {
+                if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+                    in_multiline_attribute = false;
+                    if attribute_text_is_cfg(trimmed) {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+                if attribute_text_is_cfg(trimmed) {
                     return true;
                 }
+                continue;
+            }
+            if trimmed.ends_with(']') {
+                in_multiline_attribute = true;
                 continue;
             }
             break;
@@ -2721,6 +2796,20 @@ fn impl_header_implements_trait(header: &str, trait_name: &str) -> bool {
         .unwrap_or_default()
         .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
     last_path_segment(trait_part) == trait_name
+}
+
+fn attribute_text_is_cfg(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let body = trimmed
+        .strip_prefix("#![")
+        .or_else(|| trimmed.strip_prefix("#["));
+    let Some(body) = body else { return false };
+    let head: String = body
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    head == "cfg" || head == "cfg_attr"
 }
 
 fn has_cfg_attribute(symbol: &GraphSymbol) -> bool {
