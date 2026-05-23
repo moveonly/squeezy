@@ -11,7 +11,9 @@ use futures_core::Stream;
 use futures_util::stream;
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
-use squeezy_core::{AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, Result};
+use squeezy_core::{
+    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, PermissionScope, Result,
+};
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
@@ -337,6 +339,116 @@ async fn aggregate_tool_result_budget_compacts_later_outputs() {
             .as_str()
             .expect("budget error")
             .contains("aggregate tool-result budget")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
+    let root = temp_workspace("denied_webfetch");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/blocked", "timeout_ms": 100}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("blocked".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Ask;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("fetch denied url".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested {
+            request,
+            decision_tx,
+            ..
+        } = event
+        {
+            assert_eq!(request.tool_name, "webfetch");
+            assert_eq!(request.scope, PermissionScope::Web);
+            assert!(request.summary.contains("example.com"));
+            decision_tx
+                .send(ToolApprovalDecision::Denied)
+                .expect("send denial");
+        }
+    }
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_advertised() {
+    let root = temp_workspace("approved_webfetch_validation");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "file:///tmp/secret"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("reported".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn(
+        "fetch rejected non-http url".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    let tool_names = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"webfetch"));
+    assert!(tool_names.contains(&"websearch"));
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Error");
+    assert!(
+        outputs[0].1["content"]["error"]
+            .as_str()
+            .expect("error")
+            .contains("http:// or https://")
     );
 
     let _ = fs::remove_dir_all(root);

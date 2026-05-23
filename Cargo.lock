@@ -1652,9 +1652,11 @@ dependencies = [
 name = "squeezy-tools"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "globset",
  "ignore",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

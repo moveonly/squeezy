@@ -5,6 +5,8 @@ use thiserror::Error;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
+pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
+pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
@@ -26,6 +28,8 @@ pub struct AppConfig {
     pub tool_preview_bytes: usize,
     pub max_tool_result_bytes_per_round: usize,
     pub tool_output_retention_days: u64,
+    pub exa_mcp_url: String,
+    pub exa_api_key_env: String,
 }
 
 impl AppConfig {
@@ -37,6 +41,10 @@ impl AppConfig {
         let model = var("SQUEEZY_MODEL").unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
         let base_url =
             var("OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
+        let exa_mcp_url =
+            var("SQUEEZY_EXA_MCP_URL").unwrap_or_else(|| DEFAULT_EXA_MCP_URL.to_string());
+        let exa_api_key_env =
+            var("SQUEEZY_EXA_API_KEY_ENV").unwrap_or_else(|| DEFAULT_EXA_API_KEY_ENV.to_string());
         let store_responses = parse_bool(var("SQUEEZY_STORE_RESPONSES").as_deref());
         let max_parallel_tools = var("SQUEEZY_MAX_PARALLEL_TOOLS")
             .and_then(|value| value.parse::<usize>().ok())
@@ -75,6 +83,8 @@ impl AppConfig {
             tool_preview_bytes,
             max_tool_result_bytes_per_round,
             tool_output_retention_days,
+            exa_mcp_url,
+            exa_api_key_env,
         }
     }
 }
@@ -120,6 +130,7 @@ pub enum PermissionScope {
     Edit,
     Shell,
     IgnoredSearch,
+    Web,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +139,7 @@ pub struct PermissionPolicy {
     pub edit: PermissionMode,
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
+    pub web: PermissionMode,
 }
 
 impl PermissionPolicy {
@@ -140,6 +152,7 @@ impl PermissionPolicy {
                 var("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
                 PermissionMode::Allow,
             ),
+            web: parse_permission(var("SQUEEZY_WEB_PERMISSION"), PermissionMode::Ask),
         }
     }
 
@@ -149,6 +162,7 @@ impl PermissionPolicy {
             PermissionScope::Edit => self.edit,
             PermissionScope::Shell => self.shell,
             PermissionScope::IgnoredSearch => self.ignored_search,
+            PermissionScope::Web => self.web,
         }
     }
 }
@@ -160,6 +174,7 @@ impl Default for PermissionPolicy {
             edit: PermissionMode::Ask,
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
+            web: PermissionMode::Ask,
         }
     }
 }
@@ -270,7 +285,7 @@ pub enum SqueezyError {
 
 pub type Result<T> = std::result::Result<T, SqueezyError>;
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    env,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use futures_util::{StreamExt, stream};
@@ -8,7 +11,9 @@ use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionScope, SqueezyError, TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec};
-use squeezy_tools::{ToolCall, ToolOutputConfig, ToolRegistry, ToolResult, ToolSpec};
+use squeezy_tools::{
+    ToolCall, ToolOutputConfig, ToolRegistry, ToolResult, ToolSpec, WebToolConfig,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -30,12 +35,19 @@ impl Agent {
             preview_bytes: config.tool_preview_bytes,
             retention_days: config.tool_output_retention_days,
         };
-        let tools =
-            ToolRegistry::new_with_output_config(config.workspace_root.clone(), output_config)
-                .unwrap_or_else(|_| {
-                    ToolRegistry::new_with_output_config(".", output_config)
-                        .expect("current directory must be a valid tool root")
-                });
+        let web_config = WebToolConfig {
+            exa_mcp_url: config.exa_mcp_url.clone(),
+            exa_api_key: env::var(&config.exa_api_key_env).ok(),
+        };
+        let tools = ToolRegistry::new_with_configs(
+            config.workspace_root.clone(),
+            output_config,
+            web_config.clone(),
+        )
+        .unwrap_or_else(|_| {
+            ToolRegistry::new_with_configs(".", output_config, web_config)
+                .expect("current directory must be a valid tool root")
+        });
         Self {
             config,
             provider,

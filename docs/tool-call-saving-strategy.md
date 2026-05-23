@@ -28,6 +28,10 @@ model-facing tool output compact enough to be useful.
   combined model-facing output cap, not only per-tool caps.
 - **Permission-gated mutation.** Edit and shell tools route through
   allow/ask/deny policy before execution.
+- **Permission-gated web access.** `websearch` performs current/external
+  discovery through a configurable Exa MCP endpoint, and `webfetch` retrieves
+  specific HTTP(S) URLs with bounded response sizes, text/HTML shaping, content
+  receipts, host-visible approval summaries, and cross-host redirect stops.
 - **Provider tool calls.** The OpenAI Responses provider exposes documented
   function tools and feeds tool outputs back into the model loop.
 
@@ -43,6 +47,12 @@ model-facing tool output compact enough to be useful.
   output budget for one tool round.
 - `SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS` controls cleanup of stored tool-output
   handles.
+- `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
+  and `webfetch`. The default is `ask`.
+- `SQUEEZY_EXA_MCP_URL` controls the MCP endpoint used by `websearch`. The
+  default is `https://mcp.exa.ai/mcp`.
+- `SQUEEZY_EXA_API_KEY_ENV` names the environment variable read for the Exa API
+  key. The default is `EXA_API_KEY`.
 
 ## Later Structural Savings
 
@@ -57,10 +67,13 @@ model-facing tool output compact enough to be useful.
   schemas only when the model actually needs them.
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly
   request shaping should preserve stable prompt prefixes.
+- **Domain-aware web approvals.** Web permissions should eventually support
+  durable per-domain policy decisions instead of only a global web scope.
 
 ## Non-Goals
 
-- Provider-hosted web search.
+- Provider-native LLM web search that bypasses Squeezy's tool policy.
 - Provider-hosted file search.
 - Provider-side code interpreter tools.
 - Provider-native shell tools that bypass Squeezy's local permission policy.
+- A local general-purpose public-web crawler or search index.

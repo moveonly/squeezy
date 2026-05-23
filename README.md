@@ -16,7 +16,8 @@ Every model token is a budgeted resource.
 - **Failure memory** keeps the agent from repeating dead-end searches across compactions.
 - The static system prompt is held stable so provider caches actually hit.
 - Current fallback tools use ignore-aware `grep`, path-only `glob`, compact
-  search modes, spill handles, and aggregate result budgets.
+  search modes, spill handles, aggregate result budgets, and permission-gated
+  `websearch`/`webfetch` for current external evidence.
 - The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
 
 ## Speed

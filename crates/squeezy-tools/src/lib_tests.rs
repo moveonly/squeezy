@@ -1,10 +1,12 @@
 use std::{
+    collections::VecDeque,
     fs,
     path::PathBuf,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -323,6 +325,259 @@ async fn shell_returns_bounded_output_and_exit_code() {
 }
 
 #[test]
+fn websearch_parser_accepts_json_and_sse_mcp_responses() {
+    let payload = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"search results"}]}}"#;
+
+    assert_eq!(
+        parse_mcp_websearch_response(payload),
+        Some("search results".to_string())
+    );
+    assert_eq!(
+        parse_mcp_websearch_response(&format!(
+            "event: message\ndata: {payload}\n\ndata: [DONE]\n\n"
+        )),
+        Some("search results".to_string())
+    );
+}
+
+#[test]
+fn web_tool_config_normalizes_blank_values() {
+    let config = WebToolConfig {
+        exa_mcp_url: "  ".to_string(),
+        exa_api_key: Some("  secret-token  ".to_string()),
+    }
+    .normalized();
+
+    assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
+    assert_eq!(config.exa_api_key.as_deref(), Some("secret-token"));
+}
+
+#[tokio::test]
+async fn websearch_sends_exa_mcp_request_and_returns_text() {
+    let root = temp_workspace("websearch");
+    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"search results"}]}}"#;
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response("application/json", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig {
+            exa_mcp_url: "https://search.example/mcp".to_string(),
+            exa_api_key: Some("secret-token".to_string()),
+        },
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({
+                    "query": "rust async",
+                    "num_results": 3,
+                    "search_type": "fast",
+                    "livecrawl": "preferred",
+                    "context_max_characters": 1200,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["provider"], "exa");
+    assert_eq!(result.content["query"], "rust async");
+    assert_eq!(result.content["result"], "search results");
+    let requests = http.post_requests.lock().expect("post requests");
+    assert_eq!(requests[0].url, "https://search.example/mcp");
+    assert!(
+        requests[0]
+            .headers
+            .contains(&("x-api-key".to_string(), "secret-token".to_string()))
+    );
+    assert_eq!(requests[0].body["params"]["name"], "web_search_exa");
+    assert_eq!(
+        requests[0].body["params"]["arguments"]["query"],
+        "rust async"
+    );
+    assert_eq!(requests[0].body["params"]["arguments"]["numResults"], 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_strips_html_scripts_and_styles() {
+    let root = temp_workspace("webfetch_html");
+    let html = "<html><head><style>.x{}</style><script>alert(1)</script></head><body>Hello <b>world</b> &amp; docs</body></html>";
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/html", html.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/docs", "format": "text"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["format"], "text");
+    assert_eq!(result.content["content"], "Hello world & docs");
+    let requests = http.get_requests.lock().expect("get requests");
+    assert_eq!(*requests, vec!["https://example.com/docs".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_reports_cross_host_redirect_without_following() {
+    let root = temp_workspace("webfetch_redirect");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(redirect_response("https://example.net/next"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["redirect_url"], "https://example.net/next");
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("redirect to another host")
+    );
+    let requests = http.get_requests.lock().expect("get requests");
+    assert_eq!(*requests, vec!["https://example.com/start".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_follows_same_host_redirects() {
+    let root = temp_workspace("webfetch_same_host_redirect");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(redirect_response("/next"));
+    http.push_get_response(ok_response("text/plain", b"redirected body"));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/start"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["url"], "https://example.com/next");
+    assert_eq!(result.content["content"], "redirected body");
+    let requests = http.get_requests.lock().expect("get requests");
+    assert_eq!(
+        *requests,
+        vec![
+            "https://example.com/start".to_string(),
+            "https://example.com/next".to_string()
+        ]
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_rejects_non_http_urls() {
+    let root = temp_workspace("webfetch_scheme");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "file:///tmp/secret"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .expect("error")
+            .contains("http:// or https://")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn large_webfetch_output_spills_to_handle() {
+    let root = temp_workspace("webfetch_spill");
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", "w".repeat(30_000).as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({"url": "https://example.com/large", "output_byte_cap": 40_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    assert!(
+        result.content["handle"]
+            .as_str()
+            .is_some_and(|handle| handle.len() == 64)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn tool_specs_are_sorted_by_name() {
     let root = temp_workspace("tool_specs");
     let registry = ToolRegistry::new(&root).expect("registry");
@@ -341,6 +596,8 @@ fn tool_specs_are_sorted_by_name() {
             "read_file",
             "read_tool_output",
             "shell",
+            "webfetch",
+            "websearch",
             "write_file"
         ]
     );
@@ -365,4 +622,96 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+#[derive(Debug, Clone)]
+struct MockPostRequest {
+    url: String,
+    headers: Vec<(String, String)>,
+    body: Value,
+}
+
+#[derive(Debug, Default)]
+struct MockWebHttpClient {
+    post_requests: Mutex<Vec<MockPostRequest>>,
+    get_requests: Mutex<Vec<String>>,
+    post_responses: Mutex<VecDeque<std::result::Result<WebHttpResponse, String>>>,
+    get_responses: Mutex<VecDeque<std::result::Result<WebHttpResponse, String>>>,
+}
+
+impl MockWebHttpClient {
+    fn push_post_response(&self, response: WebHttpResponse) {
+        self.post_responses
+            .lock()
+            .expect("post responses")
+            .push_back(Ok(response));
+    }
+
+    fn push_get_response(&self, response: WebHttpResponse) {
+        self.get_responses
+            .lock()
+            .expect("get responses")
+            .push_back(Ok(response));
+    }
+}
+
+impl WebHttpClient for MockWebHttpClient {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+        body: Value,
+        _max_response_bytes: usize,
+    ) -> WebHttpFuture<'a> {
+        let result = {
+            self.post_requests
+                .lock()
+                .expect("post requests")
+                .push(MockPostRequest {
+                    url: url.to_string(),
+                    headers,
+                    body,
+                });
+            self.post_responses
+                .lock()
+                .expect("post responses")
+                .pop_front()
+                .unwrap_or_else(|| Err("unexpected websearch request".to_string()))
+        };
+        Box::pin(async move { result })
+    }
+
+    fn get<'a>(&'a self, url: Url, _max_response_bytes: usize) -> WebHttpFuture<'a> {
+        let result = {
+            self.get_requests
+                .lock()
+                .expect("get requests")
+                .push(url.to_string());
+            self.get_responses
+                .lock()
+                .expect("get responses")
+                .pop_front()
+                .unwrap_or_else(|| Err("unexpected webfetch request".to_string()))
+        };
+        Box::pin(async move { result })
+    }
+}
+
+fn ok_response(content_type: &str, body: &[u8]) -> WebHttpResponse {
+    web_response(200, vec![("content-type", content_type)], body)
+}
+
+fn redirect_response(location: &str) -> WebHttpResponse {
+    web_response(302, vec![("location", location)], b"")
+}
+
+fn web_response(status: u16, headers: Vec<(&str, &str)>, body: &[u8]) -> WebHttpResponse {
+    WebHttpResponse {
+        status,
+        headers: headers
+            .into_iter()
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string()))
+            .collect(),
+        body: body.to_vec(),
+    }
 }

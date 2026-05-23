@@ -1,20 +1,28 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     io::Read,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use futures_util::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::Regex;
+use reqwest::{
+    Url,
+    header::{ACCEPT, HeaderMap, HeaderValue},
+    redirect::Policy,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
+    DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
     DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, PermissionScope, Result, SqueezyError,
 };
 use tokio::{process::Command, time};
@@ -29,6 +37,18 @@ const MAX_READ_LIMIT: usize = 128_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
+const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
+const MAX_WEB_SEARCH_RESULTS: usize = 20;
+const DEFAULT_WEB_SEARCH_CONTEXT_CHARS: usize = 10_000;
+const MAX_WEB_SEARCH_CONTEXT_CHARS: usize = 50_000;
+const DEFAULT_WEB_SEARCH_TIMEOUT_MS: u64 = 25_000;
+const DEFAULT_WEB_SEARCH_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_WEB_FETCH_TIMEOUT_MS: u64 = 30_000;
+const MAX_WEB_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
+const MAX_WEB_FETCH_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_WEB_FETCH_OUTPUT_BYTE_CAP: usize = 32_000;
+const MAX_WEB_REDIRECTS: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -94,6 +114,39 @@ impl ToolOutputConfig {
             ),
             preview_bytes: nonzero_or(self.preview_bytes, DEFAULT_TOOL_PREVIEW_BYTES),
             retention_days: nonzero_or_u64(self.retention_days, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebToolConfig {
+    pub exa_mcp_url: String,
+    pub exa_api_key: Option<String>,
+}
+
+impl Default for WebToolConfig {
+    fn default() -> Self {
+        Self {
+            exa_mcp_url: DEFAULT_EXA_MCP_URL.to_string(),
+            exa_api_key: None,
+        }
+    }
+}
+
+impl WebToolConfig {
+    fn normalized(self) -> Self {
+        let exa_mcp_url = self.exa_mcp_url.trim();
+        let exa_mcp_url = if exa_mcp_url.is_empty() {
+            DEFAULT_EXA_MCP_URL.to_string()
+        } else {
+            exa_mcp_url.to_string()
+        };
+        Self {
+            exa_mcp_url,
+            exa_api_key: self.exa_api_key.and_then(|key| {
+                let key = key.trim();
+                (!key.is_empty()).then(|| key.to_string())
+            }),
         }
     }
 }
@@ -166,20 +219,178 @@ impl ToolResult {
     }
 }
 
+type WebHttpFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<WebHttpResponse, String>> + Send + 'a>>;
+
+trait WebHttpClient: Send + Sync + std::fmt::Debug {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+        body: Value,
+        max_response_bytes: usize,
+    ) -> WebHttpFuture<'a>;
+
+    fn get<'a>(&'a self, url: Url, max_response_bytes: usize) -> WebHttpFuture<'a>;
+}
+
+#[derive(Debug, Clone)]
+struct WebHttpResponse {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl WebHttpResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
+
+    fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    fn is_redirection(&self) -> bool {
+        (300..400).contains(&self.status)
+    }
+}
+
+#[derive(Debug)]
+struct ReqwestWebHttpClient {
+    client: reqwest::Client,
+}
+
+impl ReqwestWebHttpClient {
+    fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .map_err(|err| SqueezyError::Tool(format!("failed to create HTTP client: {err}")))?;
+        Ok(Self { client })
+    }
+}
+
+impl WebHttpClient for ReqwestWebHttpClient {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        headers: Vec<(String, String)>,
+        body: Value,
+        max_response_bytes: usize,
+    ) -> WebHttpFuture<'a> {
+        Box::pin(async move {
+            let mut request_headers = HeaderMap::new();
+            for (name, value) in headers {
+                let name = name
+                    .parse::<reqwest::header::HeaderName>()
+                    .map_err(|err| format!("invalid request header name: {err}"))?;
+                let value = HeaderValue::from_str(&value)
+                    .map_err(|err| format!("invalid request header value: {err}"))?;
+                request_headers.insert(name, value);
+            }
+            let response = self
+                .client
+                .post(url)
+                .headers(request_headers)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|err| format!("websearch request failed: {err}"))?;
+            let status = response.status().as_u16();
+            let headers = response_headers(response.headers());
+            let body = read_response_bytes(response, max_response_bytes).await?;
+            Ok(WebHttpResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
+
+    fn get<'a>(&'a self, url: Url, max_response_bytes: usize) -> WebHttpFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(url)
+                .header(
+                    ACCEPT,
+                    "text/plain;q=1.0, text/html;q=0.9, application/json;q=0.8, application/xml;q=0.7, */*;q=0.1",
+                )
+                .header("user-agent", "squeezy/0.1")
+                .send()
+                .await
+                .map_err(|err| format!("webfetch request failed: {err}"))?;
+            let status = response.status().as_u16();
+            let headers = response_headers(response.headers());
+            let body = read_response_bytes(response, max_response_bytes).await?;
+            Ok(WebHttpResponse {
+                status,
+                headers,
+                body,
+            })
+        })
+    }
+}
+
+fn response_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     root: Arc<PathBuf>,
     output_store: Arc<ToolOutputStore>,
+    web_config: Arc<WebToolConfig>,
+    http: Arc<dyn WebHttpClient>,
 }
 
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        Self::new_with_output_config(root, ToolOutputConfig::default())
+        Self::new_with_configs(root, ToolOutputConfig::default(), WebToolConfig::default())
     }
 
     pub fn new_with_output_config(
         root: impl Into<PathBuf>,
         output_config: ToolOutputConfig,
+    ) -> Result<Self> {
+        Self::new_with_configs(root, output_config, WebToolConfig::default())
+    }
+
+    pub fn new_with_configs(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+    ) -> Result<Self> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
+        let output_store = ToolOutputStore::new(&root, output_config)?;
+        let http = Arc::new(ReqwestWebHttpClient::new()?);
+        Ok(Self {
+            root: Arc::new(root),
+            output_store: Arc::new(output_store),
+            web_config: Arc::new(web_config.normalized()),
+            http,
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_http_client(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        http: Arc<dyn WebHttpClient>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
@@ -189,6 +400,8 @@ impl ToolRegistry {
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
+            web_config: Arc::new(web_config.normalized()),
+            http,
         })
     }
 
@@ -200,6 +413,8 @@ impl ToolRegistry {
             read_tool_output_spec(),
             write_file_spec(),
             shell_spec(),
+            webfetch_spec(),
+            websearch_spec(),
         ];
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
@@ -209,6 +424,7 @@ impl ToolRegistry {
         match call.name.as_str() {
             "write_file" => PermissionScope::Edit,
             "shell" => PermissionScope::Shell,
+            "webfetch" | "websearch" => PermissionScope::Web,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "glob" | "grep" | "read_file" | "read_tool_output" => PermissionScope::Read,
@@ -219,7 +435,7 @@ impl ToolRegistry {
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
         matches!(
             call.name.as_str(),
-            "glob" | "grep" | "read_file" | "read_tool_output"
+            "glob" | "grep" | "read_file" | "read_tool_output" | "webfetch" | "websearch"
         )
     }
 
@@ -276,6 +492,19 @@ impl ToolRegistry {
                     .unwrap_or("run shell command");
                 format!("shell {description}")
             }
+            "webfetch" => {
+                let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
+                let host = args
+                    .as_ref()
+                    .and_then(|args| web_url_host(&args.url).ok())
+                    .unwrap_or_else(|| "?".to_string());
+                format!("webfetch host={host:?}")
+            }
+            "websearch" => {
+                let args = serde_json::from_value::<WebSearchArgs>(call.arguments.clone()).ok();
+                let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("?");
+                format!("websearch query={query:?}")
+            }
             _ => format!("{} {}", call.name, call.arguments),
         }
     }
@@ -292,6 +521,8 @@ impl ToolRegistry {
             "read_tool_output" => self.execute_read_tool_output(&call).await,
             "write_file" => self.execute_write_file(&call).await,
             "shell" => self.execute_shell(&call, cancel).await,
+            "webfetch" => self.execute_webfetch(&call, cancel).await,
+            "websearch" => self.execute_websearch(&call, cancel).await,
             _ => make_result(
                 &call,
                 ToolStatus::Error,
@@ -815,6 +1046,247 @@ impl ToolRegistry {
         )
     }
 
+    async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+        let args = match serde_json::from_value::<WebSearchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        if args.query.trim().is_empty() {
+            return tool_error(call, "query must not be empty");
+        }
+
+        let num_results = args
+            .num_results
+            .unwrap_or(DEFAULT_WEB_SEARCH_RESULTS)
+            .clamp(1, MAX_WEB_SEARCH_RESULTS);
+        let context_max_characters = args
+            .context_max_characters
+            .unwrap_or(DEFAULT_WEB_SEARCH_CONTEXT_CHARS)
+            .clamp(1, MAX_WEB_SEARCH_CONTEXT_CHARS);
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_WEB_SEARCH_TIMEOUT_MS)
+            .min(MAX_WEB_TIMEOUT_MS);
+        let search_type = args.search_type.unwrap_or_default();
+        let livecrawl = args.livecrawl.unwrap_or_default();
+
+        let mut request_headers = vec![(
+            "accept".to_string(),
+            "application/json, text/event-stream".to_string(),
+        )];
+        if let Some(api_key) = self.web_config.exa_api_key.as_deref() {
+            request_headers.push(("x-api-key".to_string(), api_key.to_string()));
+        }
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search_exa",
+                "arguments": {
+                    "query": args.query,
+                    "type": search_type.as_str(),
+                    "numResults": num_results,
+                    "livecrawl": livecrawl.as_str(),
+                    "contextMaxCharacters": context_max_characters,
+                },
+            },
+        });
+        let fetch = async {
+            let response = self
+                .http
+                .post_json(
+                    &self.web_config.exa_mcp_url,
+                    request_headers,
+                    body.clone(),
+                    DEFAULT_WEB_SEARCH_MAX_RESPONSE_BYTES,
+                )
+                .await?;
+            if !response.is_success() {
+                return Err(format!(
+                    "websearch provider returned HTTP {}",
+                    response.status
+                ));
+            }
+            let response_text = String::from_utf8_lossy(&response.body).to_string();
+            let result = parse_mcp_websearch_response(&response_text)
+                .ok_or_else(|| "websearch provider returned no text content".to_string())?;
+            Ok::<_, String>((response_text.len(), result))
+        };
+
+        let (bytes_read, result) = match tokio::select! {
+            _ = cancel.cancelled() => return ToolResult::cancelled(call),
+            result = time::timeout(Duration::from_millis(timeout_ms), fetch) => result,
+        } {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => return tool_error(call, err),
+            Err(_) => {
+                return tool_error(call, format!("websearch timed out after {timeout_ms} ms"));
+            }
+        };
+        let cost = ToolCostHint {
+            bytes_read: bytes_read as u64,
+            output_bytes: result.len() as u64,
+            ..ToolCostHint::default()
+        };
+
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "provider": "exa",
+                "query": body["params"]["arguments"]["query"],
+                "result": result,
+                "metadata": {
+                    "num_results": num_results,
+                    "search_type": search_type.as_str(),
+                    "livecrawl": livecrawl.as_str(),
+                    "context_max_characters": context_max_characters,
+                },
+            }),
+            cost,
+            None,
+        )
+    }
+
+    async fn execute_webfetch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+        let args = match serde_json::from_value::<WebFetchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let mut url = match parse_http_url(&args.url) {
+            Ok(url) => url,
+            Err(err) => return tool_error(call, err),
+        };
+        let original_url = url.clone();
+        let format = args.format.unwrap_or_default();
+        let timeout_ms = args
+            .timeout_ms
+            .unwrap_or(DEFAULT_WEB_FETCH_TIMEOUT_MS)
+            .min(MAX_WEB_TIMEOUT_MS);
+        let max_response_bytes = args
+            .max_response_bytes
+            .unwrap_or(DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES)
+            .clamp(1, MAX_WEB_FETCH_MAX_RESPONSE_BYTES);
+        let output_byte_cap = args
+            .output_byte_cap
+            .unwrap_or(DEFAULT_WEB_FETCH_OUTPUT_BYTE_CAP)
+            .min(128_000);
+
+        let fetch = async {
+            for redirect_count in 0..=MAX_WEB_REDIRECTS {
+                let response = self.http.get(url.clone(), max_response_bytes).await?;
+                if response.is_redirection() {
+                    let next = redirect_url(&url, &response)?;
+                    if next.host_str() != original_url.host_str() {
+                        return Ok(WebFetchOutcome::Redirect {
+                            status: response.status,
+                            original_url: original_url.to_string(),
+                            redirect_url: next.to_string(),
+                        });
+                    }
+                    if redirect_count == MAX_WEB_REDIRECTS {
+                        return Err("too many redirects".to_string());
+                    }
+                    url = next;
+                    continue;
+                }
+                if !response.is_success() {
+                    return Err(format!("webfetch returned HTTP status {}", response.status));
+                }
+
+                let content_type = response.header("content-type").unwrap_or("").to_string();
+                if !is_textual_content_type(&content_type) {
+                    return Err(format!(
+                        "unsupported content type: {}",
+                        if content_type.is_empty() {
+                            "unknown"
+                        } else {
+                            content_type.as_str()
+                        }
+                    ));
+                }
+
+                return Ok(WebFetchOutcome::Fetched {
+                    final_url: url.to_string(),
+                    status: response.status,
+                    content_type,
+                    bytes: response.body,
+                });
+            }
+            Err("too many redirects".to_string())
+        };
+
+        let outcome = match tokio::select! {
+            _ = cancel.cancelled() => return ToolResult::cancelled(call),
+            result = time::timeout(Duration::from_millis(timeout_ms), fetch) => result,
+        } {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(err)) => return tool_error(call, err),
+            Err(_) => return tool_error(call, format!("webfetch timed out after {timeout_ms} ms")),
+        };
+
+        match outcome {
+            WebFetchOutcome::Redirect {
+                status,
+                original_url,
+                redirect_url,
+            } => make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "redirect to another host detected; call webfetch again with redirect_url if approved",
+                    "status": status,
+                    "original_url": original_url,
+                    "redirect_url": redirect_url,
+                }),
+                ToolCostHint::default(),
+                None,
+            ),
+            WebFetchOutcome::Fetched {
+                final_url,
+                status,
+                content_type,
+                bytes,
+            } => {
+                let raw_len = bytes.len();
+                let decoded = String::from_utf8_lossy(&bytes);
+                let rendered = match format {
+                    WebFetchFormat::Text if content_type_is_html(&content_type) => {
+                        html_to_text(&decoded)
+                    }
+                    WebFetchFormat::Text => decoded.to_string(),
+                    WebFetchFormat::Html => decoded.to_string(),
+                };
+                let (content, output_truncated) = truncate_to_bytes(&rendered, output_byte_cap);
+                let content_sha256 = sha256_hex(&bytes);
+                let cost = ToolCostHint {
+                    bytes_read: raw_len as u64,
+                    output_bytes: content.len() as u64,
+                    truncated: output_truncated,
+                    ..ToolCostHint::default()
+                };
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({
+                        "url": final_url,
+                        "status": status,
+                        "content_type": content_type,
+                        "format": format.as_str(),
+                        "bytes_read": raw_len,
+                        "sha256": content_sha256,
+                        "truncated": output_truncated,
+                        "content": content,
+                    }),
+                    cost,
+                    Some(content_sha256),
+                )
+            }
+        }
+    }
+
     fn resolve_existing(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_workspace(raw)?;
         let canonical = candidate
@@ -1024,6 +1496,195 @@ fn nonzero_or_u64(value: u64, default: u64) -> u64 {
     if value == 0 { default } else { value }
 }
 
+fn parse_mcp_websearch_response(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.starts_with('{')
+        && let Some(result) = parse_mcp_payload(trimmed)
+    {
+        return Some(result);
+    }
+
+    let mut chunks = Vec::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else {
+            continue;
+        };
+        if let Some(result) = parse_mcp_payload(payload) {
+            chunks.push(result);
+        }
+    }
+    (!chunks.is_empty()).then(|| chunks.join("\n\n"))
+}
+
+fn parse_mcp_payload(payload: &str) -> Option<String> {
+    let trimmed = payload.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(trimmed).ok()?;
+    let texts = value
+        .get("result")?
+        .get("content")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.get("text")?.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    (!texts.is_empty()).then(|| texts.join("\n\n"))
+}
+
+async fn read_response_bytes(
+    response: reqwest::Response,
+    max_response_bytes: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_response_bytes as u64)
+    {
+        return Err(format!(
+            "response too large; content-length exceeds {max_response_bytes} bytes"
+        ));
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("failed to read response body: {err}"))?;
+        if bytes.len().saturating_add(chunk.len()) > max_response_bytes {
+            return Err(format!(
+                "response too large; exceeded {max_response_bytes} bytes"
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn parse_http_url(raw: &str) -> std::result::Result<Url, String> {
+    let url = Url::parse(raw).map_err(|err| format!("invalid URL: {err}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        _ => Err("URL must start with http:// or https://".to_string()),
+    }
+}
+
+fn web_url_host(raw: &str) -> std::result::Result<String, String> {
+    parse_http_url(raw).and_then(|url| {
+        url.host_str()
+            .map(str::to_string)
+            .ok_or_else(|| "URL has no host".to_string())
+    })
+}
+
+fn redirect_url(current: &Url, response: &WebHttpResponse) -> std::result::Result<Url, String> {
+    let location = response
+        .header("location")
+        .ok_or_else(|| "redirect response did not include a location".to_string())?;
+    current
+        .join(location)
+        .map_err(|err| format!("invalid redirect location: {err}"))
+        .and_then(|url| parse_http_url(url.as_str()))
+}
+
+fn is_textual_content_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mime.is_empty()
+        || mime.starts_with("text/")
+        || matches!(
+            mime.as_str(),
+            "application/json"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "image/svg+xml"
+        )
+        || mime.ends_with("+json")
+        || mime.ends_with("+xml")
+}
+
+fn content_type_is_html(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(mime.as_str(), "text/html" | "application/xhtml+xml")
+}
+
+fn html_to_text(html: &str) -> String {
+    let stripped = strip_html_blocks(html);
+    let mut text = String::new();
+    let mut in_tag = false;
+    for char in stripped.chars() {
+        match char {
+            '<' => {
+                in_tag = true;
+                text.push(' ');
+            }
+            '>' => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if !in_tag => text.push(char),
+            _ => {}
+        }
+    }
+    collapse_whitespace(&decode_html_entities(&text))
+}
+
+fn strip_html_blocks(html: &str) -> String {
+    let mut output = html.to_string();
+    for tag in ["script", "style", "noscript", "iframe", "object", "embed"] {
+        output = strip_html_block_tag(&output, tag);
+    }
+    output
+}
+
+fn strip_html_block_tag(input: &str, tag: &str) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    let open = format!("<{tag}");
+    let close = format!("</{tag}>");
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let Some(start) = lower.find(&open) else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start..];
+        let lower_after_start = after_start.to_ascii_lowercase();
+        let Some(end) = lower_after_start.find(&close) else {
+            break;
+        };
+        rest = &after_start[end + close.len()..];
+    }
+    output
+}
+
+fn decode_html_entities(input: &str) -> String {
+    input
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn collapse_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[derive(Debug, Deserialize)]
 struct GlobArgs {
     pattern: String,
@@ -1102,6 +1763,93 @@ struct ShellArgs {
     timeout_ms: Option<u64>,
     output_byte_cap: Option<usize>,
     description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSearchArgs {
+    query: String,
+    num_results: Option<usize>,
+    search_type: Option<WebSearchType>,
+    livecrawl: Option<WebSearchLivecrawl>,
+    context_max_characters: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebSearchType {
+    #[default]
+    Auto,
+    Fast,
+    Deep,
+}
+
+impl WebSearchType {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+            Self::Deep => "deep",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebSearchLivecrawl {
+    #[default]
+    Fallback,
+    Preferred,
+}
+
+impl WebSearchLivecrawl {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Preferred => "preferred",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WebFetchArgs {
+    url: String,
+    format: Option<WebFetchFormat>,
+    timeout_ms: Option<u64>,
+    max_response_bytes: Option<usize>,
+    output_byte_cap: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WebFetchFormat {
+    #[default]
+    Text,
+    Html,
+}
+
+impl WebFetchFormat {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Html => "html",
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WebFetchOutcome {
+    Redirect {
+        status: u16,
+        original_url: String,
+        redirect_url: String,
+    },
+    Fetched {
+        final_url: String,
+        status: u16,
+        content_type: String,
+        bytes: Vec<u8>,
+    },
 }
 
 fn grep_include_ignored(arguments: &Value) -> bool {
@@ -1367,6 +2115,45 @@ fn shell_spec() -> ToolSpec {
                 "description": {"type": "string", "description": "Short reason this command is needed."}
             },
             "required": ["command", "description"]
+        }),
+    }
+}
+
+fn webfetch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "webfetch".to_string(),
+        description: "Fetch a specific HTTP(S) URL with the host/domain shown in the approval summary. Use only for URLs provided by the user, found in local files, or discovered through websearch. Returns bounded text or HTML; redirects to another host are reported for a new approval.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {"type": "string", "description": "Fully-qualified http:// or https:// URL to fetch."},
+                "format": {"type": "string", "enum": ["text", "html"], "description": "Return cleaned text or raw HTML. Default text."},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_WEB_TIMEOUT_MS},
+                "max_response_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_WEB_FETCH_MAX_RESPONSE_BYTES},
+                "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000}
+            },
+            "required": ["url"]
+        }),
+    }
+}
+
+fn websearch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "websearch".to_string(),
+        description: "Search the web for current or external information using Squeezy's permission-gated Exa search backend. Use for discovery; use webfetch when retrieving a specific URL.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "description": "Web search query."},
+                "num_results": {"type": "integer", "minimum": 1, "maximum": MAX_WEB_SEARCH_RESULTS, "description": "Number of results to request. Default 8."},
+                "search_type": {"type": "string", "enum": ["auto", "fast", "deep"], "description": "Search depth. Default auto."},
+                "livecrawl": {"type": "string", "enum": ["fallback", "preferred"], "description": "Live crawl behavior. Default fallback."},
+                "context_max_characters": {"type": "integer", "minimum": 1, "maximum": MAX_WEB_SEARCH_CONTEXT_CHARS},
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_WEB_TIMEOUT_MS}
+            },
+            "required": ["query"]
         }),
     }
 }

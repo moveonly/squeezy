@@ -20,6 +20,8 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert!(!config.store_responses);
     assert_eq!(config.max_parallel_tools, 8);
+    assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
+    assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
     assert_eq!(
         config.max_tool_result_bytes_per_round,
         DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND
@@ -50,6 +52,9 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_SHELL_PERMISSION" => Some("deny".to_string()),
         "SQUEEZY_STORE_RESPONSES" => Some("true".to_string()),
         "SQUEEZY_MAX_PARALLEL_TOOLS" => Some("3".to_string()),
+        "SQUEEZY_WEB_PERMISSION" => Some("allow".to_string()),
+        "SQUEEZY_EXA_MCP_URL" => Some("https://search.example/mcp".to_string()),
+        "SQUEEZY_EXA_API_KEY_ENV" => Some("CUSTOM_EXA_KEY".to_string()),
         "SQUEEZY_TOOL_SPILL_THRESHOLD_BYTES" => Some("1234".to_string()),
         "SQUEEZY_TOOL_PREVIEW_BYTES" => Some("456".to_string()),
         "SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND" => Some("7890".to_string()),
@@ -60,8 +65,11 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.model, "custom-model");
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
     assert_eq!(config.permissions.shell, PermissionMode::Deny);
+    assert_eq!(config.permissions.web, PermissionMode::Allow);
     assert!(config.store_responses);
     assert_eq!(config.max_parallel_tools, 3);
+    assert_eq!(config.exa_mcp_url, "https://search.example/mcp");
+    assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
     assert_eq!(config.tool_spill_threshold_bytes, 1234);
     assert_eq!(config.tool_preview_bytes, 456);
     assert_eq!(config.max_tool_result_bytes_per_round, 7890);
