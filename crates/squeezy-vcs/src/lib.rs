@@ -19,7 +19,7 @@ pub struct GitVcs {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiffMode {
     #[default]
@@ -522,7 +522,7 @@ fn default_branch(git_root: &Path) -> Option<String> {
     {
         return Some(configured);
     }
-    for candidate in ["main", "master", "origin/main", "origin/master"] {
+    for candidate in ["origin/main", "origin/master", "main", "master"] {
         if ref_exists(git_root, candidate) {
             return Some(candidate.to_string());
         }

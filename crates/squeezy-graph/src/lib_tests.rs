@@ -1056,6 +1056,63 @@ impl IntoThing for Local {
     );
 }
 
+#[test]
+fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply() {
+    let source = "pub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\npub fn third() -> usize { 3 }\n";
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let mut dirty = HashMap::new();
+    dirty.insert(
+        FileId::new("src/lib.rs"),
+        DirtyAnnotation {
+            status: "modified".to_string(),
+            ranges: vec![DirtyRange {
+                start_line: 1,
+                end_line: 1,
+            }],
+        },
+    );
+    graph.annotate_dirty_ranges(&dirty);
+
+    let dirty_names = graph
+        .dirty_symbols()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_names, vec!["second".to_string()]);
+    assert!(
+        graph
+            .dirty_symbols()
+            .iter()
+            .all(|symbol| symbol.kind != SymbolKind::File)
+    );
+
+    dirty.clear();
+    dirty.insert(
+        FileId::new("src/lib.rs"),
+        DirtyAnnotation {
+            status: "modified".to_string(),
+            ranges: vec![DirtyRange {
+                start_line: 2,
+                end_line: 2,
+            }],
+        },
+    );
+    graph.annotate_dirty_ranges(&dirty);
+    let dirty_names = graph
+        .dirty_symbols()
+        .into_iter()
+        .map(|symbol| symbol.name)
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_names, vec!["third".to_string()]);
+
+    graph.annotate_dirty_ranges(&HashMap::new());
+    assert!(graph.dirty_symbols().is_empty());
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);

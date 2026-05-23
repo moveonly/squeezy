@@ -3,7 +3,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -11,6 +14,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+
+static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
@@ -1372,11 +1377,15 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
-    let nonce = SystemTime::now()
+    let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
+    let counter = WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!(
+        "squeezy_{name}_{pid}_{base}_{counter}",
+        pid = std::process::id()
+    ));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
 }

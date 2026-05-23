@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use futures_util::StreamExt;
@@ -41,6 +41,7 @@ const DEFAULT_READ_LIMIT: usize = 32_000;
 const MAX_READ_LIMIT: usize = 128_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
+const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
 const MAX_WEB_SEARCH_RESULTS: usize = 20;
@@ -54,6 +55,7 @@ const DEFAULT_WEB_FETCH_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_WEB_FETCH_MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_WEB_FETCH_OUTPUT_BYTE_CAP: usize = 32_000;
 const MAX_WEB_REDIRECTS: usize = 5;
+const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -359,6 +361,25 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
+}
+
+#[derive(Debug, Default)]
+struct DiffSnapshotCache {
+    entries: HashMap<DiffSnapshotKey, CachedDiffSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct DiffSnapshotKey {
+    mode: DiffMode,
+    include_patch: bool,
+    max_patch_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CachedDiffSnapshot {
+    snapshot: Arc<DiffSnapshot>,
+    fetched_at: Instant,
 }
 
 impl ToolRegistry {
@@ -393,6 +414,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
         })
     }
 
@@ -417,7 +439,39 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
         })
+    }
+
+    fn diff_snapshot(&self, mode: DiffMode, options: DiffOptions) -> DiffSnapshot {
+        let key = DiffSnapshotKey {
+            mode,
+            include_patch: options.include_patch,
+            max_patch_bytes: options.max_patch_bytes,
+        };
+        if let Ok(cache) = self.diff_cache.lock()
+            && let Some(entry) = cache.entries.get(&key)
+            && entry.fetched_at.elapsed() < DIFF_SNAPSHOT_TTL
+        {
+            return (*entry.snapshot).clone();
+        }
+        let snapshot = self.vcs.snapshot(mode, options);
+        if let Ok(mut cache) = self.diff_cache.lock() {
+            cache.entries.insert(
+                key,
+                CachedDiffSnapshot {
+                    snapshot: Arc::new(snapshot.clone()),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        snapshot
+    }
+
+    fn invalidate_diff_cache(&self) {
+        if let Ok(mut cache) = self.diff_cache.lock() {
+            cache.entries.clear();
+        }
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
@@ -605,8 +659,28 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        let registry = self.clone();
+        let call = call.clone();
+        tokio::task::spawn_blocking(move || registry.execute_diff_context_blocking(&call, args))
+            .await
+            .unwrap_or_else(|err| {
+                make_result(
+                    &ToolCall {
+                        call_id: String::new(),
+                        name: "diff_context".to_string(),
+                        arguments: Value::Null,
+                    },
+                    ToolStatus::Error,
+                    json!({ "error": format!("diff_context join failed: {err}") }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            })
+    }
+
+    fn execute_diff_context_blocking(&self, call: &ToolCall, args: DiffContextArgs) -> ToolResult {
         let max_patch_bytes = args.max_patch_bytes.unwrap_or(1_000_000).min(5_000_000);
-        let snapshot = self.vcs.snapshot(
+        let snapshot = self.diff_snapshot(
             args.mode.unwrap_or_default(),
             DiffOptions {
                 include_patch: args.include_patch.unwrap_or(false),
@@ -652,9 +726,32 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        let snapshot = self
-            .vcs
-            .snapshot(DiffMode::Worktree, DiffOptions::default());
+        let registry = self.clone();
+        let call = call.clone();
+        tokio::task::spawn_blocking(move || registry.execute_symbol_context_blocking(&call, args))
+            .await
+            .unwrap_or_else(|err| {
+                make_result(
+                    &ToolCall {
+                        call_id: String::new(),
+                        name: "symbol_context".to_string(),
+                        arguments: Value::Null,
+                    },
+                    ToolStatus::Error,
+                    json!({ "error": format!("symbol_context join failed: {err}") }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            })
+    }
+
+    fn execute_symbol_context_blocking(
+        &self,
+        call: &ToolCall,
+        args: SymbolContextArgs,
+    ) -> ToolResult {
+        let mode = args.mode.unwrap_or_default();
+        let snapshot = self.diff_snapshot(mode, DiffOptions::default());
         let dirty_paths = diff_path_set(&snapshot);
         let max_references = args.max_references.unwrap_or(12).min(50);
         let mut graph = match self.graph.lock() {
@@ -686,6 +783,8 @@ impl ToolRegistry {
         let _ = manager.refresh_before_query();
         annotate_graph(manager, &snapshot);
         let graph = manager.graph();
+        let path_filter = args.path.as_deref();
+        let diff_only = args.diff_only.unwrap_or(false);
         let mut symbols = graph
             .signature_search(&SignatureQuery {
                 text: args.query.clone(),
@@ -694,23 +793,17 @@ impl ToolRegistry {
                 attribute: None,
             })
             .into_iter()
+            .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
             .filter(|symbol| {
-                args.path
-                    .as_deref()
-                    .map(|path| symbol.file_id.0 == path || symbol.file_id.0.ends_with(path))
-                    .unwrap_or(true)
-            })
-            .filter(|symbol| {
-                !args.diff_only.unwrap_or(false)
-                    || symbol.dirty.is_some()
-                    || dirty_paths.contains(&symbol.file_id.0)
+                !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
             })
             .take(25)
             .collect::<Vec<_>>();
-        if symbols.is_empty() && args.diff_only.unwrap_or(false) {
+        if symbols.is_empty() && diff_only {
             symbols = graph
                 .dirty_symbols()
                 .into_iter()
+                .filter(|symbol| symbol_matches_path_filter(symbol, path_filter))
                 .filter(|symbol| {
                     symbol.name.contains(&args.query) || symbol.signature.contains(&args.query)
                 })
@@ -726,7 +819,8 @@ impl ToolRegistry {
             ToolStatus::Success,
             json!({
                 "query": args.query,
-                "diff_only": args.diff_only.unwrap_or(false),
+                "mode": diff_mode_str(mode),
+                "diff_only": diff_only,
                 "symbols": content,
                 "graph_available": true,
             }),
@@ -765,6 +859,7 @@ impl ToolRegistry {
         let files = by_file
             .into_iter()
             .map(|(path, symbols)| {
+                let total = symbols.len();
                 let symbols = symbols
                     .iter()
                     .take(max_symbols_per_file)
@@ -773,7 +868,7 @@ impl ToolRegistry {
                 json!({
                     "path": path,
                     "symbols": symbols,
-                    "truncated": symbols.len() >= max_symbols_per_file,
+                    "truncated": total > max_symbols_per_file,
                 })
             })
             .collect::<Vec<_>>();
@@ -806,11 +901,7 @@ impl ToolRegistry {
         let include_ignored = args.include_ignored.unwrap_or(false);
         let diff_only = args.diff_only.unwrap_or(false);
         let diff_paths = if diff_only {
-            diff_path_set(
-                &self
-                    .vcs
-                    .snapshot(DiffMode::Worktree, DiffOptions::default()),
-            )
+            diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()))
         } else {
             BTreeSet::new()
         };
@@ -921,11 +1012,7 @@ impl ToolRegistry {
         let include_ignored = args.include_ignored.unwrap_or(false);
         let diff_only = args.diff_only.unwrap_or(false);
         let diff_paths = if diff_only {
-            diff_path_set(
-                &self
-                    .vcs
-                    .snapshot(DiffMode::Worktree, DiffOptions::default()),
-            )
+            diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()))
         } else {
             BTreeSet::new()
         };
@@ -1114,11 +1201,8 @@ impl ToolRegistry {
         };
         let rel = self.relative(&path);
         if args.diff_only.unwrap_or(false) {
-            let diff_paths = diff_path_set(
-                &self
-                    .vcs
-                    .snapshot(DiffMode::Worktree, DiffOptions::default()),
-            );
+            let diff_paths =
+                diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
             if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
                 return make_result(
                     call,
@@ -1223,9 +1307,7 @@ impl ToolRegistry {
         };
         let scope = args.scope.unwrap_or_default();
         let level = args.level.unwrap_or_default();
-        let snapshot = self
-            .vcs
-            .snapshot(DiffMode::Worktree, DiffOptions::default());
+        let snapshot = self.diff_snapshot(DiffMode::Worktree, DiffOptions::default());
         let changed_paths = snapshot
             .files
             .iter()
@@ -1275,20 +1357,26 @@ impl ToolRegistry {
             arguments: json!({
                 "command": command,
                 "description": "run verification scoped by current diff",
-                "timeout_ms": MAX_SHELL_TIMEOUT_MS,
+                "timeout_ms": VERIFY_SHELL_TIMEOUT_MS,
                 "output_byte_cap": DEFAULT_SHELL_OUTPUT_BYTE_CAP,
             }),
         };
-        let mut result = self.execute_shell(&shell_call, cancel).await;
-        result.tool_name = call.name.clone();
-        let mut content = result.content;
+        let shell_result = self
+            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS)
+            .await;
+        let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
             object.insert("scope".to_string(), json!(verify_scope_str(scope)));
             object.insert("level".to_string(), json!(verify_level_str(level)));
             object.insert("changed_files".to_string(), json!(changed_paths));
         }
-        result.content = content;
-        result
+        make_result(
+            call,
+            shell_result.status,
+            content,
+            shell_result.cost_hint,
+            None,
+        )
     }
 
     async fn execute_write_file(&self, call: &ToolCall) -> ToolResult {
@@ -1335,6 +1423,7 @@ impl ToolRegistry {
         if let Err(err) = fs::write(&path, args.content.as_bytes()) {
             return tool_error(call, err);
         }
+        self.invalidate_diff_cache();
 
         let after_sha256 = sha256_hex(args.content.as_bytes());
         let cost = ToolCostHint {
@@ -1358,6 +1447,16 @@ impl ToolRegistry {
     }
 
     async fn execute_shell(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS)
+            .await
+    }
+
+    async fn execute_shell_capped(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        max_timeout_ms: u64,
+    ) -> ToolResult {
         let args = match serde_json::from_value::<ShellArgs>(call.arguments.clone()) {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
@@ -1369,7 +1468,7 @@ impl ToolRegistry {
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
-            .min(MAX_SHELL_TIMEOUT_MS);
+            .min(max_timeout_ms);
         let output_cap = args
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
@@ -1440,6 +1539,7 @@ impl ToolRegistry {
             ToolStatus::Error
         };
         let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
+        self.invalidate_diff_cache();
 
         make_result(
             call,
@@ -2175,6 +2275,7 @@ struct SymbolContextArgs {
     query: String,
     path: Option<String>,
     diff_only: Option<bool>,
+    mode: Option<DiffMode>,
     max_references: Option<usize>,
 }
 
@@ -2334,6 +2435,14 @@ fn diff_path_set(snapshot: &DiffSnapshot) -> BTreeSet<String> {
         .iter()
         .map(|file| file.path.clone())
         .collect()
+}
+
+fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let path = symbol.file_id.0.as_str();
+    path == filter || path.ends_with(&format!("/{filter}"))
 }
 
 fn diff_file_json(file: &DiffFile) -> Value {
