@@ -11,11 +11,97 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use squeezy_core::SkillsConfig;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[test]
+fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
+    let root = temp_workspace("permission_metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let destructive = registry.permission_request(&ToolCall {
+        call_id: "rm".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "rm -rf target",
+            "description": "clean"
+        }),
+    });
+    assert_eq!(destructive.capability, PermissionCapability::Destructive);
+    assert_eq!(destructive.risk, PermissionRisk::Critical);
+    assert_eq!(destructive.target, "rm:*");
+
+    let compiler = registry.permission_request(&ToolCall {
+        call_id: "test".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "cargo test --workspace",
+            "description": "run tests"
+        }),
+    });
+    assert_eq!(compiler.capability, PermissionCapability::Compiler);
+    assert_eq!(compiler.target, "cargo test:*");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_file_permission_request_target_matches_suggested_rule_target() {
+    let root = temp_workspace("permission_write_target");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}",
+            "expected_sha256": "deadbeef"
+        }),
+    });
+    assert_eq!(request.capability, PermissionCapability::Edit);
+    assert_eq!(request.target, "path:src/foo.rs");
+    assert_eq!(request.risk, PermissionRisk::High);
+    let suggested = request
+        .suggested_rules
+        .first()
+        .expect("write_file should propose a session rule");
+    assert_eq!(
+        suggested.target, request.target,
+        "suggested rule target must match the request target so future calls match the persisted rule",
+    );
+    assert_eq!(suggested.capability, "edit");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn webfetch_and_websearch_requests_carry_expected_targets() {
+    let root = temp_workspace("permission_web_targets");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let webfetch = registry.permission_request(&ToolCall {
+        call_id: "fetch".to_string(),
+        name: "webfetch".to_string(),
+        arguments: json!({"url": "https://docs.rs/foo"}),
+    });
+    assert_eq!(webfetch.capability, PermissionCapability::Network);
+    assert_eq!(webfetch.target, "domain:docs.rs");
+
+    let websearch = registry.permission_request(&ToolCall {
+        call_id: "search".to_string(),
+        name: "websearch".to_string(),
+        arguments: json!({"query": "rust async runtime"}),
+    });
+    assert_eq!(websearch.capability, PermissionCapability::Network);
+    assert_eq!(websearch.target, "search:exa");
+
+    let _ = fs::remove_dir_all(root);
+}
 
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
@@ -96,6 +182,100 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
         .collect::<Vec<_>>();
     paths.sort();
     assert_eq!(paths, vec!["ignored.rs", "visible.rs"]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
+    let root = temp_workspace("tool_indexing_policy");
+    fs::create_dir_all(root.join("node_modules/pkg")).expect("mkdir node_modules");
+    fs::write(root.join("visible.rs"), "needle\n").expect("write visible");
+    fs::write(root.join("node_modules/pkg/index.ts"), "needle\n").expect("write ignored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let grep_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(match_paths(&grep_default), vec!["visible.rs"]);
+
+    let grep_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let mut paths = match_paths(&grep_including_ignored);
+    paths.sort();
+    assert_eq!(paths, vec!["node_modules/pkg/index.ts", "visible.rs"]);
+
+    let glob_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_3".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(glob_default.content["paths"], json!([]));
+
+    let glob_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_4".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        glob_including_ignored.content["paths"],
+        json!(["node_modules/pkg/index.ts"])
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_reports_policy_ignored_reason_and_permission_scope() {
+    let root = temp_workspace("read_ignored_policy");
+    fs::create_dir_all(root.join("vendor/lib")).expect("mkdir vendor");
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() {}\n",
+    )
+    .expect("write vendored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let call = ToolCall {
+        call_id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "vendor/lib/generated.rs"}),
+    };
+
+    assert_eq!(
+        registry.permission_scope(&call),
+        PermissionScope::IgnoredSearch
+    );
+    let result = registry.execute(call, CancellationToken::new()).await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["ignored"], true);
+    assert_eq!(result.content["ignored_reason"], "vendor");
+    assert_eq!(result.content["path"], "vendor/lib/generated.rs");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -462,6 +642,7 @@ async fn output_spill_uses_registry_config() {
             spill_threshold_bytes: 100,
             preview_bytes: 17,
             retention_days: 1,
+            output_dir: None,
         },
     )
     .expect("registry");
@@ -487,6 +668,88 @@ async fn output_spill_uses_registry_config() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn relative_output_dir_resolves_against_workspace_root() {
+    let root = temp_workspace("output_dir_rel");
+    fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 8,
+            retention_days: 1,
+            output_dir: Some(PathBuf::from("cache/spill")),
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_rel".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": 500}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let canonical_root = root.canonicalize().expect("canonical root");
+    let expected_dir = canonical_root.join("cache").join("spill");
+    assert!(
+        expected_dir.is_dir(),
+        "spill dir {expected_dir:?} should exist under the workspace root",
+    );
+    let handle = result.content["handle"].as_str().expect("handle");
+    assert!(expected_dir.join(format!("{handle}.json")).is_file());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn absolute_output_dir_overrides_workspace_root() {
+    let root = temp_workspace("output_dir_abs");
+    let absolute_dir = std::env::temp_dir().join(format!(
+        "squeezy_output_abs_{}_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos(),
+        WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst),
+    ));
+    fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 8,
+            retention_days: 1,
+            output_dir: Some(absolute_dir.clone()),
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_abs".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": 500}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let handle = result.content["handle"].as_str().expect("handle");
+    assert!(absolute_dir.join(format!("{handle}.json")).is_file());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&absolute_dir);
 }
 
 #[tokio::test]
@@ -1353,6 +1616,8 @@ fn tool_specs_are_sorted_by_name() {
             "diff_context",
             "glob",
             "grep",
+            "list_skills",
+            "load_skill",
             "read_file",
             "read_tool_output",
             "shell",
@@ -1362,6 +1627,58 @@ fn tool_specs_are_sorted_by_name() {
             "websearch",
             "write_file"
         ]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn skill_tools_list_metadata_and_load_body() {
+    let root = temp_workspace("skill_tools");
+    write_skill(&root.join(".agents/skills/rust-nav"), "rust-nav");
+    let registry = ToolRegistry::new_with_configs_and_skills(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+        },
+        &GraphConfig::default(),
+    )
+    .expect("registry");
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "list_skills".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    assert_eq!(list.content["skills"][0]["name"], "rust-nav");
+    assert!(list.content.to_string().contains("Rust navigation"));
+    assert!(!list.content.to_string().contains("Use graph tools"));
+
+    let loaded = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "load_skill".to_string(),
+                arguments: json!({"name": "rust-nav"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(loaded.status, ToolStatus::Success);
+    assert_eq!(loaded.content["name"], "rust-nav");
+    assert!(
+        loaded.content["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Use graph tools"))
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1420,6 +1737,17 @@ fn run_git(root: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn write_skill(dir: &Path, name: &str) {
+    fs::create_dir_all(dir).expect("mkdir skill");
+    fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Rust navigation\ntriggers:\n  - rust symbol\n---\n# Rust Nav\n\nUse graph tools.\n"
+        ),
+    )
+    .expect("write skill");
 }
 
 #[derive(Debug, Clone)]

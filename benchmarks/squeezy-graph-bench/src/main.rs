@@ -7,11 +7,11 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
 use squeezy_graph::{BodySearchQuery, GraphManager, RefreshConfig, SemanticGraph, SignatureQuery};
-use squeezy_parse::{BodyHitKind, RustParser};
+use squeezy_parse::{BodyHitKind, LanguageParser, ParsedFile};
 use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
 
 #[derive(Debug, Deserialize)]
@@ -52,12 +52,16 @@ struct BenchmarkReport {
     squeezy_build_ms: u128,
     squeezy_query_ms: u128,
     squeezy_total_ms: u128,
+    build_phases: BuildPhaseReport,
     faster_than_rustc_check: bool,
     faster_than_validation: bool,
     graph: GraphReport,
     accuracy: AccuracyReport,
     python_oracle: Option<PythonOracleReport>,
     csharp_oracle: Option<CsharpOracleReport>,
+    go_oracle: Option<GoOracleReport>,
+    refresh_probe: Option<RefreshProbeReport>,
+    heuristic_iterations: Vec<HeuristicIterationReport>,
     queries: Vec<QueryReport>,
     mixed_workload: Option<MixedWorkloadReport>,
 }
@@ -70,6 +74,18 @@ struct GraphReport {
     body_hits: usize,
     references: usize,
     calls: usize,
+    body_hit_trigram_indexed: bool,
+    body_hit_trigram_terms: usize,
+    reference_index_terms: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct BuildPhaseReport {
+    crawl_ms: u128,
+    parse_ms: u128,
+    declaration_graph_ms: u128,
+    full_graph_ms: u128,
+    total_ms: u128,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,6 +123,7 @@ struct MixedWorkloadReport {
 
 #[derive(Debug, Serialize)]
 struct RefreshProbeReport {
+    language: String,
     copied_source_files: usize,
     edited_files: usize,
     refresh_ms: u128,
@@ -164,6 +181,31 @@ struct CsharpOracleReport {
     oracle_unparseable_examples: Vec<String>,
     symbols: AccuracySetReport,
     limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct GoOracleReport {
+    oracle_ms: u128,
+    status: String,
+    oracle_unparseable_files: usize,
+    oracle_unparseable_examples: Vec<String>,
+    symbols: AccuracySetReport,
+    limitations: Vec<String>,
+}
+
+/// Per-iteration heuristic notes for the Go benchmark.
+///
+/// Each entry documents a heuristic decision (accepted, rejected, or targeted
+/// next) and the reason. FP/FN deltas are intentionally not stored here: they
+/// would need historical snapshots to be meaningful, and a single benchmark
+/// run only knows the current state. The current state is already reported in
+/// `go_oracle.symbols`; consumers that need before/after numbers should diff
+/// JSON reports across runs.
+#[derive(Debug, Clone, Serialize)]
+struct HeuristicIterationReport {
+    name: String,
+    status: String,
+    notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -273,16 +315,18 @@ fn main() -> Result<()> {
         BenchmarkLanguage::CSharp => time_dotnet_build(&args.fixture)?,
         BenchmarkLanguage::Rust => time_cargo_check(&args.fixture)?,
         BenchmarkLanguage::Python => time_python_ast_oracle(&args.fixture)?,
+        BenchmarkLanguage::Go => time_go_ast_oracle(&args.fixture)?,
     };
     let validation_status = match args.language {
         BenchmarkLanguage::CSharp => "dotnet build".to_string(),
         BenchmarkLanguage::Rust => "cargo check".to_string(),
         BenchmarkLanguage::Python => "CPython ast oracle".to_string(),
+        BenchmarkLanguage::Go => "Go parser/type oracle".to_string(),
     };
 
-    let build_started = Instant::now();
-    let graph = build_graph(&args.fixture)?;
-    let squeezy_build_ms = build_started.elapsed().as_millis();
+    let build = build_graph(&args.fixture)?;
+    let graph = build.graph;
+    let squeezy_build_ms = build.phases.total_ms;
 
     let query_started = Instant::now();
     let query_reports = spec
@@ -296,20 +340,26 @@ fn main() -> Result<()> {
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
         BenchmarkLanguage::CSharp => empty_accuracy("rust-analyzer oracle not used for C#"),
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
+        BenchmarkLanguage::Go => empty_accuracy("rust-analyzer oracle not used for Go"),
     };
     let python_oracle = match args.language {
         BenchmarkLanguage::CSharp => None,
         BenchmarkLanguage::Rust => None,
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
+        BenchmarkLanguage::Go => None,
+    };
+    let go_oracle = match args.language {
+        BenchmarkLanguage::Go => Some(collect_go_oracle_accuracy(&args.fixture, &graph)?),
+        BenchmarkLanguage::CSharp | BenchmarkLanguage::Rust | BenchmarkLanguage::Python => None,
     };
     let csharp_oracle = match args.language {
         BenchmarkLanguage::CSharp => Some(collect_csharp_oracle_accuracy(&args.fixture, &graph)?),
-        BenchmarkLanguage::Rust | BenchmarkLanguage::Python => None,
+        BenchmarkLanguage::Go | BenchmarkLanguage::Rust | BenchmarkLanguage::Python => None,
     };
 
     let mixed_workload = if matches!(
         args.language,
-        BenchmarkLanguage::Rust | BenchmarkLanguage::CSharp
+        BenchmarkLanguage::Rust | BenchmarkLanguage::CSharp | BenchmarkLanguage::Go
     ) {
         args.mixed_repo
             .as_ref()
@@ -327,6 +377,8 @@ fn main() -> Result<()> {
     };
 
     let stats = graph.stats();
+    let refresh_probe = Some(run_refresh_probe(&args.fixture, args.language)?);
+    let heuristic_iterations = heuristic_iteration_reports(args.language, &go_oracle);
     let report = BenchmarkReport {
         language: args.language.as_str().to_string(),
         fixture: args.fixture.display().to_string(),
@@ -337,6 +389,7 @@ fn main() -> Result<()> {
         squeezy_build_ms,
         squeezy_query_ms,
         squeezy_total_ms,
+        build_phases: build.phases,
         faster_than_rustc_check: squeezy_total_ms < validation_ms,
         faster_than_validation: squeezy_total_ms < validation_ms,
         graph: GraphReport {
@@ -346,10 +399,16 @@ fn main() -> Result<()> {
             body_hits: stats.body_hits,
             references: stats.references,
             calls: stats.calls,
+            body_hit_trigram_indexed: stats.body_hit_trigram_indexed,
+            body_hit_trigram_terms: stats.body_hit_trigram_terms,
+            reference_index_terms: stats.reference_index_terms,
         },
         accuracy,
         python_oracle,
         csharp_oracle,
+        go_oracle,
+        refresh_probe,
+        heuristic_iterations,
         queries: query_reports,
         mixed_workload,
     };
@@ -359,11 +418,55 @@ fn main() -> Result<()> {
     enforce_gates(&report, args.no_speed_gate)
 }
 
-fn build_graph(root: &Path) -> Result<SemanticGraph> {
+struct GraphBuildOutput {
+    graph: SemanticGraph,
+    phases: BuildPhaseReport,
+}
+
+fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
+    let total_started = Instant::now();
+    let crawl_started = Instant::now();
     let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
-    let mut parser = RustParser::new()?;
+    let crawl_ms = crawl_started.elapsed().as_millis();
+
+    let parse_started = Instant::now();
+    let mut parser = LanguageParser::new()?;
     let (parsed, _) = parser.parse_records(&snapshot.files)?;
-    Ok(SemanticGraph::from_parsed(parsed))
+    let parse_ms = parse_started.elapsed().as_millis();
+
+    let declaration_started = Instant::now();
+    let declaration_graph = SemanticGraph::from_parsed(declaration_only_parsed(&parsed));
+    let declaration_graph_ms = declaration_started.elapsed().as_millis();
+    drop(declaration_graph);
+
+    let full_graph_started = Instant::now();
+    let graph = SemanticGraph::from_parsed(parsed);
+    let full_graph_ms = full_graph_started.elapsed().as_millis();
+
+    Ok(GraphBuildOutput {
+        graph,
+        phases: BuildPhaseReport {
+            crawl_ms,
+            parse_ms,
+            declaration_graph_ms,
+            full_graph_ms,
+            total_ms: total_started.elapsed().as_millis(),
+        },
+    })
+}
+
+fn declaration_only_parsed(parsed: &[ParsedFile]) -> Vec<ParsedFile> {
+    parsed
+        .iter()
+        .cloned()
+        .map(|mut file| {
+            file.imports.clear();
+            file.calls.clear();
+            file.references.clear();
+            file.body_hits.clear();
+            file
+        })
+        .collect()
 }
 
 fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
@@ -485,23 +588,29 @@ fn run_mixed_workload(
 ) -> Result<MixedWorkloadReport> {
     let (compiler_check_ms, compiler_check_status) = match language {
         BenchmarkLanguage::CSharp => time_dotnet_build_optional(repo),
+        BenchmarkLanguage::Go => (None, "compiler validation not used".to_string()),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Python => (None, "compiler validation not used".to_string()),
     };
     let (rust_analyzer_ms, rust_analyzer_status) = match language {
         BenchmarkLanguage::Rust => time_rust_analyzer(repo),
         BenchmarkLanguage::CSharp => (None, "rust-analyzer oracle not used for C#".to_string()),
+        BenchmarkLanguage::Go => (None, "rust-analyzer oracle not used for Go".to_string()),
         BenchmarkLanguage::Python => (None, "rust-analyzer oracle not used for Python".to_string()),
     };
 
-    let build_started = Instant::now();
-    let graph = build_graph(repo)?;
-    let squeezy_build_ms = build_started.elapsed().as_millis();
+    let build = build_graph(repo)?;
+    let graph = build.graph;
+    let squeezy_build_ms = build.phases.total_ms;
     let accuracy = match language {
         BenchmarkLanguage::Rust => collect_accuracy(repo, &graph, ra_lsp_probes),
         BenchmarkLanguage::CSharp => match collect_csharp_oracle_accuracy(repo, &graph) {
             Ok(report) => csharp_oracle_to_accuracy(&report),
             Err(err) => empty_accuracy(&format!("C# semantic oracle failed: {err}")),
+        },
+        BenchmarkLanguage::Go => match collect_go_oracle_accuracy(repo, &graph) {
+            Ok(report) => go_oracle_to_accuracy(&report),
+            Err(err) => empty_accuracy(&format!("Go semantic oracle failed: {err}")),
         },
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
     };
@@ -640,6 +749,106 @@ fn collect_python_oracle_accuracy(
     })
 }
 
+fn collect_go_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<GoOracleReport> {
+    let started = Instant::now();
+    let oracle = collect_go_ast_symbol_scan(root)?;
+    let oracle_ms = started.elapsed().as_millis();
+    let unparseable_files = oracle
+        .unparseable_files
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let oracle_unparseable_examples = unparseable_files
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
+    let oracle_unparseable_files = unparseable_files.len();
+
+    Ok(GoOracleReport {
+        oracle_ms,
+        status: if oracle_unparseable_files == 0 {
+            "Go AST oracle succeeded".to_string()
+        } else {
+            format!(
+                "Go AST oracle succeeded with {oracle_unparseable_files} unparseable files excluded from symbol FP accounting"
+            )
+        },
+        oracle_unparseable_files,
+        oracle_unparseable_examples,
+        symbols,
+        limitations: vec![
+            "The Go oracle uses the Go parser/AST for declaration discovery and does not execute package code.".to_string(),
+            "Symbol comparison is file/name/kind based; receiver dispatch, interface satisfaction, build tags, generated files, and external modules remain heuristic or excluded.".to_string(),
+            "Heuristic changes should be accepted by FP/FN deltas on smoke plus external corpora, with rejected broad matches documented in the report.".to_string(),
+        ],
+    })
+}
+
+fn heuristic_iteration_reports(
+    language: BenchmarkLanguage,
+    go_oracle: &Option<GoOracleReport>,
+) -> Vec<HeuristicIterationReport> {
+    if language != BenchmarkLanguage::Go {
+        return Vec::new();
+    }
+    if go_oracle.is_none() {
+        return Vec::new();
+    }
+    vec![
+        HeuristicIterationReport {
+            name: "baseline-tree-sitter".to_string(),
+            status: "accepted".to_string(),
+            notes: vec![
+                "Package/import/declaration extraction is the baseline for Go heuristic comparisons.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "top-level-declaration-scope".to_string(),
+            status: "accepted".to_string(),
+            notes: vec![
+                "Function-local var/const/type declarations, blank identifiers, and declarations inside top-level function literals are excluded from top-level symbol accuracy.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "go-alias-and-declaration-lists".to_string(),
+            status: "accepted".to_string(),
+            notes: vec![
+                "Grouped var/const specs and tree-sitter-go type_alias nodes are expanded so multi-name declarations and aliases count as symbols.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "go-test-method-normalization".to_string(),
+            status: "accepted".to_string(),
+            notes: vec![
+                "Suite-style _test.go methods with Test/Benchmark/Fuzz names are normalized to test functions for oracle comparison.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "go-external-package-examples".to_string(),
+            status: "targeted-next".to_string(),
+            notes: vec![
+                "Remaining etcd FNs are concentrated in external-package example test files; keep them visible instead of broad lexical matching.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "go-lazy-reference-materialization".to_string(),
+            status: "targeted-next".to_string(),
+            notes: vec![
+                "Prometheus and etcd are slower than the declaration-only Go oracle because cold build materializes references, body hits, calls, and edges eagerly.".to_string(),
+            ],
+        },
+        HeuristicIterationReport {
+            name: "broad-lexical-reference-binding".to_string(),
+            status: "rejected-default".to_string(),
+            notes: vec![
+                "Broad same-name binding is not enabled by default; Go navigation favors exact package/import/receiver evidence before recall-only expansion.".to_string(),
+            ],
+        },
+    ]
+}
+
 fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     collect_squeezy_symbol_scan_excluding_files(graph, &BTreeSet::new())
 }
@@ -686,6 +895,28 @@ struct PythonAstOracleOutput {
 struct PythonAstSymbolScan {
     symbols: SymbolScan,
     unparseable_files: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoAstOracleOutput {
+    #[serde(default, deserialize_with = "null_default")]
+    rows: Vec<[String; 3]>,
+    #[serde(default, deserialize_with = "null_default")]
+    unparseable_files: Vec<String>,
+}
+
+#[derive(Debug)]
+struct GoAstSymbolScan {
+    symbols: SymbolScan,
+    unparseable_files: Vec<String>,
+}
+
+fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSymbolScan> {
@@ -777,6 +1008,25 @@ fn csharp_oracle_to_accuracy(report: &CsharpOracleReport) -> AccuracyReport {
             references: ReferenceAccuracyReport::default(),
             limitations: vec![
                 "C# accuracy currently compares symbol declarations against Roslyn; LSP-style go-to-definition probes are not exercised yet.".to_string(),
+            ],
+        },
+        limitations: report.limitations.clone(),
+    }
+}
+
+fn go_oracle_to_accuracy(report: &GoOracleReport) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: Some(report.oracle_ms),
+        rust_analyzer_symbol_status: report.status.clone(),
+        symbols: report.symbols.clone(),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "Go LSP navigation oracle not used".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "Go accuracy currently compares symbol declarations against the Go parser/type oracle; LSP-style go-to-definition probes are not exercised yet.".to_string(),
             ],
         },
         limitations: report.limitations.clone(),
@@ -930,6 +1180,139 @@ for path in sorted(root.rglob("*.py")):
     Visitor(rel).visit(tree)
 
 print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
+"#;
+
+fn collect_go_ast_symbol_scan(root: &Path) -> Result<GoAstSymbolScan> {
+    // The oracle Go program is written to a dedicated sub-directory of the
+    // system temp directory and the whole sub-directory is removed when this
+    // function returns. Tracking the sub-directory explicitly (instead of
+    // relying on `script_path.parent()`) keeps the cleanup scoped even if a
+    // future change ever co-locates additional files with the script.
+    let oracle_dir = temp_dir("squeezy-go-oracle")?;
+    let script_path = oracle_dir.join("oracle.go");
+    let result = run_go_ast_oracle(&script_path, root);
+    let _ = fs::remove_dir_all(&oracle_dir);
+    result
+}
+
+fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAstSymbolScan> {
+    fs::write(script_path, GO_AST_ORACLE)?;
+    let output = Command::new("go")
+        .arg("run")
+        .arg(script_path)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("failed to run Go AST oracle: {err}")))?;
+    if !output.status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Go AST oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let output: GoAstOracleOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid Go AST oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for [file, kind, name] in output.rows {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file,
+                kind,
+                name: normalize_symbol_name(&name),
+            },
+        );
+    }
+    Ok(GoAstSymbolScan {
+        symbols: scan,
+        unparseable_files: output.unparseable_files,
+    })
+}
+
+const GO_AST_ORACLE: &str = r#"
+package main
+
+import (
+	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+type Output struct {
+	Rows             [][3]string `json:"rows"`
+	UnparseableFiles []string    `json:"unparseable_files"`
+}
+
+func main() {
+	root, _ := filepath.Abs(os.Args[1])
+	out := Output{}
+	filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			if entry != nil && entry.IsDir() && (entry.Name() == "vendor" || strings.HasPrefix(entry.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		rel, _ := filepath.Rel(root, path)
+		rel = filepath.ToSlash(rel)
+		fset := token.NewFileSet()
+		file, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		if err != nil {
+			out.UnparseableFiles = append(out.UnparseableFiles, rel)
+			return nil
+		}
+		for _, decl := range file.Decls {
+			switch decl := decl.(type) {
+			case *ast.FuncDecl:
+				kind := "Function"
+				if decl.Recv != nil {
+					kind = "Method"
+				}
+				if strings.HasSuffix(rel, "_test.go") && (strings.HasPrefix(decl.Name.Name, "Test") || strings.HasPrefix(decl.Name.Name, "Benchmark") || strings.HasPrefix(decl.Name.Name, "Fuzz")) {
+					kind = "Function"
+				}
+				out.Rows = append(out.Rows, [3]string{rel, kind, decl.Name.Name})
+			case *ast.GenDecl:
+				for _, spec := range decl.Specs {
+					switch spec := spec.(type) {
+					case *ast.TypeSpec:
+						kind := "TypeAlias"
+						switch spec.Type.(type) {
+						case *ast.StructType:
+							kind = "Struct"
+						case *ast.InterfaceType:
+							kind = "Interface"
+						}
+						out.Rows = append(out.Rows, [3]string{rel, kind, spec.Name.Name})
+					case *ast.ValueSpec:
+						kind := "Static"
+						if decl.Tok == token.CONST {
+							kind = "Const"
+						}
+						for _, name := range spec.Names {
+							if name.Name != "_" {
+								out.Rows = append(out.Rows, [3]string{rel, kind, name.Name})
+							}
+						}
+					}
+				}
+			}
+		}
+		return nil
+	})
+	sort.Slice(out.Rows, func(i, j int) bool {
+		return strings.Join(out.Rows[i][:], "\x00") < strings.Join(out.Rows[j][:], "\x00")
+	})
+	_ = json.NewEncoder(os.Stdout).Encode(out)
+}
 "#;
 
 fn collect_rust_analyzer_symbol_scan(graph: &SemanticGraph) -> (SymbolScan, String) {
@@ -1097,6 +1480,7 @@ fn normalize_rust_analyzer_kind(kind: &str) -> Option<String> {
 fn normalize_squeezy_kind(kind: SymbolKind) -> Option<String> {
     match kind {
         SymbolKind::Class => Some("Class".to_string()),
+        SymbolKind::Interface => Some("Interface".to_string()),
         SymbolKind::Module => Some("Module".to_string()),
         SymbolKind::Struct => Some("Struct".to_string()),
         SymbolKind::Enum => Some("Enum".to_string()),
@@ -1178,6 +1562,7 @@ fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> Accu
     AccuracySetReport {
         compared_kinds: vec![
             "Class".to_string(),
+            "Interface".to_string(),
             "Module".to_string(),
             "Struct".to_string(),
             "Enum".to_string(),
@@ -1903,7 +2288,7 @@ fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<Refresh
     for record in source_snapshot
         .files
         .iter()
-        .filter(|record| language.matches_record(record.language))
+        .filter(|record| record.language == language.language_kind())
         .take(250)
     {
         let dest = temp_root.join(&record.relative_path);
@@ -1926,7 +2311,7 @@ fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<Refresh
     let edits = copied.iter().take(2).cloned().collect::<Vec<_>>();
     for path in &edits {
         let mut text = fs::read_to_string(path)?;
-        text.push_str("\n// squeezy refresh benchmark edit\n");
+        text.push_str(language.comment_text());
         fs::write(path, text)?;
         manager.record_changed_path(path.clone());
     }
@@ -1937,6 +2322,7 @@ fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<Refresh
     fs::remove_dir_all(&temp_root)?;
 
     Ok(RefreshProbeReport {
+        language: language.as_str().to_string(),
         copied_source_files: copied.len(),
         edited_files: edits.len(),
         refresh_ms,
@@ -1966,6 +2352,7 @@ fn parse_symbol_kind(value: &str) -> Result<SymbolKind> {
         "Class" => Ok(SymbolKind::Class),
         "Crate" => Ok(SymbolKind::Crate),
         "File" => Ok(SymbolKind::File),
+        "Interface" => Ok(SymbolKind::Interface),
         "Module" => Ok(SymbolKind::Module),
         "Struct" => Ok(SymbolKind::Struct),
         "Enum" => Ok(SymbolKind::Enum),
@@ -2097,6 +2484,12 @@ fn time_dotnet_build_optional(repo: &Path) -> (Option<u128>, String) {
         Ok(ms) => (Some(ms), "dotnet build succeeded".to_string()),
         Err(err) => (None, format!("dotnet build failed: {err}")),
     }
+}
+
+fn time_go_ast_oracle(fixture: &Path) -> Result<u128> {
+    let started = Instant::now();
+    let _ = collect_go_ast_symbol_scan(fixture)?;
+    Ok(started.elapsed().as_millis())
 }
 
 fn time_cargo_check_optional(repo: &Path) -> (Option<u128>, String) {
@@ -2574,6 +2967,20 @@ fn print_summary(report: &BenchmarkReport) {
         report.validation_status, report.validation_ms
     );
     println!("squeezy_total_ms: {}", report.squeezy_total_ms);
+    println!(
+        "build_phases: crawl={}ms parse={}ms declaration_graph={}ms full_graph={}ms total={}ms",
+        report.build_phases.crawl_ms,
+        report.build_phases.parse_ms,
+        report.build_phases.declaration_graph_ms,
+        report.build_phases.full_graph_ms,
+        report.build_phases.total_ms
+    );
+    println!(
+        "graph_indexes: body_hit_trigram_indexed={} body_hit_trigram_terms={} reference_index_terms={}",
+        report.graph.body_hit_trigram_indexed,
+        report.graph.body_hit_trigram_terms,
+        report.graph.reference_index_terms
+    );
     println!("faster_than_validation: {}", report.faster_than_validation);
     print_accuracy_summary("fixture", &report.accuracy);
     print_navigation_summary("fixture", &report.accuracy.navigation);
@@ -2607,6 +3014,37 @@ fn print_summary(report: &BenchmarkReport) {
                 .map(|ms| format!("{ms}ms"))
                 .unwrap_or_else(|| "cached".to_string()),
             csharp.oracle_unparseable_files,
+        );
+    }
+    if let Some(go) = &report.go_oracle {
+        println!(
+            "go_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms oracle_unparseable={}",
+            go.symbols.true_positive,
+            go.symbols.false_positive,
+            go.symbols.false_negative,
+            go.symbols.precision,
+            go.symbols.recall,
+            go.symbols.rust_analyzer_total,
+            go.symbols.squeezy_total,
+            go.oracle_ms,
+            go.oracle_unparseable_files
+        );
+    }
+    if let Some(refresh) = &report.refresh_probe {
+        println!(
+            "refresh_probe: language={} copied={} edited={} reparsed={} refresh_ms={} budget_exhausted={}",
+            refresh.language,
+            refresh.copied_source_files,
+            refresh.edited_files,
+            refresh.reparsed_files,
+            refresh.refresh_ms,
+            refresh.budget_exhausted
+        );
+    }
+    for iteration in &report.heuristic_iterations {
+        println!(
+            "heuristic_iteration: {} status={}",
+            iteration.name, iteration.status
         );
     }
     for query in &report.queries {
@@ -2714,6 +3152,25 @@ fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Result<()> {
         )));
     }
 
+    if let Some(refresh) = &report.refresh_probe
+        && refresh.reparsed_files != refresh.edited_files
+    {
+        return Err(SqueezyError::Graph(format!(
+            "refresh probe reparsed {} files after {} edits",
+            refresh.reparsed_files, refresh.edited_files
+        )));
+    }
+
+    if !no_speed_gate
+        && let Some(go) = &report.go_oracle
+        && (go.symbols.false_positive != 0 || go.symbols.false_negative != 0)
+    {
+        return Err(SqueezyError::Graph(format!(
+            "Go oracle accuracy regressed: fp={} fn={}",
+            go.symbols.false_positive, go.symbols.false_negative
+        )));
+    }
+
     if let Some(mixed) = &report.mixed_workload
         && mixed.refresh_probe.reparsed_files != mixed.refresh_probe.edited_files
     {
@@ -2770,6 +3227,7 @@ impl DeterministicRng {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkLanguage {
     CSharp,
+    Go,
     Python,
     Rust,
 }
@@ -2778,6 +3236,7 @@ impl BenchmarkLanguage {
     fn parse(value: &str) -> Result<Self> {
         match value {
             "csharp" | "cs" => Ok(Self::CSharp),
+            "go" => Ok(Self::Go),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
             other => Err(SqueezyError::Graph(format!(
@@ -2789,16 +3248,28 @@ impl BenchmarkLanguage {
     fn as_str(self) -> &'static str {
         match self {
             Self::CSharp => "csharp",
+            Self::Go => "go",
             Self::Python => "python",
             Self::Rust => "rust",
         }
     }
 
-    fn matches_record(self, language: LanguageKind) -> bool {
+    fn language_kind(self) -> LanguageKind {
         match self {
-            Self::CSharp => language == LanguageKind::CSharp,
-            Self::Python => language == LanguageKind::Python,
-            Self::Rust => language == LanguageKind::Rust,
+            Self::CSharp => LanguageKind::CSharp,
+            Self::Go => LanguageKind::Go,
+            Self::Python => LanguageKind::Python,
+            Self::Rust => LanguageKind::Rust,
+        }
+    }
+
+    fn comment_text(self) -> &'static str {
+        match self {
+            // C# uses C-style comments like Go/Rust; a `//` line stays valid
+            // both at file scope (alongside `using` directives or file-scoped
+            // namespaces) and inside any member body.
+            Self::CSharp | Self::Go | Self::Rust => "\n// squeezy refresh benchmark edit\n",
+            Self::Python => "\n# squeezy refresh benchmark edit\n",
         }
     }
 }
@@ -2856,7 +3327,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--language rust|python|csharp] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--language rust|python|csharp|go] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }

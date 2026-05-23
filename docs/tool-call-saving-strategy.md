@@ -32,8 +32,23 @@ model-facing tool output compact enough to be useful.
   the aggregate result budget are not remembered as seen.
 - **Aggregate result budgets.** A round with many parallel tools enforces a
   combined model-facing output cap, not only per-tool caps.
-- **Permission-gated mutation.** Edit and shell tools route through
-  allow/ask/deny policy before execution.
+- **Unified permission engine.** Every tool call is converted into a structured
+  permission request with capability, target, risk, metadata, and suggested
+  persistence rules before execution. Compatibility `allow`/`ask`/`deny`
+  defaults still work, and ordered `[[permissions.rules]]` entries can target
+  command prefixes, domains, paths, or tool families. Session approvals from
+  the TUI are layered on top of file rules and take effect immediately for
+  later tool calls in the same process, so an "Allow user/project rule" choice
+  does not require restarting the agent to be honored. Every verdict is logged
+  via the `squeezy::permissions` tracing target with capability, target, risk,
+  action, matched-rule source, and reason fields.
+- **Destructive safety net.** Allow rules on the `destructive` capability are
+  refused both at config load time and at approval-persistence time, so an
+  approved "Allow project rule" for `rm -rf node_modules` cannot quietly turn
+  into blanket permission for `rm:*` later.
+- **Permission-gated mutation.** Edit, shell, compiler/verify, git, network,
+  and destructive tool capabilities route through the same policy engine before
+  execution.
 - **Permission-gated web access.** `websearch` performs current/external
   discovery through a configurable Exa MCP endpoint, and `webfetch` retrieves
   specific HTTP(S) URLs with bounded response sizes, text/HTML shaping, content
@@ -67,6 +82,13 @@ model-facing tool output compact enough to be useful.
   cap.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
+- `SQUEEZY_SHELL_PERMISSION_CLASSIFIER` controls the narrow LLM fallback for
+  ambiguous shell commands. Disabled by default to keep the per-turn token
+  budget predictable: every ambiguous shell call would otherwise cost one
+  extra round-trip with the agent model. Deterministic command analysis runs
+  first; the classifier can require approval or deny, but it does not silently
+  allow a command, and unparseable classifier output now keeps the verdict at
+  `ask` instead of being heuristically guessed.
 - `SQUEEZY_EXA_MCP_URL` controls the MCP endpoint used by `websearch`. The
   default is `https://mcp.exa.ai/mcp`.
 - `SQUEEZY_EXA_API_KEY_ENV` names the environment variable read for the Exa API
@@ -87,8 +109,9 @@ model-facing tool output compact enough to be useful.
   schemas only when the model actually needs them.
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly
   request shaping should preserve stable prompt prefixes.
-- **Domain-aware web approvals.** Web permissions should eventually support
-  durable per-domain policy decisions instead of only a global web scope.
+- **Approval persistence.** TUI prompts can allow once, allow a user/project
+  rule, deny once, or persist a denial rule. Web approvals can persist
+  per-domain rules, and shell approvals can persist command-prefix rules.
 
 ## Non-Goals
 

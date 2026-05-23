@@ -9,12 +9,13 @@ use squeezy_core::{
     SymbolId, SymbolKind,
 };
 use squeezy_parse::{
-    BodyHit, BodyHitKind, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
-    ParsedSymbol, ReferenceKind, RustParser, edge_kind_for_call,
+    BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
+    ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
-use squeezy_workspace::{CrawlOptions, FileRecord, WorkspaceCrawler};
+use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 pub const CRATE_NAME: &str = "squeezy-graph";
+const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -139,12 +140,16 @@ pub struct GraphStats {
     pub body_hits: usize,
     pub references: usize,
     pub calls: usize,
+    pub body_hit_trigram_indexed: bool,
+    pub body_hit_trigram_terms: usize,
+    pub reference_index_terms: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct SemanticGraph {
     pub files: HashMap<FileId, FileRecord>,
     pub symbols: HashMap<SymbolId, GraphSymbol>,
+    packages: HashMap<FileId, String>,
     edges: Vec<GraphEdge>,
     imports: Vec<ParsedImport>,
     calls: Vec<ParsedCall>,
@@ -155,6 +160,7 @@ pub struct SemanticGraph {
     signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
     body_hit_text_lower: Vec<String>,
     body_hit_trigram_index: HashMap<[u8; 3], Vec<usize>>,
+    body_hit_trigram_indexed: bool,
     references_by_text: HashMap<String, Vec<usize>>,
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
@@ -166,6 +172,7 @@ impl SemanticGraph {
         Self {
             files: HashMap::new(),
             symbols: HashMap::new(),
+            packages: HashMap::new(),
             edges: Vec::new(),
             imports: Vec::new(),
             calls: Vec::new(),
@@ -176,6 +183,7 @@ impl SemanticGraph {
             signature_trigram_index: HashMap::new(),
             body_hit_text_lower: Vec::new(),
             body_hit_trigram_index: HashMap::new(),
+            body_hit_trigram_indexed: true,
             references_by_text: HashMap::new(),
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
@@ -214,6 +222,7 @@ impl SemanticGraph {
 
     fn remove_file_data(&mut self, file_id: &FileId) {
         self.files.remove(file_id);
+        self.packages.remove(file_id);
         self.symbols.retain(|_, symbol| &symbol.file_id != file_id);
         self.imports.retain(|import| &import.file_id != file_id);
         self.calls.retain(|call| &call.file_id != file_id);
@@ -238,6 +247,9 @@ impl SemanticGraph {
             body_hits: self.body_hits.len(),
             references: self.references.len(),
             calls: self.calls.len(),
+            body_hit_trigram_indexed: self.body_hit_trigram_indexed,
+            body_hit_trigram_terms: self.body_hit_trigram_index.len(),
+            reference_index_terms: self.references_by_text.len(),
         }
     }
 
@@ -486,6 +498,9 @@ impl SemanticGraph {
 
     fn insert_parsed_file(&mut self, file: ParsedFile) {
         self.files.insert(file.file.id.clone(), file.file.clone());
+        if let Some(package) = &file.package {
+            self.packages.insert(file.file.id.clone(), package.clone());
+        }
         if file.unsupported.is_some() {
             return;
         }
@@ -608,8 +623,7 @@ impl SemanticGraph {
             let candidates = self.symbols_by_name_or_scan(&last_path_segment(&reference.text));
             let (to, confidence) = match candidates.as_slice() {
                 [only] => (Some(only.clone()), Confidence::Heuristic),
-                [] => (None, Confidence::External),
-                _ => (None, Confidence::CandidateSet),
+                _ => continue,
             };
             self.edges.push(GraphEdge {
                 from,
@@ -699,6 +713,9 @@ impl SemanticGraph {
             if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
                 return (Some(id), Confidence::ImportResolved, "imported module");
             }
+            if let Some(id) = self.go_package_qualified_call(&candidates, caller_id, call) {
+                return (Some(id), Confidence::ImportResolved, "go package import");
+            }
             return match candidates.as_slice() {
                 [] => (None, Confidence::External, "method external"),
                 _ => (None, Confidence::CandidateSet, "method candidate set"),
@@ -774,7 +791,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver) {
+        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
             return None;
         }
         let type_name = last_path_segment(receiver);
@@ -814,7 +831,7 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver) {
+        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
@@ -979,7 +996,10 @@ impl SemanticGraph {
                     .filter(|symbol| {
                         matches!(
                             symbol.kind,
-                            SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                            SymbolKind::Class
+                                | SymbolKind::Function
+                                | SymbolKind::Method
+                                | SymbolKind::Test
                         ) && self.import_matches_symbol(import, symbol)
                     })
                     .map(|symbol| symbol.id.clone())
@@ -1011,7 +1031,10 @@ impl SemanticGraph {
                 .filter(|symbol| {
                     matches!(
                         symbol.kind,
-                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                        SymbolKind::Class
+                            | SymbolKind::Function
+                            | SymbolKind::Method
+                            | SymbolKind::Test
                     )
                 })
                 .map(|symbol| symbol.id.clone()),
@@ -1044,8 +1067,13 @@ impl SemanticGraph {
         let Some(file) = self.files.get(&symbol.file_id) else {
             return true;
         };
-        if file.language != squeezy_core::LanguageKind::Python {
+        if file.language != squeezy_core::LanguageKind::Python
+            && file.language != squeezy_core::LanguageKind::Go
+        {
             return true;
+        }
+        if file.language == squeezy_core::LanguageKind::Go {
+            return self.go_import_matches_symbol(import, symbol);
         }
         let import_segments = python_path_segments(&import.path);
         if import_segments.len() <= 1 {
@@ -1054,6 +1082,24 @@ impl SemanticGraph {
         let import_module = &import_segments[..import_segments.len() - 1];
         let symbol_module = python_module_path_for_file(&file.relative_path);
         path_segments_suffix_match(import_module, &symbol_module)
+    }
+
+    fn go_import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        let Some(file) = self.files.get(&symbol.file_id) else {
+            return true;
+        };
+        let import_leaf = import
+            .alias
+            .as_deref()
+            .filter(|alias| *alias != "_")
+            .map(str::to_string)
+            .unwrap_or_else(|| last_path_segment(&import.path));
+        let symbol_package = self
+            .packages
+            .get(&symbol.file_id)
+            .cloned()
+            .unwrap_or_else(|| go_package_name_from_path(&file.relative_path));
+        import_leaf == symbol_package || last_path_segment(&import.path) == symbol_package
     }
 
     fn import_visible_from_symbol(&self, import: &ParsedImport, caller: &GraphSymbol) -> bool {
@@ -1161,6 +1207,48 @@ impl SemanticGraph {
                             receiver_paths.iter().any(|path| path == &module_path)
                         })
                         .unwrap_or(false)
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
+    fn go_package_qualified_call(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let receiver = call.receiver.as_deref()?;
+        if receiver.contains('.') || receiver.contains('/') {
+            return None;
+        }
+        let caller = self.symbols.get(caller_id)?;
+        let imports = self
+            .imports
+            .iter()
+            .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| {
+                import
+                    .alias
+                    .as_deref()
+                    .filter(|alias| *alias != "_")
+                    .map(|alias| alias == receiver)
+                    .unwrap_or_else(|| last_path_segment(&import.path) == receiver)
+            })
+            .collect::<Vec<_>>();
+        if imports.is_empty() {
+            return None;
+        }
+        single_symbol(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Test))
+                .filter(|symbol| is_free_function_like(symbol))
+                .filter(|symbol| {
+                    imports
+                        .iter()
+                        .any(|import| self.go_import_matches_symbol(import, symbol))
                 })
                 .map(|symbol| symbol.id.clone()),
         )
@@ -1365,12 +1453,18 @@ impl SemanticGraph {
         let parent = self.symbols.get(&impl_id)?;
         if !matches!(
             parent.kind,
-            // Records / structs / classes / interfaces / impl blocks all
-            // declare instance methods that resolve to siblings via
-            // `this`/`self`/`Self`. Keeping `Impl` and `Trait` here covers
-            // Rust; adding `Struct` covers C# records and C# structs whose
-            // siblings need to be reachable for `this.Foo()` resolution.
-            SymbolKind::Class | SymbolKind::Impl | SymbolKind::Trait | SymbolKind::Struct
+            // Containers that declare instance methods reachable via
+            // `this`/`self`/`Self`: Rust's impl/trait blocks and Class
+            // for Python-style classes, plus C# class/record/struct and
+            // C#/Go interfaces. `Struct` covers C# records and C# structs
+            // whose siblings need to be reachable for `this.Foo()`
+            // resolution; `Interface` covers C# interface methods and Go
+            // interface declarations.
+            SymbolKind::Class
+                | SymbolKind::Impl
+                | SymbolKind::Interface
+                | SymbolKind::Struct
+                | SymbolKind::Trait
         ) {
             return None;
         }
@@ -1467,7 +1561,7 @@ impl SemanticGraph {
         {
             return None;
         }
-        if path_starts_with_external_root(&reference.text)
+        if path_starts_with_external_root(&reference.text, self.reference_language(reference))
             || self.reference_has_external_scope_prefix(reference)
         {
             return None;
@@ -1590,6 +1684,13 @@ impl SemanticGraph {
         }
     }
 
+    fn reference_language(&self, reference: &ParsedReference) -> LanguageKind {
+        self.files
+            .get(&reference.file_id)
+            .map(|file| file.language)
+            .unwrap_or(LanguageKind::Unknown)
+    }
+
     fn reference_is_in_symbol_package(
         &self,
         symbol: &GraphSymbol,
@@ -1606,6 +1707,14 @@ impl SemanticGraph {
             (LanguageKind::Python, LanguageKind::Python)
         ) {
             return true;
+        }
+        if matches!(
+            (symbol_file.language, reference_file.language),
+            (LanguageKind::Go, LanguageKind::Go)
+        ) {
+            return self.packages.get(&symbol.file_id) == self.packages.get(&reference.file_id)
+                && package_key(&symbol_file.relative_path)
+                    == package_key(&reference_file.relative_path);
         }
         package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path)
     }
@@ -1666,7 +1775,8 @@ impl SemanticGraph {
             .iter()
             .filter(|import| import.file_id == reference.file_id)
             .any(|import| {
-                if path_starts_with_external_root(&import.path) {
+                if path_starts_with_external_root(&import.path, self.reference_language(reference))
+                {
                     return false;
                 }
                 let alias_or_name = import
@@ -1706,7 +1816,7 @@ impl SemanticGraph {
         if !self.reference_qualifier_matches_symbol(symbol, reference) {
             return false;
         }
-        if path_starts_with_external_root(&reference.text) {
+        if path_starts_with_external_root(&reference.text, self.reference_language(reference)) {
             return false;
         }
         self.symbol_is_in_reference_scope(symbol, reference)
@@ -1762,7 +1872,9 @@ impl SemanticGraph {
         if reference_path.pop().as_deref() != Some(symbol.name.as_str()) {
             return false;
         }
-        if reference_path.is_empty() || path_starts_with_external_root(&reference.text) {
+        if reference_path.is_empty()
+            || path_starts_with_external_root(&reference.text, self.reference_language(reference))
+        {
             return false;
         }
         if reference_path.first().map(String::as_str) == Some("crate") {
@@ -2089,7 +2201,8 @@ impl SemanticGraph {
             .rev()
             .collect::<String>();
         let scope = scope.trim_end_matches("::");
-        !scope.is_empty() && path_starts_with_external_root(scope)
+        !scope.is_empty()
+            && path_starts_with_external_root(scope, self.reference_language(reference))
     }
 
     fn reference_has_uppercase_scope_prefix(&self, reference: &ParsedReference) -> bool {
@@ -2255,12 +2368,15 @@ impl SemanticGraph {
             .iter()
             .map(|hit| hit.text.to_lowercase())
             .collect();
-        for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
-            for trigram in unique_trigrams(lower) {
-                self.body_hit_trigram_index
-                    .entry(trigram)
-                    .or_default()
-                    .push(index);
+        self.body_hit_trigram_indexed = self.body_hits.len() <= BODY_HIT_TRIGRAM_INDEX_MAX_HITS;
+        if self.body_hit_trigram_indexed {
+            for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
+                for trigram in unique_trigrams(lower) {
+                    self.body_hit_trigram_index
+                        .entry(trigram)
+                        .or_default()
+                        .push(index);
+                }
             }
         }
 
@@ -2319,6 +2435,15 @@ impl SemanticGraph {
     }
 
     fn body_hit_candidates(&self, needle: &str) -> Vec<&BodyHit> {
+        if !self.body_hit_trigram_indexed {
+            return self
+                .body_hits
+                .iter()
+                .zip(self.body_hit_text_lower.iter())
+                .filter(|(_, lower)| lower.contains(needle))
+                .map(|(hit, _)| hit)
+                .collect();
+        }
         match rarest_indexed_trigram(needle, &self.body_hit_trigram_index) {
             CandidateSet::All => self
                 .body_hits
@@ -2409,6 +2534,10 @@ pub struct GraphBuildReport {
     pub files_seen: usize,
     pub parsed_files: usize,
     pub unsupported_files: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
@@ -2422,6 +2551,10 @@ pub struct RefreshReport {
     pub reparsed_files: usize,
     pub duration_ms: u128,
     pub files_seen: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub bytes_reparsed: u64,
     pub language: LanguageReport,
@@ -2433,6 +2566,7 @@ pub struct RefreshReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
     pub csharp_files: usize,
+    pub go_files: usize,
     pub python_files: usize,
     pub rust_files: usize,
     pub supported_files: usize,
@@ -2443,7 +2577,7 @@ pub struct LanguageReport {
 pub struct GraphManager {
     root: PathBuf,
     crawler: WorkspaceCrawler,
-    parser: RustParser,
+    parser: LanguageParser,
     graph: SemanticGraph,
     config: RefreshConfig,
     last_refresh: Instant,
@@ -2457,11 +2591,19 @@ impl GraphManager {
     }
 
     pub fn open_with_config(root: impl AsRef<Path>, config: RefreshConfig) -> Result<Self> {
+        Self::open_with_crawl_options(root, config, CrawlOptions::default())
+    }
+
+    pub fn open_with_crawl_options(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+    ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
-        let crawler = WorkspaceCrawler::new(CrawlOptions::default());
+        let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
-        let mut parser = RustParser::new()?;
+        let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let (parsed, parse_summary) = parser.parse_records(&snapshot.files)?;
@@ -2471,6 +2613,10 @@ impl GraphManager {
             files_seen: snapshot.files.len(),
             parsed_files: parse_summary.parsed_files,
             unsupported_files: parse_summary.unsupported_files,
+            excluded_files: snapshot.coverage.skipped_files,
+            excluded_dirs: snapshot.coverage.skipped_dirs,
+            excluded_bytes: snapshot.coverage.skipped_bytes,
+            coverage: snapshot.coverage.clone(),
             bytes_seen,
             language,
             stats: graph.stats(),
@@ -2518,6 +2664,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: 0,
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2539,6 +2689,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: started.elapsed().as_millis(),
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2550,6 +2704,7 @@ impl GraphManager {
 
         let snapshot = self.crawler.crawl(&self.root)?;
         let files_seen = snapshot.files.len();
+        let coverage = snapshot.coverage.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let current = snapshot
@@ -2612,6 +2767,10 @@ impl GraphManager {
             reparsed_files,
             duration_ms: started.elapsed().as_millis(),
             files_seen,
+            excluded_files: coverage.skipped_files,
+            excluded_dirs: coverage.skipped_dirs,
+            excluded_bytes: coverage.skipped_bytes,
+            coverage,
             bytes_seen,
             bytes_reparsed,
             language,
@@ -2632,6 +2791,10 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
             }
             LanguageKind::Python => {
                 report.python_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Go => {
+                report.go_files += 1;
                 report.supported_files += 1;
             }
             LanguageKind::Rust => {
@@ -2683,6 +2846,9 @@ fn last_path_segment(path: &str) -> String {
         .rsplit("::")
         .next()
         .unwrap_or(path)
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
         .rsplit('.')
         .next()
         .unwrap_or(path);
@@ -2706,6 +2872,7 @@ fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSym
     }
     match symbol.kind {
         SymbolKind::Class
+        | SymbolKind::Interface
         | SymbolKind::Struct
         | SymbolKind::Enum
         | SymbolKind::Union
@@ -2738,6 +2905,7 @@ fn is_type_like_symbol(kind: SymbolKind) -> bool {
     matches!(
         kind,
         SymbolKind::Struct
+            | SymbolKind::Interface
             | SymbolKind::Enum
             | SymbolKind::Union
             | SymbolKind::Trait
@@ -2792,16 +2960,44 @@ fn constructor_reference_can_bind_symbol(
         .unwrap_or(false)
 }
 
-fn path_starts_with_external_root(path: &str) -> bool {
-    path.split("::")
-        .next()
-        .map(str::trim)
-        .map(|root| matches!(root, "std" | "core" | "alloc" | "proc_macro"))
-        .unwrap_or(false)
+fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
+    let first_segment = match language {
+        LanguageKind::Rust => path.split("::").next().unwrap_or(path).trim(),
+        LanguageKind::Go | LanguageKind::CSharp => path
+            .split([':', '.', '/'])
+            .find(|segment| !segment.trim().is_empty())
+            .unwrap_or(path)
+            .trim(),
+        LanguageKind::Python | LanguageKind::Unknown | LanguageKind::Unsupported => return false,
+    };
+    let externals: &[&str] = match language {
+        LanguageKind::Rust => &["std", "core", "alloc", "proc_macro"],
+        LanguageKind::Go => &[
+            "fmt", "context", "errors", "io", "net", "os", "strings", "sync", "time",
+        ],
+        LanguageKind::CSharp => &[
+            // Top-level BCL / NuGet roots whose members live outside the
+            // workspace graph; binding heuristics should treat them as
+            // external rather than searching for matching local symbols.
+            "System",
+            "Microsoft",
+            "Windows",
+            "Azure",
+            "Newtonsoft",
+            "Xunit",
+            "NUnit",
+            "MsTest",
+            "FluentAssertions",
+        ],
+        _ => &[],
+    };
+    externals.contains(&first_segment)
 }
 
 fn path_segments(path: &str) -> Vec<String> {
     path.split("::")
+        .flat_map(|segment| segment.split('/'))
+        .flat_map(|segment| segment.split('.'))
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
@@ -2812,6 +3008,14 @@ fn path_segments(path: &str) -> Vec<String> {
         })
         .filter(|segment| !segment.is_empty())
         .collect()
+}
+
+fn go_package_name_from_path(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches(".go")
+        .to_string()
 }
 
 fn python_path_segments(path: &str) -> Vec<String> {

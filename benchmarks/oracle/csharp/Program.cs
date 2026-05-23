@@ -192,10 +192,11 @@ internal sealed class DeclarationVisitor : CSharpSyntaxWalker
 
     public override void VisitInterfaceDeclaration(InterfaceDeclarationSyntax node)
     {
-        // Squeezy stores interfaces as `SymbolKind::Trait`; the normalized
-        // comparison kind is "Trait".
-        Emit("Trait", node.Identifier.ValueText);
-        _typeStack.Push("Trait");
+        // Squeezy stores C# interfaces as `SymbolKind::Interface`; the
+        // normalized comparison kind is "Interface" (matching Go's mapping
+        // for `interface_type`).
+        Emit("Interface", node.Identifier.ValueText);
+        _typeStack.Push("Interface");
         base.VisitInterfaceDeclaration(node);
         _typeStack.Pop();
     }

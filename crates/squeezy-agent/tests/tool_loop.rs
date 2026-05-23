@@ -766,7 +766,7 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
         {
             assert_eq!(request.tool_name, "webfetch");
             assert_eq!(request.scope, PermissionScope::Web);
-            assert!(request.summary.contains("example.com"));
+            assert!(request.summary().contains("example.com"));
             decision_tx
                 .send(ToolApprovalDecision::Denied)
                 .expect("send denial");

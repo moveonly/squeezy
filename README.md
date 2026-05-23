@@ -20,7 +20,7 @@ Every model token is a budgeted resource.
   `websearch`/`webfetch` for current external evidence.
 - The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
 - Anonymous product telemetry is documented in [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
-- Provider and model configuration is documented in [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+- Configuration is documented in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md), with provider details in [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
 
 ## Speed
 

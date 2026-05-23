@@ -51,6 +51,8 @@ The planned crate layout should separate:
 
 Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
+Integration-test fixtures and reusable test artifacts belong under `tests/artifacts/`; do not add top-level `examples/` directories for them.
+
 ## Constraints
 
 - Do not copy code from extracted proprietary reference implementations.

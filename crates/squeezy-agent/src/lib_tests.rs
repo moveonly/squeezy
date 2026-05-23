@@ -1,7 +1,7 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -10,8 +10,11 @@ use std::{
 use futures_core::Stream;
 use futures_util::stream;
 use serde_json::json;
-use squeezy_core::{AppConfig, PermissionMode, PermissionPolicy, Result};
-use squeezy_llm::{LlmEvent, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_core::{
+    AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
+    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SkillsConfig,
+};
+use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_tools::{ToolStatus, sha256_hex};
 
 use super::*;
@@ -347,6 +350,281 @@ async fn tool_loop_can_edit_file_with_write_tool() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn inactive_skills_are_not_eagerly_added_to_instructions() {
+    let root = temp_workspace("agent_skill_inactive");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn("hello".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(!request.instructions.contains("<active_skills>"));
+    assert!(!request.instructions.contains("Rust Nav"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn explicit_skill_activation_injects_body_and_rewrites_task() {
+    let root = temp_workspace("agent_skill_explicit");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "/skill rust-nav inspect main".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(request.instructions.contains("<active_skills>"));
+    assert!(request.instructions.contains("# Rust Nav"));
+    assert_eq!(
+        request.input,
+        vec![LlmInputItem::UserText("inspect main".to_string())]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn trigger_skill_activation_injects_body() {
+    let root = temp_workspace("agent_skill_trigger");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        &["rust symbol"],
+    );
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "Find this Rust symbol".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().pop().expect("request");
+    assert!(request.instructions.contains("<active_skills>"));
+    assert!(request.instructions.contains("# Rust Nav"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn classifier_verdict_parses_strict_json_action_field() {
+    let verdict =
+        parse_classifier_verdict(r#"{"action": "deny", "reason": "curl piped to bash is unsafe"}"#);
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(verdict.reason.contains("denied"));
+
+    let permissive =
+        parse_classifier_verdict(r#"{"action": "ask", "reason": "looks fine but confirm"}"#);
+    assert_eq!(permissive.action, PermissionAction::Ask);
+    assert!(permissive.reason.contains("requires approval"));
+}
+
+#[test]
+fn classifier_verdict_defaults_to_ask_when_action_is_unknown_or_allow() {
+    // Even if the model says "allow" we must not flip to Allow.
+    let verdict = parse_classifier_verdict(r#"{"action": "allow", "reason": "x"}"#);
+    assert_eq!(verdict.action, PermissionAction::Ask);
+
+    let verdict = parse_classifier_verdict("not even json");
+    assert_eq!(verdict.action, PermissionAction::Ask);
+
+    // Loose action: "deny" but missing JSON braces is still recognized.
+    let loose = parse_classifier_verdict("action: deny because rm -rf /");
+    assert_eq!(loose.action, PermissionAction::Deny);
+}
+
+#[test]
+fn classifier_verdict_does_not_match_action_inside_reason_text() {
+    // The previous substring heuristic would have fired on this. The new
+    // parser pulls the literal `action` field and ignores prose.
+    let verdict = parse_classifier_verdict(
+        r#"{"action": "ask", "reason": "if we later wanted to deny we could"}"#,
+    );
+    assert_eq!(verdict.action, PermissionAction::Ask);
+}
+
+#[test]
+fn persistence_guard_refuses_allow_on_destructive_capability() {
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Destructive,
+        target: "rm:*".to_string(),
+        risk: PermissionRisk::Critical,
+        summary: "rm -rf node_modules".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    assert!(
+        permission_rule_for_persistence(
+            &request,
+            PermissionRuleSource::User,
+            PermissionAction::Allow
+        )
+        .is_none(),
+        "destructive Allow rules must never be persisted",
+    );
+
+    // Deny is allowed - users can permanently block a destructive prefix.
+    let deny = permission_rule_for_persistence(
+        &request,
+        PermissionRuleSource::User,
+        PermissionAction::Deny,
+    );
+    assert!(deny.is_some());
+    assert_eq!(deny.expect("deny rule").action, PermissionAction::Deny);
+}
+
+#[test]
+fn persistence_guard_refuses_allow_with_star_target() {
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "*".to_string(),
+        risk: PermissionRisk::High,
+        summary: "any shell".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+    assert!(
+        permission_rule_for_persistence(
+            &request,
+            PermissionRuleSource::User,
+            PermissionAction::Allow
+        )
+        .is_none(),
+        "Allow rules with a catch-all target must not be persisted",
+    );
+}
+
+#[tokio::test]
+async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_squeezy_toml() {
+    let root = temp_workspace("agent_session_rule");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let expected_sha256 = sha256_hex("before".as_bytes());
+
+    let first_call = LlmToolCall {
+        call_id: "write_1".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "sample.txt",
+            "content": "after-1",
+            "expected_sha256": expected_sha256,
+        }),
+    };
+    let second_call = LlmToolCall {
+        call_id: "write_2".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "sample.txt",
+            "content": "after-2",
+            "expected_sha256": sha256_hex("after-1".as_bytes()),
+        }),
+    };
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(first_call)),
+            Ok(LlmEvent::ToolCall(second_call)),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("edit sample twice".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::AllowRuleProject)
+                .expect("send AllowRuleProject");
+        }
+    }
+
+    assert_eq!(
+        approvals_seen, 1,
+        "session rule should auto-approve the second matching write_file",
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).expect("read sample"),
+        "after-2",
+        "second write must run after the session rule takes effect",
+    );
+
+    let session_rules = agent.session_rules_snapshot();
+    assert_eq!(session_rules.len(), 1, "exactly one rule should be cached");
+    assert_eq!(session_rules[0].source, PermissionRuleSource::Project);
+    assert_eq!(session_rules[0].capability, "edit");
+    assert_eq!(session_rules[0].target, "path:sample.txt");
+
+    let written = fs::read_to_string(root.join("squeezy.toml")).expect("read project settings");
+    assert!(written.contains("[[permissions.rules]]"));
+    assert!(written.contains("target = \"path:sample.txt\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_workspace(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -355,4 +633,31 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+fn config_with_skill_dirs(root: &Path) -> AppConfig {
+    AppConfig {
+        workspace_root: root.to_path_buf(),
+        skills: SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+        },
+        ..Default::default()
+    }
+}
+
+fn write_skill(dir: &Path, name: &str, triggers: &[&str]) {
+    fs::create_dir_all(dir).expect("mkdir skill");
+    let triggers = triggers
+        .iter()
+        .map(|trigger| format!("  - {trigger}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\nname: {name}\ndescription: Rust navigation skill\ntriggers:\n{triggers}\n---\n# Rust Nav\n\nUse graph tools.\n"
+        ),
+    )
+    .expect("write skill");
 }
