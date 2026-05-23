@@ -63,11 +63,15 @@ jobs:
 
       - name: Run semantic graph benchmark
         run: |
+          mkdir -p target/benchmark-repos
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep target/benchmark-repos/ripgrep-smoke
           cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
             --fixture benchmarks/fixtures/rust/semantic-cases \
             --spec benchmarks/specs/smoke-queries.json \
             --report target/semantic-graph-benchmark/smoke.json \
-            --mixed-repo .
+            --mixed-repo target/benchmark-repos/ripgrep-smoke \
+            --mixed-iterations 1000 \
+            --ra-lsp-probes 25
 
       - name: Run full external benchmark
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'full' }}
@@ -80,7 +84,8 @@ jobs:
               --spec benchmarks/specs/smoke-queries.json \
               --report "target/semantic-graph-benchmark/$name.json" \
               --mixed-repo "target/benchmark-repos/$name" \
-              --mixed-iterations 5000
+              --mixed-iterations 5000 \
+              --ra-lsp-probes 50
           done <<'REPOS'
           ripgrep https://github.com/BurntSushi/ripgrep
           fd https://github.com/sharkdp/fd
@@ -116,6 +121,14 @@ jobs:
                       f"- Fixture symbol scope: comparable RA={acc['rust_analyzer_total']} raw RA={acc['rust_analyzer_raw_total']} excluded RA={acc['rust_analyzer_excluded_by_kind']} comparable Squeezy={acc['squeezy_total']} raw Squeezy={acc['squeezy_raw_total']} excluded Squeezy={acc['squeezy_excluded_by_kind']}",
                       file=out,
                   )
+                  nav = report['accuracy']['navigation']
+                  defs = nav['definitions']
+                  refs = nav['references']
+                  lsp = nav['rust_analyzer_lsp_ms'] if nav['rust_analyzer_lsp_ms'] is not None else nav['rust_analyzer_lsp_status']
+                  print(
+                      f"- Fixture navigation accuracy: definition probes={defs['probes']}/{defs['available_probes']} TP={defs['true_positive']} FP={defs['false_positive']} FN={defs['false_negative']} Squeezy-only={defs['squeezy_only']} wrong-target={defs['wrong_target']}; reference symbols={refs['symbols_sampled']}/{refs['available_symbols']} TP={refs['true_positive']} FP={refs['false_positive']} FN={refs['false_negative']}; RA LSP={lsp}",
+                      file=out,
+                  )
                   mixed = report.get("mixed_workload")
                   if mixed:
                       print(f"- Repo: {mixed['repo']}", file=out)
@@ -137,6 +150,14 @@ jobs:
                       )
                       print(
                           f"- Mixed symbol scope: comparable RA={macc['rust_analyzer_total']} raw RA={macc['rust_analyzer_raw_total']} excluded RA={macc['rust_analyzer_excluded_by_kind']} comparable Squeezy={macc['squeezy_total']} raw Squeezy={macc['squeezy_raw_total']} excluded Squeezy={macc['squeezy_excluded_by_kind']}",
+                          file=out,
+                      )
+                      mnav = mixed['accuracy']['navigation']
+                      mdefs = mnav['definitions']
+                      mrefs = mnav['references']
+                      mlsp = mnav['rust_analyzer_lsp_ms'] if mnav['rust_analyzer_lsp_ms'] is not None else mnav['rust_analyzer_lsp_status']
+                      print(
+                          f"- Mixed navigation accuracy: definition probes={mdefs['probes']}/{mdefs['available_probes']} TP={mdefs['true_positive']} FP={mdefs['false_positive']} FN={mdefs['false_negative']} Squeezy-only={mdefs['squeezy_only']} wrong-target={mdefs['wrong_target']}; reference symbols={mrefs['symbols_sampled']}/{mrefs['available_symbols']} TP={mrefs['true_positive']} FP={mrefs['false_positive']} FN={mrefs['false_negative']}; RA LSP={mlsp}",
                           file=out,
                       )
                   print("", file=out)

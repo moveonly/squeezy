@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
 use squeezy_graph::{BodySearchQuery, GraphManager, RefreshConfig, SemanticGraph, SignatureQuery};
 use squeezy_parse::{BodyHitKind, RustParser};
@@ -112,6 +113,7 @@ struct AccuracyReport {
     rust_analyzer_symbols_ms: Option<u128>,
     rust_analyzer_symbol_status: String,
     symbols: AccuracySetReport,
+    navigation: NavigationAccuracyReport,
     limitations: Vec<String>,
 }
 
@@ -151,6 +153,81 @@ struct SymbolKey {
     name: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct NavigationAccuracyReport {
+    rust_analyzer_lsp_ms: Option<u128>,
+    rust_analyzer_lsp_status: String,
+    requested_probe_limit: usize,
+    definitions: DefinitionAccuracyReport,
+    references: ReferenceAccuracyReport,
+    limitations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DefinitionAccuracyReport {
+    available_probes: usize,
+    probes: usize,
+    true_positive: usize,
+    false_positive: usize,
+    false_negative: usize,
+    unresolved_agreement: usize,
+    squeezy_only: usize,
+    wrong_target: usize,
+    precision: f64,
+    recall: f64,
+    examples: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ReferenceAccuracyReport {
+    available_symbols: usize,
+    symbols_sampled: usize,
+    true_positive: usize,
+    false_positive: usize,
+    false_negative: usize,
+    precision: f64,
+    recall: f64,
+    false_positive_examples: Vec<String>,
+    false_negative_examples: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DefinitionProbe {
+    label: String,
+    uri: String,
+    path: PathBuf,
+    position: LspPosition,
+    squeezy_target: Option<SymbolId>,
+}
+
+#[derive(Debug, Clone)]
+struct ReferenceProbe {
+    label: String,
+    uri: String,
+    path: PathBuf,
+    position: LspPosition,
+    name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LspPosition {
+    line: u32,
+    character: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LocationKey {
+    file: String,
+    line: u32,
+    character: u32,
+}
+
+impl LocationKey {
+    fn render(&self) -> String {
+        format!("{}:{}:{}", self.file, self.line + 1, self.character + 1)
+    }
+}
+
 impl SymbolKey {
     fn render(&self) -> String {
         format!("{}:{}:{}", self.file, self.kind, self.name)
@@ -177,12 +254,12 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let squeezy_query_ms = query_started.elapsed().as_millis();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
-    let accuracy = collect_accuracy(&graph);
+    let accuracy = collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes);
 
     let mixed_workload = args
         .mixed_repo
         .as_ref()
-        .map(|repo| run_mixed_workload(repo, args.mixed_iterations))
+        .map(|repo| run_mixed_workload(repo, args.mixed_iterations, args.ra_lsp_probes))
         .transpose()?;
 
     let stats = graph.stats();
@@ -317,14 +394,18 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
     })
 }
 
-fn run_mixed_workload(repo: &Path, requested_scenarios: usize) -> Result<MixedWorkloadReport> {
+fn run_mixed_workload(
+    repo: &Path,
+    requested_scenarios: usize,
+    ra_lsp_probes: usize,
+) -> Result<MixedWorkloadReport> {
     let (compiler_check_ms, compiler_check_status) = time_cargo_check_optional(repo);
     let (rust_analyzer_ms, rust_analyzer_status) = time_rust_analyzer(repo);
 
     let build_started = Instant::now();
     let graph = build_graph(repo)?;
     let squeezy_build_ms = build_started.elapsed().as_millis();
-    let accuracy = collect_accuracy(&graph);
+    let accuracy = collect_accuracy(repo, &graph, ra_lsp_probes);
 
     let scenarios = build_mixed_scenarios(&graph);
     let scenario_indexes = select_scenarios(scenarios.len(), requested_scenarios);
@@ -378,7 +459,7 @@ fn run_mixed_workload(repo: &Path, requested_scenarios: usize) -> Result<MixedWo
     })
 }
 
-fn collect_accuracy(graph: &SemanticGraph) -> AccuracyReport {
+fn collect_accuracy(root: &Path, graph: &SemanticGraph, ra_lsp_probes: usize) -> AccuracyReport {
     let squeezy_symbols = collect_squeezy_symbol_scan(graph);
     let started = Instant::now();
     let (rust_analyzer_symbols, status) = collect_rust_analyzer_symbol_scan(graph);
@@ -388,14 +469,16 @@ fn collect_accuracy(graph: &SemanticGraph) -> AccuracyReport {
         None
     };
     let symbols = compare_symbol_sets(&squeezy_symbols, &rust_analyzer_symbols);
+    let navigation = collect_navigation_accuracy(root, graph, ra_lsp_probes);
 
     AccuracyReport {
         rust_analyzer_symbols_ms,
         rust_analyzer_symbol_status: status,
         symbols,
+        navigation,
         limitations: vec![
             "Symbol TP/FP/FN compares declaration families both engines expose; raw rust-analyzer locals and fields are counted as excluded, not silently compared.".to_string(),
-            "Call-target and reference TP/FP/FN are not yet compared because rust-analyzer CLI search failed locally and SCIP/rustc-HIR oracle parsing is future work.".to_string(),
+            "Navigation TP/FP/FN is sampled through rust-analyzer LSP definition/reference requests; it is a realistic loss tracker, not an exhaustive proof.".to_string(),
             "Macro-generated items, proc macros, cfg matrices, trait dispatch, deref/autoref method resolution, and external crate/stdlib references remain documented lower-confidence areas.".to_string(),
         ],
     }
@@ -699,6 +782,447 @@ fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> Accu
         recall,
         false_positive_examples: difference_examples(&squeezy.counts, &rust_analyzer.counts),
         false_negative_examples: difference_examples(&rust_analyzer.counts, &squeezy.counts),
+    }
+}
+
+fn collect_navigation_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+    probe_limit: usize,
+) -> NavigationAccuracyReport {
+    if probe_limit == 0 {
+        return NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "disabled by --ra-lsp-probes 0".to_string(),
+            requested_probe_limit: probe_limit,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: navigation_limitations(),
+        };
+    }
+
+    let started = Instant::now();
+    let mut client = match RustAnalyzerLsp::start(root) {
+        Ok(client) => client,
+        Err(err) => {
+            return NavigationAccuracyReport {
+                rust_analyzer_lsp_ms: None,
+                rust_analyzer_lsp_status: format!("rust-analyzer LSP unavailable: {err}"),
+                requested_probe_limit: probe_limit,
+                definitions: DefinitionAccuracyReport::default(),
+                references: ReferenceAccuracyReport::default(),
+                limitations: navigation_limitations(),
+            };
+        }
+    };
+
+    let definitions = compare_definition_probes(root, graph, &mut client, probe_limit);
+    let references = compare_reference_probes(root, graph, &mut client, probe_limit);
+    let elapsed = started.elapsed().as_millis();
+    let status = match (&definitions, &references) {
+        (Ok(_), Ok(_)) => "rust-analyzer LSP definition/reference probes succeeded".to_string(),
+        (Err(err), _) => format!("rust-analyzer LSP definition probes failed: {err}"),
+        (_, Err(err)) => format!("rust-analyzer LSP reference probes failed: {err}"),
+    };
+
+    NavigationAccuracyReport {
+        rust_analyzer_lsp_ms: (definitions.is_ok() && references.is_ok()).then_some(elapsed),
+        rust_analyzer_lsp_status: status,
+        requested_probe_limit: probe_limit,
+        definitions: definitions.unwrap_or_default(),
+        references: references.unwrap_or_default(),
+        limitations: navigation_limitations(),
+    }
+}
+
+fn navigation_limitations() -> Vec<String> {
+    vec![
+        "Definition probes compare Squeezy resolved call and macro edge targets with rust-analyzer LSP definitions for sampled call sites.".to_string(),
+        "Reference probes compare Squeezy lexical reference_search results with rust-analyzer LSP references for sampled declarations, with declarations included to match Squeezy's current output surface.".to_string(),
+        "Samples are deterministic and capped; increase --ra-lsp-probes for deeper local audits.".to_string(),
+        "External dependency definitions are counted as rust-analyzer-only misses because Squeezy currently indexes workspace files only.".to_string(),
+    ]
+}
+
+fn compare_definition_probes(
+    root: &Path,
+    graph: &SemanticGraph,
+    client: &mut RustAnalyzerLsp,
+    probe_limit: usize,
+) -> Result<DefinitionAccuracyReport> {
+    let (available_probes, probes) = build_definition_probes(graph, probe_limit)?;
+    let mut report = DefinitionAccuracyReport {
+        available_probes,
+        probes: probes.len(),
+        ..DefinitionAccuracyReport::default()
+    };
+
+    for probe in probes {
+        client.did_open(&probe.uri, &probe.path)?;
+        let ra_locations = client.definition(&probe.uri, probe.position)?;
+        let squeezy_has_target = probe.squeezy_target.is_some();
+        let squeezy_matches = probe
+            .squeezy_target
+            .as_ref()
+            .and_then(|id| graph.symbols.get(id))
+            .map(|symbol| {
+                ra_locations
+                    .iter()
+                    .any(|location| location_matches_symbol(root, graph, location, symbol))
+            })
+            .unwrap_or(false);
+
+        match (ra_locations.is_empty(), squeezy_has_target, squeezy_matches) {
+            (false, true, true) => report.true_positive += 1,
+            (false, false, _) => {
+                report.false_negative += 1;
+                push_example(
+                    &mut report.examples,
+                    format!(
+                        "FN definition {}: RA -> {}, Squeezy unresolved",
+                        probe.label,
+                        render_locations(&ra_locations)
+                    ),
+                );
+            }
+            (false, true, false) => {
+                report.false_positive += 1;
+                report.false_negative += 1;
+                report.wrong_target += 1;
+                push_example(
+                    &mut report.examples,
+                    format!(
+                        "Wrong definition {}: RA -> {}, Squeezy -> {}",
+                        probe.label,
+                        render_locations(&ra_locations),
+                        probe
+                            .squeezy_target
+                            .as_ref()
+                            .map(|id| id.0.as_str())
+                            .unwrap_or("<none>")
+                    ),
+                );
+            }
+            (true, true, false) => {
+                report.false_positive += 1;
+                report.squeezy_only += 1;
+                push_example(
+                    &mut report.examples,
+                    format!(
+                        "Squeezy-only definition {}: RA unresolved, Squeezy -> {}",
+                        probe.label,
+                        probe
+                            .squeezy_target
+                            .as_ref()
+                            .map(|id| id.0.as_str())
+                            .unwrap_or("<none>")
+                    ),
+                );
+            }
+            (true, false, _) => report.unresolved_agreement += 1,
+            (true, true, true) => unreachable!("matched target requires an RA location"),
+        }
+    }
+
+    report.precision = ratio(
+        report.true_positive,
+        report.true_positive + report.false_positive,
+    );
+    report.recall = ratio(
+        report.true_positive,
+        report.true_positive + report.false_negative,
+    );
+    Ok(report)
+}
+
+fn compare_reference_probes(
+    root: &Path,
+    graph: &SemanticGraph,
+    client: &mut RustAnalyzerLsp,
+    probe_limit: usize,
+) -> Result<ReferenceAccuracyReport> {
+    let (available_symbols, probes) = build_reference_probes(root, graph, probe_limit)?;
+    let mut report = ReferenceAccuracyReport {
+        available_symbols,
+        symbols_sampled: probes.len(),
+        ..ReferenceAccuracyReport::default()
+    };
+
+    for probe in probes {
+        client.did_open(&probe.uri, &probe.path)?;
+        let ra = client
+            .references(&probe.uri, probe.position)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let squeezy = graph
+            .reference_search(&probe.name)
+            .into_iter()
+            .filter_map(|hit| location_key_for_reference_hit(graph, &hit, &probe.name))
+            .collect::<BTreeSet<_>>();
+
+        let tp = squeezy.intersection(&ra).count();
+        let fp = squeezy.difference(&ra).cloned().collect::<Vec<_>>();
+        let fn_ = ra.difference(&squeezy).cloned().collect::<Vec<_>>();
+        report.true_positive += tp;
+        report.false_positive += fp.len();
+        report.false_negative += fn_.len();
+
+        if !fp.is_empty() {
+            push_example(
+                &mut report.false_positive_examples,
+                format!(
+                    "{} FP refs: {}",
+                    probe.label,
+                    fp.iter()
+                        .take(5)
+                        .map(LocationKey::render)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        if !fn_.is_empty() {
+            push_example(
+                &mut report.false_negative_examples,
+                format!(
+                    "{} FN refs: {}",
+                    probe.label,
+                    fn_.iter()
+                        .take(5)
+                        .map(LocationKey::render)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+    }
+
+    report.precision = ratio(
+        report.true_positive,
+        report.true_positive + report.false_positive,
+    );
+    report.recall = ratio(
+        report.true_positive,
+        report.true_positive + report.false_negative,
+    );
+    Ok(report)
+}
+
+fn build_definition_probes(
+    graph: &SemanticGraph,
+    limit: usize,
+) -> Result<(usize, Vec<DefinitionProbe>)> {
+    let mut probes = Vec::new();
+    let mut edges = graph
+        .edges()
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::Calls | EdgeKind::InvokesMacro))
+        .filter_map(|edge| {
+            let span = edge.span?;
+            let from = graph.symbols.get(&edge.from)?;
+            let file = graph.files.get(&from.file_id)?;
+            Some((file.relative_path.clone(), span.start_byte, edge))
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.cmp(&right.1))
+            .then(left.2.target_text.cmp(&right.2.target_text))
+    });
+    let available = edges.len();
+    let selected = select_scenarios(available, limit);
+
+    for index in selected {
+        let (_, _, edge) = edges[index];
+        let Some(span) = edge.span else {
+            continue;
+        };
+        let Some(from) = graph.symbols.get(&edge.from) else {
+            continue;
+        };
+        let Some(file) = graph.files.get(&from.file_id) else {
+            continue;
+        };
+        let source = fs::read_to_string(&file.path)?;
+        let byte = probe_byte_for_edge(
+            &source,
+            span.start_byte as usize,
+            span.end_byte as usize,
+            &edge.target_text,
+        );
+        let position = byte_to_lsp_position(&source, byte);
+        probes.push(DefinitionProbe {
+            label: format!(
+                "{}:{}:{} {}",
+                file.relative_path,
+                position.line + 1,
+                position.character + 1,
+                edge.target_text
+            ),
+            uri: path_to_file_uri(&file.path)?,
+            path: file.path.clone(),
+            position,
+            squeezy_target: edge.to.clone(),
+        });
+    }
+
+    Ok((available, probes))
+}
+
+fn build_reference_probes(
+    _root: &Path,
+    graph: &SemanticGraph,
+    limit: usize,
+) -> Result<(usize, Vec<ReferenceProbe>)> {
+    let mut symbols = graph
+        .symbols
+        .values()
+        .filter(|symbol| {
+            matches!(
+                symbol.kind,
+                SymbolKind::Struct
+                    | SymbolKind::Enum
+                    | SymbolKind::Union
+                    | SymbolKind::Trait
+                    | SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::TypeAlias
+                    | SymbolKind::Const
+                    | SymbolKind::Static
+                    | SymbolKind::Macro
+            ) && symbol.name.len() >= 3
+        })
+        .collect::<Vec<_>>();
+    symbols.sort_by(|left, right| {
+        left.file_id
+            .0
+            .cmp(&right.file_id.0)
+            .then(left.span.start_byte.cmp(&right.span.start_byte))
+            .then(left.name.cmp(&right.name))
+    });
+    let available = symbols.len();
+    let selected = select_scenarios(available, limit);
+
+    let mut probes = Vec::new();
+    for index in selected {
+        let symbol = symbols[index];
+        let Some(file) = graph.files.get(&symbol.file_id) else {
+            continue;
+        };
+        let source = fs::read_to_string(&file.path)?;
+        let byte = probe_byte_for_symbol(
+            &source,
+            symbol.span.start_byte as usize,
+            symbol.span.end_byte as usize,
+            &symbol.name,
+        );
+        let position = byte_to_lsp_position(&source, byte);
+        probes.push(ReferenceProbe {
+            label: format!(
+                "{}:{}:{} {}",
+                file.relative_path,
+                position.line + 1,
+                position.character + 1,
+                symbol.name
+            ),
+            uri: path_to_file_uri(&file.path)?,
+            path: file.path.clone(),
+            position,
+            name: symbol.name.clone(),
+        });
+    }
+
+    Ok((available, probes))
+}
+
+fn location_key_for_reference_hit(
+    graph: &SemanticGraph,
+    hit: &squeezy_graph::ReferenceHit,
+    name: &str,
+) -> Option<LocationKey> {
+    let file = graph.files.get(&hit.reference.file_id)?;
+    let source = fs::read_to_string(&file.path).ok()?;
+    let start = hit.reference.span.start_byte as usize;
+    let end = (hit.reference.span.end_byte as usize).min(source.len());
+    let slice = source.get(start.min(end)..end).unwrap_or_default();
+    let byte = slice
+        .find(name)
+        .map(|index| start + index)
+        .unwrap_or(hit.reference.span.start_byte as usize);
+    let position = byte_to_lsp_position(&source, byte);
+    Some(LocationKey {
+        file: file.relative_path.clone(),
+        line: position.line,
+        character: position.character,
+    })
+}
+
+fn probe_byte_for_edge(source: &str, start: usize, end: usize, target_text: &str) -> usize {
+    let end = end.min(source.len());
+    let start = start.min(end);
+    let slice = source.get(start..end).unwrap_or_default();
+    let needle = target_identifier(target_text);
+    slice
+        .rfind(&needle)
+        .map(|index| start + index)
+        .unwrap_or(start)
+}
+
+fn probe_byte_for_symbol(source: &str, start: usize, end: usize, name: &str) -> usize {
+    let end = end.min(source.len());
+    let start = start.min(end);
+    let slice = source.get(start..end).unwrap_or_default();
+    let needle = target_identifier(name);
+    slice
+        .find(&needle)
+        .map(|index| start + index)
+        .unwrap_or(start)
+}
+
+fn target_identifier(text: &str) -> String {
+    let before_bang = text.split('!').next().unwrap_or(text);
+    let before_call = before_bang.split('(').next().unwrap_or(before_bang);
+    before_call
+        .rsplit(|ch| ['.', ':', '<', '>', '&', ' ', '\t', '\n'].contains(&ch))
+        .find(|part| !part.is_empty())
+        .unwrap_or(before_call)
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .to_string()
+}
+
+fn location_matches_symbol(
+    root: &Path,
+    graph: &SemanticGraph,
+    location: &LocationKey,
+    symbol: &squeezy_graph::GraphSymbol,
+) -> bool {
+    let Some(file) = graph.files.get(&symbol.file_id) else {
+        return false;
+    };
+    if location.file != file.relative_path {
+        return false;
+    }
+    let Ok(source) = fs::read_to_string(root.join(&file.relative_path)) else {
+        return false;
+    };
+    line_char_to_byte(&source, location.line, location.character)
+        .map(|byte| symbol.span.contains_byte(byte as u32))
+        .unwrap_or(false)
+}
+
+fn render_locations(locations: &[LocationKey]) -> String {
+    locations
+        .iter()
+        .take(5)
+        .map(LocationKey::render)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn push_example(examples: &mut Vec<String>, example: String) {
+    if examples.len() < 20 {
+        examples.push(example);
     }
 }
 
@@ -1097,6 +1621,373 @@ fn time_rust_analyzer(repo: &Path) -> (Option<u128>, String) {
     }
 }
 
+struct RustAnalyzerLsp {
+    root: PathBuf,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: i64,
+    opened: BTreeSet<String>,
+}
+
+impl RustAnalyzerLsp {
+    fn start(root: &Path) -> Result<Self> {
+        let Some(program) = rust_analyzer_program() else {
+            return Err(SqueezyError::Graph("rust-analyzer not found".to_string()));
+        };
+        let root = fs::canonicalize(root)?;
+        let mut child = Command::new(program)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| SqueezyError::Graph("failed to open rust-analyzer stdin".to_string()))?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            SqueezyError::Graph("failed to open rust-analyzer stdout".to_string())
+        })?;
+        let mut client = Self {
+            root: root.clone(),
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            next_id: 1,
+            opened: BTreeSet::new(),
+        };
+        let root_uri = path_to_file_uri(&root)?;
+        client.request(
+            "initialize",
+            json!({
+                "processId": null,
+                "rootUri": root_uri,
+                "workspaceFolders": [{
+                    "uri": root_uri,
+                    "name": root.file_name().and_then(|name| name.to_str()).unwrap_or("workspace"),
+                }],
+                "capabilities": {
+                    "textDocument": {
+                        "definition": {},
+                        "references": {}
+                    }
+                }
+            }),
+        )?;
+        client.notify("initialized", json!({}))?;
+        std::thread::sleep(std::time::Duration::from_millis(750));
+        Ok(client)
+    }
+
+    fn definition(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>> {
+        let value = self.request(
+            "textDocument/definition",
+            json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": position.line, "character": position.character}
+            }),
+        )?;
+        parse_lsp_locations(&value, &self.root)
+    }
+
+    fn references(&mut self, uri: &str, position: LspPosition) -> Result<Vec<LocationKey>> {
+        let value = self.request(
+            "textDocument/references",
+            json!({
+                "textDocument": {"uri": uri},
+                "position": {"line": position.line, "character": position.character},
+                "context": {"includeDeclaration": true}
+            }),
+        )?;
+        parse_lsp_locations(&value, &self.root)
+    }
+
+    fn did_open(&mut self, uri: &str, path: &Path) -> Result<()> {
+        if !self.opened.insert(uri.to_string()) {
+            return Ok(());
+        }
+        let text = fs::read_to_string(path)?;
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "rust",
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        )
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        let mut last_error = None;
+        for _ in 0..4 {
+            match self.request_once(method, params.clone()) {
+                Ok(value) => return Ok(value),
+                Err(err) if err.to_string().contains("content modified") => {
+                    last_error = Some(err);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            SqueezyError::Graph(format!("LSP request {method} failed after retries"))
+        }))
+    }
+
+    fn request_once(&mut self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }))?;
+
+        loop {
+            let message = self.read_message()?;
+            if message.get("id").and_then(Value::as_i64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(SqueezyError::Graph(format!(
+                    "LSP request {method} failed: {error}"
+                )));
+            }
+            return Ok(message.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    fn notify(&mut self, method: &str, params: Value) -> Result<()> {
+        self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params
+        }))
+    }
+
+    fn write_message(&mut self, value: &Value) -> Result<()> {
+        let body = serde_json::to_vec(value).map_err(|err| {
+            SqueezyError::Graph(format!("failed to serialize LSP message: {err}"))
+        })?;
+        write!(self.stdin, "Content-Length: {}\r\n\r\n", body.len())?;
+        self.stdin.write_all(&body)?;
+        self.stdin.flush()?;
+        Ok(())
+    }
+
+    fn read_message(&mut self) -> Result<Value> {
+        let mut content_length = None;
+        loop {
+            let mut line = String::new();
+            let read = self.stdout.read_line(&mut line)?;
+            if read == 0 {
+                return Err(SqueezyError::Graph(
+                    "rust-analyzer LSP closed stdout".to_string(),
+                ));
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                break;
+            }
+            if let Some(raw) = trimmed.strip_prefix("Content-Length:") {
+                content_length = Some(raw.trim().parse::<usize>().map_err(|err| {
+                    SqueezyError::Graph(format!("invalid LSP Content-Length {raw}: {err}"))
+                })?);
+            }
+        }
+
+        let len = content_length
+            .ok_or_else(|| SqueezyError::Graph("missing LSP Content-Length".to_string()))?;
+        let mut body = vec![0; len];
+        self.stdout.read_exact(&mut body)?;
+        serde_json::from_slice(&body)
+            .map_err(|err| SqueezyError::Graph(format!("invalid LSP JSON response: {err}")))
+    }
+}
+
+impl Drop for RustAnalyzerLsp {
+    fn drop(&mut self) {
+        let _ = self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "id": self.next_id,
+            "method": "shutdown",
+            "params": null
+        }));
+        let _ = self.write_message(&json!({
+            "jsonrpc": "2.0",
+            "method": "exit",
+            "params": null
+        }));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn parse_lsp_locations(value: &Value, root: &Path) -> Result<Vec<LocationKey>> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    if let Some(items) = value.as_array() {
+        return items
+            .iter()
+            .map(|item| parse_lsp_location(item, root))
+            .collect();
+    }
+    parse_lsp_location(value, root).map(|location| vec![location])
+}
+
+fn parse_lsp_location(value: &Value, root: &Path) -> Result<LocationKey> {
+    let uri = value
+        .get("uri")
+        .or_else(|| value.get("targetUri"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| SqueezyError::Graph(format!("LSP location missing uri: {value}")))?;
+    let range = value
+        .get("range")
+        .or_else(|| value.get("targetSelectionRange"))
+        .or_else(|| value.get("targetRange"))
+        .ok_or_else(|| SqueezyError::Graph(format!("LSP location missing range: {value}")))?;
+    let start = range
+        .get("start")
+        .ok_or_else(|| SqueezyError::Graph(format!("LSP range missing start: {range}")))?;
+    let line = start
+        .get("line")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| SqueezyError::Graph(format!("LSP range start missing line: {start}")))?
+        as u32;
+    let character = start
+        .get("character")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| SqueezyError::Graph(format!("LSP range start missing character: {start}")))?
+        as u32;
+    let path = file_uri_to_path(uri)?;
+    Ok(LocationKey {
+        file: location_file_key(root, &path),
+        line,
+        character,
+    })
+}
+
+fn location_file_key(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .ok()
+        .map(|relative| relative.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+fn path_to_file_uri(path: &Path) -> Result<String> {
+    let path = fs::canonicalize(path)?;
+    let raw = path.to_string_lossy();
+    Ok(format!("file://{}", percent_encode_path(&raw)))
+}
+
+fn file_uri_to_path(uri: &str) -> Result<PathBuf> {
+    let raw = uri
+        .strip_prefix("file://")
+        .ok_or_else(|| SqueezyError::Graph(format!("unsupported non-file URI {uri}")))?;
+    Ok(PathBuf::from(percent_decode(raw)?))
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::new();
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn percent_decode(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3])
+                .map_err(|err| SqueezyError::Graph(format!("invalid URI escape: {err}")))?;
+            out.push(
+                u8::from_str_radix(hex, 16).map_err(|err| {
+                    SqueezyError::Graph(format!("invalid URI escape %{hex}: {err}"))
+                })?,
+            );
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|err| SqueezyError::Graph(format!("invalid UTF-8 file URI: {err}")))
+}
+
+fn byte_to_lsp_position(source: &str, byte: usize) -> LspPosition {
+    let byte = byte.min(source.len());
+    let mut line = 0u32;
+    let mut line_start = 0usize;
+    for (index, ch) in source.char_indices() {
+        if index >= byte {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            line_start = index + ch.len_utf8();
+        }
+    }
+    let character = source
+        .get(line_start..byte)
+        .unwrap_or_default()
+        .encode_utf16()
+        .count() as u32;
+    LspPosition { line, character }
+}
+
+fn line_char_to_byte(source: &str, line: u32, character: u32) -> Option<usize> {
+    let mut current_line = 0u32;
+    let mut line_start = 0usize;
+    for (index, ch) in source.char_indices() {
+        if current_line == line {
+            break;
+        }
+        if ch == '\n' {
+            current_line += 1;
+            line_start = index + ch.len_utf8();
+        }
+    }
+    if current_line != line {
+        return None;
+    }
+
+    let mut utf16 = 0u32;
+    for (offset, ch) in source[line_start..].char_indices() {
+        if ch == '\n' {
+            break;
+        }
+        if utf16 == character {
+            return Some(line_start + offset);
+        }
+        utf16 += ch.len_utf16() as u32;
+        if utf16 > character {
+            return Some(line_start + offset);
+        }
+    }
+    Some(
+        line_start
+            + source[line_start..]
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .len(),
+    )
+}
+
 fn rust_analyzer_command() -> Option<Command> {
     rust_analyzer_program().map(Command::new)
 }
@@ -1158,6 +2049,7 @@ fn print_summary(report: &BenchmarkReport) {
         report.faster_than_rustc_check
     );
     print_accuracy_summary("fixture", &report.accuracy);
+    print_navigation_summary("fixture", &report.accuracy.navigation);
     for query in &report.queries {
         println!(
             "{}: actual={} missing={} extras={}",
@@ -1191,6 +2083,7 @@ fn print_summary(report: &BenchmarkReport) {
                 .unwrap_or_else(|| mixed.rust_analyzer_status.clone())
         );
         print_accuracy_summary("mixed", &mixed.accuracy);
+        print_navigation_summary("mixed", &mixed.accuracy.navigation);
     }
 }
 
@@ -1212,6 +2105,28 @@ fn print_accuracy_summary(label: &str, accuracy: &AccuracyReport) {
             .rust_analyzer_symbols_ms
             .map(|ms| format!("{ms}ms"))
             .unwrap_or_else(|| accuracy.rust_analyzer_symbol_status.clone())
+    );
+}
+
+fn print_navigation_summary(label: &str, navigation: &NavigationAccuracyReport) {
+    println!(
+        "{label}_navigation_accuracy: def_probes={}/{} def_tp={} def_fp={} def_fn={} def_squeezy_only={} def_wrong_target={} ref_symbols={}/{} ref_tp={} ref_fp={} ref_fn={} lsp={}",
+        navigation.definitions.probes,
+        navigation.definitions.available_probes,
+        navigation.definitions.true_positive,
+        navigation.definitions.false_positive,
+        navigation.definitions.false_negative,
+        navigation.definitions.squeezy_only,
+        navigation.definitions.wrong_target,
+        navigation.references.symbols_sampled,
+        navigation.references.available_symbols,
+        navigation.references.true_positive,
+        navigation.references.false_positive,
+        navigation.references.false_negative,
+        navigation
+            .rust_analyzer_lsp_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| navigation.rust_analyzer_lsp_status.clone())
     );
 }
 
@@ -1299,6 +2214,7 @@ struct Args {
     report: PathBuf,
     mixed_repo: Option<PathBuf>,
     mixed_iterations: usize,
+    ra_lsp_probes: usize,
 }
 
 impl Args {
@@ -1308,6 +2224,7 @@ impl Args {
         let mut report = None;
         let mut mixed_repo = None;
         let mut mixed_iterations = 0;
+        let mut ra_lsp_probes = 25;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -1323,9 +2240,17 @@ impl Args {
                         SqueezyError::Graph(format!("invalid --mixed-iterations {raw}: {err}"))
                     })?;
                 }
+                "--ra-lsp-probes" => {
+                    let raw = args.next().ok_or_else(|| {
+                        SqueezyError::Graph("missing --ra-lsp-probes value".to_string())
+                    })?;
+                    ra_lsp_probes = raw.parse().map_err(|err| {
+                        SqueezyError::Graph(format!("invalid --ra-lsp-probes {raw}: {err}"))
+                    })?;
+                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>]"
+                        "usage: squeezy-graph-bench --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>]"
                     );
                     std::process::exit(0);
                 }
@@ -1341,6 +2266,11 @@ impl Args {
             report: report.ok_or_else(|| SqueezyError::Graph("missing --report".to_string()))?,
             mixed_repo,
             mixed_iterations,
+            ra_lsp_probes,
         })
     }
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;

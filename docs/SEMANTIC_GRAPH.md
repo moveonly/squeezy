@@ -94,22 +94,30 @@ temporary directory to measure refresh after editing two files.
 Mixed-workload timings are reported for trend analysis rather than used as a
 hard gate.
 
-Accuracy reporting uses `rust-analyzer symbols` as an external declaration
-oracle. The benchmark compares comparable declaration families and reports
-symbol TP/FP/FN, precision, recall, examples, raw counts, and excluded counts.
-Rust-analyzer locals, fields, and variants are excluded from TP/FP/FN because the
-current Squeezy graph does not expose them as declaration symbols. This validates
-hierarchy and signature-class discovery against rust-analyzer without making
-rust-analyzer a production navigation dependency.
+Accuracy reporting has two external rust-analyzer oracles. `rust-analyzer
+symbols` compares comparable declaration families and reports symbol TP/FP/FN,
+precision, recall, examples, raw counts, and excluded counts. Rust-analyzer
+locals, fields, and variants are excluded from symbol TP/FP/FN because the
+current Squeezy graph does not expose them as declaration symbols.
+
+The benchmark also starts rust-analyzer as an LSP server for sampled navigation
+diffs. `textDocument/definition` validates sampled Squeezy call and macro edge
+targets, while `textDocument/references` compares sampled declaration references
+against Squeezy `reference_search`. This is intentionally a loss tracker rather
+than a hard product dependency: it exposes wrong targets, rust-analyzer-only
+definitions, and Squeezy-only/lexical extras while keeping production navigation
+tree-sitter-only.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated
 code, or unresolved external code.
 
-Current external-oracle gaps:
+Current external-oracle gaps and known losses:
 
-- references and call targets need a SCIP or rustc/HIR oracle; local
-  `rust-analyzer search` failed against the installed toolchain
+- the LSP oracle is sampled by `--ra-lsp-probes`, not exhaustive by default
+- lexical reference search has high recall but many same-name false positives
+- unique-name method heuristics can choose the wrong local method for common
+  names such as `get`, `push`, or `clear`
 - item-generating macros and proc macros are recorded as opaque unless the
   generated item appears in source
 - cfg/feature matrices are not enumerated
@@ -119,6 +127,8 @@ Current external-oracle gaps:
 
 Latest local benchmark snapshot is documented in `benchmarks/README.md`. On the
 May 23, 2026 release run, comparable declaration symbols were 100% TP with 0 FP
-and 0 FN against `rust-analyzer symbols` on Squeezy, ripgrep, fd, bat, tokio,
-and serde. This does not claim call/reference equivalence yet; those still need
-the separate oracle above.
+and 0 FN against `rust-analyzer symbols` on five external popular Rust repos:
+ripgrep, fd, bat, tokio, and serde. The LSP navigation oracle does show losses:
+sampled references have large FP counts from lexical matching, and sampled
+definitions miss stdlib, external, trait/deref/autoref, and some local
+method-resolution targets.
