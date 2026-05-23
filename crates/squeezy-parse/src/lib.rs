@@ -170,6 +170,7 @@ struct CachedParsedFile {
 
 pub struct RustParser {
     rust_parser: Parser,
+    java_parser: Parser,
     python_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
 }
@@ -190,9 +191,11 @@ struct ParseOutput {
 impl RustParser {
     pub fn new() -> Result<Self> {
         let rust_parser = parser_with_rust_language()?;
+        let java_parser = parser_with_java_language()?;
         let python_parser = parser_with_python_language()?;
         Ok(Self {
             rust_parser,
+            java_parser,
             python_parser,
             cache: HashMap::new(),
         })
@@ -370,6 +373,7 @@ impl RustParser {
 
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::Java => Ok(&mut self.java_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -382,6 +386,7 @@ impl RustParser {
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     let mut parsers = WorkerParsers {
         rust: parser_with_rust_language()?,
+        java: parser_with_java_language()?,
         python: parser_with_python_language()?,
     };
     let mut outputs = Vec::with_capacity(jobs.len());
@@ -393,12 +398,14 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
 
 struct WorkerParsers {
     rust: Parser,
+    java: Parser,
     python: Parser,
 }
 
 impl WorkerParsers {
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::Java => Ok(&mut self.java),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
             _ => Err(SqueezyError::Parse(format!(
@@ -527,8 +534,21 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_java_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = java_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Java grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+fn java_language() -> tree_sitter::Language {
+    tree_sitter_java::LANGUAGE.into()
 }
 
 fn python_language() -> tree_sitter::Language {
@@ -536,11 +556,15 @@ fn python_language() -> tree_sitter::Language {
 }
 
 fn is_supported_language(language: LanguageKind) -> bool {
-    matches!(language, LanguageKind::Rust | LanguageKind::Python)
+    matches!(
+        language,
+        LanguageKind::Rust | LanguageKind::Python | LanguageKind::Java
+    )
 }
 
 fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     match file.language {
+        LanguageKind::Java => extract_java(file, source, tree),
         LanguageKind::Rust => extract_rust(file, source, tree),
         LanguageKind::Python => extract_python(file, source, tree),
         _ => ParsedFile::unsupported(
@@ -571,6 +595,42 @@ fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
 
     visit_node(root, &mut ctx, None, None);
+
+    ParsedFile {
+        file,
+        symbols: ctx.symbols,
+        imports: ctx.imports,
+        calls: ctx.calls,
+        references: ctx.references,
+        body_hits: ctx.body_hits,
+        unsupported: None,
+        diagnostics: ctx.diagnostics,
+        changed_ranges: Vec::new(),
+    }
+}
+
+fn extract_java(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    let mut ctx = ExtractContext {
+        file: file.clone(),
+        source,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    visit_java_node(root, &mut ctx, None, None);
+    dedup_java_facts(&mut ctx);
 
     ParsedFile {
         file,
@@ -631,6 +691,447 @@ struct ExtractContext<'source> {
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
     diagnostics: Vec<ParseDiagnostic>,
+}
+
+fn visit_java_node(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    if node.is_missing() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!("missing {}", node.kind()),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+
+    match node.kind() {
+        "package_declaration" => extract_java_package(node, ctx),
+        "import_declaration" => extract_java_import(node, ctx, owner_symbol.clone()),
+        _ => {}
+    }
+
+    if let Some(symbol) = java_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        extract_java_symbol_facts(node, &symbol, ctx);
+        let next_parent = Some((symbol.id.clone(), symbol.kind));
+        let next_owner = if symbol.body_span.is_some() {
+            Some(symbol.id.clone())
+        } else {
+            owner_symbol.clone()
+        };
+        ctx.symbols.push(symbol);
+        visit_java_children(node, ctx, next_parent, next_owner);
+        return;
+    }
+
+    match node.kind() {
+        "method_invocation" => {
+            extract_java_method_invocation(node, ctx, owner_symbol.clone());
+            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+        }
+        "object_creation_expression" => {
+            extract_java_object_creation(node, ctx, owner_symbol.clone());
+            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+        }
+        "identifier" => {}
+        "type_identifier" | "scoped_type_identifier" => {
+            extract_java_reference(node, ReferenceKind::Type, ctx, owner_symbol.clone())
+        }
+        "scoped_identifier" => {
+            extract_java_reference(node, ReferenceKind::Path, ctx, owner_symbol.clone())
+        }
+        "field_access" => {
+            extract_java_reference(node, ReferenceKind::Field, ctx, owner_symbol.clone())
+        }
+        "marker_annotation" | "annotation" => {
+            extract_java_reference(node, ReferenceKind::Attribute, ctx, owner_symbol.clone())
+        }
+        kind if is_java_literal(kind) => {
+            extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol)
+        }
+        _ => visit_java_children(node, ctx, parent_symbol, owner_symbol),
+    }
+}
+
+fn visit_java_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_java_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
+fn java_symbol_from_node(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let kind = match node.kind() {
+        "class_declaration" => SymbolKind::Class,
+        "interface_declaration" | "annotation_type_declaration" => SymbolKind::Trait,
+        "enum_declaration" => SymbolKind::Enum,
+        "record_declaration" => SymbolKind::Struct,
+        "annotation_type_element_declaration" => SymbolKind::Method,
+        "method_declaration" => SymbolKind::Method,
+        "constructor_declaration" => SymbolKind::Method,
+        "field_declaration" => SymbolKind::Field,
+        _ => return None,
+    };
+    if kind == SymbolKind::Field {
+        return java_field_symbol_from_node(node, ctx, parent_symbol);
+    }
+
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())?;
+    let body = node.child_by_field_name("body");
+    let span = span_from_node(node);
+    let body_span = body.map(span_from_node);
+    let signature = signature_text(node, body, ctx.source);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
+    let mut attributes = java_attributes_for_node(node, ctx.source);
+    if is_java_test_symbol(&ctx.file.relative_path, kind, &name, &attributes) {
+        attributes.push("java:test".to_string());
+    }
+    if matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+    ) {
+        attributes.extend(
+            java_type_inheritance_names(node, ctx.source)
+                .into_iter()
+                .map(|base| format!("base:{base}")),
+        );
+    }
+    attributes.sort();
+    attributes.dedup();
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind,
+        span,
+        body_span,
+        signature,
+        visibility: java_visibility_text(node, ctx.source),
+        docs: java_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-java", format!("{} declaration", node.kind())),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn java_field_symbol_from_node(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let variable = first_named_descendant_kind(node, "variable_declarator")?;
+    let name = variable
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())?;
+    let span = span_from_node(variable);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Field,
+        &name,
+        span,
+    );
+    let mut attributes = java_attributes_for_node(node, ctx.source);
+    if let Some(field_type) = java_field_type(node, ctx.source) {
+        attributes.push(format!("type:{field_type}"));
+    }
+    attributes.sort();
+    attributes.dedup();
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Field,
+        span,
+        body_span: None,
+        signature: signature_text(node, None, ctx.source),
+        visibility: java_visibility_text(node, ctx.source),
+        docs: java_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-java", "field_declaration declaration"),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn extract_java_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+    if matches!(
+        symbol.kind,
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+    ) {
+        for base in java_type_inheritance_names(node, ctx.source) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: base.clone(),
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new("tree-sitter-java", "inheritance/interface reference"),
+            });
+            ctx.body_hits.push(BodyHit {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: base,
+                kind: BodyHitKind::Type,
+                span: symbol.span,
+            });
+        }
+    }
+    if matches!(symbol.kind, SymbolKind::Method | SymbolKind::Field) {
+        for type_name in java_signature_type_names(&symbol.signature) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: type_name.clone(),
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new("tree-sitter-java", "signature type reference"),
+            });
+            ctx.body_hits.push(BodyHit {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: type_name,
+                kind: BodyHitKind::Type,
+                span: symbol.span,
+            });
+        }
+    }
+}
+
+fn extract_java_package(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some(path) = raw
+        .trim()
+        .strip_prefix("package")
+        .map(|text| text.trim().trim_end_matches(';').trim().to_string())
+        .filter(|text| !text.is_empty())
+    else {
+        return;
+    };
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id: None,
+        path,
+        alias: Some("__java_package__".to_string()),
+        is_glob: false,
+        is_reexport: true,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", "package declaration"),
+    });
+}
+
+fn extract_java_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some(mut path) = raw
+        .trim()
+        .strip_prefix("import")
+        .map(|text| text.trim().trim_end_matches(';').trim().to_string())
+    else {
+        return;
+    };
+    let is_static = path.strip_prefix("static ").is_some();
+    if is_static {
+        path = path.trim_start_matches("static ").trim().to_string();
+    }
+    if path.is_empty() {
+        return;
+    }
+    let is_glob = path.ends_with(".*");
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        path,
+        alias: None,
+        is_glob,
+        is_reexport: false,
+        span: span_from_node(node),
+        provenance: Provenance::new(
+            "tree-sitter-java",
+            if is_static {
+                "static import declaration"
+            } else {
+                "import declaration"
+            },
+        ),
+    });
+}
+
+fn extract_java_method_invocation(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let raw = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        return;
+    }
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| method_name_from_text(&raw));
+    if name.is_empty() {
+        return;
+    }
+    let receiver = node
+        .child_by_field_name("object")
+        .or_else(|| node.child_by_field_name("receiver"))
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .or_else(|| receiver_from_method_text(&raw, &name));
+    let arity = node
+        .child_by_field_name("arguments")
+        .map(named_child_count)
+        .unwrap_or_default();
+
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: raw,
+        receiver,
+        arity,
+        kind: ParsedCallKind::Method,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", "method_invocation"),
+        confidence: Confidence::CandidateSet,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn extract_java_object_creation(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let target_text = node
+        .child_by_field_name("type")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| {
+            java_object_type_from_text(node_text(node, ctx.source).unwrap_or_default())
+        });
+    if target_text.is_empty() {
+        return;
+    }
+    let arity = node
+        .child_by_field_name("arguments")
+        .map(named_child_count)
+        .unwrap_or_default();
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name: last_path_segment(&target_text),
+        target_text: target_text.clone(),
+        receiver: receiver_from_direct_call(&target_text),
+        arity,
+        kind: ParsedCallKind::Direct,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", "object_creation_expression"),
+        confidence: Confidence::Heuristic,
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text: target_text,
+        kind: BodyHitKind::Call,
+        span: span_from_node(node),
+    });
+}
+
+fn extract_java_reference(
+    node: Node<'_>,
+    kind: ReferenceKind,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('@')
+        .to_string();
+    if text.is_empty() || is_java_keyword(&text) {
+        return;
+    }
+    let body_kind = match kind {
+        ReferenceKind::Identifier | ReferenceKind::Field => None,
+        ReferenceKind::Attribute => Some(BodyHitKind::Attribute),
+        ReferenceKind::Type => Some(BodyHitKind::Type),
+        ReferenceKind::Path => Some(BodyHitKind::Path),
+    };
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-java", format!("{} reference", node.kind())),
+    });
+    if let Some(body_kind) = body_kind {
+        ctx.body_hits.push(BodyHit {
+            file_id: ctx.file.id.clone(),
+            owner_id,
+            text,
+            kind: body_kind,
+            span: span_from_node(node),
+        });
+    }
+}
+
+fn dedup_java_facts(ctx: &mut ExtractContext<'_>) {
+    let mut references = HashSet::new();
+    ctx.references.retain(|reference| {
+        references.insert(format!(
+            "{}|{:?}|{}|{:?}|{}",
+            reference.file_id.0,
+            reference.owner_id.as_ref().map(|id| id.0.as_str()),
+            reference.text,
+            reference.kind,
+            reference.span.start_byte
+        ))
+    });
+    let mut body_hits = HashSet::new();
+    ctx.body_hits.retain(|hit| {
+        body_hits.insert(format!(
+            "{}|{:?}|{}|{:?}|{}",
+            hit.file_id.0,
+            hit.owner_id.as_ref().map(|id| id.0.as_str()),
+            hit.text,
+            hit.kind,
+            hit.span.start_byte
+        ))
+    });
 }
 
 fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
@@ -962,6 +1463,177 @@ fn extract_python_symbol_facts(
     }
 
     let _ = node;
+}
+
+fn java_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+    let raw = signature_text(node, node.child_by_field_name("body"), source);
+    let mut attributes = Vec::new();
+    for annotation in raw
+        .split_whitespace()
+        .filter(|part| part.starts_with('@'))
+        .map(|part| {
+            part.trim_start_matches('@')
+                .trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.')
+        })
+        .filter(|part| !part.is_empty())
+    {
+        attributes.push(format!("java:annotation:{annotation}"));
+        match annotation.rsplit('.').next().unwrap_or(annotation) {
+            "Test" | "ParameterizedTest" => attributes.push("junit:test".to_string()),
+            "Override" => attributes.push("java:override".to_string()),
+            _ => {}
+        }
+    }
+    attributes
+}
+
+fn java_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
+    let signature = signature_text(node, node.child_by_field_name("body"), source);
+    for visibility in ["public", "protected", "private"] {
+        if signature
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .any(|part| part == visibility)
+        {
+            return Some(visibility.to_string());
+        }
+    }
+    None
+}
+
+fn java_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut docs = Vec::new();
+    let Some(mut previous) = node.prev_named_sibling() else {
+        return docs;
+    };
+    while previous.kind() == "line_comment" || previous.kind() == "block_comment" {
+        if let Ok(text) = node_text(previous, source) {
+            let trimmed = text
+                .trim()
+                .trim_start_matches("/**")
+                .trim_start_matches("/*")
+                .trim_start_matches("//")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string();
+            if !trimmed.is_empty() {
+                docs.push(trimmed);
+            }
+        }
+        let Some(next_previous) = previous.prev_named_sibling() else {
+            break;
+        };
+        previous = next_previous;
+    }
+    docs.reverse();
+    docs
+}
+
+fn java_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for field in ["superclass", "interfaces"] {
+        if let Some(child) = node.child_by_field_name(field) {
+            collect_java_type_names(child, source, &mut names);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn java_signature_type_names(signature: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for token in signature
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '$'))
+    {
+        if token.is_empty()
+            || is_java_keyword(token)
+            || token
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_ascii_uppercase())
+        {
+            continue;
+        }
+        names.push(token.to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_java_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
+    if matches!(
+        node.kind(),
+        "type_identifier" | "scoped_type_identifier" | "generic_type"
+    ) && let Ok(text) = node_text(node, source)
+        && let Some(name) = java_type_name_from_text(text)
+    {
+        names.push(name);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_java_type_names(child, source, names);
+    }
+}
+
+fn java_type_name_from_text(text: &str) -> Option<String> {
+    let clean = text
+        .split('<')
+        .next()
+        .unwrap_or(text)
+        .trim()
+        .trim_end_matches("[]")
+        .to_string();
+    if clean.is_empty() || is_java_keyword(&clean) {
+        None
+    } else {
+        Some(clean)
+    }
+}
+
+fn java_field_type(node: Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind().contains("type") || child.kind() == "integral_type")
+        .and_then(|child| node_text(child, source).ok())
+        .and_then(java_type_name_from_text)
+}
+
+fn first_named_descendant_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = first_named_descendant_kind(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn java_object_type_from_text(raw: &str) -> String {
+    raw.split_once("new ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(raw)
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn is_java_test_symbol(
+    relative_path: &str,
+    kind: SymbolKind,
+    name: &str,
+    attributes: &[String],
+) -> bool {
+    matches!(kind, SymbolKind::Method | SymbolKind::Class)
+        && (relative_path.contains("/test/")
+            || relative_path.ends_with("Test.java")
+            || name.ends_with("Test")
+            || attributes.iter().any(|attribute| attribute == "junit:test"))
 }
 
 fn python_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
@@ -2181,6 +2853,76 @@ fn is_python_literal(kind: &str) -> bool {
     matches!(
         kind,
         "string" | "integer" | "float" | "true" | "false" | "none"
+    )
+}
+
+fn is_java_literal(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string_literal"
+            | "decimal_integer_literal"
+            | "decimal_floating_point_literal"
+            | "hex_integer_literal"
+            | "true"
+            | "false"
+            | "null_literal"
+            | "character_literal"
+    )
+}
+
+fn is_java_keyword(text: &str) -> bool {
+    matches!(
+        text,
+        "abstract"
+            | "assert"
+            | "boolean"
+            | "break"
+            | "byte"
+            | "case"
+            | "catch"
+            | "char"
+            | "class"
+            | "const"
+            | "continue"
+            | "default"
+            | "do"
+            | "double"
+            | "else"
+            | "enum"
+            | "extends"
+            | "final"
+            | "finally"
+            | "float"
+            | "for"
+            | "if"
+            | "goto"
+            | "implements"
+            | "import"
+            | "instanceof"
+            | "int"
+            | "interface"
+            | "long"
+            | "native"
+            | "new"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "short"
+            | "static"
+            | "strictfp"
+            | "super"
+            | "switch"
+            | "synchronized"
+            | "this"
+            | "throw"
+            | "throws"
+            | "transient"
+            | "try"
+            | "void"
+            | "volatile"
+            | "while"
     )
 }
 

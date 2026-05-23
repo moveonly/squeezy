@@ -179,3 +179,71 @@ jobs:
             target/semantic-graph-benchmark/*.json
             __summary.md
           if-no-files-found: error
+
+  java-semantic-graph-smoke:
+    name: Java semantic graph smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Show toolchains
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+          java -version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run Java semantic graph benchmark
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language java \
+            --fixture benchmarks/fixtures/java/semantic-cases \
+            --spec benchmarks/specs/java-smoke-queries.json \
+            --report target/semantic-graph-benchmark/java-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Write Java benchmark summary
+        run: |
+          python3 - <<'PY'
+          import json
+          report = json.load(open("target/semantic-graph-benchmark/java-smoke.json"))
+          oracle = report["java_oracle"]
+          acc = oracle["symbols"]
+          nav = oracle["navigation"]
+          with open("__java_summary.md", "w") as out:
+              print("## Java Semantic Graph Benchmark", file=out)
+              print("", file=out)
+              print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
+              print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
+              print(
+                  f"- Java oracle symbols: TP={acc['true_positive']} FP={acc['false_positive']} FN={acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
+                  file=out,
+              )
+              print(
+                  f"- Java navigation oracle: queries={nav['query_count']} TP={nav['true_positive']} FP={nav['false_positive']} FN={nav['false_negative']} precision={nav['precision']} recall={nav['recall']}",
+                  file=out,
+              )
+              print("", file=out)
+              print("| Query | Actual | Missing | Extras |", file=out)
+              print("|---|---:|---:|---:|", file=out)
+              for query in report["queries"]:
+                  print(
+                      f"| {query['id']} | {len(query['actual'])} | {len(query['missing'])} | {len(query['extras'])} |",
+                      file=out,
+                  )
+          PY
+          cat __java_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Java benchmark report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: java-semantic-graph-benchmark
+          path: |
+            target/semantic-graph-benchmark/java-smoke.json
+            __java_summary.md
+          if-no-files-found: error

@@ -77,6 +77,109 @@ fn semantic_pipeline_indexes_queries_and_refreshes_incrementally() {
     assert!(!manager.graph().find_symbol_by_name("extra").is_empty());
 }
 
+#[test]
+fn semantic_pipeline_refreshes_java_incrementally() {
+    let root = temp_root("semantic-pipeline-java");
+    let java_dir = root.join("src/main/java/com/example/app");
+    fs::create_dir_all(&java_dir).unwrap();
+    fs::write(root.join("README.md"), "# java case\n").unwrap();
+    fs::write(
+        root.join("pom.xml"),
+        r#"
+<project>
+  <build>
+    <sourceDirectory>src/main/java</sourceDirectory>
+    <testSourceDirectory>src/test/java</testSourceDirectory>
+  </build>
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("build.gradle"),
+        r#"
+plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation 'com.google.guava:guava:33.0.0-jre'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDir 'src/main/java'
+        }
+    }
+    test {
+        java {
+            srcDir 'src/test/java'
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    fs::write(java_dir.join("Runner.java"), initial_java_source()).unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        manager
+            .graph()
+            .signature_search(&SignatureQuery {
+                text: "class Runner".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: Some("public".to_string()),
+                attribute: None,
+            })
+            .iter()
+            .any(|symbol| symbol.name == "Runner")
+    );
+    let facts = manager
+        .graph()
+        .java_project_facts()
+        .iter()
+        .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+        .collect::<Vec<_>>();
+    assert!(facts.contains(&"maven:source_root:main:src/main/java".to_string()));
+    assert!(facts.contains(&"maven:test_root:test:src/test/java".to_string()));
+    assert!(
+        facts.contains(&"maven:dependency:test:org.junit.jupiter:junit-jupiter:5.10.0".to_string())
+    );
+    assert!(facts.contains(&"gradle:source_root:main:src/main/java".to_string()));
+    assert!(facts.contains(&"gradle:test_root:test:src/test/java".to_string()));
+    assert!(facts.contains(
+        &"gradle:dependency:implementation:com.google.guava:guava:33.0.0-jre".to_string()
+    ));
+
+    fs::write(java_dir.join("Runner.java"), updated_java_source()).unwrap();
+    manager.record_changed_path(java_dir.join("Runner.java"));
+    let report = manager.refresh_before_query().unwrap();
+
+    assert!(report.refreshed);
+    assert_eq!(report.reparsed_files, 1);
+    assert!(manager.graph().find_symbol_by_name("run").is_empty());
+    assert!(!manager.graph().find_symbol_by_name("execute").is_empty());
+}
+
 fn initial_source() -> &'static str {
     r#"
 pub struct Runner;
@@ -102,6 +205,34 @@ impl Runner {
 }
 
 fn helper_two() -> usize { 2 }
+"#
+}
+
+fn initial_java_source() -> &'static str {
+    r#"
+package com.example.app;
+
+public class Runner {
+    public void run() {
+        helper();
+    }
+
+    private void helper() {}
+}
+"#
+}
+
+fn updated_java_source() -> &'static str {
+    r#"
+package com.example.app;
+
+public class Runner {
+    public void execute() {
+        helper();
+    }
+
+    private void helper() {}
+}
 "#
 }
 

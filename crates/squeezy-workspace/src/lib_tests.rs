@@ -96,6 +96,55 @@ fn crawler_classifies_python_files() {
 }
 
 #[test]
+fn crawler_classifies_java_files() {
+    let root = temp_root("crawler_classifies_java_files");
+    fs::write(
+        root.join("Main.java"),
+        "package com.example;\nclass Main {}\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "Main.java")
+            .unwrap()
+            .language,
+        LanguageKind::Java
+    );
+}
+
+#[test]
+fn crawler_allows_larger_java_sources_by_default() {
+    let root = temp_root("crawler_allows_larger_java_sources_by_default");
+    let mut source = "class Large {\n".to_string();
+    source.push_str(&"void method() {}\n".repeat(80_000));
+    source.push_str("}\n");
+    assert!(source.len() > 1_000_000);
+    assert!(source.len() < 2_000_000);
+    fs::write(root.join("Large.java"), source).unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "Large.java")
+            .unwrap()
+            .language,
+        LanguageKind::Java
+    );
+}
+
+#[test]
 fn crawler_skips_roots_without_code_signals() {
     let root = temp_root("crawler_skips_roots_without_code_signals");
     fs::write(root.join("notes.txt"), "plain notes\n").unwrap();

@@ -14,8 +14,10 @@ The oracle is a benchmark/testing aid only; production navigation must not call
 benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
+  fixtures/java/semantic-cases/     # small Java package used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
+  specs/java-smoke-queries.json     # Java expected query results
   squeezy-graph-bench/              # benchmark CLI
 ```
 
@@ -55,6 +57,17 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --report target/semantic-graph-benchmark/python-real/requests.json \
   --ra-lsp-probes 0 \
   --no-speed-gate
+```
+
+Java smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language java \
+  --fixture benchmarks/fixtures/java/semantic-cases \
+  --spec benchmarks/specs/java-smoke-queries.json \
+  --report target/semantic-graph-benchmark/java-smoke.json \
+  --ra-lsp-probes 0
 ```
 
 The run fails if required expected results are missing, the fixture graph build
@@ -124,6 +137,28 @@ parser defects. The Python smoke spec also includes controlled navigation
 queries for route attributes, property references, and constructor-alias method
 calls; these are fixture oracles for syntax-only navigation behavior rather than
 runtime framework checks.
+
+For Java, the benchmark runs a JDK compiler tree API oracle when `java` is
+available and compares class/interface/enum/record/method/constructor
+declarations against Squeezy's tree-sitter graph. The oracle does not require
+successful type attribution and is not a production dependency. The TP/FP/FN
+numbers are declaration-only; they do not claim reference, call, dispatch,
+overload, generated-code, annotation-processor, or classpath completeness. If no
+JDK is available, the oracle is reported as skipped and the deterministic Java
+query spec still gates parser/navigation behavior. Java reports also include a
+fixture-query navigation oracle over `expected_contains` checks for references,
+call chains, and Maven/Gradle project facts; this is a minimum expected set, so
+per-query extras are reported but are not counted as false positives.
+
+Latest local Java release run on May 23, 2026:
+
+| Repo | Squeezy total | JDK oracle | TP | FP | FN | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| junit5 | 2,719 ms | 1,159 ms | 18,890 | 4 | 8 | 0.9998 | 0.9996 |
+| mockito | 805 ms | 843 ms | 8,928 | 0 | 0 | 1.0000 | 1.0000 |
+| guava | 20,804 ms | 2,056 ms | 66,217 | 0 | 0 | 1.0000 | 1.0000 |
+| retrofit | 502 ms | 643 ms | 3,505 | 0 | 0 | 1.0000 | 1.0000 |
+| picocli | 7,269 ms | 880 ms | 9,523 | 0 | 0 | 1.0000 | 1.0000 |
 
 ## Local Results
 
@@ -224,3 +259,12 @@ repository roots because formatter snapshots, parser fixtures, and future-syntax
 test corpora can contain Python files that tree-sitter can recover from but
 CPython `ast` rejects as non-modules. If such files appear anyway, the report
 counts them as `oracle_unparseable` instead of Squeezy false positives.
+
+`.github/workflows/java-semantic-graph-benchmark.yml` runs the Java smoke
+benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or
+workflow files. It writes Squeezy timing, JDK compiler tree oracle accuracy,
+query diffs, and raw JSON reports as a workflow artifact. Manual
+`workflow_dispatch` with `tier=full` additionally clones junit5, mockito, guava,
+retrofit, and picocli, then runs oracle-only FP/FN comparison against each repo
+root with the fixture speed gate disabled so external-corpus variance is
+reported rather than blocking the run.

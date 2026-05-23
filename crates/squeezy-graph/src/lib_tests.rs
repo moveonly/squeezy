@@ -94,6 +94,73 @@ def make():
 }
 
 #[test]
+fn graph_answers_java_navigation_queries() {
+    let mut parser = RustParser::new().unwrap();
+    let greeter = java_record(
+        "src/main/java/com/example/services/Greeter.java",
+        r#"
+package com.example.services;
+
+public class Greeter {
+    public String greet(String name) {
+        return name;
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.services.Greeter;
+
+public class Runner implements Runnable {
+    private final Greeter greeter;
+
+    public Runner(Greeter greeter) {
+        this.greeter = greeter;
+    }
+
+    public void run() {
+        greeter.greet("Ada");
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "class Runner".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: Some("public".to_string()),
+                attribute: None,
+            })
+            .iter()
+            .any(|symbol| symbol.name == "Runner")
+    );
+    let run = graph.find_symbol_by_name("run").pop().unwrap();
+    let greet = graph.find_symbol_by_name("greet").pop().unwrap();
+    assert!(graph.call_chain(&run.id, &greet.id, 3).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&graph.find_symbol_by_name("Greeter").pop().unwrap().id)
+            .iter()
+            .any(|hit| hit.reference.text == "Greeter")
+    );
+}
+
+#[test]
 fn graph_uses_python_navigation_heuristics() {
     let mut parser = RustParser::new().unwrap();
     let greeter = python_record(
@@ -1133,6 +1200,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn java_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Java;
     record
 }
 

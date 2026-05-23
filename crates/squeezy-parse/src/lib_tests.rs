@@ -287,6 +287,102 @@ fn extract_python_module_exports_requires_word_boundary() {
 }
 
 #[test]
+fn parser_extracts_java_symbols_imports_calls_and_references() {
+    let source = r#"
+package com.example.app;
+
+import com.example.services.Greeter;
+import static com.example.util.Names.defaultName;
+
+public class Runner extends BaseRunner implements Runnable {
+    private final Greeter greeter;
+
+    public Runner(Greeter greeter) {
+        this.greeter = greeter;
+    }
+
+    @Override
+    public void run() {
+        String name = defaultName();
+        greeter.greet(name);
+        new Helper().assist();
+    }
+}
+
+record Helper(String name) {
+    void assist() {}
+}
+
+@interface Route {
+    String value();
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = java_record("src/main/java/com/example/app/Runner.java", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "com.example.app" && import.alias.as_deref() == Some("__java_package__")
+    }));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "com.example.services.Greeter")
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Runner"
+            && symbol.kind == SymbolKind::Class
+            && symbol.visibility.as_deref() == Some("public")
+            && symbol.attributes.contains(&"base:BaseRunner".to_string())
+            && symbol.attributes.contains(&"base:Runnable".to_string())
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Helper" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "greeter" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "defaultName" && call.kind == ParsedCallKind::Method)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "greet" && call.receiver.as_deref() == Some("greeter"))
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "Helper" && call.kind == ParsedCallKind::Direct)
+    );
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Greeter" && reference.kind == ReferenceKind::Type)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "value" && symbol.kind == SymbolKind::Method)
+    );
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -522,6 +618,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn java_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Java;
     record
 }
 

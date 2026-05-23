@@ -131,6 +131,15 @@ pub struct CallEdgeHit {
     pub edge: GraphEdge,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JavaProjectFact {
+    pub provider: String,
+    pub kind: String,
+    pub value: String,
+    pub source_file: FileId,
+    pub provenance: Provenance,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphStats {
     pub files: usize,
@@ -150,6 +159,7 @@ pub struct SemanticGraph {
     calls: Vec<ParsedCall>,
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
+    java_project_facts: Vec<JavaProjectFact>,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
     symbol_signature_lower: HashMap<SymbolId, String>,
     signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
@@ -171,6 +181,7 @@ impl SemanticGraph {
             calls: Vec::new(),
             references: Vec::new(),
             body_hits: Vec::new(),
+            java_project_facts: Vec::new(),
             symbols_by_name: HashMap::new(),
             symbol_signature_lower: HashMap::new(),
             signature_trigram_index: HashMap::new(),
@@ -188,6 +199,7 @@ impl SemanticGraph {
         for file in files {
             graph.insert_parsed_file(file);
         }
+        graph.rebuild_java_project_facts();
         graph.rebuild_semantic_edges();
         graph.rebuild_indexes();
         graph
@@ -202,12 +214,14 @@ impl SemanticGraph {
             self.remove_file_data(&file.file.id);
             self.insert_parsed_file(file);
         }
+        self.rebuild_java_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
 
     pub fn remove_file(&mut self, file_id: &FileId) {
         self.remove_file_data(file_id);
+        self.rebuild_java_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -220,6 +234,8 @@ impl SemanticGraph {
         self.references
             .retain(|reference| &reference.file_id != file_id);
         self.body_hits.retain(|hit| &hit.file_id != file_id);
+        self.java_project_facts
+            .retain(|fact| &fact.source_file != file_id);
         self.edges.retain(|edge| {
             self.symbols.contains_key(&edge.from)
                 && edge
@@ -243,6 +259,10 @@ impl SemanticGraph {
 
     pub fn edges(&self) -> &[GraphEdge] {
         &self.edges
+    }
+
+    pub fn java_project_facts(&self) -> &[JavaProjectFact] {
+        &self.java_project_facts
     }
 
     pub fn hierarchy(&self, root: Option<&SymbolId>, max_depth: usize) -> Vec<HierarchyNode> {
@@ -519,6 +539,87 @@ impl SemanticGraph {
         self.body_hits.extend(file.body_hits.clone());
     }
 
+    fn rebuild_java_project_facts(&mut self) {
+        self.java_project_facts.clear();
+        let metadata_files = self
+            .files
+            .values()
+            .filter_map(|file| {
+                java_build_metadata_provider(file).map(|provider| (provider, file.clone()))
+            })
+            .collect::<Vec<_>>();
+        if metadata_files.is_empty() {
+            return;
+        }
+
+        let java_paths = self
+            .files
+            .values()
+            .filter(|file| file.language == LanguageKind::Java)
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        let mut dedup = BTreeSet::new();
+
+        for (provider, file) in metadata_files {
+            let java_path_refs = java_paths.iter().map(String::as_str).collect::<Vec<_>>();
+            for (kind, value, reason) in java_source_root_facts(provider, &java_path_refs) {
+                self.push_java_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+
+            let Ok(source) = std::fs::read_to_string(&file.path) else {
+                continue;
+            };
+            for value in java_dependency_facts(provider, &source) {
+                self.push_java_project_fact(
+                    &mut dedup,
+                    provider,
+                    "dependency",
+                    value,
+                    &file,
+                    "build dependency coordinate",
+                );
+            }
+            for (kind, value, reason) in java_configured_source_facts(provider, &source) {
+                self.push_java_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+        }
+
+        self.java_project_facts.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.value.cmp(&right.value))
+        });
+    }
+
+    fn push_java_project_fact(
+        &mut self,
+        dedup: &mut BTreeSet<(String, String, String, String)>,
+        provider: &str,
+        kind: &str,
+        value: String,
+        file: &FileRecord,
+        reason: &str,
+    ) {
+        if value.is_empty()
+            || !dedup.insert((
+                provider.to_string(),
+                kind.to_string(),
+                value.clone(),
+                file.id.0.clone(),
+            ))
+        {
+            return;
+        }
+        self.java_project_facts.push(JavaProjectFact {
+            provider: provider.to_string(),
+            kind: kind.to_string(),
+            value,
+            source_file: file.id.clone(),
+            provenance: Provenance::new(provider, reason),
+        });
+    }
+
     fn rebuild_semantic_edges(&mut self) {
         self.edges.retain(|edge| {
             edge.kind == EdgeKind::Contains
@@ -529,18 +630,26 @@ impl SemanticGraph {
                     .map(|to| self.symbols.contains_key(to))
                     .unwrap_or(true)
         });
-        self.rebuild_indexes();
+        self.rebuild_resolution_indexes();
 
-        let imports = self.imports.clone();
-        let calls = self.calls.clone();
-        let references = self.references.clone();
+        let imports = std::mem::take(&mut self.imports);
         self.add_import_edges(&imports);
+        self.imports = imports;
+
+        let calls = std::mem::take(&mut self.calls);
         self.add_call_edges(&calls);
+        self.calls = calls;
+
+        let references = std::mem::take(&mut self.references);
         self.add_reference_edges(&references);
+        self.references = references;
     }
 
     fn add_import_edges(&mut self, imports: &[ParsedImport]) {
         for import in imports {
+            if import.alias.as_deref() == Some("__java_package__") {
+                continue;
+            }
             let file_symbol_id = file_symbol_id(&import.file_id);
             let from = import
                 .owner_id
@@ -600,6 +709,9 @@ impl SemanticGraph {
 
     fn add_reference_edges(&mut self, references: &[ParsedReference]) {
         for reference in references {
+            if self.should_skip_reference_edge(reference) {
+                continue;
+            }
             let file_symbol_id = file_symbol_id(&reference.file_id);
             let from = reference
                 .owner_id
@@ -611,6 +723,9 @@ impl SemanticGraph {
                 [] => (None, Confidence::External),
                 _ => (None, Confidence::CandidateSet),
             };
+            if to.is_none() {
+                continue;
+            }
             self.edges.push(GraphEdge {
                 from,
                 to,
@@ -622,6 +737,19 @@ impl SemanticGraph {
                 provenance: reference.provenance.clone(),
             });
         }
+    }
+
+    fn should_skip_reference_edge(&self, reference: &ParsedReference) -> bool {
+        self.files
+            .get(&reference.file_id)
+            .map(|file| {
+                file.language == LanguageKind::Java
+                    && matches!(
+                        reference.kind,
+                        ReferenceKind::Identifier | ReferenceKind::Field
+                    )
+            })
+            .unwrap_or(false)
     }
 
     fn resolve_call(
@@ -689,6 +817,9 @@ impl SemanticGraph {
         }
 
         if call.kind == ParsedCallKind::Method {
+            if let Some(id) = self.java_receiver_field_method(caller_id, call) {
+                return (Some(id), Confidence::Heuristic, "java field receiver");
+            }
             if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
                 return (Some(id), Confidence::Heuristic, "constructor alias");
             }
@@ -860,6 +991,7 @@ impl SemanticGraph {
             .imports
             .iter()
             .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
         {
             let alias_or_name = import
                 .alias
@@ -880,7 +1012,14 @@ impl SemanticGraph {
         let mut path = self
             .files
             .get(&symbol.file_id)
-            .map(|file| module_path_for_file(&file.relative_path))
+            .map(|file| {
+                if file.language == LanguageKind::Java {
+                    self.java_package_for_file(&symbol.file_id)
+                        .unwrap_or_else(|| module_path_for_file(&file.relative_path))
+                } else {
+                    module_path_for_file(&file.relative_path)
+                }
+            })
             .unwrap_or_else(|| vec!["crate".to_string()]);
         let mut modules = Vec::new();
         let mut parent_id = symbol.parent_id.as_ref();
@@ -896,6 +1035,16 @@ impl SemanticGraph {
         modules.reverse();
         path.extend(modules);
         path
+    }
+
+    fn java_package_for_file(&self, file_id: &FileId) -> Option<Vec<String>> {
+        self.imports
+            .iter()
+            .find(|import| {
+                import.file_id == *file_id && import.alias.as_deref() == Some("__java_package__")
+            })
+            .map(|import| path_segments(&import.path))
+            .filter(|segments| !segments.is_empty())
     }
 
     fn same_file_direct_call(
@@ -996,6 +1145,10 @@ impl SemanticGraph {
                 .iter()
                 .filter_map(|id| self.symbols.get(id))
                 .filter(|symbol| {
+                    if caller_file.language == LanguageKind::Java {
+                        return self.java_package_for_file(&symbol.file_id)
+                            == self.java_package_for_file(&caller.file_id);
+                    }
                     self.files
                         .get(&symbol.file_id)
                         .map(|file| {
@@ -1023,6 +1176,7 @@ impl SemanticGraph {
         self.imports
             .iter()
             .filter(|import| self.import_visible_from_symbol(import, caller))
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .filter(|import| {
                 import
                     .alias
@@ -1034,12 +1188,23 @@ impl SemanticGraph {
     }
 
     fn import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        if import.alias.as_deref() == Some("__java_package__") {
+            return false;
+        }
         if last_path_segment(&import.path) != symbol.name {
             return false;
         }
         let Some(file) = self.files.get(&symbol.file_id) else {
             return true;
         };
+        if file.language == squeezy_core::LanguageKind::Java {
+            let mut import_segments = path_segments(&import.path);
+            if !import.is_glob {
+                import_segments.pop();
+            }
+            return !import_segments.is_empty()
+                && self.java_package_for_file(&symbol.file_id) == Some(import_segments);
+        }
         if file.language != squeezy_core::LanguageKind::Python {
             return true;
         }
@@ -1195,6 +1360,101 @@ impl SemanticGraph {
             return Some(class);
         }
         self.python_class_for_alias_in_scope(caller, &target_name, before_byte, depth + 1)
+    }
+
+    fn java_receiver_field_method(
+        &self,
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        let receiver = call.receiver.as_deref()?;
+        if matches!(receiver, "this" | "super") || receiver.contains(' ') || receiver.contains('(')
+        {
+            return None;
+        }
+        let class_id = self.java_class_for_caller(caller_id)?;
+        let field = self
+            .children_by_parent
+            .get(&class_id)?
+            .iter()
+            .find_map(|child_id| {
+                self.symbols
+                    .get(child_id)
+                    .filter(|symbol| symbol.kind == SymbolKind::Field && symbol.name == receiver)
+            })?;
+        let type_name = field
+            .attributes
+            .iter()
+            .find_map(|attribute| attribute.strip_prefix("type:"))?;
+        let class_id = self
+            .java_class_candidates_for_name_in_file(&field.file_id, type_name)
+            .first()?
+            .clone();
+        self.java_method_on_class(&class_id, &call.name)
+    }
+
+    fn java_class_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        if matches!(
+            caller.kind,
+            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+        ) {
+            return Some(caller.id.clone());
+        }
+        let mut current = caller.parent_id.clone();
+        while let Some(id) = current {
+            let symbol = self.symbols.get(&id)?;
+            if matches!(
+                symbol.kind,
+                SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+            ) {
+                return Some(symbol.id.clone());
+            }
+            current = symbol.parent_id.clone();
+        }
+        None
+    }
+
+    fn java_class_candidates_for_name_in_file(
+        &self,
+        file_id: &FileId,
+        name: &str,
+    ) -> Vec<SymbolId> {
+        let direct_name = last_path_segment(name);
+        let mut class_ids = self
+            .symbols_by_name_or_scan(&direct_name)
+            .into_iter()
+            .filter_map(|id| self.symbols.get(&id))
+            .filter(|symbol| {
+                matches!(
+                    symbol.kind,
+                    SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
+                )
+            })
+            .filter(|symbol| {
+                symbol.file_id == *file_id
+                    || self.java_package_for_file(&symbol.file_id)
+                        == self.java_package_for_file(file_id)
+                    || self.imports.iter().any(|import| {
+                        import.file_id == *file_id && self.import_matches_symbol(import, symbol)
+                    })
+            })
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        class_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        class_ids.dedup();
+        class_ids
+    }
+
+    fn java_method_on_class(&self, class_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
+        single_symbol(
+            self.children_by_parent
+                .get(class_id)?
+                .iter()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(|symbol| symbol.kind == SymbolKind::Method && symbol.name == method_name)
+                .map(|symbol| symbol.id.clone()),
+        )
     }
 
     fn python_receiver_module_paths(
@@ -1515,6 +1775,7 @@ impl SemanticGraph {
         self.imports
             .iter()
             .filter(|import| self.import_visible_from_reference(import, reference))
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
             .any(|import| self.import_matches_symbol(import, symbol))
     }
@@ -1586,6 +1847,14 @@ impl SemanticGraph {
         ) {
             return true;
         }
+        if matches!(
+            (symbol_file.language, reference_file.language),
+            (LanguageKind::Java, LanguageKind::Java)
+        ) {
+            return self.java_package_for_file(&symbol.file_id)
+                == self.java_package_for_file(&reference.file_id)
+                || self.imported_reference_matches_symbol(symbol, reference);
+        }
         package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path)
     }
 
@@ -1599,6 +1868,7 @@ impl SemanticGraph {
             .imports
             .iter()
             .filter(|import| import.file_id == reference.file_id)
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 if import.is_glob
                     || !import.span.contains_byte(reference.span.start_byte)
@@ -1644,6 +1914,7 @@ impl SemanticGraph {
         self.imports
             .iter()
             .filter(|import| import.file_id == reference.file_id)
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 if path_starts_with_external_root(&import.path) {
                     return false;
@@ -1702,6 +1973,7 @@ impl SemanticGraph {
         self.imports
             .iter()
             .filter(|import| import.file_id == reference.file_id)
+            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 let alias_or_name = import
                     .alias
@@ -2229,19 +2501,8 @@ impl SemanticGraph {
             self.symbol_signature_lower.insert(symbol.id.clone(), lower);
         }
 
-        self.body_hit_text_lower = self
-            .body_hits
-            .iter()
-            .map(|hit| hit.text.to_lowercase())
-            .collect();
-        for (index, lower) in self.body_hit_text_lower.iter().enumerate() {
-            for trigram in unique_trigrams(lower) {
-                self.body_hit_trigram_index
-                    .entry(trigram)
-                    .or_default()
-                    .push(index);
-            }
-        }
+        // Body hits can dominate large Java repositories. Keep this index lazy:
+        // body_search does a direct scan so cold graph builds stay cheap.
 
         for (index, reference) in self.references.iter().enumerate() {
             self.references_by_text
@@ -2282,6 +2543,29 @@ impl SemanticGraph {
         }
     }
 
+    fn rebuild_resolution_indexes(&mut self) {
+        self.symbols_by_name.clear();
+        self.children_by_parent.clear();
+
+        for symbol in self.symbols.values() {
+            self.symbols_by_name
+                .entry(symbol.name.clone())
+                .or_default()
+                .push(symbol.id.clone());
+        }
+
+        for edge in &self.edges {
+            if edge.kind == EdgeKind::Contains
+                && let Some(to) = &edge.to
+            {
+                self.children_by_parent
+                    .entry(edge.from.clone())
+                    .or_default()
+                    .push(to.clone());
+            }
+        }
+    }
+
     fn symbols_by_name_or_scan(&self, name: &str) -> Vec<SymbolId> {
         self.symbols_by_name.get(name).cloned().unwrap_or_default()
     }
@@ -2298,26 +2582,10 @@ impl SemanticGraph {
     }
 
     fn body_hit_candidates(&self, needle: &str) -> Vec<&BodyHit> {
-        match rarest_indexed_trigram(needle, &self.body_hit_trigram_index) {
-            CandidateSet::All => self
-                .body_hits
-                .iter()
-                .zip(self.body_hit_text_lower.iter())
-                .filter(|(_, lower)| lower.contains(needle))
-                .map(|(hit, _)| hit)
-                .collect(),
-            CandidateSet::None => Vec::new(),
-            CandidateSet::Indexes(indexes) => indexes
-                .into_iter()
-                .filter_map(|index| {
-                    let lower = self.body_hit_text_lower.get(index)?;
-                    lower
-                        .contains(needle)
-                        .then(|| self.body_hits.get(index))
-                        .flatten()
-                })
-                .collect(),
-        }
+        self.body_hits
+            .iter()
+            .filter(|hit| hit.text.to_lowercase().contains(needle))
+            .collect()
     }
 }
 
@@ -2411,6 +2679,7 @@ pub struct RefreshReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
+    pub java_files: usize,
     pub rust_files: usize,
     pub supported_files: usize,
     pub unsupported_files: usize,
@@ -2603,6 +2872,10 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     let mut report = LanguageReport::default();
     for record in records {
         match record.language {
+            LanguageKind::Java => {
+                report.java_files += 1;
+                report.supported_files += 1;
+            }
             LanguageKind::Python => {
                 report.supported_files += 1;
             }
@@ -2648,6 +2921,216 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
 
 fn file_symbol_id(file_id: &FileId) -> SymbolId {
     SymbolId::new(format!("file:{}", file_id.0))
+}
+
+fn java_build_metadata_provider(file: &FileRecord) -> Option<&'static str> {
+    match file.relative_path.as_str() {
+        "pom.xml" => Some("maven"),
+        "build.gradle" | "build.gradle.kts" | "settings.gradle" | "settings.gradle.kts" => {
+            Some("gradle")
+        }
+        _ => None,
+    }
+}
+
+fn java_source_root_facts(
+    provider: &str,
+    java_paths: &[&str],
+) -> Vec<(&'static str, String, &'static str)> {
+    let mut roots = BTreeSet::new();
+    for path in java_paths {
+        let segments = path.split('/').collect::<Vec<_>>();
+        if segments.len() >= 4 && segments[0] == "src" && segments[2] == "java" {
+            let source_set = segments[1];
+            roots.insert((source_set.to_string(), format!("src/{source_set}/java")));
+        }
+        if let Some(root) = generated_source_root(path) {
+            roots.insert(("generated".to_string(), root));
+        }
+    }
+
+    let mut facts = Vec::new();
+    for (source_set, root) in roots {
+        let kind = if source_set == "generated" {
+            "generated_exclusion"
+        } else if source_set.to_ascii_lowercase().contains("test") {
+            "test_root"
+        } else {
+            "source_root"
+        };
+        let reason = if provider == "maven" {
+            "Maven Java source layout"
+        } else {
+            "Gradle Java source layout"
+        };
+        facts.push((kind, format!("{source_set}:{root}"), reason));
+    }
+    facts
+}
+
+fn java_configured_source_facts(
+    provider: &str,
+    source: &str,
+) -> Vec<(&'static str, String, &'static str)> {
+    match provider {
+        "maven" => maven_configured_source_facts(source),
+        "gradle" => gradle_configured_source_facts(source),
+        _ => Vec::new(),
+    }
+}
+
+fn maven_configured_source_facts(source: &str) -> Vec<(&'static str, String, &'static str)> {
+    let mut facts = Vec::new();
+    for value in tag_values(source, "sourceDirectory") {
+        facts.push((
+            "source_root",
+            format!("main:{value}"),
+            "Maven configured sourceDirectory",
+        ));
+    }
+    for value in tag_values(source, "testSourceDirectory") {
+        facts.push((
+            "test_root",
+            format!("test:{value}"),
+            "Maven configured testSourceDirectory",
+        ));
+    }
+    facts
+}
+
+fn gradle_configured_source_facts(source: &str) -> Vec<(&'static str, String, &'static str)> {
+    let mut facts = Vec::new();
+    for line in source.lines().map(str::trim) {
+        if line.starts_with("//") || !line.contains("srcDir") {
+            continue;
+        }
+        let Some(path) = first_quoted_value(line) else {
+            continue;
+        };
+        let source_set = path
+            .strip_prefix("src/")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(source_set, _)| source_set)
+            .unwrap_or("main");
+        let kind = if source_set.to_ascii_lowercase().contains("test") {
+            "test_root"
+        } else {
+            "source_root"
+        };
+        facts.push((
+            kind,
+            format!("{source_set}:{path}"),
+            "Gradle configured srcDir",
+        ));
+    }
+    facts
+}
+
+fn java_dependency_facts(provider: &str, source: &str) -> Vec<String> {
+    match provider {
+        "maven" => maven_dependency_facts(source),
+        "gradle" => gradle_dependency_facts(source),
+        _ => Vec::new(),
+    }
+}
+
+fn maven_dependency_facts(source: &str) -> Vec<String> {
+    let mut facts = Vec::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("<dependency>") {
+        rest = &rest[start + "<dependency>".len()..];
+        let Some(end) = rest.find("</dependency>") else {
+            break;
+        };
+        let block = &rest[..end];
+        rest = &rest[end + "</dependency>".len()..];
+
+        let Some(group_id) = first_tag_value(block, "groupId") else {
+            continue;
+        };
+        let Some(artifact_id) = first_tag_value(block, "artifactId") else {
+            continue;
+        };
+        let version = first_tag_value(block, "version").unwrap_or_else(|| "?".to_string());
+        let scope = first_tag_value(block, "scope").unwrap_or_else(|| "compile".to_string());
+        facts.push(format!("{scope}:{group_id}:{artifact_id}:{version}"));
+    }
+    facts
+}
+
+fn gradle_dependency_facts(source: &str) -> Vec<String> {
+    let mut facts = Vec::new();
+    for line in source.lines().map(str::trim) {
+        if line.starts_with("//") {
+            continue;
+        }
+        let Some(coordinate) = first_quoted_value(line) else {
+            continue;
+        };
+        if coordinate.matches(':').count() < 2 {
+            continue;
+        }
+        let config = line
+            .split(|ch: char| ch.is_whitespace() || ch == '(')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if config.is_empty() {
+            continue;
+        }
+        facts.push(format!("{config}:{coordinate}"));
+    }
+    facts
+}
+
+fn tag_values(source: &str, tag: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut rest = source;
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    while let Some(start) = rest.find(&open) {
+        let value_start = start + open.len();
+        let Some(value_len) = rest[value_start..].find(&close) else {
+            break;
+        };
+        let value_end = value_start + value_len;
+        let value = rest[value_start..value_end].trim();
+        if !value.is_empty() {
+            values.push(value.to_string());
+        }
+        rest = &rest[value_end + close.len()..];
+    }
+    values
+}
+
+fn first_tag_value(source: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = source.find(&open)? + open.len();
+    let end = source[start..].find(&close)? + start;
+    Some(source[start..end].trim().to_string()).filter(|value| !value.is_empty())
+}
+
+fn first_quoted_value(line: &str) -> Option<String> {
+    let quote_start = line.find(['"', '\''])?;
+    let quote = line.as_bytes()[quote_start] as char;
+    let rest = &line[quote_start + 1..];
+    let quote_end = rest.find(quote)?;
+    Some(rest[..quote_end].trim().to_string()).filter(|value| !value.is_empty())
+}
+
+fn generated_source_root(path: &str) -> Option<String> {
+    for marker in [
+        "target/generated-sources/",
+        "build/generated/",
+        "generated-src/",
+        "src/generated/java/",
+    ] {
+        if path.starts_with(marker) {
+            return Some(marker.trim_end_matches('/').to_string());
+        }
+    }
+    None
 }
 
 fn last_path_segment(path: &str) -> String {
@@ -2757,13 +3240,22 @@ fn constructor_reference_can_bind_symbol(
 fn path_starts_with_external_root(path: &str) -> bool {
     path.split("::")
         .next()
+        .unwrap_or(path)
+        .split('.')
+        .next()
         .map(str::trim)
-        .map(|root| matches!(root, "std" | "core" | "alloc" | "proc_macro"))
+        .map(|root| {
+            matches!(
+                root,
+                "std" | "core" | "alloc" | "proc_macro" | "java" | "javax" | "jakarta"
+            )
+        })
         .unwrap_or(false)
 }
 
 fn path_segments(path: &str) -> Vec<String> {
     path.split("::")
+        .flat_map(|segment| segment.split('.'))
         .map(str::trim)
         .filter(|segment| !segment.is_empty())
         .map(|segment| {

@@ -1,0 +1,75 @@
+{
+  "queries": [
+    {
+      "id": "java-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Runner",
+        "Class:BaseRunner",
+        "Trait:Greeter",
+        "Class:FriendlyGreeter",
+        "Struct:Helper",
+        "Enum:Names",
+        "Method:run",
+        "Method:greet",
+        "Method:prepareName",
+        "Method:defaultName"
+      ]
+    },
+    {
+      "id": "java-class-signature",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:Runner"
+      ]
+    },
+    {
+      "id": "java-inheritance-reference",
+      "kind": "references_to_symbol",
+      "to": "Greeter",
+      "expected_contains": [
+        "Greeter"
+      ]
+    },
+    {
+      "id": "java-constructor-chain",
+      "kind": "call_chain",
+      "from": "buildDefault",
+      "to": "Runner",
+      "expected_contains": [
+        "buildDefault -> Runner"
+      ]
+    },
+    {
+      "id": "java-field-receiver-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "greet",
+      "expected_contains": [
+        "run -> greet"
+      ]
+    },
+    {
+      "id": "java-reference-search",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": [
+        "Runner"
+      ]
+    },
+    {
+      "id": "java-project-facts",
+      "kind": "java_project_facts",
+      "expected_contains": [
+        "gradle:source_root:main:src/main/java",
+        "gradle:test_root:test:src/test/java",
+        "gradle:dependency:implementation:com.google.guava:guava:33.0.0-jre",
+        "maven:source_root:main:src/main/java",
+        "maven:test_root:test:src/test/java",
+        "maven:dependency:test:org.junit.jupiter:junit-jupiter:5.10.0"
+      ]
+    }
+  ]
+}

@@ -1,4 +1,7 @@
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use squeezy_core::{AppConfig, CostSnapshot, DEFAULT_TELEMETRY_ENDPOINT, TurnMetrics};
 
@@ -11,11 +14,7 @@ fn disabled_client_does_not_send() {
 
 #[test]
 fn telemetry_disabled_when_install_id_cannot_be_persisted() {
-    let root = std::env::temp_dir().join(format!(
-        "squeezy-telemetry-install-block-{}-{}",
-        now_ms(),
-        std::process::id()
-    ));
+    let root = telemetry_temp_root("install-block");
     fs::create_dir_all(&root).unwrap();
     // Use a path whose parent already exists as a file, so create_dir_all
     // and the subsequent write both fail deterministically.
@@ -37,11 +36,7 @@ fn telemetry_disabled_when_install_id_cannot_be_persisted() {
 
 #[test]
 fn install_id_is_persisted() {
-    let root = std::env::temp_dir().join(format!(
-        "squeezy-telemetry-install-{}-{}",
-        now_ms(),
-        std::process::id()
-    ));
+    let root = telemetry_temp_root("install-id");
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -61,11 +56,7 @@ fn install_id_is_persisted() {
 
 #[tokio::test]
 async fn record_buffers_events_for_periodic_batch_flush() {
-    let root = std::env::temp_dir().join(format!(
-        "squeezy-telemetry-record-{}-{}",
-        now_ms(),
-        std::process::id()
-    ));
+    let root = telemetry_temp_root("batch-flush");
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -169,4 +160,12 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
     assert!(text.contains("\"rust_files\":8"));
     assert!(text.contains("\"unsupported_files\":3"));
     assert!(!text.contains("/Users/"));
+}
+
+fn telemetry_temp_root(name: &str) -> std::path::PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("squeezy-telemetry-{name}-{nonce}"))
 }

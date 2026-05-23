@@ -10,6 +10,8 @@ use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, Squeezy
 pub const CRATE_NAME: &str = "squeezy-workspace";
 const SOURCE_SCAN_MAX_DEPTH: usize = 2;
 const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
+const DEFAULT_MAX_FILE_BYTES: u64 = 1_000_000;
+const DEFAULT_JAVA_MAX_FILE_BYTES: u64 = 2_000_000;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -26,7 +28,7 @@ impl Default for CrawlOptions {
     fn default() -> Self {
         Self {
             include_hidden: false,
-            max_file_bytes: 1_000_000,
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
             require_indexing_signal: true,
         }
     }
@@ -137,8 +139,15 @@ impl WorkspaceCrawler {
                 .extension()
                 .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
+            let max_file_bytes = if language == LanguageKind::Java
+                && self.options.max_file_bytes == DEFAULT_MAX_FILE_BYTES
+            {
+                DEFAULT_JAVA_MAX_FILE_BYTES
+            } else {
+                self.options.max_file_bytes
+            };
 
-            if size_bytes > self.options.max_file_bytes {
+            if size_bytes > max_file_bytes {
                 unsupported.push(unsupported_file(
                     &path,
                     relative_path,
@@ -205,6 +214,7 @@ impl WorkspaceCrawler {
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("java") => LanguageKind::Java,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
@@ -437,6 +447,7 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::Java => signals.push("shallow Java source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
             _ => {
