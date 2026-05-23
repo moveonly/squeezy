@@ -610,10 +610,14 @@ pub fn classify_language(path: &Path) -> LanguageKind {
         // header naming is conventionally C++-leaning in modern code.
         Some("h") => LanguageKind::Cpp,
         Some("cs") | Some("csx") => LanguageKind::CSharp,
+        Some("cjs" | "js" | "mjs") => LanguageKind::JavaScript,
+        Some("cts" | "mts" | "ts") => LanguageKind::TypeScript,
         Some("go") => LanguageKind::Go,
         Some("java") => LanguageKind::Java,
+        Some("jsx") => LanguageKind::Jsx,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
+        Some("tsx") => LanguageKind::Tsx,
         Some(_) => LanguageKind::Unsupported,
         None => LanguageKind::Unknown,
     }
@@ -922,8 +926,14 @@ fn collect_source_markers(
             LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
             LanguageKind::Go => signals.push("shallow Go source".to_string()),
             LanguageKind::Java => signals.push("shallow Java source".to_string()),
+            LanguageKind::JavaScript | LanguageKind::Jsx => {
+                signals.push("shallow JavaScript source".to_string())
+            }
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
+            LanguageKind::TypeScript | LanguageKind::Tsx => {
+                signals.push("shallow TypeScript source".to_string())
+            }
             _ => {
                 if let Some(label) = code_extension_signal(&path) {
                     signals.push(label);

@@ -6,7 +6,7 @@ The production graph runner uses Squeezy's tree-sitter parsers and in-memory
 graph. The oracle tier validates each fixture with a slower language-specific
 checker and compares Squeezy query output against checked query specifications.
 The oracle is a benchmark/testing aid only; production navigation must not call
-`rustc`, LSP, `rust-analyzer`, or Python runtime analysis.
+`rustc`, LSP, `rust-analyzer`, Python runtime analysis, Node, or TypeScript.
 
 ## Layout
 
@@ -14,12 +14,14 @@ The oracle is a benchmark/testing aid only; production navigation must not call
 benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
+  fixtures/js-ts/semantic-cases/    # small JS/TS package used by smoke CI
   fixtures/java/semantic-cases/     # small Java package used by smoke CI
   fixtures/go/semantic-cases/       # small Go module used by smoke CI
   fixtures/c/semantic-cases/        # small C project used by smoke CI
   fixtures/cpp/semantic-cases/      # small C++ project used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
+  specs/js-ts-smoke-queries.json    # JS/TS expected query results
   specs/java-smoke-queries.json     # Java expected query results
   specs/go-smoke-queries.json       # Go expected query results
   specs/c-smoke-queries.json        # C expected query results
@@ -64,6 +66,68 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --ra-lsp-probes 0 \
   --no-speed-gate
 ```
+
+JS/TS smoke (with mixed workload against redux/src):
+
+```sh
+mkdir -p target/benchmark-repos
+git clone --depth 1 https://github.com/reduxjs/redux target/benchmark-repos/redux
+
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language typescript \
+  --fixture benchmarks/fixtures/js-ts/semantic-cases \
+  --spec benchmarks/specs/js-ts-smoke-queries.json \
+  --report target/semantic-graph-benchmark/js-ts-smoke.json \
+  --mixed-repo target/benchmark-repos/redux/src \
+  --mixed-iterations 500 \
+  --ra-lsp-probes 25 \
+  --no-speed-gate
+```
+
+When the pinned Node `typescript` package is installed, the JS/TS benchmark runs
+three oracle tiers:
+1. **Declaration oracle** — TypeScript compiler API compares exported symbol
+   TP/FP/FN for file/name/kind declarations.
+2. **Mixed workload** — all nine query types (hierarchy, symbol lookup, signature
+   search, body search, reference search, references-to-symbol, callers, callees,
+   call-chain) against real JS/TS repos, plus a two-file refresh probe.
+3. **Navigation oracle** — TypeScript Language Service `getDefinitionAtPosition`
+   and `findReferences` probes on sampled call edges and declaration symbols,
+   producing definition TP/FP/FN (including `wrong_target` and `squeezy_only`
+   counts) and reference TP/FP/FN, mirroring the rust-analyzer LSP probes on the
+   Rust benchmark. `--ra-lsp-probes 0` disables the navigation oracle; `--ra-lsp-probes 25`
+   (default) samples 25 definition probes and 25 reference probes.
+
+If Node or TypeScript is unavailable the report records that status explicitly
+and still validates the tree-sitter query spec.
+
+JS/TS full-tier comparison uses five representative open-source repositories:
+Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the
+TypeScript compiler API oracle and the post-merge heuristics produced:
+
+| Repo | Squeezy total | TS oracle | Symbol TP | FP | FN | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| axios | 54 ms | 172 ms | 857 | 0 | 0 | 1.0000 | 1.0000 |
+| express | 19 ms | 151 ms | 290 | 0 | 0 | 1.0000 | 1.0000 |
+| prettier | 304 ms | 292 ms | 4,133 | 0 | 0 | 1.0000 | 1.0000 |
+| redux | 10 ms | 149 ms | 130 | 0 | 0 | 1.0000 | 1.0000 |
+| vite | 471 ms | 349 ms | 6,789 | 0 | 0 | 1.0000 | 1.0000 |
+
+The full-tier numbers come from a second pass that combined four small
+heuristic fixes with one symmetric oracle change. On the Squeezy side, the
+`get`/`set` accessor filter now inspects only the method header (the prior
+substring scan on the full method text mis-fired when a body comment
+contained ` set ` or ` get `, dropping for example axios's `static from`),
+the JavaScript grammar's `field_definition.property` field is recognized in
+addition to TypeScript's `name`, and the Field-to-Method promotion fires
+inside both `class_declaration` and anonymous `class_expression` bodies.
+Two synthesizers cover the remaining surface gaps: `declare global { ... }`
+becomes a `Module:global` symbol, and `using x = expr` / `await using x =
+expr` (TC39 Stage 3) becomes `Const:x`. The oracle change is symmetric:
+the Node script skips files marked `@generated` / `do not edit`, prunes
+`node_modules` / `vendor` / `third_party` plus hidden directories, and
+excludes `for`/`for-in`/`for-of` / `catch` locals from declaration accounting
+because Squeezy also excludes them.
 
 Java smoke:
 
@@ -116,6 +180,7 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --no-speed-gate
 ```
 
+
 Go smoke:
 
 ```sh
@@ -126,6 +191,7 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --report target/semantic-graph-benchmark/go-smoke.json \
   --ra-lsp-probes 0
 ```
+
 
 The run fails if required expected results are missing, the fixture graph build
 plus query time is not faster than compiler validation, or the incremental

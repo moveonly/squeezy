@@ -23,6 +23,11 @@ navigation questions before the model reads raw files.
   typedefs/type aliases, fields, functions, methods, constructors/destructors,
   operators, templates, macro definitions/usages, and declaration/definition
   spans.
+- JavaScript and TypeScript declarations: functions, arrow functions assigned to
+  names, classes, methods, class-property arrow methods, fields, interfaces,
+  modules/namespaces, decorators, type aliases, enums, imports/exports, CommonJS
+  require/export aliases, JSX/TSX component-like declarations, calls, member
+  calls, type references, and object/member references.
 - Go declarations: packages, imports, structs, interfaces, type aliases,
   functions, methods, receiver relationships, fields, constants, variables,
   tests, calls, and references from `.go` files.
@@ -148,6 +153,20 @@ decision instead of walking a likely non-code or dangerous directory.
   graph facts; explicit workspace crawler caps are still respected.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
+- JavaScript and TypeScript ES module imports, CommonJS requires, relative
+  module references, `tsconfig.json` `baseUrl`/`paths`, simple package
+  `exports`, class constructors, direct calls, member calls, and type/interface
+  references are indexed from tree-sitter syntax and checked local config files.
+  JSX/TSX functions/classes with uppercase names or JSX bodies are tagged as
+  component-like. `declare global { ... }` is synthesized as `Module:global`,
+  TC39 Stage 3 `using x = expr` / `await using x = expr` becomes `Const:x`,
+  and `static prop = () => {}` arrow fields are surfaced as methods on both
+  named classes and anonymous `class { ... }` expressions. Loop counters
+  (`for (let i = 0; ...)`) and `catch (e)` bindings are intentionally not
+  exposed as declaration symbols. Dynamic imports, computed property access,
+  bundler aliases without checked config, package export edge cases, and
+  runtime dispatch are explicit candidate, heuristic, external, or fallback
+  results rather than exact edges.
 - C/C++ header classification prefers same-stem source files and then project
   majority when a plain `.h` file has no unambiguous pair. `.hpp`, `.hh`, and
   `.hxx` are treated as C++.
@@ -222,7 +241,9 @@ refreshes immediately after debounce. If no events arrive, Squeezy polls every
 hashes, reparses changed files only, removes deleted files, and preserves
 unchanged graph partitions. Body-only edits replace body-derived facts for that
 file. Signature/module/import edits replace that file's stub and rebuild
-cross-file indexes.
+cross-file indexes. JS/TS config edits such as `tsconfig.json` path changes or
+`package.json` export changes rebuild the local resolver and dependent import
+edges without reparsing unchanged source files.
 
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild
@@ -231,9 +252,12 @@ refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
 Graph build and refresh reports include duration, file counts, reparsed byte
-counts, symbol/edge counts, and Rust/supported/unsupported/unknown language
-distribution. Telemetry callers use these reports for one-shot graph build
-events and repeated graph refresh events without sending paths or source text.
+counts, symbol/edge counts, and Rust/Python/JS/TS/supported/unsupported/unknown
+language distribution. Refresh reports also separate changed paths observed from
+events, changed paths discovered by polling, and unchanged event paths so
+file-watcher FP/FN behavior can be benchmarked without sending paths or source
+text. Telemetry callers use these reports for one-shot graph build events and
+repeated graph refresh events without sending paths or source text.
 
 ## Traversal Surface
 
@@ -260,6 +284,17 @@ deterministic query gates when it is not. The language smoke benchmarks fail if
 required expected results are missing or, when a validation oracle is available,
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
+
+The JS/TS smoke benchmark validates a controlled TSX fixture with query specs.
+When the `typescript` npm package is available, the benchmark also runs three
+oracle tiers: a declaration oracle (TypeScript compiler API, reports symbol
+TP/FP/FN for file/name/kind declarations), a mixed workload (all nine query
+types against real repos with a refresh probe), and a navigation oracle
+(TypeScript Language Service `getDefinitionAtPosition` / `findReferences` probes
+on sampled call-edge sites and declaration symbols — the JS/TS equivalent of the
+rust-analyzer LSP probes on the Rust benchmark). If Node or TypeScript is
+unavailable the report records that status explicitly and still runs the
+tree-sitter query spec.
 
 The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
 `clang++ -fsyntax-only`, then compare declaration symbols against

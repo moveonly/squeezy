@@ -1684,6 +1684,331 @@ fn docs_from_attributes_only_keeps_doc_attribute() {
     );
 }
 
+#[test]
+fn parser_extracts_js_ts_symbols_imports_calls_and_references() {
+    let source = r#"
+import React, { useMemo as memo } from "react";
+import { buildRunner } from "./helpers";
+
+export interface RunnerProps {
+    name: string;
+}
+
+export class Runner {
+    start(props: RunnerProps) {
+        return buildRunner(props.name);
+    }
+}
+
+export const RunnerView = (props: RunnerProps) => <Runner />;
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = tsx_record("src/app.tsx", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "RunnerProps" && symbol.kind == SymbolKind::Interface })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "start" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "RunnerView"
+            && symbol.kind == SymbolKind::Function
+            && symbol.attributes.contains(&"jsx:component".to_string())
+    }));
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "react.useMemo" && import.alias.as_deref() == Some("memo")
+    }));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "./helpers.buildRunner")
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "buildRunner"));
+    assert!(parsed.references.iter().any(|reference| {
+        reference.text == "RunnerProps" && reference.kind == ReferenceKind::Type
+    }));
+}
+
+#[test]
+fn parser_keeps_js_ts_const_and_function_symbol_scope_precise() {
+    let source = r#"
+const options = values.map((value) => value.name);
+service.start = function start() {
+    return options;
+};
+service.stop = function() {};
+
+class Runner {
+    constructor() {}
+    #privateMethod() {}
+    [Symbol.iterator]() {}
+    run() {}
+    handle = () => options;
+}
+
+class ConstructorLocals {
+    constructor() {
+        const localFactory = () => options;
+    }
+}
+
+namespace RunnerNamespace {
+    export function create() {
+        return options;
+    }
+}
+
+@sealed
+class DecoratedRunner {}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/scope.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "options" && symbol.kind == SymbolKind::Const })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "options" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "start" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "stop" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "constructor")
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "#privateMethod")
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name.contains("Symbol.iterator"))
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "handle" && symbol.kind == SymbolKind::Method })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "localFactory" && symbol.kind == SymbolKind::Method })
+    );
+    assert!(
+        parsed.symbols.iter().any(|symbol| {
+            symbol.name == "RunnerNamespace" && symbol.kind == SymbolKind::Module
+        })
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "DecoratedRunner"
+            && symbol.attributes.contains(&"decorator:sealed".to_string())
+    }));
+}
+
+#[test]
+fn js_ts_static_method_not_dropped_by_body_comment_with_get_or_set_words() {
+    // Regression: the prior accessor check string-scanned the whole method
+    // text for " get "/" set ", which mis-fired when a benign comment in the
+    // method body contained those words (e.g. axios's `static from(...)`).
+    let mut parser = LanguageParser::new().unwrap();
+    let source = r#"
+class AxiosError {
+  static from(error, code) {
+    // Preserve status from the original error if not already set from response
+    return null;
+  }
+  static set name(v) { return v; }
+  static get foo() { return 1; }
+}
+"#;
+    let record = js_record("src/axios-error.js", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let methods: Vec<_> = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Method)
+        .map(|symbol| symbol.name.clone())
+        .collect();
+    assert!(
+        methods.iter().any(|name| name == "from"),
+        "expected `from` method, got {methods:?}"
+    );
+    assert!(
+        methods.iter().all(|name| name != "name"),
+        "static set accessor `name` should not be exposed as a method"
+    );
+    assert!(
+        methods.iter().all(|name| name != "foo"),
+        "static get accessor `foo` should not be exposed as a method"
+    );
+}
+
+#[test]
+fn js_ts_class_expression_method_arrow_field_is_recognized() {
+    // `C = class { static f = () => 0 }` carries the field inside a
+    // class_expression rather than a class_declaration, so the previous
+    // Field-to-Method conversion (which required parent_kind == Class) never
+    // fired. Anchoring the conversion on the class_body parent instead keeps
+    // both named and anonymous class members visible.
+    let mut parser = LanguageParser::new().unwrap();
+    let source = r#"
+class Named {
+  static f = () => 0;
+}
+C = class {
+  static f = () => 1;
+};
+"#;
+    let record = js_record("src/class-expr.js", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let methods: Vec<_> = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Method && symbol.name == "f")
+        .collect();
+    assert!(
+        methods.len() >= 2,
+        "expected `f` from both the named and anonymous classes, got {methods:#?}"
+    );
+}
+
+#[test]
+fn js_ts_declare_global_emits_global_module_symbol() {
+    let mut parser = LanguageParser::new().unwrap();
+    let source = r#"
+declare global {
+  interface SymbolConstructor {
+    readonly observable: symbol;
+  }
+}
+"#;
+    let record = ts_record("src/globals.d.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "global" && symbol.kind == SymbolKind::Module),
+        "expected synthesized Module:global from `declare global`"
+    );
+}
+
+#[test]
+fn js_ts_using_declaration_is_emitted_as_const() {
+    // Tree-sitter still parses `using x = expr` as an assignment_expression
+    // with a leading anonymous `using` token, so the regular
+    // variable_declarator path can't see it. Synthesizing a Const symbol
+    // matches what the TypeScript compiler API reports.
+    let mut parser = LanguageParser::new().unwrap();
+    let source = r#"
+async function open() {
+  await using server = await createSimpleServer();
+  using cleanup = makeCleanup();
+  return server;
+}
+"#;
+    let record = ts_record("src/using.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "server" && symbol.kind == SymbolKind::Const),
+        "expected `await using server` to become Const:server"
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "cleanup" && symbol.kind == SymbolKind::Const),
+        "expected `using cleanup` to become Const:cleanup"
+    );
+}
+
+#[test]
+fn js_ts_for_loop_locals_are_not_emitted_as_symbols() {
+    // `for (let i = 0; ...)`, `for (const x of ...)`, and `catch (e)` are
+    // tiny-scope locals; the prior extractor emitted the for-statement's
+    // `lexical_declaration -> variable_declarator` chain as Const symbols,
+    // which polluted symbol-by-name lookups with `i`/`len`/`e` per call site.
+    let mut parser = LanguageParser::new().unwrap();
+    let source = r#"
+export function noisy(items) {
+  for (let i = 0; i < items.length; i++) {
+    items[i] = i;
+  }
+  for (const item of items) {
+    use(item);
+  }
+  try {
+    risky();
+  } catch (err) {
+    log(err);
+  }
+}
+"#;
+    let record = js_record("src/noisy.js", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let names: Vec<_> = parsed
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.name.clone(), symbol.kind))
+        .collect();
+    assert!(
+        names
+            .iter()
+            .any(|(name, kind)| name == "noisy" && *kind == SymbolKind::Function),
+        "expected the outer function to still be a symbol, got {names:?}"
+    );
+    for forbidden in ["i", "item", "err"] {
+        assert!(
+            !names.iter().any(|(name, _)| name == forbidden),
+            "loop/catch local `{forbidden}` should not be exposed as a symbol"
+        );
+    }
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
@@ -1704,6 +2029,24 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn tsx_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Tsx;
+    record
+}
+
+fn ts_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::TypeScript;
+    record
+}
+
+fn js_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::JavaScript;
     record
 }
 

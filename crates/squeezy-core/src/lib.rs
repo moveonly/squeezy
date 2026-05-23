@@ -51,6 +51,7 @@ pub struct AppConfig {
     pub tick_rate: Duration,
     pub workspace_root: PathBuf,
     pub permissions: PermissionPolicy,
+    pub session_mode: SessionMode,
     pub store_responses: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
@@ -340,6 +341,13 @@ impl AppConfig {
             settings.permissions.unwrap_or_default(),
             &mut get_var,
         )?;
+        let session_mode = parse_session_mode(
+            get_var("SQUEEZY_SESSION_MODE"),
+            settings
+                .session
+                .and_then(|session| session.mode)
+                .unwrap_or_default(),
+        );
         let skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
@@ -362,6 +370,7 @@ impl AppConfig {
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             permissions,
+            session_mode,
             store_responses,
             max_parallel_tools,
             tool_spill_threshold_bytes,
@@ -441,6 +450,12 @@ impl AppConfig {
             self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
         ));
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+
+        output.push_str("[session]\n");
+        output.push_str(&format!(
+            "mode = {}\n\n",
+            toml_string(self.session_mode.as_str())
+        ));
 
         output.push_str("[budgets]\n");
         output.push_str(&format!(
@@ -797,6 +812,7 @@ pub struct SettingsFile {
     pub model: Option<String>,
     pub model_settings: Option<ModelSettings>,
     pub providers: Option<BTreeMap<String, ProviderSettings>>,
+    pub session: Option<SessionSettings>,
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
@@ -852,6 +868,7 @@ impl SettingsFile {
                 "profile",
                 "model",
                 "providers",
+                "session",
                 "budgets",
                 "permissions",
                 "telemetry",
@@ -883,6 +900,9 @@ impl SettingsFile {
             }
         }
         settings.providers = providers_settings(table, source)?;
+        settings.session = optional_table(table, "session", source)?
+            .map(|table| SessionSettings::from_table(table, source, "session"))
+            .transpose()?;
         settings.budgets = optional_table(table, "budgets", source)?
             .map(|table| BudgetSettings::from_table(table, source, "budgets"))
             .transpose()?;
@@ -926,6 +946,7 @@ impl SettingsFile {
             ModelSettings::merge,
         );
         merge_provider_maps(&mut self.providers, next.providers);
+        merge_option(&mut self.session, next.session, SessionSettings::merge);
         merge_option(&mut self.budgets, next.budgets, BudgetSettings::merge);
         merge_option(
             &mut self.permissions,
@@ -1195,6 +1216,83 @@ impl PermissionMode {
 }
 
 pub type PermissionAction = PermissionMode;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    Plan,
+    #[default]
+    Build,
+}
+
+impl SessionMode {
+    /// Parse the two canonical session-mode names. The accepted values are
+    /// only `plan` and `build` (case-insensitive, surrounding whitespace
+    /// ignored) so that the user-visible vocabulary stays in sync with
+    /// `as_str`, error messages, and config docs. Anything else returns
+    /// `None` so configuration loaders can surface a precise error.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "plan" => Some(Self::Plan),
+            "build" => Some(Self::Build),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Build => "build",
+        }
+    }
+
+    /// Compact wire form for lock-free storage in an `AtomicU8`. `from_u8`
+    /// rejects unknown discriminants and the caller decides on a safe
+    /// default; see `Agent::session_mode` for the in-process use.
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Plan => 0,
+            Self::Build => 1,
+        }
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Plan),
+            1 => Some(Self::Build),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct SessionSettings {
+    pub mode: Option<SessionMode>,
+}
+
+impl SessionSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["mode"], source, path)?;
+        let mode = match table.get("mode") {
+            Some(value) => {
+                let value = value
+                    .as_str()
+                    .ok_or_else(|| type_error(source, &field(path, "mode"), "string"))?;
+                Some(parse_session_mode_value(
+                    value,
+                    source,
+                    &field(path, "mode"),
+                )?)
+            }
+            None => None,
+        };
+        Ok(Self { mode })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.mode, next.mode);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PermissionCapability {
@@ -1782,6 +1880,21 @@ fn parse_permission(value: Option<String>, default: PermissionMode) -> Permissio
         .as_deref()
         .and_then(PermissionMode::parse)
         .unwrap_or(default)
+}
+
+fn parse_session_mode(value: Option<String>, default: SessionMode) -> SessionMode {
+    value
+        .as_deref()
+        .and_then(SessionMode::parse)
+        .unwrap_or(default)
+}
+
+fn parse_session_mode_value(value: &str, source: &str, path: &str) -> Result<SessionMode> {
+    SessionMode::parse(value).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid session mode {value:?}; expected plan or build"
+        ))
+    })
 }
 
 fn parse_bool(value: Option<String>, default: bool) -> bool {
@@ -2660,6 +2773,9 @@ pub fn user_settings_template() -> &'static str {
 # max_output_tokens = 128
 # store_responses = false      # only honored by openai/azure_openai
 
+[session]
+# mode = "build"              # build | plan
+
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
@@ -2742,6 +2858,9 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+[session]
+# mode = "build"              # build | plan
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -3602,8 +3721,12 @@ pub enum LanguageKind {
     Cpp,
     Go,
     Java,
+    JavaScript,
+    Jsx,
     Python,
     Rust,
+    TypeScript,
+    Tsx,
     Unsupported,
     Unknown,
 }

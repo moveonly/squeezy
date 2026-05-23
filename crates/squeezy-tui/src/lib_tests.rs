@@ -1,17 +1,154 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+use squeezy_core::{
+    AppConfig, PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope,
+    SessionMode,
+};
+use squeezy_llm::UnavailableProvider;
 
 use super::*;
 
 #[test]
 fn app_starts_ready_with_empty_transcript() {
-    let app = TuiApp::new("openai", "gpt-test".to_string(), "defaults".to_string());
+    let app = TuiApp::new(
+        "openai",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Build,
+    );
 
     assert_eq!(app.provider_name, "openai");
     assert_eq!(app.model, "gpt-test");
+    assert_eq!(app.mode, SessionMode::Build);
     assert_eq!(app.status, "ready");
     assert!(app.transcript.is_empty());
+}
+
+#[test]
+fn status_line_surfaces_current_mode_and_switch_hints() {
+    let mut app = TuiApp::new(
+        "openai",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Plan,
+    );
+    app.status = "ready".to_string();
+
+    let status = format_status_tokens(&app);
+    assert!(status.contains("mode=plan"), "missing mode: {status}");
+    assert!(
+        status.contains("Shift-Tab mode"),
+        "missing toggle hint: {status}",
+    );
+    assert!(
+        status.contains("/plan /build"),
+        "missing commands: {status}"
+    );
+}
+
+#[tokio::test]
+async fn shift_tab_toggles_mode() {
+    let agent = test_agent(SessionMode::Build);
+    let mut app = TuiApp::new(
+        "scripted",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Build,
+    );
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+    assert_eq!(app.status, "mode switched to plan");
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Build);
+    assert_eq!(agent.session_mode(), SessionMode::Build);
+    assert_eq!(app.status, "mode switched to build");
+}
+
+#[tokio::test]
+async fn slash_plan_and_build_force_modes() {
+    let agent = test_agent(SessionMode::Build);
+    let mut app = TuiApp::new(
+        "scripted",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Build,
+    );
+
+    app.input = "/plan".to_string();
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+    assert!(app.input.is_empty());
+
+    app.input = "/plan".to_string();
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert_eq!(app.status, "already in plan mode");
+
+    app.input = "/build".to_string();
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Build);
+    assert_eq!(agent.session_mode(), SessionMode::Build);
+    assert_eq!(app.status, "mode switched to build");
+}
+
+#[tokio::test]
+async fn mode_switch_is_refused_during_active_turn() {
+    let agent = test_agent(SessionMode::Build);
+    let mut app = TuiApp::new(
+        "scripted",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Build,
+    );
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+
+    handle_key(
+        &mut app,
+        &agent,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert_eq!(agent.session_mode(), SessionMode::Build);
+    assert_eq!(app.status, "mode switch unavailable during active turn");
 }
 
 #[test]
@@ -84,4 +221,14 @@ fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
     assert!(prompt.contains("u user deny"));
     assert!(prompt.contains("d project deny"));
     assert!(prompt.contains("n deny once"));
+}
+
+fn test_agent(mode: SessionMode) -> Agent {
+    Agent::new(
+        AppConfig {
+            session_mode: mode,
+            ..Default::default()
+        },
+        Arc::new(UnavailableProvider::new("scripted", "test provider")),
+    )
 }

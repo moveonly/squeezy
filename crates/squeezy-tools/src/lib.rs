@@ -77,6 +77,14 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    /// The capability that approximates this tool's lowest-risk form, used at
+    /// advertisement time (before any arguments are bound) to decide whether a
+    /// tool should be visible to the model in a given session mode. Runtime
+    /// permission decisions still flow through `permission_request` and can
+    /// reclassify a specific call to a higher-risk capability (for example
+    /// shell → git via the shell classifier); session mode gating in the agent
+    /// applies on top of both layers.
+    pub capability: PermissionCapability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4426,6 +4434,7 @@ fn diff_context_spec() -> ToolSpec {
     ToolSpec {
         name: "diff_context".to_string(),
         description: "Return the current Git change set with compact semantic graph cross-references. Use this first for questions like 'what did I change?' or 'what does this diff affect?'.".to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4445,6 +4454,7 @@ fn grep_spec() -> ToolSpec {
     ToolSpec {
         name: "grep".to_string(),
         description: "Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.".to_string(),
+        capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4470,6 +4480,7 @@ fn glob_spec() -> ToolSpec {
     ToolSpec {
         name: "glob".to_string(),
         description: "List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.".to_string(),
+        capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4490,6 +4501,7 @@ fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
         description: "Read a bounded byte slice from one workspace file and return its sha256 receipt. Use grep first when locating unknown files.".to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4510,6 +4522,7 @@ fn read_tool_output_spec() -> ToolSpec {
         description:
             "Read a bounded byte range from a spilled tool-output handle returned by another tool."
                 .to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4527,6 +4540,7 @@ fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
         description: "Return compact semantic context for symbols matching a signature query, with inline dirty/diff annotations when current Git changes touch the symbol.".to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4545,6 +4559,7 @@ fn list_skills_spec() -> ToolSpec {
     ToolSpec {
         name: "list_skills".to_string(),
         description: "List locally discovered Squeezy skills by metadata only. Use before load_skill when the task may benefit from specialized instructions. Skill bodies are not included in this listing.".to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4557,6 +4572,7 @@ fn load_skill_spec() -> ToolSpec {
     ToolSpec {
         name: "load_skill".to_string(),
         description: "Load one locally discovered skill body into the conversation when the user explicitly requests it or the task matches a listed skill description. Loading a skill only adds instructions and does not change tool permissions.".to_string(),
+        capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4572,6 +4588,7 @@ fn write_file_spec() -> ToolSpec {
     ToolSpec {
         name: "write_file".to_string(),
         description: "Replace a workspace file with exact content. Existing files require expected_sha256 from read_file to prevent stale writes.".to_string(),
+        capability: PermissionCapability::Edit,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4589,6 +4606,7 @@ fn shell_spec() -> ToolSpec {
     ToolSpec {
         name: "shell".to_string(),
         description: "Run a bounded shell command in the workspace. Use for verification commands after explaining the purpose in description.".to_string(),
+        capability: PermissionCapability::Shell,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4608,6 +4626,7 @@ fn verify_spec() -> ToolSpec {
     ToolSpec {
         name: "verify".to_string(),
         description: "Run bounded local verification, defaulting to the current Git diff scope. For Rust diffs this runs package-scoped cargo tests when possible; full mode adds fmt and clippy.".to_string(),
+        capability: PermissionCapability::Compiler,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4623,6 +4642,7 @@ fn webfetch_spec() -> ToolSpec {
     ToolSpec {
         name: "webfetch".to_string(),
         description: "Fetch a specific HTTP(S) URL with the host/domain shown in the approval summary. Use only for URLs provided by the user, found in local files, or discovered through websearch. Returns bounded text or HTML; redirects to another host are reported for a new approval.".to_string(),
+        capability: PermissionCapability::Network,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
@@ -4642,6 +4662,7 @@ fn websearch_spec() -> ToolSpec {
     ToolSpec {
         name: "websearch".to_string(),
         description: "Search the web for current or external information using Squeezy's permission-gated Exa search backend. Use for discovery; use webfetch when retrieving a specific URL.".to_string(),
+        capability: PermissionCapability::Network,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,

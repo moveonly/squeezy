@@ -29,13 +29,15 @@ squeezy config inspect
 squeezy config init --user
 squeezy config init --project
 squeezy --health
+squeezy --mode plan
 ```
 
 `config inspect` prints the effective merged configuration as valid TOML
 with sensitive-looking values redacted; the document can be parsed back
 through the same loader. `config init` refuses to overwrite an existing
 file unless `--force` is passed. `--health` validates configuration and
-prints the source chain used for resolution.
+prints the source chain used for resolution. `--mode plan|build` selects the
+starting session mode for the TUI.
 
 ## Example User Settings
 
@@ -49,6 +51,9 @@ commented examples so that built-in defaults can evolve over time:
 # model = "gpt-5-nano"
 # max_output_tokens = 128
 # store_responses = false
+
+[session]
+# mode = "build"
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -103,6 +108,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
 
+[session]
+# mode = "build"
+
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
 # everywhere they appear in tool output, model requests, and UI surfaces.
@@ -121,6 +129,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `store_responses`.
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
+- `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
+  normal tool behavior subject to permission policy. Plan mode advertises only
+  read/search/navigation tools and refuses edit, shell, git, network, MCP,
+  compiler, and destructive capabilities before ordinary permission rules or
+  approvals are evaluated. In the TUI, `Shift+Tab` toggles modes; `/plan` and
+  `/build` force a specific mode.
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
@@ -212,6 +226,7 @@ new configuration should use `[model]`.
 Existing environment overrides remain supported, including:
 
 - `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`, `SQUEEZY_PROFILE`
+- `SQUEEZY_SESSION_MODE`
 - `SQUEEZY_MAX_OUTPUT_TOKENS`
 - `SQUEEZY_MAX_PARALLEL_TOOLS`
 - `SQUEEZY_TOOL_SPILL_THRESHOLD_BYTES`

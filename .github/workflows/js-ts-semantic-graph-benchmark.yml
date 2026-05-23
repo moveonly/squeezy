@@ -1,0 +1,175 @@
+name: JS/TS Semantic Graph Benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/js-ts-semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/js-ts-semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Benchmark tier"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SQUEEZY_TYPESCRIPT_VERSION: 6.0.3
+  SQUEEZY_TYPESCRIPT_PATH: ${{ github.workspace }}/target/js-ts-oracle/node_modules/typescript
+
+jobs:
+  js-ts-semantic-graph-smoke:
+    name: JS/TS semantic graph smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Show Rust and Node toolchains
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+
+      - name: Install TypeScript oracle
+        run: npm install --prefix target/js-ts-oracle "typescript@${SQUEEZY_TYPESCRIPT_VERSION}"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Clone smoke repo for mixed workload
+        run: |
+          mkdir -p target/benchmark-repos
+          git clone --depth 1 --filter=blob:none https://github.com/reduxjs/redux \
+            target/benchmark-repos/redux-smoke
+
+      - name: Run JS/TS semantic graph benchmark
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language typescript \
+            --fixture benchmarks/fixtures/js-ts/semantic-cases \
+            --spec benchmarks/specs/js-ts-smoke-queries.json \
+            --report target/semantic-graph-benchmark/js-ts-smoke.json \
+            --mixed-repo target/benchmark-repos/redux-smoke/src \
+            --mixed-iterations 500 \
+            --ra-lsp-probes 25 \
+            --no-speed-gate
+
+      - name: Run full external JS/TS comparison
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'full' }}
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/js-ts-real
+          while read -r name package_root url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language typescript \
+              --fixture "target/benchmark-repos/$name/$package_root" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/js-ts-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name/$package_root" \
+              --mixed-iterations 1000 \
+              --ra-lsp-probes 25 \
+              --no-speed-gate
+          done <<'REPOS'
+          vite packages/vite/src https://github.com/vitejs/vite
+          redux src https://github.com/reduxjs/redux
+          axios lib https://github.com/axios/axios
+          express lib https://github.com/expressjs/express
+          prettier src https://github.com/prettier/prettier
+          REPOS
+
+      - name: Write benchmark summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          reports = []
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/**/*.json", recursive=True)):
+              reports.append((path, json.load(open(path))))
+          with open("__js_ts_summary.md", "w") as out:
+              print("## JS/TS Semantic Graph Benchmark", file=out)
+              for path, report in reports:
+                  oracle = report.get("js_ts_oracle") or {}
+                  acc = oracle.get("symbols", {})
+                  print("", file=out)
+                  print(f"### {path}", file=out)
+                  print(f"- Fixture: {report['fixture']}", file=out)
+                  print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
+                  print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
+                  if oracle:
+                      print(f"- Oracle status: {oracle.get('status', 'n/a')}", file=out)
+                      print(
+                          f"- JS/TS oracle symbols: TP={acc.get('true_positive',0)} FP={acc.get('false_positive',0)} FN={acc.get('false_negative',0)} precision={acc.get('precision',0)} recall={acc.get('recall',0)}",
+                          file=out,
+                      )
+                      print(
+                          f"- Symbol scope: oracle={acc.get('rust_analyzer_total',0)} squeezy={acc.get('squeezy_total',0)} raw_squeezy={acc.get('squeezy_raw_total',0)} excluded_squeezy={acc.get('squeezy_excluded_by_kind',{})}",
+                          file=out,
+                      )
+                  mixed = report.get("mixed_workload")
+                  if mixed:
+                      print("", file=out)
+                      print(f"- Mixed workload repo: {mixed['repo']}", file=out)
+                      print(f"- Scenarios: {mixed['executed_scenarios']}/{mixed['available_scenarios']} requested={mixed['requested_scenarios']}", file=out)
+                      print(f"- Squeezy build+query: {mixed['squeezy_total_ms']} ms", file=out)
+                      if mixed.get('compiler_check_ms') is not None:
+                          print(f"- TS oracle: {mixed['compiler_check_ms']} ms ({mixed['compiler_check_status']})", file=out)
+                      if mixed.get('refresh_probe'):
+                          rp = mixed['refresh_probe']
+                          print(f"- Refresh: edited={rp['edited_files']} reparsed={rp['reparsed_files']} in {rp['refresh_ms']} ms budget_exhausted={rp['budget_exhausted']}", file=out)
+                  if mixed.get('accuracy') and mixed['accuracy'].get('symbols'):
+                      macc = mixed['accuracy']['symbols']
+                      print(f"- Mixed oracle symbols: TP={macc.get('true_positive',0)} FP={macc.get('false_positive',0)} FN={macc.get('false_negative',0)} precision={macc.get('precision',0)} recall={macc.get('recall',0)}", file=out)
+                  if mixed.get('accuracy') and mixed['accuracy'].get('navigation'):
+                      nav = mixed['accuracy']['navigation']
+                      d = nav.get('definitions', {})
+                      r = nav.get('references', {})
+                      print(f"- Navigation: def_probes={d.get('probes',0)}/{d.get('available_probes',0)} def_tp={d.get('true_positive',0)} def_fp={d.get('false_positive',0)} def_fn={d.get('false_negative',0)} ref_symbols={r.get('symbols_sampled',0)}/{r.get('available_symbols',0)} ref_tp={r.get('true_positive',0)} ref_fp={r.get('false_positive',0)} ref_fn={r.get('false_negative',0)} oracle={nav.get('rust_analyzer_lsp_ms','?')}ms", file=out)
+                  if report.get("queries"):
+                      print("", file=out)
+                      print("| Query | Actual | Missing | Extras |", file=out)
+                      print("|---|---:|---:|---:|", file=out)
+                      for query in report["queries"]:
+                          print(
+                              f"| {query['id']} | {len(query['actual'])} | {len(query['missing'])} | {len(query['extras'])} |",
+                              file=out,
+                          )
+          PY
+          cat __js_ts_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: js-ts-semantic-graph-benchmark-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/**/*.json
+            __js_ts_summary.md
+          if-no-files-found: error
