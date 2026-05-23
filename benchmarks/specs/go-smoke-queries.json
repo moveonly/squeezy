@@ -1,0 +1,49 @@
+{
+  "queries": [
+    {
+      "id": "go-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "File:greeter/runner.go",
+        "Struct:Runner",
+        "Interface:Greeter",
+        "Function:NewRunner",
+        "Method:Greet"
+      ]
+    },
+    {
+      "id": "go-signature-runner",
+      "kind": "signature_search",
+      "text": "Runner struct",
+      "symbol_kind": "Struct",
+      "expected_contains": ["Struct:Runner"]
+    },
+    {
+      "id": "go-body-helper",
+      "kind": "body_search",
+      "text": "helper",
+      "owner_kind": "Method",
+      "expected_contains": ["Greet:helper"]
+    },
+    {
+      "id": "go-reference-runner",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": ["Runner"]
+    },
+    {
+      "id": "go-call-helper",
+      "kind": "call_chain",
+      "from": "Greet",
+      "to": "helper",
+      "expected_contains": ["Greet -> helper"]
+    },
+    {
+      "id": "go-call-imported-format",
+      "kind": "call_chain",
+      "from": "Greet",
+      "to": "Format",
+      "expected_contains": ["Greet -> Format"]
+    }
+  ]
+}

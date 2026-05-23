@@ -8,11 +8,17 @@ navigation questions before the model reads raw files.
 
 - Gitignore-aware file records: path, relative path, size, mtime, stable content
   hash, language, and freshness.
+- Policy-aware coverage for skipped generated, vendored, dependency cache,
+  build output, lockfile, binary, large, VCS metadata, hidden, and
+  user-excluded paths.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
+- Go declarations: packages, imports, structs, interfaces, type aliases,
+  functions, methods, receiver relationships, fields, constants, variables,
+  tests, calls, and references from `.go` files.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -23,6 +29,21 @@ navigation questions before the model reads raw files.
 Unsupported files are retained as structured unsupported results so callers can
 fall back to bounded read/grep/list navigation without pretending the graph knows
 more than it does.
+
+Generated, vendored, dependency cache, build output, binary, lockfile, and large
+files are excluded from graph indexing by default with compact reason-tagged
+coverage. Directory-level exclusions such as `vendor/`, `node_modules/`, and
+`target/` are pruned at the walker so individual files inside them are never
+visited; the pruned directory shows up once in the coverage report rather than
+once per file. Unrecognized hidden paths are skipped when `include_hidden=false`
+and counted under the `hidden` reason. Project config can re-include paths via
+`include = [...]` or whole classes via `include_classes = ["lockfile"]`; when an
+include glob points below a default-excluded directory the crawler walks into
+that directory so the glob can match. `exclude_classes = [...]` is the
+counterpart that keeps a class pruned even when an include glob would otherwise
+re-enable it. Explicit fallback tool reads can still inspect excluded files
+through the ignored-search permission and normal byte budgets; `read_file`
+returns `ignored=true` plus an `ignored_reason` for those reads.
 
 ## Heuristics
 
@@ -89,6 +110,12 @@ decision instead of walking a likely non-code or dangerous directory.
   symbol so behavior-word searches do not have to read raw files first.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
+- Go package-qualified calls resolve through explicit imports when the imported
+  package maps to one indexed package and one function target. Same-package
+  direct calls and same-receiver method calls resolve when there is a single
+  syntactic target. Interface satisfaction, full receiver type inference,
+  embedded field promotion, build tags, generated code, and external modules are
+  reported as candidate, heuristic, or external facts rather than guessed.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,
@@ -183,6 +210,17 @@ Python smoke benchmark also carries controlled navigation checks for route
 metadata, constructor-alias method calls, and property references so navigation
 heuristics are regression-tested separately from declaration accuracy.
 
+Go accuracy reporting uses a benchmark-only Go parser/AST oracle for
+declaration discovery. It reports symbol TP/FP/FN, precision, recall, examples,
+and heuristic-iteration notes so receiver/import/interface heuristics can be
+accepted or rejected by measured FP/FN movement. The Go oracle is not a
+production dependency and `gopls` is not used for production navigation.
+The Go oracle is declaration-only; Squeezy cold-build timing currently includes
+full graph work such as body-hit, reference, call, and edge materialization. Any
+repo where Squeezy is slower than the Go oracle should be treated as a graph
+build performance target, not as proof that the parser path is heavier than
+Go's AST parser.
+
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated
 code, or unresolved external code.
@@ -202,6 +240,18 @@ Current external-oracle gaps and known losses:
   when rust-analyzer's active cfg/target view does not include the site
 - cross-package references are conservative until Cargo package/dependency facts
   are indexed
+- Internal symlinked Go files are indexed when their resolved target stays
+  inside the workspace root, matching Go parser behavior on repos such as etcd
+  without indexing arbitrary external paths.
+- Body-hit trigram indexing is disabled and `body_search` falls back to an
+  exact lower-case scan whenever the workspace contains more than 100,000 body
+  hits. The threshold is language-agnostic and applies to Rust, Python, and Go
+  alike; large repos in any supported language will report
+  `body_hit_trigram_indexed=false` in `GraphStats`/benchmark output so callers
+  can correlate slower body searches with the fallback.
+- Go generated files and remaining full-graph reference/call resolution work
+  still need reduced or lazy indexing before full graph cold builds can be
+  compared fairly with declaration-only oracles.
 - item-generating macros and proc macros are recorded as opaque unless the
   generated item appears in source
 - cfg/feature matrices are not enumerated

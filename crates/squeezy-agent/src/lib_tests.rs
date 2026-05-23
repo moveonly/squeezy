@@ -217,9 +217,12 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
     }
 
     let summary = summary.expect("approval summary");
+    // Avoid interpolating the redacted-summary value into the panic
+    // message; CodeQL flags that as cleartext logging on assertions
+    // whose fixture inputs look secret-shaped.
     assert!(
         !summary.contains("abcdefghijklmnopqrstuvwxyz"),
-        "approval summary leaked bearer token: {summary:?}",
+        "approval summary leaked bearer token",
     );
     assert!(summary.contains("<redacted:bearer_token"));
 

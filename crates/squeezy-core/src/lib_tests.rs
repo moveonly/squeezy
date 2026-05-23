@@ -387,6 +387,10 @@ languages = ["rust", "csharp"]
 max_file_bytes = 42
 include_hidden = true
 require_indexing_signal = false
+include = ["vendor/allowed/**"]
+exclude = ["fixtures/generated/**"]
+include_classes = ["lockfile"]
+exclude_classes = ["generated"]
 
 [cache]
 root = ".squeezy/cache"
@@ -418,6 +422,10 @@ env = { TOKEN = "secret" }
     assert!(!config.telemetry.enabled);
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
     assert_eq!(config.graph.languages, vec!["rust", "csharp"]);
+    assert_eq!(config.graph.include, vec!["vendor/allowed/**"]);
+    assert_eq!(config.graph.exclude, vec!["fixtures/generated/**"]);
+    assert_eq!(config.graph.include_classes, vec!["lockfile"]);
+    assert_eq!(config.graph.exclude_classes, vec!["generated"]);
     assert_eq!(
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
@@ -608,10 +616,13 @@ fn stream_redactor_redacts_secret_split_across_chunks() {
     assert!(second.is_empty(), "still inside tail buffer");
 
     let final_chunk = stream.finish();
+    // Intentionally do not include `final_chunk.text` in the panic
+    // message: the CodeQL "cleartext logging" rule flags assertion
+    // messages that interpolate test-fixture secrets even though the
+    // assertion only fires when redaction has already failed.
     assert!(
         !final_chunk.text.contains("sk-abcdefghijklmnopqrstuvwxyz"),
-        "the full secret should be redacted on finish: {:?}",
-        final_chunk.text
+        "the full secret should be redacted on finish",
     );
     assert!(final_chunk.text.contains("<redacted:openai_key"));
     assert!(stream.total_redactions() >= 1);
@@ -646,10 +657,9 @@ fn stream_redactor_holds_emission_until_pem_end_marker_arrives() {
     // chunk should be available either inline or on finish.
     let tail = stream.finish();
     let combined = format!("{}{}", pem_close.text, tail.text);
-    assert!(
-        !combined.contains("AAAAA"),
-        "PEM body must be redacted: {combined:?}",
-    );
+    // See note in stream_redactor_redacts_secret_split_across_chunks
+    // about avoiding interpolated fixtures in panic messages.
+    assert!(!combined.contains("AAAAA"), "PEM body must be redacted");
     assert!(combined.contains("<redacted:private_key"));
     assert!(combined.contains("preface"));
     assert!(combined.contains("trailer"));
@@ -669,9 +679,11 @@ fn stream_redactor_does_not_split_a_redaction_marker_across_emits() {
     let trailing = stream.finish();
 
     let combined = format!("{}{}", with_secret.text, trailing.text);
+    // Keep the panic message free of `combined` so the CodeQL
+    // cleartext-logging analysis stays clean.
     assert!(
         !combined.contains("sk-abcdefghijklmnopqrstuvwxyz"),
-        "raw secret leaked through stream emit: {combined:?}",
+        "raw secret leaked through stream emit",
     );
     // Whenever a marker opens within the emitted portion it must also close
     // there; the unemitted tail may not start mid-marker.

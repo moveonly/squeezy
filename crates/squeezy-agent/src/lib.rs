@@ -66,17 +66,20 @@ impl Agent {
             output_config.clone(),
             web_config.clone(),
             config.skills.clone(),
+            &config.graph,
             redactor.clone(),
         )
         .unwrap_or_else(|_| {
             // Workspace root unavailable; fall back to the current
-            // directory but keep the configured redactor so the agent
-            // never silently downgrades to default patterns.
+            // directory but keep the configured redactor and graph
+            // policy so the agent never silently downgrades to
+            // default patterns or default crawl options.
             ToolRegistry::new_with_configs_and_skills(
                 ".",
                 output_config,
                 web_config,
                 config.skills.clone(),
+                &config.graph,
                 redactor.clone(),
             )
             .expect("current directory must be a valid tool root")
