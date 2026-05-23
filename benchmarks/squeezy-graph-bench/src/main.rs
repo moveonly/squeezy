@@ -690,10 +690,15 @@ fn run_mixed_workload(
         ),
         BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
         BenchmarkLanguage::Python => (None, "mixed workload unsupported for Python".to_string()),
-        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => (
-            None,
-            "mixed workload unsupported for JavaScript/TypeScript".to_string(),
-        ),
+        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
+            match time_js_ts_oracle(repo) {
+                Ok(ms) => (Some(ms), "TypeScript compiler API oracle".to_string()),
+                Err(err) => (
+                    None,
+                    format!("TypeScript compiler API oracle unavailable: {err}"),
+                ),
+            }
+        }
     };
     let (rust_analyzer_ms, rust_analyzer_status) = if language == BenchmarkLanguage::Rust {
         time_rust_analyzer(repo)
@@ -725,7 +730,7 @@ fn run_mixed_workload(
         }
         BenchmarkLanguage::Python => empty_accuracy("mixed workload unsupported for Python"),
         BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
-            empty_accuracy("mixed workload unsupported for JavaScript/TypeScript")
+            js_ts_oracle_to_accuracy(&collect_js_ts_oracle_accuracy(repo, &graph))
         }
     };
 
@@ -1449,6 +1454,25 @@ fn go_oracle_to_accuracy(report: &GoOracleReport) -> AccuracyReport {
             references: ReferenceAccuracyReport::default(),
             limitations: vec![
                 "Go accuracy currently compares symbol declarations against the Go parser/type oracle; LSP-style go-to-definition probes are not exercised yet.".to_string(),
+            ],
+        },
+        limitations: report.limitations.clone(),
+    }
+}
+
+fn js_ts_oracle_to_accuracy(report: &JsTsOracleReport) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: Some(report.oracle_ms),
+        rust_analyzer_symbol_status: report.status.clone(),
+        symbols: report.symbols.clone(),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "JS/TS LSP navigation oracle not used".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "JS/TS accuracy compares declaration symbols against the TypeScript compiler API; tsserver-style go-to-definition and find-references probes are not exercised yet.".to_string(),
             ],
         },
         limitations: report.limitations.clone(),
@@ -4458,7 +4482,13 @@ impl BenchmarkLanguage {
     fn supports_mixed_workload(self) -> bool {
         matches!(
             self,
-            Self::C | Self::CSharp | Self::Cpp | Self::Go | Self::Rust
+            Self::C
+                | Self::CSharp
+                | Self::Cpp
+                | Self::Go
+                | Self::JavaScript
+                | Self::Rust
+                | Self::TypeScript
         )
     }
 

@@ -67,14 +67,19 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --no-speed-gate
 ```
 
-JS/TS smoke:
+JS/TS smoke (with mixed workload against redux/src):
 
 ```sh
+mkdir -p target/benchmark-repos
+git clone --depth 1 https://github.com/reduxjs/redux target/benchmark-repos/redux
+
 cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
   --language typescript \
   --fixture benchmarks/fixtures/js-ts/semantic-cases \
   --spec benchmarks/specs/js-ts-smoke-queries.json \
   --report target/semantic-graph-benchmark/js-ts-smoke.json \
+  --mixed-repo target/benchmark-repos/redux/src \
+  --mixed-iterations 500 \
   --ra-lsp-probes 0 \
   --no-speed-gate
 ```
@@ -82,7 +87,10 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
 When the pinned Node `typescript` package is installed, the JS/TS benchmark also
 runs a benchmark-only TypeScript compiler API declaration oracle and reports
 symbol TP/FP/FN. If TypeScript is unavailable, the report records that status
-explicitly and still validates the tree-sitter query spec.
+explicitly and still validates the tree-sitter query spec. The mixed workload
+clocks all nine query types (hierarchy, symbol lookup, signature search, body
+search, reference search, references-to-symbol, callers, callees, call-chain)
+against real JS/TS repos and runs a two-file refresh probe.
 
 JS/TS full-tier comparison uses five representative open-source repositories:
 Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the
