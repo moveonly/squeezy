@@ -39,6 +39,9 @@ pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
 pub const PROJECT_SETTINGS_FILE: &str = "squeezy.toml";
 pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
+pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
+pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
+pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +55,7 @@ pub struct AppConfig {
     pub workspace_root: PathBuf,
     pub permissions: PermissionPolicy,
     pub session_mode: SessionMode,
+    pub session_logs: SessionLogConfig,
     pub store_responses: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
@@ -342,12 +346,10 @@ impl AppConfig {
             &sources.join(","),
             &mut get_var,
         )?;
+        let session_settings = settings.session.unwrap_or_default();
         let session_mode = parse_session_mode(
             get_var("SQUEEZY_SESSION_MODE"),
-            settings
-                .session
-                .and_then(|session| session.mode)
-                .unwrap_or_default(),
+            session_settings.mode.unwrap_or_default(),
         );
         let skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
@@ -355,6 +357,7 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
+        let session_logs = SessionLogConfig::from_settings(&session_settings);
         let tui = TuiConfig::from_settings(settings.tui.unwrap_or_default());
         if env_used {
             sources.push("env".to_string());
@@ -372,6 +375,7 @@ impl AppConfig {
             workspace_root: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             permissions,
             session_mode,
+            session_logs,
             store_responses,
             max_parallel_tools,
             tool_spill_threshold_bytes,
@@ -453,8 +457,26 @@ impl AppConfig {
 
         output.push_str("[session]\n");
         output.push_str(&format!(
-            "mode = {}\n\n",
+            "mode = {}\n",
             toml_string(self.session_mode.as_str())
+        ));
+        if let Some(log_dir) = &self.session_logs.log_dir {
+            output.push_str(&format!(
+                "log_dir = {}\n",
+                toml_string(&log_dir.display().to_string())
+            ));
+        }
+        output.push_str(&format!(
+            "log_retention_days = {}\n",
+            self.session_logs.log_retention_days
+        ));
+        output.push_str(&format!(
+            "max_event_bytes = {}\n",
+            self.session_logs.max_event_bytes
+        ));
+        output.push_str(&format!(
+            "max_session_bytes = {}\n\n",
+            self.session_logs.max_session_bytes
         ));
 
         output.push_str("[budgets]\n");
@@ -1272,11 +1294,26 @@ impl SessionMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SessionSettings {
     pub mode: Option<SessionMode>,
+    pub log_dir: Option<PathBuf>,
+    pub log_retention_days: Option<u64>,
+    pub max_event_bytes: Option<usize>,
+    pub max_session_bytes: Option<usize>,
 }
 
 impl SessionSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["mode"], source, path)?;
+        reject_unknown_keys(
+            table,
+            &[
+                "mode",
+                "log_dir",
+                "log_retention_days",
+                "max_event_bytes",
+                "max_session_bytes",
+            ],
+            source,
+            path,
+        )?;
         let mode = match table.get("mode") {
             Some(value) => {
                 let value = value
@@ -1290,11 +1327,75 @@ impl SessionSettings {
             }
             None => None,
         };
-        Ok(Self { mode })
+        Ok(Self {
+            mode,
+            log_dir: path_value(table, "log_dir", source, &field(path, "log_dir"))?,
+            log_retention_days: u64_value(
+                table,
+                "log_retention_days",
+                source,
+                &field(path, "log_retention_days"),
+            )?,
+            max_event_bytes: usize_value(
+                table,
+                "max_event_bytes",
+                source,
+                &field(path, "max_event_bytes"),
+            )?,
+            max_session_bytes: usize_value(
+                table,
+                "max_session_bytes",
+                source,
+                &field(path, "max_session_bytes"),
+            )?,
+        })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.mode, next.mode);
+        replace_if_some(&mut self.log_dir, next.log_dir);
+        replace_if_some(&mut self.log_retention_days, next.log_retention_days);
+        replace_if_some(&mut self.max_event_bytes, next.max_event_bytes);
+        replace_if_some(&mut self.max_session_bytes, next.max_session_bytes);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLogConfig {
+    pub log_dir: Option<PathBuf>,
+    pub log_retention_days: u64,
+    pub max_event_bytes: usize,
+    pub max_session_bytes: usize,
+}
+
+impl SessionLogConfig {
+    fn from_settings(settings: &SessionSettings) -> Self {
+        Self {
+            log_dir: settings.log_dir.clone(),
+            log_retention_days: settings
+                .log_retention_days
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_SESSION_LOG_RETENTION_DAYS),
+            max_event_bytes: settings
+                .max_event_bytes
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_SESSION_MAX_EVENT_BYTES),
+            max_session_bytes: settings
+                .max_session_bytes
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_SESSION_MAX_SESSION_BYTES),
+        }
+    }
+}
+
+impl Default for SessionLogConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: None,
+            log_retention_days: DEFAULT_SESSION_LOG_RETENTION_DAYS,
+            max_event_bytes: DEFAULT_SESSION_MAX_EVENT_BYTES,
+            max_session_bytes: DEFAULT_SESSION_MAX_SESSION_BYTES,
+        }
     }
 }
 
@@ -2919,6 +3020,10 @@ pub fn user_settings_template() -> &'static str {
 
 [session]
 # mode = "build"              # build | plan
+# log_dir = ".squeezy/sessions"
+# log_retention_days = 30
+# max_event_bytes = 65536
+# max_session_bytes = 52428800
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -3005,6 +3110,10 @@ pub fn project_settings_template() -> &'static str {
 
 [session]
 # mode = "build"              # build | plan
+# log_dir = ".squeezy/sessions"
+# log_retention_days = 30
+# max_event_bytes = 65536
+# max_session_bytes = 52428800
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact

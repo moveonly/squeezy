@@ -326,6 +326,10 @@ fn openai_input_item(item: &LlmInputItem) -> Value {
             "role": "user",
             "content": text,
         }),
+        LlmInputItem::AssistantText(text) => json!({
+            "role": "assistant",
+            "content": text,
+        }),
         LlmInputItem::FunctionCall {
             call_id,
             name,

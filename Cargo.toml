@@ -66,6 +66,7 @@ squeezy-harness = { path = "crates/squeezy-harness" }
 squeezy-llm = { path = "crates/squeezy-llm" }
 squeezy-parse = { path = "crates/squeezy-parse" }
 squeezy-skills = { path = "crates/squeezy-skills" }
+squeezy-store = { path = "crates/squeezy-store" }
 squeezy-telemetry = { path = "crates/squeezy-telemetry" }
 squeezy-tools = { path = "crates/squeezy-tools" }
 squeezy-tui = { path = "crates/squeezy-tui" }

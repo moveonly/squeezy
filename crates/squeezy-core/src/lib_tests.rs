@@ -1355,6 +1355,29 @@ fn load_settings_from_paths_skips_missing_files() {
 }
 
 #[test]
+fn session_log_settings_parse_defaults_and_overrides() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[session]
+mode = "plan"
+log_dir = ".squeezy/history"
+log_retention_days = 45
+max_event_bytes = 1234
+max_session_bytes = 5678
+"#,
+        "test",
+    )
+    .expect("parse settings");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.session_mode, SessionMode::Plan);
+    assert_eq!(config.session_logs.log_dir, Some(".squeezy/history".into()));
+    assert_eq!(config.session_logs.log_retention_days, 45);
+    assert_eq!(config.session_logs.max_event_bytes, 1234);
+    assert_eq!(config.session_logs.max_session_bytes, 5678);
+}
+
+#[test]
 fn init_user_template_contains_no_uncommented_assignments() {
     for line in user_settings_template().lines() {
         let trimmed = line.trim_start();

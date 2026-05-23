@@ -54,6 +54,10 @@ commented examples so that built-in defaults can evolve over time:
 
 [session]
 # mode = "build"
+# log_dir = ".squeezy/sessions"
+# log_retention_days = 30
+# max_event_bytes = 65536
+# max_session_bytes = 52428800
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -113,6 +117,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 [session]
 # mode = "build"
+# log_dir = ".squeezy/sessions"
+# log_retention_days = 30
+# max_event_bytes = 65536
+# max_session_bytes = 52428800
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -137,8 +145,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   normal tool behavior subject to permission policy. Plan mode advertises only
   read/search/navigation tools and refuses edit, shell, git, network, MCP,
   compiler, and destructive capabilities before ordinary permission rules or
-  approvals are evaluated. In the TUI, `Shift+Tab` toggles modes; `/plan` and
-  `/build` force a specific mode.
+  approvals are evaluated. `log_dir`, `log_retention_days`, `max_event_bytes`,
+  and `max_session_bytes` control redacted local session history and resume
+  state. When `log_dir` is unset, sessions are written to `<cache.root>/sessions`
+  if `[cache].root` is set, otherwise `.squeezy/sessions`. In the TUI,
+  `Shift+Tab` toggles modes; `/plan` and `/build` force a specific mode.
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.

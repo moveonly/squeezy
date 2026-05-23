@@ -85,6 +85,14 @@ fn anthropic_messages(input: &[LlmInputItem]) -> Value {
                     "text": text,
                 })],
             ),
+            LlmInputItem::AssistantText(text) => push_anthropic_message(
+                &mut messages,
+                "assistant",
+                vec![json!({
+                    "type": "text",
+                    "text": text,
+                })],
+            ),
             LlmInputItem::FunctionCall {
                 call_id,
                 name,

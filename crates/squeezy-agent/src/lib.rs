@@ -18,6 +18,10 @@ use squeezy_core::{
     TurnMetrics, default_settings_path, escape_toml_basic_string,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
+use squeezy_store::{
+    CleanupReport, ResumeItem, SessionEvent, SessionHandle, SessionMetadata, SessionQuery,
+    SessionRecord, SessionResumeState, SessionStatus, SessionStore,
+};
 use squeezy_telemetry::{
     ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
     ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
@@ -31,6 +35,47 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_TOOL_ROUNDS: usize = 8;
 
+#[derive(Debug, Clone, Default)]
+struct ConversationState {
+    previous_response_id: Option<String>,
+    conversation: Vec<LlmInputItem>,
+    transcript: Vec<TranscriptItem>,
+    cost: CostSnapshot,
+    metrics: SessionMetrics,
+    redactions: u64,
+}
+
+impl ConversationState {
+    fn from_resume(state: SessionResumeState, metadata: &SessionMetadata) -> Self {
+        Self {
+            previous_response_id: state.previous_response_id,
+            conversation: state
+                .conversation
+                .into_iter()
+                .map(resume_item_to_llm_input)
+                .collect(),
+            transcript: state.transcript,
+            cost: metadata.cost.clone(),
+            metrics: metadata.metrics.clone(),
+            redactions: metadata.redactions,
+        }
+    }
+
+    fn to_resume_state(&self) -> SessionResumeState {
+        SessionResumeState {
+            resume_available: true,
+            previous_response_id: self.previous_response_id.clone(),
+            conversation: self
+                .conversation
+                .iter()
+                .cloned()
+                .map(llm_input_to_resume_item)
+                .collect(),
+            transcript: self.transcript.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
@@ -39,6 +84,8 @@ pub struct Agent {
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Arc<Mutex<ConversationState>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
     /// In-memory permission rules added via "Allow user/project rule" during
@@ -55,6 +102,47 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
+        let session_log = start_session_log(&config, provider.name());
+        Self::build(config, provider, session_log, ConversationState::default())
+    }
+
+    pub fn resume(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_id: &str,
+    ) -> squeezy_core::Result<(Self, Vec<TranscriptItem>)> {
+        let store = SessionStore::open(&config);
+        let handle = store.open_session(session_id.to_string());
+        let resume_state = handle.read_resume_state()?;
+        if !resume_state.resume_available {
+            return Err(SqueezyError::Agent(format!(
+                "session {session_id} is not resumable"
+            )));
+        }
+        let metadata = handle.metadata()?;
+        let transcript = resume_state.transcript.clone();
+        let conversation_state = ConversationState::from_resume(resume_state, &metadata);
+        let agent = Self::build(config, provider, Some(handle.clone()), conversation_state);
+        let _ = handle.update_metadata(|metadata| {
+            metadata.status = SessionStatus::Running;
+            metadata.ended_at_ms = None;
+            metadata.resume_available = true;
+        });
+        let _ = handle.append_event(SessionEvent::new(
+            "session_resumed",
+            None,
+            Some("session resumed".to_string()),
+            json!({}),
+        ));
+        Ok((agent, transcript))
+    }
+
+    fn build(
+        config: AppConfig,
+        provider: Arc<dyn LlmProvider>,
+        session_log: Option<SessionHandle>,
+        conversation_state: ConversationState,
+    ) -> Self {
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
@@ -100,13 +188,16 @@ impl Agent {
             .expect("current directory must be a valid tool root")
         });
         let initial_session_mode = config.session_mode;
+        let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
             provider,
             tools,
             redactor,
-            session_metrics: Arc::new(Mutex::new(SessionMetrics::default())),
+            session_metrics,
+            session_log,
+            conversation_state: Arc::new(Mutex::new(conversation_state)),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
@@ -181,6 +272,62 @@ impl Agent {
         let _ = self.telemetry.flush().await;
     }
 
+    pub fn session_id(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
+    }
+
+    pub fn list_sessions(
+        &self,
+        query: &SessionQuery,
+    ) -> squeezy_core::Result<Vec<SessionMetadata>> {
+        SessionStore::open(&self.config).list(query)
+    }
+
+    pub fn show_session(&self, session_id: &str) -> squeezy_core::Result<SessionRecord> {
+        SessionStore::open(&self.config).show(session_id)
+    }
+
+    pub fn export_session(&self, session_id: &str) -> squeezy_core::Result<Value> {
+        SessionStore::open(&self.config).export(session_id)
+    }
+
+    pub fn cleanup_sessions(&self, ids: &[String]) -> squeezy_core::Result<CleanupReport> {
+        // Refuse to delete the session that this agent is currently writing
+        // to. Removing it under our feet would orphan future event writes and
+        // leave a session that no longer exists on disk but still appears in
+        // `metadata`/`resume_state` until the process exits.
+        let active = self.session_id();
+        if let Some(active_id) = &active
+            && ids.iter().any(|id| id == active_id)
+        {
+            return Err(SqueezyError::Agent(format!(
+                "refusing to clean up the active session {active_id}; finish or exit first"
+            )));
+        }
+        SessionStore::open(&self.config).cleanup_excluding(ids, active.as_deref())
+    }
+
+    pub fn resume_current(
+        &mut self,
+        session_id: &str,
+    ) -> squeezy_core::Result<Vec<TranscriptItem>> {
+        let (agent, transcript) =
+            Self::resume(self.config.clone(), self.provider.clone(), session_id)?;
+        *self = agent;
+        Ok(transcript)
+    }
+
+    pub async fn finish_session(&self, status: SessionStatus) {
+        let Some(session) = &self.session_log else {
+            return;
+        };
+        let state = self.conversation_state.lock().await.clone();
+        let _ = session.write_resume_state(&state.to_resume_state());
+        let _ = session.finish(status, state.cost, state.metrics, state.redactions);
+    }
+
     pub fn start_turn(
         &self,
         input: String,
@@ -198,9 +345,12 @@ impl Agent {
         let approval_ids = self.next_approval_id.clone();
         let session_rules = self.session_rules.clone();
         let session_mode = self.session_mode.clone();
+        let session_log = self.session_log.clone();
+        let conversation_state = self.conversation_state.clone();
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
+            let failure_session_log = session_log.clone();
             if tx
                 .send(AgentEvent::UserMessage {
                     turn_id,
@@ -227,12 +377,26 @@ impl Agent {
                 seed_redactions: redacted_input.redactions,
                 session_rules,
                 session_mode,
+                session_log,
+                conversation_state,
             }
             .run(redacted_input.text)
             .await;
 
             if let Err(error) = outcome {
                 let error = redact_error(error, &redactor);
+                if let Some(session) = failure_session_log {
+                    let _ = session.append_event(SessionEvent::new(
+                        "failed",
+                        Some(turn_id.to_string()),
+                        Some(error.to_string()),
+                        json!({ "error": error.to_string() }),
+                    ));
+                    let _ = session.update_metadata(|metadata| {
+                        metadata.status = SessionStatus::Failed;
+                        metadata.latest_summary = Some(error.to_string());
+                    });
+                }
                 telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
                 let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
             }
@@ -260,18 +424,32 @@ struct TurnRuntime {
     seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
     session_mode: Arc<AtomicU8>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Arc<Mutex<ConversationState>>,
 }
 
 impl TurnRuntime {
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
+        let user_transcript = TranscriptItem::user(input.clone());
         let activation = self.tools.activate_skills_for_input(&input)?;
         let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
-        let mut conversation = vec![LlmInputItem::UserText(activation.task_input)];
-        let mut next_input = conversation.clone();
-        let mut previous_response_id = None;
+        let user_item = LlmInputItem::UserText(activation.task_input);
+        let mut prior_state = self.conversation_state.lock().await.clone();
+        let mut conversation = prior_state.conversation.clone();
+        conversation.push(user_item.clone());
+        let mut previous_response_id = if self.config.store_responses {
+            prior_state.previous_response_id.take()
+        } else {
+            None
+        };
+        let mut next_input = if previous_response_id.is_some() && self.config.store_responses {
+            vec![user_item.clone()]
+        } else {
+            conversation.clone()
+        };
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::default();
         let mut broker = CostBroker::new(&self.config);
@@ -291,6 +469,12 @@ impl TurnRuntime {
         // text at the end) keeps ordinals stable between what streamed
         // into the TUI and what lands in the transcript.
         let mut assistant_message = String::new();
+        self.log_event(
+            "user_message",
+            Some(self.turn_id),
+            user_item_summary(&user_item),
+            json!({}),
+        );
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
@@ -347,6 +531,16 @@ impl TurnRuntime {
                             name: tool_call.name,
                             arguments: tool_call.arguments,
                         };
+                        self.log_event(
+                            "tool_call",
+                            Some(self.turn_id),
+                            Some(call.name.clone()),
+                            json!({
+                                "call_id": call.call_id,
+                                "tool": call.name,
+                                "arguments": call.arguments,
+                            }),
+                        );
                         if self
                             .tx
                             .send(AgentEvent::ToolCallQueued {
@@ -375,6 +569,18 @@ impl TurnRuntime {
                         break;
                     }
                     Ok(LlmEvent::Cancelled) => {
+                        // A cancelled turn leaves the session active so the
+                        // user can keep working. The lifecycle status only
+                        // flips when the agent itself is finalized (TUI exit
+                        // or `finish_session`). Recording the event here
+                        // still makes the cancellation discoverable in
+                        // `events.jsonl` and `squeezy sessions show`.
+                        self.log_event(
+                            "cancelled",
+                            Some(self.turn_id),
+                            Some("turn cancelled".to_string()),
+                            json!({}),
+                        );
                         let _ = self
                             .tx
                             .send(AgentEvent::Cancelled {
@@ -391,11 +597,22 @@ impl TurnRuntime {
                 self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
                     .await;
                 broker.metrics.redactions += assistant_stream.total_redactions();
+                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                self.persist_turn_state(
+                    &conversation,
+                    previous_response_id.clone(),
+                    user_transcript.clone(),
+                    message.clone(),
+                    &total_cost,
+                    &broker.metrics,
+                )
+                .await;
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
+                        message,
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -409,11 +626,22 @@ impl TurnRuntime {
                 self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
                     .await;
                 broker.metrics.redactions += assistant_stream.total_redactions();
+                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                self.persist_turn_state(
+                    &conversation,
+                    response_id.clone(),
+                    user_transcript.clone(),
+                    message.clone(),
+                    &total_cost,
+                    &broker.metrics,
+                )
+                .await;
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
+                        message,
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -437,6 +665,7 @@ impl TurnRuntime {
                     approval_ids: self.approval_ids.clone(),
                     session_rules: self.session_rules.clone(),
                     session_mode: self.session_mode.clone(),
+                    session_log: self.session_log.clone(),
                 },
                 &mut broker,
             )
@@ -458,18 +687,27 @@ impl TurnRuntime {
                     }
                 })
                 .collect::<Vec<_>>();
+            conversation.extend(
+                tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|call| llm_function_call_item(call, &self.redactor)),
+            );
+            conversation.extend(outputs.clone());
+            for output in &outputs {
+                self.log_event(
+                    "tool_result",
+                    Some(self.turn_id),
+                    tool_output_summary(output),
+                    json!({ "output": resume_item_for_json(output.clone()) }),
+                );
+            }
 
             if self.config.store_responses {
                 previous_response_id = response_id;
                 next_input = outputs;
             } else {
                 previous_response_id = None;
-                conversation.extend(
-                    tool_calls
-                        .into_iter()
-                        .map(|call| llm_function_call_item(call, &self.redactor)),
-                );
-                conversation.extend(outputs.clone());
                 next_input = conversation.clone();
             }
         }
@@ -486,6 +724,67 @@ impl TurnRuntime {
             metrics.clone(),
         ));
         self.session_metrics.lock().await.merge_turn(metrics);
+    }
+
+    async fn persist_turn_state(
+        &self,
+        conversation: &[LlmInputItem],
+        response_id: Option<String>,
+        user: TranscriptItem,
+        assistant: TranscriptItem,
+        cost: &CostSnapshot,
+        metrics: &TurnMetrics,
+    ) {
+        let mut state = self.conversation_state.lock().await;
+        state.conversation = conversation.to_vec();
+        state.previous_response_id = if self.config.store_responses {
+            response_id.clone()
+        } else {
+            None
+        };
+        state.transcript.push(user);
+        state.transcript.push(assistant.clone());
+        merge_cost(&mut state.cost, cost);
+        state.metrics.merge_turn(metrics);
+        state.redactions += metrics.redactions;
+        if let Some(session) = &self.session_log {
+            let _ = session.write_resume_state(&state.to_resume_state());
+            let _ = session.update_metadata(|metadata| {
+                metadata.cost = state.cost.clone();
+                metadata.metrics = state.metrics.clone();
+                metadata.redactions = state.redactions;
+                metadata.resume_available = true;
+                metadata.mode = load_session_mode(&self.session_mode);
+            });
+        }
+        drop(state);
+        self.log_event(
+            "assistant_completed",
+            Some(self.turn_id),
+            Some(assistant.content),
+            json!({
+                "response_id": response_id,
+                "cost": cost,
+                "metrics": metrics,
+            }),
+        );
+    }
+
+    fn log_event(
+        &self,
+        kind: &str,
+        turn_id: Option<TurnId>,
+        summary: Option<String>,
+        payload: Value,
+    ) {
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            kind,
+            turn_id,
+            summary,
+            payload,
+        );
     }
 
     /// Flushes any text the stream redactor is still holding behind its
@@ -525,6 +824,7 @@ struct ToolExecutionContext<'a> {
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
     session_mode: Arc<AtomicU8>,
+    session_log: Option<SessionHandle>,
 }
 
 async fn execute_tool_calls(
@@ -991,6 +1291,19 @@ async fn permission_decision(
                 matched_rule: verdict.matched_rule,
                 reason: context.redactor.redact(&verdict.reason).text,
             };
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "approval_requested",
+                Some(context.turn_id),
+                Some(call.name.clone()),
+                json!({
+                    "tool": call.name,
+                    "call_id": call.call_id,
+                    "permission": approval_request.permission,
+                    "reason": approval_request.reason,
+                }),
+            );
             let send_approval = context.tx.send(AgentEvent::ApprovalRequested {
                 turn_id: context.turn_id,
                 request: approval_request,
@@ -1003,10 +1316,19 @@ async fn permission_decision(
             if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
-            match tokio::select! {
+            let decision = tokio::select! {
                 _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
                 decision = decision_rx => decision,
-            } {
+            };
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "approval_decided",
+                Some(context.turn_id),
+                Some(format!("{decision:?}")),
+                json!({ "decision": format!("{decision:?}") }),
+            );
+            match decision {
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
                     ApprovalDecision::Approved
                 }
@@ -1504,6 +1826,9 @@ fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<Ll
         .cloned()
         .map(|item| match item {
             LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
+            LlmInputItem::AssistantText(text) => {
+                LlmInputItem::AssistantText(redactor.redact(&text).text)
+            }
             LlmInputItem::FunctionCall {
                 call_id,
                 name,
@@ -1599,6 +1924,129 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
     );
     total.estimated_usd_micros =
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
+}
+
+fn start_session_log(config: &AppConfig, provider: &str) -> Option<SessionHandle> {
+    let store = SessionStore::open(config);
+    let metadata = SessionMetadata::new(config, provider);
+    match store.start_session(metadata) {
+        Ok(handle) => {
+            let _ = handle.append_event(SessionEvent::new(
+                "session_started",
+                None,
+                Some("session started".to_string()),
+                json!({}),
+            ));
+            Some(handle)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "squeezy::sessions",
+                %error,
+                "session logging disabled for this run",
+            );
+            None
+        }
+    }
+}
+
+fn redact_json_payload(payload: Value, redactor: &Redactor) -> Value {
+    match payload {
+        Value::String(text) => Value::String(redactor.redact(&text).text),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| redact_json_payload(item, redactor))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, redact_json_payload(value, redactor)))
+                .collect(),
+        ),
+        // Numbers, booleans, and null cannot contain redactable text and we
+        // intentionally do not touch JSON object keys so the resulting value
+        // keeps a stable shape for callers that index into the payload.
+        other => other,
+    }
+}
+
+fn log_session_event(
+    session: Option<&SessionHandle>,
+    redactor: &Redactor,
+    kind: &str,
+    turn_id: Option<TurnId>,
+    summary: Option<String>,
+    payload: Value,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    let summary = summary.map(|value| redactor.redact(&value).text);
+    let payload = redact_json_payload(payload, redactor);
+    let _ = session.append_event(SessionEvent::new(
+        kind,
+        turn_id.map(|value| value.to_string()),
+        summary,
+        payload,
+    ));
+}
+
+fn user_item_summary(item: &LlmInputItem) -> Option<String> {
+    match item {
+        LlmInputItem::UserText(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn tool_output_summary(item: &LlmInputItem) -> Option<String> {
+    match item {
+        LlmInputItem::FunctionCallOutput { call_id, .. } => Some(format!("tool output {call_id}")),
+        _ => None,
+    }
+}
+
+fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
+    match item {
+        LlmInputItem::UserText(text) => ResumeItem::UserText { text },
+        LlmInputItem::AssistantText(text) => ResumeItem::AssistantText { text },
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => ResumeItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        },
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            ResumeItem::FunctionCallOutput { call_id, output }
+        }
+    }
+}
+
+fn resume_item_for_json(item: LlmInputItem) -> Value {
+    serde_json::to_value(llm_input_to_resume_item(item))
+        .unwrap_or_else(|_| json!({"error": "resume item serialization failed"}))
+}
+
+fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
+    match item {
+        ResumeItem::UserText { text } => LlmInputItem::UserText(text),
+        ResumeItem::AssistantText { text } => LlmInputItem::AssistantText(text),
+        ResumeItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        },
+        ResumeItem::FunctionCallOutput { call_id, output } => {
+            LlmInputItem::FunctionCallOutput { call_id, output }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

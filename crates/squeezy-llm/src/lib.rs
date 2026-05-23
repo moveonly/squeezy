@@ -57,6 +57,7 @@ impl LlmRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmInputItem {
     UserText(String),
+    AssistantText(String),
     FunctionCall {
         call_id: String,
         name: String,

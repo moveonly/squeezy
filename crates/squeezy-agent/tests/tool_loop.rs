@@ -1058,6 +1058,136 @@ async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_a
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn resumed_session_restores_prior_conversation() {
+    let root = temp_workspace("resume_conversation");
+    let first_provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("first answer".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_first".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let first_agent = Agent::new(config_for(root.clone()), first_provider);
+    drain_turn(first_agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let session_id = first_agent.session_id().expect("session id");
+
+    let second_provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("second answer".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_second".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let (second_agent, transcript) = Agent::resume(
+        config_for(root.clone()),
+        second_provider.clone(),
+        &session_id,
+    )
+    .expect("resume session");
+    assert_eq!(transcript.len(), 2);
+
+    drain_turn(second_agent.start_turn("second prompt".to_string(), CancellationToken::new()))
+        .await;
+    let requests = second_provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        matches!(&requests[0].input[0], LlmInputItem::UserText(text) if text == "first prompt")
+    );
+    assert!(
+        matches!(&requests[0].input[1], LlmInputItem::AssistantText(text) if text == "first answer")
+    );
+    assert!(
+        matches!(&requests[0].input[2], LlmInputItem::UserText(text) if text == "second prompt")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn resumed_session_preserves_cumulative_cost_and_metrics() {
+    let root = temp_workspace("resume_cost_preserved");
+    let first_provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("first answer".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_first".to_string()),
+            cost: CostSnapshot {
+                input_tokens: Some(100),
+                output_tokens: Some(50),
+                ..CostSnapshot::default()
+            },
+        }),
+    ]]));
+    let first_agent = Agent::new(config_for(root.clone()), first_provider);
+    drain_turn(first_agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let session_id = first_agent.session_id().expect("session id");
+
+    let mid_metadata = first_agent
+        .show_session(&session_id)
+        .expect("show first")
+        .metadata;
+    let first_turns = mid_metadata.metrics.turns;
+    assert!(first_turns >= 1, "first turn should be recorded");
+    assert_eq!(mid_metadata.cost.input_tokens, Some(100));
+
+    let second_provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("second answer".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_second".to_string()),
+            cost: CostSnapshot {
+                input_tokens: Some(40),
+                output_tokens: Some(20),
+                ..CostSnapshot::default()
+            },
+        }),
+    ]]));
+    let (second_agent, _) = Agent::resume(
+        config_for(root.clone()),
+        second_provider.clone(),
+        &session_id,
+    )
+    .expect("resume session");
+    drain_turn(second_agent.start_turn("second prompt".to_string(), CancellationToken::new()))
+        .await;
+
+    let resumed_metadata = second_agent
+        .show_session(&session_id)
+        .expect("show resumed")
+        .metadata;
+    assert_eq!(
+        resumed_metadata.cost.input_tokens,
+        Some(140),
+        "resumed cost should accumulate across the original and post-resume turns",
+    );
+    assert_eq!(resumed_metadata.cost.output_tokens, Some(70));
+    assert_eq!(resumed_metadata.metrics.turns, first_turns + 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cleanup_sessions_refuses_to_remove_the_active_session() {
+    let root = temp_workspace("cleanup_active");
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let agent = Agent::new(config_for(root.clone()), provider);
+    let session_id = agent.session_id().expect("session id");
+
+    let result = agent.cleanup_sessions(std::slice::from_ref(&session_id));
+    assert!(result.is_err(), "active session must not be cleanable");
+    assert!(
+        agent
+            .show_session(&session_id)
+            .is_ok_and(|record| record.metadata.session_id == session_id),
+        "active session metadata should still be readable",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
 }

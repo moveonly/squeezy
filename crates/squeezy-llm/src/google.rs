@@ -160,6 +160,10 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 "role": "user",
                 "parts": [{"text": text}],
             })),
+            LlmInputItem::AssistantText(text) => contents.push(json!({
+                "role": "model",
+                "parts": [{"text": text}],
+            })),
             LlmInputItem::FunctionCall {
                 call_id,
                 name,

@@ -1135,6 +1135,59 @@ impl<'writer> MakeWriter<'writer> for SharedLogWriter {
     }
 }
 
+#[test]
+fn redact_json_payload_walks_nested_string_values_and_preserves_structure() {
+    let redactor = squeezy_core::RedactionConfig::default()
+        .redactor()
+        .expect("built-in redactor");
+    // The literal token values below are synthetic placeholders that the
+    // built-in redactor patterns (`secret_assignment` and `aws_access_key`)
+    // match shape-wise; they are intentionally chosen to not look like any
+    // real provider's credential format so that repository-level secret
+    // scanners (gitleaks etc.) don't see them as live secrets.
+    let synthetic_assignment = "OPENAI_API_KEY=plaintestvaluedoesnotexist0001";
+    let synthetic_aws_access_key = "AKIAEXAMPLEEXAMPLEXX";
+    let payload = json!({
+        "tool": "shell",
+        "args": {
+            "command": format!("echo {synthetic_assignment}"),
+            "env_count": 7,
+            "destructive": false,
+        },
+        "matches": [
+            {"path": "src/main.rs", "snippet": synthetic_aws_access_key},
+            {"path": "README.md", "snippet": "plain text"},
+        ],
+        "null_field": serde_json::Value::Null,
+    });
+
+    let redacted = redact_json_payload(payload, &redactor);
+
+    // Shape must survive untouched: the function must not collapse on a
+    // failed reparse the way the string-roundtrip version could.
+    assert_eq!(redacted["tool"], "shell");
+    assert_eq!(redacted["args"]["env_count"], 7);
+    assert_eq!(redacted["args"]["destructive"], false);
+    assert!(redacted["null_field"].is_null());
+    assert_eq!(redacted["matches"][1]["path"], "README.md");
+
+    // Secret-bearing string values are scrubbed in place, while non-secret
+    // sibling strings (paths, keys) are left alone so downstream consumers
+    // can still navigate the payload.
+    let command = redacted["args"]["command"]
+        .as_str()
+        .expect("command remains a string");
+    assert!(
+        !command.contains("plaintestvaluedoesnotexist0001"),
+        "{command}",
+    );
+    assert!(command.contains("echo"), "{command}");
+    let snippet = redacted["matches"][0]["snippet"]
+        .as_str()
+        .expect("snippet remains a string");
+    assert!(!snippet.contains(synthetic_aws_access_key), "{snippet}");
+}
+
 struct SharedLogWrite {
     buffer: Arc<Mutex<Vec<u8>>>,
 }

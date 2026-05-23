@@ -1581,6 +1581,7 @@ dependencies = [
  "serde_json",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tools",
  "tokio",
@@ -1595,8 +1596,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "futures-util",
+ "serde_json",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tui",
  "tokio",
@@ -1697,7 +1700,10 @@ dependencies = [
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "squeezy-core",
+ "thiserror",
 ]
 
 [[package]]
@@ -1745,6 +1751,7 @@ dependencies = [
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-store",
  "squeezy-tools",
  "squeezy-vcs",
  "tokio",

@@ -15,6 +15,10 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
     models_for_provider, provider_from_config,
 };
+use squeezy_store::{
+    ResumeItem, SessionEvent, SessionMetadata, SessionQuery, SessionResumeState, SessionStatus,
+    SessionStore,
+};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +56,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "List, inspect, resume, export, or clean up local sessions")]
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +85,45 @@ struct InitScope {
     project: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    #[command(about = "List local sessions")]
+    List(SessionListArgs),
+    #[command(about = "Show a local session summary")]
+    Show { id: String },
+    #[command(about = "Resume a local session in the TUI")]
+    Resume { id: String },
+    #[command(about = "Export a redacted local session bundle as JSON")]
+    Export { id: String },
+    #[command(about = "Remove expired sessions or explicit session ids")]
+    Cleanup {
+        #[arg(long = "id")]
+        ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct SessionListArgs {
+    #[arg(long, help = "Unix timestamp in milliseconds")]
+    since: Option<u64>,
+    #[arg(long, help = "Unix timestamp in milliseconds")]
+    until: Option<u64>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    branch: Option<String>,
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long, help = "running, completed, cancelled, failed, or truncated")]
+    status: Option<String>,
+    #[arg(long)]
+    query: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
     tracing_subscriber::fmt()
@@ -86,6 +134,9 @@ async fn main() -> squeezy_core::Result<()> {
     let cli = Cli::parse();
     if let Some(Command::Config { command }) = &cli.command {
         return handle_config_command(command, &cli);
+    }
+    if let Some(Command::Sessions { command }) = &cli.command {
+        return handle_sessions_command(command, &cli).await;
     }
 
     let config = config_from_cli(&cli)?;
@@ -209,15 +260,153 @@ fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Re
     }
 }
 
+async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let store = SessionStore::open(&config);
+    match command {
+        SessionsCommand::List(args) => {
+            let sessions = store.list(&session_query_from_args(args)?)?;
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    session.session_id,
+                    session.status.as_str(),
+                    session.started_at_ms,
+                    session.branch.unwrap_or_else(|| "-".to_string()),
+                    session.provider,
+                    session
+                        .first_user_task
+                        .or(session.latest_summary)
+                        .unwrap_or_default()
+                        .replace('\n', " ")
+                );
+            }
+            Ok(())
+        }
+        SessionsCommand::Show { id } => {
+            let record = store.show(id)?;
+            println!("id={}", record.metadata.session_id);
+            println!("status={}", record.metadata.status.as_str());
+            println!("started_at_ms={}", record.metadata.started_at_ms);
+            println!(
+                "ended_at_ms={}",
+                format_optional_u64(record.metadata.ended_at_ms)
+            );
+            println!("cwd={}", record.metadata.cwd);
+            println!("workspace_root={}", record.metadata.workspace_root);
+            println!(
+                "repo_root={}",
+                record.metadata.repo_root.unwrap_or_else(|| "-".to_string())
+            );
+            println!(
+                "branch={}",
+                record.metadata.branch.unwrap_or_else(|| "-".to_string())
+            );
+            println!("provider={}", record.metadata.provider);
+            println!("model={}", record.metadata.model);
+            println!("mode={}", record.metadata.mode.as_str());
+            println!("events={}", record.metadata.event_count);
+            println!("event_warnings={}", record.event_warnings);
+            println!("redactions={}", record.metadata.redactions);
+            println!("resume_available={}", record.metadata.resume_available);
+            if let Some(reason) = record.metadata.resume_unavailable_reason {
+                println!("resume_unavailable_reason={reason}");
+            }
+            if let Some(task) = record.metadata.first_user_task {
+                println!("first_user_task={}", task.replace('\n', " "));
+            }
+            if let Some(summary) = record.metadata.latest_summary {
+                println!("latest_summary={}", summary.replace('\n', " "));
+            }
+            Ok(())
+        }
+        SessionsCommand::Resume { id } => {
+            let provider = provider_from_app_config(&config);
+            squeezy_tui::resume(config, provider, id.clone()).await
+        }
+        SessionsCommand::Export { id } => {
+            let value = store.export(id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).map_err(|err| {
+                    SqueezyError::Tool(format!("failed to serialize session export: {err}"))
+                })?
+            );
+            Ok(())
+        }
+        SessionsCommand::Cleanup { ids } => {
+            let report = store.cleanup(ids)?;
+            for id in report.removed {
+                println!("removed {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn session_query_from_args(args: &SessionListArgs) -> squeezy_core::Result<SessionQuery> {
+    Ok(SessionQuery {
+        since_ms: args.since,
+        until_ms: args.until,
+        cwd: args.cwd.clone(),
+        repo: args.repo.clone(),
+        branch: args.branch.clone(),
+        provider: args.provider.clone(),
+        model: args.model.clone(),
+        status: args
+            .status
+            .as_deref()
+            .map(parse_session_status)
+            .transpose()?,
+        query: args.query.clone(),
+    })
+}
+
+fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "running" => Ok(SessionStatus::Running),
+        "completed" => Ok(SessionStatus::Completed),
+        "cancelled" | "canceled" => Ok(SessionStatus::Cancelled),
+        "failed" => Ok(SessionStatus::Failed),
+        "truncated" => Ok(SessionStatus::Truncated),
+        _ => Err(SqueezyError::Config(format!(
+            "invalid session status {value:?}; expected running, completed, cancelled, failed, or truncated"
+        ))),
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
 async fn run_prompt(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     prompt: String,
 ) -> squeezy_core::Result<()> {
+    let redactor = config.redaction.redactor()?;
+    let session = SessionStore::open(&config)
+        .start_session(SessionMetadata::new(&config, provider.name()))
+        .ok();
+    let mut redactions: u64 = 0;
+    let redacted_prompt = redactor.redact(&prompt);
+    redactions = redactions.saturating_add(redacted_prompt.redactions);
+    let redacted_prompt = redacted_prompt.text;
+    let redacted_instructions = redactor.redact(&config.instructions);
+    redactions = redactions.saturating_add(redacted_instructions.redactions);
+    let redacted_instructions = redacted_instructions.text;
+    if let Some(session) = &session {
+        let _ = session.append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some(redacted_prompt.clone()),
+            serde_json::json!({}),
+        ));
+    }
     let request = LlmRequest {
-        model: config.model,
-        instructions: config.instructions,
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: config.model.clone(),
+        instructions: redacted_instructions,
+        input: vec![LlmInputItem::UserText(redacted_prompt.clone())],
         max_output_tokens: config.max_output_tokens,
         previous_response_id: None,
         tools: Vec::new(),
@@ -225,11 +414,13 @@ async fn run_prompt(
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());
     let mut stdout = io::stdout().lock();
+    let mut assistant = String::new();
 
     while let Some(event) = stream.next().await {
         match event? {
             LlmEvent::Started => {}
             LlmEvent::TextDelta(delta) => {
+                assistant.push_str(&delta);
                 write!(stdout, "{delta}")?;
                 stdout.flush()?;
             }
@@ -239,9 +430,45 @@ async fn run_prompt(
                     tool_call.name
                 );
             }
-            LlmEvent::Completed { cost, .. } => {
+            LlmEvent::Completed { response_id, cost } => {
                 writeln!(stdout)?;
                 stdout.flush()?;
+                let redacted_assistant = redactor.redact(&assistant);
+                redactions = redactions.saturating_add(redacted_assistant.redactions);
+                let redacted_assistant = redacted_assistant.text;
+                if let Some(session) = &session {
+                    let _ = session.append_event(SessionEvent::new(
+                        "assistant_completed",
+                        None,
+                        Some(redacted_assistant.clone()),
+                        serde_json::json!({ "response_id": response_id, "cost": cost }),
+                    ));
+                    let _ = session.write_resume_state(&SessionResumeState {
+                        resume_available: true,
+                        previous_response_id: response_id,
+                        conversation: vec![
+                            ResumeItem::UserText {
+                                text: redacted_prompt.clone(),
+                            },
+                            ResumeItem::AssistantText {
+                                text: redacted_assistant.clone(),
+                            },
+                        ],
+                        transcript: vec![
+                            squeezy_core::TranscriptItem::user(redacted_prompt.clone()),
+                            squeezy_core::TranscriptItem::assistant(redacted_assistant.clone()),
+                        ],
+                    });
+                    let metrics = squeezy_core::SessionMetrics {
+                        turns: 1,
+                        model_output_bytes: redacted_assistant.len() as u64,
+                        redactions,
+                        provider: cost.clone(),
+                        ..squeezy_core::SessionMetrics::default()
+                    };
+                    let _ =
+                        session.finish(SessionStatus::Completed, cost.clone(), metrics, redactions);
+                }
                 eprintln!(
                     "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
                     format_token(cost.input_tokens),

@@ -14,8 +14,10 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 futures-util.workspace = true
+serde_json.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tui.workspace = true
 tokio.workspace = true

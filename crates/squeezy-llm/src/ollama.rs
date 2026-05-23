@@ -115,6 +115,9 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             LlmInputItem::UserText(text) => {
                 messages.push(json!({ "role": "user", "content": text }));
             }
+            LlmInputItem::AssistantText(text) => {
+                messages.push(json!({ "role": "assistant", "content": text }));
+            }
             LlmInputItem::FunctionCall {
                 call_id: _,
                 name,

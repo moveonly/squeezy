@@ -23,25 +23,53 @@ use squeezy_core::{
     TelemetryConfig, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
+use squeezy_store::SessionQuery;
 use squeezy_tools::ToolCall;
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
+    run_inner(config, provider, None).await
+}
+
+pub async fn resume(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    session_id: String,
+) -> Result<()> {
+    run_inner(config, provider, Some(session_id)).await
+}
+
+async fn run_inner(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    resume_session_id: Option<String>,
+) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
-    let agent = Agent::new(config.clone(), provider);
+    let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
+        Agent::resume(config.clone(), provider, &session_id)?
+    } else {
+        (Agent::new(config.clone(), provider), Vec::new())
+    };
     let mut app = TuiApp::new(agent.provider_name(), &config, agent.session_mode());
+    app.transcript.extend(initial_transcript);
+    if let Some(session_id) = agent.session_id() {
+        app.status = format!("session {session_id}");
+    }
 
     loop {
         terminal.draw(|frame| render(frame, &app))?;
 
         drain_agent_events(&mut app).await;
-        if poll_input(&mut app, &agent, config.tick_rate).await? {
+        if poll_input(&mut app, &mut agent, config.tick_rate).await? {
             break;
         }
     }
 
+    agent
+        .finish_session(squeezy_store::SessionStatus::Completed)
+        .await;
     agent.flush_telemetry().await;
 
     Ok(())
@@ -138,7 +166,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
     }
 }
 
-async fn poll_input(app: &mut TuiApp, agent: &Agent, tick_rate: Duration) -> Result<bool> {
+async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) -> Result<bool> {
     if !event::poll(tick_rate).map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         return Ok(false);
     }
@@ -151,7 +179,7 @@ async fn poll_input(app: &mut TuiApp, agent: &Agent, tick_rate: Duration) -> Res
     handle_key(app, agent, key).await
 }
 
-async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bool> {
+async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if let Some(cancel) = &app.cancel {
             cancel.cancel();
@@ -247,18 +275,117 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
     }
 }
 
-async fn handle_slash_command(app: &mut TuiApp, agent: &Agent, input: &str) -> bool {
+async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
         return false;
     };
-    if command == "/copy" {
-        match parts.next() {
-            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
-            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
-            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
+    match command {
+        "/sessions" => {
+            match agent.list_sessions(&SessionQuery::default()) {
+                Ok(sessions) => {
+                    app.status = format!("{} sessions", sessions.len());
+                    app.transcript.push(TranscriptItem::system(
+                        sessions
+                            .into_iter()
+                            .take(10)
+                            .map(|session| {
+                                format!(
+                                    "{} {} {}",
+                                    session.session_id,
+                                    session.status.as_str(),
+                                    session
+                                        .first_user_task
+                                        .or(session.latest_summary)
+                                        .unwrap_or_default()
+                                        .replace('\n', " ")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ));
+                }
+                Err(error) => app.status = format!("session list failed: {error}"),
+            }
+            return true;
         }
-        return true;
+        "/session" => {
+            let Some(session_id) = parts.next() else {
+                app.status = "usage: /session <session_id>".to_string();
+                return true;
+            };
+            match agent.show_session(session_id) {
+                Ok(record) => {
+                    app.status = format!(
+                        "session {}: {} events={} redactions={}",
+                        record.metadata.session_id,
+                        record.metadata.status.as_str(),
+                        record.metadata.event_count,
+                        record.metadata.redactions
+                    );
+                    app.transcript.push(TranscriptItem::system(format!(
+                        "{}\nstatus={} started={} branch={} task={}",
+                        record.metadata.session_id,
+                        record.metadata.status.as_str(),
+                        record.metadata.started_at_ms,
+                        record.metadata.branch.unwrap_or_else(|| "-".to_string()),
+                        record.metadata.first_user_task.unwrap_or_default()
+                    )));
+                }
+                Err(error) => app.status = format!("session show failed: {error}"),
+            }
+            return true;
+        }
+        "/resume" => {
+            let Some(session_id) = parts.next() else {
+                app.status = "usage: /resume <session_id>".to_string();
+                return true;
+            };
+            match agent.resume_current(session_id) {
+                Ok(transcript) => {
+                    app.transcript = transcript;
+                    app.pending_assistant.clear();
+                    app.turn_rx = None;
+                    app.cancel = None;
+                    app.status = format!("resumed session {session_id}");
+                }
+                Err(error) => app.status = format!("resume failed: {error}"),
+            }
+            return true;
+        }
+        "/session-export" => {
+            let Some(session_id) = parts.next() else {
+                app.status = "usage: /session-export <session_id>".to_string();
+                return true;
+            };
+            match agent.export_session(session_id) {
+                Ok(value) => {
+                    app.status = format!(
+                        "session export {} bytes",
+                        serde_json::to_string(&value).map_or(0, |text| text.len())
+                    );
+                }
+                Err(error) => app.status = format!("session export failed: {error}"),
+            }
+            return true;
+        }
+        "/session-cleanup" => {
+            let ids = parts.map(str::to_string).collect::<Vec<_>>();
+            match agent.cleanup_sessions(&ids) {
+                Ok(report) => app.status = format!("removed {} sessions", report.removed.len()),
+                Err(error) => app.status = format!("session cleanup failed: {error}"),
+            }
+            return true;
+        }
+        "/copy" => {
+            match parts.next() {
+                None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
+                Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
+                Some(_) => app.status = "usage: /copy [transcript]".to_string(),
+            }
+            return true;
+        }
+        _ => {}
     }
     let (name, arguments) = match command {
         "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
@@ -692,7 +819,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume | Ctrl-C cancel | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
