@@ -12,6 +12,7 @@ members = [
     "crates/squeezy-telemetry",
     "crates/squeezy-tools",
     "crates/squeezy-tui",
+    "crates/squeezy-vcs",
     "crates/squeezy-workspace",
 ]
 resolver = "3"
@@ -57,6 +58,7 @@ squeezy-parse = { path = "crates/squeezy-parse" }
 squeezy-telemetry = { path = "crates/squeezy-telemetry" }
 squeezy-tools = { path = "crates/squeezy-tools" }
 squeezy-tui = { path = "crates/squeezy-tui" }
+squeezy-vcs = { path = "crates/squeezy-vcs" }
 squeezy-workspace = { path = "crates/squeezy-workspace" }
 
 [profile.release]

@@ -1,7 +1,8 @@
 use std::{
     collections::VecDeque,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Command,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -206,6 +207,153 @@ async fn read_file_returns_bounded_content_and_hash() {
         result.receipt.content_sha256,
         Some(sha256_hex("abcdef".as_bytes()))
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn diff_context_reports_changed_file_and_dirty_symbol() {
+    let root = temp_workspace("diff_context");
+    write_rust_crate(
+        &root,
+        "pub fn changed() -> usize { 1 }\nfn caller() -> usize { changed() }\n",
+    );
+    git_init_commit(&root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn changed() -> usize { 2 }\nfn caller() -> usize { changed() }\n",
+    )
+    .expect("modify source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "diff_context".to_string(),
+                arguments: json!({"max_symbols_per_file": 10}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["summary"]["files_changed"], 1);
+    assert_eq!(result.content["files"][0]["path"], "src/lib.rs");
+    let symbols = result.content["graph"]["files"][0]["symbols"]
+        .as_array()
+        .expect("symbols");
+    assert!(symbols.iter().any(|symbol| symbol["name"] == "changed"
+        && !symbol["references"].as_array().unwrap().is_empty()));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn diff_only_filters_glob_grep_and_read_file() {
+    let root = temp_workspace("diff_only");
+    fs::write(root.join("changed.txt"), "needle before\n").expect("write changed");
+    fs::write(root.join("clean.txt"), "needle clean\n").expect("write clean");
+    git_init_commit(&root);
+    fs::write(root.join("changed.txt"), "needle after\n").expect("modify changed");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let glob = registry
+        .execute(
+            ToolCall {
+                call_id: "glob".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "*.txt", "diff_only": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(glob.content["paths"], json!(["changed.txt"]));
+
+    let grep = registry
+        .execute(
+            ToolCall {
+                call_id: "grep".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "diff_only": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(match_paths(&grep), vec!["changed.txt"]);
+
+    let clean_read = registry
+        .execute(
+            ToolCall {
+                call_id: "read_clean".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "clean.txt", "diff_only": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(clean_read.status, ToolStatus::Denied);
+
+    let changed_read = registry
+        .execute(
+            ToolCall {
+                call_id: "read_changed".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "changed.txt", "diff_only": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(changed_read.status, ToolStatus::Success);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn verify_defaults_to_diff_scope_and_noops_for_non_rust_diff() {
+    let root = temp_workspace("verify_noop");
+    fs::write(root.join("README.md"), "before\n").expect("write readme");
+    git_init_commit(&root);
+    fs::write(root.join("README.md"), "after\n").expect("modify readme");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "verify".to_string(),
+                name: "verify".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["scope"], "diff");
+    assert_eq!(result.content["level"], "quick");
+    assert_eq!(result.content["no_op"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn diff_verify_command_uses_package_scoped_cargo_test() {
+    let root = temp_workspace("verify_command");
+    fs::create_dir_all(root.join("crates/example")).expect("create crate");
+    fs::write(
+        root.join("crates/example/Cargo.toml"),
+        "[package]\nname = \"squeezy-example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+
+    let command = verify_command(
+        &root,
+        VerifyScope::Diff,
+        VerifyLevel::Quick,
+        &["crates/example/src/lib.rs".to_string()],
+    );
+
+    assert_eq!(command, "cargo test -p squeezy-example");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1197,11 +1345,14 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         names,
         vec![
+            "diff_context",
             "glob",
             "grep",
             "read_file",
             "read_tool_output",
             "shell",
+            "symbol_context",
+            "verify",
             "webfetch",
             "websearch",
             "write_file"
@@ -1228,6 +1379,38 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+fn write_rust_crate(root: &Path, source: &str) {
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), source).expect("write source");
+}
+
+fn git_init_commit(root: &Path) {
+    run_git(root, &["init"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "user.name", "Squeezy Test"]);
+    run_git(root, &["add", "."]);
+    run_git(root, &["commit", "-m", "initial"]);
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[derive(Debug, Clone)]
