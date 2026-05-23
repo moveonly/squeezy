@@ -16,6 +16,7 @@ fn app_starts_ready_with_empty_transcript() {
         "gpt-test".to_string(),
         "defaults".to_string(),
         SessionMode::Build,
+        None,
     );
 
     assert_eq!(app.provider_name, "openai");
@@ -26,12 +27,31 @@ fn app_starts_ready_with_empty_transcript() {
 }
 
 #[test]
+fn app_surfaces_onboarding_summary_once() {
+    let app = TuiApp::new(
+        "openai",
+        "gpt-test".to_string(),
+        "defaults".to_string(),
+        SessionMode::Build,
+        Some("repo profile created: /tmp/project".to_string()),
+    );
+
+    assert_eq!(app.status, "repo profile ready");
+    assert_eq!(app.transcript.len(), 1);
+    assert_eq!(
+        app.transcript[0].content,
+        "repo profile created: /tmp/project"
+    );
+}
+
+#[test]
 fn status_line_surfaces_current_mode_and_switch_hints() {
     let mut app = TuiApp::new(
         "openai",
         "gpt-test".to_string(),
         "defaults".to_string(),
         SessionMode::Plan,
+        None,
     );
     app.status = "ready".to_string();
 
@@ -55,6 +75,7 @@ async fn shift_tab_toggles_mode() {
         "gpt-test".to_string(),
         "defaults".to_string(),
         SessionMode::Build,
+        None,
     );
 
     handle_key(
@@ -88,6 +109,7 @@ async fn slash_plan_and_build_force_modes() {
         "gpt-test".to_string(),
         "defaults".to_string(),
         SessionMode::Build,
+        None,
     );
 
     app.input = "/plan".to_string();
@@ -134,6 +156,7 @@ async fn mode_switch_is_refused_during_active_turn() {
         "gpt-test".to_string(),
         "defaults".to_string(),
         SessionMode::Build,
+        None,
     );
     let (_tx, rx) = mpsc::channel(1);
     app.turn_rx = Some(rx);

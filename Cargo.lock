@@ -1597,6 +1597,7 @@ dependencies = [
  "futures-util",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-store",
  "squeezy-telemetry",
  "squeezy-tui",
  "tokio",
@@ -1697,7 +1698,12 @@ dependencies = [
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
  "squeezy-core",
+ "squeezy-workspace",
+ "toml",
 ]
 
 [[package]]

@@ -15,6 +15,7 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
     models_for_provider, provider_from_config,
 };
+use squeezy_store::{RepoProfileLoad, ensure_repo_profile, refresh_repo_profile};
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +53,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    #[command(about = "Inspect or refresh the local generated repo profile")]
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +82,16 @@ struct InitScope {
     project: bool,
 }
 
+#[derive(Debug, Subcommand)]
+enum RepoCommand {
+    #[command(about = "Print the stored or freshly computed repo profile")]
+    Inspect,
+    #[command(about = "Recompute and persist the generated local repo profile")]
+    Refresh,
+    #[command(about = "Print suggested project config settings for manual adoption")]
+    Recommendations,
+}
+
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
     tracing_subscriber::fmt()
@@ -84,11 +100,13 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if let Some(Command::Config { command }) = &cli.command {
-        return handle_config_command(command, &cli);
+    match &cli.command {
+        Some(Command::Config { command }) => return handle_config_command(command, &cli),
+        Some(Command::Repo { command }) => return handle_repo_command(command, &cli),
+        None => {}
     }
 
-    let config = config_from_cli(&cli)?;
+    let mut config = config_from_cli(&cli)?;
 
     if cli.list_providers {
         for provider in PROVIDERS {
@@ -121,13 +139,22 @@ async fn main() -> squeezy_core::Result<()> {
     }
 
     if cli.health {
+        let onboarding = prepare_repo_profile(&mut config)?;
         println!("squeezy: ok");
         println!("config_sources={}", config.config_sources.join(","));
         println!(
             "config_source_labels={}",
             config.config_source_labels().join(",")
         );
+        if let Some(summary) = onboarding.visible_summary {
+            println!("{summary}");
+        }
         return Ok(());
+    }
+
+    let onboarding = prepare_repo_profile(&mut config)?;
+    if let Some(summary) = &onboarding.visible_summary {
+        eprintln!("{summary}");
     }
 
     show_telemetry_notice_once(&config);
@@ -141,7 +168,8 @@ async fn main() -> squeezy_core::Result<()> {
         return result;
     }
 
-    let result = squeezy_tui::run(config, provider).await;
+    let result =
+        squeezy_tui::run_with_onboarding(config, provider, onboarding.visible_summary).await;
     let _ = telemetry.flush().await;
     result
 }
@@ -207,6 +235,55 @@ fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Re
             Ok(())
         }
     }
+}
+
+fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    match command {
+        RepoCommand::Inspect => {
+            let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
+            println!("{}", loaded.profile.render_human());
+            println!(
+                "registry: {} ({})",
+                loaded.registry_path.display(),
+                loaded.status.as_str()
+            );
+            Ok(())
+        }
+        RepoCommand::Refresh => {
+            let loaded = refresh_repo_profile(&config.workspace_root, &config.graph)?;
+            println!("{}", loaded.profile.compact_summary(loaded.status));
+            println!("registry: {}", loaded.registry_path.display());
+            Ok(())
+        }
+        RepoCommand::Recommendations => {
+            let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
+            print!("{}", loaded.profile.recommendations_toml());
+            Ok(())
+        }
+    }
+}
+
+struct PreparedRepoProfile {
+    visible_summary: Option<String>,
+}
+
+fn prepare_repo_profile(config: &mut AppConfig) -> squeezy_core::Result<PreparedRepoProfile> {
+    let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
+    append_repo_profile_instructions(config, &loaded);
+    let visible_summary = loaded
+        .status
+        .should_show_onboarding()
+        .then(|| loaded.profile.compact_summary(loaded.status));
+    Ok(PreparedRepoProfile { visible_summary })
+}
+
+fn append_repo_profile_instructions(config: &mut AppConfig, loaded: &RepoProfileLoad) {
+    config.instructions = format!(
+        "{}\n\n{}",
+        config.instructions,
+        loaded.profile.model_context()
+    );
 }
 
 async fn run_prompt(

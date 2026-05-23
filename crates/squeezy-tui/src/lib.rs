@@ -21,6 +21,14 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
+    run_with_onboarding(config, provider, None).await
+}
+
+pub async fn run_with_onboarding(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    onboarding_summary: Option<String>,
+) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let agent = Agent::new(config.clone(), provider);
     let mut app = TuiApp::new(
@@ -28,6 +36,7 @@ pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()
         config.model.clone(),
         config.config_source_labels().join(","),
         agent.session_mode(),
+        onboarding_summary,
     );
 
     loop {
@@ -597,16 +606,27 @@ impl TuiApp {
         model: String,
         config_sources: String,
         mode: SessionMode,
+        onboarding_summary: Option<String>,
     ) -> Self {
+        let mut transcript = Vec::new();
+        let status = if let Some(summary) = onboarding_summary {
+            transcript.push(TranscriptItem {
+                role: Role::Assistant,
+                content: summary,
+            });
+            "repo profile ready".to_string()
+        } else {
+            "ready".to_string()
+        };
         Self {
             provider_name,
             model,
             mode,
             config_sources,
             input: String::new(),
-            transcript: Vec::new(),
+            transcript,
             pending_assistant: String::new(),
-            status: "ready".to_string(),
+            status,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,

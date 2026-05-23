@@ -19,6 +19,10 @@ Set `SQUEEZY_SETTINGS_PATH` to use a different user settings file. Shared
 project configuration should live in `squeezy.toml`; `.squeezy/` remains local
 runtime state and is ignored by git in this repository.
 
+Generated repo profiles are separate from project configuration. Squeezy stores
+detected, machine-local repo knowledge in `~/.squeezy/repos.toml`; see
+`docs/REPO_PROFILE.md`.
+
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
 
