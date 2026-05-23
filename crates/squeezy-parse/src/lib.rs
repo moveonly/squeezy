@@ -802,30 +802,146 @@ fn is_test_function(attributes: &[String]) -> bool {
         .any(|attr| attr.contains("#[test]") || attr.contains("::test"))
 }
 
-fn extract_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
-    let raw = node_text(node, ctx.source).unwrap_or_default();
-    let path = raw
-        .trim()
-        .trim_start_matches("pub")
-        .trim_start_matches("use")
-        .trim()
-        .trim_end_matches(';')
-        .trim()
-        .to_string();
-    let alias = path
-        .rsplit_once(" as ")
-        .map(|(_, alias)| alias.trim().to_string());
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImportSpec {
+    path: String,
+    alias: Option<String>,
+    is_glob: bool,
+}
 
-    ctx.imports.push(ParsedImport {
-        file_id: ctx.file.id.clone(),
-        owner_id,
-        is_glob: path.ends_with("::*") || path.contains("::*"),
-        is_reexport: raw.trim_start().starts_with("pub"),
+fn expand_use_declaration(raw: &str) -> Vec<ImportSpec> {
+    let Some(tree) = strip_use_declaration(raw) else {
+        return Vec::new();
+    };
+    expand_use_tree(tree)
+        .into_iter()
+        .filter(|import| !import.path.is_empty())
+        .collect()
+}
+
+fn strip_use_declaration(raw: &str) -> Option<&str> {
+    let mut text = raw.trim().trim_end_matches(';').trim();
+    if let Some(rest) = text.strip_prefix("pub") {
+        text = rest.trim_start();
+        if text.starts_with('(')
+            && let Some(close) = text.find(')')
+        {
+            text = text[close + 1..].trim_start();
+        }
+    }
+    text.strip_prefix("use").map(str::trim)
+}
+
+fn expand_use_tree(tree: &str) -> Vec<ImportSpec> {
+    let tree = tree.trim();
+    if tree.is_empty() {
+        return Vec::new();
+    }
+    if let Some((prefix, inner, suffix)) = split_top_level_braces(tree) {
+        let prefix = prefix.trim_end_matches("::").trim();
+        let suffix = suffix.trim_start_matches("::").trim();
+        let mut imports = Vec::new();
+        for item in split_top_level_commas(inner) {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let combined = join_use_segments(prefix, item, suffix);
+            imports.extend(expand_use_tree(&combined));
+        }
+        return imports;
+    }
+
+    let (path, alias) = split_use_alias(tree);
+    let path = path.trim().trim_end_matches(';').trim().to_string();
+    if path.ends_with("::self") {
+        return vec![ImportSpec {
+            path: path.trim_end_matches("::self").to_string(),
+            alias,
+            is_glob: false,
+        }];
+    }
+    vec![ImportSpec {
+        is_glob: path.ends_with("::*"),
         path,
         alias,
-        span: span_from_node(node),
-        provenance: Provenance::new("tree-sitter-rust", "use declaration"),
-    });
+    }]
+}
+
+fn split_use_alias(path: &str) -> (&str, Option<String>) {
+    path.rsplit_once(" as ")
+        .map(|(path, alias)| (path, Some(alias.trim().to_string())))
+        .unwrap_or((path, None))
+}
+
+fn split_top_level_braces(text: &str) -> Option<(&str, &str, &str)> {
+    let mut depth = 0usize;
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let start = start?;
+                    return Some((&text[..start], &text[start + 1..index], &text[index + 1..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                items.push(&text[start..index]);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    items.push(&text[start..]);
+    items
+}
+
+fn join_use_segments(prefix: &str, item: &str, suffix: &str) -> String {
+    let item = if item == "self" { "" } else { item };
+    [prefix, item, suffix]
+        .into_iter()
+        .filter(|segment| !segment.trim().is_empty())
+        .map(|segment| segment.trim().trim_matches(':'))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn extract_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let is_reexport = raw.trim_start().starts_with("pub");
+    for import in expand_use_declaration(raw) {
+        ctx.imports.push(ParsedImport {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            is_glob: import.is_glob,
+            is_reexport,
+            path: import.path,
+            alias: import.alias,
+            span: span_from_node(node),
+            provenance: Provenance::new("tree-sitter-rust", "use declaration"),
+        });
+    }
 }
 
 fn extract_direct_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {

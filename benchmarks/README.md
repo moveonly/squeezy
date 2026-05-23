@@ -145,6 +145,17 @@ cfg-gated Tokio helpers and build-script/test utilities. Bat's rust-analyzer
 project load is degraded on this local toolchain, so its LSP reference numbers
 are treated as a noisy oracle result.
 
+Follow-up reference-FN reduction on May 23, 2026 added grouped `use` tree
+expansion, workspace package scoping for top-level crates, inline-module path
+matching, guarded unit-struct constructor references, and cfg-gated trait impl
+declaration filtering. On deterministic 5,000-scenario local runs with 50 LSP
+reference probes, `ripgrep` moved from TP=15 FP=0 FN=146 to TP=31 FP=1 FN=130.
+`serde` moved from TP=8 FP=3 FN=115 to TP=39 FP=6 FN=84. The remaining misses
+are mostly associated type references, trait method calls through type
+inference, active cfg/feature differences, proc-macro-generated references, and
+cross-crate reexports that need Cargo metadata rather than syntax-only
+heuristics.
+
 ## CI
 
 `.github/workflows/semantic-graph-benchmark.yml` runs the smoke benchmark on PRs
