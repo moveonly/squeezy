@@ -134,6 +134,22 @@ async fn shell_returns_bounded_output_and_exit_code() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn tool_specs_are_sorted_by_name() {
+    let root = temp_workspace("tool_specs");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let names = registry
+        .specs()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, vec!["grep", "read_file", "shell", "write_file"]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn match_paths(result: &ToolResult) -> Vec<String> {
     result.content["matches"]
         .as_array()

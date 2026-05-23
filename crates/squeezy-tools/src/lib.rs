@@ -126,12 +126,14 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        vec![
+        let mut specs = vec![
             grep_spec(),
             read_file_spec(),
             write_file_spec(),
             shell_spec(),
-        ]
+        ];
+        specs.sort_by(|left, right| left.name.cmp(&right.name));
+        specs
     }
 
     pub fn permission_scope(&self, call: &ToolCall) -> PermissionScope {

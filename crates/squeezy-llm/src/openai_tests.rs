@@ -121,6 +121,37 @@ fn request_body_serializes_tool_outputs_as_input_items() {
 }
 
 #[test]
+fn request_body_sorts_function_tools_by_name() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        previous_response_id: None,
+        tools: vec![
+            LlmToolSpec {
+                name: "write_file".to_string(),
+                description: "write".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+        ],
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+
+    assert_eq!(body["tools"][0]["name"], "grep");
+    assert_eq!(body["tools"][1]["name"], "write_file");
+}
+
+#[test]
 fn parser_extracts_function_call_from_output_item_done() {
     let event = parse_openai_event(
         r#"{

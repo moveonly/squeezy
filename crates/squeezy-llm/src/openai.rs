@@ -43,9 +43,10 @@ impl OpenAiProvider {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
         if !request.tools.is_empty() {
+            let mut tools = request.tools.iter().collect::<Vec<_>>();
+            tools.sort_by(|left, right| left.name.cmp(&right.name));
             body["tools"] = json!(
-                request
-                    .tools
+                tools
                     .iter()
                     .map(|tool| {
                         json!({
