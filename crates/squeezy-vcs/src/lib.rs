@@ -1,10 +1,14 @@
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -18,6 +22,7 @@ const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CHECKPOINT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -33,6 +38,20 @@ pub struct CheckpointStore {
     root: PathBuf,
     git_dir: PathBuf,
     journal_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    pub tree: String,
+    pub large_files: Vec<LargeFileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LargeFileFingerprint {
+    pub path: String,
+    pub size_bytes: u64,
+    pub mtime_secs: i64,
+    pub mtime_nanos: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -577,9 +596,9 @@ impl CheckpointStore {
         Ok(store)
     }
 
-    pub fn track_tree(&self) -> Result<String> {
+    pub fn track_tree(&self) -> Result<WorkspaceSnapshot> {
         self.ensure_shadow_repo()?;
-        let large_paths = self.large_file_paths()?;
+        let large_files = self.large_file_fingerprints()?;
         let mut add_args = vec![
             "add".to_string(),
             "--all".to_string(),
@@ -587,11 +606,11 @@ impl CheckpointStore {
             ".".to_string(),
             ":(exclude).squeezy".to_string(),
         ];
-        for path in &large_paths {
-            add_args.push(format!(":(exclude){path}"));
+        for file in &large_files {
+            add_args.push(format!(":(exclude){}", file.path));
         }
         self.git_vec(add_args)?;
-        if !large_paths.is_empty() {
+        if !large_files.is_empty() {
             let mut rm_args = vec![
                 "rm".to_string(),
                 "--cached".to_string(),
@@ -599,29 +618,34 @@ impl CheckpointStore {
                 "--ignore-unmatch".to_string(),
                 "--".to_string(),
             ];
-            rm_args.extend(large_paths);
+            rm_args.extend(large_files.iter().map(|file| file.path.clone()));
             let _ = self.git_vec(rm_args);
         }
         let output = self.git(["write-tree"])?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        let tree = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(WorkspaceSnapshot { tree, large_files })
     }
 
     pub fn create_checkpoint(
         &self,
-        before_tree: &str,
+        before: &WorkspaceSnapshot,
         tool_name: &str,
         call_id: &str,
         group_id: &str,
         status: &str,
         mut coverage_warnings: Vec<String>,
     ) -> Result<Option<CheckpointRecord>> {
-        let after_tree = self.track_tree()?;
-        let large_paths = self.large_file_paths()?;
-        if before_tree == after_tree && large_paths.is_empty() {
+        let after = self.track_tree()?;
+        let changed_large_paths = diff_large_files(&before.large_files, &after.large_files);
+        if before.tree == after.tree && changed_large_paths.is_empty() {
             return Ok(None);
         }
-        let (files, skipped_files) =
-            self.checkpoint_files(before_tree, &after_tree, &large_paths)?;
+        let (files, skipped_files) = self.checkpoint_files(
+            &before.tree,
+            &after.tree,
+            &after.large_files,
+            &changed_large_paths,
+        )?;
         if files.is_empty() && skipped_files.is_empty() {
             return Ok(None);
         }
@@ -651,8 +675,8 @@ impl CheckpointStore {
             tool_name: tool_name.to_string(),
             call_id: call_id.to_string(),
             status: status.to_string(),
-            before_tree: before_tree.to_string(),
-            after_tree,
+            before_tree: before.tree.clone(),
+            after_tree: after.tree,
             files,
             skipped_files,
             summary,
@@ -746,7 +770,7 @@ impl CheckpointStore {
                 applied: false,
             });
         }
-        selected.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+        selected.sort_by_key(|record| Reverse(record.created_at_ms));
         let conflicts = self.preflight_conflicts(&selected)?;
         let planned_files = selected.iter().map(|record| record.files.len()).sum();
 
@@ -793,9 +817,11 @@ impl CheckpointStore {
         &self,
         before_tree: &str,
         after_tree: &str,
-        large_paths: &[String],
+        large_after: &[LargeFileFingerprint],
+        changed_large_paths: &[String],
     ) -> Result<(Vec<CheckpointFile>, Vec<SkippedCheckpointFile>)> {
-        let large_set = large_paths.iter().cloned().collect::<BTreeSet<_>>();
+        let large_after_set: BTreeSet<&str> =
+            large_after.iter().map(|file| file.path.as_str()).collect();
         let mut statuses = BTreeMap::<String, DiffFileStatus>::new();
         let output = self.git_vec(vec![
             "diff".to_string(),
@@ -834,7 +860,7 @@ impl CheckpointStore {
         let mut files = Vec::new();
         let mut skipped_files = Vec::new();
         for (path, status) in statuses {
-            if large_set.contains(&path) {
+            if large_after_set.contains(path.as_str()) {
                 skipped_files.push(SkippedCheckpointFile {
                     size_bytes: file_len(&self.root.join(&path)).ok(),
                     path,
@@ -862,7 +888,7 @@ impl CheckpointStore {
                 patch_truncated: patch.truncated,
             });
         }
-        for path in large_paths {
+        for path in changed_large_paths {
             if skipped_files.iter().any(|file| file.path == *path) {
                 continue;
             }
@@ -982,6 +1008,12 @@ impl CheckpointStore {
     }
 
     fn ensure_shadow_repo(&self) -> Result<()> {
+        let head_exists = self.git_dir.join("HEAD").exists();
+        let exclude_path = self.git_dir.join("info").join("exclude");
+        let exclude_exists = exclude_path.exists();
+        if head_exists && exclude_exists {
+            return Ok(());
+        }
         let _guard = SHADOW_REPO_INIT_LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
@@ -989,25 +1021,24 @@ impl CheckpointStore {
         if !self.git_dir.join("HEAD").exists() {
             fs::create_dir_all(&self.git_dir)?;
             self.git_raw(["init"])?;
+            self.git_raw(["config", "core.autocrlf", "false"])?;
+            self.git_raw(["config", "core.fsmonitor", "false"])?;
+            self.git_raw(["config", "core.quotepath", "false"])?;
         }
-        self.git_raw(["config", "core.autocrlf", "false"])?;
-        self.git_raw(["config", "core.fsmonitor", "false"])?;
-        self.git_raw(["config", "core.quotepath", "false"])?;
-        let exclude = self.git_dir.join("info").join("exclude");
-        if !exclude.exists() {
-            if let Some(parent) = exclude.parent() {
+        if !exclude_path.exists() {
+            if let Some(parent) = exclude_path.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(exclude, "/.squeezy/\n")?;
+            fs::write(&exclude_path, "/.squeezy/\n")?;
         }
         Ok(())
     }
 
-    fn large_file_paths(&self) -> Result<Vec<String>> {
-        let mut paths = Vec::new();
-        collect_large_file_paths(&self.root, &self.root, &mut paths)?;
-        paths.sort();
-        Ok(paths)
+    fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {
+        let mut files = Vec::new();
+        collect_large_file_fingerprints(&self.root, &self.root, &mut files)?;
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(files)
     }
 
     fn protect_checkpoint_trees(&self, record: &CheckpointRecord) -> Result<()> {
@@ -1220,14 +1251,19 @@ fn now_ms() -> u128 {
 }
 
 fn checkpoint_id() -> String {
-    format!("cp-{}", now_ms())
+    let counter = CHECKPOINT_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("cp-{:013}-{:08x}", now_ms(), counter)
 }
 
 fn checkpoint_ref(id: &str, side: &str) -> String {
     format!("refs/squeezy/checkpoints/{id}/{side}")
 }
 
-fn collect_large_file_paths(root: &Path, dir: &Path, paths: &mut Vec<String>) -> Result<()> {
+fn collect_large_file_fingerprints(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<LargeFileFingerprint>,
+) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -1240,12 +1276,52 @@ fn collect_large_file_paths(root: &Path, dir: &Path, paths: &mut Vec<String>) ->
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_large_file_paths(root, &path, paths)?;
+            collect_large_file_fingerprints(root, &path, files)?;
         } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
-            paths.push(rel_path(root, &path));
+            let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
+            files.push(LargeFileFingerprint {
+                path: rel_path(root, &path),
+                size_bytes: metadata.len(),
+                mtime_secs,
+                mtime_nanos,
+            });
         }
     }
     Ok(())
+}
+
+fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {
+    let Ok(modified) = metadata.modified() else {
+        return (0, 0);
+    };
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (duration.as_secs() as i64, duration.subsec_nanos()),
+        Err(err) => {
+            let duration = err.duration();
+            (-(duration.as_secs() as i64), duration.subsec_nanos())
+        }
+    }
+}
+
+fn diff_large_files(
+    before: &[LargeFileFingerprint],
+    after: &[LargeFileFingerprint],
+) -> Vec<String> {
+    let before_map: BTreeMap<&str, &LargeFileFingerprint> = before
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let after_map: BTreeMap<&str, &LargeFileFingerprint> = after
+        .iter()
+        .map(|file| (file.path.as_str(), file))
+        .collect();
+    let mut changed = BTreeSet::<String>::new();
+    for path in before_map.keys().chain(after_map.keys()) {
+        if before_map.get(path) != after_map.get(path) {
+            changed.insert((*path).to_string());
+        }
+    }
+    changed.into_iter().collect()
 }
 
 fn rel_path(root: &Path, path: &Path) -> String {

@@ -852,7 +852,7 @@ fn emit_tool_telemetry(
         turn_index: turn_id.get(),
         tool_sequence,
         tool_name: &result.tool_name,
-        status: telemetry_tool_status(result.status.clone()),
+        status: telemetry_tool_status(result.status),
         duration,
         cost: ToolCostProperties {
             files_scanned: result.cost_hint.files_scanned,

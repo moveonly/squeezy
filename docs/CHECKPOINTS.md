@@ -24,6 +24,10 @@ In the TUI:
 - `/checkpoints` lists checkpoints.
 - `/checkpoint <checkpoint_id>` shows one checkpoint.
 
+When a mutation tool creates a checkpoint, the `checkpoint` field attached to the tool result already includes `skipped_files` and `coverage_warnings` when present, so the agent sees rollback coverage problems inline without needing a follow-up `checkpoint_show`.
+
+A tool call that does not change any tracked or large workspace files does not create a checkpoint, so `checkpoint_undo` always refers to the most recent real workspace mutation rather than a no-op tool call.
+
 ## Undo And Revert
 
 Use `checkpoint_undo` to roll back the latest checkpoint.
@@ -70,3 +74,11 @@ The warning is advisory. It does not block the command and it does not make outs
 Checkpoint retention defaults to 7 days. Cleanup removes expired checkpoint journal entries and deletes their shadow Git refs, then prunes unreachable shadow Git objects.
 
 Journal recovery ignores malformed JSONL lines and counts them as warnings. Rollback treats missing required checkpoint objects as conflicts and leaves current workspace content untouched.
+
+## Diff Visibility
+
+The `.squeezy` directory is excluded from `diff_context` reporting so checkpoint state does not pollute the agent's view of workspace changes. If you keep user-authored files under `.squeezy`, move them somewhere else if you want them to appear in `diff_context`.
+
+## On-Disk Secrets
+
+Tool outputs are routed through the redactor before they reach the agent or are spilled to the on-disk tool output store. The checkpoint journal under `.squeezy/checkpoints/` and the shadow Git object store under `.squeezy/checkpoints/git/objects/` are written before redaction: they record the same patch text and blob contents that exist on disk in the workspace. Anyone with read access to `.squeezy/` can read those contents until they are pruned by retention cleanup.

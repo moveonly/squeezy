@@ -34,7 +34,7 @@ use squeezy_graph::{
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
-    DiffSnapshot, GitVcs, RollbackMode, RollbackTarget,
+    DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
 };
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
@@ -81,7 +81,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Success,
     Error,
@@ -673,7 +673,7 @@ impl ToolRegistry {
         let (capability, target, risk) = match call.name.as_str() {
             "checkpoint_undo" | "checkpoint_revert" => (
                 PermissionCapability::Edit,
-                "checkpoint:*".to_string(),
+                "workspace:*".to_string(),
                 PermissionRisk::High,
             ),
             "write_file" => {
@@ -835,15 +835,18 @@ impl ToolRegistry {
             "checkpoint_revert" => {
                 let args =
                     serde_json::from_value::<CheckpointRevertArgs>(call.arguments.clone()).ok();
-                let group_id = args
-                    .as_ref()
-                    .and_then(|args| args.group_id.as_deref())
-                    .unwrap_or("?");
-                let checkpoint_id = args
-                    .as_ref()
-                    .and_then(|args| args.checkpoint_id.as_deref())
-                    .unwrap_or("?");
-                format!("checkpoint_revert group_id={group_id:?} checkpoint_id={checkpoint_id:?}")
+                let group_id = args.as_ref().and_then(|args| args.group_id.as_deref());
+                let checkpoint_id = args.as_ref().and_then(|args| args.checkpoint_id.as_deref());
+                match (group_id, checkpoint_id) {
+                    (Some(group_id), None) => format!("checkpoint_revert group_id={group_id:?}"),
+                    (None, Some(checkpoint_id)) => {
+                        format!("checkpoint_revert checkpoint_id={checkpoint_id:?}")
+                    }
+                    (Some(group_id), Some(checkpoint_id)) => format!(
+                        "checkpoint_revert group_id={group_id:?} checkpoint_id={checkpoint_id:?}"
+                    ),
+                    (None, None) => "checkpoint_revert".to_string(),
+                }
             }
             "glob" => {
                 let args = serde_json::from_value::<GlobArgs>(call.arguments.clone()).ok();
@@ -1025,7 +1028,7 @@ impl ToolRegistry {
         match self.checkpoints.read_journal() {
             Ok(journal) => {
                 let mut checkpoints = journal.checkpoints;
-                checkpoints.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
+                checkpoints.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
                 make_result(
                     call,
                     ToolStatus::Success,
@@ -1985,7 +1988,7 @@ impl ToolRegistry {
         }
 
         let checkpoint_before = match self.checkpoints.track_tree() {
-            Ok(tree) => tree,
+            Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
         let before = fs::read(&path).ok();
@@ -2021,20 +2024,21 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
 
-        let mut result = make_result(
+        let mut content = json!({
+            "path": rel.to_string_lossy(),
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": args.content.len(),
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            &checkpoint_before,
             call,
+            group_id,
             ToolStatus::Success,
-            json!({
-                "path": rel.to_string_lossy(),
-                "before_sha256": before_sha256,
-                "after_sha256": after_sha256,
-                "bytes_written": args.content.len(),
-            }),
-            cost,
-            Some(after_sha256),
+            Vec::new(),
         );
-        self.attach_checkpoint(&mut result, &checkpoint_before, call, group_id, Vec::new());
-        result
+        make_result(call, ToolStatus::Success, content, cost, Some(after_sha256))
     }
 
     async fn execute_shell(
@@ -2071,7 +2075,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(128_000);
         let checkpoint_before = match self.checkpoints.track_tree() {
-            Ok(tree) => tree,
+            Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
         let coverage_warnings = shell_coverage_warnings(&args.command);
@@ -2143,29 +2147,24 @@ impl ToolRegistry {
         let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
         self.invalidate_diff_cache();
 
-        let mut result = make_result(
-            call,
-            status,
-            json!({
-                "command": args.command,
-                "workdir": self.relative(&workdir).to_string_lossy(),
-                "exit_code": exit_code,
-                "stdout": stdout,
-                "stderr": stderr,
-                "error": error,
-                "truncated": truncated,
-            }),
-            cost,
-            None,
-        );
-        self.attach_checkpoint(
-            &mut result,
+        let mut content = json!({
+            "command": args.command,
+            "workdir": self.relative(&workdir).to_string_lossy(),
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": error,
+            "truncated": truncated,
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
             &checkpoint_before,
             call,
             group_id,
+            status,
             coverage_warnings,
         );
-        result
+        make_result(call, status, content, cost, None)
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2464,47 +2463,30 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
-    fn attach_checkpoint(
+    fn append_checkpoint_to_content(
         &self,
-        result: &mut ToolResult,
-        before_tree: &str,
+        content: &mut Value,
+        before: &WorkspaceSnapshot,
         call: &ToolCall,
         group_id: &str,
+        status: ToolStatus,
         coverage_warnings: Vec<String>,
     ) {
-        let status = match result.status {
-            ToolStatus::Success => "success",
-            ToolStatus::Error => "error",
-            ToolStatus::Denied => "denied",
-            ToolStatus::Stale => "stale",
-            ToolStatus::Cancelled => "cancelled",
-        };
-        let checkpoint = match self.checkpoints.create_checkpoint(
-            before_tree,
+        match self.checkpoints.create_checkpoint(
+            before,
             &call.name,
             &call.call_id,
             group_id,
-            status,
+            checkpoint_status_label(status),
             coverage_warnings,
         ) {
-            Ok(checkpoint) => checkpoint,
-            Err(err) => {
-                insert_content_field(
-                    &mut result.content,
-                    "checkpoint_error",
-                    json!(err.to_string()),
-                );
-                refresh_result_receipt(result);
-                return;
+            Ok(Some(checkpoint)) => {
+                insert_content_field(content, "checkpoint", checkpoint_json(&checkpoint));
             }
-        };
-        if let Some(checkpoint) = checkpoint {
-            insert_content_field(
-                &mut result.content,
-                "checkpoint",
-                checkpoint_json(&checkpoint),
-            );
-            refresh_result_receipt(result);
+            Ok(None) => {}
+            Err(err) => {
+                insert_content_field(content, "checkpoint_error", json!(err.to_string()));
+            }
         }
     }
 
@@ -2520,8 +2502,18 @@ fn insert_content_field(content: &mut Value, key: &str, value: Value) {
     }
 }
 
+fn checkpoint_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
 fn checkpoint_json(record: &CheckpointRecord) -> Value {
-    json!({
+    let mut value = json!({
         "id": record.id,
         "group_id": record.group_id,
         "tool_name": record.tool_name,
@@ -2529,13 +2521,19 @@ fn checkpoint_json(record: &CheckpointRecord) -> Value {
         "status": record.status,
         "summary": record.summary,
         "files": record.files,
-    })
-}
-
-fn refresh_result_receipt(result: &mut ToolResult) {
-    let output = serde_json::to_vec(&result.content).unwrap_or_default();
-    result.cost_hint.output_bytes = result.cost_hint.output_bytes.max(output.len() as u64);
-    result.receipt.output_sha256 = sha256_hex(&output);
+    });
+    if let Some(object) = value.as_object_mut() {
+        if !record.skipped_files.is_empty() {
+            object.insert("skipped_files".to_string(), json!(record.skipped_files));
+        }
+        if !record.coverage_warnings.is_empty() {
+            object.insert(
+                "coverage_warnings".to_string(),
+                json!(record.coverage_warnings),
+            );
+        }
+    }
+    value
 }
 
 fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {

@@ -1205,6 +1205,112 @@ fn suspicious_shell_mutation_reports_checkpoint_coverage_warning() {
 }
 
 #[tokio::test]
+async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
+    let root = temp_workspace("checkpoint_inline_warnings");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "touch /tmp/squeezy-inline-warning-test && printf local > inside.txt",
+                    "description": "edit local file but also touch tmp"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-warn".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let warnings = result.content["checkpoint"]["coverage_warnings"]
+        .as_array()
+        .expect("coverage_warnings array");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|w| w.contains("outside the workspace"))),
+        "expected outside-workspace warning, got {warnings:?}"
+    );
+
+    let _ = std::fs::remove_file("/tmp/squeezy-inline-warning-test");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn noop_shell_produces_no_checkpoint_so_undo_targets_real_edit() {
+    let root = temp_workspace("checkpoint_noop_undo");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let edit = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "edit".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-edit".to_string(),
+        )
+        .await;
+    assert_eq!(edit.status, ToolStatus::Success);
+    let edit_checkpoint_id = edit.content["checkpoint"]["id"]
+        .as_str()
+        .expect("edit checkpoint id")
+        .to_string();
+
+    let noop = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "noop".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "true",
+                    "description": "no-op"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-noop".to_string(),
+        )
+        .await;
+    assert_eq!(noop.status, ToolStatus::Success);
+    assert!(
+        noop.content.get("checkpoint").is_none(),
+        "no-op shell must not create a checkpoint, got {:?}",
+        noop.content.get("checkpoint")
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(undo.status, ToolStatus::Success);
+    assert_eq!(
+        undo.content["rollback"]["checkpoint_ids"][0], edit_checkpoint_id,
+        "undo must roll back the most recent real edit, not a phantom no-op"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_returns_bounded_output_and_exit_code() {
     let root = temp_workspace("shell");
     let registry = ToolRegistry::new(&root).expect("registry");
