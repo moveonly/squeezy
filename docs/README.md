@@ -18,6 +18,8 @@ Current completed decisions:
 
 Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shape is OpenAI Responses streaming. Graph-backed navigation is still future work.
 
+Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
+
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
 
 Platform support details live in `docs/PLATFORMS.md`.
