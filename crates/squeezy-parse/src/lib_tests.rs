@@ -502,6 +502,131 @@ fn docs_from_attributes_only_keeps_doc_attribute() {
     );
 }
 
+#[test]
+fn parser_extracts_js_ts_symbols_imports_calls_and_references() {
+    let source = r#"
+import React, { useMemo as memo } from "react";
+import { buildRunner } from "./helpers";
+
+export interface RunnerProps {
+    name: string;
+}
+
+export class Runner {
+    start(props: RunnerProps) {
+        return buildRunner(props.name);
+    }
+}
+
+export const RunnerView = (props: RunnerProps) => <Runner />;
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = tsx_record("src/app.tsx", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "RunnerProps" && symbol.kind == SymbolKind::Interface })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "start" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "RunnerView"
+            && symbol.kind == SymbolKind::Function
+            && symbol.attributes.contains(&"jsx:component".to_string())
+    }));
+    assert!(parsed.imports.iter().any(|import| {
+        import.path == "react.useMemo" && import.alias.as_deref() == Some("memo")
+    }));
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "./helpers.buildRunner")
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "buildRunner"));
+    assert!(parsed.references.iter().any(|reference| {
+        reference.text == "RunnerProps" && reference.kind == ReferenceKind::Type
+    }));
+}
+
+#[test]
+fn parser_keeps_js_ts_const_and_function_symbol_scope_precise() {
+    let source = r#"
+const options = values.map((value) => value.name);
+service.start = function start() {
+    return options;
+};
+service.stop = function() {};
+
+class Runner {
+    constructor() {}
+    #privateMethod() {}
+    [Symbol.iterator]() {}
+    run() {}
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = ts_record("src/scope.ts", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "options" && symbol.kind == SymbolKind::Const })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "options" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "start" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| { symbol.name == "stop" && symbol.kind == SymbolKind::Function })
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "constructor")
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "#privateMethod")
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name.contains("Symbol.iterator"))
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
@@ -522,6 +647,18 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn tsx_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Tsx;
+    record
+}
+
+fn ts_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::TypeScript;
     record
 }
 

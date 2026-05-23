@@ -96,6 +96,46 @@ fn crawler_classifies_python_files() {
 }
 
 #[test]
+fn crawler_classifies_js_ts_files() {
+    let root = temp_root("crawler_classifies_js_ts_files");
+    fs::write(root.join("package.json"), "{}\n").unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src").join("app.js"), "export const app = 1;\n").unwrap();
+    fs::write(
+        root.join("src").join("view.jsx"),
+        "export const View = <main />;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("types.ts"),
+        "export type Name = string;\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("src").join("view.tsx"),
+        "export const View = <main />;\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+    let language_for = |path: &str| {
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == path)
+            .map(|file| file.language)
+            .unwrap()
+    };
+
+    assert_eq!(language_for("src/app.js"), LanguageKind::JavaScript);
+    assert_eq!(language_for("src/view.jsx"), LanguageKind::Jsx);
+    assert_eq!(language_for("src/types.ts"), LanguageKind::TypeScript);
+    assert_eq!(language_for("src/view.tsx"), LanguageKind::Tsx);
+}
+
+#[test]
 fn crawler_skips_roots_without_code_signals() {
     let root = temp_root("crawler_skips_roots_without_code_signals");
     fs::write(root.join("notes.txt"), "plain notes\n").unwrap();

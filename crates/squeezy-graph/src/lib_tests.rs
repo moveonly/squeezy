@@ -94,6 +94,66 @@ def make():
 }
 
 #[test]
+fn graph_answers_js_ts_navigation_queries() {
+    let mut parser = RustParser::new().unwrap();
+    let helpers = ts_record(
+        "src/helpers.ts",
+        r#"
+export function buildRunner(name: string) {
+    return name;
+}
+"#,
+    );
+    let app = tsx_record(
+        "src/app.tsx",
+        r#"
+import { buildRunner } from "./helpers";
+
+interface RunnerProps {
+    name: string;
+}
+
+class Runner {
+    start(props: RunnerProps) {
+        return buildRunner(props.name);
+    }
+}
+
+export const RunnerView = (props: RunnerProps) => <Runner />;
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&helpers, fs::read_to_string(&helpers.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let start = graph.find_symbol_by_name("start").pop().unwrap();
+    let build = graph.find_symbol_by_name("buildRunner").pop().unwrap();
+    let runner_props = graph.find_symbol_by_name("RunnerProps").pop().unwrap();
+    let runner_view = graph.find_symbol_by_name("RunnerView").pop().unwrap();
+
+    assert!(graph.call_chain(&start.id, &build.id, 2).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&runner_props.id)
+            .iter()
+            .any(|hit| {
+                hit.reference.text == "RunnerProps" && hit.reference.kind == ReferenceKind::Type
+            })
+    );
+    assert!(
+        runner_view
+            .attributes
+            .contains(&"jsx:component".to_string())
+    );
+}
+
+#[test]
 fn graph_uses_python_navigation_heuristics() {
     let mut parser = RustParser::new().unwrap();
     let greeter = python_record(
@@ -226,7 +286,46 @@ fn graph_manager_refresh_replaces_changed_file_only() {
 
     assert!(report.refreshed);
     assert_eq!(report.reparsed_files, 1);
+    assert_eq!(report.changed_paths_from_events, 0);
+    assert_eq!(report.changed_paths_from_polling, 1);
+    assert_eq!(report.unchanged_event_paths, 0);
     assert_eq!(report.language.rust_files, 1);
+    assert!(manager.graph().find_symbol_by_name("one").is_empty());
+    assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_manager_refresh_reports_event_and_unchanged_paths() {
+    let root = temp_root("graph-manager-refresh-events");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let path = root.join("src").join("app.ts");
+    fs::write(&path, "export const one = () => one;\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.build_report().language.typescript_files, 1);
+
+    manager.record_changed_path(path.clone());
+    let unchanged = manager.refresh_before_query().unwrap();
+    assert!(!unchanged.refreshed);
+    assert_eq!(unchanged.unchanged_event_paths, 1);
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(&path, "export const two = () => two;\n").unwrap();
+    manager.record_changed_path(path);
+    let changed = manager.refresh_before_query().unwrap();
+    assert!(changed.refreshed);
+    assert_eq!(changed.reparsed_files, 1);
+    assert_eq!(changed.changed_paths_from_events, 1);
+    assert_eq!(changed.changed_paths_from_polling, 0);
+    assert_eq!(changed.language.typescript_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
 }
@@ -1133,6 +1232,18 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn ts_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::TypeScript;
+    record
+}
+
+fn tsx_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Tsx;
     record
 }
 

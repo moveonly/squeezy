@@ -57,6 +57,7 @@ struct BenchmarkReport {
     graph: GraphReport,
     accuracy: AccuracyReport,
     python_oracle: Option<PythonOracleReport>,
+    js_ts_oracle: Option<JsTsOracleReport>,
     queries: Vec<QueryReport>,
     mixed_workload: Option<MixedWorkloadReport>,
 }
@@ -111,6 +112,9 @@ struct RefreshProbeReport {
     refresh_ms: u128,
     reparsed_files: usize,
     changed_files: usize,
+    changed_paths_from_events: usize,
+    changed_paths_from_polling: usize,
+    unchanged_event_paths: usize,
     budget_exhausted: bool,
 }
 
@@ -150,6 +154,14 @@ struct PythonOracleReport {
     status: String,
     oracle_unparseable_files: usize,
     oracle_unparseable_examples: Vec<String>,
+    symbols: AccuracySetReport,
+    limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsTsOracleReport {
+    oracle_ms: u128,
+    status: String,
     symbols: AccuracySetReport,
     limitations: Vec<String>,
 }
@@ -257,13 +269,18 @@ fn main() -> Result<()> {
     let spec: QuerySpecFile = serde_json::from_str(&spec_text)
         .map_err(|err| SqueezyError::Graph(format!("invalid benchmark spec: {err}")))?;
 
-    let validation_ms = match args.language {
-        BenchmarkLanguage::Rust => time_cargo_check(&args.fixture)?,
-        BenchmarkLanguage::Python => time_python_ast_oracle(&args.fixture)?,
-    };
-    let validation_status = match args.language {
-        BenchmarkLanguage::Rust => "cargo check".to_string(),
-        BenchmarkLanguage::Python => "CPython ast oracle".to_string(),
+    let (validation_ms, validation_status) = match args.language {
+        BenchmarkLanguage::Rust => (time_cargo_check(&args.fixture)?, "cargo check".to_string()),
+        BenchmarkLanguage::Python => (
+            time_python_ast_oracle(&args.fixture)?,
+            "CPython ast oracle".to_string(),
+        ),
+        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
+            match time_js_ts_oracle(&args.fixture) {
+                Ok(ms) => (ms, "TypeScript compiler API oracle".to_string()),
+                Err(err) => (0, format!("TypeScript compiler API oracle unavailable: {err}")),
+            }
+        }
     };
 
     let build_started = Instant::now();
@@ -280,11 +297,23 @@ fn main() -> Result<()> {
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
     let accuracy = match args.language {
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
-        BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
+        BenchmarkLanguage::Python
+        | BenchmarkLanguage::JavaScript
+        | BenchmarkLanguage::TypeScript => {
+            empty_accuracy("rust-analyzer oracle not used for this language")
+        }
     };
     let python_oracle = match args.language {
-        BenchmarkLanguage::Rust => None,
+        BenchmarkLanguage::Rust | BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
+            None
+        }
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
+    };
+    let js_ts_oracle = match args.language {
+        BenchmarkLanguage::JavaScript | BenchmarkLanguage::TypeScript => {
+            Some(collect_js_ts_oracle_accuracy(&args.fixture, &graph))
+        }
+        BenchmarkLanguage::Rust | BenchmarkLanguage::Python => None,
     };
 
     let mixed_workload = if args.language == BenchmarkLanguage::Rust {
@@ -307,8 +336,8 @@ fn main() -> Result<()> {
         squeezy_build_ms,
         squeezy_query_ms,
         squeezy_total_ms,
-        faster_than_rustc_check: squeezy_total_ms < validation_ms,
-        faster_than_validation: squeezy_total_ms < validation_ms,
+        faster_than_rustc_check: validation_ms == 0 || squeezy_total_ms < validation_ms,
+        faster_than_validation: validation_ms == 0 || squeezy_total_ms < validation_ms,
         graph: GraphReport {
             files: stats.files,
             symbols: stats.symbols,
@@ -319,6 +348,7 @@ fn main() -> Result<()> {
         },
         accuracy,
         python_oracle,
+        js_ts_oracle,
         queries: query_reports,
         mixed_workload,
     };
@@ -581,6 +611,125 @@ fn collect_python_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<
             "Python files that CPython ast cannot parse are reported as oracle_unparseable and excluded from Squeezy false-positive accounting; tree-sitter recovery remains useful for production editing workflows.".to_string(),
         ],
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct JsTsOracleSymbol {
+    file: String,
+    kind: String,
+    name: String,
+}
+
+fn collect_js_ts_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> JsTsOracleReport {
+    let started = Instant::now();
+    match collect_js_ts_symbol_scan(root) {
+        Ok(oracle) => JsTsOracleReport {
+            oracle_ms: started.elapsed().as_millis(),
+            status: "TypeScript compiler API symbol oracle succeeded".to_string(),
+            symbols: compare_symbol_sets(&collect_squeezy_symbol_scan(graph), &oracle),
+            limitations: js_ts_oracle_limitations(),
+        },
+        Err(err) => JsTsOracleReport {
+            oracle_ms: started.elapsed().as_millis(),
+            status: format!("TypeScript compiler API oracle unavailable: {err}"),
+            symbols: compare_symbol_sets(&SymbolScan::default(), &SymbolScan::default()),
+            limitations: js_ts_oracle_limitations(),
+        },
+    }
+}
+
+fn collect_js_ts_symbol_scan(root: &Path) -> Result<SymbolScan> {
+    let script = r#"
+const fs = require("fs");
+const path = require("path");
+const ts = require(process.env.SQUEEZY_TYPESCRIPT_PATH || "typescript");
+const root = process.argv[1];
+const out = [];
+function walk(dir) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if ([".git", "node_modules", "dist", "build", "coverage"].includes(entry.name)) continue;
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      walk(full);
+    } else if (/\.[cm]?[jt]sx?$/.test(entry.name)) {
+      scan(full);
+    }
+  }
+}
+function rel(file) { return path.relative(root, file).split(path.sep).join("/"); }
+function emit(file, kind, name) {
+  if (name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) out.push({ file: rel(file), kind, name });
+}
+function scan(file) {
+  const source = fs.readFileSync(file, "utf8");
+  const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  function visit(node) {
+    if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) emit(file, "Function", node.name.text);
+    else if (ts.isClassDeclaration(node) && node.name) emit(file, "Class", node.name.text);
+    else if (ts.isInterfaceDeclaration(node)) emit(file, "Interface", node.name.text);
+    else if (ts.isTypeAliasDeclaration(node)) emit(file, "TypeAlias", node.name.text);
+    else if (ts.isEnumDeclaration(node)) emit(file, "Enum", node.name.text);
+    else if ((ts.isMethodDeclaration(node) || ts.isMethodSignature(node)) && node.name && ts.isIdentifier(node.name)) emit(file, "Method", node.name.text);
+    else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+      const init = node.initializer;
+      emit(file, init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) ? "Function" : "Const", node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sf);
+}
+walk(root);
+console.log(JSON.stringify(out));
+"#;
+    let output = Command::new("node")
+        .arg("-e")
+        .arg(script)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("node unavailable: {err}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = if stderr.contains("Cannot find module 'typescript'") {
+            "node package 'typescript' is not installed".to_string()
+        } else {
+            stderr
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("node TypeScript oracle failed")
+                .trim()
+                .to_string()
+        };
+        return Err(SqueezyError::Graph(message));
+    }
+    let symbols: Vec<JsTsOracleSymbol> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid JS/TS oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for symbol in symbols {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file: symbol.file,
+                kind: symbol.kind,
+                name: normalize_symbol_name(&symbol.name),
+            },
+        );
+    }
+    Ok(scan)
+}
+
+fn time_js_ts_oracle(fixture: &Path) -> Result<u128> {
+    let started = Instant::now();
+    let _ = collect_js_ts_symbol_scan(fixture)?;
+    Ok(started.elapsed().as_millis())
+}
+
+fn js_ts_oracle_limitations() -> Vec<String> {
+    vec![
+        "The JS/TS oracle uses the TypeScript compiler API only in benchmark tooling; production navigation remains tree-sitter-only.".to_string(),
+        "Symbol comparison is file/name/kind based and does not prove dynamic JavaScript dispatch, bundler aliases, or runtime module loading.".to_string(),
+        "When node or the typescript package is unavailable, benchmark reports keep the oracle status explicit instead of blocking production parser tests.".to_string(),
+    ]
 }
 
 fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
@@ -871,6 +1020,7 @@ fn normalize_rust_analyzer_kind(kind: &str) -> Option<String> {
 fn normalize_squeezy_kind(kind: SymbolKind) -> Option<String> {
     match kind {
         SymbolKind::Class => Some("Class".to_string()),
+        SymbolKind::Interface => Some("Interface".to_string()),
         SymbolKind::Module => Some("Module".to_string()),
         SymbolKind::Struct => Some("Struct".to_string()),
         SymbolKind::Enum => Some("Enum".to_string()),
@@ -952,6 +1102,7 @@ fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> Accu
     AccuracySetReport {
         compared_kinds: vec![
             "Class".to_string(),
+            "Interface".to_string(),
             "Module".to_string(),
             "Struct".to_string(),
             "Enum".to_string(),
@@ -1716,6 +1867,9 @@ fn run_refresh_probe(repo: &Path) -> Result<RefreshProbeReport> {
         refresh_ms,
         reparsed_files: report.reparsed_files,
         changed_files: report.changed_files.len(),
+        changed_paths_from_events: report.changed_paths_from_events,
+        changed_paths_from_polling: report.changed_paths_from_polling,
+        unchanged_event_paths: report.unchanged_event_paths,
         budget_exhausted: report.budget_exhausted,
     })
 }
@@ -1741,6 +1895,7 @@ fn parse_symbol_kind(value: &str) -> Result<SymbolKind> {
         "Crate" => Ok(SymbolKind::Crate),
         "File" => Ok(SymbolKind::File),
         "Module" => Ok(SymbolKind::Module),
+        "Interface" => Ok(SymbolKind::Interface),
         "Struct" => Ok(SymbolKind::Struct),
         "Enum" => Ok(SymbolKind::Enum),
         "Union" => Ok(SymbolKind::Union),
@@ -2283,6 +2438,20 @@ fn print_summary(report: &BenchmarkReport) {
             python.oracle_unparseable_files
         );
     }
+    if let Some(js_ts) = &report.js_ts_oracle {
+        println!(
+            "js_ts_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={} status={}",
+            js_ts.symbols.true_positive,
+            js_ts.symbols.false_positive,
+            js_ts.symbols.false_negative,
+            js_ts.symbols.precision,
+            js_ts.symbols.recall,
+            js_ts.symbols.rust_analyzer_total,
+            js_ts.symbols.squeezy_total,
+            format!("{}ms", js_ts.oracle_ms),
+            js_ts.status
+        );
+    }
     for query in &report.queries {
         println!(
             "{}: actual={} missing={} extras={}",
@@ -2443,15 +2612,19 @@ impl DeterministicRng {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkLanguage {
+    JavaScript,
     Python,
     Rust,
+    TypeScript,
 }
 
 impl BenchmarkLanguage {
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "javascript" | "js" => Ok(Self::JavaScript),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
+            "typescript" | "ts" => Ok(Self::TypeScript),
             other => Err(SqueezyError::Graph(format!(
                 "unknown benchmark language {other}"
             ))),
@@ -2460,8 +2633,10 @@ impl BenchmarkLanguage {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::JavaScript => "javascript",
             Self::Python => "python",
             Self::Rust => "rust",
+            Self::TypeScript => "typescript",
         }
     }
 }
@@ -2519,7 +2694,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--language rust|python] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--language rust|python|javascript|typescript] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }

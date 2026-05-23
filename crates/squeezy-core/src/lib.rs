@@ -2276,8 +2276,12 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageKind {
+    JavaScript,
+    Jsx,
     Python,
     Rust,
+    TypeScript,
+    Tsx,
     Unsupported,
     Unknown,
 }
@@ -2288,6 +2292,7 @@ pub enum SymbolKind {
     Crate,
     File,
     Module,
+    Interface,
     Struct,
     Enum,
     Union,

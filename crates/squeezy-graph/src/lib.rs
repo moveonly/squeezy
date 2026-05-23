@@ -1715,6 +1715,14 @@ impl SemanticGraph {
     }
 
     fn import_module_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        if self
+            .files
+            .get(&symbol.file_id)
+            .map(|file| is_js_ts_language(file.language))
+            .unwrap_or(false)
+        {
+            return js_ts_import_matches_symbol(import, symbol, &self.files);
+        }
         let mut import_path = path_segments(&import.path);
         if import.is_glob {
             if import_path.last().map(String::as_str) == Some("*") {
@@ -2399,6 +2407,9 @@ pub struct RefreshReport {
     pub changed_files: Vec<FileId>,
     pub removed_files: Vec<FileId>,
     pub reparsed_files: usize,
+    pub changed_paths_from_events: usize,
+    pub changed_paths_from_polling: usize,
+    pub unchanged_event_paths: usize,
     pub duration_ms: u128,
     pub files_seen: usize,
     pub bytes_seen: u64,
@@ -2411,7 +2422,12 @@ pub struct RefreshReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
+    pub javascript_files: usize,
+    pub jsx_files: usize,
+    pub python_files: usize,
     pub rust_files: usize,
+    pub typescript_files: usize,
+    pub tsx_files: usize,
     pub supported_files: usize,
     pub unsupported_files: usize,
     pub unknown_files: usize,
@@ -2493,6 +2509,9 @@ impl GraphManager {
                 changed_files: Vec::new(),
                 removed_files: Vec::new(),
                 reparsed_files: 0,
+                changed_paths_from_events: 0,
+                changed_paths_from_polling: 0,
+                unchanged_event_paths: 0,
                 duration_ms: 0,
                 files_seen: self.graph.files.len(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
@@ -2514,6 +2533,9 @@ impl GraphManager {
                 changed_files: Vec::new(),
                 removed_files: Vec::new(),
                 reparsed_files: 0,
+                changed_paths_from_events: 0,
+                changed_paths_from_polling: 0,
+                unchanged_event_paths: 0,
                 duration_ms: started.elapsed().as_millis(),
                 files_seen: self.graph.files.len(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
@@ -2541,6 +2563,7 @@ impl GraphManager {
             .difference(&current_ids)
             .cloned()
             .collect::<Vec<_>>();
+        let pending_changed_paths = self.pending_changed_paths.clone();
         let mut changed_records = current
             .values()
             .filter(|record| {
@@ -2557,13 +2580,42 @@ impl GraphManager {
         let mut reparsed_files = 0;
         let mut bytes_reparsed = 0;
         let mut budget_exhausted = false;
-        for file_id in &removed_files {
-            self.graph.remove_file(file_id);
-        }
         let changed_files = changed_records
             .iter()
             .map(|record| record.id.clone())
             .collect::<Vec<_>>();
+        let changed_paths_from_events = changed_records
+            .iter()
+            .filter(|record| {
+                pending_changed_paths
+                    .iter()
+                    .any(|path| paths_match(path, &record.path))
+            })
+            .count();
+        let changed_paths_from_polling = changed_records
+            .len()
+            .saturating_sub(changed_paths_from_events);
+        let event_changed_or_removed = pending_changed_paths
+            .iter()
+            .filter(|path| {
+                changed_records
+                    .iter()
+                    .any(|record| paths_match(path, &record.path))
+                    || removed_files.iter().any(|id| {
+                        self.graph
+                            .files
+                            .get(id)
+                            .map(|old| paths_match(path, &old.path))
+                            .unwrap_or(false)
+                    })
+            })
+            .count();
+        let unchanged_event_paths = pending_changed_paths
+            .len()
+            .saturating_sub(event_changed_or_removed);
+        for file_id in &removed_files {
+            self.graph.remove_file(file_id);
+        }
 
         let mut parsed_files = Vec::new();
         for record in changed_records {
@@ -2587,6 +2639,9 @@ impl GraphManager {
             changed_files,
             removed_files,
             reparsed_files,
+            changed_paths_from_events,
+            changed_paths_from_polling,
+            unchanged_event_paths,
             duration_ms: started.elapsed().as_millis(),
             files_seen,
             bytes_seen,
@@ -2603,11 +2658,28 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     let mut report = LanguageReport::default();
     for record in records {
         match record.language {
+            LanguageKind::JavaScript => {
+                report.javascript_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Jsx => {
+                report.jsx_files += 1;
+                report.supported_files += 1;
+            }
             LanguageKind::Python => {
+                report.python_files += 1;
                 report.supported_files += 1;
             }
             LanguageKind::Rust => {
                 report.rust_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::TypeScript => {
+                report.typescript_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Tsx => {
+                report.tsx_files += 1;
                 report.supported_files += 1;
             }
             LanguageKind::Unsupported => report.unsupported_files += 1,
@@ -2678,6 +2750,7 @@ fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSym
     }
     match symbol.kind {
         SymbolKind::Class
+        | SymbolKind::Interface
         | SymbolKind::Struct
         | SymbolKind::Enum
         | SymbolKind::Union
@@ -2711,6 +2784,7 @@ fn is_type_like_symbol(kind: SymbolKind) -> bool {
         kind,
         SymbolKind::Struct
             | SymbolKind::Enum
+            | SymbolKind::Interface
             | SymbolKind::Union
             | SymbolKind::Trait
             | SymbolKind::TypeAlias
@@ -2722,7 +2796,7 @@ fn constructor_reference_can_bind_symbol(
     reference: &ParsedReference,
     symbol: &GraphSymbol,
 ) -> bool {
-    if symbol.kind != SymbolKind::Struct
+    if !matches!(symbol.kind, SymbolKind::Class | SymbolKind::Struct)
         || !matches!(
             reference.kind,
             ReferenceKind::Identifier | ReferenceKind::Path
@@ -2831,6 +2905,66 @@ fn python_module_path_for_file(path: &str) -> Vec<String> {
         })
         .map(ToString::to_string)
         .collect()
+}
+
+fn is_js_ts_language(language: LanguageKind) -> bool {
+    matches!(
+        language,
+        LanguageKind::JavaScript | LanguageKind::Jsx | LanguageKind::TypeScript | LanguageKind::Tsx
+    )
+}
+
+fn js_ts_import_matches_symbol(
+    import: &ParsedImport,
+    symbol: &GraphSymbol,
+    files: &HashMap<FileId, FileRecord>,
+) -> bool {
+    let Some(file) = files.get(&symbol.file_id) else {
+        return false;
+    };
+    let mut import_path = import.path.as_str();
+    if !import.is_glob {
+        import_path = import_path
+            .rsplit_once('.')
+            .map(|(module, _)| module)
+            .unwrap_or(import_path);
+    }
+    if import_path.starts_with('.') {
+        let file_module = js_ts_module_path_for_file(&file.relative_path);
+        let import_tail = import_path
+            .trim_start_matches("./")
+            .trim_start_matches("../")
+            .trim_end_matches("/index");
+        return file_module.ends_with(import_tail)
+            || file.relative_path.ends_with(&format!("{import_tail}.js"))
+            || file.relative_path.ends_with(&format!("{import_tail}.jsx"))
+            || file.relative_path.ends_with(&format!("{import_tail}.ts"))
+            || file.relative_path.ends_with(&format!("{import_tail}.tsx"));
+    }
+    true
+}
+
+fn js_ts_module_path_for_file(path: &str) -> String {
+    path.trim_start_matches("src/")
+        .trim_end_matches(".jsx")
+        .trim_end_matches(".tsx")
+        .trim_end_matches(".mjs")
+        .trim_end_matches(".cjs")
+        .trim_end_matches(".mts")
+        .trim_end_matches(".cts")
+        .trim_end_matches(".js")
+        .trim_end_matches(".ts")
+        .trim_end_matches("/index")
+        .to_string()
+}
+
+fn paths_match(left: &Path, right: &Path) -> bool {
+    left == right
+        || std::fs::canonicalize(left)
+            .ok()
+            .zip(std::fs::canonicalize(right).ok())
+            .map(|(left, right)| left == right)
+            .unwrap_or(false)
 }
 
 fn path_segments_suffix_match(left: &[String], right: &[String]) -> bool {

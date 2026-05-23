@@ -13,6 +13,11 @@ navigation questions before the model reads raw files.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
+- JavaScript and TypeScript declarations: functions, arrow functions assigned to
+  names, classes, methods, fields, interfaces, type aliases, enums,
+  imports/exports, CommonJS require/export aliases, JSX/TSX component-like
+  declarations, calls, member calls, type references, and object/member
+  references.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -89,6 +94,14 @@ decision instead of walking a likely non-code or dangerous directory.
   symbol so behavior-word searches do not have to read raw files first.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
+- JavaScript and TypeScript ES module imports, CommonJS requires, relative
+  module references, class constructors, direct calls, member calls, and
+  type/interface references are indexed from tree-sitter syntax. JSX/TSX
+  functions/classes with uppercase names or JSX bodies are tagged as
+  component-like. Dynamic imports, computed property access, bundler-only aliases
+  without checked config, package export edge cases, and runtime dispatch are
+  explicit candidate, heuristic, external, or fallback results rather than exact
+  edges.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,
@@ -122,9 +135,12 @@ refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
 Graph build and refresh reports include duration, file counts, reparsed byte
-counts, symbol/edge counts, and Rust/supported/unsupported/unknown language
-distribution. Telemetry callers use these reports for one-shot graph build
-events and repeated graph refresh events without sending paths or source text.
+counts, symbol/edge counts, and Rust/Python/JS/TS/supported/unsupported/unknown
+language distribution. Refresh reports also separate changed paths observed from
+events, changed paths discovered by polling, and unchanged event paths so
+file-watcher FP/FN behavior can be benchmarked without sending paths or source
+text. Telemetry callers use these reports for one-shot graph build events and
+repeated graph refresh events without sending paths or source text.
 
 ## Traversal Surface
 
@@ -148,6 +164,13 @@ the fixture with a slower CPython `ast` oracle and compares declaration symbols
 against Squeezy's graph. Both fail if required expected results are missing or if
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
+
+The JS/TS smoke benchmark validates a controlled TSX fixture with query specs and
+can use the TypeScript compiler API as a benchmark-only declaration oracle when
+the `typescript` package is available to Node. That oracle reports symbol
+TP/FP/FN for file/name/kind declarations without becoming a production
+dependency. If Node or TypeScript is unavailable, the report records that status
+explicitly and still runs the tree-sitter query spec.
 
 The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
 repo by default. It generates scenarios from every indexed symbol and resolved

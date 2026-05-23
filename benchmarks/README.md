@@ -6,7 +6,7 @@ The production graph runner uses Squeezy's tree-sitter parsers and in-memory
 graph. The oracle tier validates each fixture with a slower language-specific
 checker and compares Squeezy query output against checked query specifications.
 The oracle is a benchmark/testing aid only; production navigation must not call
-`rustc`, LSP, `rust-analyzer`, or Python runtime analysis.
+`rustc`, LSP, `rust-analyzer`, Python runtime analysis, Node, or TypeScript.
 
 ## Layout
 
@@ -14,8 +14,10 @@ The oracle is a benchmark/testing aid only; production navigation must not call
 benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
+  fixtures/js-ts/semantic-cases/    # small JS/TS package used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
+  specs/js-ts-smoke-queries.json    # JS/TS expected query results
   squeezy-graph-bench/              # benchmark CLI
 ```
 
@@ -56,6 +58,35 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --ra-lsp-probes 0 \
   --no-speed-gate
 ```
+
+JS/TS smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language typescript \
+  --fixture benchmarks/fixtures/js-ts/semantic-cases \
+  --spec benchmarks/specs/js-ts-smoke-queries.json \
+  --report target/semantic-graph-benchmark/js-ts-smoke.json \
+  --ra-lsp-probes 0 \
+  --no-speed-gate
+```
+
+When the Node `typescript` package is installed, the JS/TS benchmark also runs a
+benchmark-only TypeScript compiler API declaration oracle and reports symbol
+TP/FP/FN. If TypeScript is unavailable, the report records that status
+explicitly and still validates the tree-sitter query spec.
+
+JS/TS full-tier comparison uses five representative open-source repositories:
+Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the
+TypeScript compiler API oracle produced:
+
+| Repo | Squeezy total | TS oracle | Symbol TP | FP | FN | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| axios | 61 ms | 190 ms | 865 | 3 | 30 | 0.9965 | 0.9665 |
+| express | 23 ms | 150 ms | 297 | 0 | 3 | 1.0000 | 0.9900 |
+| prettier | 385 ms | 327 ms | 4,506 | 0 | 127 | 1.0000 | 0.9726 |
+| redux | 14 ms | 159 ms | 130 | 0 | 3 | 1.0000 | 0.9774 |
+| vite | 672 ms | 387 ms | 6,807 | 3 | 347 | 0.9996 | 0.9515 |
 
 The run fails if required expected results are missing, the fixture graph build
 plus query time is not faster than compiler validation, or the incremental

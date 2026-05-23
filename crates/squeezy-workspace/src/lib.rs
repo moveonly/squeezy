@@ -205,8 +205,12 @@ impl WorkspaceCrawler {
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("cjs" | "js" | "mjs") => LanguageKind::JavaScript,
+        Some("cts" | "mts" | "ts") => LanguageKind::TypeScript,
+        Some("jsx") => LanguageKind::Jsx,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
+        Some("tsx") => LanguageKind::Tsx,
         Some(_) => LanguageKind::Unsupported,
         None => LanguageKind::Unknown,
     }
@@ -437,8 +441,14 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::JavaScript | LanguageKind::Jsx => {
+                signals.push("shallow JavaScript source".to_string())
+            }
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
+            LanguageKind::TypeScript | LanguageKind::Tsx => {
+                signals.push("shallow TypeScript source".to_string())
+            }
             _ => {
                 if let Some(label) = code_extension_signal(&path) {
                     signals.push(label);

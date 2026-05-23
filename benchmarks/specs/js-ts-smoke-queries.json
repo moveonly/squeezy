@@ -1,0 +1,42 @@
+{
+  "queries": [
+    {
+      "id": "js-ts-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "File:src/app.tsx",
+        "Interface:RunnerProps",
+        "Class:Runner",
+        "Function:RunnerView"
+      ]
+    },
+    {
+      "id": "js-ts-class-signature",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "expected_contains": ["Class:Runner"]
+    },
+    {
+      "id": "js-ts-component-attribute",
+      "kind": "signature_search",
+      "text": "RunnerView",
+      "symbol_kind": "Function",
+      "attribute": "jsx:component",
+      "expected_contains": ["Function:RunnerView"]
+    },
+    {
+      "id": "js-ts-call-chain",
+      "kind": "call_chain",
+      "from": "start",
+      "to": "buildRunner",
+      "expected_contains": ["start -> buildRunner"]
+    },
+    {
+      "id": "js-ts-references",
+      "kind": "references_to_symbol",
+      "to": "RunnerProps",
+      "expected_contains": ["RunnerProps"]
+    }
+  ]
+}
