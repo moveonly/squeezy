@@ -2,9 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     future::Future,
-    io::Read,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -25,7 +26,7 @@ use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
     DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, PermissionScope, Result, SqueezyError,
 };
-use tokio::{process::Command, time};
+use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
@@ -490,7 +491,11 @@ impl ToolRegistry {
                     .as_ref()
                     .and_then(|args| args.description.as_deref())
                     .unwrap_or("run shell command");
-                format!("shell {description}")
+                let command = args
+                    .as_ref()
+                    .map(|args| truncate_text(&args.command, 200))
+                    .unwrap_or_else(|| "?".to_string());
+                format!("shell description={description:?} command={command:?}")
             }
             "webfetch" => {
                 let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
@@ -589,12 +594,12 @@ impl ToolRegistry {
             if !path.is_file() || contains_skipped_dir(path) {
                 continue;
             }
-            if is_secret_path(path) {
+            let rel = self.relative(path);
+            if is_secret_path(&rel) {
                 skipped_secret_files += 1;
                 continue;
             }
             cost.files_scanned += 1;
-            let rel = self.relative(path);
             if !pattern.is_match(rel.as_path()) {
                 continue;
             }
@@ -686,6 +691,7 @@ impl ToolRegistry {
         let mut cost = ToolCostHint::default();
         let mut skipped_secret_files = 0u64;
         let mut scanned_files = 0usize;
+        let mut stop_search = false;
 
         for entry in builder.build() {
             if cancel.is_cancelled() {
@@ -693,7 +699,7 @@ impl ToolRegistry {
             }
             if scanned_files >= max_files
                 || output_mode.is_limited(matches.len(), paths.len(), max_matches)
-                || cost.truncated
+                || stop_search
             {
                 cost.truncated = true;
                 break;
@@ -714,7 +720,7 @@ impl ToolRegistry {
             {
                 continue;
             }
-            if is_secret_path(path) {
+            if is_secret_path(&rel) {
                 skipped_secret_files += 1;
                 continue;
             }
@@ -754,6 +760,7 @@ impl ToolRegistry {
                         let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
                         if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
                             cost.truncated = true;
+                            stop_search = true;
                             break;
                         }
                         cost.output_bytes += next_len as u64;
@@ -771,6 +778,7 @@ impl ToolRegistry {
                 }
                 if output_mode.is_limited(matches.len(), paths.len(), max_matches) {
                     cost.truncated = true;
+                    stop_search = true;
                     break;
                 }
             }
@@ -820,7 +828,8 @@ impl ToolRegistry {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
-        if is_secret_path(&path) {
+        let rel = self.relative(&path);
+        if is_secret_path(&rel) {
             return make_result(
                 call,
                 ToolStatus::Denied,
@@ -830,19 +839,26 @@ impl ToolRegistry {
             );
         }
 
-        let bytes = match fs::read(&path) {
+        let total_bytes = match file_len(&path) {
+            Ok(len) => len,
+            Err(err) => return tool_error(call, err),
+        };
+        let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+        let bytes = match read_range(&path, offset as u64, limit) {
             Ok(bytes) => bytes,
             Err(err) => return tool_error(call, err),
         };
-        let offset = args.offset.unwrap_or(0).min(bytes.len());
-        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
-        let end = offset.saturating_add(limit).min(bytes.len());
-        let content = String::from_utf8_lossy(&bytes[offset..end]).to_string();
-        let content_sha256 = sha256_hex(&bytes);
+        let end = offset.saturating_add(bytes.len());
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let content_sha256 = match sha256_file(&path) {
+            Ok(hash) => hash,
+            Err(err) => return tool_error(call, err),
+        };
         let cost = ToolCostHint {
-            bytes_read: (end - offset) as u64,
+            bytes_read: total_bytes,
             output_bytes: content.len() as u64,
-            truncated: end < bytes.len(),
+            truncated: end < total_bytes as usize,
             ..ToolCostHint::default()
         };
 
@@ -850,12 +866,12 @@ impl ToolRegistry {
             call,
             ToolStatus::Success,
             json!({
-                "path": self.relative(&path).to_string_lossy(),
+                "path": rel.to_string_lossy(),
                 "offset": offset,
-                "bytes_returned": end - offset,
-                "total_bytes": bytes.len(),
+                "bytes_returned": bytes.len(),
+                "total_bytes": total_bytes,
                 "sha256": content_sha256,
-                "truncated": end < bytes.len(),
+                "truncated": end < total_bytes as usize,
                 "content": content,
             }),
             cost,
@@ -909,7 +925,8 @@ impl ToolRegistry {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
-        if is_secret_path(&path) {
+        let rel = self.relative(&path);
+        if is_secret_path(&rel) {
             return make_result(
                 call,
                 ToolStatus::Denied,
@@ -927,7 +944,7 @@ impl ToolRegistry {
                 ToolStatus::Stale,
                 json!({
                     "error": "expected_sha256 does not match current file",
-                    "path": self.relative(&path).to_string_lossy(),
+                    "path": rel.to_string_lossy(),
                     "current_sha256": before_sha256,
                 }),
                 ToolCostHint::default(),
@@ -955,7 +972,7 @@ impl ToolRegistry {
             call,
             ToolStatus::Success,
             json!({
-                "path": self.relative(&path).to_string_lossy(),
+                "path": rel.to_string_lossy(),
                 "before_sha256": before_sha256,
                 "after_sha256": after_sha256,
                 "bytes_written": args.content.len(),
@@ -988,47 +1005,66 @@ impl ToolRegistry {
             .arg("-lc")
             .arg(&args.command)
             .current_dir(&workdir)
-            .kill_on_drop(true);
-        let output = command.output();
-
-        let output = tokio::select! {
-            _ = cancel.cancelled() => return ToolResult::cancelled(call),
-            result = time::timeout(Duration::from_millis(timeout_ms), output) => result,
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) => return tool_error(call, err),
         };
 
-        let output = match output {
-            Ok(Ok(output)) => output,
-            Ok(Err(err)) => return tool_error(call, err),
-            Err(_) => {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({ "error": format!("shell command timed out after {timeout_ms} ms") }),
-                    ToolCostHint {
-                        truncated: true,
-                        ..ToolCostHint::default()
-                    },
-                    None,
-                );
+        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
+        let stdout_task = tokio::spawn(read_limited_pipe(
+            child.stdout.take(),
+            remaining_output_bytes.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_limited_pipe(
+            child.stderr.take(),
+            remaining_output_bytes,
+        ));
+
+        let status = tokio::select! {
+            _ = cancel.cancelled() => {
+                let _ = child.kill().await;
+                return ToolResult::cancelled(call);
             }
+            result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
         };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let (stdout, stdout_truncated) = truncate_to_bytes(stdout.as_ref(), output_cap);
-        let remaining = output_cap.saturating_sub(stdout.len());
-        let (stderr, stderr_truncated) = truncate_to_bytes(stderr.as_ref(), remaining);
-        let truncated = stdout_truncated || stderr_truncated;
+        let timed_out = status.is_err();
+        let exit_status = match status {
+            Ok(Ok(status)) => Some(status),
+            Err(_) => {
+                let _ = child.kill().await;
+                None
+            }
+            Ok(Err(err)) => return tool_error(call, err),
+        };
+
+        let (stdout_bytes, stdout_truncated) = match join_limited_pipe(stdout_task).await {
+            Ok(output) => output,
+            Err(err) => return tool_error(call, err),
+        };
+        let (stderr_bytes, stderr_truncated) = match join_limited_pipe(stderr_task).await {
+            Ok(output) => output,
+            Err(err) => return tool_error(call, err),
+        };
+
+        let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+        let truncated = stdout_truncated || stderr_truncated || timed_out;
         let cost = ToolCostHint {
             output_bytes: (stdout.len() + stderr.len()) as u64,
             truncated,
             ..ToolCostHint::default()
         };
-        let status = if output.status.success() {
+        let exit_code = exit_status.as_ref().and_then(|status| status.code());
+        let status = if exit_status.as_ref().is_some_and(|status| status.success()) {
             ToolStatus::Success
         } else {
             ToolStatus::Error
         };
+        let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
 
         make_result(
             call,
@@ -1036,9 +1072,10 @@ impl ToolRegistry {
             json!({
                 "command": args.command,
                 "workdir": self.relative(&workdir).to_string_lossy(),
-                "exit_code": output.status.code(),
+                "exit_code": exit_code,
                 "stdout": stdout,
                 "stderr": stderr,
+                "error": error,
                 "truncated": truncated,
             }),
             cost,
@@ -1942,8 +1979,80 @@ fn read_prefix(path: &Path, limit: usize) -> std::result::Result<Vec<u8>, std::i
     Ok(bytes)
 }
 
+fn read_range(
+    path: &Path,
+    offset: u64,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn sha256_file(path: &Path) -> std::result::Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    Ok(output)
+}
+
 fn file_len(path: &Path) -> std::result::Result<u64, std::io::Error> {
     Ok(fs::metadata(path)?.len())
+}
+
+async fn read_limited_pipe<R>(
+    mut reader: Option<R>,
+    remaining_bytes: Arc<Mutex<usize>>,
+) -> std::result::Result<(Vec<u8>, bool), std::io::Error>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader.take() else {
+        return Ok((Vec::new(), false));
+    };
+    let mut output = Vec::new();
+    let mut buffer = vec![0u8; 8192];
+    let mut truncated = false;
+
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let mut remaining = remaining_bytes.lock().await;
+        let keep = count.min(*remaining);
+        if keep > 0 {
+            output.extend_from_slice(&buffer[..keep]);
+            *remaining -= keep;
+        }
+        if keep < count {
+            truncated = true;
+        }
+    }
+
+    Ok((output, truncated))
+}
+
+async fn join_limited_pipe(
+    handle: tokio::task::JoinHandle<std::result::Result<(Vec<u8>, bool), std::io::Error>>,
+) -> std::result::Result<(Vec<u8>, bool), std::io::Error> {
+    handle
+        .await
+        .map_err(|err| std::io::Error::other(format!("shell output reader failed: {err}")))?
 }
 
 fn contains_skipped_dir(path: &Path) -> bool {

@@ -92,6 +92,7 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 2);
+    assert!(requests[0].tools.iter().all(|tool| !tool.strict));
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs.len(), 2);
     assert_eq!(outputs[0].0, "grep_call");
