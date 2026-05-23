@@ -32,6 +32,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
     assert_eq!(config.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
     assert_eq!(config.permissions, PermissionPolicy::default());
+    assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
     assert_eq!(config.max_parallel_tools, 8);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
@@ -99,6 +100,7 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_MAX_SEARCH_FILES_PER_TURN" => Some("78".to_string()),
         "SQUEEZY_TELEMETRY" => Some("off".to_string()),
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
+        "SQUEEZY_SESSION_MODE" => Some("plan".to_string()),
         "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
         "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
@@ -108,6 +110,7 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
     assert_eq!(config.permissions.shell, PermissionMode::Deny);
     assert_eq!(config.permissions.web, PermissionMode::Allow);
+    assert_eq!(config.session_mode, SessionMode::Plan);
     assert!(config.store_responses);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.exa_mcp_url, "https://search.example/mcp");
@@ -498,6 +501,9 @@ fn inspect_redacted_round_trips_with_permission_rules() {
 shell = "ask"
 shell_classifier = true
 
+[session]
+mode = "plan"
+
 [[permissions.rules]]
 capability = "shell"
 target = "cargo test:*"
@@ -518,6 +524,8 @@ source = "project"
     let inspect = config.inspect_redacted();
 
     assert!(inspect.contains("shell_classifier = true"));
+    assert!(inspect.contains("[session]"));
+    assert!(inspect.contains("mode = \"plan\""));
     assert!(inspect.contains("[[permissions.rules]]"));
     assert!(inspect.contains("target = \"cargo test:*\""));
     assert!(inspect.contains("target = \"domain:docs.rs\""));
@@ -525,6 +533,7 @@ source = "project"
     let round_tripped = SettingsFile::from_toml_str(&inspect, "round-trip")
         .expect("inspect output parses back as settings");
     let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(round_tripped_config.session_mode, SessionMode::Plan);
     assert_eq!(round_tripped_config.permissions.rules.len(), 2);
     assert!(round_tripped_config.permissions.shell_classifier);
 }
@@ -561,6 +570,9 @@ tool_output_retention_days = 2
 max_tool_calls_per_turn = 4
 max_tool_bytes_read_per_turn = 5000
 max_search_files_per_turn = 6
+
+[session]
+mode = "plan"
 
 [permissions]
 read = "allow"
@@ -611,6 +623,7 @@ env = { TOKEN = "secret" }
     assert_eq!(config.model, "gpt-custom");
     assert_eq!(config.max_output_tokens, Some(512));
     assert!(config.store_responses);
+    assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);
     assert_eq!(config.permissions.edit, PermissionMode::Deny);
@@ -684,6 +697,23 @@ shell = "sometimes"
     let message = error.to_string();
     assert!(message.contains("squeezy.toml"));
     assert!(message.contains("permissions.shell"));
+}
+
+#[test]
+fn session_mode_validation_reports_source_and_path() {
+    let error = SettingsFile::from_toml_str(
+        r#"
+[session]
+mode = "maybe"
+"#,
+        "squeezy.toml",
+    )
+    .expect_err("invalid session mode should fail");
+
+    let message = error.to_string();
+    assert!(message.contains("squeezy.toml"));
+    assert!(message.contains("session.mode"));
+    assert!(message.contains("expected plan or build"));
 }
 
 #[test]

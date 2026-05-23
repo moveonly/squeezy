@@ -173,12 +173,16 @@ struct CachedParsedFile {
 
 pub struct LanguageParser {
     csharp_parser: Parser,
+    c_parser: Parser,
+    cpp_parser: Parser,
     go_parser: Parser,
+    javascript_parser: Parser,
+    jsx_parser: Parser,
     rust_parser: Parser,
     java_parser: Parser,
     python_parser: Parser,
-    c_parser: Parser,
-    cpp_parser: Parser,
+    typescript_parser: Parser,
+    tsx_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
 }
 
@@ -202,20 +206,28 @@ struct ParseOutput {
 impl LanguageParser {
     pub fn new() -> Result<Self> {
         let csharp_parser = parser_with_csharp_language()?;
+        let c_parser = parser_with_c_language()?;
+        let cpp_parser = parser_with_cpp_language()?;
         let go_parser = parser_with_go_language()?;
+        let javascript_parser = parser_with_javascript_language()?;
+        let jsx_parser = parser_with_jsx_language()?;
         let rust_parser = parser_with_rust_language()?;
         let java_parser = parser_with_java_language()?;
         let python_parser = parser_with_python_language()?;
-        let c_parser = parser_with_c_language()?;
-        let cpp_parser = parser_with_cpp_language()?;
+        let typescript_parser = parser_with_typescript_language()?;
+        let tsx_parser = parser_with_tsx_language()?;
         Ok(Self {
             csharp_parser,
+            c_parser,
+            cpp_parser,
             go_parser,
+            javascript_parser,
+            jsx_parser,
             rust_parser,
             java_parser,
             python_parser,
-            c_parser,
-            cpp_parser,
+            typescript_parser,
+            tsx_parser,
             cache: HashMap::new(),
         })
     }
@@ -397,8 +409,12 @@ impl LanguageParser {
             LanguageKind::Cpp => Ok(&mut self.cpp_parser),
             LanguageKind::Go => Ok(&mut self.go_parser),
             LanguageKind::Java => Ok(&mut self.java_parser),
+            LanguageKind::JavaScript => Ok(&mut self.javascript_parser),
+            LanguageKind::Jsx => Ok(&mut self.jsx_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
+            LanguageKind::TypeScript => Ok(&mut self.typescript_parser),
+            LanguageKind::Tsx => Ok(&mut self.tsx_parser),
             _ => Err(SqueezyError::Parse(format!(
                 "unsupported parser language {language:?}"
             ))),
@@ -409,12 +425,16 @@ impl LanguageParser {
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     let mut parsers = WorkerParsers {
         csharp: parser_with_csharp_language()?,
+        c: parser_with_c_language()?,
+        cpp: parser_with_cpp_language()?,
         go: parser_with_go_language()?,
+        javascript: parser_with_javascript_language()?,
+        jsx: parser_with_jsx_language()?,
         rust: parser_with_rust_language()?,
         java: parser_with_java_language()?,
         python: parser_with_python_language()?,
-        c: parser_with_c_language()?,
-        cpp: parser_with_cpp_language()?,
+        typescript: parser_with_typescript_language()?,
+        tsx: parser_with_tsx_language()?,
     };
     let mut outputs = Vec::with_capacity(jobs.len());
     for job in jobs {
@@ -425,12 +445,16 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
 
 struct WorkerParsers {
     csharp: Parser,
+    c: Parser,
+    cpp: Parser,
     go: Parser,
+    javascript: Parser,
+    jsx: Parser,
     rust: Parser,
     java: Parser,
     python: Parser,
-    c: Parser,
-    cpp: Parser,
+    typescript: Parser,
+    tsx: Parser,
 }
 
 impl WorkerParsers {
@@ -441,8 +465,12 @@ impl WorkerParsers {
             LanguageKind::Cpp => Ok(&mut self.cpp),
             LanguageKind::Go => Ok(&mut self.go),
             LanguageKind::Java => Ok(&mut self.java),
+            LanguageKind::JavaScript => Ok(&mut self.javascript),
+            LanguageKind::Jsx => Ok(&mut self.jsx),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
+            LanguageKind::TypeScript => Ok(&mut self.typescript),
+            LanguageKind::Tsx => Ok(&mut self.tsx),
             _ => Err(SqueezyError::Parse(format!(
                 "unsupported parser language {language:?}"
             ))),
@@ -587,6 +615,42 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_javascript_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = javascript_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load JavaScript grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_jsx_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = jsx_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load JSX grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_typescript_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = typescript_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load TypeScript grammar: {err}")))?;
+    Ok(parser)
+}
+
+fn parser_with_tsx_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = tsx_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load TSX grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_java_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = java_language();
@@ -634,6 +698,22 @@ fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
+fn javascript_language() -> tree_sitter::Language {
+    tree_sitter_javascript::LANGUAGE.into()
+}
+
+fn jsx_language() -> tree_sitter::Language {
+    tree_sitter_javascript::LANGUAGE.into()
+}
+
+fn typescript_language() -> tree_sitter::Language {
+    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+}
+
+fn tsx_language() -> tree_sitter::Language {
+    tree_sitter_typescript::LANGUAGE_TSX.into()
+}
+
 fn c_language() -> tree_sitter::Language {
     tree_sitter_c::LANGUAGE.into()
 }
@@ -650,8 +730,12 @@ fn is_supported_language(language: LanguageKind) -> bool {
             | LanguageKind::Cpp
             | LanguageKind::Go
             | LanguageKind::Java
-            | LanguageKind::Python
+            | LanguageKind::JavaScript
+            | LanguageKind::Jsx
             | LanguageKind::Rust
+            | LanguageKind::Python
+            | LanguageKind::TypeScript
+            | LanguageKind::Tsx
     )
 }
 
@@ -661,6 +745,10 @@ fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
         LanguageKind::CSharp => extract_csharp(file, source, tree),
         LanguageKind::Go => extract_go(file, source, tree),
         LanguageKind::Java => extract_java(file, source, tree),
+        LanguageKind::JavaScript
+        | LanguageKind::Jsx
+        | LanguageKind::TypeScript
+        | LanguageKind::Tsx => extract_js_ts(file, source, tree),
         LanguageKind::Rust => extract_rust(file, source, tree),
         LanguageKind::Python => extract_python(file, source, tree),
         _ => ParsedFile::unsupported(
@@ -1954,6 +2042,45 @@ fn extract_go(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     ParsedFile {
         file,
         package,
+        symbols: ctx.symbols,
+        imports: ctx.imports,
+        calls: ctx.calls,
+        references: ctx.references,
+        body_hits: ctx.body_hits,
+        unsupported: None,
+        diagnostics: ctx.diagnostics,
+        changed_ranges: Vec::new(),
+    }
+}
+
+fn extract_js_ts(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    let mut ctx = ExtractContext {
+        file: file.clone(),
+        source,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        diagnostics: Vec::new(),
+        go_type_index: HashMap::new(),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    visit_js_ts_node(root, &mut ctx, None, None);
+    extract_js_ts_commonjs_facts(&mut ctx);
+    dedup_js_ts_facts(&mut ctx);
+
+    ParsedFile {
+        file,
+        package: None,
         symbols: ctx.symbols,
         imports: ctx.imports,
         calls: ctx.calls,
@@ -4499,6 +4626,79 @@ fn visit_python_children(
     }
 }
 
+fn visit_js_ts_node(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    if node.is_missing() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!("missing {}", node.kind()),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+
+    let kind = node.kind();
+    if matches!(kind, "import_statement" | "export_statement") {
+        extract_js_ts_import_export(node, ctx, owner_symbol.clone());
+    }
+
+    if let Some(symbol) = js_ts_synthetic_binding_symbol(node, ctx, parent_symbol.as_ref()) {
+        ctx.symbols.push(symbol);
+    }
+
+    if let Some(symbol) = js_ts_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        extract_js_ts_symbol_facts(node, &symbol, ctx);
+        let next_parent = Some((symbol.id.clone(), symbol.kind));
+        let next_owner = if symbol.body_span.is_some() {
+            Some(symbol.id.clone())
+        } else {
+            owner_symbol.clone()
+        };
+        ctx.symbols.push(symbol);
+        visit_js_ts_children(node, ctx, next_parent, next_owner);
+        return;
+    }
+
+    if parent_symbol
+        .as_ref()
+        .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+        .unwrap_or(false)
+        && matches!(
+            kind,
+            "method_definition" | "public_field_definition" | "field_definition"
+        )
+    {
+        visit_js_ts_children(node, ctx, None, owner_symbol);
+        return;
+    }
+
+    if kind == "call_expression" || kind == "new_expression" {
+        extract_js_ts_call(node, ctx, owner_symbol.clone());
+    } else if let Some(reference_kind) = js_ts_reference_kind(kind) {
+        extract_js_ts_reference(node, reference_kind, ctx, owner_symbol.clone());
+    } else if is_js_ts_literal(kind) {
+        extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
+    }
+
+    visit_js_ts_children(node, ctx, parent_symbol, owner_symbol);
+}
+
+fn visit_js_ts_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_js_ts_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
 fn visit_node(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -4630,6 +4830,7 @@ fn python_symbol_from_node(
         _ => return None,
     };
     if kind == SymbolKind::Function
+        && node.kind() != "variable_declarator"
         && parent_symbol
             .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
             .unwrap_or(false)
@@ -4681,6 +4882,502 @@ fn python_symbol_from_node(
     })
 }
 
+fn js_ts_symbol_from_node(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut kind = match node.kind() {
+        "class_declaration" => SymbolKind::Class,
+        "enum_declaration" => SymbolKind::Enum,
+        "function"
+        | "function_declaration"
+        | "function_expression"
+        | "function_signature"
+        | "generator_function"
+        | "generator_function_declaration" => SymbolKind::Function,
+        "interface_declaration" => SymbolKind::Interface,
+        "ambient_declaration"
+        | "internal_module"
+        | "module"
+        | "module_declaration"
+        | "namespace_declaration" => SymbolKind::Module,
+        "method_definition" | "method_signature" => SymbolKind::Method,
+        "public_field_definition" | "field_definition" | "property_signature" => SymbolKind::Field,
+        "type_alias_declaration" => SymbolKind::TypeAlias,
+        "variable_declarator" => {
+            if js_ts_variable_is_for_loop_local(node) {
+                return None;
+            }
+            js_ts_variable_symbol_kind(node, ctx.source)?
+        }
+        _ => return None,
+    };
+    if kind == SymbolKind::Function
+        && parent_symbol
+            .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+            .unwrap_or(false)
+    {
+        kind = SymbolKind::Method;
+    }
+    if kind == SymbolKind::Field
+        && js_ts_node_value_is_function_like(node)
+        && (parent_symbol
+            .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+            .unwrap_or(false)
+            || node
+                .parent()
+                .map(|parent| matches!(parent.kind(), "class_body"))
+                .unwrap_or(false))
+    {
+        kind = SymbolKind::Method;
+    }
+
+    let name = js_ts_symbol_name(node, kind, ctx.source)?;
+    let body = js_ts_symbol_body(node, kind);
+    let span = span_from_node(node);
+    let body_span = body.map(span_from_node);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
+    let mut attributes = js_ts_attributes_for_symbol(node, kind, &name, ctx);
+    attributes.sort();
+    attributes.dedup();
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind,
+        span,
+        body_span,
+        signature: signature_text(node, body, ctx.source),
+        visibility: js_ts_visibility_text(node, ctx.source),
+        docs: js_ts_docs_for_node(node, ctx.source),
+        attributes,
+        provenance: Provenance::new("tree-sitter-js-ts", format!("{} declaration", node.kind())),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn js_ts_variable_symbol_kind(node: Node<'_>, source: &str) -> Option<SymbolKind> {
+    let value = node.child_by_field_name("value");
+    let value_kind = value.map(|node| node.kind()).unwrap_or_default();
+    if matches!(
+        value_kind,
+        "arrow_function" | "function" | "function_expression" | "generator_function"
+    ) {
+        return Some(SymbolKind::Function);
+    }
+    if matches!(value_kind, "class" | "class_expression") {
+        return Some(SymbolKind::Class);
+    }
+    let _ = source;
+    Some(SymbolKind::Const)
+}
+
+/// A `variable_declarator` introduced by a C-style `for (let i = 0; ...; ...)`
+/// is anchored on a `lexical_declaration` whose parent is the enclosing
+/// `for_statement`. Loop counters and similar locals are excluded from the
+/// declaration set in both Squeezy and the JS/TS oracle so navigation does
+/// not get flooded by `i`/`j`/`len` per loop site.
+fn js_ts_variable_is_for_loop_local(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return false;
+    }
+    let Some(grand) = parent.parent() else {
+        return false;
+    };
+    matches!(
+        grand.kind(),
+        "for_statement" | "for_in_statement" | "for_of_statement"
+    )
+}
+
+fn js_ts_node_value_is_function_like(node: Node<'_>) -> bool {
+    node.child_by_field_name("value")
+        .map(|value| {
+            matches!(
+                value.kind(),
+                "arrow_function" | "function" | "function_expression" | "generator_function"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn js_ts_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<String> {
+    if kind == SymbolKind::Module {
+        let raw_name = node
+            .child_by_field_name("name")
+            .and_then(|child| node_text(child, source).ok())?
+            .trim()
+            .to_string();
+        if raw_name.starts_with(['"', '\'']) {
+            return None;
+        }
+        return Some(js_ts_clean_property_name(&raw_name)).filter(|text| !text.is_empty());
+    }
+    if kind == SymbolKind::Method {
+        if js_ts_method_is_accessor(node, source) {
+            return None;
+        }
+        let name_node = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"));
+        if let Some(name) = name_node {
+            let name = node_text(name, source)
+                .ok()
+                .map(js_ts_clean_property_name)
+                .filter(|text| !text.is_empty())?;
+            if name == "constructor" {
+                return None;
+            }
+            return Some(name);
+        }
+    }
+    if node.kind() == "variable_declarator" {
+        return node
+            .child_by_field_name("name")
+            .and_then(|child| node_text(child, source).ok())
+            .and_then(js_ts_binding_name);
+    }
+    // JavaScript field/method definitions expose the identifier as `property`,
+    // while TypeScript uses `name`; falling back covers both grammars without
+    // duplicating the rest of the lookup.
+    node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("property"))
+        .and_then(|child| node_text(child, source).ok())
+        .map(js_ts_clean_property_name)
+        .filter(|text| !text.is_empty())
+}
+
+fn js_ts_binding_name(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if is_js_ts_identifier(trimmed) {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+/// Tree-sitter parses a few constructs as flat keyword + identifier sequences
+/// rather than `variable_declarator` or `module_declaration` wrappers, so the
+/// regular declaration walk does not pick them up:
+///
+/// - `declare global { ... }` is an `ambient_declaration` whose `global`
+///   segment is an anonymous keyword token rather than a named identifier
+///   child. TypeScript treats it as a Module named `global`.
+/// - `using x = expr` / `await using x = expr` (TC39 Stage 3) parse as an
+///   `assignment_expression` whose first anonymous child is the `using`
+///   keyword and whose `left` field is the binding identifier. TypeScript
+///   treats these as ordinary `VariableDeclaration` Const symbols.
+///
+/// Synthesizing matching graph symbols keeps the JS/TS oracle from flagging
+/// them as false negatives without forcing downstream consumers to special
+/// case these surface syntaxes.
+fn js_ts_synthetic_binding_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    match node.kind() {
+        "ambient_declaration" => js_ts_declare_global_symbol(node, ctx, parent_symbol),
+        "assignment_expression" => js_ts_using_binding_symbol(node, ctx, parent_symbol),
+        _ => None,
+    }
+}
+
+fn js_ts_declare_global_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut cursor = node.walk();
+    let mut declare_seen = false;
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            return None;
+        }
+        let text = node_text(child, ctx.source).ok()?.trim().to_string();
+        if !declare_seen {
+            if text == "declare" {
+                declare_seen = true;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        if text == "global" {
+            let span = span_from_node(child);
+            let parent_id = parent_symbol.map(|(id, _)| id.clone());
+            let id = symbol_id(
+                &ctx.file,
+                parent_id.as_ref(),
+                SymbolKind::Module,
+                "global",
+                span,
+            );
+            let attributes = vec![
+                js_ts_language_tag(ctx.file.language),
+                "declare:global".to_string(),
+            ]
+            .into_iter()
+            .filter(|attr| !attr.is_empty())
+            .collect();
+            let body_span = {
+                let mut walker = node.walk();
+                node.children(&mut walker)
+                    .find(|child| child.kind() == "statement_block")
+                    .map(span_from_node)
+            };
+            return Some(ParsedSymbol {
+                id,
+                file_id: ctx.file.id.clone(),
+                parent_id,
+                name: "global".to_string(),
+                kind: SymbolKind::Module,
+                span,
+                body_span,
+                signature: "declare global".to_string(),
+                visibility: None,
+                docs: Vec::new(),
+                attributes,
+                provenance: Provenance::new(
+                    "tree-sitter-js-ts",
+                    "declare global module".to_string(),
+                ),
+                confidence: Confidence::ExactSyntax,
+                freshness: Freshness::Fresh,
+            });
+        }
+        return None;
+    }
+    None
+}
+
+/// Recognize `using x = expr` and `await using x = expr` bindings. The
+/// tree-sitter grammar (still pre-`using`) parses these as an assignment
+/// expression with `using` as the first anonymous token; everything that
+/// looks like a normal assignment is rejected so we never emit a Const for
+/// `obj.foo = bar` or other reassignments.
+fn js_ts_using_binding_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut cursor = node.walk();
+    let mut first_anonymous_token: Option<String> = None;
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            break;
+        }
+        if let Ok(text) = node_text(child, ctx.source) {
+            let token = text.trim();
+            if !token.is_empty() {
+                first_anonymous_token = Some(token.to_string());
+                break;
+            }
+        }
+    }
+    if first_anonymous_token.as_deref() != Some("using") {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(left, ctx.source).ok()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let span = span_from_node(left);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Const,
+        &name,
+        span,
+    );
+    let attributes = vec![js_ts_language_tag(ctx.file.language), "using".to_string()]
+        .into_iter()
+        .filter(|attr| !attr.is_empty())
+        .collect();
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Const,
+        span,
+        body_span: None,
+        signature: node_text(node, ctx.source).unwrap_or_default().to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-js-ts", "using declaration".to_string()),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn js_ts_language_tag(language: LanguageKind) -> String {
+    match language {
+        LanguageKind::JavaScript => "javascript".to_string(),
+        LanguageKind::Jsx => "jsx".to_string(),
+        LanguageKind::TypeScript => "typescript".to_string(),
+        LanguageKind::Tsx => "tsx".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Detect `get foo()`/`set foo()` accessors on `method_definition` and
+/// `method_signature` nodes. We look at the header (everything up to the
+/// parameter list or method body) for a `get` or `set` keyword token that
+/// is not the method's own name. Inspecting only the header avoids the old
+/// substring scan that misfired on benign occurrences of " set " or " get "
+/// inside comments or the method body itself.
+fn js_ts_method_is_accessor(node: Node<'_>, source: &str) -> bool {
+    let name_node = node.child_by_field_name("name");
+    let header_end = node
+        .child_by_field_name("parameters")
+        .map(|params| params.start_byte())
+        .or_else(|| {
+            node.child_by_field_name("body")
+                .map(|body| body.start_byte())
+        })
+        .unwrap_or(node.end_byte());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= header_end {
+            break;
+        }
+        if matches!(name_node, Some(name) if name.id() == child.id()) {
+            break;
+        }
+        if let Ok(text) = node_text(child, source) {
+            let token = text.trim();
+            if token == "get" || token == "set" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn js_ts_clean_property_name(text: &str) -> String {
+    let name = text.trim().trim_matches(['"', '\'']).to_string();
+    if name.starts_with('#') || name.starts_with('[') || name.contains('[') || name.contains(']') {
+        String::new()
+    } else {
+        name
+    }
+}
+
+fn js_ts_symbol_body(node: Node<'_>, kind: SymbolKind) -> Option<Node<'_>> {
+    node.child_by_field_name("body").or_else(|| {
+        if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+            node.child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("right"))
+        } else {
+            None
+        }
+    })
+}
+
+fn js_ts_attributes_for_symbol(
+    node: Node<'_>,
+    kind: SymbolKind,
+    name: &str,
+    ctx: &ExtractContext<'_>,
+) -> Vec<String> {
+    let mut attributes = Vec::new();
+    match ctx.file.language {
+        LanguageKind::JavaScript => attributes.push("javascript".to_string()),
+        LanguageKind::Jsx => attributes.push("jsx".to_string()),
+        LanguageKind::TypeScript => attributes.push("typescript".to_string()),
+        LanguageKind::Tsx => attributes.push("tsx".to_string()),
+        _ => {}
+    }
+    if matches!(ctx.file.language, LanguageKind::Jsx | LanguageKind::Tsx)
+        && matches!(
+            kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+        )
+        && name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+    {
+        attributes.push("framework:component-like".to_string());
+        attributes.push("jsx:component".to_string());
+    }
+    if js_ts_node_has_jsx_descendant(node) {
+        attributes.push("jsx:returns-jsx".to_string());
+    }
+    attributes.extend(js_ts_decorator_attributes(node, ctx.source));
+    attributes
+}
+
+fn js_ts_decorator_attributes(node: Node<'_>, source: &str) -> Vec<String> {
+    let Ok(raw) = node_text(node, source) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .map(str::trim)
+        .take_while(|line| line.starts_with('@'))
+        .filter_map(|line| {
+            let name = line
+                .trim_start_matches('@')
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+                .next()
+                .unwrap_or_default();
+            (!name.is_empty()).then(|| format!("decorator:{name}"))
+        })
+        .collect()
+}
+
+fn js_ts_node_has_jsx_descendant(node: Node<'_>) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind().starts_with("jsx_") {
+            return true;
+        }
+        let mut cursor = current.walk();
+        stack.extend(current.named_children(&mut cursor));
+    }
+    false
+}
+
+fn js_ts_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
+    let raw = node_text(node, source).ok()?.trim_start();
+    ["public", "private", "protected", "readonly", "static"]
+        .into_iter()
+        .find(|keyword| raw.starts_with(*keyword))
+        .map(str::to_string)
+}
+
+fn js_ts_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+    let start = node.start_byte();
+    let before = source.get(..start).unwrap_or_default();
+    let Some(comment_start) = before.rfind("/**") else {
+        return Vec::new();
+    };
+    let between = before[comment_start..].trim();
+    if between.ends_with("*/") && between.lines().count() <= 20 {
+        vec![between.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn extract_python_symbol_facts(
     node: Node<'_>,
     symbol: &ParsedSymbol,
@@ -4720,6 +5417,118 @@ fn extract_python_symbol_facts(
     }
 
     let _ = node;
+}
+
+fn extract_js_ts_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
+    if matches!(symbol.kind, SymbolKind::Class | SymbolKind::Interface) {
+        for type_name in js_ts_extends_implements_names(&symbol.signature) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: type_name,
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new("tree-sitter-js-ts", "heritage reference"),
+            });
+        }
+    }
+    for type_name in js_ts_type_reference_names(&symbol.signature) {
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: type_name.clone(),
+            kind: ReferenceKind::Type,
+            span: symbol.span,
+            provenance: Provenance::new("tree-sitter-js-ts", "type annotation reference"),
+        });
+        ctx.body_hits.push(BodyHit {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(symbol.id.clone()),
+            text: type_name,
+            kind: BodyHitKind::Type,
+            span: symbol.span,
+        });
+    }
+    let _ = node;
+}
+
+fn js_ts_extends_implements_names(signature: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for keyword in ["extends", "implements"] {
+        let Some((_, rest)) = signature.split_once(keyword) else {
+            continue;
+        };
+        let before_body = rest
+            .split_once('{')
+            .map(|(before, _)| before)
+            .unwrap_or(rest)
+            .split_once(" from ")
+            .map(|(before, _)| before)
+            .unwrap_or(rest);
+        names.extend(
+            split_top_level_commas(before_body)
+                .into_iter()
+                .filter_map(|name| js_ts_type_name_from_annotation(&name)),
+        );
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn js_ts_type_reference_names(signature: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for segment in signature.split([':', '<', '|', '&']) {
+        if let Some(name) = js_ts_type_name_from_annotation(segment) {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn js_ts_type_name_from_annotation(annotation: &str) -> Option<String> {
+    let text = annotation
+        .split(['=', ';', ',', ')', '(', '[', ']', '{', '}'])
+        .next()
+        .unwrap_or(annotation)
+        .trim()
+        .trim_start_matches("readonly ")
+        .trim();
+    if text.is_empty()
+        || matches!(
+            text,
+            "any"
+                | "bigint"
+                | "boolean"
+                | "false"
+                | "never"
+                | "null"
+                | "number"
+                | "object"
+                | "string"
+                | "symbol"
+                | "true"
+                | "undefined"
+                | "unknown"
+                | "void"
+        )
+    {
+        return None;
+    }
+    let name = last_path_segment(text);
+    if is_js_ts_identifier(&name)
+        && name
+            .chars()
+            .next()
+            .map(|ch| ch.is_ascii_uppercase())
+            .unwrap_or(false)
+    {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 fn java_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
@@ -5539,6 +6348,161 @@ fn extract_python_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id:
     }
 }
 
+fn extract_js_ts_import_export(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let is_reexport = raw.starts_with("export");
+    let imports = js_ts_imports_from_statement(raw);
+    for (path, alias, is_glob) in imports {
+        ctx.imports.push(ParsedImport {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            path,
+            alias,
+            is_glob,
+            is_reexport,
+            is_static: false,
+            span: span_from_node(node),
+            provenance: Provenance::new("tree-sitter-js-ts", "import/export declaration"),
+        });
+    }
+}
+
+fn js_ts_imports_from_statement(raw: &str) -> Vec<(String, Option<String>, bool)> {
+    let mut imports = Vec::new();
+    if raw.starts_with("import") {
+        let Some(module) = js_ts_module_specifier(raw) else {
+            return imports;
+        };
+        let before_from = raw
+            .split_once(" from ")
+            .map(|(before, _)| before)
+            .unwrap_or(raw)
+            .trim()
+            .trim_start_matches("import")
+            .trim()
+            .trim_end_matches(';')
+            .trim();
+        if before_from.is_empty() || before_from.starts_with(['"', '\'']) {
+            imports.push((module, None, false));
+            return imports;
+        }
+        if let Some(namespace) = before_from.strip_prefix("* as ") {
+            imports.push((
+                format!("{module}.*"),
+                Some(namespace.trim().to_string()),
+                true,
+            ));
+            return imports;
+        }
+        let (default_part, named_part) = split_js_ts_default_and_named_import(before_from);
+        if let Some(default_name) = default_part.filter(|name| is_js_ts_identifier(name)) {
+            imports.push((
+                format!("{module}.default"),
+                Some(default_name.to_string()),
+                false,
+            ));
+        }
+        if let Some(named) = named_part {
+            for (imported, alias) in js_ts_named_imports(named) {
+                imports.push((format!("{module}.{imported}"), alias, false));
+            }
+        }
+    } else if raw.starts_with("export") {
+        let Some(module) = js_ts_module_specifier(raw) else {
+            for (exported, alias) in js_ts_named_imports(raw) {
+                imports.push((exported, alias, false));
+            }
+            return imports;
+        };
+        if raw.contains("* from ") {
+            imports.push((format!("{module}.*"), None, true));
+        }
+        for (exported, alias) in js_ts_named_imports(raw) {
+            imports.push((format!("{module}.{exported}"), alias, false));
+        }
+    }
+    imports
+}
+
+fn split_js_ts_default_and_named_import(text: &str) -> (Option<&str>, Option<&str>) {
+    if let Some(open) = text.find('{') {
+        let default = text[..open].trim().trim_end_matches(',').trim();
+        let named = Some(&text[open..]);
+        (Some(default).filter(|value| !value.is_empty()), named)
+    } else {
+        (Some(text.trim()).filter(|value| !value.is_empty()), None)
+    }
+}
+
+fn js_ts_named_imports(text: &str) -> Vec<(String, Option<String>)> {
+    let inside = if let Some(open) = text.find('{') {
+        text[open + 1..]
+            .split_once('}')
+            .map(|(inside, _)| inside)
+            .unwrap_or_default()
+    } else {
+        text.trim()
+    };
+    split_top_level_commas(inside)
+        .into_iter()
+        .filter_map(|part| {
+            let part = part.trim().trim_start_matches("type ").trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (imported, alias) = part
+                .split_once(" as ")
+                .map(|(left, right)| (left.trim(), Some(right.trim().to_string())))
+                .unwrap_or((part, None));
+            if is_js_ts_identifier(imported) {
+                Some((imported.to_string(), alias))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn js_ts_module_specifier(raw: &str) -> Option<String> {
+    let source = if let Some((_, after_from)) = raw.rsplit_once(" from ") {
+        after_from
+    } else if raw.trim_start().starts_with("import") {
+        raw.trim_start().trim_start_matches("import").trim()
+    } else {
+        return None;
+    };
+    first_js_ts_string_literal(source)
+}
+
+fn first_js_ts_string_literal(text: &str) -> Option<String> {
+    let mut chars = text.char_indices();
+    while let Some((_, ch)) = chars.next() {
+        let quote = match ch {
+            '\'' | '"' => ch,
+            _ => continue,
+        };
+        let mut escaped = false;
+        let mut value = String::new();
+        for (_, ch) in chars.by_ref() {
+            if escaped {
+                value.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                return Some(value);
+            } else {
+                value.push(ch);
+            }
+        }
+    }
+    None
+}
+
 fn python_plain_imports(rest: &str) -> Vec<(String, Option<String>, bool)> {
     rest.split(',')
         .filter_map(|part| {
@@ -5772,6 +6736,81 @@ fn extract_python_assignment(
     });
 }
 
+fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
+    for line in ctx.source.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if let Some((left, right)) = line.split_once("require(") {
+            let alias = js_ts_commonjs_alias(left);
+            if let Some(module) = first_js_ts_string_literal(right)
+                && let Some(alias) = alias
+            {
+                ctx.imports.push(ParsedImport {
+                    file_id: ctx.file.id.clone(),
+                    owner_id: None,
+                    path: module,
+                    alias: Some(alias),
+                    is_glob: false,
+                    is_reexport: false,
+                    is_static: false,
+                    span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                    provenance: Provenance::new("tree-sitter-js-ts", "commonjs require"),
+                });
+            }
+        }
+        if let Some((_, right)) = line.split_once("module.exports")
+            && let Some((_, exported)) = right.split_once('=')
+        {
+            let exported = exported.trim().trim_end_matches(';').trim();
+            if is_js_ts_identifier(exported) {
+                ctx.imports.push(ParsedImport {
+                    file_id: ctx.file.id.clone(),
+                    owner_id: None,
+                    path: exported.to_string(),
+                    alias: None,
+                    is_glob: false,
+                    is_reexport: true,
+                    is_static: false,
+                    span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                    provenance: Provenance::new("tree-sitter-js-ts", "commonjs export"),
+                });
+            }
+        }
+    }
+}
+
+fn js_ts_commonjs_alias(left: &str) -> Option<String> {
+    let left = left
+        .trim()
+        .trim_start_matches("const ")
+        .trim_start_matches("let ")
+        .trim_start_matches("var ")
+        .trim();
+    let alias = left.split('=').next()?.trim();
+    if is_js_ts_identifier(alias) {
+        Some(alias.to_string())
+    } else {
+        None
+    }
+}
+
+fn dedup_js_ts_facts(ctx: &mut ExtractContext<'_>) {
+    let mut imports = HashSet::new();
+    ctx.imports.retain(|import| {
+        imports.insert(format!(
+            "{}|{:?}|{}|{:?}|{}|{}",
+            import.file_id.0,
+            import.owner_id.as_ref().map(|id| id.0.as_str()),
+            import.path,
+            import.alias,
+            import.is_glob,
+            import.is_reexport
+        ))
+    });
+}
+
 fn python_simple_assignment_name(left: &str) -> Option<String> {
     let left = left.trim();
     if left.contains('.') || left.contains('[') || left.contains(',') {
@@ -5932,6 +6971,59 @@ fn extract_python_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: O
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
 }
 
+fn extract_js_ts_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let function_node = node.child_by_field_name("function").or_else(|| {
+        if node.kind() == "new_expression" {
+            node.child_by_field_name("constructor")
+        } else {
+            None
+        }
+    });
+    let Some(function_node) = function_node.or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    }) else {
+        return;
+    };
+    let target_text = node_text(function_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches("new ")
+        .to_string();
+    if target_text.is_empty() {
+        return;
+    }
+    let name = last_path_segment(&target_text);
+    let receiver = receiver_from_direct_call(&target_text);
+    let arity = node
+        .child_by_field_name("arguments")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "arguments")
+        })
+        .map(named_child_count)
+        .unwrap_or_default();
+
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: target_text.clone(),
+        receiver,
+        arity,
+        kind: if target_text.contains('.') {
+            ParsedCallKind::Method
+        } else {
+            ParsedCallKind::Direct
+        },
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-js-ts", node.kind()),
+        confidence: Confidence::Heuristic,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
 fn extract_method_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let name = node
@@ -6066,6 +7158,73 @@ fn extract_python_reference(
     });
 }
 
+fn extract_js_ts_reference(
+    node: Node<'_>,
+    kind: ReferenceKind,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .trim_matches(['"', '\''])
+        .to_string();
+    if text.is_empty() || js_ts_reference_is_declaration_name(node) {
+        return;
+    }
+    let body_kind = match kind {
+        ReferenceKind::Identifier => BodyHitKind::Identifier,
+        ReferenceKind::Field => BodyHitKind::Identifier,
+        ReferenceKind::Attribute => BodyHitKind::Attribute,
+        ReferenceKind::Type => BodyHitKind::Type,
+        ReferenceKind::Path => BodyHitKind::Path,
+    };
+
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-js-ts", format!("{} reference", node.kind())),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: body_kind,
+        span: span_from_node(node),
+    });
+}
+
+fn js_ts_reference_is_declaration_name(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    matches!(
+        parent.kind(),
+        "class_declaration"
+            | "enum_declaration"
+            | "function_declaration"
+            | "function"
+            | "function_expression"
+            | "function_signature"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "interface_declaration"
+            | "method_definition"
+            | "method_signature"
+            | "public_field_definition"
+            | "field_definition"
+            | "property_signature"
+            | "type_alias_declaration"
+            | "variable_declarator"
+    ) && parent
+        .child_by_field_name("name")
+        .map(|name| name == node)
+        .unwrap_or(false)
+}
+
 fn extract_body_hit(
     node: Node<'_>,
     kind: BodyHitKind,
@@ -6101,6 +7260,18 @@ fn reference_kind(kind: &str) -> Option<ReferenceKind> {
     }
 }
 
+fn js_ts_reference_kind(kind: &str) -> Option<ReferenceKind> {
+    match kind {
+        "identifier" | "shorthand_property_identifier" => Some(ReferenceKind::Identifier),
+        "member_expression" | "nested_identifier" => Some(ReferenceKind::Path),
+        "property_identifier" | "private_property_identifier" => Some(ReferenceKind::Field),
+        "predefined_type" | "type_identifier" | "type_predicate" | "generic_type" => {
+            Some(ReferenceKind::Type)
+        }
+        _ => None,
+    }
+}
+
 fn is_literal(kind: &str) -> bool {
     matches!(
         kind,
@@ -6113,11 +7284,27 @@ fn is_literal(kind: &str) -> bool {
     )
 }
 
+fn is_js_ts_literal(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string" | "template_string" | "number" | "true" | "false" | "null" | "undefined" | "regex"
+    )
+}
+
 fn is_python_literal(kind: &str) -> bool {
     matches!(
         kind,
         "string" | "integer" | "float" | "true" | "false" | "none"
     )
+}
+
+fn is_js_ts_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first == '$' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
 fn is_java_literal(kind: &str) -> bool {

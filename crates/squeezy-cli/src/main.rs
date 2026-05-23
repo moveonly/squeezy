@@ -8,8 +8,8 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use squeezy_core::{
-    AppConfig, ModelProfile, PROJECT_SETTINGS_FILE, SqueezyError, default_settings_path,
-    project_settings_template, user_settings_template,
+    AppConfig, ModelProfile, PROJECT_SETTINGS_FILE, SessionMode, SqueezyError,
+    default_settings_path, project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
@@ -31,6 +31,8 @@ struct Cli {
     profile: Option<String>,
     #[arg(long, help = "Max output tokens; overrides SQUEEZY_MAX_OUTPUT_TOKENS")]
     max_output_tokens: Option<u32>,
+    #[arg(long, help = "Start session mode: plan or build")]
+    mode: Option<String>,
     #[arg(long, help = "List configured built-in providers")]
     list_providers: bool,
     #[arg(long, help = "List built-in model metadata")]
@@ -158,6 +160,14 @@ fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
     if let Some(max_output_tokens) = cli.max_output_tokens {
         cli_used = true;
         config.max_output_tokens = Some(max_output_tokens);
+    }
+    if let Some(mode) = &cli.mode {
+        cli_used = true;
+        config.session_mode = SessionMode::parse(mode).ok_or_else(|| {
+            SqueezyError::Config(format!(
+                "cli: --mode: invalid session mode {mode:?}; expected plan or build"
+            ))
+        })?;
     }
     if cli_used && !config.config_sources.iter().any(|source| source == "cli") {
         config.config_sources.push("cli".to_string());

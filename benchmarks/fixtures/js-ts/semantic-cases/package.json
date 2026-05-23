@@ -1,0 +1,9 @@
+{
+  "name": "squeezy-js-ts-semantic-cases",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./helpers": "./src/helpers.ts"
+  }
+}

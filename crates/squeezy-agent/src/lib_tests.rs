@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -12,10 +12,13 @@ use futures_util::stream;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SkillsConfig,
+    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode, SkillsConfig,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
+};
 use squeezy_tools::{ToolStatus, sha256_hex};
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
@@ -628,6 +631,173 @@ fn classifier_verdict_does_not_match_action_inside_reason_text() {
 }
 
 #[test]
+fn plan_mode_denies_mutating_capabilities_before_policy() {
+    for capability in [
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+        PermissionCapability::Compiler,
+        PermissionCapability::Destructive,
+    ] {
+        let request = permission_request_for_capability(capability);
+        let verdict = mode_permission_verdict(SessionMode::Plan, &request)
+            .expect("plan mode should deny mutating capability");
+        assert_eq!(verdict.action, PermissionAction::Deny);
+        assert_eq!(verdict.matched_rule, None);
+        assert_eq!(
+            verdict.reason,
+            format!("plan mode refuses {}", capability.as_str())
+        );
+    }
+}
+
+#[test]
+fn plan_mode_keeps_read_and_search_on_normal_policy_path() {
+    for capability in [PermissionCapability::Read, PermissionCapability::Search] {
+        let request = permission_request_for_capability(capability);
+        assert_eq!(mode_permission_verdict(SessionMode::Plan, &request), None);
+        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+    }
+}
+
+#[test]
+fn build_mode_never_adds_mode_denials() {
+    for capability in [
+        PermissionCapability::Read,
+        PermissionCapability::Search,
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+        PermissionCapability::Compiler,
+        PermissionCapability::Destructive,
+    ] {
+        let request = permission_request_for_capability(capability);
+        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+    }
+}
+
+#[test]
+fn agent_session_mode_can_be_set_and_toggled() {
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+    assert!(agent.set_session_mode(SessionMode::Build, "test"));
+    assert_eq!(agent.session_mode(), SessionMode::Build);
+    assert!(!agent.set_session_mode(SessionMode::Build, "test"));
+    assert_eq!(agent.toggle_session_mode("test"), SessionMode::Plan);
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+}
+
+#[test]
+fn agent_session_mode_transition_logs_structured_fields() {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(agent.set_session_mode(SessionMode::Build, "test_transition"));
+    });
+
+    let logs = writer.contents();
+    assert!(logs.contains("from_mode=plan"), "missing from_mode: {logs}");
+    assert!(logs.contains("to_mode=build"), "missing to_mode: {logs}");
+    assert!(
+        logs.contains("source=\"test_transition\"") || logs.contains("source=test_transition"),
+        "missing source: {logs}",
+    );
+    assert!(
+        logs.contains("session mode transition"),
+        "missing message: {logs}",
+    );
+}
+
+#[test]
+fn advertised_tool_specs_are_mode_aware() {
+    let tools = [
+        ("diff_context", PermissionCapability::Read),
+        ("glob", PermissionCapability::Search),
+        ("grep", PermissionCapability::Search),
+        ("list_skills", PermissionCapability::Read),
+        ("load_skill", PermissionCapability::Read),
+        ("read_file", PermissionCapability::Read),
+        ("read_tool_output", PermissionCapability::Read),
+        ("shell", PermissionCapability::Shell),
+        ("symbol_context", PermissionCapability::Read),
+        ("verify", PermissionCapability::Compiler),
+        ("webfetch", PermissionCapability::Network),
+        ("websearch", PermissionCapability::Network),
+        ("write_file", PermissionCapability::Edit),
+    ]
+    .map(|(name, capability)| test_advertised_tool(name, capability));
+
+    let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
+    let build_names = advertised_tool_names(&build_specs);
+    assert_eq!(
+        build_names,
+        tools
+            .iter()
+            .map(|tool| tool.spec.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
+    let plan_names = advertised_tool_names(&plan_specs);
+    assert_eq!(
+        plan_names,
+        vec![
+            "diff_context",
+            "glob",
+            "grep",
+            "list_skills",
+            "load_skill",
+            "read_file",
+            "read_tool_output",
+            "symbol_context",
+        ]
+    );
+}
+
+#[test]
+fn registry_specs_carry_capability_aligned_with_permission_request() {
+    let tools = ToolRegistry::new("/tmp").expect("registry");
+    for spec in tools.specs() {
+        let call = ToolCall {
+            call_id: "probe".to_string(),
+            name: spec.name.clone(),
+            arguments: serde_json::json!({}),
+        };
+        let runtime_capability = tools.permission_request(&call).capability;
+        let advertised = !mode_refuses_capability(SessionMode::Plan, spec.capability);
+        let runtime = !mode_refuses_capability(SessionMode::Plan, runtime_capability);
+        assert_eq!(
+            advertised, runtime,
+            "{}: advertised_capability={:?} runtime_capability={:?} disagree on plan-mode admittance",
+            spec.name, spec.capability, runtime_capability,
+        );
+    }
+}
+
+#[test]
 fn persistence_guard_refuses_allow_on_destructive_capability() {
     let request = PermissionRequest {
         call_id: "call".to_string(),
@@ -769,6 +939,72 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
     assert!(written.contains("target = \"path:sample.txt\""));
 
     let _ = fs::remove_dir_all(root);
+}
+
+fn permission_request_for_capability(capability: PermissionCapability) -> PermissionRequest {
+    PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: capability.as_str().to_string(),
+        capability,
+        target: "target:*".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: format!("{} request", capability.as_str()),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    }
+}
+
+fn test_advertised_tool(name: &str, capability: PermissionCapability) -> AdvertisedTool {
+    advertised_tool(ToolSpec {
+        name: name.to_string(),
+        description: format!("{name} test tool"),
+        capability,
+        parameters: json!({"type": "object"}),
+    })
+}
+
+fn advertised_tool_names(specs: &[LlmToolSpec]) -> Vec<&str> {
+    specs.iter().map(|spec| spec.name.as_str()).collect()
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedLogWriter {
+    fn contents(&self) -> String {
+        let bytes = self.buffer.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("logs are UTF-8")
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for SharedLogWriter {
+    type Writer = SharedLogWrite;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogWrite {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+struct SharedLogWrite {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedLogWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
