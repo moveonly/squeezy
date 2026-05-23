@@ -1,5 +1,7 @@
 use std::{
+    env, fs,
     io::{self, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -90,6 +92,7 @@ async fn main() -> squeezy_core::Result<()> {
         return Ok(());
     }
 
+    show_telemetry_notice_once(&config);
     let telemetry = TelemetryClient::from_config(&config);
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
@@ -180,4 +183,32 @@ fn config_from_cli_provider(provider: Option<&str>) -> squeezy_core::Result<AppC
         return AppConfig::from_env_and_settings();
     };
     AppConfig::from_env_and_settings_with_provider(provider)
+}
+
+fn show_telemetry_notice_once(config: &AppConfig) {
+    if !config.telemetry.enabled {
+        return;
+    }
+    let path = telemetry_notice_path();
+    if path.exists() {
+        return;
+    }
+    eprintln!(
+        "Squeezy sends anonymous usage telemetry: version, OS, tool timings/status, graph performance, and coarse failures. No prompts, file contents, paths, commands, URLs, or tool arguments are sent. Opt out with SQUEEZY_TELEMETRY=off."
+    );
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, b"shown\n");
+}
+
+fn telemetry_notice_path() -> PathBuf {
+    env::var_os("SQUEEZY_TELEMETRY_NOTICE_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".squeezy/telemetry_notice"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".squeezy/telemetry_notice"))
 }

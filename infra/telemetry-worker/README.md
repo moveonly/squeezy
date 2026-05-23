@@ -26,6 +26,40 @@ is not secret and defaults to the EU ingestion host, `https://eu.i.posthog.com`.
 wrangler deploy
 ```
 
+Deployment is not per Squeezy release or per user session. Deploy the Worker
+when its source or `wrangler.toml` changes. Set `POSTHOG_PROJECT_TOKEN` once,
+then update it only when rotating the PostHog project token.
+
+## PostHog Dashboard
+
+The project token is only for event ingestion. Programmatic dashboard setup uses
+a PostHog personal API key with dashboard, insight, and query scopes.
+
+```sh
+export POSTHOG_PERSONAL_API_KEY=...
+export POSTHOG_ENVIRONMENT_ID=185494
+export POSTHOG_HOST=https://eu.posthog.com
+bun run setup:posthog
+```
+
+## Smoke Test
+
+After deployment, send one synthetic telemetry batch through the Worker:
+
+```sh
+export TELEMETRY_ENDPOINT=https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
+bun run smoke:worker
+```
+
+Then verify recent Squeezy events reached PostHog:
+
+```sh
+export POSTHOG_PERSONAL_API_KEY=...
+export POSTHOG_ENVIRONMENT_ID=185494
+export POSTHOG_HOST=https://eu.posthog.com
+bun run smoke:posthog
+```
+
 Recommended production controls:
 
 - Cloudflare WAF or rate limiting for `POST /v1/batch`.

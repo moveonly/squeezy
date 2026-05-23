@@ -31,7 +31,8 @@ pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
 pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
 pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
-pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "https://telemetry.squeezy.dev/v1/batch";
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
+    "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
