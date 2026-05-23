@@ -153,6 +153,50 @@ impl Runner {
     );
 }
 
+#[test]
+fn parser_parallel_records_preserve_order_and_cache_changes() {
+    let mut parser = RustParser::new().unwrap();
+    let mut records = (0..10)
+        .map(|index| {
+            let source = format!("pub fn f{index}() {{}}\n");
+            record(&format!("src/file{index}.rs"), &source)
+        })
+        .collect::<Vec<_>>();
+
+    let (parsed, summary) = parser.parse_records(&records).unwrap();
+
+    assert_eq!(summary.parsed_files, records.len());
+    assert_eq!(summary.changed_files, 0);
+    for (index, parsed_file) in parsed.iter().enumerate() {
+        assert!(parsed_file.changed_ranges.is_empty());
+        assert!(
+            parsed_file
+                .symbols
+                .iter()
+                .any(|symbol| symbol.name == format!("f{index}"))
+        );
+    }
+
+    let changed_source = "pub fn f3() { helper3(); }\nfn helper3() {}\n";
+    fs::write(&records[3].path, changed_source).unwrap();
+    records[3].hash = ContentHash::new(stable_content_hash(changed_source.as_bytes()));
+    records[3].size_bytes = changed_source.len() as u64;
+
+    let (updated, summary) = parser.parse_records(&records).unwrap();
+
+    assert_eq!(summary.parsed_files, records.len());
+    assert_eq!(summary.changed_files, 1);
+    assert_eq!(summary.changed_ranges, updated[3].changed_ranges.len());
+    assert!(updated[3].calls.iter().any(|call| call.name == "helper3"));
+    for (index, parsed_file) in updated.iter().enumerate() {
+        if index == 3 {
+            assert!(!parsed_file.changed_ranges.is_empty());
+        } else {
+            assert!(parsed_file.changed_ranges.is_empty());
+        }
+    }
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);

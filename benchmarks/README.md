@@ -121,11 +121,18 @@ Latest local LSP-oracle run on May 23, 2026 used
 
 | Repo | Scenarios | Squeezy total | RA analysis total | Def probes | Def TP | FP | FN | Squeezy-only | Wrong target | Ref symbols | Ref TP | FP | FN |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| ripgrep | 1,000 | 622 ms | 5,288 ms | 50 / 15,190 | 10 | 1 | 11 | 0 | 1 | 50 / 3,276 | 15 | 0 | 146 |
-| fd | 1,000 | 90 ms | 3,746 ms | 50 / 2,122 | 5 | 1 | 19 | 1 | 0 | 50 / 389 | 24 | 1 | 119 |
-| bat | 1,000 | 350 ms | failed locally | 50 / 7,082 | 0 | 2 | 0 | 2 | 0 | 50 / 972 | 0 | 36 | 0 |
-| serde | 1,000 | 592 ms | 7,462 ms | 50 / 9,540 | 0 | 0 | 17 | 0 | 0 | 50 / 2,804 | 8 | 3 | 115 |
-| tokio | 1,000 | 1,912 ms | 4,769 ms | 50 / 40,098 | 0 | 8 | 6 | 8 | 0 | 50 / 8,787 | 0 | 26 | 23 |
+| ripgrep | 1,000 | 484 ms | 5,250 ms | 50 / 15,190 | 10 | 1 | 11 | 0 | 1 | 50 / 3,276 | 15 | 0 | 146 |
+| fd | 1,000 | 74 ms | 3,745 ms | 50 / 2,122 | 5 | 1 | 19 | 1 | 0 | 50 / 389 | 24 | 1 | 119 |
+| bat | 1,000 | 318 ms | failed locally | 50 / 7,082 | 0 | 2 | 0 | 2 | 0 | 50 / 972 | 0 | 36 | 0 |
+| serde | 1,000 | 521 ms | 7,403 ms | 50 / 9,540 | 0 | 0 | 17 | 0 | 0 | 50 / 2,804 | 8 | 3 | 115 |
+| tokio | 1,000 | 1,459 ms | 4,764 ms | 50 / 40,098 | 0 | 8 | 6 | 8 | 0 | 50 / 8,787 | 0 | 26 | 23 |
+
+The latest run uses parallel tree-sitter parsing for batches of at least eight
+files, with one parser per worker and deterministic serial graph merge/index
+rebuild. Compared with the prior serial-parser run, cold graph build time moved
+from 470 -> 334 ms on ripgrep, 69 -> 53 ms on fd, 318 -> 287 ms on bat,
+371 -> 300 ms on serde, and 1,631 -> 1,186 ms on tokio. The two-file refresh
+probe intentionally stays serial and remains flat.
 
 The navigation FP/FN numbers are intentionally not zero. The latest
 high-precision reference path removes the earlier same-name lexical explosion

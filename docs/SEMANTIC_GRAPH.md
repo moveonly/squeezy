@@ -67,6 +67,12 @@ unchanged graph partitions. Body-only edits replace body-derived facts for that
 file. Signature/module/import edits replace that file's stub and rebuild
 cross-file indexes.
 
+Tree-sitter parse work is parallelized for batches of at least eight files. Each
+worker owns its own parser instance, and the final graph merge plus index rebuild
+remain serial so output ordering and graph IDs stay deterministic. Small
+refreshes, including the common one- or two-file edit case, stay serial to avoid
+thread setup overhead.
+
 ## Traversal Surface
 
 The in-memory graph supports:

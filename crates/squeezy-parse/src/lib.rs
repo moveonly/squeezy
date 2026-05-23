@@ -8,6 +8,7 @@ use squeezy_workspace::FileRecord;
 use tree_sitter::{InputEdit, Node, Parser, Point, Tree};
 
 pub const CRATE_NAME: &str = "squeezy-parse";
+const PARALLEL_PARSE_THRESHOLD: usize = 8;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -148,7 +149,7 @@ pub struct ParseDiagnostic {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParseSummary {
     pub parsed_files: usize,
     pub unsupported_files: usize,
@@ -168,13 +169,22 @@ pub struct RustParser {
     cache: HashMap<FileId, CachedRustFile>,
 }
 
+#[derive(Debug, Clone)]
+struct ParseJob {
+    index: usize,
+    record: FileRecord,
+    old: Option<CachedRustFile>,
+}
+
+struct ParseOutput {
+    index: usize,
+    parsed: ParsedFile,
+    cache: Option<CachedRustFile>,
+}
+
 impl RustParser {
     pub fn new() -> Result<Self> {
-        let mut parser = Parser::new();
-        let language = rust_language();
-        parser
-            .set_language(&language)
-            .map_err(|err| SqueezyError::Parse(format!("failed to load Rust grammar: {err}")))?;
+        let parser = parser_with_rust_language()?;
         Ok(Self {
             parser,
             cache: HashMap::new(),
@@ -185,26 +195,81 @@ impl RustParser {
         &mut self,
         records: &[FileRecord],
     ) -> Result<(Vec<ParsedFile>, ParseSummary)> {
+        if records.len() >= PARALLEL_PARSE_THRESHOLD {
+            return self.parse_records_parallel(records);
+        }
+        self.parse_records_serial(records)
+    }
+
+    fn parse_records_serial(
+        &mut self,
+        records: &[FileRecord],
+    ) -> Result<(Vec<ParsedFile>, ParseSummary)> {
         let mut parsed = Vec::with_capacity(records.len());
-        let mut summary = ParseSummary {
-            parsed_files: 0,
-            unsupported_files: 0,
-            changed_files: 0,
-            changed_ranges: 0,
-        };
+        let mut summary = ParseSummary::default();
 
         for record in records {
             let parsed_file = self.parse_record(record)?;
-            if parsed_file.unsupported.is_some() {
-                summary.unsupported_files += 1;
-            } else {
-                summary.parsed_files += 1;
-            }
-            if !parsed_file.changed_ranges.is_empty() {
-                summary.changed_files += 1;
-                summary.changed_ranges += parsed_file.changed_ranges.len();
-            }
+            update_parse_summary(&mut summary, &parsed_file);
             parsed.push(parsed_file);
+        }
+
+        Ok((parsed, summary))
+    }
+
+    fn parse_records_parallel(
+        &mut self,
+        records: &[FileRecord],
+    ) -> Result<(Vec<ParsedFile>, ParseSummary)> {
+        let worker_count = std::thread::available_parallelism()
+            .map(|threads| threads.get())
+            .unwrap_or(1)
+            .min(records.len());
+        if worker_count <= 1 {
+            return self.parse_records_serial(records);
+        }
+
+        let jobs = records
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, record)| {
+                let old = self.cache.remove(&record.id);
+                ParseJob { index, record, old }
+            })
+            .collect::<Vec<_>>();
+        let chunk_size = jobs.len().div_ceil(worker_count);
+        let mut outputs = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in jobs.chunks(chunk_size) {
+                let chunk = chunk.to_vec();
+                handles.push(scope.spawn(move || parse_job_chunk(chunk)));
+            }
+
+            let mut outputs = Vec::with_capacity(records.len());
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(mut chunk_outputs)) => outputs.append(&mut chunk_outputs),
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(SqueezyError::Parse(
+                            "parallel Rust parse worker panicked".to_string(),
+                        ));
+                    }
+                }
+            }
+            Ok(outputs)
+        })?;
+
+        outputs.sort_by_key(|output| output.index);
+        let mut parsed = Vec::with_capacity(outputs.len());
+        let mut summary = ParseSummary::default();
+        for output in outputs {
+            if let Some(cache) = output.cache {
+                self.cache.insert(output.parsed.file.id.clone(), cache);
+            }
+            update_parse_summary(&mut summary, &output.parsed);
+            parsed.push(output.parsed);
         }
 
         Ok((parsed, summary))
@@ -289,6 +354,115 @@ impl RustParser {
         );
         Ok(parsed)
     }
+}
+
+fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
+    let mut parser = parser_with_rust_language()?;
+    let mut outputs = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        outputs.push(parse_record_with_cache(&mut parser, job)?);
+    }
+    Ok(outputs)
+}
+
+fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOutput> {
+    let ParseJob { index, record, old } = job;
+    if record.language != LanguageKind::Rust {
+        return Ok(ParseOutput {
+            index,
+            parsed: ParsedFile::unsupported(
+                record.clone(),
+                format!("unsupported language for {}", record.relative_path),
+            ),
+            cache: None,
+        });
+    }
+
+    let old = match old {
+        Some(cached) if cached.hash == record.hash => {
+            let mut parsed = extract_rust(record.clone(), &cached.source, &cached.tree);
+            parsed.changed_ranges = Vec::new();
+            return Ok(ParseOutput {
+                index,
+                parsed,
+                cache: Some(cached),
+            });
+        }
+        other => other,
+    };
+
+    let source = match fs::read_to_string(&record.path) {
+        Ok(source) => source,
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            return Ok(ParseOutput {
+                index,
+                parsed: ParsedFile::unsupported(
+                    record.clone(),
+                    format!("non-UTF-8 Rust source for {}", record.relative_path),
+                ),
+                cache: None,
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let (tree, changed_ranges) = match old {
+        Some(mut cached) => {
+            let edit = input_edit(&cached.source, &source);
+            cached.tree.edit(&edit);
+            let new_tree = parser.parse(&source, Some(&cached.tree)).ok_or_else(|| {
+                SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
+            })?;
+            let mut changed_ranges = cached
+                .tree
+                .changed_ranges(&new_tree)
+                .map(span_from_range)
+                .collect::<Vec<_>>();
+            if changed_ranges.is_empty() {
+                changed_ranges.push(span_from_edit(&edit));
+            }
+            (new_tree, changed_ranges)
+        }
+        None => {
+            let tree = parser.parse(&source, None).ok_or_else(|| {
+                SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
+            })?;
+            (tree, Vec::new())
+        }
+    };
+
+    let mut parsed = extract_rust(record.clone(), &source, &tree);
+    parsed.changed_ranges = changed_ranges;
+    Ok(ParseOutput {
+        index,
+        parsed,
+        cache: Some(CachedRustFile {
+            hash: record.hash.clone(),
+            source,
+            tree,
+        }),
+    })
+}
+
+fn update_parse_summary(summary: &mut ParseSummary, parsed_file: &ParsedFile) {
+    if parsed_file.unsupported.is_some() {
+        summary.unsupported_files += 1;
+    } else {
+        summary.parsed_files += 1;
+    }
+    if !parsed_file.changed_ranges.is_empty() {
+        summary.changed_files += 1;
+        summary.changed_ranges += parsed_file.changed_ranges.len();
+    }
+}
+
+fn parser_with_rust_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = rust_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Rust grammar: {err}")))?;
+    Ok(parser)
 }
 
 fn rust_language() -> tree_sitter::Language {
