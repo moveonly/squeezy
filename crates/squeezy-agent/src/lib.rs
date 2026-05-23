@@ -175,7 +175,7 @@ impl Agent {
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
-        let tool_specs = tools
+        let all_tool_specs = tools
             .specs()
             .into_iter()
             .map(llm_tool_spec)
@@ -206,7 +206,7 @@ impl Agent {
                 telemetry: telemetry.clone(),
                 redactor: redactor.clone(),
                 session_metrics,
-                tool_specs,
+                all_tool_specs,
                 tx: tx.clone(),
                 cancel,
                 approval_ids,
@@ -236,7 +236,7 @@ struct TurnRuntime {
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
-    tool_specs: Vec<LlmToolSpec>,
+    all_tool_specs: Vec<LlmToolSpec>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
@@ -279,13 +279,14 @@ impl TurnRuntime {
         let mut assistant_message = String::new();
 
         for _round in 0..MAX_TOOL_ROUNDS {
+            let active_mode = snapshot_session_mode(&self.session_mode, self.config.session_mode);
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 instructions: request_instructions.clone(),
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 previous_response_id: previous_response_id.clone(),
-                tools: self.tool_specs.clone(),
+                tools: advertised_tool_specs(&self.all_tool_specs, active_mode),
                 store: self.config.store_responses,
             };
             let request_model = request.model.clone();
@@ -1438,6 +1439,28 @@ fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
         parameters: spec.parameters,
         strict: false,
     }
+}
+
+fn advertised_tool_specs(specs: &[LlmToolSpec], mode: SessionMode) -> Vec<LlmToolSpec> {
+    specs
+        .iter()
+        .filter(|spec| mode == SessionMode::Build || plan_mode_advertises_tool(&spec.name))
+        .cloned()
+        .collect()
+}
+
+fn plan_mode_advertises_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "diff_context"
+            | "glob"
+            | "grep"
+            | "read_file"
+            | "read_tool_output"
+            | "symbol_context"
+            | "list_skills"
+            | "load_skill"
+    )
 }
 
 fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {

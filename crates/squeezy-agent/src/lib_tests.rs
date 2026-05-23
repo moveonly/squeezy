@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -14,8 +14,11 @@ use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode, SkillsConfig,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_llm::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
+};
 use squeezy_tools::{ToolStatus, sha256_hex};
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
 
@@ -696,6 +699,87 @@ fn agent_session_mode_can_be_set_and_toggled() {
 }
 
 #[test]
+fn agent_session_mode_transition_logs_structured_fields() {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    tracing::subscriber::with_default(subscriber, || {
+        assert!(agent.set_session_mode(SessionMode::Build, "test_transition"));
+    });
+
+    let logs = writer.contents();
+    assert!(logs.contains("from_mode=plan"), "missing from_mode: {logs}");
+    assert!(logs.contains("to_mode=build"), "missing to_mode: {logs}");
+    assert!(
+        logs.contains("source=\"test_transition\"") || logs.contains("source=test_transition"),
+        "missing source: {logs}",
+    );
+    assert!(
+        logs.contains("session mode transition"),
+        "missing message: {logs}",
+    );
+}
+
+#[test]
+fn advertised_tool_specs_are_mode_aware() {
+    let specs = [
+        "diff_context",
+        "glob",
+        "grep",
+        "list_skills",
+        "load_skill",
+        "read_file",
+        "read_tool_output",
+        "shell",
+        "symbol_context",
+        "verify",
+        "webfetch",
+        "websearch",
+        "write_file",
+    ]
+    .into_iter()
+    .map(test_tool_spec)
+    .collect::<Vec<_>>();
+
+    let build_specs = advertised_tool_specs(&specs, SessionMode::Build);
+    let build_names = advertised_tool_names(&build_specs);
+    assert_eq!(
+        build_names,
+        specs
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let plan_specs = advertised_tool_specs(&specs, SessionMode::Plan);
+    let plan_names = advertised_tool_names(&plan_specs);
+    assert_eq!(
+        plan_names,
+        vec![
+            "diff_context",
+            "glob",
+            "grep",
+            "list_skills",
+            "load_skill",
+            "read_file",
+            "read_tool_output",
+            "symbol_context",
+        ]
+    );
+}
+
+#[test]
 fn persistence_guard_refuses_allow_on_destructive_capability() {
     let request = PermissionRequest {
         call_id: "call".to_string(),
@@ -849,6 +933,59 @@ fn permission_request_for_capability(capability: PermissionCapability) -> Permis
         summary: format!("{} request", capability.as_str()),
         metadata: BTreeMap::new(),
         suggested_rules: Vec::new(),
+    }
+}
+
+fn test_tool_spec(name: &str) -> LlmToolSpec {
+    LlmToolSpec {
+        name: name.to_string(),
+        description: format!("{name} test tool"),
+        parameters: json!({"type": "object"}),
+        strict: false,
+    }
+}
+
+fn advertised_tool_names(specs: &[LlmToolSpec]) -> Vec<&str> {
+    specs.iter().map(|spec| spec.name.as_str()).collect()
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedLogWriter {
+    fn contents(&self) -> String {
+        let bytes = self.buffer.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("logs are UTF-8")
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for SharedLogWriter {
+    type Writer = SharedLogWrite;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogWrite {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+struct SharedLogWrite {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedLogWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 

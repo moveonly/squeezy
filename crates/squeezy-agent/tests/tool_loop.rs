@@ -104,6 +104,73 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
 }
 
 #[tokio::test]
+async fn plan_mode_advertises_only_read_only_tools() {
+    let root = temp_workspace("plan_tools");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("planned".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.edit = PermissionMode::Allow;
+    config.permissions.shell = PermissionMode::Allow;
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("plan only".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let tool_names = tool_names(&requests[0]);
+    assert_eq!(
+        tool_names,
+        vec![
+            "diff_context",
+            "glob",
+            "grep",
+            "list_skills",
+            "load_skill",
+            "read_file",
+            "read_tool_output",
+            "symbol_context",
+        ]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn build_mode_advertises_full_tool_set() {
+    let root = temp_workspace("build_tools");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("building".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn("build".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let tool_names = tool_names(&requests[0]);
+    for expected in ["write_file", "shell", "verify", "webfetch", "websearch"] {
+        assert!(
+            tool_names.contains(&expected),
+            "build mode should advertise {expected}: {tool_names:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
     let root = temp_workspace("parallel_byte_budget");
     fs::write(root.join("first.txt"), "first content").expect("write first");
@@ -322,6 +389,95 @@ async fn plan_mode_write_is_denied_without_approval_prompt() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_denies_hidden_shell_verify_and_webfetch_without_approval() {
+    let cases = [
+        (
+            "shell_call",
+            "shell",
+            serde_json::json!({"command": "echo should-not-run", "description": "test shell"}),
+            "plan mode refuses shell",
+        ),
+        (
+            "verify_call",
+            "verify",
+            serde_json::json!({}),
+            "plan mode refuses compiler",
+        ),
+        (
+            "web_call",
+            "webfetch",
+            serde_json::json!({"url": "https://example.com"}),
+            "plan mode refuses network",
+        ),
+    ];
+
+    for (call_id, tool_name, arguments, expected_reason) in cases {
+        let root = temp_workspace(&format!("plan_denies_{tool_name}"));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: call_id.to_string(),
+                    name: tool_name.to_string(),
+                    arguments,
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("denied".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("resp_final".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+        ]));
+        let mut config = config_for(root.clone());
+        config.session_mode = SessionMode::Plan;
+        config.permissions.shell = PermissionMode::Allow;
+        config.permissions.web = PermissionMode::Allow;
+        let agent = Agent::new(config, provider.clone());
+
+        let mut approvals_seen = 0usize;
+        let mut rx = agent.start_turn(
+            format!("attempt hidden {tool_name}"),
+            CancellationToken::new(),
+        );
+        while let Some(event) = rx.recv().await {
+            if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+                approvals_seen += 1;
+                decision_tx
+                    .send(ToolApprovalDecision::Approved)
+                    .expect("send approval");
+            }
+        }
+
+        assert_eq!(approvals_seen, 0, "{tool_name} should not prompt");
+        let requests = provider.requests();
+        assert!(
+            !tool_names(&requests[0]).contains(&tool_name),
+            "{tool_name} should not be advertised in plan mode",
+        );
+        let outputs = function_outputs(&requests[1]);
+        assert_eq!(outputs[0].0, call_id);
+        assert_eq!(outputs[0].1["status"], "Denied");
+        assert!(
+            outputs[0].1["content"]["error"]
+                .as_str()
+                .expect("denial reason")
+                .contains(expected_reason),
+            "{tool_name} denial should contain {expected_reason}: {:?}",
+            outputs[0].1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
 
 #[tokio::test]
@@ -911,6 +1067,14 @@ fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {
                 serde_json::from_str(output).expect("tool output JSON"),
             ))
         })
+        .collect()
+}
+
+fn tool_names(request: &LlmRequest) -> Vec<&str> {
+    request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
         .collect()
 }
 
