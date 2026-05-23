@@ -1794,7 +1794,7 @@ fn websearch_parser_accepts_json_and_sse_mcp_responses() {
 
 #[test]
 fn cargo_json_output_shape_preserves_warnings_errors_and_summary() {
-    let cargo_json = include_str!("../../../tests/artifacts/tool-output-shaping/cargo-json.txt");
+    let cargo_json = include_str!("../tests/artifacts/tool-output-shaping/cargo-json.txt");
 
     let shaped = shape_shell_output(
         "cargo test --workspace --message-format=json",
@@ -1815,7 +1815,7 @@ fn cargo_json_output_shape_preserves_warnings_errors_and_summary() {
 
 #[test]
 fn jest_json_output_shape_preserves_failure_and_summary() {
-    let jest_json = include_str!("../../../tests/artifacts/tool-output-shaping/jest-json.txt");
+    let jest_json = include_str!("../tests/artifacts/tool-output-shaping/jest-json.txt");
 
     let shaped = shape_shell_output("jest --json", jest_json, "", false, Some(1));
 
@@ -1827,7 +1827,7 @@ fn jest_json_output_shape_preserves_failure_and_summary() {
 
 #[test]
 fn unstructured_shape_drops_noise_and_keeps_signal() {
-    let noisy = include_str!("../../../tests/artifacts/tool-output-shaping/noisy-shell.txt");
+    let noisy = include_str!("../tests/artifacts/tool-output-shaping/noisy-shell.txt");
 
     let shaped = shape_shell_output("cargo fmt --check", noisy, "", false, Some(1));
 
@@ -1845,7 +1845,7 @@ fn cargo_json_with_libtest_plain_text_preserves_test_failure() {
     // libtest's plain-text harness output (panics, "test result: FAILED",
     // etc.). The shaped output has to surface those plain-text failure lines
     // or shaped verify runs silently hide test failures.
-    let mixed = include_str!("../../../tests/artifacts/tool-output-shaping/cargo-test-mixed.txt");
+    let mixed = include_str!("../tests/artifacts/tool-output-shaping/cargo-test-mixed.txt");
 
     let shaped = shape_shell_output(
         "cargo test --workspace --message-format=json",
@@ -1881,7 +1881,7 @@ fn test_report_json_parses_when_stderr_has_non_json_chatter() {
     // lands on stdout. The shaper has to ignore the stderr chatter instead of
     // concatenating both streams into a single malformed document.
     let jest_stdout =
-        include_str!("../../../tests/artifacts/tool-output-shaping/jest-json.txt").to_string();
+        include_str!("../tests/artifacts/tool-output-shaping/jest-json.txt").to_string();
     let stderr = "npm WARN deprecated foo@1.0.0\nnpm notice using cache\n";
 
     let shaped = shape_shell_output("jest --json", &jest_stdout, stderr, false, Some(1));
@@ -1894,7 +1894,7 @@ fn test_report_json_parses_when_stderr_has_non_json_chatter() {
 
 #[test]
 fn nextest_json_emits_pass_fail_summary_even_when_all_pass() {
-    let pass = include_str!("../../../tests/artifacts/tool-output-shaping/nextest-pass.txt");
+    let pass = include_str!("../tests/artifacts/tool-output-shaping/nextest-pass.txt");
 
     let shaped = shape_shell_output("cargo nextest run", pass, "", false, Some(0));
 
