@@ -7,7 +7,7 @@ use std::{
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
 use squeezy_parse::{ParsedFile, ReferenceKind, RustParser};
-use squeezy_workspace::{FileRecord, stable_content_hash};
+use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
 
 use super::*;
 
@@ -229,6 +229,41 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert_eq!(report.language.rust_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_reports_indexing_policy_coverage() {
+    let root = temp_root("graph-policy-coverage");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("vendor/lib")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "pub fn indexed() {}\n").unwrap();
+    fs::write(root.join("vendor/lib/lib.rs"), "pub fn vendored() {}\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "# lock\n").unwrap();
+
+    let manager = GraphManager::open_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+    )
+    .unwrap();
+
+    assert!(!manager.graph().find_symbol_by_name("indexed").is_empty());
+    assert!(manager.graph().find_symbol_by_name("vendored").is_empty());
+    assert!(manager.build_report().excluded_files >= 2);
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("vendor")
+    );
+    assert!(
+        manager
+            .build_report()
+            .coverage
+            .reasons
+            .contains_key("lockfile")
+    );
 }
 
 #[test]

@@ -12,7 +12,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
     ParsedSymbol, ReferenceKind, RustParser, edge_kind_for_call,
 };
-use squeezy_workspace::{CrawlOptions, FileRecord, WorkspaceCrawler};
+use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 
@@ -2388,6 +2388,10 @@ pub struct GraphBuildReport {
     pub files_seen: usize,
     pub parsed_files: usize,
     pub unsupported_files: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub language: LanguageReport,
     pub stats: GraphStats,
@@ -2401,6 +2405,10 @@ pub struct RefreshReport {
     pub reparsed_files: usize,
     pub duration_ms: u128,
     pub files_seen: usize,
+    pub excluded_files: usize,
+    pub excluded_dirs: usize,
+    pub excluded_bytes: u64,
+    pub coverage: IndexCoverage,
     pub bytes_seen: u64,
     pub bytes_reparsed: u64,
     pub language: LanguageReport,
@@ -2434,9 +2442,17 @@ impl GraphManager {
     }
 
     pub fn open_with_config(root: impl AsRef<Path>, config: RefreshConfig) -> Result<Self> {
+        Self::open_with_crawl_options(root, config, CrawlOptions::default())
+    }
+
+    pub fn open_with_crawl_options(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+    ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
-        let crawler = WorkspaceCrawler::new(CrawlOptions::default());
+        let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
         let mut parser = RustParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
@@ -2448,6 +2464,10 @@ impl GraphManager {
             files_seen: snapshot.files.len(),
             parsed_files: parse_summary.parsed_files,
             unsupported_files: parse_summary.unsupported_files,
+            excluded_files: snapshot.coverage.skipped_files,
+            excluded_dirs: snapshot.coverage.skipped_dirs,
+            excluded_bytes: snapshot.coverage.skipped_bytes,
+            coverage: snapshot.coverage.clone(),
             bytes_seen,
             language,
             stats: graph.stats(),
@@ -2495,6 +2515,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: 0,
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2516,6 +2540,10 @@ impl GraphManager {
                 reparsed_files: 0,
                 duration_ms: started.elapsed().as_millis(),
                 files_seen: self.graph.files.len(),
+                excluded_files: self.build_report.excluded_files,
+                excluded_dirs: self.build_report.excluded_dirs,
+                excluded_bytes: self.build_report.excluded_bytes,
+                coverage: self.build_report.coverage.clone(),
                 bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
                 bytes_reparsed: 0,
                 language: language_report(self.graph.files.values()),
@@ -2527,6 +2555,7 @@ impl GraphManager {
 
         let snapshot = self.crawler.crawl(&self.root)?;
         let files_seen = snapshot.files.len();
+        let coverage = snapshot.coverage.clone();
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
         let current = snapshot
@@ -2589,6 +2618,10 @@ impl GraphManager {
             reparsed_files,
             duration_ms: started.elapsed().as_millis(),
             files_seen,
+            excluded_files: coverage.skipped_files,
+            excluded_dirs: coverage.skipped_dirs,
+            excluded_bytes: coverage.skipped_bytes,
+            coverage,
             bytes_seen,
             bytes_reparsed,
             language,

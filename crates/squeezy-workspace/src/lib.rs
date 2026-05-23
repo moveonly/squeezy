@@ -1,9 +1,11 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, SqueezyError};
 
@@ -20,6 +22,7 @@ pub struct CrawlOptions {
     pub include_hidden: bool,
     pub max_file_bytes: u64,
     pub require_indexing_signal: bool,
+    pub policy: IndexingPolicy,
 }
 
 impl Default for CrawlOptions {
@@ -28,7 +31,43 @@ impl Default for CrawlOptions {
             include_hidden: false,
             max_file_bytes: 1_000_000,
             require_indexing_signal: true,
+            policy: IndexingPolicy::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexingPolicy {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include_classes: Vec<String>,
+    pub exclude_classes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledIndexingPolicy {
+    include: GlobSet,
+    exclude: GlobSet,
+    include_classes: Vec<String>,
+    exclude_classes: Vec<String>,
+}
+
+impl IndexingPolicy {
+    fn compile(&self) -> Result<CompiledIndexingPolicy> {
+        Ok(CompiledIndexingPolicy {
+            include: build_glob_set(&self.include)?,
+            exclude: build_glob_set(&self.exclude)?,
+            include_classes: self
+                .include_classes
+                .iter()
+                .map(|class| normalize_reason_class(class))
+                .collect(),
+            exclude_classes: self
+                .exclude_classes
+                .iter()
+                .map(|class| normalize_reason_class(class))
+                .collect(),
+        })
     }
 }
 
@@ -62,10 +101,65 @@ pub enum UnsupportedReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExcludedPath {
+    pub path: PathBuf,
+    pub relative_path: String,
+    pub size_bytes: u64,
+    pub reason: ExclusionReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExclusionReason {
+    VcsMetadata,
+    Vendor,
+    DependencyCache,
+    BuildOutput,
+    Generated,
+    Lockfile,
+    Binary,
+    LargeFile,
+    UserExclude,
+}
+
+impl ExclusionReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VcsMetadata => "vcs_metadata",
+            Self::Vendor => "vendor",
+            Self::DependencyCache => "dependency_cache",
+            Self::BuildOutput => "build_output",
+            Self::Generated => "generated",
+            Self::Lockfile => "lockfile",
+            Self::Binary => "binary",
+            Self::LargeFile => "large_file",
+            Self::UserExclude => "user_exclude",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexCoverage {
+    pub skipped_files: usize,
+    pub skipped_dirs: usize,
+    pub skipped_bytes: u64,
+    pub reasons: BTreeMap<String, IndexReasonCoverage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IndexReasonCoverage {
+    pub files: usize,
+    pub dirs: usize,
+    pub bytes: u64,
+    pub samples: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceSnapshot {
     pub root: PathBuf,
     pub files: Vec<FileRecord>,
     pub unsupported: Vec<UnsupportedFile>,
+    pub excluded: Vec<ExcludedPath>,
+    pub coverage: IndexCoverage,
     pub walk_errors: Vec<String>,
     pub indexing_decision: IndexingDecision,
 }
@@ -96,14 +190,17 @@ impl WorkspaceCrawler {
                 root,
                 files: Vec::new(),
                 unsupported: Vec::new(),
+                excluded: Vec::new(),
+                coverage: IndexCoverage::default(),
                 walk_errors: Vec::new(),
                 indexing_decision,
             });
         }
+        let policy = self.options.policy.compile()?;
 
         let mut walker = WalkBuilder::new(&root);
         walker
-            .hidden(!self.options.include_hidden)
+            .hidden(false)
             .git_ignore(true)
             .git_exclude(true)
             .parents(true)
@@ -111,6 +208,8 @@ impl WorkspaceCrawler {
 
         let mut files = Vec::new();
         let mut unsupported = Vec::new();
+        let mut excluded = Vec::new();
+        let mut coverage = IndexCoverage::default();
         let mut walk_errors = Vec::new();
 
         for entry in walker.build() {
@@ -125,39 +224,81 @@ impl WorkspaceCrawler {
             let Some(file_type) = entry.file_type() else {
                 continue;
             };
+            let path = entry.into_path();
+            let relative_path = relative_path(&root, &path)?;
+            if file_type.is_dir() {
+                if let Some(reason) = policy.path_reason(&relative_path, true) {
+                    record_excluded_dir(&mut coverage, reason, &relative_path);
+                }
+                continue;
+            }
             if !file_type.is_file() {
                 continue;
             }
 
-            let path = entry.into_path();
             let metadata = fs::metadata(&path)?;
             let size_bytes = metadata.len();
-            let relative_path = relative_path(&root, &path)?;
             let extension = path
                 .extension()
                 .map(|ext| ext.to_string_lossy().to_string());
             let language = classify_language(&path);
 
-            if size_bytes > self.options.max_file_bytes {
-                unsupported.push(unsupported_file(
+            if let Some(reason) = policy.path_reason(&relative_path, false) {
+                record_excluded_file(
+                    &mut excluded,
+                    &mut coverage,
                     &path,
                     relative_path,
-                    extension,
                     size_bytes,
-                    UnsupportedReason::TooLarge,
-                ));
+                    reason,
+                );
                 continue;
             }
 
             let bytes = fs::read(&path)?;
-            if looks_binary(&bytes) {
-                unsupported.push(unsupported_file(
+            if size_bytes > self.options.max_file_bytes
+                && !policy.includes_class(ExclusionReason::LargeFile)
+            {
+                record_excluded_file(
+                    &mut excluded,
+                    &mut coverage,
                     &path,
                     relative_path,
-                    extension,
                     size_bytes,
-                    UnsupportedReason::BinaryLike,
-                ));
+                    ExclusionReason::LargeFile,
+                );
+                continue;
+            }
+            if looks_binary(&bytes) {
+                if policy.includes_class(ExclusionReason::Binary) {
+                    unsupported.push(unsupported_file(
+                        &path,
+                        relative_path.clone(),
+                        extension,
+                        size_bytes,
+                        UnsupportedReason::BinaryLike,
+                    ));
+                } else {
+                    record_excluded_file(
+                        &mut excluded,
+                        &mut coverage,
+                        &path,
+                        relative_path,
+                        size_bytes,
+                        ExclusionReason::Binary,
+                    );
+                }
+                continue;
+            }
+            if looks_generated(&bytes) && !policy.includes_class(ExclusionReason::Generated) {
+                record_excluded_file(
+                    &mut excluded,
+                    &mut coverage,
+                    &path,
+                    relative_path,
+                    size_bytes,
+                    ExclusionReason::Generated,
+                );
                 continue;
             }
 
@@ -192,15 +333,90 @@ impl WorkspaceCrawler {
 
         files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
         unsupported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        excluded.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         Ok(WorkspaceSnapshot {
             root,
             files,
             unsupported,
+            excluded,
+            coverage,
             walk_errors,
             indexing_decision,
         })
     }
+}
+
+impl CompiledIndexingPolicy {
+    fn path_reason(&self, relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
+        let normalized = normalize_path(relative_path, is_dir);
+        let path = Path::new(&normalized);
+        if self.exclude.is_match(path) {
+            return Some(ExclusionReason::UserExclude);
+        }
+        let reason = default_path_reason(&normalized, is_dir)?;
+        if self.include.is_match(path) || self.includes_class(reason) {
+            return None;
+        }
+        Some(reason)
+    }
+
+    fn includes_class(&self, reason: ExclusionReason) -> bool {
+        let class = reason.as_str();
+        self.include_classes
+            .iter()
+            .any(|candidate| candidate == class)
+    }
+
+    #[allow(dead_code)]
+    fn excludes_class(&self, reason: ExclusionReason) -> bool {
+        let class = reason.as_str();
+        self.exclude_classes
+            .iter()
+            .any(|candidate| candidate == class)
+    }
+}
+
+pub fn default_path_exclusion(relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
+    IndexingPolicy::default()
+        .compile()
+        .ok()
+        .and_then(|policy| policy.path_reason(relative_path, is_dir))
+}
+
+pub fn policy_path_exclusion(
+    policy: &IndexingPolicy,
+    relative_path: &str,
+    is_dir: bool,
+) -> Option<ExclusionReason> {
+    policy
+        .compile()
+        .ok()
+        .and_then(|policy| policy.path_reason(relative_path, is_dir))
+}
+
+pub fn policy_file_exclusion(
+    policy: &IndexingPolicy,
+    relative_path: &str,
+    size_bytes: u64,
+    max_file_bytes: u64,
+    prefix: Option<&[u8]>,
+) -> Option<ExclusionReason> {
+    let compiled = policy.compile().ok()?;
+    if let Some(reason) = compiled.path_reason(relative_path, false) {
+        return Some(reason);
+    }
+    if size_bytes > max_file_bytes && !compiled.includes_class(ExclusionReason::LargeFile) {
+        return Some(ExclusionReason::LargeFile);
+    }
+    let bytes = prefix.unwrap_or_default();
+    if looks_binary(bytes) && !compiled.includes_class(ExclusionReason::Binary) {
+        return Some(ExclusionReason::Binary);
+    }
+    if looks_generated(bytes) && !compiled.includes_class(ExclusionReason::Generated) {
+        return Some(ExclusionReason::Generated);
+    }
+    None
 }
 
 pub fn classify_language(path: &Path) -> LanguageKind {
@@ -474,7 +690,20 @@ fn should_scan_source_dir(path: &Path) -> bool {
     };
     !matches!(
         name,
-        ".git" | ".hg" | ".jj" | ".svn" | "__pycache__" | "node_modules" | "target" | "vendor"
+        ".git"
+            | ".hg"
+            | ".jj"
+            | ".svn"
+            | "__pycache__"
+            | "node_modules"
+            | "target"
+            | "vendor"
+            | "dist"
+            | "build"
+            | "out"
+            | ".venv"
+            | "venv"
+            | ".gradle"
     )
 }
 
@@ -529,6 +758,199 @@ fn unsupported_file(
 
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(1024).any(|byte| *byte == 0)
+}
+
+fn looks_generated(bytes: &[u8]) -> bool {
+    let prefix = &bytes[..bytes.len().min(4096)];
+    let text = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    [
+        "@generated",
+        "auto-generated",
+        "automatically generated",
+        "code generated",
+        "do not edit",
+    ]
+    .into_iter()
+    .any(|marker| text.contains(marker))
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).map_err(|err| {
+            SqueezyError::Config(format!("invalid graph glob {pattern:?}: {err}"))
+        })?);
+    }
+    builder
+        .build()
+        .map_err(|err| SqueezyError::Config(format!("invalid graph glob set: {err}")))
+}
+
+fn normalize_reason_class(class: &str) -> String {
+    class.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn normalize_path(relative_path: &str, is_dir: bool) -> String {
+    let mut normalized = relative_path.replace('\\', "/");
+    while normalized.starts_with("./") {
+        normalized = normalized[2..].to_string();
+    }
+    if is_dir && !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+fn default_path_reason(relative_path: &str, is_dir: bool) -> Option<ExclusionReason> {
+    let path = relative_path.trim_end_matches('/');
+    let parts = path.split('/').filter(|part| !part.is_empty());
+    for part in parts {
+        match part {
+            ".git" | ".hg" | ".jj" | ".svn" => return Some(ExclusionReason::VcsMetadata),
+            "vendor" => return Some(ExclusionReason::Vendor),
+            "node_modules" | "bower_components" | ".pnpm-store" | ".npm" | ".venv" | "venv"
+            | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".tox" | ".nox" | ".gradle" => {
+                return Some(ExclusionReason::DependencyCache);
+            }
+            "target" | "dist" | "build" | "out" | "bin" | "obj" | ".next" | ".turbo"
+            | ".output" | ".cache" | "coverage" | ".nyc_output" => {
+                return Some(ExclusionReason::BuildOutput);
+            }
+            _ => {}
+        }
+    }
+    if is_dir {
+        return None;
+    }
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    if is_lockfile_name(&name) {
+        return Some(ExclusionReason::Lockfile);
+    }
+    if name.ends_with(".generated.rs") || name.ends_with(".pb.go") {
+        return Some(ExclusionReason::Generated);
+    }
+    if is_binary_extension(&name) {
+        return Some(ExclusionReason::Binary);
+    }
+    None
+}
+
+fn is_lockfile_name(name: &str) -> bool {
+    matches!(
+        name,
+        "cargo.lock"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "bun.lock"
+            | "poetry.lock"
+            | "uv.lock"
+            | "pipfile.lock"
+            | "gemfile.lock"
+            | "composer.lock"
+            | "go.sum"
+    )
+}
+
+fn is_binary_extension(name: &str) -> bool {
+    let Some((_, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    matches!(
+        extension,
+        "a" | "apk"
+            | "app"
+            | "bin"
+            | "bmp"
+            | "bz2"
+            | "class"
+            | "dll"
+            | "dmg"
+            | "doc"
+            | "docx"
+            | "dylib"
+            | "ear"
+            | "exe"
+            | "flac"
+            | "gif"
+            | "gz"
+            | "ico"
+            | "iso"
+            | "jar"
+            | "jpeg"
+            | "jpg"
+            | "lib"
+            | "m4a"
+            | "mov"
+            | "mp3"
+            | "mp4"
+            | "o"
+            | "obj"
+            | "pdf"
+            | "png"
+            | "ppt"
+            | "pptx"
+            | "rar"
+            | "so"
+            | "tar"
+            | "ttf"
+            | "wasm"
+            | "webm"
+            | "webp"
+            | "woff"
+            | "woff2"
+            | "xls"
+            | "xlsx"
+            | "xz"
+            | "zip"
+    )
+}
+
+fn record_excluded_file(
+    excluded: &mut Vec<ExcludedPath>,
+    coverage: &mut IndexCoverage,
+    path: &Path,
+    relative_path: String,
+    size_bytes: u64,
+    reason: ExclusionReason,
+) {
+    coverage.skipped_files += 1;
+    coverage.skipped_bytes += size_bytes;
+    let entry = coverage
+        .reasons
+        .entry(reason.as_str().to_string())
+        .or_default();
+    entry.files += 1;
+    entry.bytes += size_bytes;
+    if entry.samples.len() < 5 {
+        entry.samples.push(relative_path.clone());
+    }
+    excluded.push(ExcludedPath {
+        path: path.to_path_buf(),
+        relative_path,
+        size_bytes,
+        reason,
+    });
+}
+
+fn record_excluded_dir(coverage: &mut IndexCoverage, reason: ExclusionReason, relative_path: &str) {
+    coverage.skipped_dirs += 1;
+    let entry = coverage
+        .reasons
+        .entry(reason.as_str().to_string())
+        .or_default();
+    entry.dirs += 1;
+    if entry.samples.len() < 5 {
+        entry.samples.push(
+            normalize_path(relative_path, true)
+                .trim_end_matches('/')
+                .to_string(),
+        );
+    }
 }
 
 pub fn stable_content_hash(bytes: &[u8]) -> String {

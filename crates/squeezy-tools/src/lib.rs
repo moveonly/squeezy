@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
-    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionScope, Result, SkillsConfig,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionScope, Result, SkillsConfig,
     SqueezyError,
 };
 use squeezy_graph::{
@@ -32,6 +32,9 @@ use squeezy_graph::{
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_vcs::{DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs};
+use squeezy_workspace::{
+    CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy, policy_file_exclusion,
+};
 use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 
@@ -368,6 +371,7 @@ pub struct ToolRegistry {
     vcs: Arc<GitVcs>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
+    crawl_options: Arc<CrawlOptions>,
 }
 
 #[derive(Debug, Default)]
@@ -405,7 +409,28 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
     ) -> Result<Self> {
-        Self::new_inner(root, output_config, web_config, SkillCatalog::empty())
+        Self::new_inner(
+            root,
+            output_config,
+            web_config,
+            SkillCatalog::empty(),
+            CrawlOptions::default(),
+        )
+    }
+
+    pub fn new_with_graph_config(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+        web_config: WebToolConfig,
+        graph_config: &GraphConfig,
+    ) -> Result<Self> {
+        Self::new_inner(
+            root,
+            output_config,
+            web_config,
+            SkillCatalog::empty(),
+            crawl_options_from_graph_config(graph_config),
+        )
     }
 
     pub fn new_with_configs_and_skills(
@@ -413,13 +438,20 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills_config: SkillsConfig,
+        graph_config: &GraphConfig,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
-        Self::new_inner_canonical(root, output_config, web_config, skills)
+        Self::new_inner_canonical(
+            root,
+            output_config,
+            web_config,
+            skills,
+            crawl_options_from_graph_config(graph_config),
+        )
     }
 
     fn new_inner(
@@ -427,12 +459,13 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
+        crawl_options: CrawlOptions,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
-        Self::new_inner_canonical(root, output_config, web_config, skills)
+        Self::new_inner_canonical(root, output_config, web_config, skills, crawl_options)
     }
 
     fn new_inner_canonical(
@@ -440,10 +473,13 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
+        crawl_options: CrawlOptions,
     ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
-        let graph = GraphManager::open(&root).ok();
+        let graph =
+            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
+                .ok();
         let vcs = GitVcs::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
@@ -454,6 +490,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
+            crawl_options: Arc::new(crawl_options),
         })
     }
 
@@ -469,7 +506,10 @@ impl ToolRegistry {
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let output_store = ToolOutputStore::new(&root, output_config)?;
-        let graph = GraphManager::open(&root).ok();
+        let crawl_options = CrawlOptions::default();
+        let graph =
+            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
+                .ok();
         let vcs = GitVcs::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
@@ -480,6 +520,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
+            crawl_options: Arc::new(crawl_options),
         })
     }
 
@@ -514,6 +555,34 @@ impl ToolRegistry {
         }
     }
 
+    fn read_file_targets_ignored_policy(&self, arguments: &Value) -> bool {
+        let Ok(args) = serde_json::from_value::<ReadFileArgs>(arguments.clone()) else {
+            return false;
+        };
+        let Ok(path) = self.resolve_existing(&args.path) else {
+            return false;
+        };
+        let rel = self.relative(&path);
+        self.policy_exclusion_for_file(&path, &rel, read_prefix(&path, 4096).ok())
+            .is_some()
+    }
+
+    fn policy_exclusion_for_file(
+        &self,
+        path: &Path,
+        rel: &Path,
+        prefix: Option<Vec<u8>>,
+    ) -> Option<ExclusionReason> {
+        let size_bytes = file_len(path).ok()?;
+        policy_file_exclusion(
+            &self.crawl_options.policy,
+            &rel.to_string_lossy(),
+            size_bytes,
+            self.crawl_options.max_file_bytes,
+            prefix.as_deref(),
+        )
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             diff_context_spec(),
@@ -541,6 +610,9 @@ impl ToolRegistry {
             "webfetch" | "websearch" => PermissionScope::Web,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
+            "read_file" if self.read_file_targets_ignored_policy(&call.arguments) => {
+                PermissionScope::IgnoredSearch
+            }
             "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
             | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
             _ => PermissionScope::Read,
@@ -905,6 +977,7 @@ impl ToolRegistry {
                 "mode": diff_mode_str(mode),
                 "diff_only": diff_only,
                 "symbols": content,
+                "coverage": coverage_json(&manager.build_report().coverage),
                 "graph_available": true,
             }),
             ToolCostHint {
@@ -962,8 +1035,13 @@ impl ToolRegistry {
                 "changed_files": report.changed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
                 "removed_files": report.removed_files.iter().map(|id| id.0.clone()).collect::<Vec<_>>(),
                 "reparsed_files": report.reparsed_files,
+                "excluded_files": report.excluded_files,
+                "excluded_dirs": report.excluded_dirs,
+                "excluded_bytes": report.excluded_bytes,
+                "coverage": coverage_json(&report.coverage),
                 "budget_exhausted": report.budget_exhausted,
             })),
+            "coverage": coverage_json(&manager.build_report().coverage),
             "files": files,
         })
     }
@@ -1050,6 +1128,9 @@ impl ToolRegistry {
                 continue;
             }
             let rel = self.relative(path);
+            if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
+                continue;
+            }
             if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
                 continue;
             }
@@ -1181,6 +1262,9 @@ impl ToolRegistry {
                 continue;
             }
             let rel = self.relative(path);
+            if !include_ignored && self.policy_exclusion_for_file(path, &rel, None).is_some() {
+                continue;
+            }
             if diff_only && !diff_paths.contains(rel.to_string_lossy().as_ref()) {
                 continue;
             }
@@ -1201,6 +1285,13 @@ impl ToolRegistry {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
+            if !include_ignored
+                && self
+                    .policy_exclusion_for_file(path, &rel, Some(bytes.clone()))
+                    .is_some()
+            {
+                continue;
+            }
             cost.bytes_read += bytes.len() as u64;
             let file_truncated = file_len(path)
                 .map(|len| len > bytes.len() as u64)
@@ -1335,6 +1426,9 @@ impl ToolRegistry {
             Ok(len) => len,
             Err(err) => return tool_error(call, err),
         };
+        let ignored_reason = self
+            .policy_exclusion_for_file(&path, &rel, read_prefix(&path, 4096).ok())
+            .map(ExclusionReason::as_str);
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
         let bytes = match read_range(&path, offset as u64, limit) {
@@ -1364,6 +1458,8 @@ impl ToolRegistry {
                 "total_bytes": total_bytes,
                 "sha256": content_sha256,
                 "truncated": end < total_bytes as usize,
+                "ignored": ignored_reason.is_some(),
+                "ignored_reason": ignored_reason,
                 "content": content,
             }),
             cost,
@@ -2541,6 +2637,44 @@ fn tool_include_ignored(arguments: &Value) -> bool {
         .get("include_ignored")
         .and_then(Value::as_bool)
         .unwrap_or(false)
+}
+
+fn crawl_options_from_graph_config(config: &GraphConfig) -> CrawlOptions {
+    CrawlOptions {
+        include_hidden: config.include_hidden,
+        max_file_bytes: config.max_file_bytes,
+        require_indexing_signal: config.require_indexing_signal,
+        policy: IndexingPolicy {
+            include: config.include.clone(),
+            exclude: config.exclude.clone(),
+            include_classes: config.include_classes.clone(),
+            exclude_classes: config.exclude_classes.clone(),
+        },
+    }
+}
+
+fn coverage_json(coverage: &IndexCoverage) -> Value {
+    let reasons = coverage
+        .reasons
+        .iter()
+        .map(|(reason, coverage)| {
+            (
+                reason.clone(),
+                json!({
+                    "files": coverage.files,
+                    "dirs": coverage.dirs,
+                    "bytes": coverage.bytes,
+                    "samples": coverage.samples,
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "skipped_files": coverage.skipped_files,
+        "skipped_dirs": coverage.skipped_dirs,
+        "skipped_bytes": coverage.skipped_bytes,
+        "reasons": reasons,
+    })
 }
 
 fn diff_mode_str(mode: DiffMode) -> &'static str {

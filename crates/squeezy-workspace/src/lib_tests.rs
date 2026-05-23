@@ -11,7 +11,7 @@ fn crawler_respects_gitignore_and_classifies_files() {
     let root = temp_root("crawler_respects_gitignore_and_classifies_files");
     fs::create_dir_all(root.join("src")).unwrap();
     fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
-    fs::write(root.join("src").join("lib.rs"), "pub fn visible() {}\n").unwrap();
+    fs::write(root.join("src").join("lib.rs"), "fn a(){}\n").unwrap();
     fs::write(root.join("ignored.rs"), "pub fn hidden() {}\n").unwrap();
     fs::write(root.join("README.md"), "# docs\n").unwrap();
 
@@ -62,17 +62,156 @@ fn crawler_marks_large_and_binary_files_as_unsupported() {
         include_hidden: false,
         max_file_bytes: 8,
         require_indexing_signal: true,
+        policy: IndexingPolicy::default(),
     })
     .crawl(&root)
     .unwrap();
 
     assert!(snapshot.files.is_empty());
-    assert!(snapshot.unsupported.iter().any(|file| {
-        file.relative_path == "large.rs" && file.reason == UnsupportedReason::TooLarge
+    assert!(snapshot.excluded.iter().any(|file| {
+        file.relative_path == "large.rs" && file.reason == ExclusionReason::LargeFile
     }));
-    assert!(snapshot.unsupported.iter().any(|file| {
-        file.relative_path == "bytes.bin" && file.reason == UnsupportedReason::BinaryLike
+    assert!(snapshot.excluded.iter().any(|file| {
+        file.relative_path == "bytes.bin" && file.reason == ExclusionReason::Binary
     }));
+}
+
+#[test]
+fn default_policy_excludes_generated_vendor_build_lock_binary_and_large_paths() {
+    let root =
+        temp_root("default_policy_excludes_generated_vendor_build_lock_binary_and_large_paths");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(root.join("vendor/lib")).unwrap();
+    fs::create_dir_all(root.join("target/debug")).unwrap();
+    fs::create_dir_all(root.join(".venv/lib")).unwrap();
+    fs::write(root.join("src").join("lib.rs"), "fn a(){}\n").unwrap();
+    fs::write(root.join("src").join("generated.rs"), "// @generated\n").unwrap();
+    fs::write(root.join("node_modules/pkg/index.ts"), "needle\n").unwrap();
+    fs::write(root.join("vendor/lib/lib.rs"), "pub fn vendored() {}\n").unwrap();
+    fs::write(
+        root.join("target/debug/out.rs"),
+        "pub fn build_output() {}\n",
+    )
+    .unwrap();
+    fs::write(root.join(".venv/lib/site.py"), "def hidden(): pass\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "# lock\n").unwrap();
+    fs::write(root.join("image.png"), b"\x89PNG\r\n\0").unwrap();
+    fs::write(
+        root.join("huge.rs"),
+        "pub fn huge() { let x = 1 + 2 + 3; }\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions {
+        max_file_bytes: 16,
+        ..CrawlOptions::default()
+    })
+    .crawl(&root)
+    .unwrap();
+
+    assert!(
+        snapshot
+            .files
+            .iter()
+            .any(|file| file.relative_path == "src/lib.rs")
+    );
+    for (path, reason) in [
+        ("src/generated.rs", ExclusionReason::Generated),
+        (
+            "node_modules/pkg/index.ts",
+            ExclusionReason::DependencyCache,
+        ),
+        ("vendor/lib/lib.rs", ExclusionReason::Vendor),
+        ("target/debug/out.rs", ExclusionReason::BuildOutput),
+        (".venv/lib/site.py", ExclusionReason::DependencyCache),
+        ("Cargo.lock", ExclusionReason::Lockfile),
+        ("image.png", ExclusionReason::Binary),
+        ("huge.rs", ExclusionReason::LargeFile),
+    ] {
+        assert!(
+            snapshot
+                .excluded
+                .iter()
+                .any(|file| file.relative_path == path && file.reason == reason),
+            "{path} should be excluded as {reason:?}: {:?}",
+            snapshot.excluded
+        );
+    }
+    assert!(snapshot.coverage.skipped_files >= 8);
+    assert!(
+        snapshot
+            .coverage
+            .reasons
+            .contains_key(ExclusionReason::Vendor.as_str())
+    );
+}
+
+#[test]
+fn policy_include_and_exclude_overrides_are_reason_tagged() {
+    let root = temp_root("policy_include_and_exclude_overrides_are_reason_tagged");
+    fs::create_dir_all(root.join("vendor/allowed")).unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("vendor/allowed/lib.rs"), "pub fn allowed() {}\n").unwrap();
+    fs::write(root.join("src/private.rs"), "pub fn private() {}\n").unwrap();
+    fs::write(root.join("Cargo.lock"), "# lock\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions {
+        policy: IndexingPolicy {
+            include: vec!["vendor/allowed/**".to_string()],
+            exclude: vec!["src/private.rs".to_string()],
+            include_classes: vec!["lockfile".to_string()],
+            exclude_classes: Vec::new(),
+        },
+        ..CrawlOptions::default()
+    })
+    .crawl(&root)
+    .unwrap();
+
+    let indexed = snapshot
+        .files
+        .iter()
+        .map(|file| file.relative_path.as_str())
+        .collect::<Vec<_>>();
+    assert!(indexed.contains(&"vendor/allowed/lib.rs"));
+    assert!(indexed.contains(&"Cargo.lock"));
+    assert!(snapshot.excluded.iter().any(|file| {
+        file.relative_path == "src/private.rs" && file.reason == ExclusionReason::UserExclude
+    }));
+}
+
+#[test]
+fn indexing_policy_covers_common_language_layouts() {
+    for (dir, file) in [
+        ("rust/target/debug", "lib.rs"),
+        ("python/.venv/lib", "site.py"),
+        ("js/node_modules/pkg", "index.ts"),
+        ("go/vendor/pkg", "lib.go"),
+        ("java/build/classes", "App.java"),
+        ("csharp/bin/Debug", "Program.cs"),
+        ("cpp/build/obj", "main.cpp"),
+    ] {
+        let root = temp_root(&format!("layout-{}-{}", dir.replace(['/', '.'], "_"), file));
+        let excluded_dir = root.join(dir);
+        fs::create_dir_all(&excluded_dir).unwrap();
+        fs::write(root.join("README.md"), "# project\n").unwrap();
+        fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(excluded_dir.join(file), "needle\n").unwrap();
+
+        let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+            .crawl(&root)
+            .unwrap();
+
+        let excluded_path = format!("{dir}/{file}");
+        assert!(
+            snapshot
+                .excluded
+                .iter()
+                .any(|entry| entry.relative_path == excluded_path),
+            "{excluded_path}: {:?}",
+            snapshot.excluded
+        );
+    }
 }
 
 #[test]

@@ -97,6 +97,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   set to `allow`, `ask`, or `deny`.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
+- `[graph]`: workspace indexing controls including `languages`,
+  `max_file_bytes`, `include_hidden`, `require_indexing_signal`, path
+  `include`/`exclude` globs, and class overrides such as `include_classes =
+  ["lockfile"]`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
@@ -108,8 +112,6 @@ The following sections are accepted, validated, and surfaced by
 reserved so that you can start writing configuration today and have it
 keep working when wiring lands:
 
-- `[graph]`: `languages`, `max_file_bytes`, `include_hidden`, and
-  `require_indexing_signal`.
 - `[tui].status_verbosity` (`"compact"` or `"verbose"`).
 - `[mcp.servers.<name>]`: `enabled`, `transport`, `command`, `args`,
   `url`, `timeout_ms`, and `env`.
