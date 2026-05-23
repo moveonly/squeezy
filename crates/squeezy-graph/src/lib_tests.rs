@@ -430,6 +430,39 @@ pub fn use_context(mode: ContextMode) {
         .unwrap();
     let graph = SemanticGraph::from_parsed(vec![lowargs_parsed, defs_parsed]);
     let context_mode = graph.find_symbol_by_name("ContextMode").pop().unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&context_mode.id)
+            .iter()
+            .any(|hit| hit.reference.text == "ContextMode")
+    );
+}
+
+#[test]
+fn graph_binds_grouped_import_clause_to_imported_type() {
+    let mut parser = RustParser::new().unwrap();
+    let lowargs = record(
+        "crates/core/flags/lowargs.rs",
+        r#"
+pub enum ContextMode {
+    Passthru,
+}
+"#,
+    );
+    let defs = record(
+        "crates/core/flags/defs.rs",
+        r#"
+use crate::flags::lowargs::{ContextMode};
+"#,
+    );
+    let lowargs_parsed = parser
+        .parse_source(&lowargs, fs::read_to_string(&lowargs.path).unwrap())
+        .unwrap();
+    let defs_parsed = parser
+        .parse_source(&defs, fs::read_to_string(&defs.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![lowargs_parsed, defs_parsed]);
+    let context_mode = graph.find_symbol_by_name("ContextMode").pop().unwrap();
 
     assert!(
         graph
@@ -554,6 +587,129 @@ fn option() -> Option<u8> {
     let none = graph.find_symbol_by_name("None").pop().unwrap();
 
     assert!(graph.references_to_symbol(&none.id).is_empty());
+}
+
+#[test]
+fn graph_binds_trait_owned_self_associated_type_references() {
+    let source = r#"
+pub trait IntoThing {
+    type Output;
+
+    fn convert(self) -> Self::Output;
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let output = graph.find_symbol_by_name("Output").pop().unwrap();
+
+    assert!(
+        graph
+            .references_to_symbol(&output.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Self::Output")
+    );
+}
+
+#[test]
+fn graph_binds_trait_qualified_associated_type_to_trait_item() {
+    let source = r#"
+pub trait IntoThing {
+    type Output;
+}
+
+struct Local;
+
+impl IntoThing for Local {
+    type Output = Local;
+}
+
+pub fn consume(_: IntoThing::Output) {}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let trait_output = graph
+        .find_symbol_by_name("Output")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.kind == SymbolKind::Trait)
+                .unwrap_or(false)
+        })
+        .unwrap();
+    let impl_output = graph
+        .find_symbol_by_name("Output")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.kind == SymbolKind::Impl)
+                .unwrap_or(false)
+        })
+        .unwrap();
+
+    assert!(
+        graph
+            .references_to_symbol(&trait_output.id)
+            .iter()
+            .any(|hit| hit.reference.text == "IntoThing::Output")
+    );
+    assert!(
+        graph
+            .references_to_symbol(&impl_output.id)
+            .iter()
+            .all(|hit| hit.reference.text != "IntoThing::Output")
+    );
+}
+
+#[test]
+fn graph_does_not_bind_impl_self_projection_to_impl_associated_type() {
+    let source = r#"
+pub trait IntoThing {
+    type Output;
+}
+
+struct Local;
+
+impl IntoThing for Local {
+    type Output = Local;
+
+    fn convert(self) -> Self::Output {
+        Local
+    }
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+    let impl_output = graph
+        .find_symbol_by_name("Output")
+        .into_iter()
+        .find(|symbol| {
+            symbol
+                .parent_id
+                .as_ref()
+                .and_then(|id| graph.symbols.get(id))
+                .map(|parent| parent.kind == SymbolKind::Impl)
+                .unwrap_or(false)
+        })
+        .unwrap();
+
+    assert!(
+        graph
+            .references_to_symbol(&impl_output.id)
+            .iter()
+            .all(|hit| hit.reference.text != "Self::Output")
+    );
 }
 
 fn record(relative_path: &str, source: &str) -> FileRecord {

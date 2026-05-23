@@ -156,6 +156,14 @@ inference, active cfg/feature differences, proc-macro-generated references, and
 cross-crate reexports that need Cargo metadata rather than syntax-only
 heuristics.
 
+A subsequent reference-FN pass on May 23, 2026 bound identifier references
+inside import clauses back to their resolved import entries, and added
+precision-scoped trait associated type projection matching. On deterministic
+5,000-scenario local runs with 50 LSP reference probes, `ripgrep` moved from
+TP=31 FP=1 FN=130 to TP=89 FP=1 FN=72. `serde` moved from TP=39 FP=6 FN=84 to
+TP=49 FP=6 FN=74. A broader associated-type declaration-family heuristic was
+tested but rejected because it increased serde reference FP from 6 to 158.
+
 ## CI
 
 `.github/workflows/semantic-graph-benchmark.yml` runs the smoke benchmark on PRs

@@ -999,8 +999,14 @@ impl SemanticGraph {
         if self.reference_is_impl_method_declaration_for_trait(symbol, reference) {
             return Some(Confidence::Heuristic);
         }
+        if self.associated_type_reference_matches_symbol(symbol, reference) {
+            return Some(Confidence::Heuristic);
+        }
         if let Some(edge) = self.call_edge_for_reference(reference) {
             return self.edge_binding_confidence(symbol, edge);
+        }
+        if self.imported_reference_matches_symbol(symbol, reference) {
+            return Some(Confidence::ImportResolved);
         }
         if let Some(edge) = self.semantic_edge_for_reference(reference) {
             if edge.kind == EdgeKind::References
@@ -1008,10 +1014,12 @@ impl SemanticGraph {
             {
                 return None;
             }
-            return self.edge_binding_confidence(symbol, edge);
-        }
-        if self.imported_reference_matches_symbol(symbol, reference) {
-            return Some(Confidence::ImportResolved);
+            if let Some(confidence) = self.edge_binding_confidence(symbol, edge) {
+                return Some(confidence);
+            }
+            if !matches!(edge.kind, EdgeKind::Imports | EdgeKind::Reexports) {
+                return None;
+            }
         }
         if self.scoped_type_qualifier_matches_symbol(symbol, reference) {
             return Some(Confidence::Heuristic);
@@ -1057,10 +1065,33 @@ impl SemanticGraph {
         symbol: &GraphSymbol,
         reference: &ParsedReference,
     ) -> bool {
+        let reference_name = last_path_segment(&reference.text);
+        if self
+            .imports
+            .iter()
+            .filter(|import| import.file_id == reference.file_id)
+            .any(|import| {
+                if import.is_glob
+                    || !import.span.contains_byte(reference.span.start_byte)
+                    || !import.span.contains_byte(reference.span.end_byte)
+                {
+                    return false;
+                }
+                let alias_or_name = import
+                    .alias
+                    .as_deref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| last_path_segment(&import.path));
+                (reference_name == symbol.name || reference_name == alias_or_name)
+                    && last_path_segment(&import.path) == symbol.name
+                    && self.import_module_matches_symbol(import, symbol)
+            })
+        {
+            return true;
+        }
         if !reference_kind_can_bind_symbol(reference, symbol) {
             return false;
         }
-        let reference_name = last_path_segment(&reference.text);
         self.imports
             .iter()
             .filter(|import| import.file_id == reference.file_id)
@@ -1230,6 +1261,90 @@ impl SemanticGraph {
             return false;
         }
         !self.symbol_or_ancestors_have_cfg_attribute(owner)
+    }
+
+    fn associated_type_reference_matches_symbol(
+        &self,
+        symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if symbol.kind != SymbolKind::TypeAlias || last_path_segment(&reference.text) != symbol.name
+        {
+            return false;
+        }
+        let Some(symbol_owner) = symbol
+            .parent_id
+            .as_ref()
+            .and_then(|id| self.symbols.get(id))
+        else {
+            return false;
+        };
+        if symbol_owner.kind != SymbolKind::Trait {
+            return false;
+        }
+
+        let segments = path_segments(&reference.text);
+        if segments.len() < 2 || segments.last() != Some(&symbol.name) {
+            return false;
+        }
+        let qualifier = &segments[..segments.len() - 1];
+        if qualifier.len() == 1 && qualifier[0] == "Self" {
+            return self
+                .reference_owner_trait(reference)
+                .map(|owner| owner.id == symbol_owner.id)
+                .unwrap_or(false);
+        }
+        self.trait_path_matches_symbol(qualifier, symbol_owner, reference)
+    }
+
+    fn reference_owner_trait(&self, reference: &ParsedReference) -> Option<&GraphSymbol> {
+        let mut current = reference
+            .owner_id
+            .as_ref()
+            .and_then(|id| self.symbols.get(id));
+        while let Some(symbol) = current {
+            match symbol.kind {
+                SymbolKind::Trait => return Some(symbol),
+                SymbolKind::Impl => return None,
+                _ => {
+                    current = symbol
+                        .parent_id
+                        .as_ref()
+                        .and_then(|id| self.symbols.get(id));
+                }
+            }
+        }
+        None
+    }
+
+    fn trait_path_matches_symbol(
+        &self,
+        path: &[String],
+        trait_symbol: &GraphSymbol,
+        reference: &ParsedReference,
+    ) -> bool {
+        if path.last().map(String::as_str) != Some(trait_symbol.name.as_str()) {
+            return false;
+        }
+        if path.len() == 1 {
+            return self.symbol_is_in_reference_scope(trait_symbol, reference);
+        }
+        if path.first().map(String::as_str) == Some("crate") {
+            let mut expected = self.module_path_for_symbol(trait_symbol);
+            expected.push(trait_symbol.name.clone());
+            return path == expected;
+        }
+        let Some(owner) = reference
+            .owner_id
+            .as_ref()
+            .and_then(|id| self.symbols.get(id))
+        else {
+            return false;
+        };
+        let receiver = path[..path.len() - 1].join("::");
+        self.receiver_module_paths(owner, &receiver)
+            .into_iter()
+            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
     }
 
     fn symbol_or_ancestors_have_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
