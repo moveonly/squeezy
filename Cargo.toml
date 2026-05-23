@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 futures-core = "0.3"
 futures-util = "0.3"
+ignore = "0.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
@@ -37,11 +38,16 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "syn
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
 
 squeezy-agent = { path = "crates/squeezy-agent" }
 squeezy-core = { path = "crates/squeezy-core" }
+squeezy-graph = { path = "crates/squeezy-graph" }
 squeezy-llm = { path = "crates/squeezy-llm" }
+squeezy-parse = { path = "crates/squeezy-parse" }
 squeezy-tui = { path = "crates/squeezy-tui" }
+squeezy-workspace = { path = "crates/squeezy-workspace" }
 
 [profile.release]
 opt-level = 3

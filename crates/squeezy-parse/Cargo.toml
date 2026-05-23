@@ -9,3 +9,6 @@ publish.workspace = true
 
 [dependencies]
 squeezy-core.workspace = true
+squeezy-workspace.workspace = true
+tree-sitter.workspace = true
+tree-sitter-rust.workspace = true

@@ -1,0 +1,73 @@
+{
+  "queries": [
+    {
+      "id": "hierarchy-service",
+      "kind": "hierarchy_contains",
+      "text": "",
+      "expected_contains": [
+        "File:src/lib.rs",
+        "Module:service",
+        "Trait:Service",
+        "Struct:Runner",
+        "Method:run",
+        "Function:helper",
+        "Macro:local_macro",
+        "Function:macro_user"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "signature-run",
+      "kind": "signature_search",
+      "text": "pub fn run",
+      "symbol_kind": "Method",
+      "expected_contains": [
+        "Method:run"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "body-helper",
+      "kind": "body_search",
+      "text": "helper",
+      "owner_kind": "Method",
+      "expected_contains": [
+        "run:helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "reference-runner",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": [
+        "Runner"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "call-chain-run-helper",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "helper",
+      "expected_contains": [
+        "run -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "macro-opacity",
+      "kind": "body_search",
+      "text": "local_macro",
+      "expected_contains": [
+        "macro_user:local_macro!()"
+      ],
+      "documented_misses": [
+        {
+          "result": "expanded macro call local_macro! -> helper",
+          "reason": "macro expansion is intentionally outside the production graph"
+        }
+      ]
+    }
+  ]
+}

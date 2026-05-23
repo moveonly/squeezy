@@ -8,4 +8,5 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+ignore.workspace = true
 squeezy-core.workspace = true

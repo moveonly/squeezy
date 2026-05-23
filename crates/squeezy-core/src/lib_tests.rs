@@ -13,6 +13,16 @@ fn transcript_constructors_set_roles() {
 }
 
 #[test]
+fn source_span_contains_byte_inclusively() {
+    let span = SourceSpan::new(10, 20, SourcePoint::new(1, 0), SourcePoint::new(1, 10));
+
+    assert!(!span.contains_byte(9));
+    assert!(span.contains_byte(10));
+    assert!(span.contains_byte(20));
+    assert!(!span.contains_byte(21));
+}
+
+#[test]
 fn config_without_env_uses_openai_provider_defaults() {
     let config = AppConfig::from_env_vars(|_| None);
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);

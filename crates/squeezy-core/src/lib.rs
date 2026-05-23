@@ -118,6 +118,150 @@ pub struct CostSnapshot {
     pub estimated_usd_micros: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContentHash(pub String);
+
+impl ContentHash {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FileId(pub String);
+
+impl FileId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SymbolId(pub String);
+
+impl SymbolId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourcePoint {
+    pub line: u32,
+    pub column: u32,
+}
+
+impl SourcePoint {
+    pub const fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SourceSpan {
+    pub start_byte: u32,
+    pub end_byte: u32,
+    pub start: SourcePoint,
+    pub end: SourcePoint,
+}
+
+impl SourceSpan {
+    pub const fn new(start_byte: u32, end_byte: u32, start: SourcePoint, end: SourcePoint) -> Self {
+        Self {
+            start_byte,
+            end_byte,
+            start,
+            end,
+        }
+    }
+
+    pub const fn contains_byte(self, byte: u32) -> bool {
+        self.start_byte <= byte && byte <= self.end_byte
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LanguageKind {
+    Rust,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Crate,
+    File,
+    Module,
+    Struct,
+    Enum,
+    Union,
+    Trait,
+    Impl,
+    Function,
+    Method,
+    Const,
+    Static,
+    TypeAlias,
+    Field,
+    Variant,
+    Macro,
+    Test,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EdgeKind {
+    Contains,
+    Imports,
+    Reexports,
+    Calls,
+    References,
+    Implements,
+    InherentImpl,
+    TraitImpl,
+    TestOf,
+    DefinesMacro,
+    InvokesMacro,
+    Conditional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Confidence {
+    ExactSyntax,
+    ImportResolved,
+    Heuristic,
+    CandidateSet,
+    External,
+    MacroOpaque,
+    ConditionalUnknown,
+    Unsupported,
+    Stale,
+    Partial,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Freshness {
+    Fresh,
+    Stale,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Provenance {
+    pub source: String,
+    pub reason: String,
+}
+
+impl Provenance {
+    pub fn new(source: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SqueezyError {
     #[error("provider is not configured: {0}")]
@@ -130,6 +274,12 @@ pub enum SqueezyError {
     Terminal(String),
     #[error("agent error: {0}")]
     Agent(String),
+    #[error("workspace error: {0}")]
+    Workspace(String),
+    #[error("parse error: {0}")]
+    Parse(String),
+    #[error("graph error: {0}")]
+    Graph(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }

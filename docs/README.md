@@ -18,4 +18,6 @@ Current completed decisions:
 
 Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shape is OpenAI Responses streaming. Graph-backed navigation is still future work.
 
+Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
+
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.

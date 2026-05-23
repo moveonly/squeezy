@@ -1,0 +1,16 @@
+[package]
+name = "squeezy-graph-bench"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+squeezy-core = { path = "../../crates/squeezy-core" }
+squeezy-graph = { path = "../../crates/squeezy-graph" }
+squeezy-parse = { path = "../../crates/squeezy-parse" }
+squeezy-workspace = { path = "../../crates/squeezy-workspace" }

@@ -1,0 +1,151 @@
+name: Semantic Graph Benchmark
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/semantic-graph-benchmark.yml"
+      - "benchmarks/**"
+      - "crates/squeezy-core/**"
+      - "crates/squeezy-graph/**"
+      - "crates/squeezy-parse/**"
+      - "crates/squeezy-workspace/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Benchmark tier"
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  semantic-graph-smoke:
+    name: Semantic graph smoke
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Ensure rust-analyzer when available
+        run: rustup component add rust-analyzer || true
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run semantic graph benchmark
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --fixture benchmarks/fixtures/rust/semantic-cases \
+            --spec benchmarks/specs/smoke-queries.json \
+            --report target/semantic-graph-benchmark/smoke.json \
+            --mixed-repo .
+
+      - name: Run full external benchmark
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'full' }}
+        run: |
+          mkdir -p target/benchmark-repos
+          while read -r name url; do
+            git clone --depth 1 "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --fixture benchmarks/fixtures/rust/semantic-cases \
+              --spec benchmarks/specs/smoke-queries.json \
+              --report "target/semantic-graph-benchmark/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 5000
+          done <<'REPOS'
+          ripgrep https://github.com/BurntSushi/ripgrep
+          fd https://github.com/sharkdp/fd
+          bat https://github.com/sharkdp/bat
+          tokio https://github.com/tokio-rs/tokio
+          serde https://github.com/serde-rs/serde
+          REPOS
+
+      - name: Write benchmark summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          reports = []
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/*.json")):
+              report = json.load(open(path))
+              reports.append((path, report))
+          reports.sort(key=lambda item: (item[0] != "target/semantic-graph-benchmark/smoke.json", item[0]))
+          print("## Semantic Graph Benchmark", file=open("__summary.md", "w"))
+          with open("__summary.md", "a") as out:
+              for path, report in reports:
+                  print("", file=out)
+                  print(f"### {path}", file=out)
+                  print(f"- Rust compiler validation: {report['rustc_check_ms']} ms", file=out)
+                  print(f"- Squeezy graph build: {report['squeezy_build_ms']} ms", file=out)
+                  print(f"- Squeezy graph queries: {report['squeezy_query_ms']} ms", file=out)
+                  acc = report['accuracy']['symbols']
+                  print(
+                      f"- Fixture symbol accuracy: TP={acc['true_positive']} FP={acc['false_positive']} FN={acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
+                      file=out,
+                  )
+                  print(
+                      f"- Fixture symbol scope: comparable RA={acc['rust_analyzer_total']} raw RA={acc['rust_analyzer_raw_total']} excluded RA={acc['rust_analyzer_excluded_by_kind']} comparable Squeezy={acc['squeezy_total']} raw Squeezy={acc['squeezy_raw_total']} excluded Squeezy={acc['squeezy_excluded_by_kind']}",
+                      file=out,
+                  )
+                  mixed = report.get("mixed_workload")
+                  if mixed:
+                      print(f"- Repo: {mixed['repo']}", file=out)
+                      print(f"- Available scenarios: {mixed['available_scenarios']}", file=out)
+                      print(f"- Executed scenarios: {mixed['executed_scenarios']}", file=out)
+                      print(f"- Tools: {', '.join(mixed['tools'])}", file=out)
+                      compiler = mixed['compiler_check_ms'] if mixed['compiler_check_ms'] is not None else mixed['compiler_check_status']
+                      rust_analyzer = mixed['rust_analyzer_ms'] if mixed['rust_analyzer_ms'] is not None else mixed['rust_analyzer_status']
+                      print(f"- cargo check: {compiler}", file=out)
+                      print(f"- rust-analyzer: {rust_analyzer}", file=out)
+                      print(f"- Squeezy total: {mixed['squeezy_total_ms']} ms", file=out)
+                      print(f"- Query time by tool: {mixed.get('query_time_ms', {})}", file=out)
+                      print(f"- Refresh after edits: {mixed['refresh_probe']['refresh_ms']} ms", file=out)
+                      print(f"- Reparsed files: {mixed['refresh_probe']['reparsed_files']}", file=out)
+                      macc = mixed['accuracy']['symbols']
+                      print(
+                          f"- Mixed symbol accuracy: TP={macc['true_positive']} FP={macc['false_positive']} FN={macc['false_negative']} precision={macc['precision']} recall={macc['recall']}",
+                          file=out,
+                      )
+                      print(
+                          f"- Mixed symbol scope: comparable RA={macc['rust_analyzer_total']} raw RA={macc['rust_analyzer_raw_total']} excluded RA={macc['rust_analyzer_excluded_by_kind']} comparable Squeezy={macc['squeezy_total']} raw Squeezy={macc['squeezy_raw_total']} excluded Squeezy={macc['squeezy_excluded_by_kind']}",
+                          file=out,
+                      )
+                  print("", file=out)
+                  print("| Query | Actual | Missing | Extras |", file=out)
+                  print("|---|---:|---:|---:|", file=out)
+                  for query in report["queries"]:
+                      print(
+                          f"| {query['id']} | {len(query['actual'])} | {len(query['missing'])} | {len(query['extras'])} |",
+                          file=out,
+                      )
+          PY
+          cat __summary.md >> "$GITHUB_STEP_SUMMARY"
