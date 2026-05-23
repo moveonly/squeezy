@@ -5,6 +5,10 @@ understand usage, reliability, cost, and performance without collecting prompts,
 file contents, paths, commands, URLs, environment variables, repository names,
 or tool arguments.
 
+On first CLI/TUI use, Squeezy prints a short notice with the same opt-out
+command and then records that the notice was shown at
+`~/.squeezy/telemetry_notice`.
+
 Opt out with:
 
 ```sh
@@ -18,7 +22,7 @@ Accepted opt-out values are `off`, `0`, `false`, `no`, and `disabled`.
 The default endpoint is:
 
 ```text
-https://telemetry.squeezy.dev/v1/batch
+https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
 ```
 
 Override it with `SQUEEZY_TELEMETRY_ENDPOINT` when testing a local or staging

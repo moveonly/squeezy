@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "setup:posthog": "bun scripts/posthog.ts setup-dashboard",
+    "smoke:worker": "bun scripts/posthog.ts smoke-worker",
+    "smoke:posthog": "bun scripts/posthog.ts verify-posthog",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wrangler": "^4.94.0"
+  }
+}
