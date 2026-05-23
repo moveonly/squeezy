@@ -18,6 +18,10 @@ use squeezy_parse::{
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 use crate::languages::{
+    csharp::{
+        csharp_import_matches_symbol, dotnet_configured_source_facts, dotnet_dependency_facts,
+        dotnet_project_metadata_provider, dotnet_source_root_facts, dotnet_target_facts,
+    },
     java::{
         java_build_metadata_provider, java_configured_source_facts, java_dependency_facts,
         java_paths_signature, java_source_root_facts,
@@ -40,6 +44,7 @@ pub struct GraphSymbol {
     pub parent_id: Option<SymbolId>,
     pub name: String,
     pub kind: SymbolKind,
+    pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
     pub signature: String,
@@ -60,6 +65,7 @@ impl From<ParsedSymbol> for GraphSymbol {
             parent_id: symbol.parent_id,
             name: symbol.name,
             kind: symbol.kind,
+            language_identity: symbol.language_identity,
             span: symbol.span,
             body_span: symbol.body_span,
             signature: symbol.signature,
@@ -154,8 +160,18 @@ pub struct JavaProjectFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DotnetProjectFact {
+    pub provider: String,
+    pub kind: String,
+    pub value: String,
+    pub source_file: FileId,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LanguageFact {
     Java(JavaProjectFact),
+    Dotnet(DotnetProjectFact),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -182,6 +198,7 @@ pub struct SemanticGraph {
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
     java_project_facts: Vec<JavaProjectFact>,
+    dotnet_project_facts: Vec<DotnetProjectFact>,
     java_project_facts_cache: HashMap<FileId, CachedJavaProjectFacts>,
     java_project_facts_cache_java_paths_signature: u64,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
@@ -238,6 +255,7 @@ impl SemanticGraph {
             references: Vec::new(),
             body_hits: Vec::new(),
             java_project_facts: Vec::new(),
+            dotnet_project_facts: Vec::new(),
             java_project_facts_cache: HashMap::new(),
             java_project_facts_cache_java_paths_signature: 0,
             symbols_by_name: HashMap::new(),
@@ -262,6 +280,7 @@ impl SemanticGraph {
             graph.insert_parsed_file(file);
         }
         graph.rebuild_java_project_facts();
+        graph.rebuild_dotnet_project_facts();
         graph.rebuild_semantic_edges();
         graph.rebuild_indexes();
         graph
@@ -277,6 +296,7 @@ impl SemanticGraph {
             self.insert_parsed_file(file);
         }
         self.rebuild_java_project_facts();
+        self.rebuild_dotnet_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -284,6 +304,7 @@ impl SemanticGraph {
     pub fn remove_file(&mut self, file_id: &FileId) {
         self.remove_file_data(file_id);
         self.rebuild_java_project_facts();
+        self.rebuild_dotnet_project_facts();
         self.rebuild_semantic_edges();
         self.rebuild_indexes();
     }
@@ -298,6 +319,8 @@ impl SemanticGraph {
             .retain(|reference| &reference.file_id != file_id);
         self.body_hits.retain(|hit| &hit.file_id != file_id);
         self.java_project_facts
+            .retain(|fact| &fact.source_file != file_id);
+        self.dotnet_project_facts
             .retain(|fact| &fact.source_file != file_id);
         self.edges.retain(|edge| {
             self.symbols.contains_key(&edge.from)
@@ -331,11 +354,21 @@ impl SemanticGraph {
         &self.java_project_facts
     }
 
+    pub fn dotnet_project_facts(&self) -> &[DotnetProjectFact] {
+        &self.dotnet_project_facts
+    }
+
     pub fn language_facts(&self) -> Vec<LanguageFact> {
         self.java_project_facts
             .iter()
             .cloned()
             .map(LanguageFact::Java)
+            .chain(
+                self.dotnet_project_facts
+                    .iter()
+                    .cloned()
+                    .map(LanguageFact::Dotnet),
+            )
             .collect()
     }
 
@@ -713,6 +746,70 @@ impl SemanticGraph {
         });
     }
 
+    fn rebuild_dotnet_project_facts(&mut self) {
+        self.dotnet_project_facts.clear();
+        let metadata_files = self
+            .files
+            .values()
+            .filter_map(|file| {
+                dotnet_project_metadata_provider(file).map(|provider| (provider, file.clone()))
+            })
+            .collect::<Vec<_>>();
+        if metadata_files.is_empty() {
+            return;
+        }
+
+        let mut csharp_paths = self
+            .files
+            .values()
+            .filter(|file| file.language == LanguageKind::CSharp)
+            .map(|file| file.relative_path.clone())
+            .collect::<Vec<_>>();
+        csharp_paths.sort();
+        let csharp_path_refs = csharp_paths.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let mut dedup = BTreeSet::new();
+        for (provider, file) in metadata_files {
+            self.push_dotnet_project_fact(
+                &mut dedup,
+                provider,
+                "metadata_file",
+                file.relative_path.clone(),
+                &file,
+                ".NET project metadata file",
+            );
+            for (kind, value, reason) in dotnet_source_root_facts(provider, &csharp_path_refs) {
+                self.push_dotnet_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+            let Ok(source) = std::fs::read_to_string(&file.path) else {
+                continue;
+            };
+            for (kind, value, reason) in dotnet_target_facts(provider, &source) {
+                self.push_dotnet_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+            for value in dotnet_dependency_facts(provider, &source) {
+                self.push_dotnet_project_fact(
+                    &mut dedup,
+                    provider,
+                    "dependency",
+                    value,
+                    &file,
+                    ".NET dependency coordinate",
+                );
+            }
+            for (kind, value, reason) in dotnet_configured_source_facts(provider, &source) {
+                self.push_dotnet_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+        }
+
+        self.dotnet_project_facts.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then(left.kind.cmp(&right.kind))
+                .then(left.value.cmp(&right.value))
+        });
+    }
+
     fn push_java_project_fact(
         &mut self,
         dedup: &mut BTreeSet<(String, String, String, String)>,
@@ -741,6 +838,34 @@ impl SemanticGraph {
         });
     }
 
+    fn push_dotnet_project_fact(
+        &mut self,
+        dedup: &mut BTreeSet<(String, String, String, String)>,
+        provider: &str,
+        kind: &str,
+        value: String,
+        file: &FileRecord,
+        reason: &str,
+    ) {
+        if value.is_empty()
+            || !dedup.insert((
+                provider.to_string(),
+                kind.to_string(),
+                value.clone(),
+                file.id.0.clone(),
+            ))
+        {
+            return;
+        }
+        self.dotnet_project_facts.push(DotnetProjectFact {
+            provider: provider.to_string(),
+            kind: kind.to_string(),
+            value,
+            source_file: file.id.clone(),
+            provenance: Provenance::new(provider, reason),
+        });
+    }
+
     fn rebuild_semantic_edges(&mut self) {
         self.edges.retain(|edge| {
             edge.kind == EdgeKind::Contains
@@ -753,6 +878,7 @@ impl SemanticGraph {
         });
         self.rebuild_resolution_indexes();
         self.js_ts_resolver = JsTsResolver::from_files(&self.files);
+        self.add_csharp_type_edges();
 
         // Move-out, mutate, move-back. Each builder iterates a single
         // field's data while writing edges, and the borrow checker won't
@@ -808,6 +934,19 @@ impl SemanticGraph {
                     self.symbols
                         .get(id)
                         .map(|symbol| self.java_import_matches_symbol(import, symbol))
+                        .unwrap_or(false)
+                });
+            }
+            if self
+                .files
+                .get(&import.file_id)
+                .map(|file| file.language == squeezy_core::LanguageKind::CSharp)
+                .unwrap_or(false)
+            {
+                candidates.retain(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| csharp_import_matches_symbol(import, symbol))
                         .unwrap_or(false)
                 });
             }
@@ -1461,18 +1600,7 @@ impl SemanticGraph {
         ) {
             return None;
         }
-        single_symbol(
-            self.children_by_parent
-                .get(parent_id)?
-                .iter()
-                .filter_map(|child_id| self.symbols.get(child_id))
-                .filter(|symbol| {
-                    matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function)
-                        && symbol.name == method_name
-                        && symbol.id != caller.id
-                })
-                .map(|symbol| symbol.id.clone()),
-        )
+        self.method_on_class_or_partials(parent, method_name, Some(&caller.id))
     }
 
     fn same_impl_method(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
@@ -1500,16 +1628,41 @@ impl SemanticGraph {
         ) {
             return None;
         }
-        self.children_by_parent
-            .get(&impl_id)?
-            .iter()
-            .find(|child_id| {
-                self.symbols
-                    .get(*child_id)
-                    .map(|symbol| symbol.name == method_name)
-                    .unwrap_or(false)
+        self.method_on_class_or_partials(parent, method_name, Some(&caller.id))
+    }
+
+    fn method_on_class_or_partials(
+        &self,
+        parent: &GraphSymbol,
+        method_name: &str,
+        exclude: Option<&SymbolId>,
+    ) -> Option<SymbolId> {
+        let parent_ids = self
+            .symbols
+            .values()
+            .filter(|symbol| {
+                symbol.id == parent.id
+                    || (symbol.language_identity.is_some()
+                        && symbol.language_identity == parent.language_identity
+                        && is_class_like_kind(symbol.kind))
             })
-            .cloned()
+            .map(|symbol| symbol.id.clone())
+            .collect::<Vec<_>>();
+        single_symbol(parent_ids.iter().flat_map(|parent_id| {
+            self.children_by_parent
+                .get(parent_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(move |symbol| {
+                    matches!(
+                        symbol.kind,
+                        SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
+                    ) && symbol.name == method_name
+                        && exclude.map(|id| id != &symbol.id).unwrap_or(true)
+                })
+                .map(|symbol| symbol.id.clone())
+        }))
     }
 
     fn edge_hit(&self, edge_index: usize) -> Option<CallEdgeHit> {
@@ -2799,13 +2952,47 @@ impl GraphManager {
         let old_ids = self.graph.files.keys().cloned().collect::<HashSet<_>>();
         let current_ids = current.keys().cloned().collect::<HashSet<_>>();
 
-        let removed_files = old_ids
+        let removed_files_all = old_ids
             .difference(&current_ids)
             .cloned()
             .collect::<Vec<_>>();
+        let removed_files = removed_files_all
+            .iter()
+            .filter(|id| {
+                self.graph
+                    .files
+                    .get(*id)
+                    .map(|old| old.language != LanguageKind::Unsupported)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let unsupported_removed_files = removed_files_all
+            .iter()
+            .filter(|id| {
+                self.graph
+                    .files
+                    .get(*id)
+                    .map(|old| old.language == LanguageKind::Unsupported)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let metadata_removed_files = unsupported_removed_files
+            .iter()
+            .filter(|id| {
+                self.graph
+                    .files
+                    .get(*id)
+                    .map(unsupported_record_affects_graph)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         let pending_changed_paths = self.pending_changed_paths.clone();
-        let mut changed_records = current
+        let mut supported_changed_records = current
             .values()
+            .filter(|record| record.language != LanguageKind::Unsupported)
             .filter(|record| {
                 self.graph
                     .files
@@ -2815,7 +3002,31 @@ impl GraphManager {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let unsupported_changed_records = current
+            .values()
+            .filter(|record| {
+                record.language == LanguageKind::Unsupported
+                    && self
+                        .graph
+                        .files
+                        .get(&record.id)
+                        .map(|old| old.hash != record.hash || old.language != record.language)
+                        .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let metadata_changed_records = unsupported_changed_records
+            .iter()
+            .filter(|record| unsupported_record_affects_graph(record))
+            .cloned()
+            .collect::<Vec<_>>();
+        let metadata_refresh_needed =
+            !metadata_changed_records.is_empty() || !metadata_removed_files.is_empty();
+        let mut changed_records = supported_changed_records.clone();
+        changed_records.extend(metadata_changed_records.iter().cloned());
         changed_records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        supported_changed_records
+            .sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         let mut reparsed_files = 0;
         let mut bytes_reparsed = 0;
@@ -2841,7 +3052,7 @@ impl GraphManager {
                 changed_records
                     .iter()
                     .any(|record| paths_match(path, &record.path))
-                    || removed_files.iter().any(|id| {
+                    || removed_files_all.iter().any(|id| {
                         self.graph
                             .files
                             .get(id)
@@ -2856,9 +3067,15 @@ impl GraphManager {
         for file_id in &removed_files {
             self.graph.remove_file(file_id);
         }
+        for file_id in &unsupported_removed_files {
+            self.graph.files.remove(file_id);
+        }
+        for record in unsupported_changed_records {
+            self.graph.files.insert(record.id.clone(), record.clone());
+        }
 
         let mut parsed_files = Vec::new();
-        for record in changed_records {
+        for record in supported_changed_records {
             if started.elapsed() > self.config.per_tool_refresh_budget {
                 budget_exhausted = true;
                 break;
@@ -2870,12 +3087,17 @@ impl GraphManager {
         }
         if !parsed_files.is_empty() {
             self.graph.replace_files(parsed_files);
+        } else if metadata_refresh_needed {
+            self.graph.rebuild_java_project_facts();
+            self.graph.rebuild_dotnet_project_facts();
+            self.graph.rebuild_semantic_edges();
+            self.graph.rebuild_indexes();
         }
 
         self.pending_changed_paths.clear();
         self.last_refresh = Instant::now();
         Ok(RefreshReport {
-            refreshed: reparsed_files > 0 || !removed_files.is_empty(),
+            refreshed: reparsed_files > 0 || !removed_files.is_empty() || metadata_refresh_needed,
             changed_files,
             removed_files,
             reparsed_files,
@@ -2896,6 +3118,13 @@ impl GraphManager {
             budget_exhausted,
         })
     }
+}
+
+fn unsupported_record_affects_graph(record: &FileRecord) -> bool {
+    dotnet_project_metadata_provider(record).is_some()
+        || java_build_metadata_provider(record).is_some()
+        || record.relative_path.ends_with("tsconfig.json")
+        || record.relative_path.ends_with("package.json")
 }
 
 fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> LanguageReport {
@@ -2956,6 +3185,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
         parent_id: None,
         name: file.relative_path.clone(),
         kind: SymbolKind::File,
+        language_identity: None,
         span: SourceSpan::new(
             0,
             0,
@@ -3047,7 +3277,8 @@ fn reference_kind_can_bind_symbol(reference: &ParsedReference, symbol: &GraphSym
 fn is_type_like_symbol(kind: SymbolKind) -> bool {
     matches!(
         kind,
-        SymbolKind::Struct
+        SymbolKind::Class
+            | SymbolKind::Struct
             | SymbolKind::Interface
             | SymbolKind::Enum
             | SymbolKind::Union
@@ -3063,7 +3294,11 @@ fn is_type_like_symbol(kind: SymbolKind) -> bool {
 fn is_class_like_kind(kind: SymbolKind) -> bool {
     matches!(
         kind,
-        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Trait
+            | SymbolKind::Enum
     )
 }
 

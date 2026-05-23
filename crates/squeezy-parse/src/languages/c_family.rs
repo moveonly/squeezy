@@ -277,6 +277,7 @@ pub(crate) fn c_family_symbol_from_node(
         parent_id,
         name,
         kind,
+        language_identity: None,
         span,
         body_span,
         signature,

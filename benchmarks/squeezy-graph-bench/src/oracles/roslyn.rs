@@ -9,8 +9,13 @@ pub(crate) fn collect_csharp_oracle_accuracy(
         .unparseable_files
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
-    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let squeezy_symbols =
+        collect_csharp_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
+    let squeezy_edges = collect_csharp_squeezy_edge_scan_excluding_files(graph, &unparseable_files);
+    let mut symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    symbols.compared_kinds = csharp_compared_symbol_kinds();
+    let mut edges = compare_symbol_sets(&squeezy_edges, &oracle.edges);
+    edges.compared_kinds = vec!["Extends".to_string(), "Implements".to_string()];
     let oracle_unparseable_examples = unparseable_files
         .iter()
         .take(10)
@@ -33,8 +38,10 @@ pub(crate) fn collect_csharp_oracle_accuracy(
         oracle_unparseable_files,
         oracle_unparseable_examples,
         symbols,
+        edges,
         limitations: vec![
             "The C# oracle uses Roslyn's CSharpSyntaxTree (syntactic, not semantic), so it counts declarations but does not resolve members inherited from referenced assemblies.".to_string(),
+            "C# edge accuracy currently compares syntactic extends/implements edges; overload, dynamic dispatch, extension methods, and accessor flow remain query-spec coverage rather than oracle coverage.".to_string(),
             "Symbol comparison is file/name/kind based; the oracle reports partial declarations once per source file, mirroring squeezy's own behavior.".to_string(),
             "C# files that Roslyn cannot parse (e.g. invalid syntax) are reported as oracle_unparseable and excluded from Squeezy false-positive accounting.".to_string(),
         ],
@@ -42,10 +49,12 @@ pub(crate) fn collect_csharp_oracle_accuracy(
 }
 
 pub(crate) fn csharp_oracle_to_accuracy(report: &CsharpOracleReport) -> AccuracyReport {
+    let mut symbols = report.symbols.clone();
+    symbols.compared_kinds = csharp_compared_symbol_kinds();
     AccuracyReport {
         rust_analyzer_symbols_ms: Some(report.oracle_ms),
         rust_analyzer_symbol_status: report.status.clone(),
-        symbols: report.symbols.clone(),
+        symbols,
         navigation: NavigationAccuracyReport {
             rust_analyzer_lsp_ms: None,
             rust_analyzer_lsp_status: "C# LSP navigation oracle not used".to_string(),
@@ -60,15 +69,33 @@ pub(crate) fn csharp_oracle_to_accuracy(report: &CsharpOracleReport) -> Accuracy
     }
 }
 
+fn csharp_compared_symbol_kinds() -> Vec<String> {
+    vec![
+        "Class".to_string(),
+        "Interface".to_string(),
+        "Module".to_string(),
+        "Struct".to_string(),
+        "Enum".to_string(),
+        "Function".to_string(),
+        "Method".to_string(),
+        "TypeAlias".to_string(),
+        "Field".to_string(),
+        "Variant".to_string(),
+    ]
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct CsharpOracleOutput {
     rows: Vec<[String; 3]>,
+    #[serde(default)]
+    edges: Vec<[String; 3]>,
     unparseable_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CsharpOracleSymbolScan {
     symbols: SymbolScan,
+    edges: SymbolScan,
     unparseable_files: Vec<String>,
     build_ms: Option<u128>,
 }
@@ -96,12 +123,18 @@ pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOra
             SymbolKey {
                 file,
                 kind,
-                name: normalize_symbol_name(&name),
+                name,
             },
         );
     }
+    let mut edges = SymbolScan::default();
+    for [file, kind, name] in output.edges {
+        edges.raw_total += 1;
+        increment_symbol(&mut edges.counts, SymbolKey { file, kind, name });
+    }
     Ok(CsharpOracleSymbolScan {
         symbols: scan,
+        edges,
         unparseable_files: output.unparseable_files,
         build_ms,
     })
@@ -114,7 +147,7 @@ pub(crate) fn ensure_csharp_oracle_built() -> Result<(PathBuf, Option<u128>)> {
         .join("Release")
         .join("net8.0")
         .join("CsharpOracle.dll");
-    if dll.exists() {
+    if dll.exists() && csharp_oracle_is_fresh(&project, &dll) {
         return Ok((dll, None));
     }
     let started = Instant::now();
@@ -141,6 +174,29 @@ pub(crate) fn ensure_csharp_oracle_built() -> Result<(PathBuf, Option<u128>)> {
         )));
     }
     Ok((dll, Some(build_ms)))
+}
+
+fn csharp_oracle_is_fresh(project: &Path, dll: &Path) -> bool {
+    let Ok(dll_modified) = dll.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(project) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        if !matches!(extension, Some("cs") | Some("csproj")) {
+            continue;
+        }
+        let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else {
+            return false;
+        };
+        if modified > dll_modified {
+            return false;
+        }
+    }
+    true
 }
 
 pub(crate) fn csharp_oracle_project_dir() -> Result<PathBuf> {

@@ -66,6 +66,7 @@ pub struct ParsedSymbol {
     pub parent_id: Option<SymbolId>,
     pub name: String,
     pub kind: SymbolKind,
+    pub language_identity: Option<String>,
     pub span: SourceSpan,
     pub body_span: Option<SourceSpan>,
     pub signature: String,

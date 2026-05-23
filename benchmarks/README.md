@@ -158,6 +158,36 @@ Latest local Java release run on May 23, 2026:
 | retrofit | 502 ms | 643 ms | 3,505 | 0 | 0 | 1.0000 | 1.0000 |
 | picocli | 7,269 ms | 880 ms | 9,523 | 0 | 0 | 1.0000 | 1.0000 |
 
+For C#, the benchmark validates the smoke fixture with `dotnet build` and runs
+the Roslyn syntax oracle in `benchmarks/oracle/csharp`. The oracle reports
+declaration symbols plus syntactic extends/implements edges; it deliberately
+does not claim overload resolution, dynamic dispatch, extension-method binding,
+MSBuild-equivalent project evaluation, generated-code flow, or Razor embedded-C#
+coverage. The C# smoke spec gates expected navigation and graph behavior for
+declarations, attributes, body hits, references, partial-type calls,
+inheritance/interface/partial edges, and .NET project facts. Razor, `.razor`,
+and `.cshtml` files remain bounded fallback inputs for v0.
+
+Latest local C# smoke run on May 24, 2026:
+
+| Fixture | Squeezy total | dotnet build | Symbol TP | FP | FN | Edge TP | FP | FN |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| semantic-cases | 6 ms | 621 ms | 32 | 0 | 0 | 2 | 0 | 0 |
+
+Latest local C# full-tier external run on May 24, 2026 used 1,500
+deterministic mixed-workload scenarios per repo. The Roslyn oracle produced
+symbol TP/FP/FN for all five repos; local `dotnet build` validation was
+reporting-only and failed because this machine has .NET SDK 8.0.201 while some
+repos pin .NET 10 SDKs or newer `.slnx` solution handling.
+
+| Repo | Squeezy total | TP | FP | FN | Precision | Recall |
+|---|---:|---:|---:|---:|---:|---:|
+| automapper | 3,496 ms | 17,175 | 1,445 | 1,383 | 0.9224 | 0.9255 |
+| dapper | 370 ms | 2,741 | 491 | 352 | 0.8481 | 0.8862 |
+| newtonsoft_json | 3,601 ms | 9,357 | 4,829 | 3,652 | 0.6596 | 0.7193 |
+| polly | 2,627 ms | 5,500 | 2,605 | 2,582 | 0.6786 | 0.6805 |
+| serilog | 257 ms | 1,846 | 643 | 494 | 0.7417 | 0.7889 |
+
 For C and C++, the benchmark validates source fixtures with `clang` or
 `clang++ -fsyntax-only` and compares Squeezy declaration symbols with sampled
 `clang -Xclang -ast-dump=json` output. This keeps compiler checking in the
@@ -250,10 +280,11 @@ tested but rejected because it increased serde reference FP from 6 to 158.
 
 ## CI
 
-`.github/workflows/semantic-graph-benchmark.yml` is the shared benchmark entry
-point for Rust, C, and C++. PRs and pushes run Rust, C, and C++ smoke jobs.
-Manual `workflow_dispatch` adds a `language` selector (`rust`, `c`, `cpp`,
-`c-family`, or `all`) plus `tier=smoke|full`.
+`.github/workflows/benchmark.yml` is the shared benchmark entry point for Rust,
+Python, Java, Go, C/C++, C#, and JS/TS. PRs and pushes run language smoke jobs
+for touched graph/parser/workspace/benchmark paths. Manual `workflow_dispatch`
+adds a `language` selector (`rust`, `python`, `java`, `go`, `c-family`,
+`csharp`, `js-ts`, or `all`) plus `tier=smoke|full`.
 
 For Rust, the full tier clones ripgrep, fd, bat, tokio, and serde, runs 5,000
 deterministic mixed-workload scenarios per repo, and writes timing, symbol
@@ -269,6 +300,13 @@ validation and sampled clang AST symbol TP/FP/FN are reported when they succeed,
 but full-tier external repos are not blocked on compiler validation because real
 C/C++ projects often need project-specific include paths, generated headers, or
 compile command databases.
+
+For C#, the full tier clones Newtonsoft.Json, Dapper, AutoMapper, Polly, and
+Serilog, then runs 1,500 deterministic mixed-workload scenarios, refresh probes,
+`dotnet build` validation when available, and Roslyn symbol/edge oracle
+comparison in reporting-only mode with the fixture speed gate disabled. This is
+the five-repo external corpus for C#; the PR/smoke tier remains the small
+`benchmarks/fixtures/csharp/semantic-cases` fixture.
 
 The workflow uploads the raw JSON reports and rendered summaries as
 `semantic-graph-benchmark-*` artifacts so benchmark runs can be audited after

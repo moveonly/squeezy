@@ -50,6 +50,8 @@ pub(crate) fn extract_csharp(file: FileRecord, source: &str, tree: &Tree) -> Par
 struct CsharpScope {
     namespace_segments: Vec<String>,
     top_namespace: Option<String>,
+    type_path: Vec<String>,
+    callable_path: Vec<String>,
 }
 
 impl CsharpScope {
@@ -111,8 +113,10 @@ fn visit_csharp_node(
                     scope,
                 );
             }
-            for _ in 0..pushed {
-                scope.namespace_segments.pop();
+            if kind == "namespace_declaration" {
+                for _ in 0..pushed {
+                    scope.namespace_segments.pop();
+                }
             }
             return;
         }
@@ -130,14 +134,31 @@ fn visit_csharp_node(
         } else {
             owner_symbol.clone()
         };
+        let pushed_type = csharp_symbol_can_own_type_members(symbol.kind);
+        let pushed_callable = matches!(
+            symbol.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+        );
+        if pushed_type {
+            scope.type_path.push(symbol.name.clone());
+        }
+        if pushed_callable {
+            scope.callable_path.push(symbol.name.clone());
+        }
         ctx.symbols.push(symbol);
         visit_csharp_children(node, ctx, next_parent, next_owner, scope);
+        if pushed_callable {
+            scope.callable_path.pop();
+        }
+        if pushed_type {
+            scope.type_path.pop();
+        }
         return;
     }
 
     match kind {
         "field_declaration" | "event_field_declaration" => {
-            extract_csharp_field_symbols(node, ctx, parent_symbol.as_ref());
+            extract_csharp_field_symbols(node, ctx, parent_symbol.as_ref(), scope);
         }
         "invocation_expression" => {
             extract_csharp_call(node, ctx, owner_symbol.clone());
@@ -212,6 +233,7 @@ pub(crate) fn csharp_namespace_symbol(
         parent_id,
         name: trimmed.to_string(),
         kind: SymbolKind::Module,
+        language_identity: Some(format!("N:{trimmed}")),
         span,
         body_span: body.map(span_from_node),
         signature,
@@ -269,7 +291,9 @@ fn csharp_symbol_from_node(
                 )
             })
             .unwrap_or(false);
-        if !inside_type {
+        if !inside_type
+            && !(node.kind() == "local_function_statement" && !scope.type_path.is_empty())
+        {
             kind = SymbolKind::Function;
         }
     }
@@ -315,6 +339,7 @@ fn csharp_symbol_from_node(
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let visibility = csharp_visibility(&modifiers);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
+    let language_identity = csharp_language_identity(node, kind, &name, &modifiers, scope);
 
     Some(ParsedSymbol {
         id,
@@ -322,6 +347,7 @@ fn csharp_symbol_from_node(
         parent_id,
         name,
         kind,
+        language_identity,
         span,
         body_span: body.map(span_from_node),
         signature,
@@ -338,6 +364,9 @@ fn csharp_symbol_from_node(
 }
 
 pub(crate) fn csharp_symbol_name(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() == "indexer_declaration" {
+        return Some("Item".to_string());
+    }
     if let Some(name_node) = node.child_by_field_name("name") {
         return node_text(name_node, source)
             .ok()
@@ -351,6 +380,141 @@ pub(crate) fn csharp_symbol_name(node: Node<'_>, source: &str) -> Option<String>
             .map(|text| format!("operator{}", text.trim()));
     }
     None
+}
+
+fn csharp_symbol_can_own_type_members(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class
+            | SymbolKind::Struct
+            | SymbolKind::Interface
+            | SymbolKind::Enum
+            | SymbolKind::Module
+    )
+}
+
+fn csharp_language_identity(
+    node: Node<'_>,
+    kind: SymbolKind,
+    name: &str,
+    modifiers: &[String],
+    scope: &CsharpScope,
+) -> Option<String> {
+    let type_name = csharp_type_identity_name(scope, name);
+    match kind {
+        SymbolKind::Class
+        | SymbolKind::Struct
+        | SymbolKind::Interface
+        | SymbolKind::Enum
+        | SymbolKind::TypeAlias => Some(format!("T:{type_name}")),
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test => {
+            let member = match node.kind() {
+                "constructor_declaration" => {
+                    if modifiers.iter().any(|modifier| modifier == "static") {
+                        "#cctor".to_string()
+                    } else {
+                        "#ctor".to_string()
+                    }
+                }
+                "destructor_declaration" => "Finalize".to_string(),
+                "operator_declaration" | "conversion_operator_declaration" => {
+                    csharp_operator_identity_name(name)
+                }
+                _ => name.to_string(),
+            };
+            Some(format!(
+                "M:{}.{}",
+                csharp_member_owner_identity(scope)?,
+                member
+            ))
+        }
+        SymbolKind::Field => {
+            let prefix = match node.kind() {
+                "event_declaration" => "E",
+                "property_declaration" | "indexer_declaration" => "P",
+                _ => "F",
+            };
+            Some(format!(
+                "{prefix}:{}.{}",
+                csharp_member_owner_identity(scope)?,
+                name
+            ))
+        }
+        SymbolKind::Variant => Some(format!(
+            "F:{}.{}",
+            csharp_member_owner_identity(scope)?,
+            name
+        )),
+        _ => None,
+    }
+}
+
+fn csharp_type_identity_name(scope: &CsharpScope, name: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(namespace) = scope.current_namespace() {
+        parts.push(namespace);
+    }
+    parts.extend(scope.type_path.iter().cloned());
+    parts.push(name.to_string());
+    parts.join(".")
+}
+
+fn csharp_member_owner_identity(scope: &CsharpScope) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(namespace) = scope.current_namespace() {
+        parts.push(namespace);
+    }
+    parts.extend(scope.type_path.iter().cloned());
+    if parts.is_empty() {
+        return None;
+    }
+    if !scope.callable_path.is_empty() {
+        parts.extend(scope.callable_path.iter().cloned());
+    }
+    Some(parts.join("."))
+}
+
+fn csharp_operator_identity_name(name: &str) -> String {
+    match name.trim_start_matches("operator") {
+        "+" => "op_Addition",
+        "-" => "op_Subtraction",
+        "*" => "op_Multiply",
+        "/" => "op_Division",
+        "%" => "op_Modulus",
+        "==" => "op_Equality",
+        "!=" => "op_Inequality",
+        "<" => "op_LessThan",
+        ">" => "op_GreaterThan",
+        "<=" => "op_LessThanOrEqual",
+        ">=" => "op_GreaterThanOrEqual",
+        "true" => "op_True",
+        "false" => "op_False",
+        "!" => "op_LogicalNot",
+        "~" => "op_OnesComplement",
+        "&" => "op_BitwiseAnd",
+        "|" => "op_BitwiseOr",
+        "^" => "op_ExclusiveOr",
+        "<<" => "op_LeftShift",
+        ">>" => "op_RightShift",
+        "++" => "op_Increment",
+        "--" => "op_Decrement",
+        other => return format!("op_{other}"),
+    }
+    .to_string()
+}
+
+fn csharp_field_language_identity(
+    node: Node<'_>,
+    name: &str,
+    scope: &CsharpScope,
+) -> Option<String> {
+    let owner = csharp_member_owner_identity(scope)?;
+    let prefix = if node.kind() == "event_field_declaration" {
+        "E"
+    } else {
+        "F"
+    };
+    Some(format!("{prefix}:{owner}.{name}"))
 }
 
 pub(crate) fn csharp_field_text(node: Node<'_>, field: &str, source: &str) -> Option<String> {
@@ -783,10 +947,11 @@ pub(crate) fn extract_csharp_reference(
     });
 }
 
-pub(crate) fn extract_csharp_field_symbols(
+fn extract_csharp_field_symbols(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
+    scope: &CsharpScope,
 ) {
     let Some((parent_id, parent_kind)) = parent_symbol else {
         return;
@@ -851,8 +1016,9 @@ pub(crate) fn extract_csharp_field_symbols(
                 id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
                 file_id: ctx.file.id.clone(),
                 parent_id: Some(parent_id.clone()),
-                name,
+                name: name.clone(),
                 kind: SymbolKind::Field,
+                language_identity: csharp_field_language_identity(node, &name, scope),
                 span,
                 body_span: None,
                 signature,

@@ -1,3 +1,76 @@
 {
-  "queries": []
+  "queries": [
+    {
+      "id": "csharp-declarations",
+      "kind": "signature_search",
+      "text": "",
+      "expected_contains": [
+        "Class:Runner",
+        "Class:BaseRunner",
+        "Interface:IRunner",
+        "Struct:RunnerSnapshot",
+        "Struct:NativeHandle",
+        "TypeAlias:RunnerFormatter",
+        "Method:Run",
+        "Method:RunAsync",
+        "Method:LocalFormat",
+        "Field:Prefix",
+        "Field:Completed",
+        "Field:Item"
+      ]
+    },
+    {
+      "id": "csharp-web-and-serialization-attributes",
+      "kind": "signature_search",
+      "text": "",
+      "attribute": "csharp:serializable",
+      "expected_contains": [
+        "Class:Runner"
+      ]
+    },
+    {
+      "id": "csharp-body-search",
+      "kind": "body_search",
+      "text": "LocalFormat",
+      "expected_contains": [
+        "Format:LocalFormat"
+      ]
+    },
+    {
+      "id": "csharp-references",
+      "kind": "references_to_symbol",
+      "to": "IRunner",
+      "expected_contains": [
+        "IRunner"
+      ]
+    },
+    {
+      "id": "csharp-call-chain",
+      "kind": "call_chain",
+      "from": "RunAsync",
+      "to": "Run",
+      "expected_contains": [
+        "RunAsync -> Run"
+      ]
+    },
+    {
+      "id": "csharp-type-edges",
+      "kind": "edges",
+      "expected_contains": [
+        "Extends:Runner->BaseRunner:BaseRunner:Heuristic",
+        "Implements:Runner->IRunner:IRunner:Heuristic",
+        "PartialOf:Runner->Runner:partial:ExactSyntax"
+      ]
+    },
+    {
+      "id": "csharp-dotnet-project-facts",
+      "kind": "dotnet_project_facts",
+      "expected_contains": [
+        "csproj:metadata_file:Squeezy.CSharp.SemanticCases.csproj",
+        "csproj:target_framework:net8.0",
+        "directory-build-props:metadata_file:Directory.Build.props",
+        "global-json:sdk:8.0.100"
+      ]
+    }
+  ]
 }

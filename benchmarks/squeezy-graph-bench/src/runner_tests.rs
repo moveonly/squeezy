@@ -120,7 +120,7 @@ fn csharp_roslyn_oracle_emits_partial_record_declarations_once_per_file() {
         .get(&SymbolKey {
             file: "Runner.cs".to_string(),
             kind: "Module".to_string(),
-            name: "Demo".to_string(),
+            name: "N:Demo".to_string(),
         })
         .copied()
         .unwrap_or(0);
@@ -130,7 +130,7 @@ fn csharp_roslyn_oracle_emits_partial_record_declarations_once_per_file() {
         .get(&SymbolKey {
             file: "Runner.Helpers.cs".to_string(),
             kind: "Module".to_string(),
-            name: "Demo".to_string(),
+            name: "N:Demo".to_string(),
         })
         .copied()
         .unwrap_or(0);
@@ -140,7 +140,7 @@ fn csharp_roslyn_oracle_emits_partial_record_declarations_once_per_file() {
         .get(&SymbolKey {
             file: "Runner.cs".to_string(),
             kind: "Class".to_string(),
-            name: "Runner".to_string(),
+            name: "T:Demo.Runner".to_string(),
         })
         .copied()
         .unwrap_or(0);
@@ -150,7 +150,7 @@ fn csharp_roslyn_oracle_emits_partial_record_declarations_once_per_file() {
         .get(&SymbolKey {
             file: "Runner.Helpers.cs".to_string(),
             kind: "Class".to_string(),
-            name: "Runner".to_string(),
+            name: "T:Demo.Runner".to_string(),
         })
         .copied()
         .unwrap_or(0);
@@ -160,7 +160,7 @@ fn csharp_roslyn_oracle_emits_partial_record_declarations_once_per_file() {
         .get(&SymbolKey {
             file: "Runner.cs".to_string(),
             kind: "Method".to_string(),
-            name: "Run".to_string(),
+            name: "M:Demo.Runner.Run".to_string(),
         })
         .copied()
         .unwrap_or(0);

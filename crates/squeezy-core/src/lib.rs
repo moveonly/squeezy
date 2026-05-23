@@ -4041,6 +4041,8 @@ pub enum EdgeKind {
     Reexports,
     Calls,
     References,
+    Extends,
+    PartialOf,
     Implements,
     InherentImpl,
     TraitImpl,
