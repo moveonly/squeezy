@@ -1,6 +1,6 @@
 # Contributing
 
-Squeezy is implemented in Rust and targets macOS first. The foundation workspace uses Rust 2024.
+Squeezy is implemented in Rust and targets macOS and Linux first. The foundation workspace uses Rust 2024.
 
 ## Setup
 
@@ -14,6 +14,13 @@ pre-commit install
 ```
 
 If you do not use Homebrew, install `pre-commit`, `gitleaks`, `actionlint`, and `cargo-deny` with your platform's package manager.
+
+On Debian/Ubuntu Linux, install the packages needed for the static musl release build:
+
+```sh
+sudo apt-get install musl-tools file binutils
+rustup target add x86_64-unknown-linux-musl
+```
 
 For coverage, install `cargo-llvm-cov`:
 
@@ -37,10 +44,38 @@ cargo llvm-cov --workspace --all-targets --summary-only
 cargo build --workspace --all-targets
 ```
 
+Build release binaries:
+
+```sh
+cargo build --release -p squeezy-cli
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+cargo build --release -p squeezy-cli --target x86_64-unknown-linux-musl
+```
+
+The musl release build is the Linux distribution artifact. `musl-gcc` is used for native C dependencies, while `rust-lld` links the final self-contained Rust artifact. Verify that the binary has no dynamic loader and no shared-library dependencies:
+
+```sh
+if readelf -l target/x86_64-unknown-linux-musl/release/squeezy | grep -q INTERP; then
+  echo "unexpected dynamic interpreter"
+  exit 1
+fi
+
+if readelf -d target/x86_64-unknown-linux-musl/release/squeezy 2>/dev/null | grep -q NEEDED; then
+  echo "unexpected shared-library dependency"
+  exit 1
+fi
+```
+
+Both checks should pass without printing an error.
+
 ## Test
 
 ```sh
 cargo test --workspace --all-targets
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
 python3 scripts/check_test_layout.py
 ```
 
@@ -59,6 +94,9 @@ Use `SQUEEZY_COSTLY_MODEL=gpt-5-mini` to test a different cheap model. The defau
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
 pre-commit run --all-files
 gitleaks detect --source . --redact --no-banner --no-color --verbose
 actionlint
@@ -69,6 +107,9 @@ cargo deny check
 
 ```sh
 cargo llvm-cov --workspace --all-targets --summary-only
+CC_x86_64_unknown_linux_musl=musl-gcc \
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
+cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only
 ```
 
 For an HTML report:
@@ -77,7 +118,7 @@ For an HTML report:
 cargo llvm-cov --workspace --all-targets --html
 ```
 
-CI runs secret scanning, workflow linting, dependency policy checks, formatting, test-layout, clippy, tests, and coverage checks on every pull request and every push to `main`. The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy. The coverage step writes its text summary to the GitHub job summary.
+CI runs secret scanning, workflow linting, dependency policy checks, formatting, test-layout, clippy, tests, coverage checks, and release binary builds on every pull request and every push to `main`. The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, coverage, and release packaging against `x86_64-unknown-linux-musl`. macOS and Linux jobs upload release-mode `squeezy` binaries as workflow artifacts. The Linux artifact is statically checked so it does not depend on glibc, then smoke-tested with `--health`, `--version`, and `--help`. The coverage step writes its text summary to the GitHub job summary.
 
 ## Run
 

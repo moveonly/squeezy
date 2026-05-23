@@ -15,7 +15,7 @@ Squeezy is a Rust-first coding agent optimized around low cost and high-signal s
 
 - Implementation language: Rust only.
 - First semantic navigation source language: Rust.
-- First supported platform: macOS.
+- First supported platforms: macOS and Linux.
 - UI: TUI.
 - Unsupported source languages fall back to ordinary bounded read/grep/list tools; do not fake graph confidence for them.
 - "Navigation tools" means tree-sitter-backed semantic graph operations such as declarations, references, hierarchy, call candidates, dependency paths, impact, and exact read slices.

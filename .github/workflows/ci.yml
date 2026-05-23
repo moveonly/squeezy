@@ -29,8 +29,20 @@ jobs:
           arguments: --all-features
 
   build-test-lint-coverage:
-    name: Build, test, lint, coverage
-    runs-on: macos-latest
+    name: Build, test, lint, coverage (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            os: macos-latest
+            artifact-name: squeezy-macos
+            binary-path: target/release/squeezy
+          - platform: linux
+            os: ubuntu-22.04
+            artifact-name: squeezy-linux-x86_64-musl
+            binary-path: target/x86_64-unknown-linux-musl/release/squeezy
 
     steps:
       - name: Checkout
@@ -47,6 +59,13 @@ jobs:
       - name: Ensure Rust components
         run: rustup component add rustfmt clippy llvm-tools-preview
 
+      - name: Install Linux release tools
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools file binutils
+          rustup target add x86_64-unknown-linux-musl
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
@@ -54,9 +73,11 @@ jobs:
         uses: taiki-e/install-action@cace7d8762492808237e791b718365fe6f57c8b2 # cargo-llvm-cov
 
       - name: Install CI tools
+        if: matrix.platform == 'macos'
         run: brew install actionlint
 
       - name: Check secrets
+        if: matrix.platform == 'macos'
         uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,6 +85,7 @@ jobs:
           GITLEAKS_ENABLE_COMMENTS: "false"
 
       - name: Check workflows
+        if: matrix.platform == 'macos'
         run: actionlint
 
       - name: Check formatting
@@ -73,19 +95,80 @@ jobs:
         run: python3 scripts/check_test_layout.py
 
       - name: Check Rust targets
+        shell: bash
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace --all-targets
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
+            cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
+          else
+            cargo clippy --workspace --all-targets -- -D warnings
+            cargo test --workspace --all-targets
+          fi
 
       - name: Coverage summary
         shell: bash
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --all-targets --summary-only | tee coverage-summary.txt
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only | tee coverage-summary.txt
+          else
+            cargo llvm-cov --workspace --all-targets --summary-only | tee coverage-summary.txt
+          fi
           {
-            echo "## Coverage Summary"
+            echo "## Coverage Summary (${{ matrix.platform }})"
             echo
             echo '```text'
             cat coverage-summary.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo build --release -p squeezy-cli --target x86_64-unknown-linux-musl
+          else
+            cargo build --release -p squeezy-cli
+          fi
+
+      - name: Verify release binary
+        shell: bash
+        run: |
+          binary="${{ matrix.binary-path }}"
+
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            file "$binary"
+            if readelf -l "$binary" | grep -q INTERP; then
+              echo "Linux release binary has a dynamic program interpreter" >&2
+              exit 1
+            fi
+
+            if readelf -d "$binary" 2>/dev/null | grep -q NEEDED; then
+              echo "Linux release binary has dynamic library dependencies" >&2
+              exit 1
+            fi
+          fi
+
+          "$binary" --health
+          "$binary" --version
+          "$binary" --help >/dev/null
+
+      - name: Package release binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.binary-path }}" "dist/${{ matrix.artifact-name }}"
+          chmod +x "dist/${{ matrix.artifact-name }}"
+
+      - name: Upload release binary
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: dist/${{ matrix.artifact-name }}
+          if-no-files-found: error

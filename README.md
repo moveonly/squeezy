@@ -37,7 +37,7 @@ The semantic graph is the primary navigation surface; bounded grep is a labeled 
 
 ## Scope
 
-Squeezy targets Rust source navigation first; Python is planned next. Initial platform is macOS. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
+Squeezy targets Rust source navigation first; Python is planned next. Initial platforms are macOS and Linux. The Linux release artifact is built for `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
 
 Squeezy explicitly does not provide:
 
