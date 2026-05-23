@@ -100,8 +100,16 @@ fn graph_uses_python_navigation_heuristics() {
         "services/greeter.py",
         r#"
 class Greeter:
+    @property
+    def label(self):
+        return "greeter"
+
     def greet(self, name):
         return name
+
+class Other:
+    def greet(self, name):
+        return "other"
 "#,
     );
     let helpers = python_record(
@@ -115,6 +123,7 @@ def build():
         "app.py",
         r#"
 from services.greeter import Greeter as GreeterAlias
+from services.greeter import Other
 import helpers
 
 router = APIRouter()
@@ -122,13 +131,18 @@ router = APIRouter()
 class Runner(GreeterAlias):
     """Routes greeting requests."""
 
-    @router.get("/hello")
+    @router.get("/hello/{name}")
     def run(self, name: GreeterAlias) -> GreeterAlias:
-        return self.greet(name)
+        return self.label
 
 def make():
     greeter = GreeterAlias()
     helpers.build()
+    return greeter.greet("Ada")
+
+def reassign():
+    greeter = GreeterAlias()
+    greeter = Other()
     return greeter.greet("Ada")
 "#,
     );
@@ -146,17 +160,36 @@ def make():
     let graph = SemanticGraph::from_parsed(parsed);
 
     let make = graph.find_symbol_by_name("make").pop().unwrap();
+    let reassign = graph.find_symbol_by_name("reassign").pop().unwrap();
     let run = graph.find_symbol_by_name("run").pop().unwrap();
-    let greet = graph.find_symbol_by_name("greet").pop().unwrap();
-    let build = graph.find_symbol_by_name("build").pop().unwrap();
     let greeter_class = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    let other_class = graph.find_symbol_by_name("Other").pop().unwrap();
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&greeter_class.id))
+        .unwrap();
+    let other_greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&other_class.id))
+        .unwrap();
+    let label = graph.find_symbol_by_name("label").pop().unwrap();
+    let build = graph.find_symbol_by_name("build").pop().unwrap();
 
     assert!(
-        run.attributes.contains(&"route:GET".to_string())
+        run.attributes
+            .contains(&"route:GET /hello/{name}".to_string())
             && run.attributes.contains(&"framework:web-route".to_string())
     );
-    assert!(graph.call_chain(&run.id, &greet.id, 2).is_some());
+    assert!(
+        graph
+            .references_to_symbol(&label.id)
+            .iter()
+            .any(|hit| hit.reference.text == "self.label")
+    );
     assert!(graph.call_chain(&make.id, &greet.id, 2).is_some());
+    assert!(graph.call_chain(&reassign.id, &other_greet.id, 2).is_some());
     assert!(graph.call_chain(&make.id, &build.id, 2).is_some());
     assert!(graph.call_chain(&make.id, &greeter_class.id, 2).is_some());
     assert!(

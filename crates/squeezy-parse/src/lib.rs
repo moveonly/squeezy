@@ -707,10 +707,8 @@ fn visit_python_node(
 
     if kind == "call" {
         extract_python_call(node, ctx, owner_symbol.clone());
-    } else if matches!(
-        kind,
-        "assignment" | "assignment_statement" | "expression_statement"
-    ) {
+    } else if matches!(kind, "assignment" | "assignment_statement") {
+        extract_python_field_symbol(node, ctx, parent_symbol.as_ref());
         extract_python_assignment(node, ctx, owner_symbol.clone());
     } else if kind == "identifier" {
         extract_python_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
@@ -895,6 +893,9 @@ fn python_symbol_from_node(
     let docs = python_docs_for_node(node, ctx.source);
     attributes.sort();
     attributes.dedup();
+    attributes.extend(python_test_attributes(&ctx.file.relative_path, kind, &name));
+    attributes.sort();
+    attributes.dedup();
 
     Some(ParsedSymbol {
         id,
@@ -1011,7 +1012,11 @@ fn python_semantic_attributes(attribute: &str) -> Vec<String> {
                 })
                 .unwrap_or(false)
             {
-                attributes.push(format!("route:{}", leaf.to_ascii_uppercase()));
+                let method = leaf.to_ascii_uppercase();
+                attributes.push(format!("route:{method}"));
+                if let Some(path) = first_python_string_literal(attribute) {
+                    attributes.push(format!("route:{method} {path}"));
+                }
                 attributes.push("framework:web-route".to_string());
             }
         }
@@ -1024,6 +1029,50 @@ fn python_semantic_attributes(attribute: &str) -> Vec<String> {
         attributes.push("framework:flask".to_string());
     }
     attributes
+}
+
+fn python_test_attributes(relative_path: &str, kind: SymbolKind, name: &str) -> Vec<String> {
+    let file_name = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    let is_test_file = file_name.starts_with("test_") || file_name.ends_with("_test.py");
+    match kind {
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+            if is_test_file || name.starts_with("test_") =>
+        {
+            vec!["python:test".to_string(), "pytest:test".to_string()]
+        }
+        SymbolKind::Class if is_test_file || name.starts_with("Test") => {
+            vec![
+                "python:test-class".to_string(),
+                "pytest:test-class".to_string(),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn first_python_string_literal(text: &str) -> Option<String> {
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        let quote = match ch {
+            '\'' | '"' => ch,
+            _ => continue,
+        };
+        let mut value = String::new();
+        let mut escaped = false;
+        for ch in chars.by_ref() {
+            if escaped {
+                value.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                return Some(value);
+            } else {
+                value.push(ch);
+            }
+        }
+    }
+    None
 }
 
 fn python_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
@@ -1368,7 +1417,7 @@ fn extract_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option
 fn extract_python_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
     let raw = node_text(node, ctx.source).unwrap_or_default().trim();
     let imports = if let Some(rest) = raw.strip_prefix("from ") {
-        python_from_imports(rest)
+        python_from_imports(rest, &ctx.file.relative_path)
     } else if let Some(rest) = raw.strip_prefix("import ") {
         python_plain_imports(rest)
     } else {
@@ -1402,11 +1451,11 @@ fn python_plain_imports(rest: &str) -> Vec<(String, Option<String>, bool)> {
         .collect()
 }
 
-fn python_from_imports(rest: &str) -> Vec<(String, Option<String>, bool)> {
+fn python_from_imports(rest: &str, relative_path: &str) -> Vec<(String, Option<String>, bool)> {
     let Some((module, names)) = rest.split_once(" import ") else {
         return Vec::new();
     };
-    let module = module.trim();
+    let module = normalize_python_import_module(module.trim(), relative_path);
     names
         .split(',')
         .filter_map(|part| {
@@ -1430,6 +1479,145 @@ fn split_python_alias(text: &str) -> (&str, Option<&str>) {
     text.split_once(" as ")
         .map(|(path, alias)| (path.trim(), Some(alias.trim())))
         .unwrap_or_else(|| (text.trim(), None))
+}
+
+fn normalize_python_import_module(module: &str, relative_path: &str) -> String {
+    let leading_dots = module.chars().take_while(|ch| *ch == '.').count();
+    if leading_dots == 0 {
+        return module.to_string();
+    }
+
+    let suffix = module.trim_start_matches('.');
+    let mut package = python_module_path_for_relative_file(relative_path);
+    if !relative_path.ends_with("__init__.py") {
+        package.pop();
+    }
+    for _ in 1..leading_dots {
+        package.pop();
+    }
+    if !suffix.is_empty() {
+        package.extend(suffix.split('.').filter(|segment| !segment.is_empty()));
+    }
+    package.join(".")
+}
+
+fn python_module_path_for_relative_file(relative_path: &str) -> Vec<&str> {
+    relative_path
+        .trim_end_matches(".py")
+        .trim_end_matches("/__init__")
+        .trim_start_matches("src/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "__init__")
+        .collect()
+}
+
+fn extract_python_field_symbol(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) {
+    let Some((parent_id, SymbolKind::Class)) = parent_symbol else {
+        return;
+    };
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some((left, right)) = split_python_assignment_like(raw) else {
+        return;
+    };
+    let Some(name) = python_field_name_from_left(left) else {
+        return;
+    };
+    let span = span_from_node(node);
+    let mut attributes = vec!["python:field".to_string()];
+    if let Some(annotation) = left
+        .split_once(':')
+        .and_then(|(_, annotation)| python_field_type_name(annotation))
+    {
+        attributes.push(format!("type:{annotation}"));
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(parent_id.clone()),
+            text: annotation,
+            kind: ReferenceKind::Type,
+            span,
+            provenance: Provenance::new("tree-sitter-python", "field annotation reference"),
+        });
+    }
+    attributes.extend(python_field_attributes(right));
+    attributes.sort();
+    attributes.dedup();
+
+    ctx.symbols.push(ParsedSymbol {
+        id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent_id.clone()),
+        name,
+        kind: SymbolKind::Field,
+        span,
+        body_span: None,
+        signature: raw.trim().to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-python", "class field assignment"),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+    });
+}
+
+fn python_field_type_name(annotation: &str) -> Option<String> {
+    let text = annotation
+        .split('=')
+        .next()
+        .unwrap_or(annotation)
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '[' | ']' | '(' | ')' | '{' | '}' | ':' | ',' | ' '
+            )
+        });
+    if text.is_empty() {
+        None
+    } else {
+        Some(last_path_segment(text))
+    }
+}
+
+fn split_python_assignment_like(text: &str) -> Option<(&str, &str)> {
+    if let Some((left, right)) = text.split_once('=') {
+        return Some((left.trim(), right.trim()));
+    }
+    if let Some((left, annotation)) = text.split_once(':') {
+        return Some((left.trim(), annotation.trim()));
+    }
+    None
+}
+
+fn python_field_name_from_left(left: &str) -> Option<String> {
+    let name = left
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(left)
+        .trim();
+    python_simple_assignment_name(name)
+}
+
+fn python_field_attributes(right: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let callee = python_assignment_target(right).unwrap_or_else(|| right.trim().to_string());
+    let lowered = callee.to_ascii_lowercase();
+    if lowered.contains("column") || lowered.contains("mapped_column") {
+        attributes.push("sqlalchemy:field".to_string());
+    }
+    if callee.contains("models.") && callee.contains("Field") {
+        attributes.push("django:field".to_string());
+    }
+    if lowered.contains("field") {
+        attributes.push("python:field-factory".to_string());
+        attributes.push("dataclass:field".to_string());
+        attributes.push("pydantic:field".to_string());
+    }
+    attributes
 }
 
 fn extract_python_assignment(

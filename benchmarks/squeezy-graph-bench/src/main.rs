@@ -27,6 +27,7 @@ struct QuerySpec {
     text: String,
     symbol_kind: Option<String>,
     owner_kind: Option<String>,
+    attribute: Option<String>,
     from: Option<String>,
     to: Option<String>,
     expected_contains: Vec<String>,
@@ -346,7 +347,7 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
                     .map(parse_symbol_kind)
                     .transpose()?,
                 visibility: None,
-                attribute: None,
+                attribute: query.attribute.clone(),
             })
             .into_iter()
             .map(|symbol| format!("{:?}:{}", symbol.kind, symbol.name))
@@ -378,6 +379,19 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
             .into_iter()
             .map(|hit| hit.reference.text)
             .collect(),
+        "references_to_symbol" => {
+            let to = required(&query.to, "to")?;
+            let symbol = graph
+                .find_symbol_by_name(to)
+                .into_iter()
+                .next()
+                .ok_or_else(|| SqueezyError::Graph(format!("missing symbol {to}")))?;
+            graph
+                .references_to_symbol(&symbol.id)
+                .into_iter()
+                .map(|hit| hit.reference.text)
+                .collect()
+        }
         "call_chain" => {
             let from = required(&query.from, "from")?;
             let to = required(&query.to, "to")?;

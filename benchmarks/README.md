@@ -120,7 +120,10 @@ model dynamic attributes, metaclasses, import side effects, or runtime dispatch.
 Files that CPython `ast` cannot parse are reported as `oracle_unparseable` and
 excluded from Squeezy false-positive accounting so whole-repo fixture corpora do
 not turn tree-sitter recovery from broken or future-syntax files into false
-parser defects.
+parser defects. The Python smoke spec also includes controlled navigation
+queries for route attributes, property references, and constructor-alias method
+calls; these are fixture oracles for syntax-only navigation behavior rather than
+runtime framework checks.
 
 ## Local Results
 

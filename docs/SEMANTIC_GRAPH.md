@@ -11,8 +11,8 @@ navigation questions before the model reads raw files.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
-  docstrings, class bases, type annotations, exports, aliases, and references
-  from `.py` files.
+  docstrings, class bases, type annotations, class fields, exports, aliases, and
+  references from `.py` files.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -62,21 +62,31 @@ decision instead of walking a likely non-code or dangerous directory.
   later compiler-as-fact epic.
 - Python constructor calls resolve to local class declarations when the class is
   same-file or imported unambiguously. `import x as y`, `from x import y as z`,
-  relative-looking import strings, package `__init__.py` reexports, `__all__`,
-  and simple assignments such as `Alias = Real` or `obj = ClassName()` feed the
-  same import/alias resolver.
+  leading-dot relative imports, package `__init__.py` reexports, `__all__`, and
+  simple assignments such as `Alias = Real` or `obj = ClassName()` feed the same
+  import/alias resolver. Alias facts are scoped to their owning symbol and
+  receiver aliases use the latest assignment before the call site.
 - Python method calls use confidence-ranked heuristics: same class first,
   inherited local classes next, constructor-derived receiver aliases after that,
   and imported module-qualified functions such as `helpers.build()` when the
-  target file path matches the imported module.
+  target file path matches the imported module. Call edges include a `rank=...`
+  provenance reason such as `same file`, `explicit import`, `inherited class`,
+  `constructor alias`, `imported module`, or `package local`.
 - Python class bases and function annotations are indexed as type references.
   Annotation facts are soft evidence only; no mypy-style type solving, generic
   constraint solving, or runtime import execution is attempted.
 - Python decorators are kept as raw attributes and tagged for common semantics:
   `@property`, `@staticmethod`, `@classmethod`, dataclasses, pytest fixtures,
-  FastAPI/Flask-style route decorators, and common Pydantic validators. Docstring
-  text is stored on the owning symbol so behavior-word searches do not have to
-  read raw files first.
+  FastAPI/Flask-style route decorators with method/path metadata, and common
+  Pydantic validators. Property attribute reads such as `self.name` can bind to
+  local `@property def name(...)` methods.
+- Python class-level annotated assignments and field factories are indexed as
+  fields. This covers dataclass/Pydantic-style fields, SQLAlchemy
+  `Column(...)`/`mapped_column(...)`, and Django `models.*Field(...)` syntax
+  without importing those frameworks.
+- Python test functions/classes are tagged from `test_*`, `*_test.py`, pytest
+  fixtures, and `Test*` class naming. Docstring text is stored on the owning
+  symbol so behavior-word searches do not have to read raw files first.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
 
@@ -163,7 +173,10 @@ for class/function/method declaration discovery. It is benchmark-only and does
 not become a production dependency. Python files that CPython `ast` cannot parse
 are reported as `oracle_unparseable` and excluded from Squeezy false-positive
 accounting, because tree-sitter recovery is useful while editing broken or
-future-syntax code even when the oracle cannot treat that file as a module.
+future-syntax code even when the oracle cannot treat that file as a module. The
+Python smoke benchmark also carries controlled navigation checks for route
+metadata, constructor-alias method calls, and property references so navigation
+heuristics are regression-tested separately from declaration accuracy.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated

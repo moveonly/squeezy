@@ -77,6 +77,7 @@ fn helper() {}
 fn parser_extracts_python_symbols_imports_calls_and_references() {
     let source = r#"
 from services.greeter import Greeter as GreeterAlias
+from .models import User
 import helpers
 
 __all__ = ["Runner"]
@@ -84,9 +85,14 @@ __all__ = ["Runner"]
 class Runner(GreeterAlias):
     """Runs greetings."""
 
+    id: int
+    name: str = Field(default="")
+    db_name = Column(String)
+    django_name = models.CharField(max_length=255)
+
     @decorator
-    @router.get("/hello")
-    def run(self, name: GreeterAlias) -> GreeterAlias:
+    @router.get("/hello/{name}")
+    def run(self, name: GreeterAlias, user: User) -> GreeterAlias:
         helper = helpers.build(name)
         return self.greet(helper)
 
@@ -95,9 +101,12 @@ RunnerAlias = Runner
 def make_runner():
     runner = RunnerAlias()
     return runner.run("Ada")
+
+def test_runner():
+    assert make_runner()
 "#;
     let mut parser = RustParser::new().unwrap();
-    let record = python_record("src/app.py", source);
+    let record = python_record("src/package/app.py", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
     assert!(parsed.unsupported.is_none());
@@ -108,7 +117,9 @@ def make_runner():
     assert!(parsed.symbols.iter().any(|symbol| {
         symbol.name == "run"
             && symbol.kind == SymbolKind::Method
-            && symbol.attributes.contains(&"route:GET".to_string())
+            && symbol
+                .attributes
+                .contains(&"route:GET /hello/{name}".to_string())
             && symbol
                 .attributes
                 .contains(&"framework:web-route".to_string())
@@ -121,10 +132,38 @@ def make_runner():
     );
     assert!(
         parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "test_runner"
+                && symbol.attributes.contains(&"pytest:test".to_string()))
+    );
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "name"
+        && symbol.kind == SymbolKind::Field
+        && symbol.attributes.contains(&"type:str".to_string())
+        && symbol.attributes.contains(&"pydantic:field".to_string())));
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "db_name"
+        && symbol.kind == SymbolKind::Field
+        && symbol.attributes.contains(&"sqlalchemy:field".to_string())));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "django_name"
+                && symbol.kind == SymbolKind::Field
+                && symbol.attributes.contains(&"django:field".to_string()))
+    );
+    assert!(
+        parsed
             .imports
             .iter()
             .any(|import| import.path == "services.greeter.Greeter"
                 && import.alias.as_deref() == Some("GreeterAlias"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "package.models.User")
     );
     assert!(
         parsed
