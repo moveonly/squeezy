@@ -129,6 +129,8 @@ async fn plan_mode_advertises_only_read_only_tools() {
     assert_eq!(
         tool_names,
         vec![
+            "checkpoint_list",
+            "checkpoint_show",
             "diff_context",
             "glob",
             "grep",

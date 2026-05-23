@@ -16,6 +16,7 @@ use ratatui::{
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError, TranscriptItem};
 use squeezy_llm::LlmProvider;
+use squeezy_tools::ToolCall;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -183,6 +184,9 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
                 return Ok(false);
             }
             app.input.clear();
+            if handle_slash_command(app, agent, &input).await {
+                return Ok(false);
+            }
             let cancel = CancellationToken::new();
             app.turn_rx = Some(agent.start_turn(input, cancel.clone()));
             app.cancel = Some(cancel);
@@ -201,6 +205,92 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         }
         _ => Ok(false),
     }
+}
+
+async fn handle_slash_command(app: &mut TuiApp, agent: &Agent, input: &str) -> bool {
+    let mut parts = input.split_whitespace();
+    let Some(command) = parts.next() else {
+        return false;
+    };
+    let (name, arguments) = match command {
+        "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
+        "/undo" => ("checkpoint_undo", serde_json::json!({})),
+        "/checkpoint" => {
+            let Some(checkpoint_id) = parts.next() else {
+                app.status = "usage: /checkpoint <checkpoint_id>".to_string();
+                return true;
+            };
+            (
+                "checkpoint_show",
+                serde_json::json!({ "checkpoint_id": checkpoint_id }),
+            )
+        }
+        "/revert-turn" => {
+            let Some(group_id) = parts.next() else {
+                app.status = "usage: /revert-turn <turn_id>".to_string();
+                return true;
+            };
+            (
+                "checkpoint_revert",
+                serde_json::json!({ "group_id": group_id }),
+            )
+        }
+        _ => return false,
+    };
+    let result = agent
+        .execute_local_tool(ToolCall {
+            call_id: format!("tui-{name}"),
+            name: name.to_string(),
+            arguments,
+        })
+        .await;
+    app.status = format!(
+        "{}: {:?} {}",
+        name,
+        result.status,
+        summarize_local_tool_result(&result.content)
+    );
+    true
+}
+
+fn summarize_local_tool_result(content: &serde_json::Value) -> String {
+    if let Some(array) = content
+        .get("checkpoints")
+        .and_then(|value| value.as_array())
+    {
+        return format!("{} checkpoints", array.len());
+    }
+    if let Some(checkpoint) = content.get("checkpoint") {
+        let id = checkpoint
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
+        let files = checkpoint
+            .get("files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        let skipped = checkpoint
+            .get("skipped_files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        return format!("checkpoint={id} files={files} skipped={skipped}");
+    }
+    if let Some(rollback) = content.get("rollback") {
+        let restored = rollback
+            .get("restored_files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        let deleted = rollback
+            .get("deleted_files")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        let conflicts = rollback
+            .get("conflicts")
+            .and_then(|value| value.as_array())
+            .map_or(0, |items| items.len());
+        return format!("restored={restored} deleted={deleted} conflicts={conflicts}");
+    }
+    String::new()
 }
 
 fn mode_command(input: &str) -> Option<SessionMode> {
@@ -453,7 +543,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn format_status_tokens(app: &TuiApp) -> String {
     format!(
-        "provider={} model={} mode={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | Shift-Tab mode | /plan /build | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} mode={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | Shift-Tab mode | /plan /build | /undo /checkpoint /checkpoints /revert-turn | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.mode.as_str(),

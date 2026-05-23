@@ -23,6 +23,8 @@ node_modules/
 
 # Squeezy local runtime state
 /.squeezy/
+# Test-generated checkpoint/audit state under any subdirectory.
+**/.squeezy/
 
 # Coverage reports
 /target/llvm-cov/

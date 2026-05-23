@@ -39,11 +39,11 @@ The semantic graph is the primary navigation surface; bounded grep is a labeled 
 - Every claim carries **provenance**: spans, hashes, parser/query origin, freshness.
 - **Framework adapters** (planned) expose routes and system functions as graph nodes when a framework is detected.
 - The **current branch diff** is first-class context: "what did I just change and what does it affect" is one query, not a search.
-- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence.
+- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence. The current language coverage matrix lives in [`docs/LANGUAGES.md`](docs/LANGUAGES.md).
 
 ## Scope
 
-Squeezy targets Rust source navigation first, with Python and C/C++ semantic graph support in progress. Initial platforms are macOS and Linux. The Linux release artifact is built for `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
+Squeezy targets local semantic navigation across Rust, Python, Java, C#/.NET, Go, C/C++, and JavaScript/TypeScript. Initial platforms are macOS and Linux. The Linux release artifact is built for `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
 
 Squeezy explicitly does not provide:
 

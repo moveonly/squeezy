@@ -602,25 +602,10 @@ fn keep_entry(
 }
 
 pub fn classify_language(path: &Path) -> LanguageKind {
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some("c") => LanguageKind::C,
-        Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => LanguageKind::Cpp,
-        // `.h` could in principle be C; we follow main's convention of binding
-        // it to Cpp since the C/C++ extractor handles both grammars and the
-        // header naming is conventionally C++-leaning in modern code.
-        Some("h") => LanguageKind::Cpp,
-        Some("cs") | Some("csx") => LanguageKind::CSharp,
-        Some("cjs" | "js" | "mjs") => LanguageKind::JavaScript,
-        Some("cts" | "mts" | "ts") => LanguageKind::TypeScript,
-        Some("go") => LanguageKind::Go,
-        Some("java") => LanguageKind::Java,
-        Some("jsx") => LanguageKind::Jsx,
-        Some("py") => LanguageKind::Python,
-        Some("rs") => LanguageKind::Rust,
-        Some("tsx") => LanguageKind::Tsx,
-        Some(_) => LanguageKind::Unsupported,
-        None => LanguageKind::Unknown,
-    }
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return LanguageKind::Unknown;
+    };
+    LanguageKind::from_extension(&extension.to_ascii_lowercase())
 }
 
 fn refine_c_family_header_languages(files: &mut [FileRecord]) {
@@ -988,21 +973,25 @@ fn should_scan_source_dir(path: &Path) -> bool {
 
 fn code_extension_signal(path: &Path) -> Option<String> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let language = match extension.as_str() {
-        "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => "C/C++",
-        "cs" | "csx" => "C#",
-        "css" | "html" | "scss" | "vue" | "svelte" => "web",
-        "go" => "Go",
-        "java" => "Java",
-        "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
-        "kt" | "kts" => "Kotlin",
-        "php" => "PHP",
-        "rb" => "Ruby",
-        "scala" | "sc" => "Scala",
-        "sh" | "bash" | "zsh" => "shell",
-        "swift" => "Swift",
-        "ts" | "tsx" | "mts" | "cts" => "TypeScript",
-        _ => return None,
+    let language = match LanguageKind::from_extension(&extension) {
+        LanguageKind::Unsupported => match extension.as_str() {
+            "css" | "html" | "scss" | "vue" | "svelte" => "web",
+            "kt" | "kts" => "Kotlin",
+            "php" => "PHP",
+            "rb" => "Ruby",
+            "scala" | "sc" => "Scala",
+            "sh" | "bash" | "zsh" => "shell",
+            "swift" => "Swift",
+            _ => return None,
+        },
+        kind => kind
+            .family()
+            .map(|family| match family {
+                squeezy_core::LanguageFamily::CFamily => "C/C++",
+                squeezy_core::LanguageFamily::JsTs => kind.display_name(),
+                _ => kind.display_name(),
+            })
+            .unwrap_or_else(|| kind.display_name()),
     };
     Some(format!("shallow {language} source"))
 }

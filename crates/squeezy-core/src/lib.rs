@@ -3884,6 +3884,135 @@ pub enum LanguageKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LanguageFamily {
+    Rust,
+    Python,
+    Java,
+    CSharp,
+    Go,
+    CFamily,
+    JsTs,
+}
+
+impl LanguageFamily {
+    pub const ALL: [Self; 7] = [
+        Self::Rust,
+        Self::Python,
+        Self::Java,
+        Self::CSharp,
+        Self::Go,
+        Self::CFamily,
+        Self::JsTs,
+    ];
+
+    pub const fn all() -> &'static [Self] {
+        &Self::ALL
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::Java => "java",
+            Self::CSharp => "csharp",
+            Self::Go => "go",
+            Self::CFamily => "c-family",
+            Self::JsTs => "js-ts",
+        }
+    }
+
+    pub const fn of(kind: LanguageKind) -> Option<Self> {
+        match kind {
+            LanguageKind::Rust => Some(Self::Rust),
+            LanguageKind::Python => Some(Self::Python),
+            LanguageKind::Java => Some(Self::Java),
+            LanguageKind::CSharp => Some(Self::CSharp),
+            LanguageKind::Go => Some(Self::Go),
+            LanguageKind::C | LanguageKind::Cpp => Some(Self::CFamily),
+            LanguageKind::JavaScript
+            | LanguageKind::Jsx
+            | LanguageKind::TypeScript
+            | LanguageKind::Tsx => Some(Self::JsTs),
+            LanguageKind::Unsupported | LanguageKind::Unknown => None,
+        }
+    }
+
+    pub const fn kinds(self) -> &'static [LanguageKind] {
+        match self {
+            Self::Rust => &[LanguageKind::Rust],
+            Self::Python => &[LanguageKind::Python],
+            Self::Java => &[LanguageKind::Java],
+            Self::CSharp => &[LanguageKind::CSharp],
+            Self::Go => &[LanguageKind::Go],
+            Self::CFamily => &[LanguageKind::C, LanguageKind::Cpp],
+            Self::JsTs => &[
+                LanguageKind::JavaScript,
+                LanguageKind::Jsx,
+                LanguageKind::TypeScript,
+                LanguageKind::Tsx,
+            ],
+        }
+    }
+
+    pub const fn file_extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Rust => &["rs"],
+            Self::Python => &["py"],
+            Self::Java => &["java"],
+            Self::CSharp => &["cs", "csx"],
+            Self::Go => &["go"],
+            Self::CFamily => &["c", "h", "cc", "cpp", "cxx", "hh", "hpp", "hxx"],
+            Self::JsTs => &["cjs", "cts", "js", "jsx", "mjs", "mts", "ts", "tsx"],
+        }
+    }
+}
+
+impl LanguageKind {
+    pub const fn family(self) -> Option<LanguageFamily> {
+        LanguageFamily::of(self)
+    }
+
+    pub const fn from_extension(extension: &str) -> Self {
+        match extension.as_bytes() {
+            b"c" => Self::C,
+            b"cc" | b"cpp" | b"cxx" | b"hh" | b"hpp" | b"hxx" => Self::Cpp,
+            b"h" => Self::Cpp,
+            b"cs" | b"csx" => Self::CSharp,
+            b"cjs" | b"js" | b"mjs" => Self::JavaScript,
+            b"cts" | b"mts" | b"ts" => Self::TypeScript,
+            b"go" => Self::Go,
+            b"java" => Self::Java,
+            b"jsx" => Self::Jsx,
+            b"py" => Self::Python,
+            b"rs" => Self::Rust,
+            b"tsx" => Self::Tsx,
+            _ => Self::Unsupported,
+        }
+    }
+
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::C => "C",
+            Self::CSharp => "C#",
+            Self::Cpp => "C++",
+            Self::Go => "Go",
+            Self::Java => "Java",
+            Self::JavaScript => "JavaScript",
+            Self::Jsx => "JSX",
+            Self::Python => "Python",
+            Self::Rust => "Rust",
+            Self::TypeScript => "TypeScript",
+            Self::Tsx => "TSX",
+            Self::Unsupported => "unsupported",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct OracleId(pub String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
     Crate,
