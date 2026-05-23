@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
-use squeezy_core::{AppConfig, Result, Role, SqueezyError, TranscriptItem};
+use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError, TranscriptItem};
 use squeezy_llm::LlmProvider;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +26,7 @@ pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()
         agent.provider_name(),
         config.model.clone(),
         config.config_source_labels().join(","),
+        agent.session_mode(),
     );
 
     loop {
@@ -144,6 +145,21 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         return Ok(true);
     }
 
+    if key.code == KeyCode::BackTab {
+        switch_mode(app, agent, None, "tui_shift_tab");
+        return Ok(false);
+    }
+
+    if key.code == KeyCode::Enter
+        && let Some(mode) = mode_command(app.input.trim())
+    {
+        switch_mode(app, agent, Some(mode), "tui_command");
+        if app.turn_rx.is_none() && app.pending_approval.is_none() {
+            app.input.clear();
+        }
+        return Ok(false);
+    }
+
     if handle_approval_key(app, key) {
         return Ok(false);
     }
@@ -179,6 +195,38 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         }
         _ => Ok(false),
     }
+}
+
+fn mode_command(input: &str) -> Option<SessionMode> {
+    match input {
+        "/plan" => Some(SessionMode::Plan),
+        "/build" => Some(SessionMode::Build),
+        _ => None,
+    }
+}
+
+fn switch_mode(
+    app: &mut TuiApp,
+    agent: &Agent,
+    requested: Option<SessionMode>,
+    source: &'static str,
+) {
+    if app.turn_rx.is_some() || app.pending_approval.is_some() {
+        app.status = "mode switch unavailable during active turn".to_string();
+        return;
+    }
+
+    let target = requested.unwrap_or_else(|| match app.mode {
+        SessionMode::Plan => SessionMode::Build,
+        SessionMode::Build => SessionMode::Plan,
+    });
+    if target == app.mode {
+        app.status = format!("already in {} mode", app.mode.as_str());
+        return;
+    }
+    agent.set_session_mode(target, source);
+    app.mode = target;
+    app.status = format!("mode switched to {}", app.mode.as_str());
 }
 
 fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -307,10 +355,15 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let tokens = format!(
-        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
+    frame.render_widget(Paragraph::new(format_status_tokens(app)), area);
+}
+
+fn format_status_tokens(app: &TuiApp) -> String {
+    format!(
+        "provider={} model={} mode={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | Shift-Tab mode | /plan /build | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
+        app.mode.as_str(),
         app.config_sources,
         app.status,
         app.metrics.tool_calls,
@@ -336,13 +389,13 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 "${:.6}",
                 value as f64 / 1_000_000.0
             )),
-    );
-    frame.render_widget(Paragraph::new(tokens), area);
+    )
 }
 
 struct TuiApp {
     provider_name: &'static str,
     model: String,
+    mode: SessionMode,
     config_sources: String,
     input: String,
     transcript: Vec<TranscriptItem>,
@@ -356,10 +409,16 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(provider_name: &'static str, model: String, config_sources: String) -> Self {
+    fn new(
+        provider_name: &'static str,
+        model: String,
+        config_sources: String,
+        mode: SessionMode,
+    ) -> Self {
         Self {
             provider_name,
             model,
+            mode,
             config_sources,
             input: String::new(),
             transcript: Vec::new(),

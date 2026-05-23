@@ -14,8 +14,8 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability,
     PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict,
-    Redactor, SessionMetrics, SqueezyError, StreamRedactor, TranscriptItem, TurnId, TurnMetrics,
-    default_settings_path, escape_toml_basic_string,
+    Redactor, SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TranscriptItem, TurnId,
+    TurnMetrics, default_settings_path, escape_toml_basic_string,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -46,6 +46,7 @@ pub struct Agent {
     /// vector also makes the rule take effect immediately for subsequent
     /// tool calls without having to wait for a settings reload.
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    session_mode: Arc<RwLock<SessionMode>>,
 }
 
 impl Agent {
@@ -92,6 +93,7 @@ impl Agent {
             )
             .expect("current directory must be a valid tool root")
         });
+        let initial_session_mode = config.session_mode;
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
@@ -102,6 +104,7 @@ impl Agent {
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
+            session_mode: Arc::new(RwLock::new(initial_session_mode)),
         }
     }
 
@@ -117,6 +120,43 @@ impl Agent {
 
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
+    }
+
+    pub fn session_mode(&self) -> SessionMode {
+        self.session_mode
+            .read()
+            .map(|guard| *guard)
+            .unwrap_or(self.config.session_mode)
+    }
+
+    pub fn set_session_mode(&self, mode: SessionMode, source: &'static str) -> bool {
+        let mut guard = match self.session_mode.write() {
+            Ok(guard) => guard,
+            Err(err) => {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    error = %err,
+                    "session mode lock was poisoned; mode unchanged",
+                );
+                return false;
+            }
+        };
+        let previous = *guard;
+        if previous == mode {
+            return false;
+        }
+        *guard = mode;
+        log_session_mode_transition(previous, mode, source);
+        true
+    }
+
+    pub fn toggle_session_mode(&self, source: &'static str) -> SessionMode {
+        let next = match self.session_mode() {
+            SessionMode::Plan => SessionMode::Build,
+            SessionMode::Build => SessionMode::Plan,
+        };
+        self.set_session_mode(next, source);
+        next
     }
 
     pub async fn flush_telemetry(&self) {
@@ -143,6 +183,7 @@ impl Agent {
         let turn_id = TurnId::new(self.next_turn_id.fetch_add(1, Ordering::Relaxed));
         let approval_ids = self.next_approval_id.clone();
         let session_rules = self.session_rules.clone();
+        let session_mode = self.session_mode.clone();
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
@@ -171,6 +212,7 @@ impl Agent {
                 approval_ids,
                 seed_redactions: redacted_input.redactions,
                 session_rules,
+                session_mode,
             }
             .run(redacted_input.text)
             .await;
@@ -203,6 +245,7 @@ struct TurnRuntime {
     // session metric never undercounts user-side scrubbing.
     seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    session_mode: Arc<RwLock<SessionMode>>,
 }
 
 impl TurnRuntime {
@@ -378,6 +421,7 @@ impl TurnRuntime {
                     cancel: self.cancel.clone(),
                     approval_ids: self.approval_ids.clone(),
                     session_rules: self.session_rules.clone(),
+                    session_mode: self.session_mode.clone(),
                 },
                 &mut broker,
             )
@@ -465,6 +509,7 @@ struct ToolExecutionContext<'a> {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    session_mode: Arc<RwLock<SessionMode>>,
 }
 
 async fn execute_tool_calls(
@@ -890,6 +935,11 @@ async fn permission_decision(
     context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
     let request = context.tools.permission_request(call);
+    let active_mode = snapshot_session_mode(&context.session_mode, context.config.session_mode);
+    if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
+        log_permission_verdict(&request, &verdict);
+        return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
+    }
     let session_rules = snapshot_session_rules(&context.session_rules);
     let mut verdict = context
         .config
@@ -1018,6 +1068,50 @@ async fn permission_decision(
     }
 }
 
+fn snapshot_session_mode(
+    session_mode: &Arc<RwLock<SessionMode>>,
+    fallback: SessionMode,
+) -> SessionMode {
+    session_mode
+        .read()
+        .map(|guard| *guard)
+        .unwrap_or_else(|err| {
+            tracing::warn!(
+                target: "squeezy::permissions",
+                error = %err,
+                "session mode lock was poisoned; falling back to configured mode",
+            );
+            fallback
+        })
+}
+
+pub(crate) fn mode_permission_verdict(
+    mode: SessionMode,
+    request: &PermissionRequest,
+) -> Option<PermissionVerdict> {
+    if mode != SessionMode::Plan || !plan_mode_refuses(request.capability) {
+        return None;
+    }
+    Some(PermissionVerdict {
+        action: PermissionAction::Deny,
+        matched_rule: None,
+        reason: format!("plan mode refuses {}", request.capability.as_str()),
+    })
+}
+
+fn plan_mode_refuses(capability: PermissionCapability) -> bool {
+    matches!(
+        capability,
+        PermissionCapability::Edit
+            | PermissionCapability::Shell
+            | PermissionCapability::Git
+            | PermissionCapability::Network
+            | PermissionCapability::Mcp
+            | PermissionCapability::Compiler
+            | PermissionCapability::Destructive
+    )
+}
+
 fn snapshot_session_rules(session_rules: &Arc<RwLock<Vec<PermissionRule>>>) -> Vec<PermissionRule> {
     session_rules
         .read()
@@ -1030,6 +1124,16 @@ fn snapshot_session_rules(session_rules: &Arc<RwLock<Vec<PermissionRule>>>) -> V
             );
             Vec::new()
         })
+}
+
+fn log_session_mode_transition(from_mode: SessionMode, to_mode: SessionMode, source: &'static str) {
+    tracing::info!(
+        target: "squeezy::permissions",
+        from_mode = %from_mode.as_str(),
+        to_mode = %to_mode.as_str(),
+        source,
+        "session mode transition",
+    );
 }
 
 fn log_permission_verdict(request: &PermissionRequest, verdict: &PermissionVerdict) {

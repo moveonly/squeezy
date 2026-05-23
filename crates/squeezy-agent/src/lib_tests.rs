@@ -12,7 +12,7 @@ use futures_util::stream;
 use serde_json::json;
 use squeezy_core::{
     AppConfig, PermissionAction, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SkillsConfig,
+    PermissionRequest, PermissionRisk, PermissionRuleSource, Result, SessionMode, SkillsConfig,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_tools::{ToolStatus, sha256_hex};
@@ -628,6 +628,74 @@ fn classifier_verdict_does_not_match_action_inside_reason_text() {
 }
 
 #[test]
+fn plan_mode_denies_mutating_capabilities_before_policy() {
+    for capability in [
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+        PermissionCapability::Compiler,
+        PermissionCapability::Destructive,
+    ] {
+        let request = permission_request_for_capability(capability);
+        let verdict = mode_permission_verdict(SessionMode::Plan, &request)
+            .expect("plan mode should deny mutating capability");
+        assert_eq!(verdict.action, PermissionAction::Deny);
+        assert_eq!(verdict.matched_rule, None);
+        assert_eq!(
+            verdict.reason,
+            format!("plan mode refuses {}", capability.as_str())
+        );
+    }
+}
+
+#[test]
+fn plan_mode_keeps_read_and_search_on_normal_policy_path() {
+    for capability in [PermissionCapability::Read, PermissionCapability::Search] {
+        let request = permission_request_for_capability(capability);
+        assert_eq!(mode_permission_verdict(SessionMode::Plan, &request), None);
+        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+    }
+}
+
+#[test]
+fn build_mode_never_adds_mode_denials() {
+    for capability in [
+        PermissionCapability::Read,
+        PermissionCapability::Search,
+        PermissionCapability::Edit,
+        PermissionCapability::Shell,
+        PermissionCapability::Git,
+        PermissionCapability::Network,
+        PermissionCapability::Mcp,
+        PermissionCapability::Compiler,
+        PermissionCapability::Destructive,
+    ] {
+        let request = permission_request_for_capability(capability);
+        assert_eq!(mode_permission_verdict(SessionMode::Build, &request), None);
+    }
+}
+
+#[test]
+fn agent_session_mode_can_be_set_and_toggled() {
+    let agent = Agent::new(
+        AppConfig {
+            session_mode: SessionMode::Plan,
+            ..Default::default()
+        },
+        Arc::new(MockProvider::new(Vec::new())),
+    );
+
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+    assert!(agent.set_session_mode(SessionMode::Build, "test"));
+    assert_eq!(agent.session_mode(), SessionMode::Build);
+    assert!(!agent.set_session_mode(SessionMode::Build, "test"));
+    assert_eq!(agent.toggle_session_mode("test"), SessionMode::Plan);
+    assert_eq!(agent.session_mode(), SessionMode::Plan);
+}
+
+#[test]
 fn persistence_guard_refuses_allow_on_destructive_capability() {
     let request = PermissionRequest {
         call_id: "call".to_string(),
@@ -769,6 +837,19 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
     assert!(written.contains("target = \"path:sample.txt\""));
 
     let _ = fs::remove_dir_all(root);
+}
+
+fn permission_request_for_capability(capability: PermissionCapability) -> PermissionRequest {
+    PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: capability.as_str().to_string(),
+        capability,
+        target: "target:*".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: format!("{} request", capability.as_str()),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    }
 }
 
 fn temp_workspace(name: &str) -> PathBuf {
