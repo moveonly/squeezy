@@ -1723,6 +1723,7 @@ dependencies = [
  "squeezy-graph",
  "squeezy-skills",
  "squeezy-vcs",
+ "squeezy-workspace",
  "tokio",
  "tokio-util",
 ]
@@ -1753,6 +1754,7 @@ dependencies = [
 name = "squeezy-workspace"
 version = "0.1.0"
 dependencies = [
+ "globset",
  "ignore",
  "squeezy-core",
 ]

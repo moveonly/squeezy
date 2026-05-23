@@ -8,6 +8,9 @@ navigation questions before the model reads raw files.
 
 - Gitignore-aware file records: path, relative path, size, mtime, stable content
   hash, language, and freshness.
+- Policy-aware coverage for skipped generated, vendored, dependency cache,
+  build output, lockfile, binary, large, VCS metadata, hidden, and
+  user-excluded paths.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
@@ -23,6 +26,21 @@ navigation questions before the model reads raw files.
 Unsupported files are retained as structured unsupported results so callers can
 fall back to bounded read/grep/list navigation without pretending the graph knows
 more than it does.
+
+Generated, vendored, dependency cache, build output, binary, lockfile, and large
+files are excluded from graph indexing by default with compact reason-tagged
+coverage. Directory-level exclusions such as `vendor/`, `node_modules/`, and
+`target/` are pruned at the walker so individual files inside them are never
+visited; the pruned directory shows up once in the coverage report rather than
+once per file. Unrecognized hidden paths are skipped when `include_hidden=false`
+and counted under the `hidden` reason. Project config can re-include paths via
+`include = [...]` or whole classes via `include_classes = ["lockfile"]`; when an
+include glob points below a default-excluded directory the crawler walks into
+that directory so the glob can match. `exclude_classes = [...]` is the
+counterpart that keeps a class pruned even when an include glob would otherwise
+re-enable it. Explicit fallback tool reads can still inspect excluded files
+through the ignored-search permission and normal byte budgets; `read_file`
+returns `ignored=true` plus an `ignored_reason` for those reads.
 
 ## Heuristics
 

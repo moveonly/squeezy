@@ -97,6 +97,19 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   set to `allow`, `ask`, or `deny`.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
+- `[graph]`: workspace indexing controls. `languages`, `max_file_bytes`,
+  and `require_indexing_signal` follow the usual semantics. `include_hidden`
+  is `false` by default and only walks hidden paths the policy recognizes
+  (`.git`, `.venv`, `.next`, etc.); set it to `true` to also walk
+  unclassified hidden paths like `.idea/` or `.config/`. `include` and
+  `exclude` are glob patterns relative to the workspace root. `exclude` adds
+  user-level exclusions on top of the defaults. `include` re-enables a
+  default-excluded path (e.g. `include = ["vendor/allowed/**"]`); when an
+  `include` glob can match files below a directory, the crawler walks into
+  that directory rather than pruning it. `include_classes = ["lockfile"]`
+  whitelists an entire class. `exclude_classes = ["vendor"]` keeps a class
+  pruned even when an `include` glob would otherwise re-enable it; the
+  exclusion is reported with its normal class reason, not `user_exclude`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
@@ -108,8 +121,6 @@ The following sections are accepted, validated, and surfaced by
 reserved so that you can start writing configuration today and have it
 keep working when wiring lands:
 
-- `[graph]`: `languages`, `max_file_bytes`, `include_hidden`, and
-  `require_indexing_signal`.
 - `[tui].status_verbosity` (`"compact"` or `"verbose"`).
 - `[mcp.servers.<name>]`: `enabled`, `transport`, `command`, `args`,
   `url`, `timeout_ms`, and `env`.
