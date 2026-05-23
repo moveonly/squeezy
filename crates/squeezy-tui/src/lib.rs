@@ -76,7 +76,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     decision_tx,
                     ..
                 } => {
-                    app.status = format!("approve {}? y/n", request.summary);
+                    app.status = format_approval_prompt(&request);
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
@@ -184,21 +184,57 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            let _ = pending.decision_tx.send(ToolApprovalDecision::Approved);
+            let _ = pending.decision_tx.send(ToolApprovalDecision::AllowOnce);
             app.status = format!("approved {}", pending.request.tool_name);
             true
         }
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            let _ = pending
+                .decision_tx
+                .send(ToolApprovalDecision::AllowRuleUser);
+            app.status = format!("approved user rule for {}", pending.request.tool_name);
+            true
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            let _ = pending
+                .decision_tx
+                .send(ToolApprovalDecision::AllowRuleProject);
+            app.status = format!("approved project rule for {}", pending.request.tool_name);
+            true
+        }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            let _ = pending.decision_tx.send(ToolApprovalDecision::Denied);
+            let _ = pending.decision_tx.send(ToolApprovalDecision::DenyOnce);
             app.status = format!("denied {}", pending.request.tool_name);
             true
         }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            let _ = pending
+                .decision_tx
+                .send(ToolApprovalDecision::DenyRuleProject);
+            app.status = format!("denied project rule for {}", pending.request.tool_name);
+            true
+        }
+        KeyCode::Char('u') | KeyCode::Char('U') => {
+            let _ = pending.decision_tx.send(ToolApprovalDecision::DenyRuleUser);
+            app.status = format!("denied user rule for {}", pending.request.tool_name);
+            true
+        }
         _ => {
-            app.status = format!("approve {}? y/n", pending.request.summary);
+            app.status = format_approval_prompt(&pending.request);
             app.pending_approval = Some(pending);
             true
         }
     }
+}
+
+pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
+    let permission = &request.permission;
+    format!(
+        "approve {summary} | risk={risk} target={target} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
+        summary = permission.summary,
+        risk = permission.risk.as_str(),
+        target = permission.target,
+    )
 }
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -268,7 +304,7 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.config_sources,

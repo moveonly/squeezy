@@ -18,6 +18,91 @@ use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
+    let root = temp_workspace("permission_metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let destructive = registry.permission_request(&ToolCall {
+        call_id: "rm".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "rm -rf target",
+            "description": "clean"
+        }),
+    });
+    assert_eq!(destructive.capability, PermissionCapability::Destructive);
+    assert_eq!(destructive.risk, PermissionRisk::Critical);
+    assert_eq!(destructive.target, "rm:*");
+
+    let compiler = registry.permission_request(&ToolCall {
+        call_id: "test".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "cargo test --workspace",
+            "description": "run tests"
+        }),
+    });
+    assert_eq!(compiler.capability, PermissionCapability::Compiler);
+    assert_eq!(compiler.target, "cargo test:*");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_file_permission_request_target_matches_suggested_rule_target() {
+    let root = temp_workspace("permission_write_target");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}",
+            "expected_sha256": "deadbeef"
+        }),
+    });
+    assert_eq!(request.capability, PermissionCapability::Edit);
+    assert_eq!(request.target, "path:src/foo.rs");
+    assert_eq!(request.risk, PermissionRisk::High);
+    let suggested = request
+        .suggested_rules
+        .first()
+        .expect("write_file should propose a session rule");
+    assert_eq!(
+        suggested.target, request.target,
+        "suggested rule target must match the request target so future calls match the persisted rule",
+    );
+    assert_eq!(suggested.capability, "edit");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn webfetch_and_websearch_requests_carry_expected_targets() {
+    let root = temp_workspace("permission_web_targets");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let webfetch = registry.permission_request(&ToolCall {
+        call_id: "fetch".to_string(),
+        name: "webfetch".to_string(),
+        arguments: json!({"url": "https://docs.rs/foo"}),
+    });
+    assert_eq!(webfetch.capability, PermissionCapability::Network);
+    assert_eq!(webfetch.target, "domain:docs.rs");
+
+    let websearch = registry.permission_request(&ToolCall {
+        call_id: "search".to_string(),
+        name: "websearch".to_string(),
+        arguments: json!({"query": "rust async runtime"}),
+    });
+    assert_eq!(websearch.capability, PermissionCapability::Network);
+    assert_eq!(websearch.target, "search:exa");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
     let root = temp_workspace("grep_ignore");
@@ -97,6 +182,100 @@ async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
         .collect::<Vec<_>>();
     paths.sort();
     assert_eq!(paths, vec!["ignored.rs", "visible.rs"]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_and_glob_apply_squeezy_indexing_policy_by_default() {
+    let root = temp_workspace("tool_indexing_policy");
+    fs::create_dir_all(root.join("node_modules/pkg")).expect("mkdir node_modules");
+    fs::write(root.join("visible.rs"), "needle\n").expect("write visible");
+    fs::write(root.join("node_modules/pkg/index.ts"), "needle\n").expect("write ignored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let grep_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(match_paths(&grep_default), vec!["visible.rs"]);
+
+    let grep_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let mut paths = match_paths(&grep_including_ignored);
+    paths.sort();
+    assert_eq!(paths, vec!["node_modules/pkg/index.ts", "visible.rs"]);
+
+    let glob_default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_3".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(glob_default.content["paths"], json!([]));
+
+    let glob_including_ignored = registry
+        .execute(
+            ToolCall {
+                call_id: "call_4".to_string(),
+                name: "glob".to_string(),
+                arguments: json!({"pattern": "**/*.ts", "include_ignored": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        glob_including_ignored.content["paths"],
+        json!(["node_modules/pkg/index.ts"])
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_reports_policy_ignored_reason_and_permission_scope() {
+    let root = temp_workspace("read_ignored_policy");
+    fs::create_dir_all(root.join("vendor/lib")).expect("mkdir vendor");
+    fs::write(
+        root.join("vendor/lib/generated.rs"),
+        "pub fn vendored() {}\n",
+    )
+    .expect("write vendored");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let call = ToolCall {
+        call_id: "call_1".to_string(),
+        name: "read_file".to_string(),
+        arguments: json!({"path": "vendor/lib/generated.rs"}),
+    };
+
+    assert_eq!(
+        registry.permission_scope(&call),
+        PermissionScope::IgnoredSearch
+    );
+    let result = registry.execute(call, CancellationToken::new()).await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["ignored"], true);
+    assert_eq!(result.content["ignored_reason"], "vendor");
+    assert_eq!(result.content["path"], "vendor/lib/generated.rs");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1465,6 +1644,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
         },
+        &GraphConfig::default(),
     )
     .expect("registry");
 

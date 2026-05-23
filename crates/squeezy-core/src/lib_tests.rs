@@ -348,6 +348,201 @@ fn permission_mode_parses_expected_values() {
 }
 
 #[test]
+fn permission_policy_matches_last_rule_and_reports_source() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "ask"
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "deny"
+source = "user"
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "allow"
+source = "project"
+reason = "project allows tests"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let verdict = config.permissions.evaluate(&shell_request("cargo test:*"));
+
+    assert_eq!(verdict.action, PermissionAction::Allow);
+    assert_eq!(verdict.reason, "project allows tests");
+    assert_eq!(
+        verdict.matched_rule.as_ref().map(|rule| rule.source),
+        Some(PermissionRuleSource::Project)
+    );
+}
+
+#[test]
+fn wildcard_match_anchors_prefix_and_suffix_with_multiple_stars() {
+    assert!(wildcard_match("cargo test --workspace", "cargo *"));
+    assert!(wildcard_match("path:src/foo.rs", "path:*"));
+    assert!(wildcard_match("path:src/foo.rs", "path:*.rs"));
+    assert!(wildcard_match("path:src/lib/foo.rs", "path:*/foo.rs"));
+    assert!(wildcard_match("path:src/foo.rs", "*"));
+    assert!(wildcard_match("anything", "*"));
+
+    assert!(!wildcard_match("path:src/foo.rs", "src/foo.rs"));
+    assert!(!wildcard_match("rm -rf /", "git *"));
+    assert!(!wildcard_match("path:src/foo.txt", "path:*.rs"));
+    assert!(!wildcard_match("ab", "a*b*c"));
+}
+
+#[test]
+fn permission_policy_evaluate_with_extra_lets_session_rules_override_config() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "ask"
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "deny"
+source = "user"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let request = shell_request("cargo test:*");
+    let baseline = config.permissions.evaluate(&request);
+    assert_eq!(baseline.action, PermissionAction::Deny);
+
+    let session_rule = PermissionRule::new(
+        "shell",
+        "cargo test:*",
+        PermissionAction::Allow,
+        PermissionRuleSource::Session,
+        Some("session approved cargo test".to_string()),
+    );
+    let layered = config
+        .permissions
+        .evaluate_with_extra(&request, std::slice::from_ref(&session_rule));
+    assert_eq!(layered.action, PermissionAction::Allow);
+    assert_eq!(
+        layered.matched_rule.as_ref().map(|rule| rule.source),
+        Some(PermissionRuleSource::Session)
+    );
+}
+
+#[test]
+fn permission_policy_refuses_allow_on_destructive_at_load_time() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "destructive"
+target = "rm:*"
+action = "allow"
+source = "user"
+"#,
+        "test",
+    );
+    let err = result.expect_err("destructive Allow rule should be rejected");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("destructive capability"),
+        "unexpected message: {msg}"
+    );
+}
+
+#[test]
+fn permission_policy_downgrades_allow_on_destructive_runtime_safety_net() {
+    // Build a policy by hand that wires an Allow rule onto Destructive, then
+    // confirm evaluate_with_extra refuses to honor it. This exercises the
+    // belt-and-suspenders safety net regardless of how the rule reached the
+    // in-memory policy.
+    let session_rule = PermissionRule::new(
+        "destructive",
+        "rm:*",
+        PermissionAction::Allow,
+        PermissionRuleSource::Session,
+        Some("session opt-in".to_string()),
+    );
+    let policy = PermissionPolicy::default();
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Destructive,
+        target: "rm:*".to_string(),
+        risk: PermissionRisk::Critical,
+        summary: "rm -rf node_modules".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+
+    let verdict = policy.evaluate_with_extra(&request, std::slice::from_ref(&session_rule));
+    assert_eq!(verdict.action, PermissionAction::Ask);
+    assert!(
+        verdict.reason.contains("destructive"),
+        "verdict reason should explain downgrade: {}",
+        verdict.reason
+    );
+    assert!(verdict.matched_rule.is_some());
+}
+
+#[test]
+fn inspect_redacted_round_trips_with_permission_rules() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[permissions]
+shell = "ask"
+shell_classifier = true
+
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "allow"
+source = "user"
+reason = "tests are safe"
+
+[[permissions.rules]]
+capability = "network"
+target = "domain:docs.rs"
+action = "allow"
+source = "project"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let inspect = config.inspect_redacted();
+
+    assert!(inspect.contains("shell_classifier = true"));
+    assert!(inspect.contains("[[permissions.rules]]"));
+    assert!(inspect.contains("target = \"cargo test:*\""));
+    assert!(inspect.contains("target = \"domain:docs.rs\""));
+
+    let round_tripped = SettingsFile::from_toml_str(&inspect, "round-trip")
+        .expect("inspect output parses back as settings");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(round_tripped_config.permissions.rules.len(), 2);
+    assert!(round_tripped_config.permissions.shell_classifier);
+}
+
+fn shell_request(target: &str) -> PermissionRequest {
+    PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: target.to_string(),
+        risk: PermissionRisk::Medium,
+        summary: format!("shell target={target}"),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    }
+}
+
+#[test]
 fn section_settings_cover_budgets_permissions_graph_cache_tui_and_mcp() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -387,6 +582,10 @@ languages = ["rust", "csharp"]
 max_file_bytes = 42
 include_hidden = true
 require_indexing_signal = false
+include = ["vendor/allowed/**"]
+exclude = ["fixtures/generated/**"]
+include_classes = ["lockfile"]
+exclude_classes = ["generated"]
 
 [cache]
 root = ".squeezy/cache"
@@ -418,6 +617,10 @@ env = { TOKEN = "secret" }
     assert!(!config.telemetry.enabled);
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
     assert_eq!(config.graph.languages, vec!["rust", "csharp"]);
+    assert_eq!(config.graph.include, vec!["vendor/allowed/**"]);
+    assert_eq!(config.graph.exclude, vec!["fixtures/generated/**"]);
+    assert_eq!(config.graph.include_classes, vec!["lockfile"]);
+    assert_eq!(config.graph.exclude_classes, vec!["generated"]);
     assert_eq!(
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))

@@ -32,7 +32,7 @@ impl Runner {
 
 fn helper() {}
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
@@ -105,7 +105,7 @@ def make_runner():
 def test_runner():
     assert make_runner()
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = python_record("src/package/app.py", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
@@ -213,7 +213,7 @@ class Runner:
     def handle(self):
         return router.get_settings()
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let mut record_py = record("src/handler.py", source);
     record_py.language = LanguageKind::Python;
     let parsed = parser.parse_source(&record_py, source.to_string()).unwrap();
@@ -240,6 +240,323 @@ class Runner:
 }
 
 #[test]
+fn parser_extracts_go_symbols_imports_calls_and_references() {
+    let source = r#"
+package greeter
+
+import (
+    "fmt"
+    util "example.com/acme/app/util"
+    . "example.com/acme/app/dot"
+    _ "example.com/acme/app/sideeffect"
+)
+
+const DefaultName = "Ada"
+var shared = Runner{}
+var First, Second = 1, 2
+var formatter = func() string {
+    var closureLocal string
+    return closureLocal
+}
+
+type Alias = string
+type (
+    AliasFunc = func(string) bool
+    LocalType = Runner
+)
+
+type Greeter interface {
+    Greet(name string) string
+}
+
+type Runner struct {
+    Name string
+    Greeter
+}
+
+func NewRunner(name string) Runner {
+    return Runner{Name: name}
+}
+
+func (r Runner) Greet(name string) string {
+    var localOnly string
+    fmt.Println(name)
+    helper()
+    _ = localOnly
+    return util.Format(name)
+}
+
+func helper() {}
+
+func (r Runner) TestSuiteStyle() {}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("greeter/runner_test.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert_eq!(parsed.package.as_deref(), Some("greeter"));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Greeter" && symbol.kind == SymbolKind::Interface)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Alias" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "AliasFunc" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "LocalType" && symbol.kind == SymbolKind::TypeAlias)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Name" && symbol.kind == SymbolKind::Field)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "NewRunner" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "Greet"
+            && symbol.kind == SymbolKind::Method
+            && symbol
+                .attributes
+                .contains(&"go:receiver:Runner".to_string())
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "TestSuiteStyle"
+            && symbol.kind == SymbolKind::Test
+            && symbol
+                .attributes
+                .contains(&"go:receiver:Runner".to_string())
+    }));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "DefaultName" && symbol.kind == SymbolKind::Const)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "First" && symbol.kind == SymbolKind::Static)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Second" && symbol.kind == SymbolKind::Static)
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "name" && symbol.kind == SymbolKind::Static),
+        "local variables must not be exposed as top-level graph declarations"
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "localOnly" && symbol.kind == SymbolKind::Static),
+        "function-local variables must stay out of declaration symbols"
+    );
+    assert!(
+        !parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "closureLocal" && symbol.kind == SymbolKind::Static),
+        "variables inside top-level function literals must stay out of declaration symbols"
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "example.com/acme/app/util"
+                && import.alias.as_deref() == Some("util"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "example.com/acme/app/dot" && import.is_glob)
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "Println" && call.receiver.as_deref() == Some("fmt"))
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "helper"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "Runner" && reference.kind == ReferenceKind::Type)
+    );
+}
+
+#[test]
+fn go_parser_tags_embedded_struct_fields_with_embed_attribute() {
+    let source = r#"
+package greeter
+
+type Greeter interface {
+    Greet(name string) string
+}
+
+type Runner struct {
+    Name string
+    Greeter
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("greeter/embed.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let runner_id = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+        .map(|symbol| symbol.id.clone())
+        .expect("Runner struct declaration");
+    let name_field = parsed
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.name == "Name"
+                && symbol.kind == SymbolKind::Field
+                && symbol.parent_id.as_ref() == Some(&runner_id)
+        })
+        .expect("Name field");
+    assert!(name_field.attributes.contains(&"go:field".to_string()));
+    assert!(
+        !name_field.attributes.contains(&"go:embed".to_string()),
+        "named fields must not be tagged go:embed"
+    );
+    let embedded = parsed
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.name == "Greeter"
+                && symbol.kind == SymbolKind::Field
+                && symbol.parent_id.as_ref() == Some(&runner_id)
+        })
+        .expect("embedded Greeter field");
+    assert!(embedded.attributes.contains(&"go:embed".to_string()));
+    assert!(embedded.attributes.contains(&"go:field".to_string()));
+}
+
+#[test]
+fn go_parser_attaches_methods_to_types_declared_after_them() {
+    let source = r#"
+package greeter
+
+func (r Runner) Greet(name string) string {
+    return name
+}
+
+type Runner struct {
+    Name string
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("greeter/order.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let runner = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Struct)
+        .expect("Runner struct declaration");
+    let greet = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Greet" && symbol.kind == SymbolKind::Method)
+        .expect("Greet method declaration");
+    assert_eq!(
+        greet.parent_id.as_ref(),
+        Some(&runner.id),
+        "method declared before its type must still attach to the type"
+    );
+    assert!(
+        greet
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "go:receiver:Runner")
+    );
+}
+
+#[test]
+fn go_parser_does_not_emit_wrapper_body_hit_for_selectors() {
+    let source = r#"
+package greeter
+
+import "fmt"
+
+func Use() {
+    fmt.Println("hello")
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = go_record("greeter/use.go", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    // The selector `fmt.Println` should not emit a wrapper body hit covering
+    // the whole `fmt.Println` text. The operand and field still produce body
+    // hits via child traversal, so each appears at most once.
+    let selector_hits = parsed
+        .body_hits
+        .iter()
+        .filter(|hit| hit.text == "fmt.Println")
+        .count();
+    assert_eq!(
+        selector_hits, 0,
+        "selector wrappers must not be duplicated as body hits"
+    );
+    assert!(
+        parsed.body_hits.iter().any(|hit| hit.text == "fmt"),
+        "operand body hit must still be present"
+    );
+    assert!(
+        parsed.body_hits.iter().any(|hit| hit.text == "Println"),
+        "field body hit must still be present"
+    );
+    // The full-selector text is still recorded as a reference so the
+    // import-aware resolver can match `fmt.Println` against the `fmt` import.
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "fmt.Println"),
+        "selector reference text must still be recorded for import resolution"
+    );
+}
+
+#[test]
 fn python_class_bases_filter_out_keyword_arguments() {
     let bases = python_class_bases("class Foo(Bar, metaclass=Meta, total=False)");
     assert_eq!(bases, vec!["Bar".to_string()]);
@@ -261,6 +578,7 @@ fn extract_python_module_exports_requires_word_boundary() {
             references: Vec::new(),
             body_hits: Vec::new(),
             diagnostics: Vec::new(),
+            go_type_index: std::collections::HashMap::new(),
         };
         extract_python_module_exports(&mut ctx);
         ctx.imports
@@ -386,7 +704,7 @@ record Helper(String name) {
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let mut record = record("src/lib.rs", first);
 
     let initial = parser.parse_source(&record, first.to_string()).unwrap();
@@ -400,7 +718,7 @@ fn parser_reports_changed_ranges_for_cached_file() {
 
 #[test]
 fn unsupported_language_returns_structured_result() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let mut record = record("README.md", "# docs\n");
     record.language = LanguageKind::Unsupported;
 
@@ -414,7 +732,7 @@ fn unsupported_language_returns_structured_result() {
 
 #[test]
 fn parser_treats_non_utf8_rust_files_as_unsupported() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let mut record = record("src/lib.rs", "");
     fs::write(&record.path, b"\xff\xfe").unwrap();
     record.hash = ContentHash::new(stable_content_hash(b"\xff\xfe"));
@@ -438,7 +756,7 @@ impl Runner {
     pub fn run(&self) {}
 }
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
@@ -468,7 +786,7 @@ fn parser_expands_grouped_use_trees() {
 pub use crate::flags::lowargs::{ContextMode, LowArgs as Args};
 use crate::{config::Config, flags::{defs::Generate, parse::*}};
 "#;
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let record = record("src/lib.rs", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
     let imports = parsed
@@ -493,7 +811,7 @@ use crate::{config::Config, flags::{defs::Generate, parse::*}};
 
 #[test]
 fn parser_parallel_records_preserve_order_and_cache_changes() {
-    let mut parser = RustParser::new().unwrap();
+    let mut parser = LanguageParser::new().unwrap();
     let mut records = (0..10)
         .map(|index| {
             let source = format!("pub fn f{index}() {{}}\n");
@@ -624,6 +942,12 @@ fn python_record(relative_path: &str, source: &str) -> FileRecord {
 fn java_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Java;
+    record
+}
+
+fn go_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Go;
     record
 }
 

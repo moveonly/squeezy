@@ -61,6 +61,13 @@ commented examples so that built-in defaults can evolve over time:
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
+#
+# [[permissions.rules]]
+# capability = "shell"
+# target = "cargo test:*"
+# action = "allow"
+# source = "user"
 
 [telemetry]
 # enabled = true
@@ -93,10 +100,49 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[budgets]`: per-turn and per-tool output limits.
-- `[permissions]`: `read`, `edit`, `shell`, `ignored_search`, and `web`, each
-  set to `allow`, `ask`, or `deny`.
+- `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
+  `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
+  `shell_classifier` (default `false`) enables a narrow LLM fallback that
+  can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
+  LLM round-trip per ambiguous shell call, so leave it off unless that cost
+  is acceptable.
+- `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
+  `target`, `action`, optional `source`, and optional `reason`. Later matching
+  rules win, and any session-scoped approvals added through the TUI also stack
+  on top of the file rules. Current capabilities are `read`, `search`, `edit`,
+  `shell`, `network`, `mcp`, `git`, `compiler`, and `destructive`. Targets are
+  prefix-tagged so different scopes do not collide:
+  - `path:<rel-path>` for `edit` rules.
+  - `domain:<host>` for `network` (`webfetch`) rules.
+  - `search:<provider>` for `network` search rules.
+  - `workspace:*` for ordinary read/search rules.
+  - `ignored:*` for read/search rules that include git-ignored files.
+  - `tool:<name>` as a catch-all for tools that do not specify their own scope.
+  - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
+    `rm:*`). `*` itself is treated as a wildcard segment in any position.
+  Allow rules on the `destructive` capability and Allow rules with a bare `*`
+  target are refused at load time and at approval persistence time; honor
+  destructive operations either per-call or by widening the `shell`
+  compatibility default.
+  Rules are matched by walking the configured rules first and the session
+  rules last, returning the most recently added matching rule. Permission
+  decisions are emitted on the `squeezy::permissions` tracing target with the
+  capability, target, risk, action, matched-rule source, and reason fields.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[web]`: `exa_mcp_url` and `exa_api_key_env`.
+- `[graph]`: workspace indexing controls. `languages`, `max_file_bytes`,
+  and `require_indexing_signal` follow the usual semantics. `include_hidden`
+  is `false` by default and only walks hidden paths the policy recognizes
+  (`.git`, `.venv`, `.next`, etc.); set it to `true` to also walk
+  unclassified hidden paths like `.idea/` or `.config/`. `include` and
+  `exclude` are glob patterns relative to the workspace root. `exclude` adds
+  user-level exclusions on top of the defaults. `include` re-enables a
+  default-excluded path (e.g. `include = ["vendor/allowed/**"]`); when an
+  `include` glob can match files below a directory, the crawler walks into
+  that directory rather than pruning it. `include_classes = ["lockfile"]`
+  whitelists an entire class. `exclude_classes = ["vendor"]` keeps a class
+  pruned even when an `include` glob would otherwise re-enable it; the
+  exclusion is reported with its normal class reason, not `user_exclude`.
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
@@ -108,8 +154,6 @@ The following sections are accepted, validated, and surfaced by
 reserved so that you can start writing configuration today and have it
 keep working when wiring lands:
 
-- `[graph]`: `languages`, `max_file_bytes`, `include_hidden`, and
-  `require_indexing_signal`.
 - `[tui].status_verbosity` (`"compact"` or `"verbose"`).
 - `[mcp.servers.<name>]`: `enabled`, `transport`, `command`, `args`,
   `url`, `timeout_ms`, and `env`.

@@ -15,9 +15,11 @@ benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
   fixtures/java/semantic-cases/     # small Java package used by smoke CI
+  fixtures/go/semantic-cases/       # small Go module used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
   specs/java-smoke-queries.json     # Java expected query results
+  specs/go-smoke-queries.json       # Go expected query results
   squeezy-graph-bench/              # benchmark CLI
 ```
 
@@ -67,6 +69,17 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --fixture benchmarks/fixtures/java/semantic-cases \
   --spec benchmarks/specs/java-smoke-queries.json \
   --report target/semantic-graph-benchmark/java-smoke.json \
+  --ra-lsp-probes 0
+```
+
+Go smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language go \
+  --fixture benchmarks/fixtures/go/semantic-cases \
+  --spec benchmarks/specs/go-smoke-queries.json \
+  --report target/semantic-graph-benchmark/go-smoke.json \
   --ra-lsp-probes 0
 ```
 
@@ -268,3 +281,73 @@ query diffs, and raw JSON reports as a workflow artifact. Manual
 retrofit, and picocli, then runs oracle-only FP/FN comparison against each repo
 root with the fixture speed gate disabled so external-corpus variance is
 reported rather than blocking the run.
+
+For Go, the benchmark runs a benchmark-only Go parser/AST oracle over `.go`
+files and compares top-level declarations against Squeezy's tree-sitter graph.
+The Go report includes symbol TP/FP/FN, precision, recall, unparseable files,
+and heuristic-iteration notes. Production Go navigation does not call `gopls`,
+`go list`, `go build`, or the Go oracle. The refresh probe is language-aware and
+fails when a two-file Go edit causes more files to be reparsed than edited. The
+Go FP/FN accuracy gate is enforced for the smoke fixture by default and is
+relaxed by `--no-speed-gate` so external corpora can run in reporting-only mode
+without blocking the workflow on upstream parser drift, generated files, or
+build-tag differences. `.github/workflows/go-semantic-graph-benchmark.yml` runs
+Go smoke on PRs and pushes. Manual `workflow_dispatch` with `tier=full`, or a
+push to `benchmark-full/**` after the workflow is present on the default
+branch, clones gin, cobra, prometheus, etcd, and zap. The workflow shape
+intentionally mirrors the shared benchmark workflow while staying separate from
+`.github/workflows/semantic-graph-benchmark.yml` so it does not conflict with
+parallel Rust/C/C++ workflow changes.
+
+Initial local Go full run on May 23, 2026 used Go 1.26.3 and compared five
+popular open-source Go repositories:
+
+| Repo | Squeezy total | Go oracle | Symbol TP | FP | FN | Precision | Recall | Refresh after 2 edits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| gin | 249 ms | 415 ms | 1,634 | 277 | 52 | 0.8550 | 0.9692 | 201 ms |
+| cobra | 145 ms | 410 ms | 682 | 101 | 2 | 0.8710 | 0.9971 | 99 ms |
+| prometheus | 5,147 ms | 622 ms | 12,561 | 2,794 | 320 | 0.8180 | 0.9752 | 747 ms |
+| etcd | 3,157 ms | 759 ms | 11,233 | 1,222 | 1,133 | 0.9019 | 0.9084 | 361 ms |
+| zap | 192 ms | 421 ms | 1,392 | 126 | 29 | 0.9170 | 0.9796 | 146 ms |
+
+Every repo's refresh probe reparsed exactly the two edited files. Prometheus and
+etcd are currently slower than the Go oracle on full-repo cold graph timing,
+which makes them useful targets for the next Go heuristic/performance iteration.
+
+The first Go heuristic iteration targeted the obvious FP/FN sources from that
+run:
+
+- local `var` / `const` declarations are no longer exposed as graph symbols
+- `var (...)` and `const (...)` declaration lists are expanded instead of
+  truncated
+- blank identifier declarations (`_`) are ignored for symbol accuracy
+- Go `type_alias` tree-sitter nodes are recorded as `TypeAlias`
+- suite-style `_test.go` methods named `Test*`, `Benchmark*`, or `Fuzz*` are
+  normalized to test functions for oracle comparison
+- local declarations inside top-level function literals are not exposed as
+  top-level graph symbols
+- internal symlinked Go files are indexed so workspace behavior matches the Go
+  AST oracle on repos such as etcd
+- unresolved/candidate reference edges are not eagerly materialized, and large
+  body-hit trigram indexes fall back to exact scanning at query time
+
+Latest local Go full run on May 23, 2026 after that iteration:
+
+| Repo | Squeezy total | Go oracle | Decl graph | Full graph | Symbol TP | FP | FN | Precision | Recall | Refresh after 2 edits |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| gin | 273 ms | 408 ms | 34 ms | 191 ms | 1,686 | 0 | 0 | 1.0000 | 1.0000 | 184 ms |
+| cobra | 153 ms | 416 ms | 15 ms | 97 ms | 684 | 0 | 0 | 1.0000 | 1.0000 | 96 ms |
+| prometheus | 4,708 ms | 961 ms | 462 ms | 3,649 ms | 12,881 | 0 | 0 | 1.0000 | 1.0000 | 520 ms |
+| etcd | 3,089 ms | 572 ms | 336 ms | 2,440 ms | 12,366 | 0 | 0 | 1.0000 | 1.0000 | 461 ms |
+| zap | 241 ms | 686 ms | 28 ms | 176 ms | 1,421 | 0 | 0 | 1.0000 | 1.0000 | 142 ms |
+
+The Prometheus and etcd cold-build timings are slower than the Go AST oracle
+because the two timings are not measuring equivalent work yet. The Go oracle is
+declaration-only; Squeezy builds the full semantic graph and indexes references,
+calls, body hits, and edges. After lazy reference/body-hit materialization,
+Prometheus still produced 1,065,591 body hits, 799,504 references, 105,072
+calls, and 267,663 graph edges. Etcd produced 655,099 body hits, 514,823
+references, 68,540 calls, and 193,437 graph edges. The remaining performance
+target is the full graph phase: declaration-only graph construction is already
+below the Go oracle on those repos, while full graph construction remains above
+it.

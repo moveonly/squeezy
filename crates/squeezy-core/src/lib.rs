@@ -477,9 +477,29 @@ impl AppConfig {
             toml_string(self.permissions.ignored_search.as_str())
         ));
         output.push_str(&format!(
-            "web = {}\n\n",
+            "web = {}\n",
             toml_string(self.permissions.web.as_str())
         ));
+        output.push_str(&format!(
+            "shell_classifier = {}\n\n",
+            self.permissions.shell_classifier
+        ));
+        for rule in self
+            .permissions
+            .rules
+            .iter()
+            .filter(|rule| rule.source != PermissionRuleSource::Builtin)
+        {
+            output.push_str("[[permissions.rules]]\n");
+            output.push_str(&format!("capability = {}\n", toml_string(&rule.capability)));
+            output.push_str(&format!("target = {}\n", toml_string(&rule.target)));
+            output.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
+            output.push_str(&format!("source = {}\n", toml_string(rule.source.as_str())));
+            if let Some(reason) = &rule.reason {
+                output.push_str(&format!("reason = {}\n", toml_string(reason)));
+            }
+            output.push('\n');
+        }
 
         output.push_str("[telemetry]\n");
         output.push_str(&format!("enabled = {}\n", self.telemetry.enabled));
@@ -515,6 +535,22 @@ impl AppConfig {
         output.push_str(&format!(
             "require_indexing_signal = {}\n\n",
             self.graph.require_indexing_signal
+        ));
+        output.push_str(&format!(
+            "include = {}\n",
+            toml_string_array(&self.graph.include)
+        ));
+        output.push_str(&format!(
+            "exclude = {}\n",
+            toml_string_array(&self.graph.exclude)
+        ));
+        output.push_str(&format!(
+            "include_classes = {}\n",
+            toml_string_array(&self.graph.include_classes)
+        ));
+        output.push_str(&format!(
+            "exclude_classes = {}\n\n",
+            toml_string_array(&self.graph.exclude_classes)
         ));
 
         output.push_str("[cache]\n");
@@ -579,7 +615,10 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
     }
 }
 
-fn toml_string(value: &str) -> String {
+/// Escape `value` as a TOML basic string. Public so persistence helpers in
+/// downstream crates (e.g. permission rule writing) can share the same
+/// escaping rules used by `config inspect`.
+pub fn escape_toml_basic_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -595,6 +634,10 @@ fn toml_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn toml_string(value: &str) -> String {
+    escape_toml_basic_string(value)
 }
 
 fn toml_string_array<S: AsRef<str>>(values: &[S]) -> String {
@@ -733,7 +776,7 @@ impl SettingsFile {
             Err(error) => return Err(error.into()),
         };
         Ok((
-            Self::from_toml_str(&text, &path.display().to_string())?,
+            Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?,
             vec![
                 "defaults".to_string(),
                 format!("{label}:{}", path.display()),
@@ -1095,6 +1138,146 @@ impl PermissionMode {
     }
 }
 
+pub type PermissionAction = PermissionMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PermissionCapability {
+    Read,
+    Search,
+    Edit,
+    Shell,
+    Network,
+    Mcp,
+    Git,
+    Compiler,
+    Destructive,
+}
+
+impl PermissionCapability {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "search" => Some(Self::Search),
+            "edit" | "write" => Some(Self::Edit),
+            "shell" | "bash" | "command" => Some(Self::Shell),
+            "network" | "web" => Some(Self::Network),
+            "mcp" => Some(Self::Mcp),
+            "git" => Some(Self::Git),
+            "compiler" | "verify" => Some(Self::Compiler),
+            "destructive" | "dangerous" => Some(Self::Destructive),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Edit => "edit",
+            Self::Shell => "shell",
+            Self::Network => "network",
+            Self::Mcp => "mcp",
+            Self::Git => "git",
+            Self::Compiler => "compiler",
+            Self::Destructive => "destructive",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionRisk {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl PermissionRisk {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionRuleSource {
+    Builtin,
+    User,
+    Project,
+    Session,
+}
+
+impl PermissionRuleSource {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "builtin" => Some(Self::Builtin),
+            "user" => Some(Self::User),
+            "project" => Some(Self::Project),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub capability: String,
+    pub target: String,
+    pub action: PermissionAction,
+    pub source: PermissionRuleSource,
+    pub reason: Option<String>,
+}
+
+impl PermissionRule {
+    pub fn new(
+        capability: impl Into<String>,
+        target: impl Into<String>,
+        action: PermissionAction,
+        source: PermissionRuleSource,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            capability: capability.into(),
+            target: target.into(),
+            action,
+            source,
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRequest {
+    pub call_id: String,
+    pub tool_name: String,
+    pub capability: PermissionCapability,
+    pub target: String,
+    pub risk: PermissionRisk,
+    pub summary: String,
+    pub metadata: BTreeMap<String, String>,
+    pub suggested_rules: Vec<PermissionRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionVerdict {
+    pub action: PermissionAction,
+    pub matched_rule: Option<PermissionRule>,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PermissionSettings {
     pub read: Option<PermissionMode>,
@@ -1102,13 +1285,23 @@ pub struct PermissionSettings {
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
+    pub shell_classifier: Option<bool>,
+    pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
-            &["read", "edit", "shell", "ignored_search", "web"],
+            &[
+                "read",
+                "edit",
+                "shell",
+                "ignored_search",
+                "web",
+                "shell_classifier",
+                "rules",
+            ],
             source,
             path,
         )?;
@@ -1123,6 +1316,13 @@ impl PermissionSettings {
                 &field(path, "ignored_search"),
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
+            shell_classifier: bool_value(
+                table,
+                "shell_classifier",
+                source,
+                &field(path, "shell_classifier"),
+            )?,
+            rules: permission_rules_value(table, source, &field(path, "rules"))?,
         })
     }
 
@@ -1132,6 +1332,8 @@ impl PermissionSettings {
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
+        replace_if_some(&mut self.shell_classifier, next.shell_classifier);
+        self.rules.extend(next.rules);
     }
 }
 
@@ -1151,6 +1353,8 @@ pub struct PermissionPolicy {
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
+    pub shell_classifier: bool,
+    pub rules: Vec<PermissionRule>,
 }
 
 impl PermissionPolicy {
@@ -1183,6 +1387,11 @@ impl PermissionPolicy {
                 var("SQUEEZY_WEB_PERMISSION"),
                 settings.web.unwrap_or(PermissionMode::Ask),
             ),
+            shell_classifier: parse_bool(
+                var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
+                settings.shell_classifier.unwrap_or(false),
+            ),
+            rules: settings.rules,
         }
     }
 
@@ -1195,6 +1404,75 @@ impl PermissionPolicy {
             PermissionScope::Web => self.web,
         }
     }
+
+    pub fn evaluate(&self, request: &PermissionRequest) -> PermissionVerdict {
+        self.evaluate_with_extra(request, &[])
+    }
+
+    /// Like [`Self::evaluate`] but lets the caller layer additional rules on
+    /// top of the configured ones. `extra` is treated as appended after
+    /// `self.rules`, so the most recently added session rule wins over any
+    /// rule from the on-disk config.
+    pub fn evaluate_with_extra(
+        &self,
+        request: &PermissionRequest,
+        extra: &[PermissionRule],
+    ) -> PermissionVerdict {
+        let matched_rule = self
+            .rules
+            .iter()
+            .chain(extra.iter())
+            .rev()
+            .find(|rule| {
+                wildcard_match(request.capability.as_str(), &rule.capability)
+                    && wildcard_match(&request.target, &rule.target)
+            })
+            .cloned();
+        if let Some(rule) = matched_rule {
+            let (action, override_reason) =
+                downgrade_unsafe_action(rule.action, request.capability);
+            let reason = override_reason.unwrap_or_else(|| {
+                rule.reason
+                    .clone()
+                    .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str()))
+            });
+            return PermissionVerdict {
+                action,
+                reason,
+                matched_rule: Some(rule),
+            };
+        }
+        let action = self.mode_for(legacy_scope_for_capability(request.capability));
+        PermissionVerdict {
+            action,
+            matched_rule: None,
+            reason: format!(
+                "default {} permission is {}",
+                request.capability.as_str(),
+                action.as_str()
+            ),
+        }
+    }
+}
+
+/// Belt-and-suspenders safety: refuse to honor an Allow rule that targets the
+/// `destructive` capability, regardless of where the rule came from. Returns
+/// the (possibly downgraded) action and an explanatory reason when a downgrade
+/// happens.
+fn downgrade_unsafe_action(
+    action: PermissionAction,
+    capability: PermissionCapability,
+) -> (PermissionAction, Option<String>) {
+    if action == PermissionAction::Allow && capability == PermissionCapability::Destructive {
+        return (
+            PermissionAction::Ask,
+            Some(
+                "ignoring Allow rule on destructive capability; require explicit per-call approval"
+                    .to_string(),
+            ),
+        );
+    }
+    (action, None)
 }
 
 impl Default for PermissionPolicy {
@@ -1205,6 +1483,8 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
+            shell_classifier: false,
+            rules: Vec::new(),
         }
     }
 }
@@ -1214,6 +1494,24 @@ fn parse_permission(value: Option<String>, default: PermissionMode) -> Permissio
         .as_deref()
         .and_then(PermissionMode::parse)
         .unwrap_or(default)
+}
+
+fn parse_bool(value: Option<String>, default: bool) -> bool {
+    value.as_deref().map_or(default, parse_enabled_bool)
+}
+
+fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionScope {
+    match capability {
+        PermissionCapability::Read => PermissionScope::Read,
+        PermissionCapability::Search => PermissionScope::Read,
+        PermissionCapability::Edit => PermissionScope::Edit,
+        PermissionCapability::Shell => PermissionScope::Shell,
+        PermissionCapability::Network => PermissionScope::Web,
+        PermissionCapability::Mcp => PermissionScope::Shell,
+        PermissionCapability::Git => PermissionScope::Shell,
+        PermissionCapability::Compiler => PermissionScope::Shell,
+        PermissionCapability::Destructive => PermissionScope::Shell,
+    }
 }
 
 fn parse_enabled_bool(value: &str) -> bool {
@@ -1405,6 +1703,10 @@ pub struct GraphConfig {
     pub max_file_bytes: u64,
     pub include_hidden: bool,
     pub require_indexing_signal: bool,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include_classes: Vec<String>,
+    pub exclude_classes: Vec<String>,
 }
 
 impl GraphConfig {
@@ -1416,6 +1718,10 @@ impl GraphConfig {
             max_file_bytes: settings.max_file_bytes.unwrap_or(1_000_000),
             include_hidden: settings.include_hidden.unwrap_or(false),
             require_indexing_signal: settings.require_indexing_signal.unwrap_or(true),
+            include: settings.include.unwrap_or_default(),
+            exclude: settings.exclude.unwrap_or_default(),
+            include_classes: settings.include_classes.unwrap_or_default(),
+            exclude_classes: settings.exclude_classes.unwrap_or_default(),
         }
     }
 }
@@ -1432,6 +1738,10 @@ pub struct GraphSettings {
     pub max_file_bytes: Option<u64>,
     pub include_hidden: Option<bool>,
     pub require_indexing_signal: Option<bool>,
+    pub include: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
+    pub include_classes: Option<Vec<String>>,
+    pub exclude_classes: Option<Vec<String>>,
 }
 
 impl GraphSettings {
@@ -1443,6 +1753,10 @@ impl GraphSettings {
                 "max_file_bytes",
                 "include_hidden",
                 "require_indexing_signal",
+                "include",
+                "exclude",
+                "include_classes",
+                "exclude_classes",
             ],
             source,
             path,
@@ -1467,6 +1781,20 @@ impl GraphSettings {
                 source,
                 &field(path, "require_indexing_signal"),
             )?,
+            include: string_array_value(table, "include", source, &field(path, "include"))?,
+            exclude: string_array_value(table, "exclude", source, &field(path, "exclude"))?,
+            include_classes: string_array_value(
+                table,
+                "include_classes",
+                source,
+                &field(path, "include_classes"),
+            )?,
+            exclude_classes: string_array_value(
+                table,
+                "exclude_classes",
+                source,
+                &field(path, "exclude_classes"),
+            )?,
         })
     }
 
@@ -1478,6 +1806,10 @@ impl GraphSettings {
             &mut self.require_indexing_signal,
             next.require_indexing_signal,
         );
+        replace_if_some(&mut self.include, next.include);
+        replace_if_some(&mut self.exclude, next.exclude);
+        replace_if_some(&mut self.include_classes, next.include_classes);
+        replace_if_some(&mut self.exclude_classes, next.exclude_classes);
     }
 }
 
@@ -1678,6 +2010,31 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
+#
+# Rule targets use prefix-tagged strings so different scopes don't collide.
+# Known prefixes:
+#   path:<rel-path>      - edit/write rules
+#   domain:<host>        - network rules
+#   search:<provider>    - web search rules
+#   workspace:*          - read/search rules limited to workspace files
+#   ignored:*            - read/search rules that include git-ignored files
+#   tool:<name>          - catch-all per-tool rule
+#   <cmd-prefix>:*       - shell/git/compiler rules (e.g. "cargo test:*", "rm:*")
+# Allow rules on the `destructive` capability are refused at load time; keep
+# them at `ask` or `deny`.
+#
+# [[permissions.rules]]
+# capability = "network"
+# target = "domain:docs.rs"
+# action = "allow"
+# source = "user"
+#
+# [[permissions.rules]]
+# capability = "shell"
+# target = "cargo test:*"
+# action = "allow"
+# source = "user"
 
 [telemetry]
 # enabled = true
@@ -1703,15 +2060,32 @@ pub fn project_settings_template() -> &'static str {
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
 
-# `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]` are parsed and
-# round-trip through `squeezy config inspect` but no runtime consumer reads
-# them yet; treat them as v0 reservations.
+[permissions]
+# read = "allow"
+# edit = "ask"
+# shell = "ask"
+# ignored_search = "allow"
+# web = "ask"
+#
+# [[permissions.rules]]
+# capability = "compiler"
+# target = "cargo test:*"
+# action = "allow"
+# source = "project"
+
+# `[graph]` controls workspace indexing. `[tui].status_verbosity` and
+# `[mcp.servers.*]` are parsed and round-trip through `squeezy config inspect`
+# but are still v0 reservations.
 
 # [graph]
 # languages = ["rust", "python"]
 # max_file_bytes = 1000000
 # include_hidden = false
 # require_indexing_signal = true
+# include = ["vendor/allowed/**"]
+# exclude = ["fixtures/generated/**"]
+# include_classes = ["lockfile"]
+# exclude_classes = ["generated"]
 
 [cache]
 # Relative paths are resolved against the project root (the directory
@@ -1742,7 +2116,7 @@ fn load_settings_from_paths(
     {
         let user = SettingsFile::from_toml_str(
             &fs::read_to_string(user_path)?,
-            &user_path.display().to_string(),
+            &format!("user:{}", user_path.display()),
         )?;
         settings.merge(user);
         sources.push(format!("user:{}", user_path.display()));
@@ -1752,7 +2126,7 @@ fn load_settings_from_paths(
     {
         let project = SettingsFile::from_toml_str(
             &fs::read_to_string(project_path)?,
-            &project_path.display().to_string(),
+            &format!("project:{}", project_path.display()),
         )?;
         settings.merge(project);
         sources.push(format!("project:{}", project_path.display()));
@@ -2104,6 +2478,137 @@ fn permission_value(
     })
 }
 
+fn permission_rules_value(
+    table: &toml::value::Table,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PermissionRule>> {
+    let Some(value) = table.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "array of tables"))?;
+    rules
+        .iter()
+        .enumerate()
+        .map(|value| {
+            let rule_path = format!("{path}[{}]", value.0);
+            let table = value
+                .1
+                .as_table()
+                .ok_or_else(|| type_error(source, &rule_path, "table"))?;
+            reject_unknown_keys(
+                table,
+                &["capability", "target", "action", "source", "reason"],
+                source,
+                &rule_path,
+            )?;
+            let capability = required_string_value(
+                table,
+                "capability",
+                source,
+                &field(&rule_path, "capability"),
+            )?;
+            if PermissionCapability::parse(&capability).is_none() && !capability.contains('*') {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} invalid permission capability {capability:?}",
+                    field(&rule_path, "capability")
+                )));
+            }
+            let target =
+                required_string_value(table, "target", source, &field(&rule_path, "target"))?;
+            let action = permission_value(table, "action", source, &field(&rule_path, "action"))?
+                .ok_or_else(|| {
+                SqueezyError::Config(format!(
+                    "{source}: {} missing required permission action",
+                    field(&rule_path, "action")
+                ))
+            })?;
+            if action == PermissionAction::Allow
+                && PermissionCapability::parse(&capability)
+                    == Some(PermissionCapability::Destructive)
+            {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: refuse to load Allow rule on destructive capability; \
+                     destructive actions must be approved per call or via a broader shell scope"
+                )));
+            }
+            let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
+                .as_deref()
+                .and_then(PermissionRuleSource::parse)
+                .unwrap_or_else(|| default_permission_rule_source(source));
+            let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
+            Ok(PermissionRule::new(
+                capability,
+                target,
+                action,
+                source_value,
+                reason,
+            ))
+        })
+        .collect()
+}
+
+fn required_string_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<String> {
+    string_value(table, key, source, path)?.ok_or_else(|| {
+        SqueezyError::Config(format!("{source}: {path}: missing required string value"))
+    })
+}
+
+fn default_permission_rule_source(source: &str) -> PermissionRuleSource {
+    if source.starts_with("user:") {
+        PermissionRuleSource::User
+    } else {
+        PermissionRuleSource::Project
+    }
+}
+
+/// Minimal glob matcher for permission rule targets and capabilities.
+///
+/// Supports any number of `*` wildcards. Each `*` matches any (possibly empty)
+/// run of characters; the prefix before the first `*` must anchor to the start
+/// of `value` and the suffix after the last `*` must anchor to the end.
+pub(crate) fn wildcard_match(value: &str, pattern: &str) -> bool {
+    let value = value.trim();
+    let pattern = pattern.trim();
+    if pattern == value {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return false;
+    }
+    let segments: Vec<&str> = pattern.split('*').collect();
+    let first = segments[0];
+    let last = segments[segments.len() - 1];
+    if !value.starts_with(first) || !value.ends_with(last) {
+        return false;
+    }
+    if first.len() + last.len() > value.len() {
+        return false;
+    }
+    let mut cursor = first.len();
+    let end = value.len() - last.len();
+    for segment in &segments[1..segments.len().saturating_sub(1)] {
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(idx) = value
+            .get(cursor..end)
+            .and_then(|window| window.find(segment))
+        else {
+            return false;
+        };
+        cursor += idx + segment.len();
+    }
+    true
+}
+
 fn status_verbosity_value(
     table: &toml::value::Table,
     key: &str,
@@ -2401,6 +2906,7 @@ impl SourceSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LanguageKind {
+    Go,
     Java,
     Python,
     Rust,
@@ -2413,6 +2919,7 @@ pub enum SymbolKind {
     Class,
     Crate,
     File,
+    Interface,
     Module,
     Struct,
     Enum,

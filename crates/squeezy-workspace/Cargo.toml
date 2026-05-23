@@ -8,5 +8,6 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+globset.workspace = true
 ignore.workspace = true
 squeezy-core.workspace = true
