@@ -147,6 +147,39 @@ async fn grep_files_with_matches_mode_returns_unique_paths() {
 }
 
 #[tokio::test]
+async fn grep_keeps_scanning_after_large_truncated_file() {
+    let root = temp_workspace("grep_large_first");
+    fs::write(
+        root.join("a_large.txt"),
+        format!("{}needle", "x".repeat(256)),
+    )
+    .expect("write large");
+    fs::write(root.join("z_match.txt"), "needle\n").expect("write match");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({
+                    "pattern": "needle",
+                    "output_mode": "files_with_matches",
+                    "max_bytes_per_file": 8,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["paths"], json!(["z_match.txt"]));
+    assert!(result.cost_hint.truncated);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_file_returns_bounded_content_and_hash() {
     let root = temp_workspace("read_file");
     fs::write(root.join("sample.txt"), "abcdef").expect("write sample");
@@ -173,6 +206,41 @@ async fn read_file_returns_bounded_content_and_hash() {
         result.receipt.content_sha256,
         Some(sha256_hex("abcdef".as_bytes()))
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn secret_name_checks_use_workspace_relative_paths() {
+    let root = temp_workspace("secret_parent");
+    fs::write(root.join("plain.txt"), "visible").expect("write plain");
+    fs::write(root.join("secret.txt"), "hidden").expect("write secret");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let plain = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "plain.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plain.status, ToolStatus::Success);
+    assert_eq!(plain.content["content"], "visible");
+
+    let secret = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "secret.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(secret.status, ToolStatus::Denied);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -320,6 +388,57 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "abc");
     assert_eq!(result.content["exit_code"], 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_output_cap_is_enforced_while_command_runs() {
+    let root = temp_workspace("shell_cap");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "yes x | head -c 200000",
+                    "output_byte_cap": 1024,
+                    "description": "large output"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content["stdout"].as_str().expect("stdout").len() <= 1024);
+    assert_eq!(result.content["truncated"], true);
+    let stdout_len = result.content["stdout"].as_str().expect("stdout").len();
+    let stderr_len = result.content["stderr"].as_str().expect("stderr").len();
+    assert!(stdout_len + stderr_len <= 1024);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_call_description_includes_actual_command() {
+    let root = temp_workspace("shell_description");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let call = ToolCall {
+        call_id: "call_1".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "rm -rf target",
+            "description": "list files"
+        }),
+    };
+
+    let description = registry.describe_call(&call);
+
+    assert!(description.contains("list files"));
+    assert!(description.contains("rm -rf target"));
 
     let _ = fs::remove_dir_all(root);
 }

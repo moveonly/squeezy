@@ -5,6 +5,8 @@ use thiserror::Error;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
@@ -37,15 +39,45 @@ impl AppConfig {
         Self::from_env_vars(|name| env::var(name).ok())
     }
 
+    pub fn from_env_with_provider(provider: &str) -> Self {
+        Self::from_env_vars(|name| {
+            if name == "SQUEEZY_PROVIDER" {
+                Some(provider.to_string())
+            } else {
+                env::var(name).ok()
+            }
+        })
+    }
+
     fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
-        let model = var("SQUEEZY_MODEL").unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string());
-        let base_url =
-            var("OPENAI_BASE_URL").unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string());
+        let provider_name = var("SQUEEZY_PROVIDER")
+            .unwrap_or_else(|| "openai".to_string())
+            .trim()
+            .to_ascii_lowercase();
+        let provider = match provider_name.as_str() {
+            "anthropic" | "claude" => ProviderConfig::Anthropic(AnthropicConfig {
+                api_key_env: "ANTHROPIC_API_KEY".to_string(),
+                base_url: var("ANTHROPIC_BASE_URL")
+                    .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
+            }),
+            _ => ProviderConfig::OpenAi(OpenAiConfig {
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                base_url: var("OPENAI_BASE_URL")
+                    .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+            }),
+        };
+        let default_model = match &provider {
+            ProviderConfig::OpenAi(_) => DEFAULT_OPENAI_MODEL,
+            ProviderConfig::Anthropic(_) => DEFAULT_ANTHROPIC_MODEL,
+        };
+        let model = var("SQUEEZY_MODEL").unwrap_or_else(|| default_model.to_string());
         let exa_mcp_url =
             var("SQUEEZY_EXA_MCP_URL").unwrap_or_else(|| DEFAULT_EXA_MCP_URL.to_string());
         let exa_api_key_env =
             var("SQUEEZY_EXA_API_KEY_ENV").unwrap_or_else(|| DEFAULT_EXA_API_KEY_ENV.to_string());
-        let store_responses = parse_bool(var("SQUEEZY_STORE_RESPONSES").as_deref());
+        let requested_store_responses = parse_bool(var("SQUEEZY_STORE_RESPONSES").as_deref());
+        let store_responses =
+            requested_store_responses && matches!(provider, ProviderConfig::OpenAi(_));
         let max_parallel_tools = var("SQUEEZY_MAX_PARALLEL_TOOLS")
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
@@ -67,10 +99,7 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_TOOL_OUTPUT_RETENTION_DAYS);
         Self {
-            provider: ProviderConfig::OpenAi(OpenAiConfig {
-                api_key_env: "OPENAI_API_KEY".to_string(),
-                base_url,
-            }),
+            provider,
             model,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens: Some(DEFAULT_MAX_OUTPUT_TOKENS),
@@ -98,10 +127,17 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderConfig {
     OpenAi(OpenAiConfig),
+    Anthropic(AnthropicConfig),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiConfig {
+    pub api_key_env: String,
+    pub base_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnthropicConfig {
     pub api_key_env: String,
     pub base_url: String,
 }

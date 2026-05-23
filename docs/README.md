@@ -16,7 +16,7 @@ Current completed decisions:
 - LSP and `rust-analyzer` are not part of navigation; use toolchain/compiler commands only for build, test, and explicit verification.
 - Runtime graph state starts in memory; persisted graph/cache will use `redb`; Tantivy is deferred for later full-text ranking.
 
-Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shape is OpenAI Responses streaming. Graph-backed navigation is still future work.
+Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shapes are OpenAI Responses streaming and Anthropic Messages streaming. Graph-backed navigation is still future work.
 
 Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
 
@@ -25,3 +25,5 @@ Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-c
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
 
 Platform support details live in `docs/PLATFORMS.md`.
+
+Validation harness details live in `docs/VALIDATION_HARNESS.md`.

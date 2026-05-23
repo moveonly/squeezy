@@ -32,8 +32,9 @@ model-facing tool output compact enough to be useful.
   discovery through a configurable Exa MCP endpoint, and `webfetch` retrieves
   specific HTTP(S) URLs with bounded response sizes, text/HTML shaping, content
   receipts, host-visible approval summaries, and cross-host redirect stops.
-- **Provider tool calls.** The OpenAI Responses provider exposes documented
-  function tools and feeds tool outputs back into the model loop.
+- **Provider tool calls.** The OpenAI Responses and Anthropic Messages providers
+  expose documented function tools and feed tool outputs back into the model
+  loop.
 
 ## Runtime Knobs
 

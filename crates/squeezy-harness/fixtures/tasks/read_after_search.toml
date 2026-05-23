@@ -1,0 +1,42 @@
+id = "read-after-search"
+title = "Answer from a file after locating it"
+prompt = "What is the exact status string for healthy startup?"
+
+[expect]
+contains = ["squeezy: ok"]
+
+[[workspace.files]]
+path = "src/health.rs"
+content = "pub const HEALTH: &str = \"squeezy: ok\";\n"
+
+[[workspace.files]]
+path = "src/main.rs"
+content = "fn main() {}\n"
+
+[mock.openai]
+[[mock.openai.events]]
+kind = "started"
+[[mock.openai.events]]
+kind = "text_delta"
+text = "The healthy startup status is squeezy: ok."
+[[mock.openai.events]]
+kind = "completed"
+input_tokens = 45
+output_tokens = 9
+
+[mock.anthropic]
+[[mock.anthropic.events]]
+kind = "started"
+[[mock.anthropic.events]]
+kind = "text_delta"
+text = "The healthy startup status is squeezy: ok."
+[[mock.anthropic.events]]
+kind = "completed"
+input_tokens = 44
+output_tokens = 9
+
+[baseline]
+pattern = "HEALTH"
+include = ["*.rs"]
+mode = "read"
+read_path = "src/health.rs"

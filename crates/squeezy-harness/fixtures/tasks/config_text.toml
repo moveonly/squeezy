@@ -1,0 +1,41 @@
+id = "config-text"
+title = "Find a config key"
+prompt = "Which file sets max_parallel_tools?"
+
+[expect]
+contains = ["config/app.toml"]
+
+[[workspace.files]]
+path = "config/app.toml"
+content = "max_parallel_tools = 8\n"
+
+[[workspace.files]]
+path = "src/lib.rs"
+content = "pub fn configure() {}\n"
+
+[mock.openai]
+[[mock.openai.events]]
+kind = "started"
+[[mock.openai.events]]
+kind = "text_delta"
+text = "config/app.toml sets max_parallel_tools."
+[[mock.openai.events]]
+kind = "completed"
+input_tokens = 34
+output_tokens = 7
+
+[mock.anthropic]
+[[mock.anthropic.events]]
+kind = "started"
+[[mock.anthropic.events]]
+kind = "text_delta"
+text = "config/app.toml sets max_parallel_tools."
+[[mock.anthropic.events]]
+kind = "completed"
+input_tokens = 33
+output_tokens = 7
+
+[baseline]
+pattern = "max_parallel_tools"
+include = ["*.toml"]
+mode = "paths"

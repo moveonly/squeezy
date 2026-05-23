@@ -76,6 +76,7 @@ cargo test --workspace --all-targets
 CC_x86_64_unknown_linux_musl=musl-gcc \
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld \
 cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
+cargo run -p squeezy-harness -- run --jsonl target/harness.jsonl
 python3 scripts/check_test_layout.py
 ```
 
@@ -87,7 +88,15 @@ OPENAI_API_KEY=... \
 cargo test -p squeezy-llm --features costly-tests --test openai_costly -- --ignored
 ```
 
-Use `SQUEEZY_COSTLY_MODEL=gpt-5-mini` to test a different cheap model. The default costly model is `gpt-5-nano`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke run is truncated by the provider before returning the expected text.
+Run the Anthropic costly smoke test with:
+
+```sh
+SQUEEZY_RUN_COSTLY_TESTS=1 \
+ANTHROPIC_API_KEY=... \
+cargo test -p squeezy-llm --features costly-tests --test anthropic_costly -- --ignored
+```
+
+Use `SQUEEZY_COSTLY_OPENAI_MODEL` or `SQUEEZY_COSTLY_ANTHROPIC_MODEL` to test a different cheap model for one provider. `SQUEEZY_COSTLY_MODEL` is the shared fallback. The default costly OpenAI model is `gpt-5-nano`; the default costly Anthropic model is `claude-3-5-haiku-20241022`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke run is truncated by the provider before returning the expected text.
 
 ## Clippy and Formatting
 

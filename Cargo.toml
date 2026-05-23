@@ -4,6 +4,7 @@ members = [
     "crates/squeezy-cli",
     "crates/squeezy-core",
     "crates/squeezy-graph",
+    "crates/squeezy-harness",
     "crates/squeezy-llm",
     "crates/squeezy-parse",
     "crates/squeezy-rank",
@@ -37,8 +38,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
+toml = "0.5.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
@@ -47,6 +49,7 @@ tree-sitter-rust = "0.24"
 squeezy-agent = { path = "crates/squeezy-agent" }
 squeezy-core = { path = "crates/squeezy-core" }
 squeezy-graph = { path = "crates/squeezy-graph" }
+squeezy-harness = { path = "crates/squeezy-harness" }
 squeezy-llm = { path = "crates/squeezy-llm" }
 squeezy-parse = { path = "crates/squeezy-parse" }
 squeezy-tools = { path = "crates/squeezy-tools" }
