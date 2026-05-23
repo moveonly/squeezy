@@ -51,7 +51,7 @@ The planned crate layout should separate:
 
 Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
-Integration-test fixtures and reusable test artifacts belong under `tests/artifacts/`; do not add top-level `examples/` directories for them.
+Integration-test fixtures and reusable test artifacts belong under the owning crate's `tests/artifacts/` directory. If a fixture is crate-specific, keep it inside that crate (e.g. `crates/squeezy-tools/tests/artifacts/`). Do not add top-level `examples/` directories or a workspace-level `tests/artifacts/` for crate-specific fixtures.
 
 ## Test Layout
 

@@ -193,6 +193,8 @@ pub struct ToolResult {
     pub content: Value,
     pub cost_hint: ToolCostHint,
     pub receipt: ToolReceipt,
+    #[serde(skip)]
+    pub spill_model_output: Option<String>,
 }
 
 impl ToolResult {
@@ -206,6 +208,11 @@ impl ToolResult {
             })
             .to_string()
         })
+    }
+
+    pub fn with_spill_model_output(mut self, output: String) -> Self {
+        self.spill_model_output = Some(output);
+        self
     }
 
     pub fn denied(call: &ToolCall, reason: impl Into<String>) -> Self {
@@ -2136,6 +2143,7 @@ impl ToolRegistry {
         };
         let scope = args.scope.unwrap_or_default();
         let level = args.level.unwrap_or_default();
+        let output_mode = args.output_mode.unwrap_or_default();
         let snapshot = self.diff_snapshot(DiffMode::Worktree, DiffOptions::default());
         let changed_paths = snapshot
             .files
@@ -2188,6 +2196,7 @@ impl ToolRegistry {
                 "description": "run verification scoped by current diff",
                 "timeout_ms": VERIFY_SHELL_TIMEOUT_MS,
                 "output_byte_cap": DEFAULT_SHELL_OUTPUT_BYTE_CAP,
+                "output_mode": output_mode.as_str(),
             }),
         };
         let shell_result = self
@@ -2475,9 +2484,14 @@ impl ToolRegistry {
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
         let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+        let redacted_stdout = self.redactor.redact(&stdout);
+        let redacted_stderr = self.redactor.redact(&stderr);
+        let stdout = redacted_stdout.text;
+        let stderr = redacted_stderr.text;
         let truncated = stdout_truncated || stderr_truncated || timed_out;
         let cost = ToolCostHint {
             output_bytes: (stdout.len() + stderr.len()) as u64,
+            redactions: redacted_stdout.redactions + redacted_stderr.redactions,
             truncated,
             ..ToolCostHint::default()
         };
@@ -2533,7 +2547,7 @@ impl ToolRegistry {
         );
         self.invalidate_diff_cache();
 
-        let mut content = json!({
+        let mut raw_content = json!({
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
             "exit_code": exit_code,
@@ -2560,14 +2574,43 @@ impl ToolRegistry {
             },
         });
         self.append_checkpoint_to_content(
-            &mut content,
+            &mut raw_content,
             &checkpoint_before,
             call,
             group_id,
             status,
             coverage_warnings,
         );
-        make_result(call, status, content, cost, None)
+        let raw_result = make_result(call, status, raw_content.clone(), cost.clone(), None);
+        let raw_output = raw_result.model_output();
+        let raw_output_sha256 = raw_result.receipt.output_sha256.clone();
+        if !args.output_mode.unwrap_or_default().is_shaped() {
+            return raw_result;
+        }
+
+        let shaped = shape_shell_output(&args.command, &stdout, &stderr, truncated, exit_code);
+        let mut content = raw_content;
+        if let Some(object) = content.as_object_mut() {
+            object.insert("stdout".to_string(), json!(shaped.stdout));
+            object.insert("stderr".to_string(), json!(shaped.stderr));
+            object.insert(
+                "output_shape".to_string(),
+                json!({
+                    "mode": "shaped",
+                    "family": shaped.family,
+                    "kind": shaped.kind,
+                    "raw_stdout_bytes": stdout.len(),
+                    "raw_stderr_bytes": stderr.len(),
+                    "shaped_stdout_bytes": shaped.stdout.len(),
+                    "shaped_stderr_bytes": shaped.stderr.len(),
+                    "raw_output_sha256": raw_output_sha256.clone(),
+                    "fallback_reason": shaped.fallback_reason,
+                }),
+            );
+        }
+        let mut shaped_result = make_result(call, status, content, cost, None);
+        shaped_result.receipt.output_sha256 = raw_output_sha256;
+        shaped_result.with_spill_model_output(raw_output)
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -2905,6 +2948,461 @@ fn insert_content_field(content: &mut Value, key: &str, value: Value) {
     }
 }
 
+#[derive(Debug)]
+struct ShapedShellOutput {
+    stdout: String,
+    stderr: String,
+    family: &'static str,
+    kind: &'static str,
+    fallback_reason: Option<String>,
+}
+
+fn shape_shell_output(
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    truncated: bool,
+    exit_code: Option<i32>,
+) -> ShapedShellOutput {
+    let family = shell_output_family(command);
+    if let Some((stdout, stderr)) = structured_shell_output(family, stdout, stderr) {
+        return ShapedShellOutput {
+            stdout,
+            stderr,
+            family,
+            kind: "structured",
+            fallback_reason: None,
+        };
+    }
+
+    let fallback_reason = structured_family(family)
+        .then(|| format!("{family} structured output was unavailable or could not be parsed"));
+    ShapedShellOutput {
+        stdout: shape_unstructured_stream(stdout, truncated, exit_code),
+        stderr: shape_unstructured_stream(stderr, truncated, exit_code),
+        family,
+        kind: if fallback_reason.is_some() {
+            "raw_passthrough_shaped"
+        } else {
+            "line_shaper"
+        },
+        fallback_reason,
+    }
+}
+
+fn shell_output_family(command: &str) -> &'static str {
+    let command = collapse_whitespace(command);
+    let segments = shell_segments(&command);
+    let prefixes = segments
+        .iter()
+        .map(|segment| shell_command_prefix(segment))
+        .collect::<Vec<_>>();
+    if prefixes.iter().any(|prefix| prefix == "cargo nextest") {
+        "nextest"
+    } else if prefixes.iter().any(|prefix| prefix.starts_with("cargo ")) {
+        "cargo"
+    } else if prefixes.iter().any(|prefix| prefix == "rustc") {
+        "rustc"
+    } else if prefixes.iter().any(|prefix| prefix == "pytest") {
+        "pytest"
+    } else if prefixes.iter().any(|prefix| prefix == "jest")
+        || segments
+            .iter()
+            .any(|segment| shell_segment_contains_command(segment, "jest"))
+    {
+        "jest"
+    } else if prefixes.iter().any(|prefix| prefix == "vitest")
+        || segments
+            .iter()
+            .any(|segment| shell_segment_contains_command(segment, "vitest"))
+    {
+        "vitest"
+    } else {
+        "shell"
+    }
+}
+
+fn shell_segment_contains_command(segment: &str, command: &str) -> bool {
+    segment.split_whitespace().any(|word| {
+        let word = word.trim_matches(|ch| matches!(ch, '\'' | '"' | '(' | ')' | ';'));
+        word == command || word.ends_with(&format!("/{command}"))
+    })
+}
+
+fn structured_family(family: &str) -> bool {
+    matches!(
+        family,
+        "cargo" | "rustc" | "nextest" | "pytest" | "jest" | "vitest"
+    )
+}
+
+fn structured_shell_output(family: &str, stdout: &str, stderr: &str) -> Option<(String, String)> {
+    match family {
+        "cargo" | "rustc" => parse_cargo_or_rustc_json(stdout, stderr),
+        "nextest" => parse_nextest_json(stdout, stderr),
+        "pytest" | "jest" | "vitest" => parse_test_report_json(stdout, stderr, family),
+        _ => None,
+    }
+}
+
+fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
+    let mut kept = Vec::new();
+    let mut plain_lines = Vec::new();
+    let mut parsed = 0usize;
+    let mut finished = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            // Cargo emits libtest's plain-text harness output (e.g. "test result:
+            // FAILED.", panic backtraces, "FAILED" markers) interleaved with the
+            // JSON stream. Preserve those signal lines so shaped output still
+            // surfaces test failures.
+            if libtest_signal_line(line) {
+                plain_lines.push(trim_shaped_block(line.trim_end(), 4_000));
+            }
+            continue;
+        };
+        parsed += 1;
+        match value.get("reason").and_then(Value::as_str) {
+            Some("compiler-message") => {
+                let Some(message) = value.get("message") else {
+                    continue;
+                };
+                let level = message
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("note");
+                if !matches!(level, "error" | "warning" | "failure-note") {
+                    continue;
+                }
+                let text = message
+                    .get("rendered")
+                    .and_then(Value::as_str)
+                    .or_else(|| message.get("message").and_then(Value::as_str))
+                    .unwrap_or("");
+                if !text.trim().is_empty() {
+                    kept.push(trim_shaped_block(text, 4_000));
+                }
+            }
+            Some("build-finished") => {
+                finished = value
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .map(|success| format!("build-finished success={success}"));
+            }
+            _ => {}
+        }
+        if value.get("reason").is_none()
+            && let Some(level) = value.get("level").and_then(Value::as_str)
+            && matches!(level, "error" | "warning")
+        {
+            let text = value
+                .get("rendered")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .unwrap_or("");
+            if !text.trim().is_empty() {
+                kept.push(trim_shaped_block(text, 4_000));
+            }
+        }
+    }
+    // Only claim structured output when at least one JSON line actually
+    // parsed. Plain libtest text on its own should fall through to the
+    // unstructured shaper, which preserves dedupe markers and noise accounting.
+    if parsed == 0 {
+        return None;
+    }
+    if let Some(finished) = finished {
+        kept.push(finished);
+    }
+    kept.extend(plain_lines);
+    Some((join_shaped_lines(kept), String::new()))
+}
+
+fn libtest_signal_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("test result:")
+        || lower.starts_with("failures:")
+        || lower.starts_with("thread '") && lower.contains("panicked")
+        || lower.starts_with("panicked at")
+        || lower.contains(" ... failed")
+        || lower.starts_with("error: test failed")
+        || lower.starts_with("error: ")
+        || lower.starts_with("warning: ")
+        || lower.starts_with("---- ") && lower.contains(" stdout ----")
+}
+
+fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
+    let mut kept = Vec::new();
+    let mut parsed = 0usize;
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut last_summary: Option<Value> = None;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        parsed += 1;
+        let event = value
+            .get("type")
+            .or_else(|| value.get("event"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+        let status_lower = status.to_ascii_lowercase();
+        let event_lower = event.to_ascii_lowercase();
+        let is_per_test_finish = event_lower.contains("test")
+            && (event_lower.contains("finish") || event_lower.contains("complete"));
+        if is_per_test_finish || !status.is_empty() {
+            total += 1;
+            if status_lower.contains("pass") || status_lower == "ok" {
+                passed += 1;
+            } else if status_lower.contains("fail") || status_lower.contains("error") {
+                failed += 1;
+            } else if status_lower.contains("skip") || status_lower.contains("ignore") {
+                skipped += 1;
+            }
+        }
+        if event_lower.contains("summary") || event_lower.contains("run-finished") {
+            last_summary = Some(value.clone());
+        }
+        if line_has_signal(event) || line_has_signal(status) || value_contains_signal(&value) {
+            kept.push(trim_shaped_block(&value.to_string(), 4_000));
+        }
+    }
+    if parsed == 0 {
+        return None;
+    }
+    let mut summary_parts = vec!["family=nextest".to_string()];
+    if total > 0 {
+        summary_parts.push(format!(
+            "total={total} passed={passed} failed={failed} skipped={skipped}"
+        ));
+    }
+    if let Some(summary) = last_summary {
+        summary_parts.push(trim_shaped_block(&summary.to_string(), 4_000));
+    }
+    kept.insert(0, summary_parts.join(" "));
+    Some((join_shaped_lines(kept), String::new()))
+}
+
+fn parse_test_report_json(stdout: &str, stderr: &str, family: &str) -> Option<(String, String)> {
+    // jest/pytest/vitest emit a single JSON document on either stdout or
+    // stderr. Combining them with a newline produces invalid JSON when both
+    // streams have content (e.g. npm warnings on stderr alongside a real
+    // report on stdout), so try each stream individually.
+    let value = parse_first_valid_json(stdout).or_else(|| parse_first_valid_json(stderr))?;
+    let mut kept = Vec::new();
+    collect_json_signal_lines(&value, "$", &mut kept);
+    let summary = json_test_summary(&value, family);
+    if !summary.is_empty() {
+        kept.insert(0, summary);
+    }
+    Some((join_shaped_lines(kept), String::new()))
+}
+
+fn parse_first_valid_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    // Fall back to scanning for the first line that parses as JSON, so a
+    // header line ("Running tests...") or trailer doesn't defeat the parser.
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+}
+
+fn json_test_summary(value: &Value, family: &str) -> String {
+    let mut parts = vec![format!("family={family}")];
+    for key in [
+        "success",
+        "numFailedTests",
+        "numPassedTests",
+        "numTotalTests",
+        "failed",
+        "passed",
+        "total",
+        "exitCode",
+    ] {
+        if let Some(value) = value.get(key)
+            && (value.is_boolean() || value.is_number() || value.is_string())
+        {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    if parts.len() == 1 {
+        String::new()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn collect_json_signal_lines(value: &Value, path: &str, kept: &mut Vec<String>) {
+    match value {
+        Value::String(text) if line_has_signal(text) => {
+            kept.push(trim_shaped_block(&format!("{path}: {text}"), 4_000));
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                collect_json_signal_lines(item, &format!("{path}[{index}]"), kept);
+            }
+        }
+        Value::Object(entries) => {
+            for (key, value) in entries {
+                let next = format!("{path}.{key}");
+                if line_has_signal(key) && value.is_string() {
+                    kept.push(trim_shaped_block(&format!("{next}: {value}"), 4_000));
+                }
+                collect_json_signal_lines(value, &next, kept);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn value_contains_signal(value: &Value) -> bool {
+    match value {
+        Value::String(text) => line_has_signal(text),
+        Value::Array(items) => items.iter().any(value_contains_signal),
+        Value::Object(entries) => entries
+            .iter()
+            .any(|(key, value)| line_has_signal(key) || value_contains_signal(value)),
+        _ => false,
+    }
+}
+
+fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    const HEAD_BUDGET: usize = 20;
+    const TAIL_BUDGET: usize = 20;
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_BUDGET);
+    let mut signal_lines: Vec<String> = Vec::new();
+    let mut dropped = 0usize;
+    let mut last_emitted: String = String::new();
+    let mut repeats = 0usize;
+    let flush_repeats =
+        |target: &mut Vec<String>, repeats: &mut usize, tail: &mut VecDeque<String>| {
+            if *repeats == 0 {
+                return;
+            }
+            let line = format!("[repeated previous line {} more times]", *repeats);
+            if target.len() < HEAD_BUDGET {
+                target.push(line);
+            } else {
+                if tail.len() == TAIL_BUDGET {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            *repeats = 0;
+        };
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || line_is_noise(trimmed) {
+            dropped += 1;
+            continue;
+        }
+        if trimmed == last_emitted.as_str() {
+            repeats += 1;
+            dropped += 1;
+            continue;
+        }
+        flush_repeats(&mut head, &mut repeats, &mut tail);
+        last_emitted = trimmed.to_string();
+        let shaped = trim_shaped_block(trimmed, 2_000);
+        if line_has_signal(trimmed) {
+            signal_lines.push(shaped);
+        } else if head.len() < HEAD_BUDGET {
+            head.push(shaped);
+        } else {
+            if tail.len() == TAIL_BUDGET {
+                tail.pop_front();
+                dropped += 1;
+            }
+            tail.push_back(shaped);
+        }
+    }
+    flush_repeats(&mut head, &mut repeats, &mut tail);
+
+    let mut kept = head;
+    if !signal_lines.is_empty() {
+        kept.extend(signal_lines);
+    }
+    if !tail.is_empty() {
+        kept.extend(tail);
+    }
+    if dropped > 0 {
+        kept.push(format!("[dropped {dropped} low-signal lines]"));
+    }
+    if truncated {
+        kept.push("[raw stream was truncated]".to_string());
+    }
+    if let Some(exit_code) = exit_code
+        && exit_code != 0
+        && !kept.iter().any(|line| line.contains("exit_code="))
+    {
+        kept.push(format!("exit_code={exit_code}"));
+    }
+    join_shaped_lines(kept)
+}
+
+fn line_is_noise(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.starts_with("downloading ")
+        || lower.starts_with("downloaded ")
+        || lower.starts_with("compiling ")
+        || lower.starts_with("checking ")
+        || lower.starts_with("building ")
+        || lower.starts_with("fresh ")
+        || lower.starts_with("running ")
+        || lower.contains("[          ]")
+        || lower.contains("[==========]")
+        || lower.contains("[----------]")
+}
+
+fn line_has_signal(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("warning")
+        || lower.contains("fail")
+        || lower.contains("panic")
+        || lower.contains("status")
+        || lower.contains("exit")
+        || lower.contains("passed")
+        || lower.contains("test result")
+        || lower.starts_with("finished ")
+}
+
+fn trim_shaped_block(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.trim().to_string();
+    }
+    let mut output = text.chars().take(max_chars).collect::<String>();
+    output.push_str("\n[truncated shaped block]");
+    output
+}
+
+fn join_shaped_lines(lines: Vec<String>) -> String {
+    lines
+        .into_iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn checkpoint_status_label(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Success => "success",
@@ -3016,11 +3514,15 @@ impl ToolOutputStore {
     }
 
     fn maybe_spill(&self, mut result: ToolResult) -> ToolResult {
-        let output = result.model_output();
-        if output.len() <= self.spill_threshold_bytes {
+        let model_output = result.model_output();
+        if model_output.len() <= self.spill_threshold_bytes {
             return result;
         }
 
+        let output = result
+            .spill_model_output
+            .take()
+            .unwrap_or_else(|| model_output.clone());
         let sha256 = sha256_hex(output.as_bytes());
         let path = self.path_for(&sha256);
         if let Err(err) = fs::write(&path, output.as_bytes()) {
@@ -3032,7 +3534,7 @@ impl ToolOutputStore {
             return result;
         }
 
-        let (preview, _) = truncate_to_bytes(&output, self.preview_bytes);
+        let (preview, _) = truncate_to_bytes(&model_output, self.preview_bytes);
         let ToolResult {
             call_id,
             tool_name,
@@ -3040,6 +3542,7 @@ impl ToolOutputStore {
             content: _,
             mut cost_hint,
             receipt,
+            spill_model_output: _,
         } = result;
         let original_output_sha256 = receipt.output_sha256;
         let content_sha256 = receipt.content_sha256;
@@ -4283,6 +4786,7 @@ struct SymbolContextArgs {
 struct VerifyArgs {
     scope: Option<VerifyScope>,
     level: Option<VerifyLevel>,
+    output_mode: Option<OutputMode>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -4299,6 +4803,27 @@ enum VerifyLevel {
     #[default]
     Quick,
     Full,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum OutputMode {
+    #[default]
+    Shaped,
+    Raw,
+}
+
+impl OutputMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shaped => "shaped",
+            Self::Raw => "raw",
+        }
+    }
+
+    const fn is_shaped(self) -> bool {
+        matches!(self, Self::Shaped)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4329,6 +4854,7 @@ struct ShellArgs {
     workdir: Option<String>,
     timeout_ms: Option<u64>,
     output_byte_cap: Option<usize>,
+    output_mode: Option<OutputMode>,
     description: Option<String>,
 }
 
@@ -4541,15 +5067,20 @@ fn verify_command(
     changed_paths: &[String],
 ) -> String {
     let test_command = match scope {
-        VerifyScope::Workspace => "cargo test --workspace".to_string(),
+        VerifyScope::Workspace => "cargo test --workspace --message-format=json".to_string(),
         VerifyScope::Diff => {
             let packages = diff_package_names(root, changed_paths);
             if packages.is_empty() {
-                "cargo test --workspace".to_string()
+                "cargo test --workspace --message-format=json".to_string()
             } else {
                 packages
                     .into_iter()
-                    .map(|package| format!("cargo test -p {}", shell_quote(&package)))
+                    .map(|package| {
+                        format!(
+                            "cargo test -p {} --message-format=json",
+                            shell_quote(&package)
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" && ")
             }
@@ -4558,7 +5089,7 @@ fn verify_command(
     match level {
         VerifyLevel::Quick => test_command,
         VerifyLevel::Full => format!(
-            "cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && {test_command}"
+            "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && {test_command}"
         ),
     }
 }
@@ -4721,6 +5252,7 @@ fn make_result(
             output_sha256: sha256_hex(&output),
             content_sha256,
         },
+        spill_model_output: None,
     }
 }
 
@@ -5790,6 +6322,7 @@ fn shell_spec() -> ToolSpec {
                 "workdir": {"type": "string", "description": "Workspace-relative working directory.", "default": "."},
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
+                "output_mode": {"type": "string", "enum": ["shaped", "raw"], "description": "Return compact shaped output or raw stdout/stderr. Default shaped."},
                 "description": {"type": "string", "description": "Short reason this command is needed."}
             },
             "required": ["command", "description"]
@@ -5807,7 +6340,8 @@ fn verify_spec() -> ToolSpec {
             "additionalProperties": false,
             "properties": {
                 "scope": {"type": "string", "enum": ["diff", "workspace"], "description": "Verification scope. Default diff."},
-                "level": {"type": "string", "enum": ["quick", "full"], "description": "quick runs tests; full adds fmt and clippy. Default quick."}
+                "level": {"type": "string", "enum": ["quick", "full"], "description": "quick runs tests; full adds fmt and clippy. Default quick."},
+                "output_mode": {"type": "string", "enum": ["shaped", "raw"], "description": "Return compact shaped output or raw stdout/stderr. Default shaped."}
             }
         }),
     }
