@@ -419,6 +419,48 @@ fn crawler_classifies_python_files() {
 }
 
 #[test]
+fn crawler_classifies_go_files() {
+    let root = temp_root("crawler_classifies_go_files");
+    fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "main.go")
+            .unwrap()
+            .language,
+        LanguageKind::Go
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn crawler_indexes_internal_symlinked_source_files() {
+    let root = temp_root("crawler_indexes_internal_symlinked_source_files");
+    fs::create_dir_all(root.join("real")).unwrap();
+    fs::create_dir_all(root.join("linked")).unwrap();
+    fs::write(root.join("real").join("example.go"), "package linked\n").unwrap();
+    std::os::unix::fs::symlink(
+        root.join("real").join("example.go"),
+        root.join("linked").join("example.go"),
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.files.iter().any(|file| {
+        file.relative_path == "linked/example.go" && file.language == LanguageKind::Go
+    }));
+}
+
+#[test]
 fn crawler_skips_roots_without_code_signals() {
     let root = temp_root("crawler_skips_roots_without_code_signals");
     fs::write(root.join("notes.txt"), "plain notes\n").unwrap();
