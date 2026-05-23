@@ -34,7 +34,14 @@ wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "all"
 allow = []
-deny = []
+# Keep `indexmap` < 2.14 until `ratatui-core` upgrades off `hashbrown` 0.16.
+# `indexmap` 2.14 bumped its `hashbrown` dep to 0.17, which would coexist
+# with the 0.16 still pinned by the `ratatui` 0.30 stack and break the
+# `multiple-versions = "deny"` rule above. Revisit when `ratatui-core` moves
+# to `hashbrown` 0.17 (or any later compatible version).
+deny = [
+    { crate = "indexmap:>=2.14", reason = "Pulls in hashbrown 0.17 which duplicates the 0.16 pinned by ratatui-core; remove when ratatui-core upgrades hashbrown." },
+]
 skip = []
 skip-tree = []
 
