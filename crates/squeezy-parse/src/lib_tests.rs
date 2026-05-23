@@ -79,32 +79,40 @@ fn parser_extracts_python_symbols_imports_calls_and_references() {
 from services.greeter import Greeter as GreeterAlias
 import helpers
 
+__all__ = ["Runner"]
+
 class Runner(GreeterAlias):
+    """Runs greetings."""
+
     @decorator
-    def run(self, name: str) -> str:
+    @router.get("/hello")
+    def run(self, name: GreeterAlias) -> GreeterAlias:
         helper = helpers.build(name)
         return self.greet(helper)
 
+RunnerAlias = Runner
+
 def make_runner():
-    return Runner()
+    runner = RunnerAlias()
+    return runner.run("Ada")
 "#;
     let mut parser = RustParser::new().unwrap();
     let record = python_record("src/app.py", source);
     let parsed = parser.parse_source(&record, source.to_string()).unwrap();
 
     assert!(parsed.unsupported.is_none());
-    assert!(
-        parsed
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
-    );
-    assert!(
-        parsed
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
-    );
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "Runner"
+        && symbol.kind == SymbolKind::Class
+        && symbol.attributes.contains(&"base:GreeterAlias".to_string())
+        && symbol.docs.iter().any(|doc| doc.contains("Runs greetings"))));
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "run"
+            && symbol.kind == SymbolKind::Method
+            && symbol.attributes.contains(&"route:GET".to_string())
+            && symbol
+                .attributes
+                .contains(&"framework:web-route".to_string())
+    }));
     assert!(
         parsed
             .symbols
@@ -120,16 +128,37 @@ def make_runner():
     );
     assert!(
         parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Runner" && import.is_reexport)
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "Runner"
+                && import.alias.as_deref() == Some("RunnerAlias"))
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "RunnerAlias"
+                && import.alias.as_deref() == Some("runner"))
+    );
+    assert!(
+        parsed
             .calls
             .iter()
             .any(|call| call.name == "build" && call.kind == ParsedCallKind::Method)
     );
-    assert!(parsed.calls.iter().any(|call| call.name == "Runner"));
+    assert!(parsed.calls.iter().any(|call| call.name == "RunnerAlias"));
     assert!(
         parsed
             .references
             .iter()
-            .any(|reference| reference.text == "GreeterAlias")
+            .any(|reference| reference.text == "GreeterAlias"
+                && reference.kind == ReferenceKind::Type)
     );
 }
 

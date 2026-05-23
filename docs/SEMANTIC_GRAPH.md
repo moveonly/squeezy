@@ -11,7 +11,8 @@ navigation questions before the model reads raw files.
 - Rust declarations: modules, structs, enums, unions, traits, impls, functions,
   methods, consts, statics, type aliases, macros, and tests.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
-  and references from `.py` files.
+  docstrings, class bases, type annotations, exports, aliases, and references
+  from `.py` files.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
 - Edges: containment, imports/reexports, references, calls, and macro
@@ -60,9 +61,24 @@ decision instead of walking a likely non-code or dangerous directory.
   treat affected results as lower-confidence until compiler facts land in the
   later compiler-as-fact epic.
 - Python constructor calls resolve to local class declarations when the class is
-  same-file or imported unambiguously. Dynamic attributes, metaclasses, runtime
-  import side effects, and type-inferred receiver dispatch remain heuristic or
-  external.
+  same-file or imported unambiguously. `import x as y`, `from x import y as z`,
+  relative-looking import strings, package `__init__.py` reexports, `__all__`,
+  and simple assignments such as `Alias = Real` or `obj = ClassName()` feed the
+  same import/alias resolver.
+- Python method calls use confidence-ranked heuristics: same class first,
+  inherited local classes next, constructor-derived receiver aliases after that,
+  and imported module-qualified functions such as `helpers.build()` when the
+  target file path matches the imported module.
+- Python class bases and function annotations are indexed as type references.
+  Annotation facts are soft evidence only; no mypy-style type solving, generic
+  constraint solving, or runtime import execution is attempted.
+- Python decorators are kept as raw attributes and tagged for common semantics:
+  `@property`, `@staticmethod`, `@classmethod`, dataclasses, pytest fixtures,
+  FastAPI/Flask-style route decorators, and common Pydantic validators. Docstring
+  text is stored on the owning symbol so behavior-word searches do not have to
+  read raw files first.
+- Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
+  and type-inferred receiver dispatch remain heuristic or external.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
 `Heuristic`, `CandidateSet`, `External`, `MacroOpaque`, `ConditionalUnknown`,

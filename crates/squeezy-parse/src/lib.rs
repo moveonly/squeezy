@@ -1,4 +1,7 @@
-use std::{collections::HashMap, fs};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+};
 
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
@@ -603,6 +606,8 @@ fn extract_python(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
 
     visit_python_node(root, &mut ctx, None, None);
+    extract_python_module_exports(&mut ctx);
+    dedup_python_facts(&mut ctx);
 
     ParsedFile {
         file,
@@ -628,6 +633,45 @@ struct ExtractContext<'source> {
     diagnostics: Vec<ParseDiagnostic>,
 }
 
+fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
+    for line in ctx.source.lines() {
+        let line = line.trim();
+        if !line.starts_with("__all__") {
+            continue;
+        }
+        let Some((_, right)) = line.split_once('=') else {
+            continue;
+        };
+        for exported in python_string_list_values(right) {
+            ctx.imports.push(ParsedImport {
+                file_id: ctx.file.id.clone(),
+                owner_id: None,
+                path: exported,
+                alias: None,
+                is_glob: false,
+                is_reexport: true,
+                span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+            });
+        }
+    }
+}
+
+fn dedup_python_facts(ctx: &mut ExtractContext<'_>) {
+    let mut imports = HashSet::new();
+    ctx.imports.retain(|import| {
+        imports.insert(format!(
+            "{}|{:?}|{}|{:?}|{}|{}",
+            import.file_id.0,
+            import.owner_id.as_ref().map(|id| id.0.as_str()),
+            import.path,
+            import.alias,
+            import.is_glob,
+            import.is_reexport
+        ))
+    });
+}
+
 fn visit_python_node(
     node: Node<'_>,
     ctx: &mut ExtractContext<'_>,
@@ -649,6 +693,7 @@ fn visit_python_node(
     }
 
     if let Some(symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        extract_python_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
             Some(symbol.id.clone())
@@ -662,6 +707,11 @@ fn visit_python_node(
 
     if kind == "call" {
         extract_python_call(node, ctx, owner_symbol.clone());
+    } else if matches!(
+        kind,
+        "assignment" | "assignment_statement" | "expression_statement"
+    ) {
+        extract_python_assignment(node, ctx, owner_symbol.clone());
     } else if kind == "identifier" {
         extract_python_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
     } else if kind == "attribute" {
@@ -834,7 +884,17 @@ fn python_symbol_from_node(
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
-    let attributes = python_attributes_for_node(node, ctx.source);
+    let mut attributes = python_attributes_for_node(node, ctx.source);
+    if kind == SymbolKind::Class {
+        attributes.extend(
+            python_class_bases(&signature)
+                .into_iter()
+                .map(|base| format!("base:{base}")),
+        );
+    }
+    let docs = python_docs_for_node(node, ctx.source);
+    attributes.sort();
+    attributes.dedup();
 
     Some(ParsedSymbol {
         id,
@@ -846,12 +906,53 @@ fn python_symbol_from_node(
         body_span,
         signature,
         visibility: None,
-        docs: Vec::new(),
+        docs,
         attributes,
         provenance: Provenance::new("tree-sitter-python", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
     })
+}
+
+fn extract_python_symbol_facts(
+    node: Node<'_>,
+    symbol: &ParsedSymbol,
+    ctx: &mut ExtractContext<'_>,
+) {
+    if symbol.kind == SymbolKind::Class {
+        for base in python_class_bases(&symbol.signature) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: base,
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new("tree-sitter-python", "class base reference"),
+            });
+        }
+    }
+
+    if matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method) {
+        for annotation in python_type_annotations(&symbol.signature) {
+            ctx.references.push(ParsedReference {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: annotation.clone(),
+                kind: ReferenceKind::Type,
+                span: symbol.span,
+                provenance: Provenance::new("tree-sitter-python", "type annotation reference"),
+            });
+            ctx.body_hits.push(BodyHit {
+                file_id: ctx.file.id.clone(),
+                owner_id: Some(symbol.id.clone()),
+                text: annotation,
+                kind: BodyHitKind::Type,
+                span: symbol.span,
+            });
+        }
+    }
+
+    let _ = node;
 }
 
 fn python_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
@@ -862,13 +963,213 @@ fn python_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut cursor = parent.walk();
-    parent
+    let mut attributes = parent
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "decorator")
         .filter_map(|child| node_text(child, source).ok())
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+
+    let mut semantic = attributes
+        .iter()
+        .flat_map(|attribute| python_semantic_attributes(attribute))
+        .collect::<Vec<_>>();
+    attributes.append(&mut semantic);
+    attributes.sort();
+    attributes.dedup();
+    attributes
+}
+
+fn python_semantic_attributes(attribute: &str) -> Vec<String> {
+    let trimmed = attribute.trim().trim_start_matches('@').trim();
+    let target = trimmed
+        .split('(')
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .trim_end_matches('.');
+    let leaf = target.rsplit('.').next().unwrap_or(target);
+    let mut attributes = Vec::new();
+    match leaf {
+        "property" | "staticmethod" | "classmethod" => {
+            attributes.push(format!("python:{leaf}"));
+        }
+        "dataclass" => attributes.push("python:dataclass".to_string()),
+        "fixture" => attributes.push("pytest:fixture".to_string()),
+        "validator" | "field_validator" | "model_validator" => {
+            attributes.push(format!("pydantic:{leaf}"));
+        }
+        "get" | "post" | "put" | "patch" | "delete" | "options" | "head" | "route" => {
+            let receiver = target.rsplit_once('.').map(|(receiver, _)| receiver);
+            if receiver
+                .map(|receiver| {
+                    matches!(
+                        receiver.rsplit('.').next().unwrap_or(receiver),
+                        "app" | "router" | "blueprint" | "bp"
+                    )
+                })
+                .unwrap_or(false)
+            {
+                attributes.push(format!("route:{}", leaf.to_ascii_uppercase()));
+                attributes.push("framework:web-route".to_string());
+            }
+        }
+        _ => {}
+    }
+    if target.contains("fastapi") || target.contains("APIRouter") {
+        attributes.push("framework:fastapi".to_string());
+    }
+    if target.contains("flask") || target.contains("Blueprint") {
+        attributes.push("framework:flask".to_string());
+    }
+    attributes
+}
+
+fn python_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(body) = node.child_by_field_name("body") else {
+        return Vec::new();
+    };
+    let mut cursor = body.walk();
+    let Some(first) = body.named_children(&mut cursor).next() else {
+        return Vec::new();
+    };
+    let doc_node = if first.kind() == "expression_statement" {
+        let mut first_cursor = first.walk();
+        first
+            .named_children(&mut first_cursor)
+            .find(|child| child.kind() == "string")
+    } else if first.kind() == "string" {
+        Some(first)
+    } else {
+        None
+    };
+    doc_node
+        .and_then(|node| node_text(node, source).ok())
+        .map(|text| vec![text.trim().to_string()])
+        .unwrap_or_default()
+}
+
+fn python_class_bases(signature: &str) -> Vec<String> {
+    let Some(after_class) = signature.trim().strip_prefix("class ") else {
+        return Vec::new();
+    };
+    let Some(open_index) = after_class.find('(') else {
+        return Vec::new();
+    };
+    let Some(close_index) = matching_close_paren(after_class, open_index) else {
+        return Vec::new();
+    };
+    split_top_level_commas(&after_class[open_index + 1..close_index])
+        .into_iter()
+        .filter_map(|base| python_type_name_from_annotation(&base))
         .collect()
+}
+
+fn python_type_annotations(signature: &str) -> Vec<String> {
+    let mut annotations = Vec::new();
+    if let Some(open_index) = signature.find('(')
+        && let Some(close_index) = matching_close_paren(signature, open_index)
+    {
+        for parameter in split_top_level_commas(&signature[open_index + 1..close_index]) {
+            if let Some((_, annotation)) = parameter.split_once(':')
+                && let Some(name) = python_type_name_from_annotation(annotation)
+            {
+                annotations.push(name);
+            }
+        }
+        let rest = &signature[close_index + 1..];
+        if let Some((_, return_annotation)) = rest.split_once("->") {
+            let return_annotation = return_annotation
+                .split_once(':')
+                .map(|(before, _)| before)
+                .unwrap_or(return_annotation);
+            if let Some(name) = python_type_name_from_annotation(return_annotation) {
+                annotations.push(name);
+            }
+        }
+    }
+    annotations.sort();
+    annotations.dedup();
+    annotations
+}
+
+fn python_type_name_from_annotation(annotation: &str) -> Option<String> {
+    let mut text = annotation
+        .split('=')
+        .next()
+        .unwrap_or(annotation)
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '[' | ']' | '(' | ')' | '{' | '}' | ':' | ',' | ' '
+            )
+        })
+        .trim_start_matches('*')
+        .trim();
+    if text.is_empty() {
+        return None;
+    }
+    for separator in ['|', '[', ','] {
+        if let Some((before, _)) = text.split_once(separator) {
+            text = before.trim();
+        }
+    }
+    if text.is_empty()
+        || matches!(
+            text,
+            "None" | "Any" | "object" | "str" | "int" | "float" | "bool"
+        )
+    {
+        return None;
+    }
+    Some(last_path_segment(text))
+}
+
+fn matching_close_paren(text: &str, open_index: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, ch) in text
+        .char_indices()
+        .skip_while(|(index, _)| *index < open_index)
+    {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_commas(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    for (index, ch) in text.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let value = text[start..index].trim();
+                if !value.is_empty() {
+                    values.push(value.to_string());
+                }
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let value = text[start..].trim();
+    if !value.is_empty() {
+        values.push(value.to_string());
+    }
+    values
 }
 
 fn parent_symbol_is_impl_or_trait(parent_symbol: &Option<SymbolId>) -> bool {
@@ -1081,7 +1382,7 @@ fn extract_python_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id:
             path,
             alias,
             is_glob,
-            is_reexport: false,
+            is_reexport: ctx.file.relative_path.ends_with("__init__.py"),
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-python", "import declaration"),
         });
@@ -1129,6 +1430,138 @@ fn split_python_alias(text: &str) -> (&str, Option<&str>) {
     text.split_once(" as ")
         .map(|(path, alias)| (path.trim(), Some(alias.trim())))
         .unwrap_or_else(|| (text.trim(), None))
+}
+
+fn extract_python_assignment(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some((left, right)) = raw.split_once('=') else {
+        return;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    if left == "__all__" {
+        for exported in python_string_list_values(right) {
+            ctx.imports.push(ParsedImport {
+                file_id: ctx.file.id.clone(),
+                owner_id: owner_id.clone(),
+                path: exported,
+                alias: None,
+                is_glob: false,
+                is_reexport: true,
+                span: span_from_node(node),
+                provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+            });
+        }
+        return;
+    }
+
+    let Some(alias) = python_simple_assignment_name(left) else {
+        return;
+    };
+    let Some(target) = python_assignment_target(right) else {
+        return;
+    };
+    if alias == last_path_segment(&target) {
+        return;
+    }
+
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        path: target,
+        alias: Some(alias),
+        is_glob: false,
+        is_reexport: false,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", "assignment alias"),
+    });
+}
+
+fn python_simple_assignment_name(left: &str) -> Option<String> {
+    let left = left.trim();
+    if left.contains('.') || left.contains('[') || left.contains(',') {
+        return None;
+    }
+    if is_python_identifier(left) {
+        Some(left.to_string())
+    } else {
+        None
+    }
+}
+
+fn python_assignment_target(right: &str) -> Option<String> {
+    let expression = right
+        .split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(right)
+        .trim();
+    if expression.is_empty() {
+        return None;
+    }
+    let callee = expression
+        .find('(')
+        .map(|index| expression[..index].trim())
+        .unwrap_or(expression)
+        .trim();
+    let starts_with_literal = callee
+        .chars()
+        .next()
+        .map(|ch| matches!(ch, '\'' | '"' | '[' | '{' | '(') || ch.is_ascii_digit())
+        .unwrap_or(false);
+    if callee.is_empty() || starts_with_literal {
+        return None;
+    }
+    if callee
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+        && callee.split('.').all(is_python_identifier)
+    {
+        Some(callee.to_string())
+    } else {
+        None
+    }
+}
+
+fn python_string_list_values(text: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, ch)) = chars.next() {
+        let quote = match ch {
+            '\'' | '"' => ch,
+            _ => continue,
+        };
+        let mut escaped = false;
+        let mut value = String::new();
+        for (_, ch) in chars.by_ref() {
+            if escaped {
+                value.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                if !value.is_empty() {
+                    values.push(value);
+                }
+                break;
+            } else {
+                value.push(ch);
+            }
+        }
+    }
+    values
+}
+
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn extract_direct_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
