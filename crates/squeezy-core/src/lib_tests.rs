@@ -45,6 +45,19 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.tool_output_retention_days,
         DEFAULT_TOOL_OUTPUT_RETENTION_DAYS
     );
+    assert_eq!(
+        config.max_tool_calls_per_turn,
+        DEFAULT_MAX_TOOL_CALLS_PER_TURN
+    );
+    assert_eq!(
+        config.max_tool_bytes_read_per_turn,
+        DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN
+    );
+    assert_eq!(
+        config.max_search_files_per_turn,
+        DEFAULT_MAX_SEARCH_FILES_PER_TURN
+    );
+    assert_eq!(config.telemetry, TelemetryConfig::default());
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
@@ -70,6 +83,11 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TOOL_PREVIEW_BYTES" => Some("456".to_string()),
         "SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND" => Some("7890".to_string()),
         "SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS" => Some("2".to_string()),
+        "SQUEEZY_MAX_TOOL_CALLS_PER_TURN" => Some("12".to_string()),
+        "SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN" => Some("3456".to_string()),
+        "SQUEEZY_MAX_SEARCH_FILES_PER_TURN" => Some("78".to_string()),
+        "SQUEEZY_TELEMETRY" => Some("off".to_string()),
+        "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         _ => None,
     });
 
@@ -85,6 +103,16 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.tool_preview_bytes, 456);
     assert_eq!(config.max_tool_result_bytes_per_round, 7890);
     assert_eq!(config.tool_output_retention_days, 2);
+    assert_eq!(config.max_tool_calls_per_turn, 12);
+    assert_eq!(config.max_tool_bytes_read_per_turn, 3456);
+    assert_eq!(config.max_search_files_per_turn, 78);
+    assert_eq!(
+        config.telemetry,
+        TelemetryConfig {
+            enabled: false,
+            endpoint: "https://telemetry.example/v1/batch".to_string()
+        }
+    );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.base_url, "https://example.test/v1");

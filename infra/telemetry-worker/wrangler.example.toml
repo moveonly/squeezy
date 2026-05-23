@@ -1,0 +1,6 @@
+name = "squeezy-telemetry"
+main = "src/worker.ts"
+compatibility_date = "2026-05-23"
+
+[vars]
+POSTHOG_HOST = "https://eu.i.posthog.com"

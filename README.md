@@ -19,6 +19,7 @@ Every model token is a budgeted resource.
   search modes, spill handles, aggregate result budgets, and permission-gated
   `websearch`/`webfetch` for current external evidence.
 - The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
+- Anonymous product telemetry is documented in [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
 
 ## Speed
 

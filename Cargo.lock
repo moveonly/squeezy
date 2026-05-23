@@ -1588,6 +1588,7 @@ dependencies = [
  "serde_json",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-telemetry",
  "squeezy-tools",
  "tokio",
  "tokio-util",
@@ -1601,6 +1602,7 @@ dependencies = [
  "futures-util",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-telemetry",
  "squeezy-tui",
  "tokio",
  "tokio-util",
@@ -1679,6 +1681,17 @@ name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
  "squeezy-core",
+]
+
+[[package]]
+name = "squeezy-telemetry"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "squeezy-core",
+ "tokio",
 ]
 
 [[package]]

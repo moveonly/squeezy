@@ -165,10 +165,19 @@ pub enum BaselineMode {
 pub struct HarnessMetrics {
     pub wall_ms: u128,
     pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_errors: u64,
+    pub tool_denials: u64,
+    pub tool_cancellations: u64,
     pub files_scanned: u64,
     pub bytes_read: u64,
     pub matches_returned: u64,
     pub output_bytes: u64,
+    pub receipt_stub_hits: u64,
+    pub negative_receipt_hits: u64,
+    pub spill_writes: u64,
+    pub spill_reads: u64,
+    pub budget_denials: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -472,11 +481,25 @@ async fn run_agent_with_config(
                 message,
                 response_id,
                 cost,
+                metrics: turn_metrics,
                 ..
             } => {
                 if final_answer.is_empty() {
                     final_answer = message.content;
                 }
+                metrics.tool_calls = turn_metrics.tool_calls;
+                metrics.tool_successes = turn_metrics.tool_successes;
+                metrics.tool_errors = turn_metrics.tool_errors;
+                metrics.tool_denials = turn_metrics.tool_denials;
+                metrics.tool_cancellations = turn_metrics.tool_cancellations;
+                metrics.files_scanned = turn_metrics.files_scanned;
+                metrics.bytes_read = turn_metrics.bytes_read;
+                metrics.matches_returned = turn_metrics.matches_returned;
+                metrics.receipt_stub_hits = turn_metrics.receipt_stub_hits;
+                metrics.negative_receipt_hits = turn_metrics.negative_receipt_hits;
+                metrics.spill_writes = turn_metrics.spill_writes;
+                metrics.spill_reads = turn_metrics.spill_reads;
+                metrics.budget_denials = turn_metrics.budget_denials;
                 metrics.input_tokens = cost.input_tokens;
                 metrics.output_tokens = cost.output_tokens;
                 metrics.cached_input_tokens = cost.cached_input_tokens;
@@ -493,14 +516,7 @@ async fn run_agent_with_config(
                 return Err(SqueezyError::Agent("task was cancelled".to_string()));
             }
             AgentEvent::UserMessage { .. } => {}
-            AgentEvent::ToolCallQueued { .. } => {
-                metrics.tool_calls += 1;
-            }
-            AgentEvent::ToolCallCompleted { result, .. } => {
-                metrics.files_scanned += result.cost_hint.files_scanned;
-                metrics.bytes_read += result.cost_hint.bytes_read;
-                metrics.matches_returned += result.cost_hint.matches_returned;
-            }
+            AgentEvent::ToolCallQueued { .. } | AgentEvent::ToolCallCompleted { .. } => {}
             AgentEvent::ToolCallStarted { .. } | AgentEvent::ApprovalRequested { .. } => {}
         }
     }

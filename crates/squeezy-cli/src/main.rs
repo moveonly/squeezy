@@ -10,6 +10,7 @@ use squeezy_llm::{
     AnthropicProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider,
     UnavailableProvider,
 };
+use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -46,12 +47,19 @@ async fn main() -> squeezy_core::Result<()> {
         return Ok(());
     }
 
+    let telemetry = TelemetryClient::from_config(&config);
+    telemetry.record(TelemetryEvent::app_started(&config)).await;
+
     let provider = provider_from_config(&config);
     if let Some(prompt) = cli.prompt {
-        return run_prompt(config, provider, prompt).await;
+        let result = run_prompt(config, provider, prompt).await;
+        let _ = telemetry.flush().await;
+        return result;
     }
 
-    squeezy_tui::run(config, provider).await
+    let result = squeezy_tui::run(config, provider).await;
+    let _ = telemetry.flush().await;
+    result
 }
 
 async fn run_prompt(
