@@ -36,6 +36,7 @@ pub struct GraphSymbol {
     pub provenance: Provenance,
     pub confidence: Confidence,
     pub freshness: Freshness,
+    pub dirty: Option<DirtyAnnotation>,
 }
 
 impl From<ParsedSymbol> for GraphSymbol {
@@ -55,8 +56,21 @@ impl From<ParsedSymbol> for GraphSymbol {
             provenance: symbol.provenance,
             confidence: symbol.confidence,
             freshness: symbol.freshness,
+            dirty: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirtyAnnotation {
+    pub status: String,
+    pub ranges: Vec<DirtyRange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyRange {
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +390,38 @@ impl SemanticGraph {
                 && left.reference.span == right.reference.span
         });
         hits
+    }
+
+    pub fn annotate_dirty_ranges(&mut self, dirty: &HashMap<FileId, DirtyAnnotation>) {
+        for symbol in self.symbols.values_mut() {
+            symbol.dirty = None;
+            let Some(annotation) = dirty.get(&symbol.file_id) else {
+                continue;
+            };
+            if symbol.kind == SymbolKind::File
+                || annotation.ranges.iter().any(|range| {
+                    line_ranges_intersect(symbol.span.start.line, symbol.span.end.line, *range)
+                })
+            {
+                symbol.dirty = Some(annotation.clone());
+            }
+        }
+    }
+
+    pub fn dirty_symbols(&self) -> Vec<GraphSymbol> {
+        let mut symbols = self
+            .symbols
+            .values()
+            .filter(|symbol| symbol.dirty.is_some() && symbol.kind != SymbolKind::File)
+            .cloned()
+            .collect::<Vec<_>>();
+        symbols.sort_by(|left, right| {
+            left.file_id
+                .0
+                .cmp(&right.file_id.0)
+                .then(left.span.start_byte.cmp(&right.span.start_byte))
+        });
+        symbols
     }
 
     pub fn callees(&self, caller: &SymbolId) -> Vec<CallEdgeHit> {
@@ -2571,6 +2617,10 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     report
 }
 
+fn line_ranges_intersect(start: u32, end: u32, dirty: DirtyRange) -> bool {
+    start <= dirty.end_line && dirty.start_line <= end
+}
+
 fn file_symbol(file: &FileRecord) -> GraphSymbol {
     GraphSymbol {
         id: file_symbol_id(&file.id),
@@ -2592,6 +2642,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
         provenance: Provenance::new("squeezy-workspace", "workspace file record"),
         confidence: Confidence::ExactSyntax,
         freshness: file.freshness,
+        dirty: None,
     }
 }
 
