@@ -17,8 +17,7 @@ use squeezy_core::{
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
     ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
-    ToolStatusKind as TelemetryToolStatusKind,
-    ToolTelemetryReport,
+    ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
 };
 use squeezy_tools::{
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
