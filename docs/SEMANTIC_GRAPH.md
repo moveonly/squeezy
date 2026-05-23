@@ -148,7 +148,6 @@ decision instead of walking a likely non-code or dangerous directory.
   graph facts; explicit workspace crawler caps are still respected.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
-<<<<<<< HEAD
 - C/C++ header classification prefers same-stem source files and then project
   majority when a plain `.h` file has no unambiguous pair. `.hpp`, `.hh`, and
   `.hxx` are treated as C++.
