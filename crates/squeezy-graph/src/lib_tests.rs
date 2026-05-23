@@ -201,6 +201,90 @@ def reassign():
 }
 
 #[test]
+fn graph_resolves_csharp_this_and_base_method_calls() {
+    let mut parser = RustParser::new().unwrap();
+    let animal = csharp_record(
+        "src/Animal.cs",
+        r#"
+namespace App;
+
+public class Animal
+{
+    public virtual string Speak() { return "generic"; }
+}
+"#,
+    );
+    let dog = csharp_record(
+        "src/Dog.cs",
+        r#"
+namespace App;
+
+public class Dog : Animal
+{
+    public string Bark() { return this.Speak(); }
+    public override string Speak() { return base.Speak(); }
+}
+"#,
+    );
+    let parsed = [animal, dog]
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let dog_id = graph
+        .find_symbol_by_name("Dog")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Dog class")
+        .id;
+    let animal_id = graph
+        .find_symbol_by_name("Animal")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .expect("Animal class")
+        .id;
+
+    let speaks = graph.find_symbol_by_name("Speak");
+    let dog_speak_id = speaks
+        .iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&dog_id))
+        .expect("Dog.Speak")
+        .id
+        .clone();
+    let animal_speak_id = speaks
+        .iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&animal_id))
+        .expect("Animal.Speak")
+        .id
+        .clone();
+    let bark = graph
+        .find_symbol_by_name("Bark")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Bark method");
+
+    // `this.Speak()` from `Dog.Bark` must bind to `Dog.Speak` (the override).
+    let this_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == bark.id && edge.kind == EdgeKind::Calls)
+        .expect("Bark -> Speak edge");
+    assert_eq!(this_edge.to.as_ref(), Some(&dog_speak_id));
+
+    // `base.Speak()` from `Dog.Speak` must bind to `Animal.Speak`.
+    let base_edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == dog_speak_id && edge.kind == EdgeKind::Calls)
+        .expect("Dog.Speak -> Animal.Speak edge");
+    assert_eq!(base_edge.to.as_ref(), Some(&animal_speak_id));
+}
+
+#[test]
 fn graph_manager_refresh_replaces_changed_file_only() {
     let root = temp_root("graph-manager-refresh");
     fs::create_dir_all(root.join("src")).unwrap();
@@ -218,6 +302,7 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert!(!manager.graph().find_symbol_by_name("one").is_empty());
     assert_eq!(manager.build_report().language.rust_files, 1);
     assert_eq!(manager.build_report().language.csharp_files, 0);
+    assert_eq!(manager.build_report().language.python_files, 0);
     assert_eq!(manager.build_report().language.supported_files, 1);
 
     thread::sleep(Duration::from_millis(2));
@@ -1134,6 +1219,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::CSharp;
     record
 }
 

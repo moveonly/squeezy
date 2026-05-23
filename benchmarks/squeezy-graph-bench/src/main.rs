@@ -57,6 +57,7 @@ struct BenchmarkReport {
     graph: GraphReport,
     accuracy: AccuracyReport,
     python_oracle: Option<PythonOracleReport>,
+    csharp_oracle: Option<CsharpOracleReport>,
     queries: Vec<QueryReport>,
     mixed_workload: Option<MixedWorkloadReport>,
 }
@@ -147,6 +148,17 @@ struct AccuracySetReport {
 #[derive(Debug, Serialize)]
 struct PythonOracleReport {
     oracle_ms: u128,
+    status: String,
+    oracle_unparseable_files: usize,
+    oracle_unparseable_examples: Vec<String>,
+    symbols: AccuracySetReport,
+    limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CsharpOracleReport {
+    oracle_ms: u128,
+    oracle_build_ms: Option<u128>,
     status: String,
     oracle_unparseable_files: usize,
     oracle_unparseable_examples: Vec<String>,
@@ -282,7 +294,7 @@ fn main() -> Result<()> {
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
     let accuracy = match args.language {
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
-        BenchmarkLanguage::CSharp => empty_accuracy("C# semantic oracle not implemented yet"),
+        BenchmarkLanguage::CSharp => empty_accuracy("rust-analyzer oracle not used for C#"),
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
     };
     let python_oracle = match args.language {
@@ -290,12 +302,24 @@ fn main() -> Result<()> {
         BenchmarkLanguage::Rust => None,
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
     };
+    let csharp_oracle = match args.language {
+        BenchmarkLanguage::CSharp => Some(collect_csharp_oracle_accuracy(&args.fixture, &graph)?),
+        BenchmarkLanguage::Rust | BenchmarkLanguage::Python => None,
+    };
 
-    let mixed_workload = if matches!(args.language, BenchmarkLanguage::Rust | BenchmarkLanguage::CSharp) {
+    let mixed_workload = if matches!(
+        args.language,
+        BenchmarkLanguage::Rust | BenchmarkLanguage::CSharp
+    ) {
         args.mixed_repo
             .as_ref()
             .map(|repo| {
-                run_mixed_workload(repo, args.language, args.mixed_iterations, args.ra_lsp_probes)
+                run_mixed_workload(
+                    repo,
+                    args.language,
+                    args.mixed_iterations,
+                    args.ra_lsp_probes,
+                )
             })
             .transpose()?
     } else {
@@ -325,6 +349,7 @@ fn main() -> Result<()> {
         },
         accuracy,
         python_oracle,
+        csharp_oracle,
         queries: query_reports,
         mixed_workload,
     };
@@ -474,7 +499,10 @@ fn run_mixed_workload(
     let squeezy_build_ms = build_started.elapsed().as_millis();
     let accuracy = match language {
         BenchmarkLanguage::Rust => collect_accuracy(repo, &graph, ra_lsp_probes),
-        BenchmarkLanguage::CSharp => empty_accuracy("C# semantic oracle not implemented yet"),
+        BenchmarkLanguage::CSharp => match collect_csharp_oracle_accuracy(repo, &graph) {
+            Ok(report) => csharp_oracle_to_accuracy(&report),
+            Err(err) => empty_accuracy(&format!("C# semantic oracle failed: {err}")),
+        },
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
     };
 
@@ -572,14 +600,24 @@ fn empty_accuracy(status: &str) -> AccuracyReport {
     }
 }
 
-fn collect_python_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<PythonOracleReport> {
+fn collect_python_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> Result<PythonOracleReport> {
     let started = Instant::now();
     let oracle = collect_python_ast_symbol_scan(root)?;
     let oracle_ms = started.elapsed().as_millis();
-    let unparseable_files = oracle.unparseable_files.into_iter().collect::<BTreeSet<_>>();
+    let unparseable_files = oracle
+        .unparseable_files
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
     let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
-    let oracle_unparseable_examples = unparseable_files.iter().take(10).cloned().collect::<Vec<_>>();
+    let oracle_unparseable_examples = unparseable_files
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
     let oracle_unparseable_files = unparseable_files.len();
 
     Ok(PythonOracleReport {
@@ -681,6 +719,175 @@ fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSymbolScan> {
         symbols: scan,
         unparseable_files: output.unparseable_files,
     })
+}
+
+fn collect_csharp_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> Result<CsharpOracleReport> {
+    let started = Instant::now();
+    let oracle = collect_csharp_oracle_symbol_scan(root)?;
+    let oracle_ms = started.elapsed().as_millis();
+    let unparseable_files = oracle
+        .unparseable_files
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let oracle_unparseable_examples = unparseable_files
+        .iter()
+        .take(10)
+        .cloned()
+        .collect::<Vec<_>>();
+    let oracle_unparseable_files = unparseable_files.len();
+
+    let status_text = if oracle_unparseable_files == 0 {
+        "Roslyn C# oracle succeeded".to_string()
+    } else {
+        format!(
+            "Roslyn C# oracle succeeded with {oracle_unparseable_files} unparseable files excluded from symbol FP accounting"
+        )
+    };
+
+    Ok(CsharpOracleReport {
+        oracle_ms,
+        oracle_build_ms: oracle.build_ms,
+        status: status_text,
+        oracle_unparseable_files,
+        oracle_unparseable_examples,
+        symbols,
+        limitations: vec![
+            "The C# oracle uses Roslyn's CSharpSyntaxTree (syntactic, not semantic), so it counts declarations but does not resolve members inherited from referenced assemblies.".to_string(),
+            "Symbol comparison is file/name/kind based; the oracle reports partial declarations once per source file, mirroring squeezy's own behavior.".to_string(),
+            "C# files that Roslyn cannot parse (e.g. invalid syntax) are reported as oracle_unparseable and excluded from Squeezy false-positive accounting.".to_string(),
+        ],
+    })
+}
+
+fn csharp_oracle_to_accuracy(report: &CsharpOracleReport) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: Some(report.oracle_ms),
+        rust_analyzer_symbol_status: report.status.clone(),
+        symbols: report.symbols.clone(),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: "C# LSP navigation oracle not used".to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![
+                "C# accuracy currently compares symbol declarations against Roslyn; LSP-style go-to-definition probes are not exercised yet.".to_string(),
+            ],
+        },
+        limitations: report.limitations.clone(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CsharpOracleOutput {
+    rows: Vec<[String; 3]>,
+    unparseable_files: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CsharpOracleSymbolScan {
+    symbols: SymbolScan,
+    unparseable_files: Vec<String>,
+    build_ms: Option<u128>,
+}
+
+fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOracleSymbolScan> {
+    let (dll, build_ms) = ensure_csharp_oracle_built()?;
+    let output = Command::new("dotnet")
+        .arg(&dll)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("failed to run Roslyn C# oracle: {err}")))?;
+    if !output.status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let output: CsharpOracleOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid Roslyn C# oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for [file, kind, name] in output.rows {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file,
+                kind,
+                name: normalize_symbol_name(&name),
+            },
+        );
+    }
+    Ok(CsharpOracleSymbolScan {
+        symbols: scan,
+        unparseable_files: output.unparseable_files,
+        build_ms,
+    })
+}
+
+fn ensure_csharp_oracle_built() -> Result<(PathBuf, Option<u128>)> {
+    let project = csharp_oracle_project_dir()?;
+    let dll = project
+        .join("bin")
+        .join("Release")
+        .join("net8.0")
+        .join("CsharpOracle.dll");
+    if dll.exists() {
+        return Ok((dll, None));
+    }
+    let started = Instant::now();
+    let status = Command::new("dotnet")
+        .arg("build")
+        .arg(&project)
+        .arg("-c")
+        .arg("Release")
+        .arg("--nologo")
+        .arg("-v")
+        .arg("minimal")
+        .status()
+        .map_err(|err| SqueezyError::Graph(format!("failed to build Roslyn C# oracle: {err}")))?;
+    let build_ms = started.elapsed().as_millis();
+    if !status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle build failed with {status}"
+        )));
+    }
+    if !dll.exists() {
+        return Err(SqueezyError::Graph(format!(
+            "Roslyn C# oracle build did not produce {}",
+            dll.display()
+        )));
+    }
+    Ok((dll, Some(build_ms)))
+}
+
+fn csharp_oracle_project_dir() -> Result<PathBuf> {
+    if let Ok(value) = std::env::var("SQUEEZY_CSHARP_ORACLE_DIR")
+        && !value.is_empty()
+    {
+        let path = PathBuf::from(value);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    let candidates: [PathBuf; 3] = [
+        PathBuf::from("benchmarks/oracle/csharp"),
+        PathBuf::from("../oracle/csharp"),
+        PathBuf::from("../../benchmarks/oracle/csharp"),
+    ];
+    for candidate in candidates {
+        if candidate.join("CsharpOracle.csproj").exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(SqueezyError::Graph(
+        "could not locate benchmarks/oracle/csharp; set SQUEEZY_CSHARP_ORACLE_DIR".to_string(),
+    ))
 }
 
 const PYTHON_AST_ORACLE: &str = r#"
@@ -1828,10 +2035,12 @@ fn time_dotnet_build(fixture: &Path) -> Result<u128> {
 fn find_dotnet_build_target(root: &Path) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     collect_dotnet_build_targets(root, root, 0, &mut candidates);
+    // Prefer the shallowest candidate (root-level solution beats nested project),
+    // then by extension priority (slnx > sln > csproj), then lexicographic.
     candidates.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.cmp(&right.0))
             .then_with(|| left.2.cmp(&right.2))
     });
     candidates.into_iter().map(|(_, _, path)| path).next()
@@ -2365,15 +2574,12 @@ fn print_summary(report: &BenchmarkReport) {
         report.validation_status, report.validation_ms
     );
     println!("squeezy_total_ms: {}", report.squeezy_total_ms);
-    println!(
-        "faster_than_validation: {}",
-        report.faster_than_validation
-    );
+    println!("faster_than_validation: {}", report.faster_than_validation);
     print_accuracy_summary("fixture", &report.accuracy);
     print_navigation_summary("fixture", &report.accuracy.navigation);
     if let Some(python) = &report.python_oracle {
         println!(
-            "python_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={} oracle_unparseable={}",
+            "python_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms oracle_unparseable={}",
             python.symbols.true_positive,
             python.symbols.false_positive,
             python.symbols.false_negative,
@@ -2381,8 +2587,26 @@ fn print_summary(report: &BenchmarkReport) {
             python.symbols.recall,
             python.symbols.rust_analyzer_total,
             python.symbols.squeezy_total,
-            format!("{}ms", python.oracle_ms),
+            python.oracle_ms,
             python.oracle_unparseable_files
+        );
+    }
+    if let Some(csharp) = &report.csharp_oracle {
+        println!(
+            "csharp_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}ms build={} oracle_unparseable={}",
+            csharp.symbols.true_positive,
+            csharp.symbols.false_positive,
+            csharp.symbols.false_negative,
+            csharp.symbols.precision,
+            csharp.symbols.recall,
+            csharp.symbols.rust_analyzer_total,
+            csharp.symbols.squeezy_total,
+            csharp.oracle_ms,
+            csharp
+                .oracle_build_ms
+                .map(|ms| format!("{ms}ms"))
+                .unwrap_or_else(|| "cached".to_string()),
+            csharp.oracle_unparseable_files,
         );
     }
     for query in &report.queries {

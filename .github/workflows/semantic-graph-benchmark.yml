@@ -220,6 +220,11 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
+      - name: Pre-build Roslyn C# oracle
+        run: |
+          dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
+            -c Release --nologo -v minimal
+
       - name: Run C# semantic graph smoke benchmark
         run: |
           cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
@@ -241,7 +246,7 @@ jobs:
               --spec benchmarks/specs/csharp-smoke-queries.json \
               --report "target/semantic-graph-benchmark/csharp-real/$name.json" \
               --mixed-repo "target/benchmark-repos/$name" \
-              --mixed-iterations 5000 \
+              --mixed-iterations 1500 \
               --ra-lsp-probes 0 \
               --no-speed-gate
           done <<'REPOS'
@@ -271,6 +276,22 @@ jobs:
                   print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
                   print(f"- Graph: files={report['graph']['files']} symbols={report['graph']['symbols']} edges={report['graph']['edges']} references={report['graph']['references']} calls={report['graph']['calls']}", file=out)
                   print(f"- Accuracy oracle: {report['accuracy']['rust_analyzer_symbol_status']}", file=out)
+                  oracle = report.get("csharp_oracle")
+                  if oracle:
+                      symbols = oracle["symbols"]
+                      build_ms = oracle.get("oracle_build_ms")
+                      build = f"{build_ms} ms" if build_ms is not None else "cached"
+                      print(
+                          "- Roslyn oracle: tp={tp} fp={fp} fn={fn} precision={precision:.3f} recall={recall:.3f} ".format(
+                              tp=symbols["true_positive"],
+                              fp=symbols["false_positive"],
+                              fn=symbols["false_negative"],
+                              precision=symbols["precision"],
+                              recall=symbols["recall"],
+                          )
+                          + f"oracle={oracle['oracle_ms']} ms build={build} unparseable={oracle['oracle_unparseable_files']}",
+                          file=out,
+                      )
                   mixed = report.get("mixed_workload")
                   if mixed:
                       print(f"- Mixed repo: {mixed['repo']}", file=out)
@@ -281,7 +302,18 @@ jobs:
                       print(f"- Mixed Squeezy total: {mixed['squeezy_total_ms']} ms", file=out)
                       print(f"- Refresh after edits: {mixed['refresh_probe']['refresh_ms']} ms", file=out)
                       print(f"- Reparsed files: {mixed['refresh_probe']['reparsed_files']}", file=out)
-                      print(f"- Accuracy oracle: {mixed['accuracy']['rust_analyzer_symbol_status']}", file=out)
+                      mixed_symbols = mixed['accuracy']['symbols']
+                      print(
+                          "- Mixed accuracy: tp={tp} fp={fp} fn={fn} precision={precision:.3f} recall={recall:.3f}".format(
+                              tp=mixed_symbols['true_positive'],
+                              fp=mixed_symbols['false_positive'],
+                              fn=mixed_symbols['false_negative'],
+                              precision=mixed_symbols['precision'],
+                              recall=mixed_symbols['recall'],
+                          ),
+                          file=out,
+                      )
+                      print(f"- Mixed oracle status: {mixed['accuracy']['rust_analyzer_symbol_status']}", file=out)
           PY
           cat __csharp_summary.md >> "$GITHUB_STEP_SUMMARY"
 
