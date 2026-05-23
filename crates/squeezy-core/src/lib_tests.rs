@@ -20,6 +20,19 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert!(!config.store_responses);
     assert_eq!(config.max_parallel_tools, 8);
+    assert_eq!(
+        config.max_tool_result_bytes_per_round,
+        DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND
+    );
+    assert_eq!(
+        config.tool_spill_threshold_bytes,
+        DEFAULT_TOOL_SPILL_THRESHOLD_BYTES
+    );
+    assert_eq!(config.tool_preview_bytes, DEFAULT_TOOL_PREVIEW_BYTES);
+    assert_eq!(
+        config.tool_output_retention_days,
+        DEFAULT_TOOL_OUTPUT_RETENTION_DAYS
+    );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
@@ -37,6 +50,10 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_SHELL_PERMISSION" => Some("deny".to_string()),
         "SQUEEZY_STORE_RESPONSES" => Some("true".to_string()),
         "SQUEEZY_MAX_PARALLEL_TOOLS" => Some("3".to_string()),
+        "SQUEEZY_TOOL_SPILL_THRESHOLD_BYTES" => Some("1234".to_string()),
+        "SQUEEZY_TOOL_PREVIEW_BYTES" => Some("456".to_string()),
+        "SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND" => Some("7890".to_string()),
+        "SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS" => Some("2".to_string()),
         _ => None,
     });
 
@@ -45,6 +62,10 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.permissions.shell, PermissionMode::Deny);
     assert!(config.store_responses);
     assert_eq!(config.max_parallel_tools, 3);
+    assert_eq!(config.tool_spill_threshold_bytes, 1234);
+    assert_eq!(config.tool_preview_bytes, 456);
+    assert_eq!(config.max_tool_result_bytes_per_round, 7890);
+    assert_eq!(config.tool_output_retention_days, 2);
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.base_url, "https://example.test/v1");

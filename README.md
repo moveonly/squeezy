@@ -15,6 +15,8 @@ Every model token is a budgeted resource.
 - A **cost broker** enforces per-turn caps on `grep`, raw reads, and tool calls, and routes trivial work to cheaper models.
 - **Failure memory** keeps the agent from repeating dead-end searches across compactions.
 - The static system prompt is held stable so provider caches actually hit.
+- Current fallback tools use ignore-aware `grep`, path-only `glob`, compact
+  search modes, spill handles, and aggregate result budgets.
 - The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
 
 ## Speed

@@ -13,7 +13,10 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use squeezy_core::{PermissionScope, Result, SqueezyError};
+use squeezy_core::{
+    DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, PermissionScope, Result, SqueezyError,
+};
 use tokio::{process::Command, time};
 use tokio_util::sync::CancellationToken;
 
@@ -23,9 +26,6 @@ const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
 const DEFAULT_READ_LIMIT: usize = 32_000;
 const MAX_READ_LIMIT: usize = 128_000;
-const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 25_000;
-const DEFAULT_SPILL_PREVIEW_BYTES: usize = 2_000;
-const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -66,6 +66,36 @@ pub struct ToolCostHint {
 pub struct ToolReceipt {
     pub output_sha256: String,
     pub content_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolOutputConfig {
+    pub spill_threshold_bytes: usize,
+    pub preview_bytes: usize,
+    pub retention_days: u64,
+}
+
+impl Default for ToolOutputConfig {
+    fn default() -> Self {
+        Self {
+            spill_threshold_bytes: DEFAULT_TOOL_SPILL_THRESHOLD_BYTES,
+            preview_bytes: DEFAULT_TOOL_PREVIEW_BYTES,
+            retention_days: DEFAULT_TOOL_OUTPUT_RETENTION_DAYS,
+        }
+    }
+}
+
+impl ToolOutputConfig {
+    fn normalized(self) -> Self {
+        Self {
+            spill_threshold_bytes: nonzero_or(
+                self.spill_threshold_bytes,
+                DEFAULT_TOOL_SPILL_THRESHOLD_BYTES,
+            ),
+            preview_bytes: nonzero_or(self.preview_bytes, DEFAULT_TOOL_PREVIEW_BYTES),
+            retention_days: nonzero_or_u64(self.retention_days, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +140,30 @@ impl ToolResult {
             None,
         )
     }
+
+    pub fn aggregate_budget_exceeded(&self, budget_bytes: usize, actual_bytes: usize) -> Self {
+        let call = ToolCall {
+            call_id: self.call_id.clone(),
+            name: self.tool_name.clone(),
+            arguments: Value::Null,
+        };
+        make_result(
+            &call,
+            ToolStatus::Error,
+            json!({
+                "error": "tool result omitted because aggregate tool-result budget was exceeded",
+                "budget_bytes": budget_bytes,
+                "actual_bytes": actual_bytes,
+                "original_status": &self.status,
+                "original_output_sha256": self.receipt.output_sha256,
+            }),
+            ToolCostHint {
+                truncated: true,
+                ..ToolCostHint::default()
+            },
+            self.receipt.content_sha256.clone(),
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,11 +174,18 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::new_with_output_config(root, ToolOutputConfig::default())
+    }
+
+    pub fn new_with_output_config(
+        root: impl Into<PathBuf>,
+        output_config: ToolOutputConfig,
+    ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
-        let output_store = ToolOutputStore::new(&root)?;
+        let output_store = ToolOutputStore::new(&root, output_config)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -823,12 +884,13 @@ struct ToolOutputStore {
 }
 
 impl ToolOutputStore {
-    fn new(root: &Path) -> Result<Self> {
+    fn new(root: &Path, config: ToolOutputConfig) -> Result<Self> {
+        let config = config.normalized();
         let store = Self {
             dir: root.join(".squeezy").join("tool_outputs"),
-            spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
-            preview_bytes: DEFAULT_SPILL_PREVIEW_BYTES,
-            retention: Duration::from_secs(DEFAULT_TOOL_OUTPUT_RETENTION_DAYS * 24 * 60 * 60),
+            spill_threshold_bytes: config.spill_threshold_bytes,
+            preview_bytes: config.preview_bytes,
+            retention: Duration::from_secs(config.retention_days * 24 * 60 * 60),
         };
         fs::create_dir_all(&store.dir)?;
         store.cleanup_old_outputs();
@@ -952,6 +1014,14 @@ struct StoredToolOutputSlice {
 
 fn is_valid_handle(handle: &str) -> bool {
     handle.len() == 64 && handle.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn nonzero_or(value: usize, default: usize) -> usize {
+    if value == 0 { default } else { value }
+}
+
+fn nonzero_or_u64(value: u64, default: u64) -> u64 {
+    if value == 0 { default } else { value }
 }
 
 #[derive(Debug, Deserialize)]

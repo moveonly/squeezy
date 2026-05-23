@@ -288,6 +288,60 @@ async fn large_read_result_returns_spill_handle_to_model() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn aggregate_tool_result_budget_compacts_later_outputs() {
+    let root = temp_workspace("aggregate_budget");
+    fs::write(root.join("small.txt"), "small").expect("write small");
+    fs::write(root.join("large.txt"), "b".repeat(2_000)).expect("write large");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "small_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "small.txt"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "large_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "large.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("budgeted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.max_tool_result_bytes_per_round = 1_000;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("read both".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "small_call");
+    assert_eq!(outputs[0].1["status"], "Success");
+    assert_eq!(outputs[1].0, "large_call");
+    assert_eq!(outputs[1].1["status"], "Error");
+    assert!(
+        outputs[1].1["content"]["error"]
+            .as_str()
+            .expect("budget error")
+            .contains("aggregate tool-result budget")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
 }

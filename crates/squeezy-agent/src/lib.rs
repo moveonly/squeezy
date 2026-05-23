@@ -8,7 +8,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionScope, SqueezyError, TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec};
-use squeezy_tools::{ToolCall, ToolRegistry, ToolResult, ToolSpec};
+use squeezy_tools::{ToolCall, ToolOutputConfig, ToolRegistry, ToolResult, ToolSpec};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -25,9 +25,17 @@ pub struct Agent {
 
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
-        let tools = ToolRegistry::new(config.workspace_root.clone()).unwrap_or_else(|_| {
-            ToolRegistry::new(".").expect("current directory must be a valid tool root")
-        });
+        let output_config = ToolOutputConfig {
+            spill_threshold_bytes: config.tool_spill_threshold_bytes,
+            preview_bytes: config.tool_preview_bytes,
+            retention_days: config.tool_output_retention_days,
+        };
+        let tools =
+            ToolRegistry::new_with_output_config(config.workspace_root.clone(), output_config)
+                .unwrap_or_else(|_| {
+                    ToolRegistry::new_with_output_config(".", output_config)
+                        .expect("current directory must be a valid tool root")
+                });
         Self {
             config,
             provider,
@@ -231,6 +239,7 @@ impl TurnRuntime {
                 self.approval_ids.clone(),
             )
             .await;
+            let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
 
             let outputs = results
                 .into_iter()
@@ -443,6 +452,28 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
     total.estimated_usd_micros =
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
+}
+
+fn pack_tool_results(results: Vec<ToolResult>, budget_bytes: usize) -> Vec<ToolResult> {
+    if budget_bytes == 0 {
+        return results;
+    }
+
+    let mut used = 0usize;
+    results
+        .into_iter()
+        .map(|result| {
+            let bytes = result.model_output().len();
+            if used.saturating_add(bytes) <= budget_bytes {
+                used += bytes;
+                result
+            } else {
+                let compact = result.aggregate_budget_exceeded(budget_bytes, bytes);
+                used = used.saturating_add(compact.model_output().len());
+                compact
+            }
+        })
+        .collect()
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {

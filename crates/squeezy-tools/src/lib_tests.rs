@@ -200,7 +200,7 @@ async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
         result
             .model_output()
             .len()
-            .lt(&DEFAULT_SPILL_THRESHOLD_BYTES)
+            .lt(&DEFAULT_TOOL_SPILL_THRESHOLD_BYTES)
     );
 
     let handle = result.content["handle"].as_str().expect("handle");
@@ -224,6 +224,43 @@ async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
             .as_str()
             .expect("content")
             .contains("\"tool_name\":\"read_file\"")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn output_spill_uses_registry_config() {
+    let root = temp_workspace("spill_config");
+    fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 17,
+            retention_days: 1,
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": 500}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    assert_eq!(result.content["preview_bytes"], 17);
+    assert!(
+        result.content["handle"]
+            .as_str()
+            .is_some_and(|handle| handle.len() == 64)
     );
 
     let _ = fs::remove_dir_all(root);

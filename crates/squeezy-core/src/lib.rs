@@ -6,6 +6,10 @@ use thiserror::Error;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
+pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
+pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
+pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
+pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -18,6 +22,10 @@ pub struct AppConfig {
     pub permissions: PermissionPolicy,
     pub store_responses: bool,
     pub max_parallel_tools: usize,
+    pub tool_spill_threshold_bytes: usize,
+    pub tool_preview_bytes: usize,
+    pub max_tool_result_bytes_per_round: usize,
+    pub tool_output_retention_days: u64,
 }
 
 impl AppConfig {
@@ -34,6 +42,22 @@ impl AppConfig {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(8);
+        let tool_spill_threshold_bytes = parse_usize(
+            var("SQUEEZY_TOOL_SPILL_THRESHOLD_BYTES"),
+            DEFAULT_TOOL_SPILL_THRESHOLD_BYTES,
+        );
+        let tool_preview_bytes = parse_usize(
+            var("SQUEEZY_TOOL_PREVIEW_BYTES"),
+            DEFAULT_TOOL_PREVIEW_BYTES,
+        );
+        let max_tool_result_bytes_per_round = parse_usize(
+            var("SQUEEZY_MAX_TOOL_RESULT_BYTES_PER_ROUND"),
+            DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND,
+        );
+        let tool_output_retention_days = var("SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_TOOL_OUTPUT_RETENTION_DAYS);
         Self {
             provider: ProviderConfig::OpenAi(OpenAiConfig {
                 api_key_env: "OPENAI_API_KEY".to_string(),
@@ -47,6 +71,10 @@ impl AppConfig {
             permissions: PermissionPolicy::from_env_vars(var),
             store_responses,
             max_parallel_tools,
+            tool_spill_threshold_bytes,
+            tool_preview_bytes,
+            max_tool_result_bytes_per_round,
+            tool_output_retention_days,
         }
     }
 }
@@ -148,6 +176,13 @@ fn parse_bool(value: Option<&str>) -> bool {
         value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
         Some("1" | "true" | "yes" | "on")
     )
+}
+
+fn parse_usize(value: Option<String>, default: usize) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
