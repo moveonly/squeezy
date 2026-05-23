@@ -40,6 +40,7 @@ fn config_without_env_uses_openai_provider_defaults() {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
+        ProviderConfig::Anthropic(_) => panic!("expected OpenAI provider"),
     }
 }
 
@@ -78,6 +79,44 @@ fn config_reads_supported_env_overrides() {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.base_url, "https://example.test/v1");
         }
+        ProviderConfig::Anthropic(_) => panic!("expected OpenAI provider"),
+    }
+}
+
+#[test]
+fn config_can_select_anthropic_provider_defaults() {
+    let config = AppConfig::from_env_vars(|name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.model, DEFAULT_ANTHROPIC_MODEL);
+    match config.provider {
+        ProviderConfig::Anthropic(anthropic) => {
+            assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+            assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
+        }
+        ProviderConfig::OpenAi(_) => panic!("expected Anthropic provider"),
+    }
+}
+
+#[test]
+fn config_reads_anthropic_env_overrides() {
+    let config = AppConfig::from_env_vars(|name| match name {
+        "SQUEEZY_PROVIDER" => Some("claude".to_string()),
+        "SQUEEZY_MODEL" => Some("claude-test".to_string()),
+        "ANTHROPIC_BASE_URL" => Some("https://anthropic.example.test/v1".to_string()),
+        "SQUEEZY_STORE_RESPONSES" => Some("true".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.model, "claude-test");
+    assert!(!config.store_responses);
+    match config.provider {
+        ProviderConfig::Anthropic(anthropic) => {
+            assert_eq!(anthropic.base_url, "https://anthropic.example.test/v1");
+        }
+        ProviderConfig::OpenAi(_) => panic!("expected Anthropic provider"),
     }
 }
 

@@ -294,7 +294,17 @@ async fn execute_tool_calls(
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
-        match permission_decision(turn_id, call, &tools, config, &tx, approval_ids.clone()).await {
+        match permission_decision(
+            turn_id,
+            call,
+            &tools,
+            config,
+            &tx,
+            &cancel,
+            approval_ids.clone(),
+        )
+        .await
+        {
             ApprovalDecision::Approved => approved.push((index, call.clone())),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
@@ -305,6 +315,17 @@ async fn execute_tool_calls(
                     })
                     .await;
                 results[index] = Some(result);
+            }
+            ApprovalDecision::Cancelled => {
+                let result = ToolResult::cancelled(call);
+                let _ = tx
+                    .send(AgentEvent::ToolCallCompleted {
+                        turn_id,
+                        result: result.clone(),
+                    })
+                    .await;
+                results[index] = Some(result);
+                return results.into_iter().flatten().collect();
             }
         }
     }
@@ -404,6 +425,7 @@ async fn permission_decision(
     tools: &ToolRegistry,
     config: &AppConfig,
     tx: &mpsc::Sender<AgentEvent>,
+    cancel: &CancellationToken,
     approval_ids: Arc<AtomicU64>,
 ) -> ApprovalDecision {
     let scope = tools.permission_scope(call);
@@ -419,18 +441,22 @@ async fn permission_decision(
                 scope,
                 summary: tools.describe_call(call),
             };
-            if tx
-                .send(AgentEvent::ApprovalRequested {
-                    turn_id,
-                    request,
-                    decision_tx,
-                })
-                .await
-                .is_err()
-            {
+            let send_approval = tx.send(AgentEvent::ApprovalRequested {
+                turn_id,
+                request,
+                decision_tx,
+            });
+            let send_result = tokio::select! {
+                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                result = send_approval => result,
+            };
+            if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
-            match decision_rx.await {
+            match tokio::select! {
+                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                decision = decision_rx => decision,
+            } {
                 Ok(ToolApprovalDecision::Approved) => ApprovalDecision::Approved,
                 Ok(ToolApprovalDecision::Denied) => {
                     ApprovalDecision::Denied("user denied tool call".to_string())
@@ -446,7 +472,7 @@ fn llm_tool_spec(spec: ToolSpec) -> LlmToolSpec {
         name: spec.name,
         description: spec.description,
         parameters: spec.parameters,
-        strict: true,
+        strict: false,
     }
 }
 
@@ -515,6 +541,7 @@ pub enum ToolApprovalDecision {
 enum ApprovalDecision {
     Approved,
     Denied(String),
+    Cancelled,
 }
 
 #[derive(Debug)]

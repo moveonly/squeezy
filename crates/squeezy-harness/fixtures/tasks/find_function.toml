@@ -1,0 +1,41 @@
+id = "find-function"
+title = "Find a function definition"
+prompt = "Which file defines make_widget?"
+
+[expect]
+contains = ["src/lib.rs"]
+
+[[workspace.files]]
+path = "src/lib.rs"
+content = "pub fn make_widget() {}\n"
+
+[[workspace.files]]
+path = "src/main.rs"
+content = "fn main() {}\n"
+
+[mock.openai]
+[[mock.openai.events]]
+kind = "started"
+[[mock.openai.events]]
+kind = "text_delta"
+text = "src/lib.rs defines make_widget."
+[[mock.openai.events]]
+kind = "completed"
+input_tokens = 42
+output_tokens = 7
+
+[mock.anthropic]
+[[mock.anthropic.events]]
+kind = "started"
+[[mock.anthropic.events]]
+kind = "text_delta"
+text = "src/lib.rs defines make_widget."
+[[mock.anthropic.events]]
+kind = "completed"
+input_tokens = 39
+output_tokens = 8
+
+[baseline]
+pattern = "make_widget"
+include = ["*.rs"]
+mode = "paths"

@@ -4,7 +4,7 @@ A coding agent that treats cost, speed, and code understanding as first-class ci
 
 Squeezy parses repositories and builds a persistent local semantic graph. The agent queries this graph through structured tools that return compact evidence packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early development. The foundation TUI scaffold is runnable; graph-backed navigation is still planned. Committed decisions live in [`docs/`](docs).
+> **Status:** early development. The foundation TUI scaffold is runnable, OpenAI and Anthropic streaming providers are available, and deterministic validation harness tasks run in CI. Graph-backed navigation is still planned. Committed decisions live in [`docs/`](docs).
 
 ## Cost
 

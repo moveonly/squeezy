@@ -1,0 +1,45 @@
+id = "count-pattern"
+title = "Count pattern occurrences"
+prompt = "How many Rust files mention CostSnapshot?"
+
+[expect]
+contains = ["2"]
+
+[[workspace.files]]
+path = "src/a.rs"
+content = "use crate::CostSnapshot;\nfn a() {}\n"
+
+[[workspace.files]]
+path = "src/b.rs"
+content = "fn b(snapshot: CostSnapshot) {}\n"
+
+[[workspace.files]]
+path = "README.md"
+content = "CostSnapshot appears in docs but not Rust.\n"
+
+[mock.openai]
+[[mock.openai.events]]
+kind = "started"
+[[mock.openai.events]]
+kind = "text_delta"
+text = "2 Rust files mention CostSnapshot."
+[[mock.openai.events]]
+kind = "completed"
+input_tokens = 44
+output_tokens = 8
+
+[mock.anthropic]
+[[mock.anthropic.events]]
+kind = "started"
+[[mock.anthropic.events]]
+kind = "text_delta"
+text = "2 Rust files mention CostSnapshot."
+[[mock.anthropic.events]]
+kind = "completed"
+input_tokens = 41
+output_tokens = 8
+
+[baseline]
+pattern = "CostSnapshot"
+include = ["*.rs"]
+mode = "count"

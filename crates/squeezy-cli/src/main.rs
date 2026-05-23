@@ -7,15 +7,18 @@ use clap::Parser;
 use futures_util::StreamExt;
 use squeezy_core::{AppConfig, ProviderConfig};
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider, UnavailableProvider,
+    AnthropicProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider,
+    UnavailableProvider,
 };
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
 struct Cli {
-    #[arg(long, env = "SQUEEZY_MODEL", default_value = squeezy_core::DEFAULT_OPENAI_MODEL)]
-    model: String,
+    #[arg(long, env = "SQUEEZY_PROVIDER", help = "Provider: openai or anthropic")]
+    provider: Option<String>,
+    #[arg(long, env = "SQUEEZY_MODEL")]
+    model: Option<String>,
     #[arg(long, default_value_t = squeezy_core::DEFAULT_MAX_OUTPUT_TOKENS)]
     max_output_tokens: u32,
     #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
@@ -32,8 +35,10 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut config = AppConfig::from_env();
-    config.model = cli.model;
+    let mut config = config_from_cli_provider(cli.provider.as_deref());
+    if let Some(model) = cli.model {
+        config.model = model;
+    }
     config.max_output_tokens = Some(cli.max_output_tokens);
 
     if cli.health {
@@ -109,5 +114,17 @@ fn provider_from_config(config: &AppConfig) -> Arc<dyn LlmProvider> {
             Ok(provider) => Arc::new(provider),
             Err(error) => Arc::new(UnavailableProvider::new("openai", error.to_string())),
         },
+        ProviderConfig::Anthropic(anthropic) => match AnthropicProvider::from_config(anthropic) {
+            Ok(provider) => Arc::new(provider),
+            Err(error) => Arc::new(UnavailableProvider::new("anthropic", error.to_string())),
+        },
     }
+}
+
+fn config_from_cli_provider(provider: Option<&str>) -> AppConfig {
+    let Some(provider) = provider else {
+        return AppConfig::from_env();
+    };
+
+    AppConfig::from_env_with_provider(provider)
 }

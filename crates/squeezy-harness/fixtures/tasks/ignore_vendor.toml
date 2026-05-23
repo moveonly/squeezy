@@ -1,0 +1,41 @@
+id = "ignore-vendor"
+title = "Ignore vendored matches by default"
+prompt = "Which source file contains the local needle implementation?"
+
+[expect]
+contains = ["src/local.rs"]
+
+[[workspace.files]]
+path = "src/local.rs"
+content = "pub fn local_needle() {}\n"
+
+[[workspace.files]]
+path = "vendor/generated.rs"
+content = "pub fn local_needle() {}\n"
+
+[mock.openai]
+[[mock.openai.events]]
+kind = "started"
+[[mock.openai.events]]
+kind = "text_delta"
+text = "src/local.rs contains the local needle implementation."
+[[mock.openai.events]]
+kind = "completed"
+input_tokens = 46
+output_tokens = 8
+
+[mock.anthropic]
+[[mock.anthropic.events]]
+kind = "started"
+[[mock.anthropic.events]]
+kind = "text_delta"
+text = "src/local.rs contains the local needle implementation."
+[[mock.anthropic.events]]
+kind = "completed"
+input_tokens = 43
+output_tokens = 8
+
+[baseline]
+pattern = "local_needle"
+include = ["*.rs"]
+mode = "paths"

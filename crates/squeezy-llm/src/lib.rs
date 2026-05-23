@@ -5,8 +5,10 @@ use serde_json::Value;
 use squeezy_core::{CostSnapshot, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
+mod anthropic;
 mod openai;
 
+pub use anthropic::AnthropicProvider;
 pub use openai::OpenAiProvider;
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;

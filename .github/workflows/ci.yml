@@ -126,6 +126,17 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Run validation harness
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo run -p squeezy-harness --target x86_64-unknown-linux-musl -- run --jsonl "target/harness-${{ matrix.platform }}.jsonl"
+          else
+            cargo run -p squeezy-harness -- run --jsonl "target/harness-${{ matrix.platform }}.jsonl"
+          fi
+
       - name: Build release binary
         shell: bash
         run: |

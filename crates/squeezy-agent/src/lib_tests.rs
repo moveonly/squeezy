@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures_core::Stream;
@@ -229,6 +229,59 @@ async fn asks_for_edit_permission_before_write_tool() {
     }
 
     assert!(saw_approval);
+    assert!(!root.join("sample.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelling_turn_unblocks_pending_approval() {
+    let root = temp_workspace("agent_cancel_approval");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_1".to_string(),
+            name: "write_file".to_string(),
+            arguments: json!({"path": "sample.txt", "content": "hello"}),
+        })),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let cancel = CancellationToken::new();
+    let mut rx = agent.start_turn("write file".to_string(), cancel.clone());
+    let mut pending_decision = None;
+    let mut saw_cancelled_tool = false;
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                    pending_decision = Some(decision_tx);
+                    cancel.cancel();
+                }
+                AgentEvent::ToolCallCompleted { result, .. } => {
+                    saw_cancelled_tool = result.status == ToolStatus::Cancelled;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("turn should not block on unanswered approval after cancellation");
+
+    assert!(pending_decision.is_some());
+    assert!(saw_cancelled_tool);
     assert!(!root.join("sample.txt").exists());
 
     let _ = fs::remove_dir_all(root);
