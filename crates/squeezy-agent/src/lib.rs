@@ -45,6 +45,7 @@ impl Agent {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
             preview_bytes: config.tool_preview_bytes,
             retention_days: config.tool_output_retention_days,
+            output_dir: config.cache.tool_outputs.clone(),
         };
         let web_config = WebToolConfig {
             exa_mcp_url: config.exa_mcp_url.clone(),
@@ -52,7 +53,7 @@ impl Agent {
         };
         let tools = ToolRegistry::new_with_configs(
             config.workspace_root.clone(),
-            output_config,
+            output_config.clone(),
             web_config.clone(),
         )
         .unwrap_or_else(|_| {

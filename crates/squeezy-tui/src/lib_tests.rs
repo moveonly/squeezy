@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn app_starts_ready_with_empty_transcript() {
-    let app = TuiApp::new("openai", "gpt-test".to_string());
+    let app = TuiApp::new("openai", "gpt-test".to_string(), "defaults".to_string());
 
     assert_eq!(app.provider_name, "openai");
     assert_eq!(app.model, "gpt-test");

@@ -30,4 +30,5 @@ Platform support details live in `docs/PLATFORMS.md`.
 
 Validation harness details live in `docs/VALIDATION_HARNESS.md`.
 
-Provider and model configuration lives in `docs/PROVIDERS.md`.
+Configuration is documented in [`CONFIGURATION.md`](CONFIGURATION.md), with
+provider-specific details in [`PROVIDERS.md`](PROVIDERS.md).

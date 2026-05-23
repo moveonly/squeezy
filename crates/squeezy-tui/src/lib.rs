@@ -22,7 +22,11 @@ use tokio_util::sync::CancellationToken;
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let agent = Agent::new(config.clone(), provider);
-    let mut app = TuiApp::new(agent.provider_name(), config.model.clone());
+    let mut app = TuiApp::new(
+        agent.provider_name(),
+        config.model.clone(),
+        config.config_source_labels().join(","),
+    );
 
     loop {
         terminal.draw(|frame| render(frame, &app))?;
@@ -264,9 +268,10 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
+        app.config_sources,
         app.status,
         app.metrics.tool_calls,
         app.metrics.bytes_read,
@@ -297,6 +302,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 struct TuiApp {
     provider_name: &'static str,
     model: String,
+    config_sources: String,
     input: String,
     transcript: Vec<TranscriptItem>,
     pending_assistant: String,
@@ -309,10 +315,11 @@ struct TuiApp {
 }
 
 impl TuiApp {
-    fn new(provider_name: &'static str, model: String) -> Self {
+    fn new(provider_name: &'static str, model: String, config_sources: String) -> Self {
         Self {
             provider_name,
             model,
+            config_sources,
             input: String::new(),
             transcript: Vec::new(),
             pending_assistant: String::new(),

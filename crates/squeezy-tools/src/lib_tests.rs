@@ -462,6 +462,7 @@ async fn output_spill_uses_registry_config() {
             spill_threshold_bytes: 100,
             preview_bytes: 17,
             retention_days: 1,
+            output_dir: None,
         },
     )
     .expect("registry");
@@ -487,6 +488,88 @@ async fn output_spill_uses_registry_config() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn relative_output_dir_resolves_against_workspace_root() {
+    let root = temp_workspace("output_dir_rel");
+    fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 8,
+            retention_days: 1,
+            output_dir: Some(PathBuf::from("cache/spill")),
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_rel".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": 500}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let canonical_root = root.canonicalize().expect("canonical root");
+    let expected_dir = canonical_root.join("cache").join("spill");
+    assert!(
+        expected_dir.is_dir(),
+        "spill dir {expected_dir:?} should exist under the workspace root",
+    );
+    let handle = result.content["handle"].as_str().expect("handle");
+    assert!(expected_dir.join(format!("{handle}.json")).is_file());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn absolute_output_dir_overrides_workspace_root() {
+    let root = temp_workspace("output_dir_abs");
+    let absolute_dir = std::env::temp_dir().join(format!(
+        "squeezy_output_abs_{}_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos(),
+        WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst),
+    ));
+    fs::write(root.join("sample.txt"), "x".repeat(200)).expect("write sample");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 8,
+            retention_days: 1,
+            output_dir: Some(absolute_dir.clone()),
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_abs".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": 500}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let handle = result.content["handle"].as_str().expect("handle");
+    assert!(absolute_dir.join(format!("{handle}.json")).is_file());
+
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&absolute_dir);
 }
 
 #[tokio::test]

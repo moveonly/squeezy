@@ -37,7 +37,11 @@ fn telemetry_disabled_when_install_id_cannot_be_persisted() {
 
 #[test]
 fn install_id_is_persisted() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-telemetry-install-{}-{}",
+        now_ms(),
+        std::process::id()
+    ));
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -57,7 +61,11 @@ fn install_id_is_persisted() {
 
 #[tokio::test]
 async fn record_buffers_events_for_periodic_batch_flush() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = std::env::temp_dir().join(format!(
+        "squeezy-telemetry-record-{}-{}",
+        now_ms(),
+        std::process::id()
+    ));
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
