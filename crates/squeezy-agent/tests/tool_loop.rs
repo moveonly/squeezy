@@ -245,6 +245,49 @@ async fn approved_write_edits_real_workspace_file() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn large_read_result_returns_spill_handle_to_model() {
+    let root = temp_workspace("agent_spill");
+    fs::write(root.join("large.txt"), "a".repeat(30_000)).expect("write large");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("spilled".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn("read large".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "read_call");
+    assert_eq!(outputs[0].1["content"]["spilled"], true);
+    assert!(
+        outputs[0].1["content"]["handle"]
+            .as_str()
+            .is_some_and(|handle| handle.len() == 64)
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 async fn drain_turn(mut rx: tokio::sync::mpsc::Receiver<AgentEvent>) {
     while rx.recv().await.is_some() {}
 }

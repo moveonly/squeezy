@@ -4,7 +4,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -23,6 +23,9 @@ const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
 const DEFAULT_READ_LIMIT: usize = 32_000;
 const MAX_READ_LIMIT: usize = 128_000;
+const DEFAULT_SPILL_THRESHOLD_BYTES: usize = 25_000;
+const DEFAULT_SPILL_PREVIEW_BYTES: usize = 2_000;
+const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -112,6 +115,7 @@ impl ToolResult {
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     root: Arc<PathBuf>,
+    output_store: Arc<ToolOutputStore>,
 }
 
 impl ToolRegistry {
@@ -120,8 +124,10 @@ impl ToolRegistry {
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
+        let output_store = ToolOutputStore::new(&root)?;
         Ok(Self {
             root: Arc::new(root),
+            output_store: Arc::new(output_store),
         })
     }
 
@@ -130,6 +136,7 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             read_file_spec(),
+            read_tool_output_spec(),
             write_file_spec(),
             shell_spec(),
         ];
@@ -143,13 +150,16 @@ impl ToolRegistry {
             "shell" => PermissionScope::Shell,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
-            "glob" | "grep" | "read_file" => PermissionScope::Read,
+            "glob" | "grep" | "read_file" | "read_tool_output" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
 
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
-        matches!(call.name.as_str(), "glob" | "grep" | "read_file")
+        matches!(
+            call.name.as_str(),
+            "glob" | "grep" | "read_file" | "read_tool_output"
+        )
     }
 
     pub fn describe_call(&self, call: &ToolCall) -> String {
@@ -183,6 +193,15 @@ impl ToolRegistry {
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("?");
                 format!("read_file path={path:?}")
             }
+            "read_tool_output" => {
+                let args =
+                    serde_json::from_value::<ReadToolOutputArgs>(call.arguments.clone()).ok();
+                let handle = args
+                    .as_ref()
+                    .map(|args| args.handle.as_str())
+                    .unwrap_or("?");
+                format!("read_tool_output handle={handle:?}")
+            }
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("?");
@@ -205,10 +224,11 @@ impl ToolRegistry {
             return ToolResult::cancelled(&call);
         }
 
-        match call.name.as_str() {
+        let result = match call.name.as_str() {
             "glob" => self.execute_glob(&call, cancel).await,
             "grep" => self.execute_grep(&call, cancel).await,
             "read_file" => self.execute_read_file(&call).await,
+            "read_tool_output" => self.execute_read_tool_output(&call).await,
             "write_file" => self.execute_write_file(&call).await,
             "shell" => self.execute_shell(&call, cancel).await,
             _ => make_result(
@@ -218,6 +238,12 @@ impl ToolRegistry {
                 ToolCostHint::default(),
                 None,
             ),
+        };
+
+        if call.name == "read_tool_output" {
+            result
+        } else {
+            self.finalize_result(result)
         }
     }
 
@@ -268,7 +294,7 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
-            if !path.is_file() || contains_vcs_dir(path) {
+            if !path.is_file() || contains_skipped_dir(path) {
                 continue;
             }
             if is_secret_path(path) {
@@ -386,7 +412,7 @@ impl ToolRegistry {
                 Err(_) => continue,
             };
             let path = entry.path();
-            if !path.is_file() || contains_vcs_dir(path) {
+            if !path.is_file() || contains_skipped_dir(path) {
                 continue;
             }
             let rel = self.relative(path);
@@ -542,6 +568,43 @@ impl ToolRegistry {
             }),
             cost,
             Some(content_sha256),
+        )
+    }
+
+    async fn execute_read_tool_output(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<ReadToolOutputArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let output = match self.output_store.read(
+            &args.handle,
+            args.offset.unwrap_or(0),
+            args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT),
+        ) {
+            Ok(output) => output,
+            Err(err) => return tool_error(call, err),
+        };
+        let cost = ToolCostHint {
+            bytes_read: output.bytes_returned as u64,
+            output_bytes: output.content.len() as u64,
+            truncated: output.truncated,
+            ..ToolCostHint::default()
+        };
+
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "handle": args.handle,
+                "offset": output.offset,
+                "bytes_returned": output.bytes_returned,
+                "total_bytes": output.total_bytes,
+                "sha256": output.sha256,
+                "truncated": output.truncated,
+                "content": output.content,
+            }),
+            cost,
+            None,
         )
     }
 
@@ -745,6 +808,150 @@ impl ToolRegistry {
             .unwrap_or(path)
             .to_path_buf()
     }
+
+    fn finalize_result(&self, result: ToolResult) -> ToolResult {
+        self.output_store.maybe_spill(result)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ToolOutputStore {
+    dir: PathBuf,
+    spill_threshold_bytes: usize,
+    preview_bytes: usize,
+    retention: Duration,
+}
+
+impl ToolOutputStore {
+    fn new(root: &Path) -> Result<Self> {
+        let store = Self {
+            dir: root.join(".squeezy").join("tool_outputs"),
+            spill_threshold_bytes: DEFAULT_SPILL_THRESHOLD_BYTES,
+            preview_bytes: DEFAULT_SPILL_PREVIEW_BYTES,
+            retention: Duration::from_secs(DEFAULT_TOOL_OUTPUT_RETENTION_DAYS * 24 * 60 * 60),
+        };
+        fs::create_dir_all(&store.dir)?;
+        store.cleanup_old_outputs();
+        Ok(store)
+    }
+
+    fn maybe_spill(&self, mut result: ToolResult) -> ToolResult {
+        let output = result.model_output();
+        if output.len() <= self.spill_threshold_bytes {
+            return result;
+        }
+
+        let sha256 = sha256_hex(output.as_bytes());
+        let path = self.path_for(&sha256);
+        if let Err(err) = fs::write(&path, output.as_bytes()) {
+            result.status = ToolStatus::Error;
+            result.content = json!({ "error": format!("failed to spill tool output: {err}") });
+            result.cost_hint.truncated = true;
+            result.receipt.output_sha256 =
+                sha256_hex(serde_json::to_vec(&result.content).unwrap_or_default());
+            return result;
+        }
+
+        let (preview, _) = truncate_to_bytes(&output, self.preview_bytes);
+        let ToolResult {
+            call_id,
+            tool_name,
+            status,
+            content: _,
+            mut cost_hint,
+            receipt,
+        } = result;
+        let call = ToolCall {
+            call_id,
+            name: tool_name,
+            arguments: Value::Null,
+        };
+        cost_hint.truncated = true;
+        cost_hint.output_bytes = 0;
+
+        make_result(
+            &call,
+            status,
+            json!({
+                "spilled": true,
+                "handle": sha256,
+                "sha256": sha256,
+                "total_bytes": output.len(),
+                "preview_bytes": preview.len(),
+                "preview": preview,
+                "truncated": true,
+            }),
+            cost_hint,
+            receipt.content_sha256,
+        )
+    }
+
+    fn read(
+        &self,
+        handle: &str,
+        offset: usize,
+        limit: usize,
+    ) -> std::result::Result<StoredToolOutputSlice, String> {
+        if !is_valid_handle(handle) {
+            return Err("invalid tool output handle".to_string());
+        }
+        let bytes = fs::read(self.path_for(handle))
+            .map_err(|err| format!("tool output handle not found or unreadable: {err}"))?;
+        let offset = offset.min(bytes.len());
+        let end = offset.saturating_add(limit).min(bytes.len());
+        let content = String::from_utf8_lossy(&bytes[offset..end]).to_string();
+        Ok(StoredToolOutputSlice {
+            offset,
+            bytes_returned: end - offset,
+            total_bytes: bytes.len(),
+            sha256: sha256_hex(&bytes),
+            truncated: end < bytes.len(),
+            content,
+        })
+    }
+
+    fn cleanup_old_outputs(&self) {
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age > self.retention)
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    fn path_for(&self, handle: &str) -> PathBuf {
+        self.dir.join(format!("{handle}.json"))
+    }
+}
+
+#[derive(Debug)]
+struct StoredToolOutputSlice {
+    offset: usize,
+    bytes_returned: usize,
+    total_bytes: usize,
+    sha256: String,
+    truncated: bool,
+    content: String,
+}
+
+fn is_valid_handle(handle: &str) -> bool {
+    handle.len() == 64 && handle.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Deserialize)]
@@ -800,6 +1007,13 @@ impl GrepOutputMode {
 #[derive(Debug, Deserialize)]
 struct ReadFileArgs {
     path: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadToolOutputArgs {
+    handle: String,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -914,12 +1128,12 @@ fn file_len(path: &Path) -> std::result::Result<u64, std::io::Error> {
     Ok(fs::metadata(path)?.len())
 }
 
-fn contains_vcs_dir(path: &Path) -> bool {
+fn contains_skipped_dir(path: &Path) -> bool {
     path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
-            .is_some_and(|part| matches!(part, ".git" | ".hg" | ".svn"))
+            .is_some_and(|part| matches!(part, ".git" | ".hg" | ".svn" | ".squeezy"))
     })
 }
 
@@ -1028,6 +1242,25 @@ fn read_file_spec() -> ToolSpec {
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT, "description": "Maximum bytes to return."}
             },
             "required": ["path"]
+        }),
+    }
+}
+
+fn read_tool_output_spec() -> ToolSpec {
+    ToolSpec {
+        name: "read_tool_output".to_string(),
+        description:
+            "Read a bounded byte range from a spilled tool-output handle returned by another tool."
+                .to_string(),
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "handle": {"type": "string", "description": "Tool output handle from a spilled result."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to start reading from."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT, "description": "Maximum bytes to return."}
+            },
+            "required": ["handle"]
         }),
     }
 }

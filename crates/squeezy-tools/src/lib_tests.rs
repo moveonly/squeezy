@@ -176,6 +176,60 @@ async fn read_file_returns_bounded_content_and_hash() {
 }
 
 #[tokio::test]
+async fn large_tool_output_spills_to_handle_and_can_be_read_back() {
+    let root = temp_workspace("spill");
+    let large = "a".repeat(30_000);
+    fs::write(root.join("large.txt"), &large).expect("write large");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "large.txt", "limit": 40_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    assert!(result.cost_hint.truncated);
+    assert!(
+        result
+            .model_output()
+            .len()
+            .lt(&DEFAULT_SPILL_THRESHOLD_BYTES)
+    );
+
+    let handle = result.content["handle"].as_str().expect("handle");
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({"handle": handle, "offset": 0, "limit": 256}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(fetched.status, ToolStatus::Success);
+    assert_eq!(fetched.content["offset"], 0);
+    assert_eq!(fetched.content["bytes_returned"], 256);
+    assert_eq!(fetched.content["truncated"], true);
+    assert!(
+        fetched.content["content"]
+            .as_str()
+            .expect("content")
+            .contains("\"tool_name\":\"read_file\"")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn write_file_rejects_stale_expected_hash() {
     let root = temp_workspace("write_file");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
@@ -244,7 +298,14 @@ fn tool_specs_are_sorted_by_name() {
 
     assert_eq!(
         names,
-        vec!["glob", "grep", "read_file", "shell", "write_file"]
+        vec![
+            "glob",
+            "grep",
+            "read_file",
+            "read_tool_output",
+            "shell",
+            "write_file"
+        ]
     );
 
     let _ = fs::remove_dir_all(root);
