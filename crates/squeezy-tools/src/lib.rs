@@ -617,6 +617,8 @@ impl ToolRegistry {
             json!({
                 "paths": paths,
                 "metadata": {
+                    "pattern": args.pattern,
+                    "path": args.path.as_deref().unwrap_or("."),
                     "include_ignored": include_ignored,
                     "offset": offset,
                     "skipped_secret_files": skipped_secret_files,
@@ -785,6 +787,14 @@ impl ToolRegistry {
         }
 
         let mut metadata = BTreeMap::new();
+        metadata.insert("pattern".to_string(), json!(args.pattern));
+        metadata.insert(
+            "path".to_string(),
+            json!(args.path.as_deref().unwrap_or(".")),
+        );
+        if let Some(include) = args.include.as_ref() {
+            metadata.insert("include".to_string(), json!(include));
+        }
         metadata.insert("include_ignored".to_string(), json!(include_ignored));
         metadata.insert("output_mode".to_string(), json!(output_mode.as_str()));
         metadata.insert("offset".to_string(), json!(offset));
