@@ -636,10 +636,18 @@ struct ExtractContext<'source> {
 fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
     for line in ctx.source.lines() {
         let line = line.trim();
-        if !line.starts_with("__all__") {
+        // Require a word boundary after `__all__` so identifiers like
+        // `__all__module = "x"` and `__all_xs = "x"` (the latter does not even
+        // share the full prefix) are not matched as `__all__` assignments,
+        // and so docstring/string content of the form `__all__ = ["fake"]`
+        // is only accepted when it is genuinely at line start.
+        let Some(rest) = line.strip_prefix("__all__") else {
+            continue;
+        };
+        if !rest.starts_with(|ch: char| ch.is_whitespace() || ch == '=' || ch == '+') {
             continue;
         }
-        let Some((_, right)) = line.split_once('=') else {
+        let Some((_, right)) = rest.split_once('=') else {
             continue;
         };
         for exported in python_string_list_values(right) {
@@ -705,7 +713,7 @@ fn visit_python_node(
         return;
     }
 
-    if kind == "call" {
+    if kind == "call" && !python_node_is_inside_decorator(node) {
         extract_python_call(node, ctx, owner_symbol.clone());
     } else if matches!(kind, "assignment" | "assignment_statement") {
         extract_python_field_symbol(node, ctx, parent_symbol.as_ref());
@@ -1099,6 +1107,20 @@ fn python_docs_for_node(node: Node<'_>, source: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Returns true when the node lies inside a Python `@decorator(...)` head,
+/// stopping at the enclosing function/class/lambda body.
+fn python_node_is_inside_decorator(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        match parent.kind() {
+            "decorator" => return true,
+            "function_definition" | "class_definition" | "lambda" => return false,
+            _ => current = parent.parent(),
+        }
+    }
+    false
+}
+
 fn python_class_bases(signature: &str) -> Vec<String> {
     let Some(after_class) = signature.trim().strip_prefix("class ") else {
         return Vec::new();
@@ -1111,6 +1133,11 @@ fn python_class_bases(signature: &str) -> Vec<String> {
     };
     split_top_level_commas(&after_class[open_index + 1..close_index])
         .into_iter()
+        // Class headers admit keyword arguments (`metaclass=`, `total=`,
+        // `frozen=`, ...); those are not base classes and `python_type_name_from_annotation`
+        // would otherwise strip `metaclass=Meta` down to the keyword name
+        // `"metaclass"` and silently drop `Meta`.
+        .filter(|item| !item.contains('='))
         .filter_map(|base| python_type_name_from_annotation(&base))
         .collect()
 }

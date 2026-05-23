@@ -202,6 +202,91 @@ def test_runner():
 }
 
 #[test]
+fn python_parser_skips_calls_inside_decorators() {
+    let source = r#"
+from fastapi import APIRouter
+
+router = APIRouter()
+
+class Runner:
+    @router.get("/x")
+    def handle(self):
+        return router.get_settings()
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let mut record_py = record("src/handler.py", source);
+    record_py.language = LanguageKind::Python;
+    let parsed = parser.parse_source(&record_py, source.to_string()).unwrap();
+
+    // The decorator `@router.get("/x")` must NOT generate a `get` call edge
+    // belonging to the surrounding class. The body call to `router.get_settings()`
+    // is still recorded.
+    let decorator_get_call = parsed
+        .calls
+        .iter()
+        .any(|call| call.name == "get" && call.receiver.as_deref() == Some("router"));
+    assert!(
+        !decorator_get_call,
+        "calls inside `@router.get(...)` must not be recorded as method calls",
+    );
+    let body_get_settings_call = parsed
+        .calls
+        .iter()
+        .any(|call| call.name == "get_settings" && call.receiver.as_deref() == Some("router"));
+    assert!(
+        body_get_settings_call,
+        "body method call must still be recorded",
+    );
+}
+
+#[test]
+fn python_class_bases_filter_out_keyword_arguments() {
+    let bases = python_class_bases("class Foo(Bar, metaclass=Meta, total=False)");
+    assert_eq!(bases, vec!["Bar".to_string()]);
+}
+
+#[test]
+fn extract_python_module_exports_requires_word_boundary() {
+    use crate::ExtractContext;
+
+    fn run_exports(source: &str) -> Vec<String> {
+        let mut record_py = record("src/mod.py", source);
+        record_py.language = LanguageKind::Python;
+        let mut ctx = ExtractContext {
+            file: record_py,
+            source,
+            symbols: Vec::new(),
+            imports: Vec::new(),
+            calls: Vec::new(),
+            references: Vec::new(),
+            body_hits: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        extract_python_module_exports(&mut ctx);
+        ctx.imports
+            .into_iter()
+            .filter(|imp| imp.is_reexport)
+            .map(|imp| imp.path)
+            .collect()
+    }
+
+    let real = run_exports("__all__ = [\"foo\", \"bar\"]\n");
+    assert_eq!(real, vec!["foo".to_string(), "bar".to_string()]);
+
+    let bogus_prefixed = run_exports("__all__module = [\"value\"]\n");
+    assert!(
+        bogus_prefixed.is_empty(),
+        "identifiers prefixed with `__all__` must not be treated as reexports"
+    );
+
+    let bogus_partial = run_exports("__all_xs = [\"value\"]\n");
+    assert!(bogus_partial.is_empty());
+
+    let plus_eq = run_exports("__all__ += [\"extra\"]\n");
+    assert_eq!(plus_eq, vec!["extra".to_string()]);
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
