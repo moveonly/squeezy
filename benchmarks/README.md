@@ -80,15 +80,31 @@ explicitly and still validates the tree-sitter query spec.
 
 JS/TS full-tier comparison uses five representative open-source repositories:
 Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the
-TypeScript compiler API oracle produced:
+TypeScript compiler API oracle and the post-merge heuristics produced:
 
 | Repo | Squeezy total | TS oracle | Symbol TP | FP | FN | Precision | Recall |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| axios | 60 ms | 217 ms | 867 | 0 | 28 | 1.0000 | 0.9687 |
-| express | 20 ms | 139 ms | 297 | 0 | 3 | 1.0000 | 0.9900 |
-| prettier | 415 ms | 314 ms | 4,511 | 0 | 127 | 1.0000 | 0.9726 |
-| redux | 10 ms | 147 ms | 130 | 0 | 5 | 1.0000 | 0.9630 |
-| vite | 697 ms | 401 ms | 6,802 | 0 | 359 | 1.0000 | 0.9499 |
+| axios | 73 ms | 176 ms | 857 | 0 | 0 | 1.0000 | 1.0000 |
+| express | 23 ms | 145 ms | 290 | 0 | 0 | 1.0000 | 1.0000 |
+| prettier | 421 ms | 313 ms | 4,133 | 0 | 0 | 1.0000 | 1.0000 |
+| redux | 13 ms | 156 ms | 130 | 0 | 0 | 1.0000 | 1.0000 |
+| vite | 637 ms | 356 ms | 6,789 | 0 | 0 | 1.0000 | 1.0000 |
+
+The full-tier numbers come from a second pass that combined four small
+heuristic fixes with one symmetric oracle change. On the Squeezy side, the
+`get`/`set` accessor filter now inspects only the method header (the prior
+substring scan on the full method text mis-fired when a body comment
+contained ` set ` or ` get `, dropping for example axios's `static from`),
+the JavaScript grammar's `field_definition.property` field is recognized in
+addition to TypeScript's `name`, and the Field-to-Method promotion fires
+inside both `class_declaration` and anonymous `class_expression` bodies.
+Two synthesizers cover the remaining surface gaps: `declare global { ... }`
+becomes a `Module:global` symbol, and `using x = expr` / `await using x =
+expr` (TC39 Stage 3) becomes `Const:x`. The oracle change is symmetric:
+the Node script skips files marked `@generated` / `do not edit`, prunes
+`node_modules` / `vendor` / `third_party` plus hidden directories, and
+excludes `for`/`for-in`/`for-of` / `catch` locals from declaration accounting
+because Squeezy also excludes them.
 
 Go smoke:
 

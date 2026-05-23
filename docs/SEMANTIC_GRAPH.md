@@ -120,10 +120,15 @@ decision instead of walking a likely non-code or dangerous directory.
   `exports`, class constructors, direct calls, member calls, and type/interface
   references are indexed from tree-sitter syntax and checked local config files.
   JSX/TSX functions/classes with uppercase names or JSX bodies are tagged as
-  component-like. Dynamic imports, computed property access, bundler aliases
-  without checked config, package export edge cases, and runtime dispatch are
-  explicit candidate, heuristic, external, or fallback results rather than exact
-  edges.
+  component-like. `declare global { ... }` is synthesized as `Module:global`,
+  TC39 Stage 3 `using x = expr` / `await using x = expr` becomes `Const:x`,
+  and `static prop = () => {}` arrow fields are surfaced as methods on both
+  named classes and anonymous `class { ... }` expressions. Loop counters
+  (`for (let i = 0; ...)`) and `catch (e)` bindings are intentionally not
+  exposed as declaration symbols. Dynamic imports, computed property access,
+  bundler aliases without checked config, package export edge cases, and
+  runtime dispatch are explicit candidate, heuristic, external, or fallback
+  results rather than exact edges.
 - Go package-qualified calls resolve through explicit imports when the imported
   package maps to one indexed package and one function target. Same-package
   direct calls and same-receiver method calls resolve when there is a single

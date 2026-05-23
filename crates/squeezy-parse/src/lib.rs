@@ -1775,6 +1775,10 @@ fn visit_js_ts_node(
         extract_js_ts_import_export(node, ctx, owner_symbol.clone());
     }
 
+    if let Some(symbol) = js_ts_synthetic_binding_symbol(node, ctx, parent_symbol.as_ref()) {
+        ctx.symbols.push(symbol);
+    }
+
     if let Some(symbol) = js_ts_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
         extract_js_ts_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
@@ -2030,7 +2034,12 @@ fn js_ts_symbol_from_node(
         "method_definition" | "method_signature" => SymbolKind::Method,
         "public_field_definition" | "field_definition" | "property_signature" => SymbolKind::Field,
         "type_alias_declaration" => SymbolKind::TypeAlias,
-        "variable_declarator" => js_ts_variable_symbol_kind(node, ctx.source)?,
+        "variable_declarator" => {
+            if js_ts_variable_is_for_loop_local(node) {
+                return None;
+            }
+            js_ts_variable_symbol_kind(node, ctx.source)?
+        }
         _ => return None,
     };
     if kind == SymbolKind::Function
@@ -2041,10 +2050,14 @@ fn js_ts_symbol_from_node(
         kind = SymbolKind::Method;
     }
     if kind == SymbolKind::Field
-        && parent_symbol
+        && js_ts_node_value_is_function_like(node)
+        && (parent_symbol
             .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
             .unwrap_or(false)
-        && js_ts_node_value_is_function_like(node)
+            || node
+                .parent()
+                .map(|parent| matches!(parent.kind(), "class_body"))
+                .unwrap_or(false))
     {
         kind = SymbolKind::Method;
     }
@@ -2093,6 +2106,30 @@ fn js_ts_variable_symbol_kind(node: Node<'_>, source: &str) -> Option<SymbolKind
     Some(SymbolKind::Const)
 }
 
+/// A `variable_declarator` introduced by a C-style `for (let i = 0; ...; ...)`
+/// is anchored on a `lexical_declaration` whose parent is the enclosing
+/// `for_statement`. Loop counters and similar locals are excluded from the
+/// declaration set in both Squeezy and the JS/TS oracle so navigation does
+/// not get flooded by `i`/`j`/`len` per loop site.
+fn js_ts_variable_is_for_loop_local(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if !matches!(
+        parent.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return false;
+    }
+    let Some(grand) = parent.parent() else {
+        return false;
+    };
+    matches!(
+        grand.kind(),
+        "for_statement" | "for_in_statement" | "for_of_statement"
+    )
+}
+
 fn js_ts_node_value_is_function_like(node: Node<'_>) -> bool {
     node.child_by_field_name("value")
         .map(|value| {
@@ -2117,15 +2154,13 @@ fn js_ts_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<S
         return Some(js_ts_clean_property_name(&raw_name)).filter(|text| !text.is_empty());
     }
     if kind == SymbolKind::Method {
-        let raw = node_text(node, source).ok()?.trim_start().to_string();
-        if raw.starts_with("get ")
-            || raw.starts_with("set ")
-            || raw.contains(" get ")
-            || raw.contains(" set ")
-        {
+        if js_ts_method_is_accessor(node, source) {
             return None;
         }
-        if let Some(name) = node.child_by_field_name("name") {
+        let name_node = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("property"));
+        if let Some(name) = name_node {
             let name = node_text(name, source)
                 .ok()
                 .map(js_ts_clean_property_name)
@@ -2142,7 +2177,11 @@ fn js_ts_symbol_name(node: Node<'_>, kind: SymbolKind, source: &str) -> Option<S
             .and_then(|child| node_text(child, source).ok())
             .and_then(js_ts_binding_name);
     }
+    // JavaScript field/method definitions expose the identifier as `property`,
+    // while TypeScript uses `name`; falling back covers both grammars without
+    // duplicating the rest of the lookup.
     node.child_by_field_name("name")
+        .or_else(|| node.child_by_field_name("property"))
         .and_then(|child| node_text(child, source).ok())
         .map(js_ts_clean_property_name)
         .filter(|text| !text.is_empty())
@@ -2154,6 +2193,211 @@ fn js_ts_binding_name(text: &str) -> Option<String> {
         return Some(trimmed.to_string());
     }
     None
+}
+
+/// Tree-sitter parses a few constructs as flat keyword + identifier sequences
+/// rather than `variable_declarator` or `module_declaration` wrappers, so the
+/// regular declaration walk does not pick them up:
+///
+/// - `declare global { ... }` is an `ambient_declaration` whose `global`
+///   segment is an anonymous keyword token rather than a named identifier
+///   child. TypeScript treats it as a Module named `global`.
+/// - `using x = expr` / `await using x = expr` (TC39 Stage 3) parse as an
+///   `assignment_expression` whose first anonymous child is the `using`
+///   keyword and whose `left` field is the binding identifier. TypeScript
+///   treats these as ordinary `VariableDeclaration` Const symbols.
+///
+/// Synthesizing matching graph symbols keeps the JS/TS oracle from flagging
+/// them as false negatives without forcing downstream consumers to special
+/// case these surface syntaxes.
+fn js_ts_synthetic_binding_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    match node.kind() {
+        "ambient_declaration" => js_ts_declare_global_symbol(node, ctx, parent_symbol),
+        "assignment_expression" => js_ts_using_binding_symbol(node, ctx, parent_symbol),
+        _ => None,
+    }
+}
+
+fn js_ts_declare_global_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut cursor = node.walk();
+    let mut declare_seen = false;
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            return None;
+        }
+        let text = node_text(child, ctx.source).ok()?.trim().to_string();
+        if !declare_seen {
+            if text == "declare" {
+                declare_seen = true;
+            } else {
+                return None;
+            }
+            continue;
+        }
+        if text == "global" {
+            let span = span_from_node(child);
+            let parent_id = parent_symbol.map(|(id, _)| id.clone());
+            let id = symbol_id(
+                &ctx.file,
+                parent_id.as_ref(),
+                SymbolKind::Module,
+                "global",
+                span,
+            );
+            let attributes = vec![
+                js_ts_language_tag(ctx.file.language),
+                "declare:global".to_string(),
+            ]
+            .into_iter()
+            .filter(|attr| !attr.is_empty())
+            .collect();
+            let body_span = {
+                let mut walker = node.walk();
+                node.children(&mut walker)
+                    .find(|child| child.kind() == "statement_block")
+                    .map(span_from_node)
+            };
+            return Some(ParsedSymbol {
+                id,
+                file_id: ctx.file.id.clone(),
+                parent_id,
+                name: "global".to_string(),
+                kind: SymbolKind::Module,
+                span,
+                body_span,
+                signature: "declare global".to_string(),
+                visibility: None,
+                docs: Vec::new(),
+                attributes,
+                provenance: Provenance::new(
+                    "tree-sitter-js-ts",
+                    "declare global module".to_string(),
+                ),
+                confidence: Confidence::ExactSyntax,
+                freshness: Freshness::Fresh,
+            });
+        }
+        return None;
+    }
+    None
+}
+
+/// Recognize `using x = expr` and `await using x = expr` bindings. The
+/// tree-sitter grammar (still pre-`using`) parses these as an assignment
+/// expression with `using` as the first anonymous token; everything that
+/// looks like a normal assignment is rejected so we never emit a Const for
+/// `obj.foo = bar` or other reassignments.
+fn js_ts_using_binding_symbol(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut cursor = node.walk();
+    let mut first_anonymous_token: Option<String> = None;
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            break;
+        }
+        if let Ok(text) = node_text(child, ctx.source) {
+            let token = text.trim();
+            if !token.is_empty() {
+                first_anonymous_token = Some(token.to_string());
+                break;
+            }
+        }
+    }
+    if first_anonymous_token.as_deref() != Some("using") {
+        return None;
+    }
+    let left = node.child_by_field_name("left")?;
+    if left.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(left, ctx.source).ok()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let span = span_from_node(left);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(
+        &ctx.file,
+        parent_id.as_ref(),
+        SymbolKind::Const,
+        &name,
+        span,
+    );
+    let attributes = vec![js_ts_language_tag(ctx.file.language), "using".to_string()]
+        .into_iter()
+        .filter(|attr| !attr.is_empty())
+        .collect();
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind: SymbolKind::Const,
+        span,
+        body_span: None,
+        signature: node_text(node, ctx.source).unwrap_or_default().to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-js-ts", "using declaration".to_string()),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn js_ts_language_tag(language: LanguageKind) -> String {
+    match language {
+        LanguageKind::JavaScript => "javascript".to_string(),
+        LanguageKind::Jsx => "jsx".to_string(),
+        LanguageKind::TypeScript => "typescript".to_string(),
+        LanguageKind::Tsx => "tsx".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Detect `get foo()`/`set foo()` accessors on `method_definition` and
+/// `method_signature` nodes. We look at the header (everything up to the
+/// parameter list or method body) for a `get` or `set` keyword token that
+/// is not the method's own name. Inspecting only the header avoids the old
+/// substring scan that misfired on benign occurrences of " set " or " get "
+/// inside comments or the method body itself.
+fn js_ts_method_is_accessor(node: Node<'_>, source: &str) -> bool {
+    let name_node = node.child_by_field_name("name");
+    let header_end = node
+        .child_by_field_name("parameters")
+        .map(|params| params.start_byte())
+        .or_else(|| {
+            node.child_by_field_name("body")
+                .map(|body| body.start_byte())
+        })
+        .unwrap_or(node.end_byte());
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.start_byte() >= header_end {
+            break;
+        }
+        if matches!(name_node, Some(name) if name.id() == child.id()) {
+            break;
+        }
+        if let Ok(text) = node_text(child, source) {
+            let token = text.trim();
+            if token == "get" || token == "set" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn js_ts_clean_property_name(text: &str) -> String {

@@ -165,6 +165,11 @@ pub struct SemanticGraph {
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
     edges_by_to: HashMap<SymbolId, Vec<usize>>,
+    /// Indices into [`Self::imports`] grouped by the file that introduced
+    /// them. `import_visible_from_symbol` only ever returns true when the
+    /// import shares a file with the caller, so resolving an alias or
+    /// reference no longer needs to scan every import in the workspace.
+    imports_by_file: HashMap<FileId, Vec<usize>>,
     js_ts_resolver: JsTsResolver,
 }
 
@@ -189,6 +194,7 @@ impl SemanticGraph {
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
+            imports_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
         }
     }
@@ -992,8 +998,7 @@ impl SemanticGraph {
         }
         let caller = self.symbols.get(caller_id)?;
         let candidates = self
-            .imports
-            .iter()
+            .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| import.span.start_byte <= call.span.start_byte)
             .filter(|import| import.alias.as_deref() == Some(call.name.as_str()))
@@ -1036,8 +1041,7 @@ impl SemanticGraph {
         {
             return false;
         }
-        self.imports
-            .iter()
+        self.imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| import.span.start_byte <= call.span.start_byte)
             .any(|import| {
@@ -1088,8 +1092,7 @@ impl SemanticGraph {
         symbol: &GraphSymbol,
         name: &str,
     ) -> bool {
-        self.imports
-            .iter()
+        self.imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| {
                 import
@@ -1099,6 +1102,25 @@ impl SemanticGraph {
                     .unwrap_or_else(|| last_path_segment(&import.path) == name)
             })
             .any(|import| self.import_matches_symbol(import, symbol))
+    }
+
+    fn imports_for_file(&self, file_id: &FileId) -> impl Iterator<Item = &ParsedImport> {
+        self.imports_by_file
+            .get(file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| self.imports.get(*index))
+    }
+
+    /// Fast path used by Python-specific resolution branches. Most large JS/TS
+    /// or Rust workspaces never have a Python caller, but the resolver paths
+    /// were still walking class-base/alias state per call before this guard.
+    fn caller_is_python(&self, caller_id: &SymbolId) -> bool {
+        self.symbols
+            .get(caller_id)
+            .and_then(|caller| self.files.get(&caller.file_id))
+            .map(|file| file.language == squeezy_core::LanguageKind::Python)
+            .unwrap_or(false)
     }
 
     fn import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
@@ -1195,6 +1217,9 @@ impl SemanticGraph {
         if !matches!(call.receiver.as_deref(), Some("self") | Some("cls")) {
             return None;
         }
+        if !self.caller_is_python(caller_id) {
+            return None;
+        }
         let class_id = self.python_class_for_caller(caller_id)?;
         self.python_method_in_bases(&class_id, &call.name, 0)
     }
@@ -1206,6 +1231,9 @@ impl SemanticGraph {
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
         if matches!(receiver, "self" | "cls") {
+            return None;
+        }
+        if !self.caller_is_python(caller_id) {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
@@ -1220,6 +1248,9 @@ impl SemanticGraph {
         call: &ParsedCall,
     ) -> Option<SymbolId> {
         let receiver = call.receiver.as_deref()?;
+        if !self.caller_is_python(caller_id) {
+            return None;
+        }
         let caller = self.symbols.get(caller_id)?;
         let receiver_paths = self.python_receiver_module_paths(caller, receiver);
         if receiver_paths.is_empty() {
@@ -1255,9 +1286,14 @@ impl SemanticGraph {
             return None;
         }
         let caller = self.symbols.get(caller_id)?;
+        if !matches!(
+            self.files.get(&caller.file_id).map(|file| file.language),
+            Some(squeezy_core::LanguageKind::Go),
+        ) {
+            return None;
+        }
         let imports = self
-            .imports
-            .iter()
+            .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| {
                 import
@@ -1432,9 +1468,7 @@ impl SemanticGraph {
             .collect::<Vec<_>>();
 
         class_ids.extend(
-            self.imports
-                .iter()
-                .filter(|import| import.file_id == *file_id)
+            self.imports_for_file(file_id)
                 .filter(|import| import.alias.as_deref() == Some(name))
                 .flat_map(|import| {
                     let target_name = last_path_segment(&import.path);
@@ -1652,8 +1686,7 @@ impl SemanticGraph {
         symbol: &GraphSymbol,
         reference: &ParsedReference,
     ) -> bool {
-        self.imports
-            .iter()
+        self.imports_for_file(&reference.file_id)
             .filter(|import| self.import_visible_from_reference(import, reference))
             .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
             .any(|import| self.import_matches_symbol(import, symbol))
@@ -1796,27 +1829,23 @@ impl SemanticGraph {
         if !reference_kind_can_bind_symbol(reference, symbol) {
             return false;
         }
-        self.imports
-            .iter()
-            .filter(|import| import.file_id == reference.file_id)
-            .any(|import| {
-                if path_starts_with_external_root(&import.path, self.reference_language(reference))
-                {
-                    return false;
-                }
-                let alias_or_name = import
-                    .alias
-                    .as_deref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| last_path_segment(&import.path));
-                if import.is_glob {
-                    return reference_name == symbol.name
-                        && self.import_module_matches_symbol(import, symbol);
-                }
-                alias_or_name == reference_name
-                    && last_path_segment(&import.path) == symbol.name
-                    && self.import_module_matches_symbol(import, symbol)
-            })
+        self.imports_for_file(&reference.file_id).any(|import| {
+            if path_starts_with_external_root(&import.path, self.reference_language(reference)) {
+                return false;
+            }
+            let alias_or_name = import
+                .alias
+                .as_deref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            if import.is_glob {
+                return reference_name == symbol.name
+                    && self.import_module_matches_symbol(import, symbol);
+            }
+            alias_or_name == reference_name
+                && last_path_segment(&import.path) == symbol.name
+                && self.import_module_matches_symbol(import, symbol)
+        })
     }
 
     fn reference_qualifier_matches_symbol(
@@ -1855,19 +1884,16 @@ impl SemanticGraph {
         if symbol.file_id == reference.file_id {
             return true;
         }
-        self.imports
-            .iter()
-            .filter(|import| import.file_id == reference.file_id)
-            .any(|import| {
-                let alias_or_name = import
-                    .alias
-                    .as_deref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| last_path_segment(&import.path));
-                alias_or_name == symbol.name
-                    && last_path_segment(&import.path) == symbol.name
-                    && self.import_module_matches_symbol(import, symbol)
-            })
+        self.imports_for_file(&reference.file_id).any(|import| {
+            let alias_or_name = import
+                .alias
+                .as_deref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| last_path_segment(&import.path));
+            alias_or_name == symbol.name
+                && last_path_segment(&import.path) == symbol.name
+                && self.import_module_matches_symbol(import, symbol)
+        })
     }
 
     fn import_module_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
@@ -2398,6 +2424,14 @@ impl SemanticGraph {
         self.children_by_parent.clear();
         self.edges_by_from.clear();
         self.edges_by_to.clear();
+        self.imports_by_file.clear();
+
+        for (index, import) in self.imports.iter().enumerate() {
+            self.imports_by_file
+                .entry(import.file_id.clone())
+                .or_default()
+                .push(index);
+        }
 
         for symbol in self.symbols.values() {
             self.symbols_by_name

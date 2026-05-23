@@ -759,9 +759,28 @@ const path = require("path");
 const ts = require(process.env.SQUEEZY_TYPESCRIPT_PATH || "typescript");
 const root = process.argv[1];
 const out = [];
+const GENERATED_MARKERS = [
+  "@generated",
+  "auto-generated",
+  "automatically generated",
+  "code generated",
+  "do not edit",
+];
+const GENERATED_PREFIX_BYTES = 4096;
+const SKIP_DIR_NAMES = new Set([
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  "coverage",
+  "out",
+  "vendor",
+  "third_party",
+]);
 function walk(dir) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if ([".git", "dist", "build", "coverage"].includes(entry.name)) continue;
+    if (SKIP_DIR_NAMES.has(entry.name)) continue;
+    if (entry.name.startsWith(".") && entry.name !== "." && entry.name !== "..") continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       walk(full);
@@ -774,8 +793,34 @@ function rel(file) { return path.relative(root, file).split(path.sep).join("/");
 function emit(file, kind, name) {
   if (name && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) out.push({ file: rel(file), kind, name });
 }
+// Tracks loop/catch variable declaration list nodes so locals introduced by
+// `for (const x of ...)`, `for (let x = ...; ...; ...)` and `catch (e)` are not
+// counted against Squeezy's declaration set. Squeezy's graph anchors these on
+// dedicated AST nodes and only synthesizes a binding symbol when the binding
+// is a simple identifier, so this matches the local heuristic on both sides.
+function isLoopOrCatchLocal(node) {
+  const parent = node.parent;
+  if (!parent) return false;
+  if (ts.isCatchClause(parent)) return true;
+  if (parent.kind === ts.SyntaxKind.VariableDeclarationList) {
+    const grand = parent.parent;
+    if (grand && (
+      ts.isForInStatement(grand) ||
+      ts.isForOfStatement(grand) ||
+      ts.isForStatement(grand)
+    )) {
+      // For-statement initializer can still be a top-level lexical declaration,
+      // but `for (let i = 0; ...)` is a loop local that the oracle should skip
+      // because Squeezy does not promote it to a graph symbol either.
+      return true;
+    }
+  }
+  return false;
+}
 function scan(file) {
   const source = fs.readFileSync(file, "utf8");
+  const head = source.slice(0, GENERATED_PREFIX_BYTES).toLowerCase();
+  if (GENERATED_MARKERS.some((marker) => head.includes(marker))) return;
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, file.endsWith("x") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   function visit(node) {
     if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node)) && node.name) emit(file, "Function", node.name.text);
@@ -789,7 +834,7 @@ function scan(file) {
       const init = node.initializer;
       if (init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init))) emit(file, "Method", node.name.text);
     }
-    else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
+    else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && !isLoopOrCatchLocal(node)) {
       const init = node.initializer;
       emit(file, init && (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) ? "Function" : "Const", node.name.text);
     }
