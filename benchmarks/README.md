@@ -1,12 +1,16 @@
 # Semantic Graph Benchmarks
 
-This directory contains end-to-end semantic graph benchmarks for `squeezy-cfa.4`.
+This directory contains end-to-end semantic graph benchmarks for Squeezy's
+semantic graph.
 
 The production graph runner uses Squeezy's tree-sitter parsers and in-memory
 graph. The oracle tier validates each fixture with a slower language-specific
 checker and compares Squeezy query output against checked query specifications.
 The oracle is a benchmark/testing aid only; production navigation must not call
 `rustc`, LSP, `rust-analyzer`, Python runtime analysis, Node, or TypeScript.
+
+Language coverage, oracle ownership, mixed-workload support, limitations, and
+language TODOs are documented in [`docs/LANGUAGES.md`](../docs/LANGUAGES.md).
 
 ## Layout
 
@@ -32,165 +36,36 @@ benchmarks/
 ## Local Run
 
 ```sh
-mkdir -p target/benchmark-repos
-git clone --depth 1 https://github.com/BurntSushi/ripgrep target/benchmark-repos/ripgrep
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- --list-languages
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- --list-oracles
 
 cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language rust \
   --fixture benchmarks/fixtures/rust/semantic-cases \
   --spec benchmarks/specs/smoke-queries.json \
-  --report target/semantic-graph-benchmark/smoke.json \
-  --mixed-repo target/benchmark-repos/ripgrep \
-  --mixed-iterations 1000 \
+  --report target/semantic-graph-benchmark/rust-smoke.json \
   --ra-lsp-probes 25
 ```
 
-Python smoke:
+Use `--language python|java|go|c|cpp|csharp|javascript|typescript|js-ts` with
+the matching fixture/spec from `docs/LANGUAGES.md`. Families with mixed workload
+support also accept `--mixed-repo <path>` and `--mixed-iterations <n>`.
 
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language python \
-  --fixture benchmarks/fixtures/python/semantic-cases \
-  --spec benchmarks/specs/python-smoke-queries.json \
-  --report target/semantic-graph-benchmark/python-smoke.json \
-  --ra-lsp-probes 0
-```
+## CI Workflow
 
-Python external oracle comparison:
+Benchmark CI is consolidated into:
 
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language python \
-  --fixture target/benchmark-repos/requests/src/requests \
-  --spec benchmarks/specs/empty-queries.json \
-  --report target/semantic-graph-benchmark/python-real/requests.json \
-  --ra-lsp-probes 0 \
-  --no-speed-gate
-```
+- `.github/workflows/benchmark.yml`: orchestrator with one job per
+  `LanguageFamily`.
+- `.github/workflows/benchmark-lang.yml`: reusable `workflow_call` benchmark
+  runner.
+- `.github/actions/setup-bench/action.yml`: shared toolchain setup and Cargo
+  cache.
+- `benchmarks/scripts/summarize.py`: shared GitHub step summary writer.
 
-JS/TS smoke (with mixed workload against redux/src):
-
-```sh
-mkdir -p target/benchmark-repos
-git clone --depth 1 https://github.com/reduxjs/redux target/benchmark-repos/redux
-
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language typescript \
-  --fixture benchmarks/fixtures/js-ts/semantic-cases \
-  --spec benchmarks/specs/js-ts-smoke-queries.json \
-  --report target/semantic-graph-benchmark/js-ts-smoke.json \
-  --mixed-repo target/benchmark-repos/redux/src \
-  --mixed-iterations 500 \
-  --ra-lsp-probes 25 \
-  --no-speed-gate
-```
-
-When the pinned Node `typescript` package is installed, the JS/TS benchmark runs
-three oracle tiers:
-1. **Declaration oracle** — TypeScript compiler API compares exported symbol
-   TP/FP/FN for file/name/kind declarations.
-2. **Mixed workload** — all nine query types (hierarchy, symbol lookup, signature
-   search, body search, reference search, references-to-symbol, callers, callees,
-   call-chain) against real JS/TS repos, plus a two-file refresh probe.
-3. **Navigation oracle** — TypeScript Language Service `getDefinitionAtPosition`
-   and `findReferences` probes on sampled call edges and declaration symbols,
-   producing definition TP/FP/FN (including `wrong_target` and `squeezy_only`
-   counts) and reference TP/FP/FN, mirroring the rust-analyzer LSP probes on the
-   Rust benchmark. `--ra-lsp-probes 0` disables the navigation oracle; `--ra-lsp-probes 25`
-   (default) samples 25 definition probes and 25 reference probes.
-
-If Node or TypeScript is unavailable the report records that status explicitly
-and still validates the tree-sitter query spec.
-
-JS/TS full-tier comparison uses five representative open-source repositories:
-Vite, Redux, Axios, Express, and Prettier. A local May 23, 2026 run with the
-TypeScript compiler API oracle and the post-merge heuristics produced:
-
-| Repo | Squeezy total | TS oracle | Symbol TP | FP | FN | Precision | Recall |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| axios | 54 ms | 172 ms | 857 | 0 | 0 | 1.0000 | 1.0000 |
-| express | 19 ms | 151 ms | 290 | 0 | 0 | 1.0000 | 1.0000 |
-| prettier | 304 ms | 292 ms | 4,133 | 0 | 0 | 1.0000 | 1.0000 |
-| redux | 10 ms | 149 ms | 130 | 0 | 0 | 1.0000 | 1.0000 |
-| vite | 471 ms | 349 ms | 6,789 | 0 | 0 | 1.0000 | 1.0000 |
-
-The full-tier numbers come from a second pass that combined four small
-heuristic fixes with one symmetric oracle change. On the Squeezy side, the
-`get`/`set` accessor filter now inspects only the method header (the prior
-substring scan on the full method text mis-fired when a body comment
-contained ` set ` or ` get `, dropping for example axios's `static from`),
-the JavaScript grammar's `field_definition.property` field is recognized in
-addition to TypeScript's `name`, and the Field-to-Method promotion fires
-inside both `class_declaration` and anonymous `class_expression` bodies.
-Two synthesizers cover the remaining surface gaps: `declare global { ... }`
-becomes a `Module:global` symbol, and `using x = expr` / `await using x =
-expr` (TC39 Stage 3) becomes `Const:x`. The oracle change is symmetric:
-the Node script skips files marked `@generated` / `do not edit`, prunes
-`node_modules` / `vendor` / `third_party` plus hidden directories, and
-excludes `for`/`for-in`/`for-of` / `catch` locals from declaration accounting
-because Squeezy also excludes them.
-
-Java smoke:
-
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language java \
-  --fixture benchmarks/fixtures/java/semantic-cases \
-  --spec benchmarks/specs/java-smoke-queries.json \
-  --report target/semantic-graph-benchmark/java-smoke.json \
-  --ra-lsp-probes 0
-```
-
-C smoke:
-
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language c \
-  --fixture benchmarks/fixtures/c/semantic-cases \
-  --spec benchmarks/specs/c-smoke-queries.json \
-  --report target/semantic-graph-benchmark/c-smoke.json \
-  --ra-lsp-probes 0
-```
-
-C++ smoke:
-
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language cpp \
-  --fixture benchmarks/fixtures/cpp/semantic-cases \
-  --spec benchmarks/specs/cpp-smoke-queries.json \
-  --report target/semantic-graph-benchmark/cpp-smoke.json \
-  --ra-lsp-probes 0
-```
-
-C/C++ external mixed comparison:
-
-```sh
-mkdir -p target/benchmark-repos
-git clone --depth 1 --filter=blob:none https://github.com/curl/curl target/benchmark-repos/curl
-
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language c \
-  --fixture benchmarks/fixtures/c/semantic-cases \
-  --spec benchmarks/specs/c-smoke-queries.json \
-  --report target/semantic-graph-benchmark/c-family-real/curl.json \
-  --mixed-repo target/benchmark-repos/curl \
-  --mixed-iterations 1000 \
-  --ra-lsp-probes 0 \
-  --oracle-files 10 \
-  --no-speed-gate
-```
-
-
-Go smoke:
-
-```sh
-cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
-  --language go \
-  --fixture benchmarks/fixtures/go/semantic-cases \
-  --spec benchmarks/specs/go-smoke-queries.json \
-  --report target/semantic-graph-benchmark/go-smoke.json \
-  --ra-lsp-probes 0
-```
+The orchestrator preserves historical job display names for branch protection
+compatibility and can be triggered with `workflow_dispatch` for `all` or a single
+family.
 
 
 The run fails if required expected results are missing, the fixture graph build

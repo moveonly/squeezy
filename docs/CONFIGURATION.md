@@ -167,6 +167,8 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   whitelists an entire class. `exclude_classes = ["vendor"]` keeps a class
   pruned even when an `include` glob would otherwise re-enable it; the
   exclusion is reported with its normal class reason, not `user_exclude`.
+  Canonical supported-language families and recognized extensions are listed in
+  [`docs/LANGUAGES.md`](LANGUAGES.md).
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.

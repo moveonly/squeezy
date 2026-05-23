@@ -1,0 +1,356 @@
+name: Reusable Semantic Graph Benchmark
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: Benchmark language family.
+        required: true
+        type: string
+      tier:
+        description: Benchmark tier.
+        required: true
+        type: string
+      artifact-suffix:
+        description: Artifact suffix.
+        required: true
+        type: string
+      summary-file:
+        description: Summary markdown file name.
+        required: true
+        type: string
+      typescript-version:
+        description: TypeScript package version for JS/TS oracle.
+        required: false
+        type: string
+        default: "6.0.3"
+  workflow_dispatch:
+    inputs:
+      language:
+        description: Benchmark language family.
+        required: true
+        default: "rust"
+        type: choice
+        options:
+          - rust
+          - python
+          - java
+          - go
+          - c-family
+          - csharp
+          - js-ts
+      tier:
+        description: Benchmark tier.
+        required: true
+        default: "smoke"
+        type: choice
+        options:
+          - smoke
+          - full
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SQUEEZY_TYPESCRIPT_VERSION: ${{ inputs.typescript-version || '6.0.3' }}
+  SQUEEZY_TYPESCRIPT_PATH: ${{ github.workspace }}/target/js-ts-oracle/node_modules/typescript
+
+jobs:
+  benchmark:
+    name: ${{ inputs.language }} benchmark
+    runs-on: ${{ inputs.language == 'rust' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: ${{ (inputs.language == 'c-family' || inputs.language == 'csharp') && 90 || inputs.language == 'go' && 60 || 120 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Setup benchmark
+        uses: ./.github/actions/setup-bench
+        with:
+          language: ${{ inputs.language }}
+          typescript-version: ${{ env.SQUEEZY_TYPESCRIPT_VERSION }}
+
+      - name: Pre-build Roslyn C# oracle
+        if: inputs.language == 'csharp'
+        run: |
+          dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
+            -c Release --nologo -v minimal
+
+      - name: Run Rust semantic graph smoke benchmark
+        if: inputs.language == 'rust'
+        run: |
+          mkdir -p target/benchmark-repos
+          git clone --depth 1 https://github.com/BurntSushi/ripgrep target/benchmark-repos/ripgrep-smoke
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language rust \
+            --fixture benchmarks/fixtures/rust/semantic-cases \
+            --spec benchmarks/specs/smoke-queries.json \
+            --report target/semantic-graph-benchmark/rust-smoke.json \
+            --mixed-repo target/benchmark-repos/ripgrep-smoke \
+            --mixed-iterations 1000 \
+            --ra-lsp-probes 25
+
+      - name: Run full external Rust benchmark
+        if: inputs.language == 'rust' && (inputs.tier == 'full' || startsWith(github.ref, 'refs/heads/benchmark-full/'))
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/rust-real
+          while read -r name url; do
+            git clone --depth 1 "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language rust \
+              --fixture benchmarks/fixtures/rust/semantic-cases \
+              --spec benchmarks/specs/smoke-queries.json \
+              --report "target/semantic-graph-benchmark/rust-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 5000 \
+              --ra-lsp-probes 50
+          done <<'REPOS'
+          ripgrep https://github.com/BurntSushi/ripgrep
+          fd https://github.com/sharkdp/fd
+          bat https://github.com/sharkdp/bat
+          tokio https://github.com/tokio-rs/tokio
+          serde https://github.com/serde-rs/serde
+          REPOS
+
+      - name: Run Python semantic graph benchmark
+        if: inputs.language == 'python'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language python \
+            --fixture benchmarks/fixtures/python/semantic-cases \
+            --spec benchmarks/specs/python-smoke-queries.json \
+            --report target/semantic-graph-benchmark/python-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external Python comparison
+        if: inputs.language == 'python' && inputs.tier == 'full'
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/python-real
+          while read -r name package_root url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language python \
+              --fixture "target/benchmark-repos/$name/$package_root" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/python-real/$name.json" \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          requests src/requests https://github.com/psf/requests
+          flask src/flask https://github.com/pallets/flask
+          click src/click https://github.com/pallets/click
+          black src/black https://github.com/psf/black
+          fastapi fastapi https://github.com/fastapi/fastapi
+          REPOS
+
+      - name: Run Java semantic graph benchmark
+        if: inputs.language == 'java'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language java \
+            --fixture benchmarks/fixtures/java/semantic-cases \
+            --spec benchmarks/specs/java-smoke-queries.json \
+            --report target/semantic-graph-benchmark/java-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external Java comparison
+        if: inputs.language == 'java' && inputs.tier == 'full'
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/java-real
+          while read -r name url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language java \
+              --fixture "target/benchmark-repos/$name" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/java-real/$name.json" \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          junit5 https://github.com/junit-team/junit5
+          mockito https://github.com/mockito/mockito
+          guava https://github.com/google/guava
+          retrofit https://github.com/square/retrofit
+          picocli https://github.com/remkop/picocli
+          REPOS
+
+      - name: Run Go semantic graph benchmark
+        if: inputs.language == 'go'
+        run: |
+          mkdir -p target/semantic-graph-benchmark
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language go \
+            --fixture benchmarks/fixtures/go/semantic-cases \
+            --spec benchmarks/specs/go-smoke-queries.json \
+            --report target/semantic-graph-benchmark/go-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external Go comparison
+        if: inputs.language == 'go' && (inputs.tier == 'full' || startsWith(github.ref, 'refs/heads/benchmark-full/'))
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/go-real
+          while read -r name url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language go \
+              --fixture "target/benchmark-repos/$name" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/go-real/$name.json" \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          gin https://github.com/gin-gonic/gin
+          cobra https://github.com/spf13/cobra
+          prometheus https://github.com/prometheus/prometheus
+          etcd https://github.com/etcd-io/etcd
+          zap https://github.com/uber-go/zap
+          REPOS
+
+      - name: Run C semantic graph smoke benchmark
+        if: inputs.language == 'c-family'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language c \
+            --fixture benchmarks/fixtures/c/semantic-cases \
+            --spec benchmarks/specs/c-smoke-queries.json \
+            --report target/semantic-graph-benchmark/c-smoke.json \
+            --ra-lsp-probes 0 \
+            --oracle-files 0
+
+      - name: Run C++ semantic graph smoke benchmark
+        if: inputs.language == 'c-family'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language cpp \
+            --fixture benchmarks/fixtures/cpp/semantic-cases \
+            --spec benchmarks/specs/cpp-smoke-queries.json \
+            --report target/semantic-graph-benchmark/cpp-smoke.json \
+            --ra-lsp-probes 0 \
+            --oracle-files 0
+
+      - name: Run full external C/C++ comparison
+        if: inputs.language == 'c-family' && (inputs.tier == 'full' || startsWith(github.ref, 'refs/heads/benchmark-full/'))
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/c-family-real
+          while read -r name language url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            if [ "$language" = "c" ]; then
+              fixture="benchmarks/fixtures/c/semantic-cases"
+              spec="benchmarks/specs/c-smoke-queries.json"
+            else
+              fixture="benchmarks/fixtures/cpp/semantic-cases"
+              spec="benchmarks/specs/cpp-smoke-queries.json"
+            fi
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language "$language" \
+              --fixture "$fixture" \
+              --spec "$spec" \
+              --report "target/semantic-graph-benchmark/c-family-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 1000 \
+              --ra-lsp-probes 0 \
+              --oracle-files 10 \
+              --no-speed-gate
+          done <<'REPOS'
+          redis c https://github.com/redis/redis
+          curl c https://github.com/curl/curl
+          sqlite c https://github.com/sqlite/sqlite
+          protobuf cpp https://github.com/protocolbuffers/protobuf
+          nlohmann_json cpp https://github.com/nlohmann/json
+          REPOS
+
+      - name: Run C# semantic graph smoke benchmark
+        if: inputs.language == 'csharp'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language csharp \
+            --fixture benchmarks/fixtures/csharp/semantic-cases \
+            --spec benchmarks/specs/csharp-smoke-queries.json \
+            --report target/semantic-graph-benchmark/csharp-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external C# benchmark
+        if: inputs.language == 'csharp' && (inputs.tier == 'full' || startsWith(github.ref, 'refs/heads/benchmark-full/'))
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/csharp-real
+          while read -r name url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language csharp \
+              --fixture benchmarks/fixtures/csharp/semantic-cases \
+              --spec benchmarks/specs/csharp-smoke-queries.json \
+              --report "target/semantic-graph-benchmark/csharp-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 1500 \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          newtonsoft_json https://github.com/JamesNK/Newtonsoft.Json
+          dapper https://github.com/DapperLib/Dapper
+          automapper https://github.com/AutoMapper/AutoMapper
+          polly https://github.com/App-vNext/Polly
+          serilog https://github.com/serilog/serilog
+          REPOS
+
+      - name: Clone smoke repo for JS/TS mixed workload
+        if: inputs.language == 'js-ts'
+        run: |
+          mkdir -p target/benchmark-repos
+          git clone --depth 1 --filter=blob:none https://github.com/reduxjs/redux \
+            target/benchmark-repos/redux-smoke
+
+      - name: Run JS/TS semantic graph benchmark
+        if: inputs.language == 'js-ts'
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language typescript \
+            --fixture benchmarks/fixtures/js-ts/semantic-cases \
+            --spec benchmarks/specs/js-ts-smoke-queries.json \
+            --report target/semantic-graph-benchmark/js-ts-smoke.json \
+            --mixed-repo target/benchmark-repos/redux-smoke/src \
+            --mixed-iterations 500 \
+            --ra-lsp-probes 25 \
+            --no-speed-gate
+
+      - name: Run full external JS/TS comparison
+        if: inputs.language == 'js-ts' && inputs.tier == 'full'
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/js-ts-real
+          while read -r name package_root url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language typescript \
+              --fixture "target/benchmark-repos/$name/$package_root" \
+              --spec benchmarks/specs/empty-queries.json \
+              --report "target/semantic-graph-benchmark/js-ts-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name/$package_root" \
+              --mixed-iterations 1000 \
+              --ra-lsp-probes 25 \
+              --no-speed-gate
+          done <<'REPOS'
+          vite packages/vite/src https://github.com/vitejs/vite
+          redux src https://github.com/reduxjs/redux
+          axios lib https://github.com/axios/axios
+          express lib https://github.com/expressjs/express
+          prettier src https://github.com/prettier/prettier
+          REPOS
+
+      - name: Write benchmark summary
+        run: |
+          python3 benchmarks/scripts/summarize.py \
+            --language "${{ inputs.language }}" \
+            --report-glob "target/semantic-graph-benchmark/**/*.json" \
+            --output "${{ inputs.summary-file || format('__{0}_summary.md', inputs.language) }}"
+          cat "${{ inputs.summary-file || format('__{0}_summary.md', inputs.language) }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: semantic-graph-benchmark-${{ inputs.artifact-suffix || inputs.language }}-${{ inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/**/*.json
+            ${{ inputs.summary-file || format('__{0}_summary.md', inputs.language) }}
+          if-no-files-found: error

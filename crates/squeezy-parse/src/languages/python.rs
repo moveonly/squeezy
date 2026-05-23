@@ -1,0 +1,470 @@
+use std::collections::HashMap;
+
+use crate::languages::js_ts::{
+    python_assignment_target, python_from_imports, python_plain_imports,
+    python_simple_assignment_name, python_string_list_values,
+};
+use crate::languages::rust::*;
+use crate::*;
+
+pub(crate) fn extract_python(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    let mut ctx = ExtractContext {
+        file: file.clone(),
+        source,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        diagnostics: Vec::new(),
+        go_type_index: HashMap::new(),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    visit_python_node(root, &mut ctx, None, None);
+    extract_python_module_exports(&mut ctx);
+    dedup_python_facts(&mut ctx);
+
+    ParsedFile {
+        file,
+        package: None,
+        symbols: ctx.symbols,
+        imports: ctx.imports,
+        calls: ctx.calls,
+        references: ctx.references,
+        body_hits: ctx.body_hits,
+        unsupported: None,
+        diagnostics: ctx.diagnostics,
+        changed_ranges: Vec::new(),
+    }
+}
+
+use std::collections::HashSet;
+
+pub(crate) fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
+    for line in ctx.source.lines() {
+        let line = line.trim();
+        // Require a word boundary after `__all__` so identifiers like
+        // `__all__module = "x"` and `__all_xs = "x"` (the latter does not even
+        // share the full prefix) are not matched as `__all__` assignments,
+        // and so docstring/string content of the form `__all__ = ["fake"]`
+        // is only accepted when it is genuinely at line start.
+        let Some(rest) = line.strip_prefix("__all__") else {
+            continue;
+        };
+        if !rest.starts_with(|ch: char| ch.is_whitespace() || ch == '=' || ch == '+') {
+            continue;
+        }
+        let Some((_, right)) = rest.split_once('=') else {
+            continue;
+        };
+        for exported in python_string_list_values(right) {
+            ctx.imports.push(ParsedImport {
+                file_id: ctx.file.id.clone(),
+                owner_id: None,
+                path: exported,
+                alias: None,
+                is_glob: false,
+                is_reexport: true,
+                is_static: false,
+                span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
+                provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+            });
+        }
+    }
+}
+
+pub(crate) fn dedup_python_facts(ctx: &mut ExtractContext<'_>) {
+    let mut imports = HashSet::new();
+    ctx.imports.retain(|import| {
+        imports.insert(format!(
+            "{}|{:?}|{}|{:?}|{}|{}",
+            import.file_id.0,
+            import.owner_id.as_ref().map(|id| id.0.as_str()),
+            import.path,
+            import.alias,
+            import.is_glob,
+            import.is_reexport
+        ))
+    });
+}
+
+pub(crate) fn visit_python_node(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    if node.is_missing() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!("missing {}", node.kind()),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+
+    let kind = node.kind();
+    if matches!(kind, "import_statement" | "import_from_statement") {
+        extract_python_import(node, ctx, owner_symbol.clone());
+    }
+
+    if let Some(symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        extract_python_symbol_facts(node, &symbol, ctx);
+        let next_parent = Some((symbol.id.clone(), symbol.kind));
+        let next_owner = if symbol.body_span.is_some() {
+            Some(symbol.id.clone())
+        } else {
+            owner_symbol.clone()
+        };
+        ctx.symbols.push(symbol);
+        visit_python_children(node, ctx, next_parent, next_owner);
+        return;
+    }
+
+    if kind == "call" && !python_node_is_inside_decorator(node) {
+        extract_python_call(node, ctx, owner_symbol.clone());
+    } else if matches!(kind, "assignment" | "assignment_statement") {
+        extract_python_field_symbol(node, ctx, parent_symbol.as_ref());
+        extract_python_assignment(node, ctx, owner_symbol.clone());
+    } else if kind == "identifier" {
+        extract_python_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
+    } else if kind == "attribute" {
+        extract_python_reference(node, ReferenceKind::Field, ctx, owner_symbol.clone());
+    } else if is_python_literal(kind) {
+        extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
+    }
+
+    visit_python_children(node, ctx, parent_symbol, owner_symbol);
+}
+
+pub(crate) fn visit_python_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_python_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
+}
+
+pub(crate) fn extract_python_import(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let imports = if let Some(rest) = raw.strip_prefix("from ") {
+        python_from_imports(rest, &ctx.file.relative_path)
+    } else if let Some(rest) = raw.strip_prefix("import ") {
+        python_plain_imports(rest)
+    } else {
+        Vec::new()
+    };
+
+    for (path, alias, is_glob) in imports {
+        ctx.imports.push(ParsedImport {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            path,
+            alias,
+            is_glob,
+            is_reexport: ctx.file.relative_path.ends_with("__init__.py"),
+            is_static: false,
+            span: span_from_node(node),
+            provenance: Provenance::new("tree-sitter-python", "import declaration"),
+        });
+    }
+}
+
+pub(crate) fn split_python_alias(text: &str) -> (&str, Option<&str>) {
+    text.split_once(" as ")
+        .map(|(path, alias)| (path.trim(), Some(alias.trim())))
+        .unwrap_or_else(|| (text.trim(), None))
+}
+
+pub(crate) fn normalize_python_import_module(module: &str, relative_path: &str) -> String {
+    let leading_dots = module.chars().take_while(|ch| *ch == '.').count();
+    if leading_dots == 0 {
+        return module.to_string();
+    }
+
+    let suffix = module.trim_start_matches('.');
+    let mut package = python_module_path_for_relative_file(relative_path);
+    if !relative_path.ends_with("__init__.py") {
+        package.pop();
+    }
+    for _ in 1..leading_dots {
+        package.pop();
+    }
+    if !suffix.is_empty() {
+        package.extend(suffix.split('.').filter(|segment| !segment.is_empty()));
+    }
+    package.join(".")
+}
+
+pub(crate) fn python_module_path_for_relative_file(relative_path: &str) -> Vec<&str> {
+    relative_path
+        .trim_end_matches(".py")
+        .trim_end_matches("/__init__")
+        .trim_start_matches("src/")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != "__init__")
+        .collect()
+}
+
+pub(crate) fn extract_python_field_symbol(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) {
+    let Some((parent_id, SymbolKind::Class)) = parent_symbol else {
+        return;
+    };
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some((left, right)) = split_python_assignment_like(raw) else {
+        return;
+    };
+    let Some(name) = python_field_name_from_left(left) else {
+        return;
+    };
+    let span = span_from_node(node);
+    let mut attributes = vec!["python:field".to_string()];
+    if let Some(annotation) = left
+        .split_once(':')
+        .and_then(|(_, annotation)| python_field_type_name(annotation))
+    {
+        attributes.push(format!("type:{annotation}"));
+        ctx.references.push(ParsedReference {
+            file_id: ctx.file.id.clone(),
+            owner_id: Some(parent_id.clone()),
+            text: annotation,
+            kind: ReferenceKind::Type,
+            span,
+            provenance: Provenance::new("tree-sitter-python", "field annotation reference"),
+        });
+    }
+    attributes.extend(python_field_attributes(right));
+    attributes.sort();
+    attributes.dedup();
+
+    ctx.symbols.push(ParsedSymbol {
+        id: symbol_id(&ctx.file, Some(parent_id), SymbolKind::Field, &name, span),
+        file_id: ctx.file.id.clone(),
+        parent_id: Some(parent_id.clone()),
+        name,
+        kind: SymbolKind::Field,
+        span,
+        body_span: None,
+        signature: raw.trim().to_string(),
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-python", "class field assignment"),
+        confidence: Confidence::Heuristic,
+        freshness: Freshness::Fresh,
+    });
+}
+
+pub(crate) fn python_field_type_name(annotation: &str) -> Option<String> {
+    let text = annotation
+        .split('=')
+        .next()
+        .unwrap_or(annotation)
+        .trim()
+        .trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '\'' | '"' | '[' | ']' | '(' | ')' | '{' | '}' | ':' | ',' | ' '
+            )
+        });
+    if text.is_empty() {
+        None
+    } else {
+        Some(last_path_segment(text))
+    }
+}
+
+pub(crate) fn split_python_assignment_like(text: &str) -> Option<(&str, &str)> {
+    if let Some((left, right)) = text.split_once('=') {
+        return Some((left.trim(), right.trim()));
+    }
+    if let Some((left, annotation)) = text.split_once(':') {
+        return Some((left.trim(), annotation.trim()));
+    }
+    None
+}
+
+pub(crate) fn python_field_name_from_left(left: &str) -> Option<String> {
+    let name = left
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(left)
+        .trim();
+    python_simple_assignment_name(name)
+}
+
+pub(crate) fn python_field_attributes(right: &str) -> Vec<String> {
+    let mut attributes = Vec::new();
+    let callee = python_assignment_target(right).unwrap_or_else(|| right.trim().to_string());
+    let lowered = callee.to_ascii_lowercase();
+    if lowered.contains("column") || lowered.contains("mapped_column") {
+        attributes.push("sqlalchemy:field".to_string());
+    }
+    if callee.contains("models.") && callee.contains("Field") {
+        attributes.push("django:field".to_string());
+    }
+    if lowered.contains("field") {
+        attributes.push("python:field-factory".to_string());
+        attributes.push("dataclass:field".to_string());
+        attributes.push("pydantic:field".to_string());
+    }
+    attributes
+}
+
+pub(crate) fn extract_python_assignment(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let raw = node_text(node, ctx.source).unwrap_or_default();
+    let Some((left, right)) = raw.split_once('=') else {
+        return;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    if left == "__all__" {
+        for exported in python_string_list_values(right) {
+            ctx.imports.push(ParsedImport {
+                file_id: ctx.file.id.clone(),
+                owner_id: owner_id.clone(),
+                path: exported,
+                alias: None,
+                is_glob: false,
+                is_reexport: true,
+                is_static: false,
+                span: span_from_node(node),
+                provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+            });
+        }
+        return;
+    }
+
+    let Some(alias) = python_simple_assignment_name(left) else {
+        return;
+    };
+    let Some(target) = python_assignment_target(right) else {
+        return;
+    };
+    if alias == last_path_segment(&target) {
+        return;
+    }
+
+    ctx.imports.push(ParsedImport {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        path: target,
+        alias: Some(alias),
+        is_glob: false,
+        is_reexport: false,
+        is_static: false,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", "assignment alias"),
+    });
+}
+
+pub(crate) fn extract_python_call(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let Some(function_node) = node.child_by_field_name("function").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    }) else {
+        return;
+    };
+    let target_text = node_text(function_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if target_text.is_empty() {
+        return;
+    }
+    let name = last_path_segment(&target_text);
+    let receiver = receiver_from_direct_call(&target_text);
+    let arity = node
+        .child_by_field_name("arguments")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "argument_list")
+        })
+        .map(|arguments| named_child_count(arguments))
+        .unwrap_or_default();
+
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: target_text.clone(),
+        receiver,
+        arity,
+        kind: if target_text.contains('.') {
+            ParsedCallKind::Method
+        } else {
+            ParsedCallKind::Direct
+        },
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", "call"),
+        confidence: Confidence::Heuristic,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+pub(crate) fn extract_python_reference(
+    node: Node<'_>,
+    kind: ReferenceKind,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return;
+    }
+    let body_kind = match kind {
+        ReferenceKind::Identifier => BodyHitKind::Identifier,
+        ReferenceKind::Field => BodyHitKind::Identifier,
+        ReferenceKind::Attribute => BodyHitKind::Attribute,
+        ReferenceKind::Type => BodyHitKind::Type,
+        ReferenceKind::Path => BodyHitKind::Path,
+    };
+
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", format!("{} reference", node.kind())),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: body_kind,
+        span: span_from_node(node),
+    });
+}
