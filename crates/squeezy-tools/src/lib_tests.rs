@@ -19,13 +19,20 @@ use super::*;
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
+    registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
+}
+
+fn registry_with_shell_sandbox_off_and_output_config(
+    root: &Path,
+    output_config: ToolOutputConfig,
+) -> ToolRegistry {
     let shell_sandbox = squeezy_core::ShellSandboxConfig {
         mode: squeezy_core::ShellSandboxMode::Off,
         ..squeezy_core::ShellSandboxConfig::default()
     };
     ToolRegistry::new_inner(
         root,
-        ToolOutputConfig::default(),
+        output_config,
         WebToolConfig::default(),
         shell_sandbox,
         SkillCatalog::empty(),
@@ -650,7 +657,10 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
         &["crates/example/src/lib.rs".to_string()],
     );
 
-    assert_eq!(command, "cargo test -p squeezy-example");
+    assert_eq!(
+        command,
+        "cargo test -p squeezy-example --message-format=json"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1622,6 +1632,118 @@ async fn shell_output_cap_is_enforced_while_command_runs() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn shell_shaped_output_drops_noise_but_raw_mode_keeps_it() {
+    let root = temp_workspace("shell_shaped_raw");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let shaped = registry
+        .execute(
+            ToolCall {
+                call_id: "call_shaped".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nerror: bad\\n'",
+                    "description": "shape noisy output"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(shaped.status, ToolStatus::Success);
+    assert_eq!(shaped.content["output_shape"]["mode"], "shaped");
+    assert!(
+        shaped.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("error: bad")
+    );
+    assert!(
+        !shaped.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("Compiling crate_a")
+    );
+
+    let raw = registry
+        .execute(
+            ToolCall {
+                call_id: "call_raw".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nerror: bad\\n'",
+                    "description": "raw noisy output",
+                    "output_mode": "raw"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(raw.status, ToolStatus::Success);
+    assert!(raw.content.get("output_shape").is_none());
+    assert!(
+        raw.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("Compiling crate_a")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
+    let root = temp_workspace("shell_shaped_spill_raw");
+    let registry = registry_with_shell_sandbox_off_and_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 512,
+            retention_days: 1,
+            output_dir: None,
+        },
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spill".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nCompiling crate_b\\nerror: bad\\n'",
+                    "description": "spill shaped output"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    let preview = result.content["preview"].as_str().expect("preview");
+    assert!(preview.contains("output_shape"));
+    let handle = result.content["handle"].as_str().expect("handle");
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_spill".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({"handle": handle, "offset": 0, "limit": 8_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(fetched.status, ToolStatus::Success);
+    let raw = fetched.content["content"].as_str().expect("content");
+    assert!(raw.contains("Compiling crate_a"));
+    assert!(!raw.contains("output_shape"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn shell_call_description_summary_carries_only_description() {
     // The shell `describe_call` summary intentionally surfaces ONLY the
@@ -1668,6 +1790,53 @@ fn websearch_parser_accepts_json_and_sse_mcp_responses() {
         )),
         Some("search results".to_string())
     );
+}
+
+#[test]
+fn cargo_json_output_shape_preserves_warnings_errors_and_summary() {
+    let cargo_json = include_str!("../../../tests/artifacts/tool-output-shaping/cargo-json.txt");
+
+    let shaped = shape_shell_output(
+        "cargo test --workspace --message-format=json",
+        cargo_json,
+        "",
+        false,
+        Some(101),
+    );
+
+    assert_eq!(shaped.family, "cargo");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("warning: unused variable"));
+    assert!(shaped.stdout.contains("error[E0425]"));
+    assert!(shaped.stdout.contains("build-finished success=false"));
+    assert!(shaped.stderr.is_empty());
+    assert_eq!(shaped.fallback_reason, None);
+}
+
+#[test]
+fn jest_json_output_shape_preserves_failure_and_summary() {
+    let jest_json = include_str!("../../../tests/artifacts/tool-output-shaping/jest-json.txt");
+
+    let shaped = shape_shell_output("jest --json", jest_json, "", false, Some(1));
+
+    assert_eq!(shaped.family, "jest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("numFailedTests=1"));
+    assert!(shaped.stdout.contains("Error: expected true to be false"));
+}
+
+#[test]
+fn unstructured_shape_drops_noise_and_keeps_signal() {
+    let noisy = include_str!("../../../tests/artifacts/tool-output-shaping/noisy-shell.txt");
+
+    let shaped = shape_shell_output("cargo fmt --check", noisy, "", false, Some(1));
+
+    assert_eq!(shaped.family, "cargo");
+    assert!(shaped.stdout.contains("warning: unused variable"));
+    assert!(shaped.stdout.contains("error: expected `;`"));
+    assert!(shaped.stdout.contains("test result: FAILED"));
+    assert!(!shaped.stdout.contains("Compiling crate_a"));
+    assert!(shaped.stdout.contains("repeated previous line"));
 }
 
 #[test]
