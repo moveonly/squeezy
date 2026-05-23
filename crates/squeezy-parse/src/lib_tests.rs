@@ -202,6 +202,320 @@ def test_runner():
 }
 
 #[test]
+fn parser_accepts_csharp_and_tracks_cached_changes() {
+    let first = "namespace Demo;\nclass Runner { void Run() { } }\n";
+    let second = "namespace Demo;\nclass Runner { void Run() { System.Console.WriteLine(1); } }\n";
+    let mut parser = RustParser::new().unwrap();
+    let mut record = csharp_record("src/Runner.cs", first);
+
+    let initial = parser.parse_source(&record, first.to_string()).unwrap();
+    assert!(initial.unsupported.is_none());
+    assert!(initial.diagnostics.is_empty());
+    assert!(initial.changed_ranges.is_empty());
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Demo" && symbol.kind == SymbolKind::Module)
+    );
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        initial
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Run" && symbol.kind == SymbolKind::Method)
+    );
+
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    record.size_bytes = second.len() as u64;
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(updated.unsupported.is_none());
+    assert!(updated.diagnostics.is_empty());
+    assert!(!updated.changed_ranges.is_empty());
+    assert!(updated.calls.iter().any(|call| call.name == "WriteLine"));
+}
+
+#[test]
+fn csharp_parser_extracts_symbols_imports_calls_and_references() {
+    let source = r#"
+using System;
+using System.Collections.Generic;
+using static System.Math;
+using Json = System.Text.Json.JsonSerializer;
+
+namespace Squeezy.CSharp.SemanticCases;
+
+public interface IRunner
+{
+    string Run(string input);
+}
+
+public partial record Runner(string Prefix) : IRunner
+{
+    public List<string> History { get; init; } = new();
+
+    public string Run(string input)
+    {
+        var formatted = Format(input);
+        History.Add(formatted);
+        return Json.Serialize(formatted);
+    }
+}
+
+public partial record Runner
+{
+    public string Format(string input) => $"{Prefix}:{Abs(input.Length)}";
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Runner.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(parsed.diagnostics.is_empty());
+
+    let namespace_symbol = parsed
+        .symbols
+        .iter()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::Module && symbol.name == "Squeezy.CSharp.SemanticCases"
+        })
+        .expect("namespace symbol");
+    assert!(
+        namespace_symbol
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "csharp:namespace")
+    );
+
+    assert!(parsed.symbols.iter().any(|symbol| {
+        symbol.name == "IRunner"
+            && symbol.kind == SymbolKind::Interface
+            && symbol.visibility.as_deref() == Some("public")
+    }));
+    let runners = parsed
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.kind == SymbolKind::Struct && symbol.name == "Runner")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        runners.len(),
+        2,
+        "both partial record declarations recorded"
+    );
+    assert!(runners.iter().all(|symbol| {
+        symbol
+            .attributes
+            .iter()
+            .any(|attr| attr == "csharp:partial")
+    }));
+    assert!(parsed.symbols.iter().any(|symbol| symbol.name == "Run"
+        && symbol.kind == SymbolKind::Method
+        && symbol.visibility.as_deref() == Some("public")));
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Format" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "History" && symbol.kind == SymbolKind::Field)
+    );
+
+    let imports = parsed
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.path.as_str(),
+                import.alias.as_deref(),
+                import.is_glob,
+                import.is_reexport,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(imports.contains(&("System", None, false, false)));
+    assert!(imports.contains(&("System.Collections.Generic", None, false, false)));
+    assert!(imports.contains(&("System.Math.*", None, true, false)));
+    assert!(imports.contains(&(
+        "System.Text.Json.JsonSerializer",
+        Some("Json"),
+        false,
+        false
+    )));
+
+    assert!(parsed.calls.iter().any(|call| call.name == "Format"));
+    assert!(parsed.calls.iter().any(|call| call.name == "Add"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("History")));
+    assert!(parsed.calls.iter().any(|call| call.name == "Serialize"
+        && call.kind == ParsedCallKind::Method
+        && call.receiver.as_deref() == Some("Json")));
+    assert!(parsed.calls.iter().any(|call| call.name == "Abs"));
+
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "IRunner" && reference.kind == ReferenceKind::Type)
+    );
+    assert!(
+        !parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "string"),
+        "predefined types must not pollute references",
+    );
+}
+
+#[test]
+fn csharp_parser_marks_test_methods_via_attributes_and_filenames() {
+    let source = r#"
+using Xunit;
+using NUnit.Framework;
+
+namespace Demo.Tests;
+
+public class RunnerTests
+{
+    [Fact]
+    public void Runs_inputs_through_the_runner() { }
+
+    [Test]
+    public void Nunit_test_marker() { }
+
+    public void NotATest() { }
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("tests/RunnerTests.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runs_inputs_through_the_runner"
+                && symbol.kind == SymbolKind::Test
+                && symbol.attributes.iter().any(|attr| attr == "csharp:test"))
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Nunit_test_marker"
+                && symbol.kind == SymbolKind::Test
+                && symbol.attributes.iter().any(|attr| attr == "csharp:test"))
+    );
+    let not_test = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "NotATest")
+        .expect("non-test method symbol");
+    assert_ne!(not_test.kind, SymbolKind::Test);
+    assert!(
+        not_test
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "csharp:test-host"),
+        "methods in *Tests.cs files should be marked as test hosts even without attributes",
+    );
+}
+
+#[test]
+fn csharp_parser_emits_base_attributes_for_class_hierarchies() {
+    let source = r#"
+namespace App;
+
+public class Animal { public virtual void Speak() { } }
+
+public class Dog : Animal, IComparable<Dog>
+{
+    public override void Speak() { base.Speak(); }
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Animals.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let dog = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Dog")
+        .expect("Dog symbol");
+    assert!(
+        dog.attributes.iter().any(|attr| attr == "base:Animal"),
+        "C# class inheritance should produce `base:` attributes for graph resolution",
+    );
+    assert!(
+        dog.attributes.iter().any(|attr| attr == "base:IComparable"),
+        "Generic base names should be stripped to their leaf identifier",
+    );
+}
+
+#[test]
+fn csharp_parser_records_route_attributes_for_aspnet_controllers() {
+    let source = r#"
+using Microsoft.AspNetCore.Mvc;
+
+namespace App;
+
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController : ControllerBase
+{
+    [HttpGet("{id}")]
+    public IActionResult Get(int id) => Ok(id);
+}
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = csharp_record("src/Controllers/UsersController.cs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    let controller = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "UsersController")
+        .expect("controller symbol");
+    assert!(
+        controller
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:aspnet"),
+    );
+    assert!(
+        controller
+            .attributes
+            .iter()
+            .any(|attribute| attribute == "framework:web-route"),
+    );
+    let get = parsed
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Get")
+        .expect("Get method");
+    assert!(
+        get.attributes
+            .iter()
+            .any(|attribute| attribute == "route:GET"),
+    );
+    assert!(
+        get.attributes
+            .iter()
+            .any(|attribute| attribute == "route:GET {id}"),
+    );
+}
+
+#[test]
 fn python_parser_skips_calls_inside_decorators() {
     let source = r#"
 from fastapi import APIRouter
@@ -1294,6 +1608,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::CSharp;
     record
 }
 

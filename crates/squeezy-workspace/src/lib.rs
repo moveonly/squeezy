@@ -593,7 +593,11 @@ pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("c") => LanguageKind::C,
         Some("cc" | "cpp" | "cxx" | "hh" | "hpp" | "hxx") => LanguageKind::Cpp,
+        // `.h` could in principle be C; we follow main's convention of binding
+        // it to Cpp since the C/C++ extractor handles both grammars and the
+        // header naming is conventionally C++-leaning in modern code.
         Some("h") => LanguageKind::Cpp,
+        Some("cs") | Some("csx") => LanguageKind::CSharp,
         Some("go") => LanguageKind::Go,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
@@ -809,6 +813,8 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     [
         "Cargo.toml",
         "CMakeLists.txt",
+        "Directory.Build.props",
+        "Directory.Build.targets",
         "Dockerfile",
         "Justfile",
         "Makefile",
@@ -820,10 +826,12 @@ fn code_project_markers(root: &Path) -> Vec<String> {
         "composer.json",
         "docker-compose.yml",
         "go.mod",
+        "global.json",
         "gradlew",
         "noxfile.py",
         "package.json",
         "package-lock.json",
+        "packages.lock.json",
         "pom.xml",
         "pnpm-lock.yaml",
         "pyproject.toml",
@@ -843,7 +851,23 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     .into_iter()
     .filter(|marker| root.join(marker).exists())
     .map(|marker| format!("project marker {marker}"))
+    .chain(dotnet_project_markers(root))
     .collect()
+}
+
+fn dotnet_project_markers(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let extension = path.extension()?.to_str()?;
+            matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))
+        })
+        .collect()
 }
 
 fn shallow_source_markers(root: &Path) -> Vec<String> {
@@ -882,6 +906,7 @@ fn collect_source_markers(
         match classify_language(&path) {
             LanguageKind::C => signals.push("shallow C source".to_string()),
             LanguageKind::Cpp => signals.push("shallow C/C++ source".to_string()),
+            LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
             LanguageKind::Go => signals.push("shallow Go source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),

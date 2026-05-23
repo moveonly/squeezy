@@ -683,7 +683,11 @@ impl SemanticGraph {
             return (Some(callee), Confidence::ImportResolved, "import alias");
         }
 
+        let is_base_call =
+            call.kind == ParsedCallKind::Method && call.receiver.as_deref() == Some("base");
+
         if call.kind == ParsedCallKind::Method
+            && !is_base_call
             && let Some(callee) = self.same_impl_method(caller_id, &call.name)
         {
             return (Some(callee), Confidence::ExactSyntax, "same class or impl");
@@ -1256,10 +1260,22 @@ impl SemanticGraph {
     }
 
     fn inherited_python_method(&self, caller_id: &SymbolId, call: &ParsedCall) -> Option<SymbolId> {
-        if !matches!(call.receiver.as_deref(), Some("self") | Some("cls")) {
-            return None;
-        }
+        // Receivers that imply "look up the inheritance chain":
+        //   Python: `self.foo()`, `cls.foo()`
+        //   C#:     `this.Foo()`, `base.Foo()`
+        // For `base.Foo()` we want to skip the caller's own type and go
+        // directly to its bases, since the override on the current type
+        // would otherwise shadow the parent definition.
+        let receiver = call.receiver.as_deref()?;
+        let skip_self = match receiver {
+            "self" | "cls" | "this" => false,
+            "base" => true,
+            _ => return None,
+        };
         let class_id = self.python_class_for_caller(caller_id)?;
+        if !skip_self && let Some(method) = self.python_method_on_class(&class_id, &call.name) {
+            return Some(method);
+        }
         self.python_method_in_bases(&class_id, &call.name, 0)
     }
 
@@ -1438,13 +1454,13 @@ impl SemanticGraph {
 
     fn python_class_for_caller(&self, caller_id: &SymbolId) -> Option<SymbolId> {
         let caller = self.symbols.get(caller_id)?;
-        if caller.kind == SymbolKind::Class {
+        if is_class_like_kind(caller.kind) {
             return Some(caller.id.clone());
         }
         let mut current = caller.parent_id.clone();
         while let Some(id) = current {
             let symbol = self.symbols.get(&id)?;
-            if symbol.kind == SymbolKind::Class {
+            if is_class_like_kind(symbol.kind) {
                 return Some(symbol.id.clone());
             }
             current = symbol.parent_id.clone();
@@ -1491,7 +1507,7 @@ impl SemanticGraph {
             .symbols_by_name_or_scan(&direct_name)
             .into_iter()
             .filter_map(|id| self.symbols.get(&id))
-            .filter(|symbol| symbol.kind == SymbolKind::Class)
+            .filter(|symbol| is_class_like_kind(symbol.kind))
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
 
@@ -1506,7 +1522,7 @@ impl SemanticGraph {
                         .into_iter()
                         .filter_map(|id| self.symbols.get(&id))
                         .filter(|symbol| {
-                            symbol.kind == SymbolKind::Class
+                            is_class_like_kind(symbol.kind)
                                 && self.import_matches_symbol(import, symbol)
                         })
                         .map(|symbol| symbol.id.clone())
@@ -1583,6 +1599,13 @@ impl SemanticGraph {
         let parent = self.symbols.get(&impl_id)?;
         if !matches!(
             parent.kind,
+            // Containers that declare instance methods reachable via
+            // `this`/`self`/`Self`: Rust's impl/trait blocks and Class
+            // for Python-style classes, plus C# class/record/struct and
+            // C#/Go interfaces. `Struct` covers C# records and C# structs
+            // whose siblings need to be reachable for `this.Foo()`
+            // resolution; `Interface` covers C# interface methods and Go
+            // interface declarations.
             SymbolKind::Class
                 | SymbolKind::Impl
                 | SymbolKind::Interface
@@ -2697,8 +2720,10 @@ pub struct RefreshReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
     pub c_files: usize,
+    pub csharp_files: usize,
     pub cpp_files: usize,
     pub go_files: usize,
+    pub python_files: usize,
     pub rust_files: usize,
     pub supported_files: usize,
     pub unsupported_files: usize,
@@ -2920,11 +2945,16 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
                 report.c_files += 1;
                 report.supported_files += 1;
             }
+            LanguageKind::CSharp => {
+                report.csharp_files += 1;
+                report.supported_files += 1;
+            }
             LanguageKind::Cpp => {
                 report.cpp_files += 1;
                 report.supported_files += 1;
             }
             LanguageKind::Python => {
+                report.python_files += 1;
                 report.supported_files += 1;
             }
             LanguageKind::Go => {
@@ -3054,6 +3084,16 @@ fn is_type_like_symbol(kind: SymbolKind) -> bool {
     )
 }
 
+/// Returns true when `kind` denotes a container that hosts instance methods —
+/// the "class-like" types used by Python class lookups, C# class/struct/record
+/// member resolution, and similar self/this/base method calls.
+fn is_class_like_kind(kind: SymbolKind) -> bool {
+    matches!(
+        kind,
+        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Trait | SymbolKind::Enum
+    )
+}
+
 fn constructor_reference_can_bind_symbol(
     reference: &ParsedReference,
     symbol: &GraphSymbol,
@@ -3093,7 +3133,7 @@ fn constructor_reference_can_bind_symbol(
 fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
     let first_segment = match language {
         LanguageKind::Rust => path.split("::").next().unwrap_or(path).trim(),
-        LanguageKind::Go => path
+        LanguageKind::Go | LanguageKind::CSharp => path
             .split([':', '.', '/'])
             .find(|segment| !segment.trim().is_empty())
             .unwrap_or(path)
@@ -3113,6 +3153,20 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
         LanguageKind::Rust => &["std", "core", "alloc", "proc_macro"],
         LanguageKind::Go => &[
             "fmt", "context", "errors", "io", "net", "os", "strings", "sync", "time",
+        ],
+        LanguageKind::CSharp => &[
+            // Top-level BCL / NuGet roots whose members live outside the
+            // workspace graph; binding heuristics should treat them as
+            // external rather than searching for matching local symbols.
+            "System",
+            "Microsoft",
+            "Windows",
+            "Azure",
+            "Newtonsoft",
+            "Xunit",
+            "NUnit",
+            "MsTest",
+            "FluentAssertions",
         ],
         _ => &[],
     };

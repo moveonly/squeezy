@@ -341,7 +341,13 @@ pub struct TelemetryProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub c_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub csharp_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cpp_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub go_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -418,7 +424,10 @@ impl TelemetryProperties {
             duration_ms: Some(report.duration_ms),
             files_scanned: Some(report.files_seen),
             c_files: Some(report.language_distribution.c_files),
+            csharp_files: Some(report.language_distribution.csharp_files),
             cpp_files: Some(report.language_distribution.cpp_files),
+            go_files: Some(report.language_distribution.go_files),
+            python_files: Some(report.language_distribution.python_files),
             rust_files: Some(report.language_distribution.rust_files),
             supported_files: Some(report.language_distribution.supported_files),
             unsupported_files: Some(report.language_distribution.unsupported_files),
@@ -476,7 +485,10 @@ pub struct GraphPerfReport {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageDistribution {
     pub c_files: u64,
+    pub csharp_files: u64,
     pub cpp_files: u64,
+    pub go_files: u64,
+    pub python_files: u64,
     pub rust_files: u64,
     pub supported_files: u64,
     pub unsupported_files: u64,

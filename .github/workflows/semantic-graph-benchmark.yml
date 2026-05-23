@@ -33,6 +33,7 @@ on:
         type: choice
         options:
           - rust
+          - csharp
           - c
           - cpp
           - c-family
@@ -335,4 +336,137 @@ jobs:
           path: |
             target/semantic-graph-benchmark/**/*.json
             __c_family_summary.md
+          if-no-files-found: error
+
+  csharp-semantic-graph:
+    name: C# semantic graph
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'csharp' || inputs.language == 'all' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: Show toolchains
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+          dotnet --info
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Pre-build Roslyn C# oracle
+        run: |
+          dotnet build benchmarks/oracle/csharp/CsharpOracle.csproj \
+            -c Release --nologo -v minimal
+
+      - name: Run C# semantic graph smoke benchmark
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language csharp \
+            --fixture benchmarks/fixtures/csharp/semantic-cases \
+            --spec benchmarks/specs/csharp-smoke-queries.json \
+            --report target/semantic-graph-benchmark/csharp-smoke.json \
+            --ra-lsp-probes 0
+
+      - name: Run full external C# benchmark
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'full') || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/benchmark-full/')) }}
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/csharp-real
+          while read -r name url; do
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language csharp \
+              --fixture benchmarks/fixtures/csharp/semantic-cases \
+              --spec benchmarks/specs/csharp-smoke-queries.json \
+              --report "target/semantic-graph-benchmark/csharp-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 1500 \
+              --ra-lsp-probes 0 \
+              --no-speed-gate
+          done <<'REPOS'
+          newtonsoft_json https://github.com/JamesNK/Newtonsoft.Json
+          dapper https://github.com/DapperLib/Dapper
+          automapper https://github.com/AutoMapper/AutoMapper
+          polly https://github.com/App-vNext/Polly
+          serilog https://github.com/serilog/serilog
+          REPOS
+
+      - name: Write C# benchmark summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+
+          reports = []
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/**/*.json", recursive=True)):
+              reports.append((path, json.load(open(path))))
+
+          with open("__csharp_summary.md", "w") as out:
+              print("## C# Semantic Graph Benchmark", file=out)
+              for path, report in reports:
+                  print("", file=out)
+                  print(f"### {path}", file=out)
+                  print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
+                  print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
+                  print(f"- Graph: files={report['graph']['files']} symbols={report['graph']['symbols']} edges={report['graph']['edges']} references={report['graph']['references']} calls={report['graph']['calls']}", file=out)
+                  print(f"- Accuracy oracle: {report['accuracy']['rust_analyzer_symbol_status']}", file=out)
+                  oracle = report.get("csharp_oracle")
+                  if oracle:
+                      symbols = oracle["symbols"]
+                      build_ms = oracle.get("oracle_build_ms")
+                      build = f"{build_ms} ms" if build_ms is not None else "cached"
+                      print(
+                          "- Roslyn oracle: tp={tp} fp={fp} fn={fn} precision={precision:.3f} recall={recall:.3f} ".format(
+                              tp=symbols["true_positive"],
+                              fp=symbols["false_positive"],
+                              fn=symbols["false_negative"],
+                              precision=symbols["precision"],
+                              recall=symbols["recall"],
+                          )
+                          + f"oracle={oracle['oracle_ms']} ms build={build} unparseable={oracle['oracle_unparseable_files']}",
+                          file=out,
+                      )
+                  mixed = report.get("mixed_workload")
+                  if mixed:
+                      print(f"- Mixed repo: {mixed['repo']}", file=out)
+                      print(f"- Available scenarios: {mixed['available_scenarios']}", file=out)
+                      print(f"- Executed scenarios: {mixed['executed_scenarios']}", file=out)
+                      compiler = mixed['compiler_check_ms'] if mixed['compiler_check_ms'] is not None else mixed['compiler_check_status']
+                      print(f"- dotnet build: {compiler}", file=out)
+                      print(f"- Mixed Squeezy total: {mixed['squeezy_total_ms']} ms", file=out)
+                      print(f"- Refresh after edits: {mixed['refresh_probe']['refresh_ms']} ms", file=out)
+                      print(f"- Reparsed files: {mixed['refresh_probe']['reparsed_files']}", file=out)
+                      mixed_symbols = mixed['accuracy']['symbols']
+                      print(
+                          "- Mixed accuracy: tp={tp} fp={fp} fn={fn} precision={precision:.3f} recall={recall:.3f}".format(
+                              tp=mixed_symbols['true_positive'],
+                              fp=mixed_symbols['false_positive'],
+                              fn=mixed_symbols['false_negative'],
+                              precision=mixed_symbols['precision'],
+                              recall=mixed_symbols['recall'],
+                          ),
+                          file=out,
+                      )
+                      print(f"- Mixed oracle status: {mixed['accuracy']['rust_analyzer_symbol_status']}", file=out)
+          PY
+          cat __csharp_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload C# benchmark reports
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: semantic-graph-benchmark-csharp-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/**/*.json
+            __csharp_summary.md
           if-no-files-found: error
