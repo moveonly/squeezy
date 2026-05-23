@@ -19,8 +19,10 @@ use super::*;
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
-    let mut shell_sandbox = squeezy_core::ShellSandboxConfig::default();
-    shell_sandbox.mode = squeezy_core::ShellSandboxMode::Off;
+    let shell_sandbox = squeezy_core::ShellSandboxConfig {
+        mode: squeezy_core::ShellSandboxMode::Off,
+        ..squeezy_core::ShellSandboxConfig::default()
+    };
     ToolRegistry::new_inner(
         root,
         ToolOutputConfig::default(),

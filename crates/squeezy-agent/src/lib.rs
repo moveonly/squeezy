@@ -1439,7 +1439,7 @@ pub(crate) fn permission_rule_for_persistence(
         if rule.capability == "destructive" {
             return None;
         }
-        if rule.target.trim() == "*" {
+        if squeezy_core::target_is_effectively_wildcard(&rule.target) {
             return None;
         }
     }

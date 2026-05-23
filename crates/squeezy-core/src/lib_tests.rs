@@ -90,6 +90,7 @@ audit = false
 kill_grace_ms = 500
 env_allowlist = ["PATH", "LC_*"]
 sensitive_path_patterns = [".ssh/**", ".env*"]
+replace_sensitive_path_patterns = true
 "#,
         "test",
     )
@@ -122,8 +123,8 @@ sensitive_path_patterns = [".ssh/**", ".env*"]
         .expect("inspect output parses back as settings");
     let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
     assert_eq!(
-        round_tripped_config.permissions.shell_sandbox.mode,
-        ShellSandboxMode::BestEffort
+        round_tripped_config.permissions.shell_sandbox, config.permissions.shell_sandbox,
+        "inspect output must round-trip to the same effective sandbox config",
     );
 }
 

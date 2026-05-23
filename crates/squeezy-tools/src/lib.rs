@@ -712,7 +712,7 @@ impl ToolRegistry {
             "ts_unix_ms": unix_timestamp_millis(SystemTime::now()),
             "call_id": call.call_id,
             "tool": call.name,
-            "command": self.redactor.redact(&truncate_text(&args.command, 500)).text,
+            "command": truncate_text(&self.redactor.redact(&args.command).text, 500),
             "cwd": self.relative(workdir).to_string_lossy(),
             "description": args.description.as_deref().map(|value| self.redactor.redact(value).text),
             "classification": {
@@ -2189,6 +2189,8 @@ impl ToolRegistry {
         let status = tokio::select! {
             _ = cancel.cancelled() => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                stdout_task.abort();
+                stderr_task.abort();
                 self.audit_shell(
                     call,
                     &args,
@@ -3347,23 +3349,110 @@ fn is_bare_shell_prefix(prefix: &str) -> bool {
 }
 
 fn is_destructive_shell_segment(segment: &str) -> bool {
-    let first = segment.split_whitespace().next().unwrap_or("");
-    matches!(
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or("");
+    if matches!(
         first,
         "rm" | "rmdir" | "mv" | "dd" | "truncate" | "shred" | "chmod" | "chown" | "sudo"
-    ) || segment.contains('>')
-        || segment.contains(">>")
-        || segment.contains("git reset")
-        || segment.contains("git clean")
-        || segment.contains("git checkout")
-        || segment.contains("git restore")
-        || segment.contains("git stash drop")
-        || segment.contains("git stash clear")
-        || segment.contains("git branch -D")
-        || segment.contains("git push --force")
-        || segment.contains("git push -f")
-        || segment.contains("terraform destroy")
-        || segment.contains("kubectl delete")
+    ) {
+        return true;
+    }
+    if destructive_git_pair(&tokens) || destructive_two_word_command(&tokens) {
+        return true;
+    }
+    if shell_segment_has_destructive_redirect(segment) {
+        return true;
+    }
+    false
+}
+
+/// Detects shell output redirects that write to a filename (`>`, `>>`, `>|`,
+/// `&>`, `&>>`, `<>`), while ignoring file-descriptor duplications like
+/// `2>&1`, `>&-`, and any `>` that appears inside single or double quotes.
+fn shell_segment_has_destructive_redirect(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match (quote, b) {
+            (Some(q), c) if c == q => {
+                quote = None;
+                i += 1;
+            }
+            (None, b'\'') | (None, b'"') => {
+                quote = Some(b);
+                i += 1;
+            }
+            (None, b'\\') if i + 1 < bytes.len() => {
+                i += 2;
+            }
+            (None, b'>') => {
+                // Skip the run of `>` characters (handles `>`, `>>`).
+                let mut j = i + 1;
+                while j < bytes.len() && bytes[j] == b'>' {
+                    j += 1;
+                }
+                // Optional `|` (force overwrite, `>|`).
+                if j < bytes.len() && bytes[j] == b'|' {
+                    j += 1;
+                }
+                // Skip whitespace between operator and target.
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                // `>&N` or `>&-` is a file-descriptor duplication, not a
+                // write to a path.
+                if j < bytes.len() && bytes[j] == b'&' {
+                    let mut k = j + 1;
+                    while k < bytes.len() && bytes[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    let dup_dash = k < bytes.len() && bytes[k] == b'-';
+                    if k > j + 1 || dup_dash {
+                        i = if dup_dash { k + 1 } else { k };
+                        continue;
+                    }
+                }
+                return true;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+/// Recognises the destructive git command families we want to surface
+/// without misfiring on substrings like `git push -foreign-rule`. Each entry
+/// matches `git <verb> [optional flag]` exactly on token boundaries.
+fn destructive_git_pair(tokens: &[&str]) -> bool {
+    let Some(&"git") = tokens.first() else {
+        return false;
+    };
+    let Some(&verb) = tokens.get(1) else {
+        return false;
+    };
+    match verb {
+        "reset" | "clean" | "checkout" | "restore" => true,
+        "stash" => matches!(tokens.get(2).copied(), Some("drop" | "clear")),
+        "branch" => tokens.iter().skip(2).any(|tok| *tok == "-D"),
+        "push" => tokens
+            .iter()
+            .skip(2)
+            .any(|tok| *tok == "--force" || *tok == "-f" || *tok == "--force-with-lease"),
+        _ => false,
+    }
+}
+
+fn destructive_two_word_command(tokens: &[&str]) -> bool {
+    match tokens.first().copied() {
+        Some("terraform") => tokens.get(1).copied() == Some("destroy"),
+        Some("kubectl") => tokens.get(1).copied() == Some("delete"),
+        Some("docker") => matches!(tokens.get(1).copied(), Some("rm" | "rmi" | "system")),
+        _ => false,
+    }
 }
 
 fn is_network_shell_segment(segment: &str) -> bool {
@@ -4178,25 +4267,62 @@ fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellSandboxPlan)
     #[cfg(target_os = "linux")]
     if plan.backend == "linux-direct-syscalls" {
         let deny_network = plan.network == "denied";
+        // `Command::process_group(0)` already arranges a `setpgid(0, 0)` in
+        // the child's pre_exec, so we don't duplicate it here. We focus on
+        // the namespace unshare, which is the additional isolation step.
+        // CLONE_NEWUSER + uid_map is required for an unprivileged process
+        // to call unshare(CLONE_NEWNS) on stock distros; we fall back to a
+        // single-step unshare if user-namespace setup is forbidden so that
+        // best-effort mode does not hard-fail on every call.
         unsafe {
-            command.pre_exec(move || {
-                if libc::setpgid(0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let mut flags = libc::CLONE_NEWNS;
-                if deny_network {
-                    flags |= libc::CLONE_NEWNET;
-                }
-                if libc::unshare(flags) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            command.pre_exec(move || linux_unshare_pre_exec(deny_network));
         }
     }
 
     #[cfg(not(target_os = "linux"))]
     let _ = (command, plan);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unshare_pre_exec(deny_network: bool) -> std::io::Result<()> {
+    // Capture the parent's uid/gid before any namespace switch.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Preferred path: open a user namespace first so the subsequent mount
+    // and network namespace creation are allowed without CAP_SYS_ADMIN.
+    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+    if deny_network {
+        flags |= libc::CLONE_NEWNET;
+    }
+    if unsafe { libc::unshare(flags) } == 0 {
+        // Best effort: drop the inherited setgroups capability and map our
+        // uid/gid into the new user namespace. If any of these writes fail
+        // (e.g. /proc not yet mounted), continue — the sandbox is still in
+        // place; the only effect is that uid/gid inside the namespace look
+        // unmapped.
+        let _ = linux_write_proc("/proc/self/setgroups", b"deny");
+        let _ = linux_write_proc("/proc/self/uid_map", format!("0 {uid} 1").as_bytes());
+        let _ = linux_write_proc("/proc/self/gid_map", format!("0 {gid} 1").as_bytes());
+        return Ok(());
+    }
+
+    // Fallback path: try the privileged form. Will succeed in containers
+    // launched with CAP_SYS_ADMIN, fail with EPERM otherwise.
+    let mut fallback = libc::CLONE_NEWNS;
+    if deny_network {
+        fallback |= libc::CLONE_NEWNET;
+    }
+    if unsafe { libc::unshare(fallback) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_write_proc(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.write_all(contents)
 }
 
 async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {

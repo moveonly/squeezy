@@ -117,12 +117,13 @@ When `audit = true`, each shell attempt appends one JSON object to
 
 The audit record includes:
 
-- call id and tool name,
-- redacted command summary and cwd,
+- timestamp (`ts_unix_ms`), call id, and tool name,
+- redacted (then truncated) command string and optional redacted description,
+- workspace-relative cwd (no redaction applied; cwd is a workspace path),
 - classification capability, target, risk, network/destructive flags, and
   parser metadata,
 - sandbox backend, mode, network posture, and required flag,
-- allowlisted environment variable names,
+- allowlisted environment variable names (values are never recorded),
 - timeout and output caps,
 - outcome, denial reason, and exit code,
 - stdout/stderr byte counts and SHA-256 hashes.
