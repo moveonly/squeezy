@@ -1377,15 +1377,39 @@ fn attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
 fn docs_from_attributes(attributes: &[String]) -> Vec<String> {
     attributes
         .iter()
-        .filter(|attr| attr.contains("doc"))
+        .filter(|attr| attribute_path(attr).as_deref() == Some("doc"))
         .cloned()
         .collect()
 }
 
 fn is_test_function(attributes: &[String]) -> bool {
-    attributes
-        .iter()
-        .any(|attr| attr.contains("#[test]") || attr.contains("::test"))
+    attributes.iter().any(|attr| {
+        attribute_path(attr)
+            .and_then(|path| path.rsplit("::").next().map(str::to_string))
+            .as_deref()
+            == Some("test")
+    })
+}
+
+/// Extract the attribute path (the identifier or `::`-separated path that
+/// precedes any `(`, `=`, `]`, or `!`). Returns `None` for empty/unrecognized
+/// inputs. The attribute text is expected to look like `#[<path>(...)]`,
+/// `#[<path> = "..."]`, `#[<path>]`, or the inner-attribute form `#![...]`.
+fn attribute_path(attribute: &str) -> Option<String> {
+    let trimmed = attribute.trim_start();
+    let body = trimmed
+        .strip_prefix("#![")
+        .or_else(|| trimmed.strip_prefix("#["))?;
+    let body = body.trim_start();
+    let path: String = body
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
+        .collect();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.trim_end_matches(':').to_string())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

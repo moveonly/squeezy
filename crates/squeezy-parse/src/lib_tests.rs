@@ -354,6 +354,69 @@ fn parser_parallel_records_preserve_order_and_cache_changes() {
     }
 }
 
+#[test]
+fn attribute_path_extracts_leading_path_only() {
+    assert_eq!(attribute_path("#[test]").as_deref(), Some("test"));
+    assert_eq!(
+        attribute_path("#[my_crate::test]").as_deref(),
+        Some("my_crate::test")
+    );
+    assert_eq!(
+        attribute_path("#[serde(rename = \"::test\")]").as_deref(),
+        Some("serde")
+    );
+    assert_eq!(attribute_path("#[doc = \"x\"]").as_deref(), Some("doc"));
+    assert_eq!(attribute_path("#[doc(hidden)]").as_deref(), Some("doc"));
+    assert_eq!(
+        attribute_path("#[derive(Document)]").as_deref(),
+        Some("derive")
+    );
+    assert_eq!(
+        attribute_path("#![allow(unused)]").as_deref(),
+        Some("allow")
+    );
+    assert_eq!(attribute_path("not-an-attribute"), None);
+    assert_eq!(attribute_path("#[]"), None);
+}
+
+#[test]
+fn is_test_function_matches_only_test_attribute_paths() {
+    assert!(is_test_function(&["#[test]".to_string()]));
+    assert!(is_test_function(&["#[tokio::test]".to_string()]));
+    assert!(is_test_function(&[
+        "#[some_crate::nested::test]".to_string()
+    ]));
+    assert!(!is_test_function(&[
+        "#[some_crate::test_helper]".to_string()
+    ]));
+    assert!(!is_test_function(&[
+        "#[my::test_utils::install]".to_string()
+    ]));
+    assert!(!is_test_function(&[
+        "#[serde(rename = \"::test\")]".to_string()
+    ]));
+    assert!(!is_test_function(&["#[cfg(test)]".to_string()]));
+}
+
+#[test]
+fn docs_from_attributes_only_keeps_doc_attribute() {
+    let attrs = vec![
+        "#[doc = \"keep\"]".to_string(),
+        "#[doc(hidden)]".to_string(),
+        "#[derive(Document)]".to_string(),
+        "#[serde(rename = \"doc_id\")]".to_string(),
+        "#[derive(Debug, AsDocument)]".to_string(),
+    ];
+    let docs = docs_from_attributes(&attrs);
+    assert_eq!(
+        docs,
+        vec![
+            "#[doc = \"keep\"]".to_string(),
+            "#[doc(hidden)]".to_string(),
+        ]
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("parse-record");
     let path = root.join(relative_path);
