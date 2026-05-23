@@ -209,7 +209,7 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
     let agent = Agent::new(config, provider);
 
     let mut rx = agent.start_turn("run".to_string(), CancellationToken::new());
-    let mut summary = None;
+    let mut approval_payload: Option<(String, BTreeMap<String, String>)> = None;
     while let Some(event) = rx.recv().await {
         if let AgentEvent::ApprovalRequested {
             request,
@@ -217,20 +217,35 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
             ..
         } = event
         {
-            summary = Some(request.summary().to_string());
+            approval_payload = Some((
+                request.summary().to_string(),
+                request.permission.metadata.clone(),
+            ));
             let _ = decision_tx.send(ToolApprovalDecision::Denied);
         }
     }
 
-    let summary = summary.expect("approval summary");
-    // Avoid interpolating the redacted-summary value into the panic
-    // message; CodeQL flags that as cleartext logging on assertions
-    // whose fixture inputs look secret-shaped.
+    let (summary, metadata) = approval_payload.expect("approval payload");
+    // The summary now only carries the description so secret bearing
+    // commands never reach it in the first place. The command (and any
+    // other metadata values) are still redacted before being surfaced.
+    // Avoid interpolating any of the redacted values into the panic
+    // messages so CodeQL doesn't flag cleartext logging.
     assert!(
         !summary.contains("abcdefghijklmnopqrstuvwxyz"),
         "approval summary leaked bearer token",
     );
-    assert!(summary.contains("<redacted:bearer_token"));
+    let command_meta = metadata
+        .get("command")
+        .expect("shell approval metadata must include command");
+    assert!(
+        !command_meta.contains("abcdefghijklmnopqrstuvwxyz"),
+        "approval metadata leaked bearer token",
+    );
+    assert!(
+        command_meta.contains("<redacted:bearer_token"),
+        "approval metadata must carry the redaction marker",
+    );
 
     let _ = fs::remove_dir_all(root);
 }

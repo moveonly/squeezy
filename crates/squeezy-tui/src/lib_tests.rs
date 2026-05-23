@@ -169,17 +169,101 @@ fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
     let permission = PermissionRequest {
         call_id: "call".to_string(),
         tool_name: "shell".to_string(),
-        capability: PermissionCapability::Shell,
+        capability: PermissionCapability::Compiler,
         target: "cargo test:*".to_string(),
-        risk: PermissionRisk::High,
-        summary: "shell description=\"run tests\" command=\"cargo test\"".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "shell description=\"run tests\"".to_string(),
         metadata: BTreeMap::from([
             ("command".to_string(), "cargo test".to_string()),
             ("cwd".to_string(), ".".to_string()),
-            ("env".to_string(), "allowlist/redacted".to_string()),
+            ("env".to_string(), "allowlist (values redacted)".to_string()),
             ("network".to_string(), "none".to_string()),
             ("destructive".to_string(), "false".to_string()),
+            ("timeout_ms".to_string(), "30000".to_string()),
+            ("output_byte_cap".to_string(), "32000".to_string()),
+            ("sandbox".to_string(), "required".to_string()),
+            ("sandbox_network".to_string(), "deny_by_default".to_string()),
         ]),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default compiler permission is ask".to_string(),
+    };
+
+    let prompt = format_approval_prompt(&request);
+    assert!(prompt.contains("risk=medium"), "missing risk: {prompt}");
+    assert!(
+        prompt.contains("target=cargo test:*"),
+        "missing target: {prompt}",
+    );
+    assert!(
+        prompt.contains("command=\"cargo test\""),
+        "missing command metadata: {prompt}",
+    );
+    assert!(prompt.contains("cwd=\".\""), "missing cwd: {prompt}");
+    assert!(
+        prompt.contains("env=\"allowlist (values redacted)\""),
+        "missing env: {prompt}"
+    );
+    assert!(
+        prompt.contains("network=\"none\""),
+        "missing network: {prompt}"
+    );
+    assert!(
+        prompt.contains("destructive=\"false\""),
+        "missing destructive flag: {prompt}",
+    );
+    assert!(
+        prompt.contains("timeout_ms=\"30000\""),
+        "missing timeout: {prompt}",
+    );
+    assert!(
+        prompt.contains("output_byte_cap=\"32000\""),
+        "missing output_byte_cap: {prompt}",
+    );
+    assert!(
+        prompt.contains("sandbox=\"required\""),
+        "missing sandbox mode: {prompt}",
+    );
+    assert!(
+        prompt.contains("sandbox_network=\"deny_by_default\""),
+        "missing sandbox_network: {prompt}",
+    );
+    // Reason text appears verbatim on its own line.
+    assert!(
+        prompt.contains("reason=default compiler permission is ask"),
+        "missing reason: {prompt}",
+    );
+    // Multi-line format puts each field on its own line.
+    let line_count = prompt.matches('\n').count();
+    assert!(
+        line_count >= 6,
+        "expected multi-line prompt; got {line_count} newlines:\n{prompt}",
+    );
+    assert!(prompt.contains("[y] once"));
+    assert!(prompt.contains("[a] user allow"));
+    assert!(prompt.contains("[p] project allow"));
+    assert!(prompt.contains("[u] user deny"));
+    assert!(prompt.contains("[d] project deny"));
+    assert!(prompt.contains("[n] deny once"));
+}
+
+#[test]
+fn approval_status_line_is_compact_single_line() {
+    let permission = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "shell:*".to_string(),
+        risk: PermissionRisk::High,
+        summary: "shell description=\"do stuff\"".to_string(),
+        metadata: BTreeMap::new(),
         suggested_rules: Vec::new(),
     };
     let request = ToolApprovalRequest {
@@ -191,36 +275,11 @@ fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
         matched_rule: None,
         reason: "default shell permission is ask".to_string(),
     };
-
-    let prompt = format_approval_prompt(&request);
-    assert!(prompt.contains("risk=high"), "missing risk: {prompt}");
-    assert!(
-        prompt.contains("target=cargo test:*"),
-        "missing target: {prompt}",
-    );
-    assert!(
-        prompt.contains("command=\"cargo test\""),
-        "missing command metadata: {prompt}",
-    );
-    assert!(prompt.contains("cwd=\".\""), "missing cwd: {prompt}");
-    assert!(
-        prompt.contains("env=\"allowlist/redacted\""),
-        "missing env: {prompt}"
-    );
-    assert!(
-        prompt.contains("network=\"none\""),
-        "missing network: {prompt}"
-    );
-    assert!(
-        prompt.contains("destructive=\"false\""),
-        "missing destructive flag: {prompt}",
-    );
-    assert!(prompt.contains("y once"));
-    assert!(prompt.contains("a user allow"));
-    assert!(prompt.contains("p project allow"));
-    assert!(prompt.contains("u user deny"));
-    assert!(prompt.contains("d project deny"));
-    assert!(prompt.contains("n deny once"));
+    let line = format_approval_status_line(&request);
+    assert!(!line.contains('\n'), "status line must be single line");
+    assert!(line.contains("approval pending"));
+    assert!(line.contains("risk=high"));
+    assert!(line.contains("target=shell:*"));
 }
 
 fn test_agent(mode: SessionMode) -> Agent {

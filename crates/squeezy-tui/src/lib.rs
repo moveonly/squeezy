@@ -81,7 +81,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     decision_tx,
                     ..
                 } => {
-                    app.status = format_approval_prompt(&request);
+                    app.status = format_approval_status_line(&request);
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
@@ -286,49 +286,116 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
             true
         }
         _ => {
-            app.status = format_approval_prompt(&pending.request);
+            app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
             true
         }
     }
 }
 
-pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
+/// Keys we surface in the approval prompt, in display order. The list
+/// matches the metadata emitted by `ToolRegistry::permission_request` so a
+/// future field becomes visible by adding it here AND in the tool
+/// registry; the doc in `docs/CONFIGURATION.md` references this contract.
+pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
+    "command",
+    "cwd",
+    "description",
+    "env",
+    "network",
+    "destructive",
+    "timeout_ms",
+    "output_byte_cap",
+    "sandbox",
+    "sandbox_network",
+    "parser_backed",
+    "dynamic",
+];
+
+/// Single-line status banner shown in the 1-line status bar. Compact by
+/// design so the status bar remains useful for non-approval traffic.
+pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
-    let mut details = Vec::new();
-    for key in ["command", "cwd", "env", "network", "destructive"] {
-        if let Some(value) = permission.metadata.get(key) {
-            details.push(format!("{key}={value:?}"));
-        }
-    }
-    let details = if details.is_empty() {
-        String::new()
-    } else {
-        format!(" | {}", details.join(" "))
-    };
     format!(
-        "approve {summary} | risk={risk} target={target}{details} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
-        summary = permission.summary,
+        "approval pending: {tool} risk={risk} target={target} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
+        tool = request.tool_name,
         risk = permission.risk.as_str(),
         target = permission.target,
-        details = details,
     )
+}
+
+/// Multi-line approval prompt rendered on its own dedicated TUI panel.
+/// Each metadata field gets its own line so long commands wrap cleanly
+/// instead of being truncated off the right edge of the screen.
+pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
+    let permission = &request.permission;
+    let mut lines = Vec::new();
+    lines.push(format!("approve {}", permission.summary.trim()));
+    lines.push(format!(
+        "  risk={risk} target={target}",
+        risk = permission.risk.as_str(),
+        target = permission.target,
+    ));
+    if !request.reason.is_empty() {
+        lines.push(format!("  reason={}", request.reason));
+    }
+    for key in APPROVAL_PROMPT_KEYS {
+        if let Some(value) = permission.metadata.get(*key) {
+            lines.push(format!("  {key}={value:?}"));
+        }
+    }
+    lines.push(
+        "  [y] once  [a] user allow  [p] project allow  [u] user deny  [d] project deny  [n] deny once"
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(5),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .split(area);
+    if let Some(pending) = app.pending_approval.as_ref() {
+        // When an approval is pending, reserve a dedicated panel large
+        // enough to show every metadata line of `format_approval_prompt`.
+        let prompt = format_approval_prompt(&pending.request);
+        let line_count = prompt.matches('\n').count() as u16 + 1;
+        let approval_height = line_count.saturating_add(2).clamp(6, 18);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),
+                Constraint::Length(approval_height),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        render_transcript(frame, chunks[0], app);
+        render_approval(frame, chunks[1], &prompt);
+        render_input(frame, chunks[2], app);
+        render_status(frame, chunks[3], app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(5),
+                Constraint::Length(3),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        render_transcript(frame, chunks[0], app);
+        render_input(frame, chunks[1], app);
+        render_status(frame, chunks[2], app);
+    }
+}
 
-    render_transcript(frame, chunks[0], app);
-    render_input(frame, chunks[1], app);
-    render_status(frame, chunks[2], app);
+fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
+    let paragraph = Paragraph::new(prompt)
+        .block(
+            Block::default()
+                .title("Approval required")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {

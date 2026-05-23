@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -420,28 +420,78 @@ struct CachedDiffSnapshot {
     fetched_at: Instant,
 }
 
+const SHELL_AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const SHELL_AUDIT_RETAINED_ROTATIONS: usize = 4;
+
+/// Append-only JSONL store for shell audit records.
+///
+/// Each entry is serialised to a single `Vec<u8>` (terminated by `\n`) and
+/// written through a single `write_all` call under a process-wide
+/// `Mutex<()>`. Two interleaved concurrent calls therefore produce two
+/// distinct lines, not one corrupted hybrid. When the file exceeds
+/// `SHELL_AUDIT_MAX_BYTES`, the current file is rotated to a numbered
+/// suffix and a fresh log is started, keeping at most
+/// `SHELL_AUDIT_RETAINED_ROTATIONS` archived files.
 #[derive(Debug)]
 struct ShellAuditStore {
     path: PathBuf,
+    lock: StdMutex<()>,
 }
 
 impl ShellAuditStore {
     fn new(root: &Path) -> Self {
         Self {
             path: root.join(".squeezy").join("audit").join("shell.jsonl"),
+            lock: StdMutex::new(()),
         }
     }
 
     fn append(&self, entry: &Value) -> std::io::Result<()> {
+        let mut payload = serde_json::to_vec(entry)?;
+        payload.push(b'\n');
+
+        let _guard = self.lock.lock().unwrap_or_else(|err| err.into_inner());
+
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
+        self.maybe_rotate(payload.len() as u64)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, entry)?;
-        file.write_all(b"\n")
+        file.write_all(&payload)
+    }
+
+    fn maybe_rotate(&self, incoming_bytes: u64) -> std::io::Result<()> {
+        let metadata = match fs::metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if metadata.len() + incoming_bytes <= SHELL_AUDIT_MAX_BYTES {
+            return Ok(());
+        }
+        // Shift suffix N-1 → N, dropping the oldest.
+        for i in (1..SHELL_AUDIT_RETAINED_ROTATIONS).rev() {
+            let src = self.rotated_path(i);
+            let dst = self.rotated_path(i + 1);
+            if src.exists() {
+                let _ = fs::rename(&src, &dst);
+            }
+        }
+        fs::rename(&self.path, self.rotated_path(1))?;
+        Ok(())
+    }
+
+    fn rotated_path(&self, index: usize) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(format!(".{index}"));
+        self.path.with_file_name(name)
     }
 }
 
@@ -849,14 +899,11 @@ impl ToolRegistry {
                 metadata.insert("command".to_string(), command.to_string());
                 metadata.insert("cwd".to_string(), workdir.to_string());
                 metadata.insert("shell_prefix".to_string(), analysis.rule_target.clone());
-                metadata.insert(
-                    "env".to_string(),
-                    "allowlist; values redacted from approvals and output".to_string(),
-                );
+                metadata.insert("env".to_string(), "allowlist (values redacted)".to_string());
                 metadata.insert(
                     "network".to_string(),
                     if analysis.network {
-                        "detected".to_string()
+                        "classified".to_string()
                     } else {
                         "none".to_string()
                     },
@@ -870,6 +917,10 @@ impl ToolRegistry {
                 metadata.insert(
                     "sandbox".to_string(),
                     self.shell_sandbox.mode.as_str().to_string(),
+                );
+                metadata.insert(
+                    "sandbox_network".to_string(),
+                    self.shell_sandbox.network.as_str().to_string(),
                 );
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
@@ -1070,17 +1121,11 @@ impl ToolRegistry {
                     .as_ref()
                     .and_then(|args| args.description.as_deref())
                     .unwrap_or("run shell command");
-                let command = args
-                    .as_ref()
-                    .map(|args| truncate_text(&args.command, 200))
-                    .unwrap_or_else(|| "?".to_string());
-                let workdir = args
-                    .as_ref()
-                    .and_then(|args| args.workdir.as_deref())
-                    .unwrap_or(".");
-                format!(
-                    "shell description={description:?} cwd={workdir:?} env=\"allowlist/redacted\" command={command:?}"
-                )
+                // Only the description goes in the summary now; the rest
+                // (command, cwd, env policy, network, destructive, …) is
+                // emitted via `permission_request().metadata` so the UI
+                // doesn't render the same field twice.
+                format!("shell description={description:?}")
             }
             "webfetch" => {
                 let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
@@ -3045,22 +3090,46 @@ struct ParsedShellCommand {
 
 fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     let normalized = collapse_whitespace(command);
+    // Permission flow calls analyze_shell_command twice for the same
+    // command (permission_request, then execute_shell_capped). A tiny
+    // thread-local LRU avoids the second tree-sitter parse on the hot
+    // path. The cache is bounded so long-running agents don't grow
+    // unbounded memory.
+    thread_local! {
+        static MEMO: std::cell::RefCell<VecDeque<(String, ShellPermissionAnalysis)>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
+    }
+    const MEMO_CAPACITY: usize = 16;
+    if let Some(hit) = MEMO.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(key, _)| key == &normalized)
+            .map(|(_, analysis)| analysis.clone())
+    }) {
+        return hit;
+    }
     let parsed = parse_shell_command(&normalized);
     let parser_backed = parsed.is_some();
     let dynamic = parsed.as_ref().is_some_and(|parsed| parsed.dynamic);
-    let segments = parsed
+    let raw_segments = parsed
         .as_ref()
         .map(|parsed| parsed.segments.clone())
         .filter(|segments| !segments.is_empty())
         .unwrap_or_else(|| shell_segments(&normalized));
+    // Wrappers (sh -c "...", env BAR=v cmd, nohup cmd, xargs cmd, ...) hide
+    // the real command behind boilerplate. Append the recursively unwrapped
+    // inner commands so destructive/network/compiler checks fire on the
+    // actual payload, not just the wrapper.
+    let segments = expand_wrapper_segments(raw_segments);
     let first = segments
         .first()
         .map(|segment| shell_command_prefix(segment))
         .filter(|prefix| !prefix.is_empty())
         .unwrap_or_else(|| "shell".to_string());
 
-    if segments.is_empty() {
-        return ShellPermissionAnalysis {
+    let analysis = if segments.is_empty() {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
             risk: PermissionRisk::High,
             rule_target: "shell:*".to_string(),
@@ -3068,11 +3137,9 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             destructive: false,
             parser_backed,
             dynamic,
-        };
-    }
-
-    if dynamic {
-        return ShellPermissionAnalysis {
+        }
+    } else if dynamic {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
             risk: PermissionRisk::High,
             rule_target: "shell:*".to_string(),
@@ -3084,14 +3151,12 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
                 .any(|segment| is_destructive_shell_segment(segment)),
             parser_backed,
             dynamic,
-        };
-    }
-
-    if segments
+        }
+    } else if segments
         .iter()
         .any(|segment| is_destructive_shell_segment(segment))
     {
-        return ShellPermissionAnalysis {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Destructive,
             risk: PermissionRisk::Critical,
             rule_target: format!("{first}:*"),
@@ -3101,13 +3166,12 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             destructive: true,
             parser_backed,
             dynamic,
-        };
-    }
-    if segments
+        }
+    } else if segments
         .iter()
         .any(|segment| is_network_shell_segment(segment))
     {
-        return ShellPermissionAnalysis {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Network,
             risk: PermissionRisk::High,
             rule_target: format!("shell:{first}:*"),
@@ -3115,13 +3179,12 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             destructive: false,
             parser_backed,
             dynamic,
-        };
-    }
-    if segments
+        }
+    } else if segments
         .iter()
         .all(|segment| is_compiler_shell_segment(segment))
     {
-        return ShellPermissionAnalysis {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Compiler,
             risk: PermissionRisk::Medium,
             rule_target: format!(
@@ -3132,10 +3195,9 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             destructive: false,
             parser_backed,
             dynamic,
-        };
-    }
-    if segments.iter().all(|segment| is_git_shell_segment(segment)) {
-        return ShellPermissionAnalysis {
+        }
+    } else if segments.iter().all(|segment| is_git_shell_segment(segment)) {
+        ShellPermissionAnalysis {
             capability: PermissionCapability::Git,
             risk: if segments
                 .iter()
@@ -3153,18 +3215,320 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             destructive: false,
             parser_backed,
             dynamic,
-        };
-    }
+        }
+    } else {
+        ShellPermissionAnalysis {
+            capability: PermissionCapability::Shell,
+            risk: PermissionRisk::High,
+            rule_target: format!("{first}:*"),
+            network: false,
+            destructive: false,
+            parser_backed,
+            dynamic,
+        }
+    };
+    MEMO.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= MEMO_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back((normalized.clone(), analysis.clone()));
+    });
+    analysis
+}
 
-    ShellPermissionAnalysis {
-        capability: PermissionCapability::Shell,
-        risk: PermissionRisk::High,
-        rule_target: format!("{first}:*"),
-        network: false,
-        destructive: false,
-        parser_backed,
-        dynamic,
+/// For each top-level command segment, append any wrapper-stripped inner
+/// command so the rest of the analyzer sees the real argv. Recurses up to
+/// `MAX_WRAPPER_DEPTH` times to cover nested wrappers like
+/// `nohup sh -c "env BAR=v rm -rf /"`.
+fn expand_wrapper_segments(segments: Vec<String>) -> Vec<String> {
+    const MAX_WRAPPER_DEPTH: usize = 4;
+    let mut out = Vec::with_capacity(segments.len());
+    for segment in segments {
+        out.push(segment.clone());
+        let mut current = segment;
+        for _ in 0..MAX_WRAPPER_DEPTH {
+            let Some(inner) = unwrap_shell_wrapper(&current) else {
+                break;
+            };
+            // Re-parse the inner: it can contain its own `&&`/`;`/`|`
+            // operators, in which case we want each piece as a segment.
+            for piece in shell_segments(&inner) {
+                if !piece.is_empty() && !out.iter().any(|seg| seg == &piece) {
+                    out.push(piece);
+                }
+            }
+            current = inner;
+        }
     }
+    out
+}
+
+/// Try to unwrap one layer of shell wrapping. Returns the inner command
+/// string with the wrapper boilerplate removed, or `None` if the segment
+/// doesn't begin with a recognized wrapper. The recognized wrappers fall
+/// into three families:
+///
+/// - `sh -c "<cmd>"` / `bash -c '<cmd>'` (and `-lc`, `-ic`) — the script
+///   passed to a shell interpreter.
+/// - `env [VAR=val …] [-i|-] <argv>` — environment-prefix runners.
+/// - `nohup <argv>`, `nice [-n N] <argv>`, `time <argv>`, `timeout <DUR>
+///   <argv>`, `stdbuf <opts> <argv>`, `xargs [opts] <argv>`,
+///   `sudo [opts] <argv>` — passthrough wrappers.
+fn unwrap_shell_wrapper(segment: &str) -> Option<String> {
+    let tokens = tokenize_shell_segment(segment);
+    let head = tokens.first()?.as_str();
+    match head {
+        "sh" | "bash" | "zsh" | "fish" | "csh" | "tcsh" | "ksh" | "dash" => {
+            // Walk past flag tokens; if any flag contains `c`, the next
+            // positional argument is the script we want to surface.
+            let mut idx = 1;
+            while let Some(tok) = tokens.get(idx) {
+                if let Some(flag_body) = tok.strip_prefix('-') {
+                    if flag_body.contains('c') {
+                        let script = tokens.get(idx + 1)?;
+                        return Some(dequote_token(script).to_string());
+                    }
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            None
+        }
+        "env" => {
+            let mut idx = 1;
+            while let Some(tok) = tokens.get(idx) {
+                if tok == "-" || tok == "-i" || tok == "--ignore-environment" {
+                    idx += 1;
+                } else if tok.starts_with('-') {
+                    // Unknown env flag; bail out conservatively to avoid
+                    // swallowing the inner command behind a flag we don't
+                    // understand.
+                    return None;
+                } else if shell_env_assignment_token(tok) {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        "nohup" | "time" | "sudo" => {
+            // Skip the wrapper and any leading flags so the inner argv is
+            // returned cleanly. `sudo` accepts complex flags but stays a
+            // passthrough.
+            let mut idx = 1;
+            while let Some(tok) = tokens.get(idx) {
+                if tok.starts_with('-') {
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        "nice" => {
+            let mut idx = 1;
+            if tokens.get(idx).map(String::as_str) == Some("-n") {
+                idx += 2;
+            } else if tokens
+                .get(idx)
+                .map(String::as_str)
+                .is_some_and(|tok| tok.starts_with('-'))
+            {
+                idx += 1;
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        "stdbuf" => {
+            let mut idx = 1;
+            while tokens
+                .get(idx)
+                .map(String::as_str)
+                .is_some_and(|tok| tok.starts_with('-'))
+            {
+                idx += 1;
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        "timeout" => {
+            let mut idx = 1;
+            while tokens
+                .get(idx)
+                .map(String::as_str)
+                .is_some_and(|tok| tok.starts_with('-'))
+            {
+                idx += 1;
+            }
+            // First non-flag is the duration (e.g. "30", "10s"). Skip it.
+            if tokens.get(idx).is_some() {
+                idx += 1;
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        "xargs" => {
+            let mut idx = 1;
+            while let Some(tok) = tokens.get(idx) {
+                if !tok.starts_with('-') {
+                    break;
+                }
+                let flag = tok.as_str();
+                idx += 1;
+                if matches!(
+                    flag,
+                    "-I" | "-L" | "-n" | "-P" | "--max-args" | "--max-procs"
+                ) {
+                    // Consume the flag's value if present.
+                    if tokens.get(idx).is_some() {
+                        idx += 1;
+                    }
+                }
+            }
+            let inner = tokens.get(idx..)?;
+            if inner.is_empty() {
+                None
+            } else {
+                Some(
+                    inner
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                )
+            }
+        }
+        _ => None,
+    }
+}
+
+/// True for tokens shaped like `NAME=value` (the env-assignment prefix
+/// passed to `env`). Mirrors `split_env_assignment` but operates on owned
+/// strings.
+fn shell_env_assignment_token(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// Quote-aware tokenizer used by the wrapper unwrapper. Single and double
+/// quotes group whitespace-separated runs into a single token; the surrounding
+/// quotes are preserved on the token so the caller can `dequote_token` it.
+fn tokenize_shell_segment(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut iter = segment.chars().peekable();
+    while let Some(ch) = iter.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => {
+                current.push(ch);
+                quote = None;
+            }
+            (None, '\'') | (None, '"') => {
+                current.push(ch);
+                quote = Some(ch);
+            }
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            (_, '\\') => {
+                current.push(ch);
+                if let Some(next) = iter.next() {
+                    current.push(next);
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Strip a single pair of matching outer quotes from a token, leaving its
+/// contents otherwise unchanged. Bash escape semantics are not interpreted
+/// (the classifier is conservative: `sh -c "rm -rf \\"$HOME\\""` will still
+/// surface the literal payload, including the escaped backslashes).
+fn dequote_token(token: &str) -> &str {
+    let bytes = token.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' || first == b'\'') && first == last {
+            return &token[1..token.len() - 1];
+        }
+    }
+    token
 }
 
 fn parse_shell_command(command: &str) -> Option<ParsedShellCommand> {
@@ -4090,9 +4454,18 @@ fn prepare_shell_sandbox_plan(
     config: &ShellSandboxConfig,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     let required = config.mode == ShellSandboxMode::Required;
-    let network = match config.network {
-        ShellSandboxNetworkPolicy::AllowWhenApproved if analysis.network => "allowed_approved",
-        _ if analysis.network => "allowed_detected",
+    // The sandbox-level network posture has THREE distinct states:
+    //   - "allowed_approved": classified network + user opted into
+    //     `allow_when_approved`; the sandbox opens its network namespace.
+    //   - "denied_classified": classified network + default
+    //     `deny_by_default`; the permission layer may still allow the
+    //     command to RUN, but the sandbox keeps network closed so a
+    //     misclassified target or a follow-on system() call can't reach
+    //     out unnoticed.
+    //   - "denied": non-network classification; sandbox always denies.
+    let network = match (config.network, analysis.network) {
+        (ShellSandboxNetworkPolicy::AllowWhenApproved, true) => "allowed_approved",
+        (ShellSandboxNetworkPolicy::DenyByDefault, true) => "denied_classified",
         _ => "denied",
     };
 
@@ -4103,7 +4476,7 @@ fn prepare_shell_sandbox_plan(
                 program: "/usr/bin/sandbox-exec".to_string(),
                 args: vec![
                     "-p".to_string(),
-                    macos_shell_sandbox_profile(root, config, network == "denied"),
+                    macos_shell_sandbox_profile(root, config, network != "denied"),
                     "sh".to_string(),
                     "-lc".to_string(),
                     command.to_string(),
@@ -4123,14 +4496,33 @@ fn prepare_shell_sandbox_plan(
 
     #[cfg(target_os = "linux")]
     {
-        return Ok(ShellSandboxPlan {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
-            backend: "linux-direct-syscalls",
-            mode: config.mode.as_str(),
-            network,
-            required,
-        });
+        // Probe whether unshare can actually be applied as the current
+        // user. If the kernel forbids it (e.g. unprivileged_userns_clone=0
+        // or seccomp policy in the container), required mode must fail
+        // closed at sandbox-prepare time rather than silently exit 1
+        // after fork.
+        if !linux_unshare_supported() {
+            if required {
+                return Err(format!(
+                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) failed",
+                    if network == "denied" {
+                        " |CLONE_NEWNET"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            // best_effort: fall through to a direct ShellSandboxPlan below.
+        } else {
+            return Ok(ShellSandboxPlan {
+                program: "sh".to_string(),
+                args: vec!["-lc".to_string(), command.to_string()],
+                backend: "linux-direct-syscalls",
+                mode: config.mode.as_str(),
+                network,
+                required,
+            });
+        }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -4150,20 +4542,42 @@ fn prepare_shell_sandbox_plan(
 fn macos_shell_sandbox_profile(
     root: &Path,
     config: &ShellSandboxConfig,
-    deny_network: bool,
+    allow_network: bool,
 ) -> String {
-    let mut profile = String::from("(version 1)\n(allow default)\n");
-    if deny_network {
-        profile.push_str("(deny network*)\n");
-    }
-    profile.push_str("(deny file-write*\n  (require-all\n");
-    for path in shell_writable_roots(root) {
+    let mut profile = String::from("(version 1)\n(deny default)\n");
+    // Process-level capabilities every build/run/test needs.
+    profile.push_str("(allow process-exec)\n");
+    profile.push_str("(allow process-fork)\n");
+    profile.push_str("(allow signal (target self))\n");
+    profile.push_str("(allow sysctl-read)\n");
+    profile.push_str("(allow mach-lookup)\n");
+    profile.push_str("(allow ipc-posix-shm)\n");
+    profile.push_str("(allow iokit-open)\n");
+    profile.push_str("(allow system-socket)\n");
+    profile.push_str("(allow file-read-metadata)\n");
+    // Reads from system / toolchain prefixes: required so compilers,
+    // shells, dynamic linker, and certificate stores can do their job.
+    let mut read_roots = macos_read_roots();
+    read_roots.sort();
+    read_roots.dedup();
+    for path in read_roots {
         profile.push_str(&format!(
-            "    (require-not (subpath {}))\n",
+            "(allow file-read* (subpath {}))\n",
             sandbox_profile_string(&path.display().to_string())
         ));
     }
-    profile.push_str("  ))\n");
+    // Read+write inside the workspace, tmp dirs, and toolchain caches.
+    let mut write_roots = shell_writable_roots(root);
+    write_roots.sort();
+    write_roots.dedup();
+    for path in write_roots {
+        let escaped = sandbox_profile_string(&path.display().to_string());
+        profile.push_str(&format!("(allow file-read* (subpath {escaped}))\n"));
+        profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+    }
+    // Sensitive paths get an EXPLICIT deny on top of the default deny so
+    // even if a future allow rule widens reads, these subpaths stay
+    // blocked.
     let mut denied_paths = sensitive_absolute_paths(root, config);
     denied_paths.sort();
     denied_paths.dedup();
@@ -4173,7 +4587,55 @@ fn macos_shell_sandbox_profile(
             sandbox_profile_string(&path.display().to_string())
         ));
     }
+    if allow_network {
+        profile.push_str("(allow network*)\n");
+    } else {
+        // The kernel still expects an explicit allow for AF_UNIX so that
+        // local sockets (DNS resolver shared memory, IPC) work; only the
+        // network-family connections are denied by default.
+        profile.push_str("(allow network* (local unix))\n");
+        profile.push_str("(allow network-inbound (local unix))\n");
+    }
     profile
+}
+
+/// Read-only roots every shell needs to look at: system libraries, the
+/// dynamic linker, certificate stores, the toolchain prefix, and the user's
+/// rustup / cargo prefixes. We add the prefixes as reads here AND as
+/// writable roots below so cargo can read its registry index even when
+/// not invoked under `cargo build`.
+#[cfg(target_os = "macos")]
+fn macos_read_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/private/etc",
+        "/private/var/db",
+        "/private/var/folders",
+        "/opt",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    // Toolchain prefixes the user may have configured.
+    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    // Default toolchain locations under $HOME.
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
+    }
+    roots
 }
 
 #[cfg(target_os = "macos")]
@@ -4182,11 +4644,19 @@ fn shell_writable_roots(root: &Path) -> Vec<PathBuf> {
         root.to_path_buf(),
         PathBuf::from("/tmp"),
         PathBuf::from("/private/tmp"),
+        PathBuf::from("/private/var/folders"),
     ];
-    for name in ["TMPDIR", "TEMP", "TMP"] {
+    for name in ["TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME"] {
         if let Some(path) = env::var_os(name).map(PathBuf::from) {
             roots.push(path);
         }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        // The toolchain writes through `cargo build` / `cargo test` etc.;
+        // adding these by default avoids breaking the canonical use case
+        // when `mode = "required"`.
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
     }
     roots.sort();
     roots.dedup();
@@ -4234,26 +4704,154 @@ fn sandbox_profile_string(value: &str) -> String {
     out
 }
 
+/// Check whether the command text references any configured sensitive path
+/// pattern. The matcher splits the command into tokens (respecting quotes),
+/// normalises each token (expands `~` and `$HOME` against the parent env,
+/// collapses `\\` to `/`), and then tests each token against each pattern's
+/// base. This avoids the original implementation's substring-in-haystack
+/// problem (where `.env*` matched any string containing `.env`, including
+/// unrelated package or option names like `.environment`), while still
+/// catching common bypasses like `$HOME/.ssh/id_rsa` and `~/.aws/config`.
 fn shell_command_references_sensitive_path(command: &str, patterns: &[String]) -> Option<String> {
-    let normalized = command.replace('\\', "/");
-    patterns.iter().find_map(|pattern| {
-        let base = sensitive_pattern_base(pattern);
-        if !base.is_empty() && normalized.contains(&base) {
-            Some(pattern.clone())
-        } else {
-            None
+    let tokens = tokenize_shell_segment(command);
+    let home = env::var_os("HOME").map(|s| s.to_string_lossy().into_owned());
+    for raw in &tokens {
+        let stripped = dequote_token(raw);
+        let normalized = normalize_path_token(stripped, home.as_deref());
+        for pattern in patterns {
+            let base = sensitive_pattern_base(pattern);
+            if !base.is_empty() && token_contains_sensitive_base(&normalized, &base) {
+                return Some(pattern.clone());
+            }
         }
-    })
+    }
+    // Backstop: also scan the raw command (with backslashes normalised)
+    // for unquoted occurrences of each pattern base preceded by a path
+    // separator. This catches uses like `tar --exclude='*.cache' .ssh/`
+    // and unquoted `cat ~/.ssh/id_rsa`.
+    let normalized_command = command.replace('\\', "/");
+    for pattern in patterns {
+        let base = sensitive_pattern_base(pattern);
+        if base.is_empty() {
+            continue;
+        }
+        if normalized_command_references_base(&normalized_command, &base) {
+            return Some(pattern.clone());
+        }
+    }
+    None
 }
 
+/// Normalises a path-like token for sensitive-path matching:
+///   - replaces backslashes with `/`,
+///   - expands a leading `~/` or `~` against `$HOME`,
+///   - expands a leading `$HOME` or `${HOME}` against `$HOME`.
+fn normalize_path_token(token: &str, home: Option<&str>) -> String {
+    let token = token.replace('\\', "/");
+    if let Some(home) = home {
+        if let Some(rest) = token.strip_prefix("$HOME/") {
+            return format!("{home}/{rest}");
+        }
+        if token == "$HOME" {
+            return home.to_string();
+        }
+        if let Some(rest) = token.strip_prefix("${HOME}/") {
+            return format!("{home}/{rest}");
+        }
+        if token == "${HOME}" {
+            return home.to_string();
+        }
+        if let Some(rest) = token.strip_prefix("~/") {
+            return format!("{home}/{rest}");
+        }
+        if token == "~" {
+            return home.to_string();
+        }
+    }
+    token
+}
+
+/// Token-side check: does `token` reference `base` either as a path
+/// segment or as an exact match? Avoids matching `.env` inside
+/// `.environment` or `Cargo.envelope`.
+fn token_contains_sensitive_base(token: &str, base: &str) -> bool {
+    if token == base {
+        return true;
+    }
+    // Strip leading `/` so absolute and relative both compare segment-wise.
+    let token = token.trim_start_matches('/');
+    let base = base.trim_end_matches('/');
+    for piece in token.split('/') {
+        if piece == base {
+            return true;
+        }
+        // Trailing wildcard support for patterns like `.env*` → base
+        // `.env`: require the segment to begin with `.env.` or `.env-`
+        // or be exactly `.env`, not match `.environment`.
+        if let Some(rest) = piece.strip_prefix(base) {
+            if rest.is_empty()
+                || rest.starts_with('.')
+                || rest.starts_with('-')
+                || rest.starts_with('_')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Command-side check: matches `base` when preceded by a path separator
+/// (or appearing at the start of a token). Handles unquoted uses like
+/// `tar -czf out.tgz ~/.ssh` even when the tokenizer would otherwise
+/// have split `~/.ssh` away from the path matcher.
+fn normalized_command_references_base(command: &str, base: &str) -> bool {
+    let needles = [format!("/{base}"), format!(" {base}"), format!("\t{base}")];
+    for needle in &needles {
+        if let Some(idx) = command.find(needle.as_str()) {
+            let next = command[idx + needle.len()..].chars().next();
+            if next
+                .map(|c| matches!(c, '/' | ' ' | '\t' | '\0' | '"' | '\''))
+                .unwrap_or(true)
+            {
+                return true;
+            }
+            // Allow segment-style follow-ups (e.g. `.env.production`).
+            if next.map(|c| matches!(c, '.' | '-' | '_')).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Recognises the on-process signals that the sandbox backend itself
+/// failed to apply (as opposed to the user's command failing). Used in
+/// `mode = "required"` to deny the call rather than silently letting it
+/// run unsandboxed.
 fn shell_sandbox_runtime_unavailable(
     plan: &ShellSandboxPlan,
     exit_code: Option<i32>,
     stderr: &str,
 ) -> bool {
-    plan.backend == "macos-sandbox-exec"
-        && exit_code == Some(71)
-        && stderr.contains("sandbox_apply")
+    match plan.backend {
+        "macos-sandbox-exec" => {
+            // sandbox-exec returns 71 with a `sandbox_apply` message when
+            // the kernel refuses to apply the SBPL profile.
+            exit_code == Some(71) && stderr.contains("sandbox_apply")
+        }
+        "linux-direct-syscalls" => {
+            // The pre_exec hook returns Err with an EPERM/EINVAL when
+            // unshare fails after a successful spawn handshake. Tokio's
+            // child reports this as a Unix `_exit(1)`/wait status with
+            // empty stdout/stderr; we can't distinguish that perfectly
+            // from a legitimate `exit 1`. Fall back to a probe: re-check
+            // the supported-flag at the parent level, and report
+            // unavailable if the kernel no longer supports unshare.
+            !linux_unshare_supported() && exit_code == Some(1) && stderr.is_empty()
+        }
+        _ => false,
+    }
 }
 
 fn configure_shell_process_group(command: &mut Command) {
@@ -4323,6 +4921,33 @@ fn linux_unshare_pre_exec(deny_network: bool) -> std::io::Result<()> {
 fn linux_write_proc(path: &str, contents: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.write_all(contents)
+}
+
+/// Probe whether the kernel currently permits unprivileged user-namespace
+/// creation. We do this from the parent process by reading the well-known
+/// sysctl knob; this is the same signal that controls whether the eventual
+/// child `unshare(CLONE_NEWUSER|...)` will succeed. If the sysctl is
+/// missing (older kernels, namespaces unsupported altogether) we treat
+/// that as "not supported" so required mode denies pre-spawn instead of
+/// silently failing inside the child.
+#[cfg(target_os = "linux")]
+fn linux_unshare_supported() -> bool {
+    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
+        if value.trim() == "0" {
+            return false;
+        }
+    }
+    // /proc/self/ns/user existing is necessary for the syscall to do
+    // anything useful; this also covers WSL1 (no namespaces).
+    std::path::Path::new("/proc/self/ns/user").exists()
+}
+
+/// Stub for non-Linux compilation so the macOS / cross-compile builds keep
+/// working without `#[cfg]` everywhere in callers.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+fn linux_unshare_supported() -> bool {
+    false
 }
 
 async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {
