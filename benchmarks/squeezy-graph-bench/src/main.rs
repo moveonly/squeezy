@@ -147,6 +147,8 @@ struct AccuracySetReport {
 struct PythonOracleReport {
     oracle_ms: u128,
     status: String,
+    oracle_unparseable_files: usize,
+    oracle_unparseable_examples: Vec<String>,
     symbols: AccuracySetReport,
     limitations: Vec<String>,
 }
@@ -538,24 +540,43 @@ fn empty_accuracy(status: &str) -> AccuracyReport {
 }
 
 fn collect_python_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<PythonOracleReport> {
-    let squeezy_symbols = collect_squeezy_symbol_scan(graph);
     let started = Instant::now();
     let oracle = collect_python_ast_symbol_scan(root)?;
     let oracle_ms = started.elapsed().as_millis();
-    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle);
+    let unparseable_files = oracle.unparseable_files.into_iter().collect::<BTreeSet<_>>();
+    let squeezy_symbols = collect_squeezy_symbol_scan_excluding_files(graph, &unparseable_files);
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle.symbols);
+    let oracle_unparseable_examples = unparseable_files.iter().take(10).cloned().collect::<Vec<_>>();
+    let oracle_unparseable_files = unparseable_files.len();
 
     Ok(PythonOracleReport {
         oracle_ms,
-        status: "CPython ast oracle succeeded".to_string(),
+        status: if oracle_unparseable_files == 0 {
+            "CPython ast oracle succeeded".to_string()
+        } else {
+            format!(
+                "CPython ast oracle succeeded with {oracle_unparseable_files} unparseable files excluded from symbol FP accounting"
+            )
+        },
+        oracle_unparseable_files,
+        oracle_unparseable_examples,
         symbols,
         limitations: vec![
             "The Python oracle uses CPython ast for declarations and does not execute imports, infer dynamic attributes, or model metaclass-generated members.".to_string(),
             "Symbol comparison is file/name/kind based so it tracks declaration loss without pretending to prove runtime dispatch.".to_string(),
+            "Python files that CPython ast cannot parse are reported as oracle_unparseable and excluded from Squeezy false-positive accounting; tree-sitter recovery remains useful for production editing workflows.".to_string(),
         ],
     })
 }
 
 fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
+    collect_squeezy_symbol_scan_excluding_files(graph, &BTreeSet::new())
+}
+
+fn collect_squeezy_symbol_scan_excluding_files(
+    graph: &SemanticGraph,
+    excluded_files: &BTreeSet<String>,
+) -> SymbolScan {
     let mut scan = SymbolScan::default();
     for symbol in graph.symbols.values() {
         scan.raw_total += 1;
@@ -565,6 +586,10 @@ fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
                     increment(&mut scan.excluded_by_kind, "MissingFile");
                     continue;
                 };
+                if excluded_files.contains(&file.relative_path) {
+                    increment(&mut scan.excluded_by_kind, "OracleUnparseableFile");
+                    continue;
+                }
                 increment_symbol(
                     &mut scan.counts,
                     SymbolKey {
@@ -580,7 +605,19 @@ fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     scan
 }
 
-fn collect_python_ast_symbol_scan(root: &Path) -> Result<SymbolScan> {
+#[derive(Debug, Deserialize)]
+struct PythonAstOracleOutput {
+    rows: Vec<[String; 3]>,
+    unparseable_files: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PythonAstSymbolScan {
+    symbols: SymbolScan,
+    unparseable_files: Vec<String>,
+}
+
+fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSymbolScan> {
     let output = Command::new("python3")
         .arg("-c")
         .arg(PYTHON_AST_ORACLE)
@@ -593,10 +630,10 @@ fn collect_python_ast_symbol_scan(root: &Path) -> Result<SymbolScan> {
             String::from_utf8_lossy(&output.stderr)
         )));
     }
-    let rows: Vec<[String; 3]> = serde_json::from_slice(&output.stdout)
+    let output: PythonAstOracleOutput = serde_json::from_slice(&output.stdout)
         .map_err(|err| SqueezyError::Graph(format!("invalid Python AST oracle JSON: {err}")))?;
     let mut scan = SymbolScan::default();
-    for [file, kind, name] in rows {
+    for [file, kind, name] in output.rows {
         scan.raw_total += 1;
         increment_symbol(
             &mut scan.counts,
@@ -607,7 +644,10 @@ fn collect_python_ast_symbol_scan(root: &Path) -> Result<SymbolScan> {
             },
         );
     }
-    Ok(scan)
+    Ok(PythonAstSymbolScan {
+        symbols: scan,
+        unparseable_files: output.unparseable_files,
+    })
 }
 
 const PYTHON_AST_ORACLE: &str = r#"
@@ -618,6 +658,7 @@ import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
 rows = []
+unparseable_files = []
 
 class Visitor(ast.NodeVisitor):
     def __init__(self, rel):
@@ -644,10 +685,11 @@ for path in sorted(root.rglob("*.py")):
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (SyntaxError, UnicodeDecodeError):
+        unparseable_files.append(rel)
         continue
     Visitor(rel).visit(tree)
 
-print(json.dumps(rows))
+print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
 "#;
 
 fn collect_rust_analyzer_symbol_scan(graph: &SemanticGraph) -> (SymbolScan, String) {
@@ -2215,7 +2257,7 @@ fn print_summary(report: &BenchmarkReport) {
     print_navigation_summary("fixture", &report.accuracy.navigation);
     if let Some(python) = &report.python_oracle {
         println!(
-            "python_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}",
+            "python_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={} oracle_unparseable={}",
             python.symbols.true_positive,
             python.symbols.false_positive,
             python.symbols.false_negative,
@@ -2223,7 +2265,8 @@ fn print_summary(report: &BenchmarkReport) {
             python.symbols.recall,
             python.symbols.rust_analyzer_total,
             python.symbols.squeezy_total,
-            format!("{}ms", python.oracle_ms)
+            format!("{}ms", python.oracle_ms),
+            python.oracle_unparseable_files
         );
     }
     for query in &report.queries {

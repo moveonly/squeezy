@@ -109,9 +109,29 @@ fn crawler_skips_roots_without_code_signals() {
 }
 
 #[test]
-fn readme_is_enough_signal_for_non_git_roots() {
-    let root = temp_root("readme_is_enough_signal_for_non_git_roots");
+fn readme_alone_is_only_a_weak_signal_for_non_git_roots() {
+    let root = temp_root("readme_alone_is_only_a_weak_signal_for_non_git_roots");
     fs::write(root.join("README.md"), "# project\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(!snapshot.indexing_decision.should_index);
+    assert!(snapshot.files.is_empty());
+    assert!(
+        snapshot
+            .indexing_decision
+            .positive_signals
+            .contains(&"README at workspace root".to_string())
+    );
+}
+
+#[test]
+fn readme_plus_source_is_enough_signal_for_non_git_roots() {
+    let root = temp_root("readme_plus_source_is_enough_signal_for_non_git_roots");
+    fs::write(root.join("README.md"), "# project\n").unwrap();
+    fs::write(root.join("main.py"), "def main():\n    pass\n").unwrap();
 
     let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
         .crawl(&root)
@@ -156,6 +176,87 @@ fn shallow_common_source_files_are_indexing_signals() {
 }
 
 #[test]
+fn depth_two_source_files_are_indexing_signals() {
+    let root = temp_root("depth_two_source_files_are_indexing_signals");
+    fs::create_dir_all(root.join("src").join("commands")).unwrap();
+    fs::write(
+        root.join("src").join("commands").join("main.rs"),
+        "fn main() {}\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+    assert!(
+        snapshot
+            .indexing_decision
+            .positive_signals
+            .contains(&"shallow Rust source".to_string())
+    );
+}
+
+#[test]
+fn common_code_directories_are_indexing_signals_when_they_contain_source() {
+    let root = temp_root("common_code_directories_are_indexing_signals");
+    fs::create_dir_all(root.join("app")).unwrap();
+    fs::write(root.join("app").join("index.ts"), "export {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+    assert!(
+        snapshot
+            .indexing_decision
+            .positive_signals
+            .contains(&"code directory app contains source".to_string())
+    );
+}
+
+#[test]
+fn common_vcs_markers_are_indexing_signals() {
+    for marker in [".git", ".jj", ".hg", ".svn"] {
+        let root = temp_root(&format!("vcs-marker-{marker}"));
+        fs::create_dir_all(root.join(marker)).unwrap();
+
+        let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+            .crawl(&root)
+            .unwrap();
+
+        assert!(snapshot.indexing_decision.should_index, "{marker}");
+        assert!(
+            snapshot
+                .indexing_decision
+                .positive_signals
+                .iter()
+                .any(|signal| signal.contains(marker)),
+            "{marker}: {:?}",
+            snapshot.indexing_decision.positive_signals
+        );
+    }
+}
+
+#[test]
+fn git_worktree_file_is_an_indexing_signal() {
+    let root = temp_root("git_worktree_file_is_an_indexing_signal");
+    fs::write(
+        root.join(".git"),
+        "gitdir: ../repo/.git/worktrees/example\n",
+    )
+    .unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+}
+
+#[test]
 fn common_project_config_is_an_indexing_signal() {
     let root = temp_root("common_project_config_is_an_indexing_signal");
     fs::write(root.join("package.json"), "{}\n").unwrap();
@@ -170,6 +271,56 @@ fn common_project_config_is_an_indexing_signal() {
             .indexing_decision
             .positive_signals
             .contains(&"project marker package.json".to_string())
+    );
+}
+
+#[test]
+fn extended_project_markers_are_indexing_signals() {
+    for marker in [
+        "Dockerfile",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "tox.ini",
+        "noxfile.py",
+        "BUILD.bazel",
+    ] {
+        let root = temp_root(&format!("project-marker-{marker}"));
+        fs::write(root.join(marker), "\n").unwrap();
+
+        let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+            .crawl(&root)
+            .unwrap();
+
+        assert!(snapshot.indexing_decision.should_index, "{marker}");
+        assert!(
+            snapshot
+                .indexing_decision
+                .positive_signals
+                .contains(&format!("project marker {marker}")),
+            "{marker}: {:?}",
+            snapshot.indexing_decision.positive_signals
+        );
+    }
+}
+
+#[test]
+fn personal_folder_name_is_a_negative_but_not_blocking_signal() {
+    let parent = temp_root("personal_folder_name_is_a_negative_signal");
+    let root = parent.join("Downloads");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("main.rs"), "fn main() {}\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert!(snapshot.indexing_decision.should_index);
+    assert!(
+        snapshot
+            .indexing_decision
+            .negative_signals
+            .contains(&"workspace root looks like a personal folder".to_string())
     );
 }
 

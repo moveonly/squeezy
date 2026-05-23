@@ -8,6 +8,8 @@ use ignore::WalkBuilder;
 use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, SqueezyError};
 
 pub const CRATE_NAME: &str = "squeezy-workspace";
+const SOURCE_SCAN_MAX_DEPTH: usize = 2;
+const SOURCE_SCAN_MAX_ENTRIES: usize = 1_000;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -230,30 +232,47 @@ pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
         negative_signals.push("workspace root is a protected system directory".to_string());
     }
 
-    if root.join(".git").exists() || ancestor_contains_git(root) {
-        positive_signals.push("git repository marker".to_string());
+    let mut has_strong_positive = false;
+
+    if let Some(marker) = vcs_marker_signal(root) {
+        has_strong_positive = true;
+        positive_signals.push(marker);
     }
     if has_readme(root) {
         positive_signals.push("README at workspace root".to_string());
     }
     for marker in code_project_markers(root) {
+        has_strong_positive = true;
         positive_signals.push(marker);
     }
     for source in shallow_source_markers(root) {
+        has_strong_positive = true;
         positive_signals.push(source);
+    }
+    for code_dir in code_directory_markers(root) {
+        has_strong_positive = true;
+        positive_signals.push(code_dir);
+    }
+    if is_personal_folder(root) {
+        negative_signals.push("workspace root looks like a personal folder".to_string());
     }
 
     let blocked_by_root = negative_signals
         .iter()
         .any(|signal| signal.contains("home directory") || signal.contains("protected system"));
-    let should_index = !blocked_by_root && !positive_signals.is_empty();
+    let should_index = !blocked_by_root && has_strong_positive;
     let reason = if should_index {
         format!("indexing allowed: {}", positive_signals.join(", "))
     } else if blocked_by_root {
         format!("indexing skipped: {}", negative_signals.join(", "))
-    } else {
-        "indexing skipped: no git marker, README, project config, or shallow source file"
+    } else if positive_signals
+        .iter()
+        .any(|signal| signal.contains("README"))
+    {
+        "indexing skipped: README alone is a weak signal without repository, project config, or shallow source files"
             .to_string()
+    } else {
+        "indexing skipped: no VCS marker, project config, or shallow source file".to_string()
     };
 
     IndexingDecision {
@@ -293,11 +312,37 @@ fn is_protected_root(root: &Path) -> bool {
     PROTECTED.iter().any(|path| Path::new(path) == root)
 }
 
-fn ancestor_contains_git(root: &Path) -> bool {
-    root.ancestors()
-        .skip(1)
-        .take(4)
-        .any(|ancestor| ancestor.join(".git").exists())
+fn is_personal_folder(root: &Path) -> bool {
+    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "desktop" | "documents" | "downloads"
+    )
+}
+
+fn vcs_marker_signal(root: &Path) -> Option<String> {
+    for (index, ancestor) in root.ancestors().enumerate() {
+        if index > 0 && (is_home_dir(ancestor) || is_protected_root(ancestor)) {
+            break;
+        }
+        if let Some(marker) = vcs_marker_at(ancestor) {
+            let location = if index == 0 {
+                "workspace root"
+            } else {
+                "workspace ancestor"
+            };
+            return Some(format!("VCS marker {marker} at {location}"));
+        }
+    }
+    None
+}
+
+fn vcs_marker_at(path: &Path) -> Option<&'static str> {
+    [".git", ".jj", ".hg", ".svn"]
+        .into_iter()
+        .find(|marker| path.join(marker).exists())
 }
 
 fn has_readme(root: &Path) -> bool {
@@ -321,49 +366,73 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     [
         "Cargo.toml",
         "CMakeLists.txt",
+        "Dockerfile",
+        "Justfile",
         "Makefile",
+        "MODULE.bazel",
+        "Taskfile.yml",
+        "WORKSPACE",
         "build.gradle",
         "build.gradle.kts",
         "composer.json",
+        "docker-compose.yml",
         "go.mod",
         "gradlew",
+        "noxfile.py",
         "package.json",
+        "package-lock.json",
         "pom.xml",
+        "pnpm-lock.yaml",
         "pyproject.toml",
         "requirements.txt",
         "setup.cfg",
         "setup.py",
+        "tox.ini",
         "tsconfig.json",
+        "yarn.lock",
+        ".github/workflows",
+        "BUILD",
+        "BUILD.bazel",
         "Pipfile",
         "poetry.lock",
         "uv.lock",
     ]
     .into_iter()
-    .filter(|marker| root.join(marker).is_file())
+    .filter(|marker| root.join(marker).exists())
     .map(|marker| format!("project marker {marker}"))
     .collect()
 }
 
 fn shallow_source_markers(root: &Path) -> Vec<String> {
     let mut signals = Vec::new();
-    collect_source_markers(root, 0, &mut signals);
+    let mut visited = 0;
+    collect_source_markers(root, 0, &mut visited, &mut signals);
     signals.sort();
     signals.dedup();
     signals
 }
 
-fn collect_source_markers(dir: &Path, depth: usize, signals: &mut Vec<String>) {
-    if depth > 1 {
+fn collect_source_markers(
+    dir: &Path,
+    depth: usize,
+    visited: &mut usize,
+    signals: &mut Vec<String>,
+) {
+    if depth > SOURCE_SCAN_MAX_DEPTH || *visited >= SOURCE_SCAN_MAX_ENTRIES {
         return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if *visited >= SOURCE_SCAN_MAX_ENTRIES {
+            return;
+        }
+        *visited += 1;
         let path = entry.path();
         if path.is_dir() {
-            if depth == 0 {
-                collect_source_markers(&path, depth + 1, signals);
+            if depth < SOURCE_SCAN_MAX_DEPTH && should_scan_source_dir(&path) {
+                collect_source_markers(&path, depth + 1, visited, signals);
             }
             continue;
         }
@@ -377,6 +446,36 @@ fn collect_source_markers(dir: &Path, depth: usize, signals: &mut Vec<String>) {
             }
         }
     }
+}
+
+fn code_directory_markers(root: &Path) -> Vec<String> {
+    [
+        "app", "cmd", "crates", "include", "internal", "lib", "packages", "pkg", "src",
+    ]
+    .into_iter()
+    .filter(|name| {
+        let path = root.join(name);
+        path.is_dir() && directory_contains_code(&path)
+    })
+    .map(|name| format!("code directory {name} contains source"))
+    .collect()
+}
+
+fn directory_contains_code(dir: &Path) -> bool {
+    let mut signals = Vec::new();
+    let mut visited = 0;
+    collect_source_markers(dir, SOURCE_SCAN_MAX_DEPTH, &mut visited, &mut signals);
+    !signals.is_empty()
+}
+
+fn should_scan_source_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    !matches!(
+        name,
+        ".git" | ".hg" | ".jj" | ".svn" | "__pycache__" | "node_modules" | "target" | "vendor"
+    )
 }
 
 fn code_extension_signal(path: &Path) -> Option<String> {

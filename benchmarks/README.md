@@ -117,6 +117,10 @@ compares class/function/method declarations against Squeezy's tree-sitter graph.
 The oracle intentionally avoids executing user code; it is slower and more
 accurate for declaration discovery than the production parser, but it does not
 model dynamic attributes, metaclasses, import side effects, or runtime dispatch.
+Files that CPython `ast` cannot parse are reported as `oracle_unparseable` and
+excluded from Squeezy false-positive accounting so whole-repo fixture corpora do
+not turn tree-sitter recovery from broken or future-syntax files into false
+parser defects.
 
 ## Local Results
 
@@ -196,4 +200,5 @@ roots with the fixture speed gate disabled so external-corpus variance is
 reported rather than blocking the run. The full tier intentionally avoids whole
 repository roots because formatter snapshots, parser fixtures, and future-syntax
 test corpora can contain Python files that tree-sitter can recover from but
-CPython `ast` rejects as non-modules.
+CPython `ast` rejects as non-modules. If such files appear anyway, the report
+counts them as `oracle_unparseable` instead of Squeezy false positives.

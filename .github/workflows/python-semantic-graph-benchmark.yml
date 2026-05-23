@@ -115,6 +115,11 @@ jobs:
                       f"- Python oracle symbols: TP={acc['true_positive']} FP={acc['false_positive']} FN={acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
                       file=out,
                   )
+                  if oracle.get("oracle_unparseable_files", 0):
+                      print(
+                          f"- Python oracle unparseable files: {oracle['oracle_unparseable_files']}",
+                          file=out,
+                      )
                   if report["queries"]:
                       print("", file=out)
                       print("| Query | Actual | Missing | Extras |", file=out)

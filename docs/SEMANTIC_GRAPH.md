@@ -26,14 +26,20 @@ more than it does.
 ## Heuristics
 
 Workspace indexing starts with a defensive root decision before any recursive
-walk. A `.git` marker, root `README`, common project config, or shallow source
-file is a positive signal. Source signals include Rust, Python, Java, C#, C/C++,
-JavaScript, TypeScript, Go, Ruby, PHP, Swift, Kotlin, Scala, shell, and common
-web files. The user's home directory and protected system roots such as `/`,
-`/System`, `/Library`, `/Users`, `/usr`, and `/var` are negative signals. If
-there is no positive signal, or the root is a blocked system/home root, Squeezy
-returns an empty graph with the indexing decision instead of walking a likely
-non-code or dangerous directory.
+walk. VCS markers such as `.git`, `.jj`, `.hg`, and `.svn`, common project
+config, and shallow source files are strong positive signals. A root `README` is
+recorded as a weak positive signal, but is not enough on its own. Source signals
+scan to depth two with a small entry cap and include Rust, Python, Java, C#,
+C/C++, JavaScript, TypeScript, Go, Ruby, PHP, Swift, Kotlin, Scala, shell, and
+common web files. Common code directories such as `src`, `lib`, `app`,
+`packages`, `crates`, `cmd`, `pkg`, `internal`, and `include` are positive only
+when they contain shallow source files. The user's home directory and protected
+system roots such as `/`, `/System`, `/Library`, `/Users`, `/usr`, and `/var`
+are blocking negative signals. Personal folder names such as `Desktop`,
+`Documents`, and `Downloads` are weak negative signals, but real project markers
+can override them. If there is no strong positive signal, or the root is a
+blocked system/home root, Squeezy returns an empty graph with the indexing
+decision instead of walking a likely non-code or dangerous directory.
 
 - Direct calls resolve when the target is same-file, explicitly imported, or
   syntactically qualified as `Self::name`, `Type::name`, or `module::name` with
@@ -138,7 +144,10 @@ navigation tree-sitter-only.
 
 Python accuracy reporting uses the CPython `ast` oracle as the slower reference
 for class/function/method declaration discovery. It is benchmark-only and does
-not become a production dependency.
+not become a production dependency. Python files that CPython `ast` cannot parse
+are reported as `oracle_unparseable` and excluded from Squeezy false-positive
+accounting, because tree-sitter recovery is useful while editing broken or
+future-syntax code even when the oracle cannot treat that file as a module.
 
 Known misses must be documented in the query spec with a reason, for example
 macro expansion, trait dispatch, type inference, cfg, glob ambiguity, generated
