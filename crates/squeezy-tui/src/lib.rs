@@ -33,6 +33,8 @@ pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()
         }
     }
 
+    agent.flush_telemetry().await;
+
     Ok(())
 }
 
@@ -77,10 +79,16 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     });
                     break;
                 }
-                AgentEvent::Completed { message, cost, .. } => {
+                AgentEvent::Completed {
+                    message,
+                    cost,
+                    metrics,
+                    ..
+                } => {
                     app.transcript.push(message);
                     app.pending_assistant.clear();
                     app.cost = cost;
+                    app.metrics = metrics;
                     app.status = "ready".to_string();
                     app.turn_rx = None;
                     app.cancel = None;
@@ -256,10 +264,14 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} status={} in={} out={} cached={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} status={} tools={} read={} receipts={} denials={} in={} out={} cached={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.status,
+        app.metrics.tool_calls,
+        app.metrics.bytes_read,
+        app.metrics.receipt_stub_hits,
+        app.metrics.budget_denials,
         app.cost
             .input_tokens
             .map_or("-".to_string(), |value| value.to_string()),
@@ -281,6 +293,7 @@ struct TuiApp {
     pending_assistant: String,
     status: String,
     cost: squeezy_core::CostSnapshot,
+    metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
@@ -296,6 +309,7 @@ impl TuiApp {
             pending_assistant: String::new(),
             status: "ready".to_string(),
             cost: squeezy_core::CostSnapshot::default(),
+            metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
             cancel: None,
             pending_approval: None,

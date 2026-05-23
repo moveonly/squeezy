@@ -41,6 +41,12 @@ model-facing tool output compact enough to be useful.
 - **Provider tool calls.** The OpenAI Responses and Anthropic Messages providers
   expose documented function tools and feed tool outputs back into the model
   loop.
+- **Per-turn broker metrics.** Tool-call, read-byte, search-file, receipt-hit,
+  spill, denial, provider-token, cache, and estimated-cost counters are tracked
+  per turn and surfaced to the TUI/harness.
+- **Anonymous telemetry hooks.** Tool completions and turn aggregates emit typed
+  telemetry with sequence numbers, timings, statuses, and numeric cost counters.
+  Tool arguments, prompts, paths, commands, URLs, and content are not sent.
 
 ## Runtime Knobs
 
@@ -54,12 +60,17 @@ model-facing tool output compact enough to be useful.
   output budget for one tool round.
 - `SQUEEZY_TOOL_OUTPUT_RETENTION_DAYS` controls cleanup of stored tool-output
   handles.
+- `SQUEEZY_MAX_TOOL_CALLS_PER_TURN` controls the per-turn tool-call cap.
+- `SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN` controls the per-turn read-byte cap.
+- `SQUEEZY_MAX_SEARCH_FILES_PER_TURN` controls the per-turn search file-scan
+  cap.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
 - `SQUEEZY_EXA_MCP_URL` controls the MCP endpoint used by `websearch`. The
   default is `https://mcp.exa.ai/mcp`.
 - `SQUEEZY_EXA_API_KEY_ENV` names the environment variable read for the Exa API
   key. The default is `EXA_API_KEY`.
+- `SQUEEZY_TELEMETRY=off` disables anonymous product telemetry.
 
 ## Later Structural Savings
 

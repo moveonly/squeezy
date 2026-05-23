@@ -73,6 +73,11 @@ remain serial so output ordering and graph IDs stay deterministic. Small
 refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
+Graph build and refresh reports include duration, file counts, reparsed byte
+counts, symbol/edge counts, and Rust/supported/unsupported/unknown language
+distribution. Telemetry callers use these reports for one-shot graph build
+events and repeated graph refresh events without sending paths or source text.
+
 ## Traversal Surface
 
 The in-memory graph supports:

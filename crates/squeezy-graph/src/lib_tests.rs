@@ -76,6 +76,8 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     )
     .unwrap();
     assert!(!manager.graph().find_symbol_by_name("one").is_empty());
+    assert_eq!(manager.build_report().language.rust_files, 1);
+    assert_eq!(manager.build_report().language.supported_files, 1);
 
     thread::sleep(Duration::from_millis(2));
     fs::write(root.join("src").join("lib.rs"), "fn two() { beta(); }\n").unwrap();
@@ -84,6 +86,7 @@ fn graph_manager_refresh_replaces_changed_file_only() {
 
     assert!(report.refreshed);
     assert_eq!(report.reparsed_files, 1);
+    assert_eq!(report.language.rust_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
 }

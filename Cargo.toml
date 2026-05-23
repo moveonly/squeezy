@@ -9,6 +9,7 @@ members = [
     "crates/squeezy-parse",
     "crates/squeezy-rank",
     "crates/squeezy-store",
+    "crates/squeezy-telemetry",
     "crates/squeezy-tools",
     "crates/squeezy-tui",
     "crates/squeezy-workspace",
@@ -52,6 +53,7 @@ squeezy-graph = { path = "crates/squeezy-graph" }
 squeezy-harness = { path = "crates/squeezy-harness" }
 squeezy-llm = { path = "crates/squeezy-llm" }
 squeezy-parse = { path = "crates/squeezy-parse" }
+squeezy-telemetry = { path = "crates/squeezy-telemetry" }
 squeezy-tools = { path = "crates/squeezy-tools" }
 squeezy-tui = { path = "crates/squeezy-tui" }
 squeezy-workspace = { path = "crates/squeezy-workspace" }

@@ -22,6 +22,8 @@ Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
 
 Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
 
+Anonymous product telemetry is documented in [`TELEMETRY.md`](TELEMETRY.md).
+
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
 
 Platform support details live in `docs/PLATFORMS.md`.

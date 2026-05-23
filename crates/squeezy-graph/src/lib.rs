@@ -5,7 +5,8 @@ use std::{
 };
 
 use squeezy_core::{
-    Confidence, EdgeKind, FileId, Freshness, Provenance, Result, SourceSpan, SymbolId, SymbolKind,
+    Confidence, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result, SourceSpan,
+    SymbolId, SymbolKind,
 };
 use squeezy_parse::{
     BodyHit, BodyHitKind, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
@@ -1644,13 +1645,38 @@ impl Default for RefreshConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphBuildReport {
+    pub duration_ms: u128,
+    pub files_seen: usize,
+    pub parsed_files: usize,
+    pub unsupported_files: usize,
+    pub bytes_seen: u64,
+    pub language: LanguageReport,
+    pub stats: GraphStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshReport {
     pub refreshed: bool,
     pub changed_files: Vec<FileId>,
     pub removed_files: Vec<FileId>,
     pub reparsed_files: usize,
+    pub duration_ms: u128,
+    pub files_seen: usize,
+    pub bytes_seen: u64,
+    pub bytes_reparsed: u64,
+    pub language: LanguageReport,
+    pub stats: GraphStats,
     pub skipped_due_to_interval: bool,
     pub budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanguageReport {
+    pub rust_files: usize,
+    pub supported_files: usize,
+    pub unsupported_files: usize,
+    pub unknown_files: usize,
 }
 
 pub struct GraphManager {
@@ -1660,6 +1686,7 @@ pub struct GraphManager {
     graph: SemanticGraph,
     config: RefreshConfig,
     last_refresh: Instant,
+    build_report: GraphBuildReport,
     pending_changed_paths: HashSet<PathBuf>,
 }
 
@@ -1669,12 +1696,24 @@ impl GraphManager {
     }
 
     pub fn open_with_config(root: impl AsRef<Path>, config: RefreshConfig) -> Result<Self> {
+        let started = Instant::now();
         let root = root.as_ref().to_path_buf();
         let crawler = WorkspaceCrawler::new(CrawlOptions::default());
         let snapshot = crawler.crawl(&root)?;
         let mut parser = RustParser::new()?;
-        let (parsed, _) = parser.parse_records(&snapshot.files)?;
+        let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
+        let language = language_report(&snapshot.files);
+        let (parsed, parse_summary) = parser.parse_records(&snapshot.files)?;
         let graph = SemanticGraph::from_parsed(parsed);
+        let build_report = GraphBuildReport {
+            duration_ms: started.elapsed().as_millis(),
+            files_seen: snapshot.files.len(),
+            parsed_files: parse_summary.parsed_files,
+            unsupported_files: parse_summary.unsupported_files,
+            bytes_seen,
+            language,
+            stats: graph.stats(),
+        };
         Ok(Self {
             root,
             crawler,
@@ -1682,6 +1721,7 @@ impl GraphManager {
             graph,
             config,
             last_refresh: Instant::now(),
+            build_report,
             pending_changed_paths: HashSet::new(),
         })
     }
@@ -1692,6 +1732,10 @@ impl GraphManager {
 
     pub fn graph_mut(&mut self) -> &mut SemanticGraph {
         &mut self.graph
+    }
+
+    pub fn build_report(&self) -> &GraphBuildReport {
+        &self.build_report
     }
 
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {
@@ -1711,6 +1755,12 @@ impl GraphManager {
                 changed_files: Vec::new(),
                 removed_files: Vec::new(),
                 reparsed_files: 0,
+                duration_ms: 0,
+                files_seen: self.graph.files.len(),
+                bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
+                bytes_reparsed: 0,
+                language: language_report(self.graph.files.values()),
+                stats: self.graph.stats(),
                 skipped_due_to_interval: true,
                 budget_exhausted: false,
             });
@@ -1726,12 +1776,21 @@ impl GraphManager {
                 changed_files: Vec::new(),
                 removed_files: Vec::new(),
                 reparsed_files: 0,
+                duration_ms: started.elapsed().as_millis(),
+                files_seen: self.graph.files.len(),
+                bytes_seen: self.graph.files.values().map(|file| file.size_bytes).sum(),
+                bytes_reparsed: 0,
+                language: language_report(self.graph.files.values()),
+                stats: self.graph.stats(),
                 skipped_due_to_interval: true,
                 budget_exhausted: false,
             });
         }
 
         let snapshot = self.crawler.crawl(&self.root)?;
+        let files_seen = snapshot.files.len();
+        let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
+        let language = language_report(&snapshot.files);
         let current = snapshot
             .files
             .iter()
@@ -1758,6 +1817,7 @@ impl GraphManager {
         changed_records.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
 
         let mut reparsed_files = 0;
+        let mut bytes_reparsed = 0;
         let mut budget_exhausted = false;
         for file_id in &removed_files {
             self.graph.remove_file(file_id);
@@ -1773,6 +1833,7 @@ impl GraphManager {
                 budget_exhausted = true;
                 break;
             }
+            bytes_reparsed += record.size_bytes;
             let parsed = self.parser.parse_record(&record)?;
             parsed_files.push(parsed);
             reparsed_files += 1;
@@ -1788,10 +1849,31 @@ impl GraphManager {
             changed_files,
             removed_files,
             reparsed_files,
+            duration_ms: started.elapsed().as_millis(),
+            files_seen,
+            bytes_seen,
+            bytes_reparsed,
+            language,
+            stats: self.graph.stats(),
             skipped_due_to_interval: false,
             budget_exhausted,
         })
     }
+}
+
+fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> LanguageReport {
+    let mut report = LanguageReport::default();
+    for record in records {
+        match record.language {
+            LanguageKind::Rust => {
+                report.rust_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Unsupported => report.unsupported_files += 1,
+            LanguageKind::Unknown => report.unknown_files += 1,
+        }
+    }
+    report
 }
 
 fn file_symbol(file: &FileRecord) -> GraphSymbol {

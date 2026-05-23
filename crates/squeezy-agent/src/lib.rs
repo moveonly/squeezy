@@ -5,19 +5,25 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionScope, SqueezyError, TranscriptItem, TurnId,
+    AppConfig, CostSnapshot, PermissionMode, PermissionScope, SessionMetrics, SqueezyError,
+    TranscriptItem, TurnId, TurnMetrics,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec};
+use squeezy_telemetry::{
+    ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
+    ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
+};
 use squeezy_tools::{
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
     ToolStatus, WebToolConfig, sha256_hex,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const MAX_TOOL_ROUNDS: usize = 8;
@@ -27,6 +33,8 @@ pub struct Agent {
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
+    telemetry: TelemetryClient,
+    session_metrics: Arc<Mutex<SessionMetrics>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
 }
@@ -52,9 +60,11 @@ impl Agent {
                 .expect("current directory must be a valid tool root")
         });
         Self {
+            telemetry: TelemetryClient::from_config(&config),
             config,
             provider,
             tools,
+            session_metrics: Arc::new(Mutex::new(SessionMetrics::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
         }
@@ -62,6 +72,10 @@ impl Agent {
 
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
+    }
+
+    pub async fn flush_telemetry(&self) {
+        let _ = self.telemetry.flush().await;
     }
 
     pub fn start_turn(
@@ -73,6 +87,8 @@ impl Agent {
         let provider = self.provider.clone();
         let config = self.config.clone();
         let tools = self.tools.clone();
+        let telemetry = self.telemetry.clone();
+        let session_metrics = self.session_metrics.clone();
         let tool_specs = tools
             .specs()
             .into_iter()
@@ -98,6 +114,8 @@ impl Agent {
                 provider,
                 config,
                 tools,
+                telemetry: telemetry.clone(),
+                session_metrics,
                 tool_specs,
                 tx: tx.clone(),
                 cancel,
@@ -107,6 +125,7 @@ impl Agent {
             .await;
 
             if let Err(error) = outcome {
+                telemetry.spawn(TelemetryEvent::failure_seen(error_kind(&error)));
                 let _ = tx.send(AgentEvent::Failed { turn_id, error }).await;
             }
         });
@@ -120,6 +139,8 @@ struct TurnRuntime {
     provider: Arc<dyn LlmProvider>,
     config: AppConfig,
     tools: ToolRegistry,
+    telemetry: TelemetryClient,
+    session_metrics: Arc<Mutex<SessionMetrics>>,
     tool_specs: Vec<LlmToolSpec>,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
@@ -134,6 +155,7 @@ impl TurnRuntime {
         let mut assistant_text = String::new();
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::default();
+        let mut broker = CostBroker::new(&self.config);
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
@@ -201,6 +223,7 @@ impl TurnRuntime {
                         response_id: id,
                         cost,
                     }) => {
+                        broker.metrics.record_provider(&cost);
                         merge_cost(&mut total_cost, &cost);
                         response_id = id;
                         completed = true;
@@ -227,8 +250,10 @@ impl TurnRuntime {
                         message: TranscriptItem::assistant(assistant_text),
                         response_id: None,
                         cost: total_cost,
+                        metrics: broker.metrics.clone(),
                     })
                     .await;
+                self.finish_turn(&broker.metrics).await;
                 return Ok(());
             }
 
@@ -240,23 +265,28 @@ impl TurnRuntime {
                         message: TranscriptItem::assistant(assistant_text),
                         response_id,
                         cost: total_cost,
+                        metrics: broker.metrics.clone(),
                     })
                     .await;
+                self.finish_turn(&broker.metrics).await;
                 return Ok(());
             }
 
-            let results = execute_tool_calls(
-                self.turn_id,
-                tool_calls.clone(),
-                self.tools.clone(),
-                &self.config,
-                self.tx.clone(),
-                self.cancel.clone(),
-                self.approval_ids.clone(),
-            )
-            .await;
+            let tool_context = ToolExecutionContext {
+                turn_id: self.turn_id,
+                tools: self.tools.clone(),
+                config: self.config.clone(),
+                telemetry: self.telemetry.clone(),
+                tx: self.tx.clone(),
+                cancel: self.cancel.clone(),
+                approval_ids: self.approval_ids.clone(),
+            };
+            let results = execute_tool_calls(&tool_context, tool_calls.clone(), &mut broker).await;
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            for pending in &results {
+                broker.record_model_result(&pending.result);
+            }
             seen_tool_outputs.remember_results(&results);
 
             let outputs = results
@@ -285,38 +315,88 @@ impl TurnRuntime {
             "stopped after {MAX_TOOL_ROUNDS} tool rounds"
         )))
     }
+
+    async fn finish_turn(&self, metrics: &TurnMetrics) {
+        self.telemetry.spawn(TelemetryEvent::turn_completed(
+            &self.config,
+            self.turn_id.get(),
+            metrics.clone(),
+        ));
+        self.session_metrics.lock().await.merge_turn(metrics);
+    }
 }
 
-async fn execute_tool_calls(
+#[derive(Clone)]
+struct ToolExecutionContext {
     turn_id: TurnId,
-    calls: Vec<ToolCall>,
     tools: ToolRegistry,
-    config: &AppConfig,
+    config: AppConfig,
+    telemetry: TelemetryClient,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
+}
+
+async fn execute_tool_calls(
+    context: &ToolExecutionContext,
+    calls: Vec<ToolCall>,
+    broker: &mut CostBroker,
 ) -> Vec<ToolResult> {
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
+        let tool_sequence = match broker.reserve_call() {
+            Ok(tool_sequence) => tool_sequence,
+            Err((tool_sequence, reason)) => {
+                let result = budget_denied_result(call, reason);
+                emit_tool_telemetry(
+                    &context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolCallCompleted {
+                        turn_id: context.turn_id,
+                        result: result.clone(),
+                    })
+                    .await;
+                results[index] = Some(result);
+                continue;
+            }
+        };
         match permission_decision(
-            turn_id,
+            context.turn_id,
             call,
-            &tools,
-            config,
-            &tx,
-            &cancel,
-            approval_ids.clone(),
+            &context.tools,
+            &context.config,
+            &context.tx,
+            &context.cancel,
+            context.approval_ids.clone(),
         )
         .await
         {
-            ApprovalDecision::Approved => approved.push((index, call.clone())),
+            ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
-                let _ = tx
+                emit_tool_telemetry(
+                    &context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                let _ = context
+                    .tx
                     .send(AgentEvent::ToolCallCompleted {
-                        turn_id,
+                        turn_id: context.turn_id,
                         result: result.clone(),
                     })
                     .await;
@@ -324,9 +404,19 @@ async fn execute_tool_calls(
             }
             ApprovalDecision::Cancelled => {
                 let result = ToolResult::cancelled(call);
-                let _ = tx
+                emit_tool_telemetry(
+                    &context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                let _ = context
+                    .tx
                     .send(AgentEvent::ToolCallCompleted {
-                        turn_id,
+                        turn_id: context.turn_id,
                         result: result.clone(),
                     })
                     .await;
@@ -337,92 +427,275 @@ async fn execute_tool_calls(
     }
 
     let mut parallel_batch = Vec::new();
-    for (index, call) in approved {
-        if tools.is_parallel_safe(&call) {
-            parallel_batch.push((index, call));
+    for (index, call, tool_sequence) in approved {
+        if context.tools.is_parallel_safe(&call) {
+            if let Some(reason) = broker.deny_reason() {
+                let result = budget_denied_result(&call, reason);
+                emit_tool_telemetry(
+                    &context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                results[index] = Some(result);
+                continue;
+            }
+            parallel_batch.push((index, call, tool_sequence));
         } else {
-            flush_parallel_batch(
-                turn_id,
-                &tools,
-                &tx,
-                &cancel,
-                &mut results,
-                &mut parallel_batch,
-                config.max_parallel_tools,
-            )
-            .await;
-            let result =
-                run_one_tool(turn_id, tools.clone(), call, tx.clone(), cancel.clone()).await;
+            flush_parallel_batch(context, broker, &mut results, &mut parallel_batch).await;
+            if let Some(reason) = broker.deny_reason() {
+                let result = budget_denied_result(&call, reason);
+                emit_tool_telemetry(
+                    &context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                results[index] = Some(result);
+                continue;
+            }
+            let result = run_one_tool(context, tool_sequence, call).await;
+            broker.record_executed_result(&result);
             results[index] = Some(result);
         }
     }
-    flush_parallel_batch(
-        turn_id,
-        &tools,
-        &tx,
-        &cancel,
-        &mut results,
-        &mut parallel_batch,
-        config.max_parallel_tools,
-    )
-    .await;
+    flush_parallel_batch(context, broker, &mut results, &mut parallel_batch).await;
 
     results.into_iter().flatten().collect()
 }
 
 async fn flush_parallel_batch(
-    turn_id: TurnId,
-    tools: &ToolRegistry,
-    tx: &mpsc::Sender<AgentEvent>,
-    cancel: &CancellationToken,
+    context: &ToolExecutionContext,
+    broker: &mut CostBroker,
     results: &mut [Option<ToolResult>],
-    batch: &mut Vec<(usize, ToolCall)>,
-    max_parallel_tools: usize,
+    batch: &mut Vec<(usize, ToolCall, u64)>,
 ) {
     if batch.is_empty() {
         return;
     }
 
     let calls = std::mem::take(batch);
-    let completions = stream::iter(calls.into_iter().map(|(index, call)| {
-        let tools = tools.clone();
-        let tx = tx.clone();
-        let cancel = cancel.clone();
+    let completions = stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
+        let context = context.clone();
         async move {
-            let result = run_one_tool(turn_id, tools, call, tx, cancel).await;
+            let result = run_one_tool(&context, tool_sequence, call).await;
             (index, result)
         }
     }))
-    .buffer_unordered(max_parallel_tools.max(1))
+    .buffer_unordered(context.config.max_parallel_tools.max(1))
     .collect::<Vec<_>>()
     .await;
 
     for (index, result) in completions {
+        broker.record_executed_result(&result);
         results[index] = Some(result);
     }
 }
 
 async fn run_one_tool(
-    turn_id: TurnId,
-    tools: ToolRegistry,
+    context: &ToolExecutionContext,
+    tool_sequence: u64,
     call: ToolCall,
-    tx: mpsc::Sender<AgentEvent>,
-    cancel: CancellationToken,
 ) -> ToolResult {
-    let _ = tx
+    let _ = context
+        .tx
         .send(AgentEvent::ToolCallStarted {
-            turn_id,
+            turn_id: context.turn_id,
             call: call.clone(),
         })
         .await;
-    let result = tools.execute(call, cancel).await;
-    let _ = tx
+    let started = Instant::now();
+    let result = context.tools.execute(call, context.cancel.clone()).await;
+    emit_tool_telemetry(
+        &context.config,
+        &context.telemetry,
+        context.turn_id,
+        tool_sequence,
+        &result,
+        started.elapsed(),
+    );
+    let _ = context
+        .tx
         .send(AgentEvent::ToolCallCompleted {
-            turn_id,
+            turn_id: context.turn_id,
             result: result.clone(),
         })
         .await;
     result
+}
+
+#[derive(Debug)]
+struct CostBroker {
+    max_tool_calls: u64,
+    max_bytes_read: u64,
+    max_search_files: u64,
+    metrics: TurnMetrics,
+}
+
+impl CostBroker {
+    fn new(config: &AppConfig) -> Self {
+        Self {
+            max_tool_calls: config.max_tool_calls_per_turn,
+            max_bytes_read: config.max_tool_bytes_read_per_turn,
+            max_search_files: config.max_search_files_per_turn,
+            metrics: TurnMetrics::default(),
+        }
+    }
+
+    fn reserve_call(&mut self) -> Result<u64, (u64, String)> {
+        self.metrics.tool_calls += 1;
+        let tool_sequence = self.metrics.tool_calls;
+        if tool_sequence > self.max_tool_calls {
+            Err((
+                tool_sequence,
+                format!(
+                    "per-turn tool-call budget exceeded: limit={}",
+                    self.max_tool_calls
+                ),
+            ))
+        } else {
+            Ok(tool_sequence)
+        }
+    }
+
+    fn deny_reason(&self) -> Option<String> {
+        if self.metrics.bytes_read >= self.max_bytes_read {
+            Some(format!(
+                "per-turn tool byte-read budget exceeded: limit={}",
+                self.max_bytes_read
+            ))
+        } else if self.metrics.files_scanned >= self.max_search_files {
+            Some(format!(
+                "per-turn search file-scan budget exceeded: limit={}",
+                self.max_search_files
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn record_executed_result(&mut self, result: &ToolResult) {
+        match result.status {
+            ToolStatus::Success => self.metrics.tool_successes += 1,
+            ToolStatus::Error | ToolStatus::Stale => self.metrics.tool_errors += 1,
+            ToolStatus::Denied => self.metrics.tool_denials += 1,
+            ToolStatus::Cancelled => self.metrics.tool_cancellations += 1,
+        }
+        self.metrics.files_scanned += result.cost_hint.files_scanned;
+        self.metrics.bytes_read += result.cost_hint.bytes_read;
+        self.metrics.matches_returned += result.cost_hint.matches_returned;
+        if result.content.get("spilled").and_then(Value::as_bool) == Some(true) {
+            self.metrics.spill_writes += 1;
+        }
+        if result.tool_name == "read_tool_output" && result.status == ToolStatus::Success {
+            self.metrics.spill_reads += 1;
+        }
+        if is_budget_denied(result) {
+            self.metrics.budget_denials += 1;
+        }
+    }
+
+    fn record_model_result(&mut self, result: &ToolResult) {
+        self.metrics.model_output_bytes += result.model_output().len() as u64;
+        if result.content.get("receipt_stub").and_then(Value::as_bool) == Some(true) {
+            self.metrics.receipt_stub_hits += 1;
+        }
+        if result
+            .content
+            .get("negative_receipt_stub")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            self.metrics.negative_receipt_hits += 1;
+        }
+        if is_budget_denied(result) {
+            self.metrics.budget_denials += 1;
+        }
+    }
+}
+
+fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
+    let content = json!({
+        "error": reason,
+        "budget_denied": true,
+    });
+    let output_bytes = serde_json::to_vec(&content).unwrap_or_default();
+    ToolResult {
+        call_id: call.call_id.clone(),
+        tool_name: call.name.clone(),
+        status: ToolStatus::Denied,
+        content,
+        cost_hint: ToolCostHint {
+            output_bytes: output_bytes.len() as u64,
+            truncated: true,
+            ..ToolCostHint::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: None,
+        },
+    }
+}
+
+fn emit_tool_telemetry(
+    config: &AppConfig,
+    telemetry: &TelemetryClient,
+    turn_id: TurnId,
+    tool_sequence: u64,
+    result: &ToolResult,
+    duration: Duration,
+) {
+    telemetry.spawn(TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: turn_id.get(),
+        tool_sequence,
+        tool_name: &result.tool_name,
+        status: telemetry_tool_status(result.status.clone()),
+        duration,
+        cost: ToolCostProperties {
+            files_scanned: result.cost_hint.files_scanned,
+            bytes_read: result.cost_hint.bytes_read,
+            matches_returned: result.cost_hint.matches_returned,
+            output_bytes: result.cost_hint.output_bytes,
+        },
+    }));
+}
+
+fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {
+    match status {
+        ToolStatus::Success => TelemetryToolStatusKind::Success,
+        ToolStatus::Error => TelemetryToolStatusKind::Error,
+        ToolStatus::Denied => TelemetryToolStatusKind::Denied,
+        ToolStatus::Stale => TelemetryToolStatusKind::Stale,
+        ToolStatus::Cancelled => TelemetryToolStatusKind::Cancelled,
+    }
+}
+
+fn is_budget_denied(result: &ToolResult) -> bool {
+    result.content.get("budget_denied").and_then(Value::as_bool) == Some(true)
+}
+
+fn error_kind(error: &SqueezyError) -> ErrorKind {
+    match error {
+        SqueezyError::ProviderNotConfigured(_)
+        | SqueezyError::ProviderRequest(_)
+        | SqueezyError::ProviderStream(_) => ErrorKind::Provider,
+        SqueezyError::Tool(_) => ErrorKind::Tool,
+        SqueezyError::Permission(_) => ErrorKind::Permission,
+        SqueezyError::Graph(_) => ErrorKind::Graph,
+        SqueezyError::Io(_) => ErrorKind::Io,
+        SqueezyError::Agent(_)
+        | SqueezyError::Terminal(_)
+        | SqueezyError::Workspace(_)
+        | SqueezyError::Parse(_) => ErrorKind::Unknown,
+    }
 }
 
 async fn permission_decision(
@@ -785,6 +1058,7 @@ pub enum AgentEvent {
         message: TranscriptItem,
         response_id: Option<String>,
         cost: CostSnapshot,
+        metrics: TurnMetrics,
     },
     Cancelled {
         turn_id: TurnId,

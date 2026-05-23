@@ -14,6 +14,10 @@ pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
+pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
+pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
+pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
+pub const DEFAULT_TELEMETRY_ENDPOINT: &str = "https://telemetry.squeezy.dev/v1/batch";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -32,6 +36,10 @@ pub struct AppConfig {
     pub tool_output_retention_days: u64,
     pub exa_mcp_url: String,
     pub exa_api_key_env: String,
+    pub max_tool_calls_per_turn: u64,
+    pub max_tool_bytes_read_per_turn: u64,
+    pub max_search_files_per_turn: u64,
+    pub telemetry: TelemetryConfig,
 }
 
 impl AppConfig {
@@ -98,6 +106,19 @@ impl AppConfig {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_TOOL_OUTPUT_RETENTION_DAYS);
+        let max_tool_calls_per_turn = parse_u64(
+            var("SQUEEZY_MAX_TOOL_CALLS_PER_TURN"),
+            DEFAULT_MAX_TOOL_CALLS_PER_TURN,
+        );
+        let max_tool_bytes_read_per_turn = parse_u64(
+            var("SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN"),
+            DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+        );
+        let max_search_files_per_turn = parse_u64(
+            var("SQUEEZY_MAX_SEARCH_FILES_PER_TURN"),
+            DEFAULT_MAX_SEARCH_FILES_PER_TURN,
+        );
+        let telemetry = TelemetryConfig::from_env_vars(&mut var);
         Self {
             provider,
             model,
@@ -114,6 +135,10 @@ impl AppConfig {
             tool_output_retention_days,
             exa_mcp_url,
             exa_api_key_env,
+            max_tool_calls_per_turn,
+            max_tool_bytes_read_per_turn,
+            max_search_files_per_turn,
+            telemetry,
         }
     }
 }
@@ -229,11 +254,54 @@ fn parse_bool(value: Option<&str>) -> bool {
     )
 }
 
+fn parse_disabled_bool(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off" | "disabled")
+    )
+}
+
 fn parse_usize(value: Option<String>, default: usize) -> usize {
     value
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(default)
+}
+
+fn parse_u64(value: Option<String>, default: u64) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+}
+
+impl TelemetryConfig {
+    pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
+        let disabled = parse_disabled_bool(var("SQUEEZY_TELEMETRY").as_deref());
+        let endpoint = var("SQUEEZY_TELEMETRY_ENDPOINT")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_TELEMETRY_ENDPOINT.to_string());
+        Self {
+            enabled: !disabled,
+            endpoint,
+        }
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -297,6 +365,90 @@ pub struct CostSnapshot {
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub estimated_usd_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetrics {
+    pub turns: u64,
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_errors: u64,
+    pub tool_denials: u64,
+    pub tool_cancellations: u64,
+    pub files_scanned: u64,
+    pub bytes_read: u64,
+    pub matches_returned: u64,
+    pub model_output_bytes: u64,
+    pub receipt_stub_hits: u64,
+    pub negative_receipt_hits: u64,
+    pub spill_writes: u64,
+    pub spill_reads: u64,
+    pub budget_denials: u64,
+    pub provider: CostSnapshot,
+}
+
+impl SessionMetrics {
+    pub fn merge_turn(&mut self, turn: &TurnMetrics) {
+        self.turns += 1;
+        self.tool_calls += turn.tool_calls;
+        self.tool_successes += turn.tool_successes;
+        self.tool_errors += turn.tool_errors;
+        self.tool_denials += turn.tool_denials;
+        self.tool_cancellations += turn.tool_cancellations;
+        self.files_scanned += turn.files_scanned;
+        self.bytes_read += turn.bytes_read;
+        self.matches_returned += turn.matches_returned;
+        self.model_output_bytes += turn.model_output_bytes;
+        self.receipt_stub_hits += turn.receipt_stub_hits;
+        self.negative_receipt_hits += turn.negative_receipt_hits;
+        self.spill_writes += turn.spill_writes;
+        self.spill_reads += turn.spill_reads;
+        self.budget_denials += turn.budget_denials;
+        merge_cost_snapshot(&mut self.provider, &turn.provider);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnMetrics {
+    pub tool_calls: u64,
+    pub tool_successes: u64,
+    pub tool_errors: u64,
+    pub tool_denials: u64,
+    pub tool_cancellations: u64,
+    pub files_scanned: u64,
+    pub bytes_read: u64,
+    pub matches_returned: u64,
+    pub model_output_bytes: u64,
+    pub receipt_stub_hits: u64,
+    pub negative_receipt_hits: u64,
+    pub spill_writes: u64,
+    pub spill_reads: u64,
+    pub budget_denials: u64,
+    pub provider: CostSnapshot,
+}
+
+impl TurnMetrics {
+    pub fn record_provider(&mut self, cost: &CostSnapshot) {
+        merge_cost_snapshot(&mut self.provider, cost);
+    }
+}
+
+fn merge_cost_snapshot(total: &mut CostSnapshot, next: &CostSnapshot) {
+    total.input_tokens = add_optional_u64(total.input_tokens, next.input_tokens);
+    total.output_tokens = add_optional_u64(total.output_tokens, next.output_tokens);
+    total.cached_input_tokens =
+        add_optional_u64(total.cached_input_tokens, next.cached_input_tokens);
+    total.estimated_usd_micros =
+        add_optional_u64(total.estimated_usd_micros, next.estimated_usd_micros);
+}
+
+fn add_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
