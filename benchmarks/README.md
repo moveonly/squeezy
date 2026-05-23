@@ -14,9 +14,13 @@ The oracle is a benchmark/testing aid only; production navigation must not call
 benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
   fixtures/python/semantic-cases/   # small Python package used by smoke CI
+  fixtures/c/semantic-cases/        # small C project used by smoke CI
+  fixtures/cpp/semantic-cases/      # small C++ project used by smoke CI
   fixtures/go/semantic-cases/       # small Go module used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
+  specs/c-smoke-queries.json        # C expected query results
+  specs/cpp-smoke-queries.json      # C++ expected query results
   specs/go-smoke-queries.json       # Go expected query results
   squeezy-graph-bench/              # benchmark CLI
 ```
@@ -59,6 +63,46 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --no-speed-gate
 ```
 
+C smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language c \
+  --fixture benchmarks/fixtures/c/semantic-cases \
+  --spec benchmarks/specs/c-smoke-queries.json \
+  --report target/semantic-graph-benchmark/c-smoke.json \
+  --ra-lsp-probes 0
+```
+
+C++ smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language cpp \
+  --fixture benchmarks/fixtures/cpp/semantic-cases \
+  --spec benchmarks/specs/cpp-smoke-queries.json \
+  --report target/semantic-graph-benchmark/cpp-smoke.json \
+  --ra-lsp-probes 0
+```
+
+C/C++ external mixed comparison:
+
+```sh
+mkdir -p target/benchmark-repos
+git clone --depth 1 --filter=blob:none https://github.com/curl/curl target/benchmark-repos/curl
+
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language c \
+  --fixture benchmarks/fixtures/c/semantic-cases \
+  --spec benchmarks/specs/c-smoke-queries.json \
+  --report target/semantic-graph-benchmark/c-family-real/curl.json \
+  --mixed-repo target/benchmark-repos/curl \
+  --mixed-iterations 1000 \
+  --ra-lsp-probes 0 \
+  --oracle-files 10 \
+  --no-speed-gate
+```
+
 Go smoke:
 
 ```sh
@@ -75,7 +119,7 @@ plus query time is not faster than compiler validation, or the incremental
 refresh probe reparses more files than it edited.
 
 The mixed workload is deterministic and exhaustive by default. It builds a
-Squeezy graph for the supplied Rust repo, generates scenarios from every indexed
+Squeezy graph for the supplied repo, generates scenarios from every indexed
 symbol and resolved call edge, and runs hierarchy, symbol lookup, signature
 search, body search, reference search, callers, callees, and call-chain queries.
 Use `--mixed-iterations N` to cap the scenario count; `0` means run all
@@ -137,6 +181,19 @@ parser defects. The Python smoke spec also includes controlled navigation
 queries for route attributes, property references, and constructor-alias method
 calls; these are fixture oracles for syntax-only navigation behavior rather than
 runtime framework checks.
+
+For C and C++, the benchmark validates source fixtures with `clang` or
+`clang++ -fsyntax-only` and compares Squeezy declaration symbols with sampled
+`clang -Xclang -ast-dump=json` output. This keeps compiler checking in the
+benchmark tier while production navigation stays tree-sitter-only. Files that
+need project-specific generated headers, compile flags, SDKs, or
+`compile_commands.json` are reported as unparseable and excluded from Squeezy
+false-positive accounting. The C/C++ query specs track high-coverage syntax
+navigation for declarations, includes, references, calls, macro opacity,
+templates, overload-prone calls, and header/source pairing. Known losses are
+expected for preprocessor expansion, inactive conditional branches, template
+instantiation, overload resolution, function pointers, virtual dispatch, ADL,
+generated code, and external headers.
 
 ## Local Results
 
@@ -217,13 +274,29 @@ tested but rejected because it increased serde reference FP from 6 to 158.
 
 ## CI
 
-`.github/workflows/semantic-graph-benchmark.yml` runs the smoke benchmark on PRs
-and pushes. `workflow_dispatch` with `tier=full` clones ripgrep, fd, bat, tokio,
-and serde, runs 5,000 deterministic mixed-workload scenarios per repo, and
-writes timing, symbol accuracy, and rust-analyzer LSP navigation accuracy
-summaries to the GitHub Actions step summary. The workflow also uploads the raw
-JSON reports and rendered summary as the `semantic-graph-benchmark-<tier>`
-artifact so benchmark runs can be audited after the job completes.
+`.github/workflows/semantic-graph-benchmark.yml` is the shared benchmark entry
+point for Rust, C, and C++. PRs and pushes run Rust, C, and C++ smoke jobs.
+Manual `workflow_dispatch` adds a `language` selector (`rust`, `c`, `cpp`,
+`c-family`, or `all`) plus `tier=smoke|full`.
+
+For Rust, the full tier clones ripgrep, fd, bat, tokio, and serde, runs 5,000
+deterministic mixed-workload scenarios per repo, and writes timing, symbol
+accuracy, and rust-analyzer LSP navigation accuracy summaries to the GitHub
+Actions step summary.
+
+For C/C++, the full tier clones redis, curl, sqlite, protobuf, and
+nlohmann/json, then runs 1,000 deterministic mixed workload scenarios, refresh
+probes, and a 10-file clang AST symbol sample against each repo. Pushing a
+branch under `benchmark-full/**` runs the same full Rust and C-family tiers
+after the workflow is available on the default branch. Clang/clang++ syntax
+validation and sampled clang AST symbol TP/FP/FN are reported when they succeed,
+but full-tier external repos are not blocked on compiler validation because real
+C/C++ projects often need project-specific include paths, generated headers, or
+compile command databases.
+
+The workflow uploads the raw JSON reports and rendered summaries as
+`semantic-graph-benchmark-*` artifacts so benchmark runs can be audited after
+the job completes.
 
 `.github/workflows/python-semantic-graph-benchmark.yml` runs the Python smoke
 benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or

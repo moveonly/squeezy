@@ -419,6 +419,86 @@ fn crawler_classifies_python_files() {
 }
 
 #[test]
+fn crawler_classifies_c_and_cpp_files_and_pairs_plain_headers() {
+    let root = temp_root("crawler_classifies_c_and_cpp_files");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("runner.c"),
+        "int runner(void) { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("runner.h"), "int runner(void);\n").unwrap();
+    fs::write(
+        root.join("src").join("widget.cpp"),
+        "int widget() { return 2; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("widget.hpp"), "int widget();\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/runner.c")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/runner.h")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/widget.cpp")
+            .unwrap()
+            .language,
+        LanguageKind::Cpp
+    );
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "src/widget.hpp")
+            .unwrap()
+            .language,
+        LanguageKind::Cpp
+    );
+}
+
+#[test]
+fn crawler_uses_project_majority_for_ambiguous_c_headers() {
+    let root = temp_root("crawler_uses_project_majority_for_ambiguous_c_headers");
+    fs::write(root.join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    fs::write(root.join("defs.h"), "#define VALUE 1\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .find(|file| file.relative_path == "defs.h")
+            .unwrap()
+            .language,
+        LanguageKind::C
+    );
+}
+
+#[test]
 fn crawler_classifies_go_files() {
     let root = temp_root("crawler_classifies_go_files");
     fs::write(root.join("main.go"), "package main\nfunc main() {}\n").unwrap();

@@ -10,7 +10,7 @@ Current completed decisions:
 - Initial supported platforms are macOS and Linux.
 - Initial UI is a TUI.
 - Initial semantic navigation source language is Rust.
-- Additional source languages are future work.
+- Current semantic navigation source languages are Rust, Python, C, and C++.
 - Unsupported source languages fall back to ordinary bounded read/grep/list tools.
 - Navigation tools mean semantic graph/code-understanding operations on top of tree-sitter, not grep wrappers.
 - LSP and `rust-analyzer` are not part of navigation; use toolchain/compiler commands only for build, test, and explicit verification.

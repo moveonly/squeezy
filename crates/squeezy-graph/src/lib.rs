@@ -546,12 +546,28 @@ impl SemanticGraph {
         });
         self.rebuild_indexes();
 
-        let imports = self.imports.clone();
-        let calls = self.calls.clone();
-        let references = self.references.clone();
+        // Move-out, mutate, move-back. Each builder iterates a single
+        // field's data while writing edges, and the borrow checker won't
+        // let us hold an immutable iterator over `self.X` while passing
+        // `&mut self` to push edges. The original code cloned all three
+        // collections up-front; we use `mem::take` so the clone-equivalent
+        // cost is paid only on the data each builder actually iterates.
+        //
+        // IMPORTANT: `add_call_edges` and `add_reference_edges` use the
+        // resolver, which reads `self.imports` (Python alias lookups,
+        // C/C++ include-aware lookups, Rust glob/use resolution). We must
+        // restore `self.imports` between phases so the resolver sees it.
+        let imports = std::mem::take(&mut self.imports);
         self.add_import_edges(&imports);
+        self.imports = imports;
+
+        let calls = std::mem::take(&mut self.calls);
         self.add_call_edges(&calls);
+        self.calls = calls;
+
+        let references = std::mem::take(&mut self.references);
         self.add_reference_edges(&references);
+        self.references = references;
     }
 
     fn add_import_edges(&mut self, imports: &[ParsedImport]) {
@@ -673,6 +689,17 @@ impl SemanticGraph {
             return (Some(callee), Confidence::ExactSyntax, "same class or impl");
         }
 
+        // C/C++ sibling method calls without `this->` parse as Direct
+        // (no receiver). They must still resolve to the local method on the
+        // caller's enclosing class/struct/union before we look elsewhere.
+        if call.kind == ParsedCallKind::Direct
+            && call.receiver.is_none()
+            && !call.target_text.contains("::")
+            && let Some(callee) = self.same_class_direct_call(caller_id, &call.name)
+        {
+            return (Some(callee), Confidence::ExactSyntax, "same class");
+        }
+
         if call.kind == ParsedCallKind::Method
             && let Some(callee) = self.inherited_python_method(caller_id, call)
         {
@@ -730,6 +757,9 @@ impl SemanticGraph {
         }
         if let Some(id) = self.imported_direct_call(&candidates, caller_id, call) {
             return (Some(id), Confidence::ImportResolved, "explicit import");
+        }
+        if let Some(id) = self.c_family_include_direct_call(&candidates, caller_id) {
+            return (Some(id), Confidence::ImportResolved, "include directive");
         }
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
             return (Some(id), Confidence::Heuristic, "package local");
@@ -1002,6 +1032,88 @@ impl SemanticGraph {
                     .collect::<Vec<_>>()
             });
         single_symbol(candidates)
+    }
+
+    /// For C/C++ Direct calls, treat `#include "header.h"` as an
+    /// authoritative cross-TU import: when the called name resolves to a
+    /// unique Function/Method declared in a workspace file whose relative
+    /// path matches one of the caller file's includes (by trailing path
+    /// suffix on a `/` boundary, or by basename), bind to it. This is the
+    /// closest syntactic analogue to the Rust `use module::*;` shape that
+    /// is already handled — without it, every cross-file C call falls back
+    /// to `CandidateSet`.
+    fn c_family_include_direct_call(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+    ) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        let caller_file = self.files.get(&caller.file_id)?;
+        if !matches!(caller_file.language, LanguageKind::C | LanguageKind::Cpp) {
+            return None;
+        }
+        let include_paths = self
+            .imports
+            .iter()
+            .filter(|import| {
+                import.file_id == caller.file_id
+                    && import.provenance.reason.contains("include directive")
+            })
+            .map(|import| import.path.clone())
+            .collect::<Vec<_>>();
+        if include_paths.is_empty() {
+            return None;
+        }
+
+        // Gather candidate definitions/declarations that live in an
+        // included header *or any file in the same package as an included
+        // header* (e.g. `#include "runner.h"` + `runner.c` next to it).
+        // Definitions (body_span.is_some()) beat declarations when both
+        // exist — that's the canonical target the user actually wants to
+        // jump to. We also let any same-workspace C/C++ symbol resolve so
+        // a single-defining function still binds when the include only
+        // declares it.
+        let header_matches = candidates
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method))
+            .filter(|symbol| {
+                self.files
+                    .get(&symbol.file_id)
+                    .map(|file| {
+                        matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
+                            && include_paths.iter().any(|include| {
+                                include_path_matches_file(include, &file.relative_path)
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        let definitions = candidates
+            .iter()
+            .filter_map(|id| self.symbols.get(id))
+            .filter(|symbol| {
+                matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                    && symbol.body_span.is_some()
+            })
+            .filter(|symbol| {
+                self.files
+                    .get(&symbol.file_id)
+                    .map(|file| {
+                        matches!(file.language, LanguageKind::C | LanguageKind::Cpp)
+                            && include_paths.iter().any(|include| {
+                                file_shares_include_root(include, &file.relative_path)
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(only) = single_unique(definitions.iter().map(|symbol| symbol.id.clone())) {
+            return Some(only);
+        }
+        single_unique(header_matches.iter().map(|symbol| symbol.id.clone()))
     }
 
     fn package_local_direct_call(
@@ -1427,6 +1539,40 @@ impl SemanticGraph {
             .or_else(|| self.python_method_in_bases(class_id, method_name, 0))
     }
 
+    /// For C/C++ `bar()` calls from inside a method of class `Foo`, prefer
+    /// `Foo::bar` over a same-name free function in the same file. The Rust
+    /// path uses `same_impl_method` for receiver-less self/this calls
+    /// (`ParsedCallKind::Method` with `self`/`this`), but tree-sitter-cpp
+    /// classifies receiver-less calls as `Direct`, so without this lookup
+    /// the call resolver falls through to `same_file_direct_call` (which
+    /// filters out `Method`) and the call becomes `CandidateSet`.
+    fn same_class_direct_call(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
+        let caller = self.symbols.get(caller_id)?;
+        if !matches!(caller.kind, SymbolKind::Method | SymbolKind::Function) {
+            return None;
+        }
+        let parent_id = caller.parent_id.as_ref()?;
+        let parent = self.symbols.get(parent_id)?;
+        if !matches!(
+            parent.kind,
+            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Union
+        ) {
+            return None;
+        }
+        single_symbol(
+            self.children_by_parent
+                .get(parent_id)?
+                .iter()
+                .filter_map(|child_id| self.symbols.get(child_id))
+                .filter(|symbol| {
+                    matches!(symbol.kind, SymbolKind::Method | SymbolKind::Function)
+                        && symbol.name == method_name
+                        && symbol.id != caller.id
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
     fn same_impl_method(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
         let caller = self.symbols.get(caller_id)?;
         let impl_id = if caller.kind == SymbolKind::Impl {
@@ -1487,28 +1633,17 @@ impl SemanticGraph {
         if let Some(exact) = self.references_by_text.get(text) {
             indexes.extend(exact.iter().copied());
         }
-        let suffix = format!("::{text}");
-        if let Some(segment) = self.references_by_text.get(&suffix) {
+        let colon_suffix = format!("::{text}");
+        if let Some(segment) = self.references_by_text.get(&colon_suffix) {
             indexes.extend(segment.iter().copied());
         }
         let dot_suffix = format!(".{text}");
-        indexes.extend(
-            self.references
-                .iter()
-                .enumerate()
-                .filter(|(_, reference)| reference.text.ends_with(&dot_suffix))
-                .map(|(index, _)| index),
-        );
-        if text.contains("::") {
-            indexes.extend(
-                self.references
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, reference)| {
-                        reference.text == text || reference.text.ends_with(&suffix)
-                    })
-                    .map(|(index, _)| index),
-            );
+        if let Some(segment) = self.references_by_text.get(&dot_suffix) {
+            indexes.extend(segment.iter().copied());
+        }
+        let arrow_suffix = format!("->{text}");
+        if let Some(segment) = self.references_by_text.get(&arrow_suffix) {
+            indexes.extend(segment.iter().copied());
         }
         indexes.into_iter().collect()
     }
@@ -2362,10 +2497,29 @@ impl SemanticGraph {
                 .entry(reference.text.clone())
                 .or_default()
                 .push(index);
+            let leaf = last_path_segment(&reference.text);
+            // Suffix keys let `reference_candidate_indexes` answer
+            // dotted/arrow/scoped lookups in O(matches) instead of scanning
+            // every reference. We populate them eagerly here because index
+            // construction is already O(refs).
             self.references_by_text
-                .entry(format!("::{}", last_path_segment(&reference.text)))
+                .entry(format!("::{leaf}"))
                 .or_default()
                 .push(index);
+            if let Some(rest) = receiver_split(&reference.text, '.') {
+                self.references_by_text
+                    .entry(format!(".{rest}"))
+                    .or_default()
+                    .push(index);
+            }
+            if let Some(rest) = receiver_split(&reference.text, '>') {
+                // `->field` lookups; we key on `->leaf` matching the
+                // pre-arrow text via `receiver_split('>') == "leaf"`.
+                self.references_by_text
+                    .entry(format!("->{rest}"))
+                    .or_default()
+                    .push(index);
+            }
             for segment in path_segments(&reference.text) {
                 self.references_by_text
                     .entry(segment)
@@ -2542,6 +2696,8 @@ pub struct RefreshReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageReport {
+    pub c_files: usize,
+    pub cpp_files: usize,
     pub go_files: usize,
     pub rust_files: usize,
     pub supported_files: usize,
@@ -2760,6 +2916,14 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
     let mut report = LanguageReport::default();
     for record in records {
         match record.language {
+            LanguageKind::C => {
+                report.c_files += 1;
+                report.supported_files += 1;
+            }
+            LanguageKind::Cpp => {
+                report.cpp_files += 1;
+                report.supported_files += 1;
+            }
             LanguageKind::Python => {
                 report.supported_files += 1;
             }
@@ -2812,7 +2976,13 @@ fn file_symbol_id(file_id: &FileId) -> SymbolId {
 }
 
 fn last_path_segment(path: &str) -> String {
+    // Strip C/C++ pointer-arrow access (`runner->id` → `id`) before the
+    // other separators so dotted/scoped reference text from the C-family
+    // path collapses to the symbol leaf the same way Rust/Python does.
     let segment = path
+        .rsplit("->")
+        .next()
+        .unwrap_or(path)
         .rsplit("::")
         .next()
         .unwrap_or(path)
@@ -2928,7 +3098,16 @@ fn path_starts_with_external_root(path: &str, language: LanguageKind) -> bool {
             .find(|segment| !segment.trim().is_empty())
             .unwrap_or(path)
             .trim(),
-        LanguageKind::Python | LanguageKind::Unknown | LanguageKind::Unsupported => return false,
+        // C/C++ does not project "external" symbols through a path prefix
+        // (cross-TU references go through `#include` instead, which is
+        // handled by `c_family_include_direct_call`). Python/Unknown/
+        // Unsupported also have no syntactic external roots Squeezy can
+        // pattern-match on without confidence-eroding heuristics.
+        LanguageKind::C
+        | LanguageKind::Cpp
+        | LanguageKind::Python
+        | LanguageKind::Unknown
+        | LanguageKind::Unsupported => return false,
     };
     let externals: &[&str] = match language {
         LanguageKind::Rust => &["std", "core", "alloc", "proc_macro"],
@@ -2977,6 +3156,20 @@ fn receiver_from_dotted_reference(path: &str) -> Option<String> {
     path.rsplit_once('.')
         .map(|(receiver, _)| receiver.trim().to_string())
         .filter(|receiver| !receiver.is_empty())
+}
+
+/// Returns the trailing identifier after the last `delimiter` character in
+/// the text, if any. Used by index construction to derive dotted/arrow
+/// suffix keys without scanning the reference text repeatedly at query
+/// time.
+fn receiver_split(text: &str, delimiter: char) -> Option<String> {
+    let (_, rest) = text.rsplit_once(delimiter)?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    }
 }
 
 fn module_path_for_file(path: &str) -> Vec<String> {
@@ -3101,6 +3294,95 @@ fn find_identifier(text: &str, name: &str) -> Option<usize> {
                     .unwrap_or(false)
         })
         .map(|(index, _)| index)
+}
+
+/// Matches a `#include "path"` value against a workspace file's relative
+/// path. We allow three shapes:
+///   * exact match on the bracketed string (rare; only when the include
+///     uses a project-rooted path)
+///   * suffix match aligned on a `/` boundary (`utils/runner.h` vs
+///     `src/utils/runner.h`)
+///   * basename match (`runner.h` vs `src/runner.h`) when the include
+///     has no directory component
+fn include_path_matches_file(include: &str, relative_path: &str) -> bool {
+    let include =
+        include.trim_matches(|ch: char| ch.is_whitespace() || ch == '"' || ch == '<' || ch == '>');
+    if include.is_empty() {
+        return false;
+    }
+    if include == relative_path {
+        return true;
+    }
+    if !include.contains('/') {
+        return relative_path
+            .rsplit('/')
+            .next()
+            .map(|name| name == include)
+            .unwrap_or(false);
+    }
+    if relative_path.ends_with(include) {
+        let prefix_len = relative_path.len() - include.len();
+        if prefix_len == 0 || &relative_path[prefix_len - 1..prefix_len] == "/" {
+            return true;
+        }
+    }
+    false
+}
+
+/// True when `relative_path` lives in the same directory (or a sibling
+/// translation-unit directory) as the file referenced by the include.
+/// Lets `#include "runner.h"` from `src/consumer.c` resolve to
+/// `src/runner.c`'s function definitions, matching how C projects keep
+/// declaration/definition pairs next to each other.
+fn file_shares_include_root(include: &str, relative_path: &str) -> bool {
+    if include_path_matches_file(include, relative_path) {
+        return true;
+    }
+    let include =
+        include.trim_matches(|ch: char| ch.is_whitespace() || ch == '"' || ch == '<' || ch == '>');
+    if include.is_empty() {
+        return false;
+    }
+    // Strip the bracketed-include extension to derive the file stem (e.g.
+    // `runner.h` → `runner`). Then check whether `relative_path` has a
+    // matching stem in the same directory shape.
+    let include_basename = include.rsplit('/').next().unwrap_or(include);
+    let Some(include_stem) = include_basename.rsplit_once('.').map(|(stem, _)| stem) else {
+        return false;
+    };
+    let file_basename = relative_path.rsplit('/').next().unwrap_or(relative_path);
+    let Some(file_stem) = file_basename.rsplit_once('.').map(|(stem, _)| stem) else {
+        return false;
+    };
+    if include_stem != file_stem {
+        return false;
+    }
+    // Same stem, different extension. Make sure they share the same
+    // directory prefix so we don't bind `a/runner.h` → `b/runner.c`.
+    let include_dir = include.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let file_dir = relative_path
+        .rsplit_once('/')
+        .map(|(dir, _)| dir)
+        .unwrap_or("");
+    if include_dir.is_empty() {
+        return true;
+    }
+    file_dir.ends_with(include_dir)
+}
+
+/// `single_symbol` over an Iterator of `SymbolId` without sorting (we
+/// already collected and don't need stable ordering for uniqueness — only
+/// that exactly one distinct value remains).
+fn single_unique<I: IntoIterator<Item = SymbolId>>(iter: I) -> Option<SymbolId> {
+    let mut seen: Option<SymbolId> = None;
+    for id in iter {
+        match &seen {
+            Some(existing) if existing == &id => continue,
+            Some(_) => return None,
+            None => seen = Some(id),
+        }
+    }
+    seen
 }
 
 fn package_key(path: &str) -> String {

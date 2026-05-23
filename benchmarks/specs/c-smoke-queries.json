@@ -1,0 +1,82 @@
+{
+  "queries": [
+    {
+      "id": "c-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Struct:Runner",
+        "Enum:RunnerState",
+        "Variant:RUNNER_READY",
+        "Field:id",
+        "Macro:RUNNER_LIMIT",
+        "Function:helper",
+        "Function:runner_run",
+        "Function:consume"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-signature-runner-run",
+      "kind": "signature_search",
+      "text": "runner_run",
+      "symbol_kind": "Function",
+      "expected_contains": [
+        "Function:runner_run"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-call-chain",
+      "kind": "call_chain",
+      "from": "runner_run",
+      "to": "helper",
+      "expected_contains": [
+        "runner_run -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-include-cross-tu-call-chain",
+      "kind": "call_chain",
+      "from": "consume",
+      "to": "helper",
+      "expected_contains": [
+        "consume -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-include-cross-tu-runner-run",
+      "kind": "call_chain",
+      "from": "consume",
+      "to": "runner_run",
+      "expected_contains": [
+        "consume -> runner_run"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-reference-runner",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": [
+        "Runner"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "c-macro-limit",
+      "kind": "body_search",
+      "text": "RUNNER_LIMIT",
+      "expected_contains": [
+        "runner_run:RUNNER_LIMIT"
+      ],
+      "documented_misses": [
+        {
+          "result": "expanded RUNNER_LIMIT value",
+          "reason": "preprocessor expansion is intentionally opaque in the production graph"
+        }
+      ]
+    }
+  ]
+}

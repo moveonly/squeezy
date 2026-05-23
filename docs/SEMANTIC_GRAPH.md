@@ -16,6 +16,10 @@ navigation questions before the model reads raw files.
 - Python declarations: classes, functions, methods, imports, calls, decorators,
   docstrings, class bases, type annotations, class fields, exports, aliases, and
   references from `.py` files.
+- C/C++ declarations: includes, namespaces, classes, structs, unions, enums,
+  typedefs/type aliases, fields, functions, methods, constructors/destructors,
+  operators, templates, macro definitions/usages, and declaration/definition
+  spans.
 - Go declarations: packages, imports, structs, interfaces, type aliases,
   functions, methods, receiver relationships, fields, constants, variables,
   tests, calls, and references from `.go` files.
@@ -110,6 +114,51 @@ decision instead of walking a likely non-code or dangerous directory.
   symbol so behavior-word searches do not have to read raw files first.
 - Dynamic attributes, metaclasses, runtime import side effects, monkey-patching,
   and type-inferred receiver dispatch remain heuristic or external.
+<<<<<<< HEAD
+- C/C++ header classification prefers same-stem source files and then project
+  majority when a plain `.h` file has no unambiguous pair. `.hpp`, `.hh`, and
+  `.hxx` are treated as C++.
+- C/C++ include directives are indexed as glob import facts. Cross-translation-unit
+  direct calls are resolved through includes: when `#include "header.h"` is
+  visible and the called name resolves to a single Function/Method declared in
+  the included header (or a sibling translation unit sharing the header's
+  stem/directory), the call binds to the definition with `ImportResolved`
+  confidence; ambiguous matches stay candidate-set. Declaration/definition
+  pairing and calls also use structural heuristics: namespace/class scope, name,
+  arity, receiver text, and normalized signature tokens. Sibling method calls
+  inside a class without `this->` (parsed as Direct in tree-sitter-cpp) resolve
+  to the same-class peer method when unambiguous. Overloads, templates,
+  function pointers, virtual dispatch, ADL, and macro-dependent calls produce
+  candidate-set, partial, macro-opaque, or conditional confidence instead of
+  exact claims.
+- C/C++ `using foo::Name;` declarations and `using namespace foo;` directives
+  are indexed as import facts so cross-namespace references and calls in real
+  C++ code can resolve via the same import machinery.
+- C/C++ function-pointer struct fields (`int (*cb)(int)`) are kept as `Field`
+  symbols rather than promoted to `Function`/`Method`, matching how clang's
+  AST reports them.
+- C/C++ namespace-qualified free function definitions (`void ns::func() {}`)
+  remain `Function` symbols; only class-qualified definitions
+  (`void Foo::bar() {}`) are promoted to `Method`. The qualifier-leaf
+  type-name heuristic (uppercase-leading or `_t`-suffix) is the cheap
+  syntactic distinguisher.
+- C++ template specializations (`template<> class Foo<int> {}`) are tagged
+  with `c++:template-specialization` and excluded from the comparable-symbol
+  count so they do not appear as false positives against the clang AST
+  oracle (which reports them as `ClassTemplateSpecializationDecl`).
+- C/C++ forward declarations and matching definitions in the same file
+  collapse into a single canonical Function/Method symbol so the
+  declaration-symbol count stays aligned with the clang AST oracle.
+- C++ access modifiers resolve through `public:` / `private:` / `protected:`
+  blocks. Aggregate defaults apply for members declared before the first
+  access specifier (`struct`/`union` default to public, `class` defaults to
+  private).
+- C/C++ preprocessor directives are indexed but not expanded. Macro definitions,
+  macro invocations, and conditional spans are provenance-bearing evidence for
+  fallback, not compiler-equivalent semantics. All-caps call targets at least
+  two characters long are flagged as macro-opaque so common macro-like APIs
+  (`ASSERT`, `LOG`, `EXPECT_EQ`, `CHECK`) widen the macro-opaque cone instead
+  of pretending to be direct function calls.
 - Go package-qualified calls resolve through explicit imports when the imported
   package maps to one indexed package and one function target. Same-package
   direct calls and same-receiver method calls resolve when there is a single
@@ -175,6 +224,17 @@ the fixture with a slower CPython `ast` oracle and compares declaration symbols
 against Squeezy's graph. Both fail if required expected results are missing or if
 Squeezy graph build plus query time is not faster than the validation pass for
 the same fixture.
+
+The C and C++ smoke benchmarks validate fixtures with `clang -fsyntax-only` and
+`clang++ -fsyntax-only`, then compare declaration symbols against
+`clang -Xclang -ast-dump=json` output before running the same graph/query/spec
+harness. Clang is a benchmark oracle only; production C/C++ navigation remains
+tree-sitter and local graph analysis. External mixed benchmarks cap sampled
+oracle files by default and exclude unparseable files from Squeezy
+false-positive accounting because real projects often require generated
+headers, compile flags, SDKs, or compile command databases. Known misses must be
+documented for macros, inactive preprocessor branches, templates, overloads,
+generated code, external headers, function pointers, and virtual dispatch.
 
 The mixed benchmark runs deterministic exhaustive scenarios against a real Rust
 repo by default. It generates scenarios from every indexed symbol and resolved

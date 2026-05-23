@@ -6,7 +6,7 @@ use std::{
 };
 
 use squeezy_core::{ContentHash, FileId, LanguageKind};
-use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind};
+use squeezy_parse::{LanguageParser, ParsedFile, ReferenceKind, RustParser};
 use squeezy_workspace::{CrawlOptions, FileRecord, stable_content_hash};
 
 use super::*;
@@ -289,6 +289,45 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert_eq!(report.language.rust_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_manager_refresh_indexes_c_family_and_reparses_changed_header() {
+    let root = temp_root("graph-manager-c-family-refresh");
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("src").join("runner.cpp"),
+        "#include \"runner.hpp\"\nint run() { return helper(); }\nint helper() { return 1; }\n",
+    )
+    .unwrap();
+    fs::write(root.join("src").join("runner.hpp"), "int run();\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.build_report().language.cpp_files, 2);
+    assert_eq!(manager.build_report().language.supported_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("run").is_empty());
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(
+        root.join("src").join("runner.hpp"),
+        "int run();\nint added();\n",
+    )
+    .unwrap();
+    manager.record_changed_path(root.join("src").join("runner.hpp"));
+    let report = manager.refresh_before_query().unwrap();
+
+    assert!(report.refreshed);
+    assert_eq!(report.reparsed_files, 1);
+    assert_eq!(report.language.cpp_files, 2);
+    assert!(!manager.graph().find_symbol_by_name("added").is_empty());
 }
 
 #[test]
@@ -1209,6 +1248,245 @@ impl IntoThing for Local {
 }
 
 #[test]
+fn graph_resolves_cpp_same_class_direct_method_call() {
+    let mut parser = RustParser::new().unwrap();
+    let record = cpp_record(
+        "src/runner.cpp",
+        r#"
+class Runner {
+public:
+    int run() {
+        return helper();
+    }
+    int helper() {
+        return 0;
+    }
+};
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let helpers = graph.find_symbol_by_name("helper");
+    let helper = helpers
+        .iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Runner::helper method should exist");
+    let run = graph
+        .find_symbol_by_name("run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Runner::run method should exist");
+
+    // `helper()` inside `run()` parses as a Direct call with no receiver.
+    // Without the same-class fallback the resolver returns CandidateSet.
+    let chain = graph
+        .call_chain(&run.id, &helper.id, 2)
+        .expect("Runner::run -> Runner::helper should resolve");
+    assert!(chain.contains(&helper.id));
+}
+
+#[test]
+fn graph_resolves_c_include_cross_translation_unit_calls() {
+    let mut parser = RustParser::new().unwrap();
+    let header = c_record(
+        "src/runner.h",
+        r#"
+int helper(int value);
+int runner_run(int value);
+"#,
+    );
+    let definition = c_record(
+        "src/runner.c",
+        r#"
+#include "runner.h"
+
+int helper(int value) {
+    return value + 1;
+}
+
+int runner_run(int value) {
+    return helper(value);
+}
+"#,
+    );
+    let consumer = c_record(
+        "src/consumer.c",
+        r#"
+#include "runner.h"
+
+int consume(int value) {
+    return helper(value) + runner_run(value);
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&header, fs::read_to_string(&header.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&definition, fs::read_to_string(&definition.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&consumer, fs::read_to_string(&consumer.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let helper = graph
+        .find_symbol_by_name("helper")
+        .into_iter()
+        .find(|symbol| {
+            graph
+                .files
+                .get(&symbol.file_id)
+                .map(|file| file.relative_path == "src/runner.c")
+                .unwrap_or(false)
+        })
+        .expect("definition-side `helper` should exist");
+    let runner_run = graph
+        .find_symbol_by_name("runner_run")
+        .into_iter()
+        .find(|symbol| {
+            graph
+                .files
+                .get(&symbol.file_id)
+                .map(|file| file.relative_path == "src/runner.c")
+                .unwrap_or(false)
+        })
+        .expect("definition-side `runner_run` should exist");
+    let consume = graph
+        .find_symbol_by_name("consume")
+        .pop()
+        .expect("consume function should exist");
+
+    // Without include-aware resolution these calls would land in
+    // CandidateSet because the consumer file declares neither symbol.
+    assert!(
+        graph.call_chain(&consume.id, &helper.id, 2).is_some(),
+        "consume -> helper should resolve via the include directive"
+    );
+    assert!(
+        graph.call_chain(&consume.id, &runner_run.id, 2).is_some(),
+        "consume -> runner_run should resolve via the include directive"
+    );
+}
+
+#[test]
+fn graph_include_lookup_is_gated_to_c_family_callers() {
+    let mut parser = RustParser::new().unwrap();
+    let rust_caller = record(
+        "src/rust_caller/main.rs",
+        r#"
+fn caller() {
+    helper();
+}
+"#,
+    );
+    let c_definition = c_record(
+        "src/runner/runner.c",
+        r#"
+int helper(int value) {
+    return value;
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&rust_caller, fs::read_to_string(&rust_caller.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(
+                &c_definition,
+                fs::read_to_string(&c_definition.path).unwrap(),
+            )
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+    let caller = graph
+        .find_symbol_by_name("caller")
+        .pop()
+        .expect("caller function should exist");
+
+    // The include-aware lookup must never appear in the provenance for a
+    // Rust caller, even if other heuristics happen to bind the call.
+    for edge in graph.callees(&caller.id) {
+        assert!(
+            !edge.edge.provenance.reason.contains("include directive"),
+            "Rust caller's call edge should never use the C/C++ include lookup; provenance was {:?}",
+            edge.edge.provenance.reason
+        );
+    }
+}
+
+#[test]
+fn graph_field_reference_with_arrow_access_matches_struct_field() {
+    let mut parser = RustParser::new().unwrap();
+    let record = c_record(
+        "src/runner.c",
+        r#"
+struct Runner {
+    int id;
+};
+
+int peek(struct Runner *runner) {
+    return runner->id;
+}
+"#,
+    );
+    let parsed = parser
+        .parse_source(&record, fs::read_to_string(&record.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let id_field = graph
+        .find_symbol_by_name("id")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Field)
+        .expect("id field should exist");
+
+    // Arrow-access references like `runner->id` should bind to the local
+    // field via the new `last_path_segment` arrow stripping.
+    assert!(
+        graph
+            .references_to_symbol(&id_field.id)
+            .iter()
+            .any(|hit| hit.reference.text.contains("id")),
+        "expected `runner->id` reference to bind to struct field `id`"
+    );
+}
+
+#[test]
+fn include_path_helper_matches_basename_and_suffix() {
+    assert!(include_path_matches_file("runner.h", "src/runner.h"));
+    assert!(include_path_matches_file(
+        "utils/runner.h",
+        "src/utils/runner.h"
+    ));
+    assert!(include_path_matches_file("src/runner.h", "src/runner.h"));
+    assert!(!include_path_matches_file("runner.h", "src/runner_alt.h"));
+    assert!(!include_path_matches_file(
+        "utils/runner.h",
+        "src/utils_x/runner.h"
+    ));
+    assert!(!include_path_matches_file("", "src/runner.h"));
+}
+
+fn c_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::C;
+    record
+}
+
+fn cpp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Cpp;
+    record
+}
+
+#[test]
 fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply() {
     let source = "pub fn first() -> usize { 1 }\npub fn second() -> usize { 2 }\npub fn third() -> usize { 3 }\n";
     let mut parser = LanguageParser::new().unwrap();
@@ -1295,11 +1573,15 @@ fn go_record(relative_path: &str, source: &str) -> FileRecord {
 }
 
 fn temp_root(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("squeezy-{name}-{nonce}"));
+    let root = std::env::temp_dir().join(format!("squeezy-{name}-{pid}-{counter}-{nonce}"));
     fs::create_dir_all(&root).unwrap();
     root
 }

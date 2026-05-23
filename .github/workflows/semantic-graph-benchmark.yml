@@ -14,6 +14,7 @@ on:
   push:
     branches:
       - main
+      - "benchmark-full/**"
     paths:
       - ".github/workflows/semantic-graph-benchmark.yml"
       - "benchmarks/**"
@@ -25,6 +26,17 @@ on:
       - "Cargo.lock"
   workflow_dispatch:
     inputs:
+      language:
+        description: "Benchmark language"
+        required: true
+        default: "rust"
+        type: choice
+        options:
+          - rust
+          - c
+          - cpp
+          - c-family
+          - all
       tier:
         description: "Benchmark tier"
         required: true
@@ -41,8 +53,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  semantic-graph-smoke:
-    name: Semantic graph smoke
+  rust-semantic-graph:
+    name: Rust semantic graph
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'rust' || inputs.language == 'all' }}
     runs-on: macos-latest
 
     steps:
@@ -61,28 +74,30 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
-      - name: Run semantic graph benchmark
+      - name: Run Rust semantic graph smoke benchmark
         run: |
           mkdir -p target/benchmark-repos
           git clone --depth 1 https://github.com/BurntSushi/ripgrep target/benchmark-repos/ripgrep-smoke
           cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language rust \
             --fixture benchmarks/fixtures/rust/semantic-cases \
             --spec benchmarks/specs/smoke-queries.json \
-            --report target/semantic-graph-benchmark/smoke.json \
+            --report target/semantic-graph-benchmark/rust-smoke.json \
             --mixed-repo target/benchmark-repos/ripgrep-smoke \
             --mixed-iterations 1000 \
             --ra-lsp-probes 25
 
-      - name: Run full external benchmark
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.tier == 'full' }}
+      - name: Run full external Rust benchmark
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'full') || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/benchmark-full/')) }}
         run: |
-          mkdir -p target/benchmark-repos
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/rust-real
           while read -r name url; do
             git clone --depth 1 "$url" "target/benchmark-repos/$name"
             cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language rust \
               --fixture benchmarks/fixtures/rust/semantic-cases \
               --spec benchmarks/specs/smoke-queries.json \
-              --report "target/semantic-graph-benchmark/$name.json" \
+              --report "target/semantic-graph-benchmark/rust-real/$name.json" \
               --mixed-repo "target/benchmark-repos/$name" \
               --mixed-iterations 5000 \
               --ra-lsp-probes 50
@@ -94,22 +109,22 @@ jobs:
           serde https://github.com/serde-rs/serde
           REPOS
 
-      - name: Write benchmark summary
+      - name: Write Rust benchmark summary
         run: |
           python3 - <<'PY'
           import glob
           import json
           reports = []
-          for path in sorted(glob.glob("target/semantic-graph-benchmark/*.json")):
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/**/*.json", recursive=True)):
               report = json.load(open(path))
               reports.append((path, report))
-          reports.sort(key=lambda item: (item[0] != "target/semantic-graph-benchmark/smoke.json", item[0]))
-          print("## Semantic Graph Benchmark", file=open("__summary.md", "w"))
-          with open("__summary.md", "a") as out:
+          reports.sort(key=lambda item: (item[0] != "target/semantic-graph-benchmark/rust-smoke.json", item[0]))
+          print("## Rust Semantic Graph Benchmark", file=open("__rust_summary.md", "w"))
+          with open("__rust_summary.md", "a") as out:
               for path, report in reports:
                   print("", file=out)
                   print(f"### {path}", file=out)
-                  print(f"- Rust compiler validation: {report['rustc_check_ms']} ms", file=out)
+                  print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
                   print(f"- Squeezy graph build: {report['squeezy_build_ms']} ms", file=out)
                   print(f"- Squeezy graph queries: {report['squeezy_query_ms']} ms", file=out)
                   acc = report['accuracy']['symbols']
@@ -148,18 +163,6 @@ jobs:
                           f"- Mixed symbol accuracy: TP={macc['true_positive']} FP={macc['false_positive']} FN={macc['false_negative']} precision={macc['precision']} recall={macc['recall']}",
                           file=out,
                       )
-                      print(
-                          f"- Mixed symbol scope: comparable RA={macc['rust_analyzer_total']} raw RA={macc['rust_analyzer_raw_total']} excluded RA={macc['rust_analyzer_excluded_by_kind']} comparable Squeezy={macc['squeezy_total']} raw Squeezy={macc['squeezy_raw_total']} excluded Squeezy={macc['squeezy_excluded_by_kind']}",
-                          file=out,
-                      )
-                      mnav = mixed['accuracy']['navigation']
-                      mdefs = mnav['definitions']
-                      mrefs = mnav['references']
-                      mlsp = mnav['rust_analyzer_lsp_ms'] if mnav['rust_analyzer_lsp_ms'] is not None else mnav['rust_analyzer_lsp_status']
-                      print(
-                          f"- Mixed navigation accuracy: definition probes={mdefs['probes']}/{mdefs['available_probes']} TP={mdefs['true_positive']} FP={mdefs['false_positive']} FN={mdefs['false_negative']} Squeezy-only={mdefs['squeezy_only']} wrong-target={mdefs['wrong_target']}; reference symbols={mrefs['symbols_sampled']}/{mrefs['available_symbols']} TP={mrefs['true_positive']} FP={mrefs['false_positive']} FN={mrefs['false_negative']}; RA LSP={mlsp}",
-                          file=out,
-                      )
                   print("", file=out)
                   print("| Query | Actual | Missing | Extras |", file=out)
                   print("|---|---:|---:|---:|", file=out)
@@ -169,13 +172,167 @@ jobs:
                           file=out,
                       )
           PY
-          cat __summary.md >> "$GITHUB_STEP_SUMMARY"
+          cat __rust_summary.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload benchmark reports
+      - name: Upload Rust benchmark reports
         uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
-          name: semantic-graph-benchmark-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          name: semantic-graph-benchmark-rust-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
           path: |
-            target/semantic-graph-benchmark/*.json
-            __summary.md
+            target/semantic-graph-benchmark/**/*.json
+            __rust_summary.md
+          if-no-files-found: error
+
+  c-family-semantic-graph:
+    name: C/C++ semantic graph
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'c' || inputs.language == 'cpp' || inputs.language == 'c-family' || inputs.language == 'all' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install C/C++ validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          clang --version
+          clang++ --version
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run C semantic graph smoke benchmark
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'c' || inputs.language == 'c-family' || inputs.language == 'all' }}
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language c \
+            --fixture benchmarks/fixtures/c/semantic-cases \
+            --spec benchmarks/specs/c-smoke-queries.json \
+            --report target/semantic-graph-benchmark/c-smoke.json \
+            --ra-lsp-probes 0 \
+            --oracle-files 0
+
+      - name: Run C++ semantic graph smoke benchmark
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.language == 'cpp' || inputs.language == 'c-family' || inputs.language == 'all' }}
+        run: |
+          cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+            --language cpp \
+            --fixture benchmarks/fixtures/cpp/semantic-cases \
+            --spec benchmarks/specs/cpp-smoke-queries.json \
+            --report target/semantic-graph-benchmark/cpp-smoke.json \
+            --ra-lsp-probes 0 \
+            --oracle-files 0
+
+      - name: Run full external C/C++ comparison
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.tier == 'full') || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/benchmark-full/')) }}
+        env:
+          SELECTED_LANGUAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.language || 'all' }}
+        run: |
+          mkdir -p target/benchmark-repos target/semantic-graph-benchmark/c-family-real
+          while read -r name language url; do
+            if [ "$SELECTED_LANGUAGE" = "c" ] && [ "$language" != "c" ]; then
+              continue
+            fi
+            if [ "$SELECTED_LANGUAGE" = "cpp" ] && [ "$language" != "cpp" ]; then
+              continue
+            fi
+            git clone --depth 1 --filter=blob:none "$url" "target/benchmark-repos/$name"
+            if [ "$language" = "c" ]; then
+              fixture="benchmarks/fixtures/c/semantic-cases"
+              spec="benchmarks/specs/c-smoke-queries.json"
+            else
+              fixture="benchmarks/fixtures/cpp/semantic-cases"
+              spec="benchmarks/specs/cpp-smoke-queries.json"
+            fi
+            cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+              --language "$language" \
+              --fixture "$fixture" \
+              --spec "$spec" \
+              --report "target/semantic-graph-benchmark/c-family-real/$name.json" \
+              --mixed-repo "target/benchmark-repos/$name" \
+              --mixed-iterations 1000 \
+              --ra-lsp-probes 0 \
+              --oracle-files 10 \
+              --no-speed-gate
+          done <<'REPOS'
+          redis c https://github.com/redis/redis
+          curl c https://github.com/curl/curl
+          sqlite c https://github.com/sqlite/sqlite
+          protobuf cpp https://github.com/protocolbuffers/protobuf
+          nlohmann_json cpp https://github.com/nlohmann/json
+          REPOS
+
+      - name: Write C/C++ benchmark summary
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+
+          reports = []
+          for path in sorted(glob.glob("target/semantic-graph-benchmark/**/*.json", recursive=True)):
+              reports.append((path, json.load(open(path))))
+
+          with open("__c_family_summary.md", "w") as out:
+              print("## C/C++ Semantic Graph Benchmark", file=out)
+              for path, report in reports:
+                  print("", file=out)
+                  print(f"### {path}", file=out)
+                  print(f"- Language: {report['language']}", file=out)
+                  print(f"- Fixture: {report['fixture']}", file=out)
+                  print(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms", file=out)
+                  print(f"- Squeezy total: {report['squeezy_total_ms']} ms", file=out)
+                  print(f"- Graph: files={report['graph']['files']} symbols={report['graph']['symbols']} edges={report['graph']['edges']} references={report['graph']['references']} calls={report['graph']['calls']}", file=out)
+                  acc = report["accuracy"]["symbols"]
+                  print(f"- Accuracy oracle: {report['accuracy']['rust_analyzer_symbol_status']}", file=out)
+                  print(
+                      f"- Symbol TP/FP/FN: {acc['true_positive']}/{acc['false_positive']}/{acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
+                      file=out,
+                  )
+                  if report["queries"]:
+                      print("", file=out)
+                      print("| Query | Actual | Missing | Extras |", file=out)
+                      print("|---|---:|---:|---:|", file=out)
+                      for query in report["queries"]:
+                          print(
+                              f"| {query['id']} | {len(query['actual'])} | {len(query['missing'])} | {len(query['extras'])} |",
+                              file=out,
+                          )
+                  mixed = report.get("mixed_workload")
+                  if mixed:
+                      print("", file=out)
+                      print(f"- Mixed repo: {mixed['repo']}", file=out)
+                      print(f"- Available scenarios: {mixed['available_scenarios']}", file=out)
+                      print(f"- Executed scenarios: {mixed['executed_scenarios']}", file=out)
+                      print(f"- Tools: {', '.join(mixed['tools'])}", file=out)
+                      compiler = mixed['compiler_check_ms'] if mixed['compiler_check_ms'] is not None else mixed['compiler_check_status']
+                      print(f"- Compiler validation: {compiler}", file=out)
+                      print(f"- Squeezy mixed total: {mixed['squeezy_total_ms']} ms", file=out)
+                      print(f"- Query time by tool: {mixed.get('query_time_ms', {})}", file=out)
+                      print(f"- Refresh after edits: {mixed['refresh_probe']['refresh_ms']} ms", file=out)
+                      print(f"- Reparsed files: {mixed['refresh_probe']['reparsed_files']}", file=out)
+                      print(f"- Accuracy oracle: {mixed['accuracy']['rust_analyzer_symbol_status']}", file=out)
+                      acc = mixed["accuracy"]["symbols"]
+                      print(
+                          f"- Symbol TP/FP/FN: {acc['true_positive']}/{acc['false_positive']}/{acc['false_negative']} precision={acc['precision']} recall={acc['recall']}",
+                          file=out,
+                      )
+                      print(f"- Oracle exclusions: {acc['squeezy_excluded_by_kind']}", file=out)
+          PY
+          cat __c_family_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload C/C++ benchmark reports
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: semantic-graph-benchmark-c-family-${{ github.event_name == 'workflow_dispatch' && inputs.tier || 'smoke' }}
+          path: |
+            target/semantic-graph-benchmark/**/*.json
+            __c_family_summary.md
           if-no-files-found: error

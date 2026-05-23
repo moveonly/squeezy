@@ -1,0 +1,62 @@
+{
+  "queries": [
+    {
+      "id": "cpp-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Module:app",
+        "Class:Base",
+        "Class:Runner",
+        "Method:run",
+        "Method:peer",
+        "Function:helper",
+        "Function:call_runner"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "cpp-template-runner",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "attribute": "c++:template",
+      "expected_contains": [
+        "Class:Runner"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "cpp-call-chain",
+      "kind": "body_search",
+      "text": "runner.run",
+      "expected_contains": [
+        "call_runner:runner.run(1)"
+      ],
+      "documented_misses": [
+        {
+          "result": "exact overload/template instantiation target",
+          "reason": "template and overload resolution is reported as candidate-set confidence"
+        }
+      ]
+    },
+    {
+      "id": "cpp-same-class-direct-call",
+      "kind": "call_chain",
+      "from": "peer",
+      "to": "helper",
+      "expected_contains": [
+        "peer -> helper"
+      ],
+      "documented_misses": []
+    },
+    {
+      "id": "cpp-base-reference",
+      "kind": "reference_search",
+      "text": "Base",
+      "expected_contains": [
+        "Base"
+      ],
+      "documented_misses": []
+    }
+  ]
+}
