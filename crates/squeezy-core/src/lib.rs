@@ -497,7 +497,16 @@ impl AppConfig {
         if self.redaction.custom_patterns.is_empty() {
             output.push_str("custom_patterns = []\n\n");
         } else {
-            output.push_str("custom_patterns = [\"<redacted>\"]\n\n");
+            // Emit a TOML comment so the document still round-trips through
+            // `SettingsFile::from_toml_str`, but do not echo the literal
+            // patterns. A previous version emitted
+            // `custom_patterns = ["<redacted>"]`, which was itself a valid
+            // (no-op) regex if pasted back into a settings file.
+            output.push_str(&format!(
+                "# {} custom redaction pattern(s) hidden in inspect output\n",
+                self.redaction.custom_patterns.len(),
+            ));
+            output.push_str("custom_patterns = []\n\n");
         }
 
         output.push_str("[web]\n");
@@ -1436,7 +1445,11 @@ impl Redactor {
             return RedactedText::unchanged("");
         }
 
-        let mut output = Cow::Borrowed(text);
+        // Track allocation lazily: keep `output` borrowed until a pattern
+        // actually replaces something, then own the result. This keeps the
+        // common no-match case allocation-free, which matters because the
+        // redactor runs over every tool result, JSON arg, and model request.
+        let mut output: Cow<'_, str> = Cow::Borrowed(text);
         let mut values = BTreeMap::<String, usize>::new();
         let mut redactions = 0u64;
         for pattern in &self.patterns {
@@ -1446,13 +1459,176 @@ impl Redactor {
                     redactions += 1;
                     redact_capture(pattern.kind, captures, &mut values)
                 });
-            output = Cow::Owned(next.into_owned());
+            if let Cow::Owned(owned) = next {
+                output = Cow::Owned(owned);
+            }
         }
-        RedactedText {
-            text: output.into_owned(),
+        match output {
+            Cow::Borrowed(_) => RedactedText::unchanged(text),
+            Cow::Owned(owned) => RedactedText {
+                text: owned,
+                redactions,
+            },
+        }
+    }
+}
+
+/// Incrementally redacts a streaming text channel.
+///
+/// Emitting redacted token deltas naively is unsafe: a secret can be split
+/// across two stream chunks, and a regex applied to either half misses it.
+/// `StreamRedactor` keeps a tail buffer large enough to cover any realistic
+/// single-line token plus a "hold" mode that suppresses output entirely
+/// while a multi-line PEM block is open. Callers append text with [`push`]
+/// (returning what is now safe to emit) and end with [`finish`] (returning
+/// any remaining text after a final redaction pass).
+///
+/// [`push`]: StreamRedactor::push
+/// [`finish`]: StreamRedactor::finish
+#[derive(Debug)]
+pub struct StreamRedactor {
+    redactor: std::sync::Arc<Redactor>,
+    buffer: String,
+    redactions: u64,
+    pem_open: bool,
+}
+
+/// Maximum number of bytes the stream redactor will keep buffered when no
+/// multi-line pattern is open. Sized to comfortably exceed the longest
+/// realistic single-line secret (long JWTs, bearer tokens, signed URLs).
+const STREAM_TAIL_BYTES: usize = 1024;
+
+const PEM_BEGIN: &str = "-----BEGIN";
+const PEM_END: &str = "-----END";
+
+impl StreamRedactor {
+    pub fn new(redactor: std::sync::Arc<Redactor>) -> Self {
+        Self {
+            redactor,
+            buffer: String::new(),
+            redactions: 0,
+            pem_open: false,
+        }
+    }
+
+    /// Append `delta` to the internal buffer and return whatever portion is
+    /// now safe to emit downstream. Returned text is fully redacted.
+    pub fn push(&mut self, delta: &str) -> StreamChunk {
+        if delta.is_empty() {
+            return StreamChunk::empty();
+        }
+        self.buffer.push_str(delta);
+        self.try_emit()
+    }
+
+    /// Flush any remaining buffered text after a final redaction pass.
+    /// Returns the trailing redacted text and the total redactions seen
+    /// since this redactor was created.
+    pub fn finish(&mut self) -> StreamChunk {
+        if self.buffer.is_empty() {
+            return StreamChunk {
+                text: String::new(),
+                redactions: 0,
+            };
+        }
+        let RedactedText { text, redactions } = self.redactor.redact(&self.buffer);
+        self.redactions += redactions;
+        self.buffer.clear();
+        self.pem_open = false;
+        StreamChunk { text, redactions }
+    }
+
+    pub fn total_redactions(&self) -> u64 {
+        self.redactions
+    }
+
+    fn try_emit(&mut self) -> StreamChunk {
+        // If we previously opened a PEM block, hold until we see END.
+        if self.pem_open {
+            if !self.buffer.contains(PEM_END) {
+                return StreamChunk::empty();
+            }
+            self.pem_open = false;
+        } else if let Some(begin) = self.buffer.find(PEM_BEGIN)
+            && !self.buffer[begin..].contains(PEM_END)
+        {
+            self.pem_open = true;
+            return StreamChunk::empty();
+        }
+
+        if self.buffer.len() <= STREAM_TAIL_BYTES {
+            return StreamChunk::empty();
+        }
+
+        // Redaction markers are idempotent w.r.t. the built-in patterns, so
+        // running the redactor over the whole buffer on each push is safe;
+        // the previously-emitted prefix has been removed from `buffer`.
+        let RedactedText { text, redactions } = self.redactor.redact(&self.buffer);
+        self.redactions += redactions;
+
+        if text.len() <= STREAM_TAIL_BYTES {
+            self.buffer = text;
+            return StreamChunk {
+                text: String::new(),
+                redactions,
+            };
+        }
+
+        let mut emit_end = text.len() - STREAM_TAIL_BYTES;
+        emit_end = floor_char_boundary(&text, emit_end);
+        emit_end = avoid_marker_split(&text, emit_end);
+        if emit_end == 0 {
+            self.buffer = text;
+            return StreamChunk {
+                text: String::new(),
+                redactions,
+            };
+        }
+        let emitted = text[..emit_end].to_string();
+        self.buffer = text[emit_end..].to_string();
+        StreamChunk {
+            text: emitted,
             redactions,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamChunk {
+    pub text: String,
+    pub redactions: u64,
+}
+
+impl StreamChunk {
+    pub fn empty() -> Self {
+        Self {
+            text: String::new(),
+            redactions: 0,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+}
+
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn avoid_marker_split(text: &str, idx: usize) -> usize {
+    let prefix = &text[..idx];
+    let Some(open) = prefix.rfind("<redacted:") else {
+        return idx;
+    };
+    if prefix[open..].contains('>') {
+        return idx;
+    }
+    floor_char_boundary(text, open)
 }
 
 impl Default for Redactor {
@@ -1499,9 +1675,18 @@ fn redaction_marker(
 }
 
 const DEFAULT_REDACTION_PATTERNS: &[(&str, &str)] = &[
+    // Order matters: `secret_assignment` runs first and consumes the value
+    // half of `KEY=...`-style strings, so the per-provider patterns below
+    // typically only fire on bare tokens that appear without an assignment
+    // prefix (for example pasted command output). Keep that contract in
+    // mind when reordering.
+    //
+    // The captured value excludes common trailing punctuation (`)`, `]`,
+    // `}`, `>`, plus separators) so that surrounding shape is preserved in
+    // shell output like `KEY=foo)` or markdown like `KEY=foo]`.
     (
         "secret_assignment",
-        r#"(?i)\b[A-Z0-9_]*(?:API|AUTH|BEARER|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*\s*=\s*["']?(?P<value>[^\s"',;`]+)"#,
+        r#"(?i)\b[A-Z0-9_]*(?:API|AUTH|BEARER|CREDENTIAL|KEY|PASSWORD|SECRET|TOKEN)[A-Z0-9_]*\s*=\s*["']?(?P<value>[^\s"',;`)\]}>]+)"#,
     ),
     (
         "url_query",

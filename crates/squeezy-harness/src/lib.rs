@@ -195,6 +195,7 @@ pub struct HarnessMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub redactions: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -521,23 +522,11 @@ async fn run_agent_with_config(
                 metrics.spill_writes = turn_metrics.spill_writes;
                 metrics.spill_reads = turn_metrics.spill_reads;
                 metrics.budget_denials = turn_metrics.budget_denials;
+                metrics.redactions = turn_metrics.redactions;
                 metrics.input_tokens = cost.input_tokens;
                 metrics.output_tokens = cost.output_tokens;
                 metrics.cached_input_tokens = cost.cached_input_tokens;
                 metrics.estimated_usd_micros = cost.estimated_usd_micros;
-                metrics.tool_calls = turn_metrics.tool_calls;
-                metrics.tool_successes = turn_metrics.tool_successes;
-                metrics.tool_errors = turn_metrics.tool_errors;
-                metrics.tool_denials = turn_metrics.tool_denials;
-                metrics.tool_cancellations = turn_metrics.tool_cancellations;
-                metrics.files_scanned = turn_metrics.files_scanned;
-                metrics.bytes_read = turn_metrics.bytes_read;
-                metrics.matches_returned = turn_metrics.matches_returned;
-                metrics.receipt_stub_hits = turn_metrics.receipt_stub_hits;
-                metrics.negative_receipt_hits = turn_metrics.negative_receipt_hits;
-                metrics.spill_writes = turn_metrics.spill_writes;
-                metrics.spill_reads = turn_metrics.spill_reads;
-                metrics.budget_denials = turn_metrics.budget_denials;
                 trace.push(trace_completed(response_id, cost));
                 break;
             }

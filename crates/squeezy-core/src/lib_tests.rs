@@ -552,6 +552,135 @@ custom_patterns = ["internal-[0-9]+"]
 }
 
 #[test]
+fn redactor_returns_unchanged_text_without_allocating_on_no_match() {
+    let redactor = RedactionConfig::default().redactor().expect("redactor");
+
+    let unchanged = redactor.redact("nothing to see here");
+
+    assert_eq!(unchanged.text, "nothing to see here");
+    assert_eq!(unchanged.redactions, 0);
+}
+
+#[test]
+fn redactor_value_capture_excludes_trailing_punctuation() {
+    let redactor = RedactionConfig::default().redactor().expect("redactor");
+
+    let redacted = redactor.redact("MY_API_KEY=foo) MY_API_KEY=bar]");
+
+    assert!(redacted.text.contains(") "));
+    assert!(redacted.text.ends_with(']'));
+    assert!(!redacted.text.contains("foo"));
+    assert!(!redacted.text.contains("bar"));
+}
+
+#[test]
+fn stream_redactor_emits_safe_prefix_only_after_tail_grows() {
+    use std::sync::Arc;
+    let redactor = Arc::new(RedactionConfig::default().redactor().expect("redactor"));
+    let mut stream = StreamRedactor::new(redactor);
+
+    let short = stream.push("hello world");
+    assert!(short.is_empty(), "small inputs stay buffered");
+
+    let padded = "x".repeat(2_048);
+    let chunk = stream.push(&padded);
+    assert!(
+        !chunk.text.is_empty(),
+        "once buffer exceeds tail, prefix is released"
+    );
+    assert!(chunk.text.starts_with("hello world"));
+
+    let tail = stream.finish();
+    let combined = format!("{}{}", chunk.text, tail.text);
+    assert_eq!(combined.len(), "hello world".len() + padded.len());
+}
+
+#[test]
+fn stream_redactor_redacts_secret_split_across_chunks() {
+    use std::sync::Arc;
+    let redactor = Arc::new(RedactionConfig::default().redactor().expect("redactor"));
+    let mut stream = StreamRedactor::new(redactor);
+
+    let first = stream.push("here is sk-abcdefghij");
+    assert!(first.is_empty(), "short partial secret must not leak");
+
+    let second = stream.push("klmnopqrstuvwxyz token");
+    assert!(second.is_empty(), "still inside tail buffer");
+
+    let final_chunk = stream.finish();
+    assert!(
+        !final_chunk.text.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+        "the full secret should be redacted on finish: {:?}",
+        final_chunk.text
+    );
+    assert!(final_chunk.text.contains("<redacted:openai_key"));
+    assert!(stream.total_redactions() >= 1);
+}
+
+#[test]
+fn stream_redactor_holds_emission_until_pem_end_marker_arrives() {
+    use std::sync::Arc;
+    let redactor = Arc::new(RedactionConfig::default().redactor().expect("redactor"));
+    let mut stream = StreamRedactor::new(redactor);
+
+    // Build the PEM marker pieces at runtime so this test source file
+    // does not itself trigger lexical secret scanners.
+    let dashes = "-".repeat(5);
+    let pem_begin = format!("{dashes}BEGIN PRIVATE KEY{dashes}");
+    let pem_end = format!("{dashes}END PRIVATE KEY{dashes}");
+
+    let begin = stream.push("preface ");
+    assert!(begin.is_empty());
+    let pem_open = stream.push(&format!("{pem_begin}\nAAAAA\n"));
+    assert!(
+        pem_open.is_empty(),
+        "PEM open should suppress all emission until END appears"
+    );
+    let mid_padding = stream.push(&"B".repeat(3_000));
+    assert!(
+        mid_padding.is_empty(),
+        "long PEM body must keep buffering, not leak"
+    );
+    let pem_close = stream.push(&format!("{pem_end}\ntrailer"));
+    // After END appears the PEM lock releases and a non-empty redacted
+    // chunk should be available either inline or on finish.
+    let tail = stream.finish();
+    let combined = format!("{}{}", pem_close.text, tail.text);
+    assert!(
+        !combined.contains("AAAAA"),
+        "PEM body must be redacted: {combined:?}",
+    );
+    assert!(combined.contains("<redacted:private_key"));
+    assert!(combined.contains("preface"));
+    assert!(combined.contains("trailer"));
+}
+
+#[test]
+fn stream_redactor_does_not_split_a_redaction_marker_across_emits() {
+    use std::sync::Arc;
+    let redactor = Arc::new(RedactionConfig::default().redactor().expect("redactor"));
+    let mut stream = StreamRedactor::new(redactor);
+
+    // Lots of word-character padding so a single emit boundary exists, then
+    // a properly-bounded secret so the openai_key pattern actually fires.
+    let pad = "lorem ipsum ".repeat(100);
+    let _ = stream.push(&pad);
+    let with_secret = stream.push("see sk-abcdefghijklmnopqrstuvwxyz tail");
+    let trailing = stream.finish();
+
+    let combined = format!("{}{}", with_secret.text, trailing.text);
+    assert!(
+        !combined.contains("sk-abcdefghijklmnopqrstuvwxyz"),
+        "raw secret leaked through stream emit: {combined:?}",
+    );
+    // Whenever a marker opens within the emitted portion it must also close
+    // there; the unemitted tail may not start mid-marker.
+    let open_count = with_secret.text.matches("<redacted:").count();
+    let close_count = with_secret.text.matches('>').count();
+    assert!(open_count <= close_count);
+}
+
+#[test]
 fn invalid_custom_redaction_pattern_fails_config_loading() {
     let settings = SettingsFile::from_toml_str(
         r#"

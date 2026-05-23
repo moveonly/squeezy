@@ -134,7 +134,7 @@ async fn user_input_is_redacted_before_model_request_and_transcript() {
 }
 
 #[tokio::test]
-async fn assistant_text_and_provider_errors_are_redacted_before_events() {
+async fn assistant_text_is_redacted_in_streamed_deltas_and_completed_message() {
     let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
         Ok(LlmEvent::TextDelta("token sk-abcdefghijk".to_string())),
@@ -148,10 +148,10 @@ async fn assistant_text_and_provider_errors_are_redacted_before_events() {
 
     let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
     let mut completed = None;
-    let mut saw_delta = false;
+    let mut deltas: Vec<String> = Vec::new();
     while let Some(event) = rx.recv().await {
         match event {
-            AgentEvent::AssistantDelta { .. } => saw_delta = true,
+            AgentEvent::AssistantDelta { delta, .. } => deltas.push(delta),
             AgentEvent::Completed {
                 message, metrics, ..
             } => {
@@ -162,14 +162,72 @@ async fn assistant_text_and_provider_errors_are_redacted_before_events() {
     }
 
     let (message, redactions) = completed.expect("completed");
-    assert!(
-        !saw_delta,
-        "assistant deltas are withheld until redacted safely"
-    );
+    let combined_delta = deltas.join("");
+    // The secret is split across two TextDelta events; safe streaming
+    // must redact at the seam, not after the fact.
+    assert!(!combined_delta.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(!message.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(message.contains("<redacted:openai_key"));
+    // The streamed deltas concatenate into the same message we publish
+    // at completion; no drift between the live view and the transcript.
+    assert_eq!(combined_delta, message);
     assert!(redactions > 0);
+}
 
+#[tokio::test]
+async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
+    let root = temp_workspace("agent_approval_redaction");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": "curl -H 'Authorization: Bearer abcdefghijklmnopqrstuvwxyz' https://example.com",
+                "description": "fetch with token"
+            }),
+        })),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("run".to_string(), CancellationToken::new());
+    let mut summary = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested {
+            request,
+            decision_tx,
+            ..
+        } = event
+        {
+            summary = Some(request.summary.clone());
+            let _ = decision_tx.send(ToolApprovalDecision::Denied);
+        }
+    }
+
+    let summary = summary.expect("approval summary");
+    assert!(
+        !summary.contains("abcdefghijklmnopqrstuvwxyz"),
+        "approval summary leaked bearer token: {summary:?}",
+    );
+    assert!(summary.contains("<redacted:bearer_token"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn provider_errors_are_redacted_before_failure_event() {
     let provider = Arc::new(MockProvider::new(vec![vec![Err(
         SqueezyError::ProviderRequest(
             "failed with token sk-abcdefghijklmnopqrstuvwxyz".to_string(),

@@ -163,3 +163,32 @@ leak into copied diagnostics. Redaction happens before tool output is returned
 to the model, before large tool output is spilled to disk, before model
 requests are sent, and before TUI/status surfaces display provider errors or
 tool results.
+
+### Pattern Syntax
+
+`redaction.custom_patterns` are Rust [`regex`](https://docs.rs/regex) crate
+patterns, not PCRE. Inline flags like `(?i)` are supported, but PCRE-only
+constructs (lookaround, backreferences) are not. An optional named capture
+group `(?P<value>...)` may be used to redact just part of the match while
+leaving surrounding context (for example a `KEY=` prefix) intact.
+
+### Pattern Order
+
+The built-in patterns run in declared order; custom patterns run last.
+`secret_assignment` runs first and consumes the value half of
+`KEY=…`-style strings, so the more specific provider patterns
+(`openai_key`, `anthropic_key`, `google_key`, `github_token`, `aws_access_key`,
+`jwt`) typically only fire on bare tokens in prose or shell output without
+a `KEY=` prefix. This means `OPENAI_API_KEY=sk-…` redacts via
+`secret_assignment` (label is preserved, value is masked), while a bare
+`sk-…` token in command output redacts via `openai_key`.
+
+### Streaming and Multi-Line Secrets
+
+Assistant text is streamed through an incremental redactor that buffers a
+short tail (1 KiB) before releasing each delta. This guarantees that a
+secret split across two streamed tokens is redacted at the seam rather than
+leaking briefly into the TUI. When a `-----BEGIN PRIVATE KEY-----` marker
+opens, the entire PEM block is held until the matching `-----END` marker
+arrives or the turn finishes, whichever comes first. The trade-off is up to
+~1 KiB of additional latency at the tail of each assistant message.

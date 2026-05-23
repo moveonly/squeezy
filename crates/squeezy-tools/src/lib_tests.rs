@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use squeezy_core::{RedactionConfig, SkillsConfig};
+use squeezy_core::{Redactor, SkillsConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -473,6 +473,57 @@ async fn grep_and_shell_outputs_are_redacted() {
     assert!(!stdout.contains("sk-abcdefghijklmnopqrstuvwxyz"));
     assert!(stdout.contains("OPENAI_API_KEY="));
     assert!(shell.cost_hint.redactions > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn spilled_tool_output_file_is_redacted_on_disk() {
+    let root = temp_workspace("spill_redaction");
+    let mut payload = String::new();
+    payload.push_str("token=ghp_abcdefghijklmnopqrstuvwxyz ");
+    payload.push_str(&"padding".repeat(2_000));
+    fs::write(root.join("payload.txt"), &payload).expect("write payload");
+    let registry = ToolRegistry::new_with_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 256,
+            preview_bytes: 32,
+            retention_days: 1,
+            output_dir: None,
+        },
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spill".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "payload.txt", "limit": 200_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    let handle = result.content["handle"].as_str().expect("handle");
+    let spill_path = root
+        .canonicalize()
+        .expect("canonical")
+        .join(".squeezy")
+        .join("tool_outputs")
+        .join(format!("{handle}.json"));
+    let on_disk = fs::read_to_string(&spill_path).expect("read spill");
+    assert!(
+        !on_disk.contains("ghp_abcdefghijklmnopqrstuvwxyz"),
+        "spill file leaked raw secret: {spill_path:?}\n{on_disk}",
+    );
+    assert!(
+        on_disk.contains("<redacted:"),
+        "spill file should contain redaction marker: {spill_path:?}\n{on_disk}",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1543,7 +1594,7 @@ async fn skill_tools_list_metadata_and_load_body() {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
         },
-        RedactionConfig::default(),
+        Arc::new(Redactor::default()),
     )
     .expect("registry");
 

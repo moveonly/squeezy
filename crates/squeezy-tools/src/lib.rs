@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
-    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionScope, RedactionConfig, Redactor, Result,
-    SkillsConfig, SqueezyError,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, PermissionScope, Redactor, Result, SkillsConfig,
+    SqueezyError,
 };
 use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
@@ -412,7 +412,7 @@ impl ToolRegistry {
             output_config,
             web_config,
             SkillCatalog::empty(),
-            RedactionConfig::default(),
+            Arc::new(Redactor::default()),
         )
     }
 
@@ -421,14 +421,14 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills_config: SkillsConfig,
-        redaction_config: RedactionConfig,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
         let skills = SkillCatalog::discover(&root, &skills_config);
-        Self::new_inner_canonical(root, output_config, web_config, skills, redaction_config)
+        Self::new_inner_canonical(root, output_config, web_config, skills, redactor)
     }
 
     fn new_inner(
@@ -436,13 +436,13 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
-        redaction_config: RedactionConfig,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
             .map_err(|err| SqueezyError::Tool(format!("invalid workspace root: {err}")))?;
-        Self::new_inner_canonical(root, output_config, web_config, skills, redaction_config)
+        Self::new_inner_canonical(root, output_config, web_config, skills, redactor)
     }
 
     fn new_inner_canonical(
@@ -450,13 +450,12 @@ impl ToolRegistry {
         output_config: ToolOutputConfig,
         web_config: WebToolConfig,
         skills: SkillCatalog,
-        redaction_config: RedactionConfig,
+        redactor: Arc<Redactor>,
     ) -> Result<Self> {
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
         let graph = GraphManager::open(&root).ok();
         let vcs = GitVcs::open(&root)?;
-        let redactor = redaction_config.redactor()?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -466,7 +465,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
-            redactor: Arc::new(redactor),
+            redactor,
         })
     }
 

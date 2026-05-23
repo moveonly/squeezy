@@ -12,7 +12,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionScope, Redactor, SessionMetrics,
-    SqueezyError, TranscriptItem, TurnId, TurnMetrics,
+    SqueezyError, StreamRedactor, TranscriptItem, TurnId, TurnMetrics,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
@@ -52,23 +52,35 @@ impl Agent {
             exa_mcp_url: config.exa_mcp_url.clone(),
             exa_api_key: env::var(&config.exa_api_key_env).ok(),
         };
-        let tools = ToolRegistry::new_with_configs_and_skills(
-            config.workspace_root.clone(),
-            output_config.clone(),
-            web_config.clone(),
-            config.skills.clone(),
-            config.redaction.clone(),
-        )
-        .unwrap_or_else(|_| {
-            ToolRegistry::new_with_configs(".", output_config, web_config)
-                .expect("current directory must be a valid tool root")
-        });
+        // Compile the redactor exactly once and share it with the tool
+        // registry. Pattern compilation can never fail here because the
+        // surrounding config was already validated when loading.
         let redactor = Arc::new(
             config
                 .redaction
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
+        let tools = ToolRegistry::new_with_configs_and_skills(
+            config.workspace_root.clone(),
+            output_config.clone(),
+            web_config.clone(),
+            config.skills.clone(),
+            redactor.clone(),
+        )
+        .unwrap_or_else(|_| {
+            // Workspace root unavailable; fall back to the current
+            // directory but keep the configured redactor so the agent
+            // never silently downgrades to default patterns.
+            ToolRegistry::new_with_configs_and_skills(
+                ".",
+                output_config,
+                web_config,
+                config.skills.clone(),
+                redactor.clone(),
+            )
+            .expect("current directory must be a valid tool root")
+        });
         Self {
             telemetry: TelemetryClient::from_config(&config),
             config,
@@ -134,6 +146,7 @@ impl Agent {
                 tx: tx.clone(),
                 cancel,
                 approval_ids,
+                seed_redactions: redacted_input.redactions,
             }
             .run(redacted_input.text)
             .await;
@@ -161,27 +174,46 @@ struct TurnRuntime {
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
+    // Redactions that already happened on the raw user input before the
+    // turn loop began; folded into the first round's metrics so the
+    // session metric never undercounts user-side scrubbing.
+    seed_redactions: u64,
 }
 
 impl TurnRuntime {
-    async fn run(self, input: String) -> squeezy_core::Result<()> {
+    async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let activation = self.tools.activate_skills_for_input(&input)?;
-        let request_instructions = match self.tools.format_active_skills(&activation.skills) {
+        let raw_instructions = match self.tools.format_active_skills(&activation.skills) {
             Some(skills) => format!("{}\n\n{}", self.config.instructions, skills),
             None => self.config.instructions.clone(),
         };
         let mut conversation = vec![LlmInputItem::UserText(activation.task_input)];
         let mut next_input = conversation.clone();
         let mut previous_response_id = None;
-        let mut assistant_text = String::new();
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::default();
         let mut broker = CostBroker::new(&self.config);
+        broker.metrics.redactions += std::mem::take(&mut self.seed_redactions);
+        // Instructions are static across the turn's tool rounds; redact
+        // them once so the cost is not paid (or double-counted) per round.
+        let redacted_instructions = self.redactor.redact(&raw_instructions);
+        broker.metrics.redactions += redacted_instructions.redactions;
+        let request_instructions = redacted_instructions.text;
+        // Holding a single stream redactor across rounds keeps the tail
+        // buffer alive so a secret straddling a tool-call boundary is
+        // still redacted before being released downstream.
+        let mut assistant_stream = StreamRedactor::new(self.redactor.clone());
+        // The Completed event's message is the concatenation of every
+        // AssistantDelta we have already emitted plus the final flushed
+        // tail. Building it as we go (rather than re-redacting the raw
+        // text at the end) keeps ordinals stable between what streamed
+        // into the TUI and what lands in the transcript.
+        let mut assistant_message = String::new();
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
                 model: self.config.model.clone(),
-                instructions: self.redactor.redact(&request_instructions).text,
+                instructions: request_instructions.clone(),
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 previous_response_id: previous_response_id.clone(),
@@ -209,7 +241,22 @@ impl TurnRuntime {
                         }
                     }
                     Ok(LlmEvent::TextDelta(delta)) => {
-                        assistant_text.push_str(&delta);
+                        let chunk = assistant_stream.push(&delta);
+                        if chunk.text.is_empty() {
+                            continue;
+                        }
+                        assistant_message.push_str(&chunk.text);
+                        if self
+                            .tx
+                            .send(AgentEvent::AssistantDelta {
+                                turn_id: self.turn_id,
+                                delta: chunk.text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                     Ok(LlmEvent::ToolCall(tool_call)) => {
                         let call = ToolCall {
@@ -258,13 +305,14 @@ impl TurnRuntime {
             }
 
             if !completed {
-                let redacted_message = self.redactor.redact(&assistant_text);
-                broker.metrics.redactions += redacted_message.redactions;
+                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await;
+                broker.metrics.redactions += assistant_stream.total_redactions();
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(redacted_message.text),
+                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -275,13 +323,14 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
-                let redacted_message = self.redactor.redact(&assistant_text);
-                broker.metrics.redactions += redacted_message.redactions;
+                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await;
+                broker.metrics.redactions += assistant_stream.total_redactions();
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
                         turn_id: self.turn_id,
-                        message: TranscriptItem::assistant(redacted_message.text),
+                        message: TranscriptItem::assistant(std::mem::take(&mut assistant_message)),
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
@@ -352,6 +401,29 @@ impl TurnRuntime {
         ));
         self.session_metrics.lock().await.merge_turn(metrics);
     }
+
+    /// Flushes any text the stream redactor is still holding behind its
+    /// tail buffer, emitting it as a final AssistantDelta and appending
+    /// it to the running message accumulator. Idempotent on an already
+    /// flushed stream.
+    async fn flush_assistant_stream(
+        &self,
+        assistant_stream: &mut StreamRedactor,
+        assistant_message: &mut String,
+    ) {
+        let tail = assistant_stream.finish();
+        if tail.text.is_empty() {
+            return;
+        }
+        assistant_message.push_str(&tail.text);
+        let _ = self
+            .tx
+            .send(AgentEvent::AssistantDelta {
+                turn_id: self.turn_id,
+                delta: tail.text,
+            })
+            .await;
+    }
 }
 
 #[derive(Clone)]
@@ -402,18 +474,7 @@ async fn execute_tool_calls(
             }
         };
 
-        match permission_decision(
-            context.turn_id,
-            call,
-            context.tools,
-            context.config,
-            &context.redactor,
-            &context.tx,
-            &context.cancel,
-            context.approval_ids.clone(),
-        )
-        .await
-        {
+        match permission_decision(&context, call).await {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
@@ -796,42 +857,39 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
 }
 
 async fn permission_decision(
-    turn_id: TurnId,
+    context: &ToolExecutionContext<'_>,
     call: &ToolCall,
-    tools: &ToolRegistry,
-    config: &AppConfig,
-    redactor: &Redactor,
-    tx: &mpsc::Sender<AgentEvent>,
-    cancel: &CancellationToken,
-    approval_ids: Arc<AtomicU64>,
 ) -> ApprovalDecision {
-    let scope = tools.permission_scope(call);
-    match config.permissions.mode_for(scope) {
+    let scope = context.tools.permission_scope(call);
+    match context.config.permissions.mode_for(scope) {
         PermissionMode::Allow => ApprovalDecision::Approved,
         PermissionMode::Deny => ApprovalDecision::Denied(format!("{scope:?} permission is denied")),
         PermissionMode::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
             let request = ToolApprovalRequest {
-                id: approval_ids.fetch_add(1, Ordering::Relaxed),
+                id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
                 tool_name: call.name.clone(),
                 scope,
-                summary: redactor.redact(&tools.describe_call(call)).text,
+                summary: context
+                    .redactor
+                    .redact(&context.tools.describe_call(call))
+                    .text,
             };
-            let send_approval = tx.send(AgentEvent::ApprovalRequested {
-                turn_id,
+            let send_approval = context.tx.send(AgentEvent::ApprovalRequested {
+                turn_id: context.turn_id,
                 request,
                 decision_tx,
             });
             let send_result = tokio::select! {
-                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
                 result = send_approval => result,
             };
             if send_result.is_err() {
                 return ApprovalDecision::Denied("approval channel closed".to_string());
             }
             match tokio::select! {
-                _ = cancel.cancelled() => return ApprovalDecision::Cancelled,
+                _ = context.cancel.cancelled() => return ApprovalDecision::Cancelled,
                 decision = decision_rx => decision,
             } {
                 Ok(ToolApprovalDecision::Approved) => ApprovalDecision::Approved,
