@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@091bd13faf7e96935df105635d17ce9a607bc99d # v2
+        with:
+          rust-version: "1.93.1"
+          command: check
+          arguments: --all-features
+
+  build-test-lint-coverage:
+    name: Build, test, lint, coverage
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Ensure Rust components
+        run: rustup component add rustfmt clippy llvm-tools-preview
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cace7d8762492808237e791b718365fe6f57c8b2 # cargo-llvm-cov
+
+      - name: Install CI tools
+        run: brew install actionlint
+
+      - name: Check secrets
+        uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+      - name: Check workflows
+        run: actionlint
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check unit test layout
+        run: python3 scripts/check_test_layout.py
+
+      - name: Check Rust targets
+        run: |
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace --all-targets
+
+      - name: Coverage summary
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo llvm-cov --workspace --all-targets --summary-only | tee coverage-summary.txt
+          {
+            echo "## Coverage Summary"
+            echo
+            echo '```text'
+            cat coverage-summary.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

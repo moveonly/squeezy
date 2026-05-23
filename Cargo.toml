@@ -1,0 +1,49 @@
+[workspace]
+members = [
+    "crates/squeezy-agent",
+    "crates/squeezy-cli",
+    "crates/squeezy-core",
+    "crates/squeezy-graph",
+    "crates/squeezy-llm",
+    "crates/squeezy-parse",
+    "crates/squeezy-rank",
+    "crates/squeezy-store",
+    "crates/squeezy-tools",
+    "crates/squeezy-tui",
+    "crates/squeezy-workspace",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+license = "Apache-2.0"
+repository = "https://github.com/opensqueezy/squeezy"
+publish = false
+
+[workspace.dependencies]
+async-stream = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-core = "0.3"
+futures-util = "0.3"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+squeezy-agent = { path = "crates/squeezy-agent" }
+squeezy-core = { path = "crates/squeezy-core" }
+squeezy-llm = { path = "crates/squeezy-llm" }
+squeezy-tui = { path = "crates/squeezy-tui" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

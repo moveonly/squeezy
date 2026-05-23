@@ -1,0 +1,17 @@
+[package]
+name = "squeezy-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+ratatui.workspace = true
+squeezy-agent.workspace = true
+squeezy-core.workspace = true
+squeezy-llm.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true

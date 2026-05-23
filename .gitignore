@@ -1,0 +1,28 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node
+node_modules/
+
+.agents/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# Rust
+/target/
+
+# Squeezy local runtime state
+/.squeezy/
+
+# Coverage reports
+/target/llvm-cov/

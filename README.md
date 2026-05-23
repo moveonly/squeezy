@@ -1,0 +1,56 @@
+# Squeezy
+
+A coding agent that treats cost, speed, and code understanding as first-class citizens.
+
+Squeezy parses repositories and builds a persistent local semantic graph. The agent queries this graph through structured tools that return compact evidence packets — spans, hashes, confidence, freshness — instead of raw file dumps.
+
+> **Status:** early development. The foundation TUI scaffold is runnable; graph-backed navigation is still planned. Committed decisions live in [`docs/`](docs).
+
+## Cost
+
+Every model token is a budgeted resource.
+
+- **Context receipts** let re-reads return stubs that reference an earlier result instead of resending bytes.
+- An **exploration compiler** translates model intent into a deterministic local query plan; only the final compact evidence packet ships to the model.
+- A **cost broker** enforces per-turn caps on `grep`, raw reads, and tool calls, and routes trivial work to cheaper models.
+- **Failure memory** keeps the agent from repeating dead-end searches across compactions.
+- The static system prompt is held stable so provider caches actually hit.
+
+## Speed
+
+Latency is tracked along four axes:
+
+- **Time-to-first-token**, by sending focused context rather than raw file dumps.
+- **Task wall-clock**, by reducing tool calls and redo cycles.
+- **Cold start**, by lazy indexing on first run and persisting the graph between sessions.
+- **Tool-call latency**, by serving graph queries from local indexes, not network or compiler services.
+
+## Code understanding
+
+The semantic graph is the primary navigation surface; bounded grep is a labeled fallback.
+
+- Every relationship carries a **confidence label** (`exact_syntax`, `import_resolved`, `candidate_set`, `external`, `unknown`).
+- Every claim carries **provenance**: spans, hashes, parser/query origin, freshness.
+- **Framework adapters** (planned) expose routes and system functions as graph nodes when a framework is detected.
+- The **current branch diff** is first-class context: "what did I just change and what does it affect" is one query, not a search.
+- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence.
+
+## Scope
+
+Squeezy targets Rust source navigation first; Python is planned next. Initial platform is macOS. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
+
+Squeezy explicitly does not provide:
+
+- a hosted service — it runs locally,
+- an IDE plugin — the TUI is the only interface,
+- LSP-backed navigation — the graph is lightweight, local, and agent optimized,
+- a single-provider integration — bring your own key,
+- an MCP server or remote API for its semantic graph — the graph is internal.
+
+## License
+
+See [LICENSE](LICENSE).
+
+## Contributing
+
+Build, test, clippy, and coverage commands are documented in [CONTRIBUTING.md](CONTRIBUTING.md).

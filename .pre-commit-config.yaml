@@ -1,0 +1,31 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt-check
+        name: cargo fmt
+        entry: cargo fmt --all -- --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        types_or: [rust]
+
+      - id: rust-layout
+        name: Rust layout
+        entry: python3 scripts/check_test_layout.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        types_or: [rust]
+
+      - id: gitleaks-staged
+        name: Gitleaks staged secret scan
+        entry: gitleaks protect --staged --redact --no-banner --no-color
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: actionlint
+        name: GitHub Actions workflow lint
+        entry: actionlint
+        language: system
+        files: ^\.github/workflows/.*\.ya?ml$

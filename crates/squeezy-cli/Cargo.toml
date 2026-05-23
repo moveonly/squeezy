@@ -1,0 +1,23 @@
+[package]
+name = "squeezy-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "squeezy"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+futures-util.workspace = true
+squeezy-core.workspace = true
+squeezy-llm.workspace = true
+squeezy-tui.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
