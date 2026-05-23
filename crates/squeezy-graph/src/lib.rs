@@ -5,8 +5,8 @@ use std::{
 };
 
 use squeezy_core::{
-    Confidence, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result, SourceSpan,
-    SymbolId, SymbolKind,
+    Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
+    SourceSpan, SymbolId, SymbolKind,
 };
 use squeezy_parse::{
     BodyHit, BodyHitKind, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport, ParsedReference,
@@ -160,6 +160,8 @@ pub struct SemanticGraph {
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
     java_project_facts: Vec<JavaProjectFact>,
+    java_project_facts_cache: HashMap<FileId, CachedJavaProjectFacts>,
+    java_project_facts_cache_java_paths_signature: u64,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
     symbol_signature_lower: HashMap<SymbolId, String>,
     signature_trigram_index: HashMap<[u8; 3], Vec<SymbolId>>,
@@ -169,6 +171,17 @@ pub struct SemanticGraph {
     children_by_parent: HashMap<SymbolId, Vec<SymbolId>>,
     edges_by_from: HashMap<SymbolId, Vec<usize>>,
     edges_by_to: HashMap<SymbolId, Vec<usize>>,
+    imports_by_file: HashMap<FileId, Vec<usize>>,
+    java_package_by_file: HashMap<FileId, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedJavaProjectFacts {
+    hash: ContentHash,
+    java_paths_signature: u64,
+    dependency_values: Vec<String>,
+    configured_source_facts: Vec<(&'static str, String, &'static str)>,
+    source_root_facts: Vec<(&'static str, String, &'static str)>,
 }
 
 impl SemanticGraph {
@@ -182,6 +195,8 @@ impl SemanticGraph {
             references: Vec::new(),
             body_hits: Vec::new(),
             java_project_facts: Vec::new(),
+            java_project_facts_cache: HashMap::new(),
+            java_project_facts_cache_java_paths_signature: 0,
             symbols_by_name: HashMap::new(),
             symbol_signature_lower: HashMap::new(),
             signature_trigram_index: HashMap::new(),
@@ -191,6 +206,8 @@ impl SemanticGraph {
             children_by_parent: HashMap::new(),
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
+            imports_by_file: HashMap::new(),
+            java_package_by_file: HashMap::new(),
         }
     }
 
@@ -549,27 +566,71 @@ impl SemanticGraph {
             })
             .collect::<Vec<_>>();
         if metadata_files.is_empty() {
+            self.java_project_facts_cache.clear();
+            self.java_project_facts_cache_java_paths_signature = 0;
             return;
         }
 
-        let java_paths = self
+        let mut java_paths = self
             .files
             .values()
             .filter(|file| file.language == LanguageKind::Java)
             .map(|file| file.relative_path.clone())
             .collect::<Vec<_>>();
-        let mut dedup = BTreeSet::new();
+        java_paths.sort();
+        let java_paths_sig = java_paths_signature(&java_paths);
+        self.java_project_facts_cache_java_paths_signature = java_paths_sig;
 
+        let metadata_ids = metadata_files
+            .iter()
+            .map(|(_, file)| file.id.clone())
+            .collect::<HashSet<_>>();
+        self.java_project_facts_cache
+            .retain(|file_id, _| metadata_ids.contains(file_id));
+
+        let mut dedup = BTreeSet::new();
         for (provider, file) in metadata_files {
-            let java_path_refs = java_paths.iter().map(String::as_str).collect::<Vec<_>>();
-            for (kind, value, reason) in java_source_root_facts(provider, &java_path_refs) {
-                self.push_java_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            let cache_hit = self
+                .java_project_facts_cache
+                .get(&file.id)
+                .map(|entry| {
+                    entry.hash == file.hash && entry.java_paths_signature == java_paths_sig
+                })
+                .unwrap_or(false);
+
+            if !cache_hit {
+                let java_path_refs = java_paths.iter().map(String::as_str).collect::<Vec<_>>();
+                let source_root_facts = java_source_root_facts(provider, &java_path_refs);
+                let (dependency_values, configured_source_facts) =
+                    if let Ok(source) = std::fs::read_to_string(&file.path) {
+                        (
+                            java_dependency_facts(provider, &source),
+                            java_configured_source_facts(provider, &source),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                self.java_project_facts_cache.insert(
+                    file.id.clone(),
+                    CachedJavaProjectFacts {
+                        hash: file.hash.clone(),
+                        java_paths_signature: java_paths_sig,
+                        dependency_values,
+                        configured_source_facts,
+                        source_root_facts,
+                    },
+                );
             }
 
-            let Ok(source) = std::fs::read_to_string(&file.path) else {
-                continue;
-            };
-            for value in java_dependency_facts(provider, &source) {
+            let entry = self
+                .java_project_facts_cache
+                .get(&file.id)
+                .expect("just inserted")
+                .clone();
+            for (kind, value, reason) in entry.source_root_facts {
+                self.push_java_project_fact(&mut dedup, provider, kind, value, &file, reason);
+            }
+            for value in entry.dependency_values {
                 self.push_java_project_fact(
                     &mut dedup,
                     provider,
@@ -579,7 +640,7 @@ impl SemanticGraph {
                     "build dependency coordinate",
                 );
             }
-            for (kind, value, reason) in java_configured_source_facts(provider, &source) {
+            for (kind, value, reason) in entry.configured_source_facts {
                 self.push_java_project_fact(&mut dedup, provider, kind, value, &file, reason);
             }
         }
@@ -659,7 +720,24 @@ impl SemanticGraph {
                 .alias
                 .clone()
                 .unwrap_or_else(|| last_path_segment(&import.path));
-            let candidates = self.symbols_by_name_or_scan(&target_name);
+            let mut candidates = self.symbols_by_name_or_scan(&target_name);
+            // For Java imports we know the exact package + class chain, so we
+            // can prune candidates that do not match. This both improves
+            // precision and lets nested-class/static imports resolve when the
+            // raw last-segment name collides with unrelated symbols elsewhere.
+            if self
+                .files
+                .get(&import.file_id)
+                .map(|file| file.language == squeezy_core::LanguageKind::Java)
+                .unwrap_or(false)
+            {
+                candidates.retain(|id| {
+                    self.symbols
+                        .get(id)
+                        .map(|symbol| self.java_import_matches_symbol(import, symbol))
+                        .unwrap_or(false)
+                });
+            }
             let (to, confidence) = match candidates.as_slice() {
                 [only] if !import.is_glob => (Some(only.clone()), Confidence::ImportResolved),
                 [] if import.is_glob => (None, Confidence::CandidateSet),
@@ -817,6 +895,9 @@ impl SemanticGraph {
         }
 
         if call.kind == ParsedCallKind::Method {
+            if let Some(id) = self.java_static_imported_method(&candidates, caller_id, call) {
+                return (Some(id), Confidence::ImportResolved, "java static import");
+            }
             if let Some(id) = self.java_receiver_field_method(caller_id, call) {
                 return (Some(id), Confidence::Heuristic, "java field receiver");
             }
@@ -988,8 +1069,7 @@ impl SemanticGraph {
             }
         }
         for import in self
-            .imports
-            .iter()
+            .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
         {
@@ -1038,13 +1118,7 @@ impl SemanticGraph {
     }
 
     fn java_package_for_file(&self, file_id: &FileId) -> Option<Vec<String>> {
-        self.imports
-            .iter()
-            .find(|import| {
-                import.file_id == *file_id && import.alias.as_deref() == Some("__java_package__")
-            })
-            .map(|import| path_segments(&import.path))
-            .filter(|segments| !segments.is_empty())
+        self.java_package_by_file.get(file_id).cloned()
     }
 
     fn same_file_direct_call(
@@ -1173,8 +1247,7 @@ impl SemanticGraph {
         symbol: &GraphSymbol,
         name: &str,
     ) -> bool {
-        self.imports
-            .iter()
+        self.imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .filter(|import| {
@@ -1191,19 +1264,17 @@ impl SemanticGraph {
         if import.alias.as_deref() == Some("__java_package__") {
             return false;
         }
-        if last_path_segment(&import.path) != symbol.name {
-            return false;
-        }
         let Some(file) = self.files.get(&symbol.file_id) else {
+            if last_path_segment(&import.path) != symbol.name {
+                return false;
+            }
             return true;
         };
         if file.language == squeezy_core::LanguageKind::Java {
-            let mut import_segments = path_segments(&import.path);
-            if !import.is_glob {
-                import_segments.pop();
-            }
-            return !import_segments.is_empty()
-                && self.java_package_for_file(&symbol.file_id) == Some(import_segments);
+            return self.java_import_matches_symbol(import, symbol);
+        }
+        if last_path_segment(&import.path) != symbol.name {
+            return false;
         }
         if file.language != squeezy_core::LanguageKind::Python {
             return true;
@@ -1215,6 +1286,118 @@ impl SemanticGraph {
         let import_module = &import_segments[..import_segments.len() - 1];
         let symbol_module = python_module_path_for_file(&file.relative_path);
         path_segments_suffix_match(import_module, &symbol_module)
+    }
+
+    fn java_import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        let mut import_segments = path_segments(&import.path);
+        let last_segment_is_glob = import_segments
+            .last()
+            .map(|segment| segment == "*")
+            .unwrap_or(false);
+        if last_segment_is_glob {
+            import_segments.pop();
+        }
+        let Some(package) = self.java_package_for_file(&symbol.file_id) else {
+            return false;
+        };
+
+        // Static glob import (e.g. `import static a.b.C.*;`).
+        // After popping `*` the path is `a.b.C`. The symbol must be a member
+        // of that class (or a member of one of its enclosing classes if
+        // `import_segments` matches farther up the chain).
+        if import.is_glob && import.is_static {
+            return self.java_symbol_member_of_path(symbol, &import_segments, &package);
+        }
+
+        // Regular glob import (e.g. `import a.b.*;`). Matches every top-level
+        // type whose package equals `import_segments`, or any nested type
+        // whose enclosing class chain begins below `import_segments`.
+        if import.is_glob {
+            return import_segments == package && symbol_is_top_level_for_imports(symbol)
+                || self.java_symbol_owner_path(symbol) == import_segments;
+        }
+
+        // Static member import (e.g. `import static a.b.C.method;`).
+        // After popping `method` the path is `a.b.C`. The symbol must be a
+        // member of class `C`.
+        if import.is_static {
+            if import_segments.is_empty() {
+                return false;
+            }
+            // Member name must equal the symbol's name.
+            if import_segments.last().map(String::as_str) != Some(symbol.name.as_str()) {
+                return false;
+            }
+            import_segments.pop();
+            return self.java_symbol_member_of_path(symbol, &import_segments, &package);
+        }
+
+        // Plain type import (e.g. `import a.b.C;` or `import a.b.C.Nested;`).
+        // After popping the type leaf, `import_segments` is either the package
+        // (top-level type) or `package + class chain` (nested type).
+        if last_path_segment(&import.path) != symbol.name {
+            return false;
+        }
+        import_segments.pop();
+        let owner_path = self.java_symbol_owner_path(symbol);
+        owner_path == import_segments
+    }
+
+    fn java_symbol_owner_path(&self, symbol: &GraphSymbol) -> Vec<String> {
+        let mut path = self
+            .java_package_for_file(&symbol.file_id)
+            .unwrap_or_default();
+        let mut chain = Vec::new();
+        let mut parent_id = symbol.parent_id.as_ref();
+        while let Some(id) = parent_id {
+            let Some(parent) = self.symbols.get(id) else {
+                break;
+            };
+            if matches!(
+                parent.kind,
+                SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct
+            ) {
+                chain.push(parent.name.clone());
+            }
+            parent_id = parent.parent_id.as_ref();
+        }
+        chain.reverse();
+        path.extend(chain);
+        path
+    }
+
+    fn java_symbol_member_of_path(
+        &self,
+        symbol: &GraphSymbol,
+        path: &[String],
+        package: &[String],
+    ) -> bool {
+        if path.is_empty() || path.len() < package.len() {
+            return false;
+        }
+        if !path.starts_with(package) {
+            return false;
+        }
+        let class_chain = &path[package.len()..];
+        if class_chain.is_empty() {
+            return false;
+        }
+        let mut owner_classes = Vec::new();
+        let mut parent_id = symbol.parent_id.as_ref();
+        while let Some(id) = parent_id {
+            let Some(parent) = self.symbols.get(id) else {
+                break;
+            };
+            if matches!(
+                parent.kind,
+                SymbolKind::Class | SymbolKind::Trait | SymbolKind::Enum | SymbolKind::Struct
+            ) {
+                owner_classes.push(parent.name.clone());
+            }
+            parent_id = parent.parent_id.as_ref();
+        }
+        owner_classes.reverse();
+        owner_classes == class_chain
     }
 
     fn import_visible_from_symbol(&self, import: &ParsedImport, caller: &GraphSymbol) -> bool {
@@ -1362,6 +1545,34 @@ impl SemanticGraph {
         self.python_class_for_alias_in_scope(caller, &target_name, before_byte, depth + 1)
     }
 
+    fn java_static_imported_method(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if call.receiver.is_some() {
+            return None;
+        }
+        let caller = self.symbols.get(caller_id)?;
+        let caller_file = self.files.get(&caller.file_id)?;
+        if caller_file.language != LanguageKind::Java {
+            return None;
+        }
+        single_symbol(
+            candidates
+                .iter()
+                .filter_map(|id| self.symbols.get(id))
+                .filter(|symbol| symbol.kind == SymbolKind::Method)
+                .filter(|symbol| {
+                    self.imports_for_file(&caller.file_id)
+                        .filter(|import| import.is_static)
+                        .any(|import| self.java_import_matches_symbol(import, symbol))
+                })
+                .map(|symbol| symbol.id.clone()),
+        )
+    }
+
     fn java_receiver_field_method(
         &self,
         caller_id: &SymbolId,
@@ -1435,9 +1646,9 @@ impl SemanticGraph {
                 symbol.file_id == *file_id
                     || self.java_package_for_file(&symbol.file_id)
                         == self.java_package_for_file(file_id)
-                    || self.imports.iter().any(|import| {
-                        import.file_id == *file_id && self.import_matches_symbol(import, symbol)
-                    })
+                    || self
+                        .imports_for_file(file_id)
+                        .any(|import| self.import_matches_symbol(import, symbol))
             })
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
@@ -1468,8 +1679,7 @@ impl SemanticGraph {
         }
         let mut paths = BTreeSet::new();
         for import in self
-            .imports
-            .iter()
+            .imports_for_file(&caller.file_id)
             .filter(|import| self.import_visible_from_symbol(import, caller))
         {
             let import_segments = python_path_segments(&import.path);
@@ -1556,9 +1766,7 @@ impl SemanticGraph {
             .collect::<Vec<_>>();
 
         class_ids.extend(
-            self.imports
-                .iter()
-                .filter(|import| import.file_id == *file_id)
+            self.imports_for_file(file_id)
                 .filter(|import| import.alias.as_deref() == Some(name))
                 .flat_map(|import| {
                     let target_name = last_path_segment(&import.path);
@@ -1772,8 +1980,7 @@ impl SemanticGraph {
         symbol: &GraphSymbol,
         reference: &ParsedReference,
     ) -> bool {
-        self.imports
-            .iter()
+        self.imports_for_file(&reference.file_id)
             .filter(|import| self.import_visible_from_reference(import, reference))
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
@@ -1865,9 +2072,7 @@ impl SemanticGraph {
     ) -> bool {
         let reference_name = last_path_segment(&reference.text);
         if self
-            .imports
-            .iter()
-            .filter(|import| import.file_id == reference.file_id)
+            .imports_for_file(&reference.file_id)
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 if import.is_glob
@@ -1890,12 +2095,9 @@ impl SemanticGraph {
                 // within the same import span before allowing the inside-span
                 // shortcut.
                 let collisions = self
-                    .imports
-                    .iter()
+                    .imports_for_file(&import.file_id)
                     .filter(|other| {
-                        other.file_id == import.file_id
-                            && other.span == import.span
-                            && last_path_segment(&other.path) == symbol.name
+                        other.span == import.span && last_path_segment(&other.path) == symbol.name
                     })
                     .count();
                 let alias_match = import.alias.as_deref() == Some(reference.text.as_str());
@@ -1911,9 +2113,7 @@ impl SemanticGraph {
         if !reference_kind_can_bind_symbol(reference, symbol) {
             return false;
         }
-        self.imports
-            .iter()
-            .filter(|import| import.file_id == reference.file_id)
+        self.imports_for_file(&reference.file_id)
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 if path_starts_with_external_root(&import.path) {
@@ -1970,9 +2170,7 @@ impl SemanticGraph {
         if symbol.file_id == reference.file_id {
             return true;
         }
-        self.imports
-            .iter()
-            .filter(|import| import.file_id == reference.file_id)
+        self.imports_for_file(&reference.file_id)
             .filter(|import| import.alias.as_deref() != Some("__java_package__"))
             .any(|import| {
                 let alias_or_name = import
@@ -1987,6 +2185,14 @@ impl SemanticGraph {
     }
 
     fn import_module_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
+        if self
+            .files
+            .get(&symbol.file_id)
+            .map(|file| file.language == squeezy_core::LanguageKind::Java)
+            .unwrap_or(false)
+        {
+            return self.java_import_matches_symbol(import, symbol);
+        }
         let mut import_path = path_segments(&import.path);
         if import.is_glob {
             if import_path.last().map(String::as_str) == Some("*") {
@@ -2485,6 +2691,7 @@ impl SemanticGraph {
         self.children_by_parent.clear();
         self.edges_by_from.clear();
         self.edges_by_to.clear();
+        self.rebuild_import_indexes();
 
         for symbol in self.symbols.values() {
             self.symbols_by_name
@@ -2546,6 +2753,7 @@ impl SemanticGraph {
     fn rebuild_resolution_indexes(&mut self) {
         self.symbols_by_name.clear();
         self.children_by_parent.clear();
+        self.rebuild_import_indexes();
 
         for symbol in self.symbols.values() {
             self.symbols_by_name
@@ -2564,6 +2772,33 @@ impl SemanticGraph {
                     .push(to.clone());
             }
         }
+    }
+
+    fn rebuild_import_indexes(&mut self) {
+        self.imports_by_file.clear();
+        self.java_package_by_file.clear();
+        for (index, import) in self.imports.iter().enumerate() {
+            self.imports_by_file
+                .entry(import.file_id.clone())
+                .or_default()
+                .push(index);
+            if import.alias.as_deref() == Some("__java_package__") {
+                let segments = path_segments(&import.path);
+                if !segments.is_empty() {
+                    self.java_package_by_file
+                        .insert(import.file_id.clone(), segments);
+                }
+            }
+        }
+    }
+
+    fn imports_for_file(&self, file_id: &FileId) -> impl Iterator<Item = &ParsedImport> {
+        self.imports_by_file
+            .get(file_id)
+            .map(|indexes| indexes.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|index| self.imports.get(*index))
     }
 
     fn symbols_by_name_or_scan(&self, name: &str) -> Vec<SymbolId> {
@@ -2933,6 +3168,29 @@ fn java_build_metadata_provider(file: &FileRecord) -> Option<&'static str> {
     }
 }
 
+fn symbol_is_top_level_for_imports(symbol: &GraphSymbol) -> bool {
+    symbol
+        .parent_id
+        .as_ref()
+        .map(|id| id.0.starts_with("file:"))
+        .unwrap_or(true)
+}
+
+fn java_paths_signature(paths: &[String]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+    let mut hash = FNV_OFFSET;
+    for path in paths {
+        for byte in path.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= 0x00;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 fn java_source_root_facts(
     provider: &str,
     java_paths: &[&str],
@@ -3035,8 +3293,9 @@ fn java_dependency_facts(provider: &str, source: &str) -> Vec<String> {
 }
 
 fn maven_dependency_facts(source: &str) -> Vec<String> {
+    let scrubbed = strip_maven_meta_blocks(source);
     let mut facts = Vec::new();
-    let mut rest = source;
+    let mut rest = scrubbed.as_str();
     while let Some(start) = rest.find("<dependency>") {
         rest = &rest[start + "<dependency>".len()..];
         let Some(end) = rest.find("</dependency>") else {
@@ -3056,6 +3315,38 @@ fn maven_dependency_facts(source: &str) -> Vec<String> {
         facts.push(format!("{scope}:{group_id}:{artifact_id}:{version}"));
     }
     facts
+}
+
+fn strip_maven_meta_blocks(source: &str) -> String {
+    // `<dependencyManagement>` declares versions but not real edges, and
+    // `<plugins>` blocks can contain plugin dependencies that should not be
+    // surfaced as project dependencies. Strip those subtrees before scanning
+    // for `<dependency>` blocks.
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    loop {
+        let next_open = ["<dependencyManagement", "<plugins>", "<pluginManagement"]
+            .into_iter()
+            .filter_map(|tag| rest.find(tag).map(|index| (index, tag)))
+            .min_by_key(|(index, _)| *index);
+        let Some((open_index, open_tag)) = next_open else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..open_index]);
+        rest = &rest[open_index + open_tag.len()..];
+        let close_tag = match open_tag {
+            "<dependencyManagement" => "</dependencyManagement>",
+            "<plugins>" => "</plugins>",
+            "<pluginManagement" => "</pluginManagement>",
+            _ => break,
+        };
+        let Some(close_index) = rest.find(close_tag) else {
+            break;
+        };
+        rest = &rest[close_index + close_tag.len()..];
+    }
+    out
 }
 
 fn gradle_dependency_facts(source: &str) -> Vec<String> {

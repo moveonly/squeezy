@@ -75,6 +75,7 @@ pub struct ParsedImport {
     pub alias: Option<String>,
     pub is_glob: bool,
     pub is_reexport: bool,
+    pub is_static: bool,
     pub span: SourceSpan,
     pub provenance: Provenance,
 }
@@ -110,7 +111,7 @@ pub struct ParsedReference {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReferenceKind {
     Identifier,
     Type,
@@ -128,7 +129,7 @@ pub struct BodyHit {
     pub span: SourceSpan,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BodyHitKind {
     Identifier,
     Type,
@@ -714,8 +715,18 @@ fn visit_java_node(
         _ => {}
     }
 
+    if node.kind() == "field_declaration" {
+        let symbols = java_field_symbols_from_node(node, ctx, parent_symbol.as_ref());
+        if !symbols.is_empty() {
+            for symbol in symbols {
+                ctx.symbols.push(symbol);
+            }
+            visit_java_children(node, ctx, parent_symbol, owner_symbol);
+            return;
+        }
+    }
+
     if let Some(symbol) = java_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
-        extract_java_symbol_facts(node, &symbol, ctx);
         let next_parent = Some((symbol.id.clone(), symbol.kind));
         let next_owner = if symbol.body_span.is_some() {
             Some(symbol.id.clone())
@@ -747,7 +758,7 @@ fn visit_java_node(
             extract_java_reference(node, ReferenceKind::Field, ctx, owner_symbol.clone())
         }
         "marker_annotation" | "annotation" => {
-            extract_java_reference(node, ReferenceKind::Attribute, ctx, owner_symbol.clone())
+            extract_java_annotation_reference(node, ctx, owner_symbol)
         }
         kind if is_java_literal(kind) => {
             extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol)
@@ -781,12 +792,8 @@ fn java_symbol_from_node(
         "annotation_type_element_declaration" => SymbolKind::Method,
         "method_declaration" => SymbolKind::Method,
         "constructor_declaration" => SymbolKind::Method,
-        "field_declaration" => SymbolKind::Field,
         _ => return None,
     };
-    if kind == SymbolKind::Field {
-        return java_field_symbol_from_node(node, ctx, parent_symbol);
-    }
 
     let name = node
         .child_by_field_name("name")
@@ -834,26 +841,11 @@ fn java_symbol_from_node(
     })
 }
 
-fn java_field_symbol_from_node(
+fn java_field_symbols_from_node(
     node: Node<'_>,
     ctx: &ExtractContext<'_>,
     parent_symbol: Option<&(SymbolId, SymbolKind)>,
-) -> Option<ParsedSymbol> {
-    let variable = first_named_descendant_kind(node, "variable_declarator")?;
-    let name = variable
-        .child_by_field_name("name")
-        .and_then(|child| node_text(child, ctx.source).ok())
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())?;
-    let span = span_from_node(variable);
-    let parent_id = parent_symbol.map(|(id, _)| id.clone());
-    let id = symbol_id(
-        &ctx.file,
-        parent_id.as_ref(),
-        SymbolKind::Field,
-        &name,
-        span,
-    );
+) -> Vec<ParsedSymbol> {
     let mut attributes = java_attributes_for_node(node, ctx.source);
     if let Some(field_type) = java_field_type(node, ctx.source) {
         attributes.push(format!("type:{field_type}"));
@@ -861,66 +853,51 @@ fn java_field_symbol_from_node(
     attributes.sort();
     attributes.dedup();
 
-    Some(ParsedSymbol {
-        id,
-        file_id: ctx.file.id.clone(),
-        parent_id,
-        name,
-        kind: SymbolKind::Field,
-        span,
-        body_span: None,
-        signature: signature_text(node, None, ctx.source),
-        visibility: java_visibility_text(node, ctx.source),
-        docs: java_docs_for_node(node, ctx.source),
-        attributes,
-        provenance: Provenance::new("tree-sitter-java", "field_declaration declaration"),
-        confidence: Confidence::ExactSyntax,
-        freshness: Freshness::Fresh,
-    })
-}
+    let visibility = java_visibility_text(node, ctx.source);
+    let docs = java_docs_for_node(node, ctx.source);
+    let signature = signature_text(node, None, ctx.source);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
 
-fn extract_java_symbol_facts(node: Node<'_>, symbol: &ParsedSymbol, ctx: &mut ExtractContext<'_>) {
-    if matches!(
-        symbol.kind,
-        SymbolKind::Class | SymbolKind::Struct | SymbolKind::Enum | SymbolKind::Trait
-    ) {
-        for base in java_type_inheritance_names(node, ctx.source) {
-            ctx.references.push(ParsedReference {
-                file_id: ctx.file.id.clone(),
-                owner_id: Some(symbol.id.clone()),
-                text: base.clone(),
-                kind: ReferenceKind::Type,
-                span: symbol.span,
-                provenance: Provenance::new("tree-sitter-java", "inheritance/interface reference"),
-            });
-            ctx.body_hits.push(BodyHit {
-                file_id: ctx.file.id.clone(),
-                owner_id: Some(symbol.id.clone()),
-                text: base,
-                kind: BodyHitKind::Type,
-                span: symbol.span,
-            });
+    let mut symbols = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() != "variable_declarator" {
+            continue;
         }
+        let Some(name) = child
+            .child_by_field_name("name")
+            .and_then(|grandchild| node_text(grandchild, ctx.source).ok())
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        let span = span_from_node(child);
+        let id = symbol_id(
+            &ctx.file,
+            parent_id.as_ref(),
+            SymbolKind::Field,
+            &name,
+            span,
+        );
+        symbols.push(ParsedSymbol {
+            id,
+            file_id: ctx.file.id.clone(),
+            parent_id: parent_id.clone(),
+            name,
+            kind: SymbolKind::Field,
+            span,
+            body_span: None,
+            signature: signature.clone(),
+            visibility: visibility.clone(),
+            docs: docs.clone(),
+            attributes: attributes.clone(),
+            provenance: Provenance::new("tree-sitter-java", "field_declaration declaration"),
+            confidence: Confidence::ExactSyntax,
+            freshness: Freshness::Fresh,
+        });
     }
-    if matches!(symbol.kind, SymbolKind::Method | SymbolKind::Field) {
-        for type_name in java_signature_type_names(&symbol.signature) {
-            ctx.references.push(ParsedReference {
-                file_id: ctx.file.id.clone(),
-                owner_id: Some(symbol.id.clone()),
-                text: type_name.clone(),
-                kind: ReferenceKind::Type,
-                span: symbol.span,
-                provenance: Provenance::new("tree-sitter-java", "signature type reference"),
-            });
-            ctx.body_hits.push(BodyHit {
-                file_id: ctx.file.id.clone(),
-                owner_id: Some(symbol.id.clone()),
-                text: type_name,
-                kind: BodyHitKind::Type,
-                span: symbol.span,
-            });
-        }
-    }
+    symbols
 }
 
 fn extract_java_package(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
@@ -940,6 +917,7 @@ fn extract_java_package(node: Node<'_>, ctx: &mut ExtractContext<'_>) {
         alias: Some("__java_package__".to_string()),
         is_glob: false,
         is_reexport: true,
+        is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-java", "package declaration"),
     });
@@ -969,6 +947,7 @@ fn extract_java_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: O
         alias: None,
         is_glob,
         is_reexport: false,
+        is_static,
         span: span_from_node(node),
         provenance: Provenance::new(
             "tree-sitter-java",
@@ -1079,7 +1058,6 @@ fn extract_java_reference(
     let text = node_text(node, ctx.source)
         .unwrap_or_default()
         .trim()
-        .trim_start_matches('@')
         .to_string();
     if text.is_empty() || is_java_keyword(&text) {
         return;
@@ -1109,29 +1087,80 @@ fn extract_java_reference(
     }
 }
 
+fn extract_java_annotation_reference(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let name_node = node
+        .child_by_field_name("name")
+        .or_else(|| java_first_name_descendant(node));
+    let text = name_node
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| {
+            let raw = node_text(node, ctx.source).unwrap_or_default();
+            raw.trim()
+                .trim_start_matches('@')
+                .split('(')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string()
+        });
+    if text.is_empty() || is_java_keyword(&text) {
+        return;
+    }
+    let span = name_node.map(span_from_node).unwrap_or_else(|| {
+        let raw_span = span_from_node(node);
+        SourceSpan::new(
+            raw_span.start_byte.saturating_add(1).min(raw_span.end_byte),
+            raw_span.end_byte,
+            raw_span.start,
+            raw_span.end,
+        )
+    });
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind: ReferenceKind::Attribute,
+        span,
+        provenance: Provenance::new("tree-sitter-java", format!("{} reference", node.kind())),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: BodyHitKind::Attribute,
+        span,
+    });
+}
+
+fn java_first_name_descendant(node: Node<'_>) -> Option<Node<'_>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier"
+        ) {
+            return Some(child);
+        }
+        if let Some(found) = java_first_name_descendant(child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn dedup_java_facts(ctx: &mut ExtractContext<'_>) {
-    let mut references = HashSet::new();
-    ctx.references.retain(|reference| {
-        references.insert(format!(
-            "{}|{:?}|{}|{:?}|{}",
-            reference.file_id.0,
-            reference.owner_id.as_ref().map(|id| id.0.as_str()),
-            reference.text,
-            reference.kind,
-            reference.span.start_byte
-        ))
-    });
-    let mut body_hits = HashSet::new();
-    ctx.body_hits.retain(|hit| {
-        body_hits.insert(format!(
-            "{}|{:?}|{}|{:?}|{}",
-            hit.file_id.0,
-            hit.owner_id.as_ref().map(|id| id.0.as_str()),
-            hit.text,
-            hit.kind,
-            hit.span.start_byte
-        ))
-    });
+    let mut references: HashSet<(u32, ReferenceKind)> = HashSet::new();
+    ctx.references
+        .retain(|reference| references.insert((reference.span.start_byte, reference.kind)));
+    let mut body_hits: HashSet<(u32, BodyHitKind)> = HashSet::new();
+    ctx.body_hits
+        .retain(|hit| body_hits.insert((hit.span.start_byte, hit.kind)));
 }
 
 fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
@@ -1159,6 +1188,7 @@ fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
                 alias: None,
                 is_glob: false,
                 is_reexport: true,
+                is_static: false,
                 span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
                 provenance: Provenance::new("tree-sitter-python", "__all__ export"),
             });
@@ -1466,19 +1496,19 @@ fn extract_python_symbol_facts(
 }
 
 fn java_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
-    let raw = signature_text(node, node.child_by_field_name("body"), source);
     let mut attributes = Vec::new();
-    for annotation in raw
-        .split_whitespace()
-        .filter(|part| part.starts_with('@'))
-        .map(|part| {
-            part.trim_start_matches('@')
-                .trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.')
-        })
-        .filter(|part| !part.is_empty())
-    {
+    let modifiers = java_modifiers_node(node);
+    let Some(modifiers) = modifiers else {
+        return attributes;
+    };
+    let mut cursor = modifiers.walk();
+    for child in modifiers.named_children(&mut cursor) {
+        let Some(annotation) = java_annotation_name(child, source) else {
+            continue;
+        };
         attributes.push(format!("java:annotation:{annotation}"));
-        match annotation.rsplit('.').next().unwrap_or(annotation) {
+        let leaf = annotation.rsplit('.').next().unwrap_or(annotation.as_str());
+        match leaf {
             "Test" | "ParameterizedTest" => attributes.push("junit:test".to_string()),
             "Override" => attributes.push("java:override".to_string()),
             _ => {}
@@ -1487,14 +1517,33 @@ fn java_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
     attributes
 }
 
+fn java_modifiers_node(node: Node<'_>) -> Option<Node<'_>> {
+    if let Some(modifiers) = node.child_by_field_name("modifiers") {
+        return Some(modifiers);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+}
+
+fn java_annotation_name(node: Node<'_>, source: &str) -> Option<String> {
+    if !matches!(node.kind(), "marker_annotation" | "annotation") {
+        return None;
+    }
+    let name_node = node
+        .child_by_field_name("name")
+        .or_else(|| java_first_name_descendant(node))?;
+    let raw = node_text(name_node, source).ok()?.trim().to_string();
+    if raw.is_empty() { None } else { Some(raw) }
+}
+
 fn java_visibility_text(node: Node<'_>, source: &str) -> Option<String> {
-    let signature = signature_text(node, node.child_by_field_name("body"), source);
-    for visibility in ["public", "protected", "private"] {
-        if signature
-            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
-            .any(|part| part == visibility)
-        {
-            return Some(visibility.to_string());
+    let modifiers = java_modifiers_node(node)?;
+    let mut cursor = modifiers.walk();
+    for child in modifiers.children(&mut cursor) {
+        let raw = node_text(child, source).unwrap_or_default().trim();
+        if matches!(raw, "public" | "protected" | "private") {
+            return Some(raw.to_string());
         }
     }
     None
@@ -1540,27 +1589,6 @@ fn java_type_inheritance_names(node: Node<'_>, source: &str) -> Vec<String> {
     names
 }
 
-fn java_signature_type_names(signature: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for token in signature
-        .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' || ch == '$'))
-    {
-        if token.is_empty()
-            || is_java_keyword(token)
-            || token
-                .chars()
-                .next()
-                .is_some_and(|ch| !ch.is_ascii_uppercase())
-        {
-            continue;
-        }
-        names.push(token.to_string());
-    }
-    names.sort();
-    names.dedup();
-    names
-}
-
 fn collect_java_type_names(node: Node<'_>, source: &str, names: &mut Vec<String>) {
     if matches!(
         node.kind(),
@@ -1592,24 +1620,29 @@ fn java_type_name_from_text(text: &str) -> Option<String> {
 }
 
 fn java_field_type(node: Node<'_>, source: &str) -> Option<String> {
+    if let Some(child) = node.child_by_field_name("type")
+        && let Ok(text) = node_text(child, source)
+        && let Some(name) = java_type_name_from_text(text)
+    {
+        return Some(name);
+    }
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
-        .find(|child| child.kind().contains("type") || child.kind() == "integral_type")
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "type_identifier"
+                    | "scoped_type_identifier"
+                    | "generic_type"
+                    | "array_type"
+                    | "integral_type"
+                    | "floating_point_type"
+                    | "boolean_type"
+                    | "void_type"
+            )
+        })
         .and_then(|child| node_text(child, source).ok())
         .and_then(java_type_name_from_text)
-}
-
-fn first_named_descendant_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
-    if node.kind() == kind {
-        return Some(node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = first_named_descendant_kind(child, kind) {
-            return Some(found);
-        }
-    }
-    None
 }
 
 fn java_object_type_from_text(raw: &str) -> String {
@@ -2245,6 +2278,7 @@ fn extract_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option
             owner_id: owner_id.clone(),
             is_glob: import.is_glob,
             is_reexport,
+            is_static: false,
             path: import.path,
             alias: import.alias,
             span: span_from_node(node),
@@ -2271,6 +2305,7 @@ fn extract_python_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id:
             alias,
             is_glob,
             is_reexport: ctx.file.relative_path.ends_with("__init__.py"),
+            is_static: false,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-python", "import declaration"),
         });
@@ -2479,6 +2514,7 @@ fn extract_python_assignment(
                 alias: None,
                 is_glob: false,
                 is_reexport: true,
+                is_static: false,
                 span: span_from_node(node),
                 provenance: Provenance::new("tree-sitter-python", "__all__ export"),
             });
@@ -2503,6 +2539,7 @@ fn extract_python_assignment(
         alias: Some(alias),
         is_glob: false,
         is_reexport: false,
+        is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-python", "assignment alias"),
     });

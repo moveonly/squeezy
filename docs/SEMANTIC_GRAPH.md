@@ -93,17 +93,31 @@ decision instead of walking a likely non-code or dangerous directory.
 - Java package declarations and imports are indexed as graph facts. Same-file,
   same-package, explicit imports, constructor calls, inherited type references,
   and field-receiver method calls with a unique local type target resolve before
-  lower-confidence candidate sets. Overloads, runtime dispatch, reflection,
-  annotation processors, generated sources, and external classpaths remain
-  heuristic or external.
+  lower-confidence candidate sets. Static-member imports (`import static
+  a.b.C.method;`) and nested-class imports (`import a.b.Outer.Inner;`) resolve
+  by popping member and enclosing-class segments and matching the symbol's
+  parent class chain. Wildcard imports (`import a.b.*;`,
+  `import static a.b.C.*;`) match every top-level or member symbol whose
+  enclosing chain begins below the imported package or class. Overloads,
+  runtime dispatch, reflection, annotation processors, generated sources, and
+  external classpaths remain heuristic or external.
 - Maven `pom.xml` and Gradle build files contribute optional Java project facts
   for source roots, test roots, generated-source roots, and simple dependency
   coordinates. These facts are parsed locally and never require invoking Maven
-  or Gradle.
+  or Gradle. Maven `<dependencyManagement>`, `<pluginManagement>`, and
+  `<plugins>` subtrees are skipped so only real project dependencies are
+  recorded. Parsed project facts are cached per metadata-file content hash and
+  Java source-path signature so incremental refreshes only re-read metadata
+  files whose contents actually changed.
 - Java reference and body indexes intentionally skip low-signal plain identifier
-  occurrences. Type identifiers, scoped paths, field accesses, annotations,
-  calls, literals, imports, and declarations remain indexed so broad search does
-  not spend most of its budget on locals and parameter-name echoes.
+  occurrences. Type identifiers, scoped paths, field accesses, annotation
+  names (without their argument lists), calls, literals, imports, and
+  declarations remain indexed so broad search does not spend most of its budget
+  on locals, parameter-name echoes, or annotation argument string content.
+- Java declarations of multiple variables in a single `field_declaration`
+  (`private int alpha, beta, gamma;`, interface constant pairs, etc.) produce
+  one symbol per `variable_declarator` so the declaration set matches the JDK
+  compiler tree oracle.
 - Java source files use a higher default large-file cap than other source files
   so single-file libraries with many nested declarations can still contribute
   graph facts; explicit workspace crawler caps are still respected.

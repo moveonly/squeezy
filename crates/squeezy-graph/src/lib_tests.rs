@@ -1180,6 +1180,272 @@ fn annotate_dirty_ranges_marks_only_intersecting_symbols_and_clears_on_reapply()
     assert!(graph.dirty_symbols().is_empty());
 }
 
+#[test]
+fn graph_resolves_java_static_member_imports_to_enclosing_class_method() {
+    let mut parser = RustParser::new().unwrap();
+    let names = java_record(
+        "src/main/java/com/example/util/Names.java",
+        r#"
+package com.example.util;
+
+public enum Names {
+    DEFAULT;
+
+    public static String defaultName() {
+        return "Ada";
+    }
+}
+"#,
+    );
+    let app = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import static com.example.util.Names.defaultName;
+
+public class Runner {
+    public String greet() {
+        return defaultName();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&names, fs::read_to_string(&names.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&app, fs::read_to_string(&app.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let names_class = graph.find_symbol_by_name("Names").pop().unwrap();
+    let default_name = graph
+        .find_symbol_by_name("defaultName")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&names_class.id))
+        .unwrap();
+    let greet = graph
+        .find_symbol_by_name("greet")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .unwrap();
+
+    assert!(graph.call_chain(&greet.id, &default_name.id, 3).is_some());
+}
+
+#[test]
+fn graph_resolves_java_glob_imports_to_classes_in_package() {
+    let mut parser = RustParser::new().unwrap();
+    let greeter = java_record(
+        "src/main/java/com/example/services/Greeter.java",
+        r#"
+package com.example.services;
+
+public class Greeter {
+    public String greet(String name) {
+        return name;
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.services.*;
+
+public class Runner {
+    public Greeter create() {
+        return new Greeter();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&greeter, fs::read_to_string(&greeter.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let greeter_class = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&greeter_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Greeter")
+    );
+}
+
+#[test]
+fn graph_resolves_java_nested_class_imports_to_inner_type() {
+    let mut parser = RustParser::new().unwrap();
+    let outer = java_record(
+        "src/main/java/com/example/util/Outer.java",
+        r#"
+package com.example.util;
+
+public class Outer {
+    public static class Inner {
+        public String describe() {
+            return "inner";
+        }
+    }
+}
+"#,
+    );
+    let runner = java_record(
+        "src/main/java/com/example/app/Runner.java",
+        r#"
+package com.example.app;
+
+import com.example.util.Outer.Inner;
+
+public class Runner {
+    public Inner make() {
+        return new Inner();
+    }
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&outer, fs::read_to_string(&outer.path).unwrap())
+            .unwrap(),
+        parser
+            .parse_source(&runner, fs::read_to_string(&runner.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let outer_class = graph
+        .find_symbol_by_name("Outer")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Class)
+        .unwrap();
+    let inner_class = graph
+        .find_symbol_by_name("Inner")
+        .into_iter()
+        .find(|symbol| symbol.parent_id.as_ref() == Some(&outer_class.id))
+        .unwrap();
+    assert!(
+        graph
+            .references_to_symbol(&inner_class.id)
+            .iter()
+            .any(|hit| hit.reference.text == "Inner")
+    );
+}
+
+#[test]
+fn graph_emits_one_symbol_per_java_field_declarator() {
+    let mut parser = RustParser::new().unwrap();
+    let widget = java_record(
+        "src/main/java/com/example/util/Widget.java",
+        r#"
+package com.example.util;
+
+public class Widget {
+    private int alpha, beta, gamma;
+    public static final String FIRST = "1", SECOND = "2";
+}
+"#,
+    );
+    let parsed = vec![
+        parser
+            .parse_source(&widget, fs::read_to_string(&widget.path).unwrap())
+            .unwrap(),
+    ];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    for name in ["alpha", "beta", "gamma", "FIRST", "SECOND"] {
+        assert!(
+            graph
+                .find_symbol_by_name(name)
+                .into_iter()
+                .any(|symbol| symbol.kind == SymbolKind::Field),
+            "missing field declarator {name}",
+        );
+    }
+}
+
+#[test]
+fn graph_records_only_real_maven_dependencies() {
+    let _ = RustParser::new().unwrap();
+    let mut pom = record(
+        "pom.xml",
+        r#"<project>
+  <modelVersion>4.0.0</modelVersion>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.managed</groupId>
+        <artifactId>only-managed</artifactId>
+        <version>1.0.0</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>5.10.0</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <dependencies>
+          <dependency>
+            <groupId>org.plugin</groupId>
+            <artifactId>plugin-dep</artifactId>
+            <version>9.9.9</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+"#,
+    );
+    pom.language = LanguageKind::Unsupported;
+    let parsed = vec![ParsedFile::unsupported(pom, "maven metadata")];
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let dependencies = graph
+        .java_project_facts()
+        .iter()
+        .filter(|fact| fact.kind == "dependency")
+        .map(|fact| fact.value.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        dependencies.contains(&"test:org.junit.jupiter:junit-jupiter:5.10.0".to_string()),
+        "expected real dependency to be recorded; got {dependencies:?}",
+    );
+    assert!(
+        !dependencies
+            .iter()
+            .any(|value| value.contains("only-managed")),
+        "managed dependencies should be excluded; got {dependencies:?}",
+    );
+    assert!(
+        !dependencies
+            .iter()
+            .any(|value| value.contains("plugin-dep")),
+        "plugin dependencies should be excluded; got {dependencies:?}",
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);
