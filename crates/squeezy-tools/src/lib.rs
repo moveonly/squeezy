@@ -46,9 +46,6 @@ use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
-
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
 const DEFAULT_MAX_MATCHES: usize = 100;
@@ -4778,6 +4775,11 @@ fn prepare_shell_sandbox_plan(
     root: &Path,
     config: &ShellSandboxConfig,
 ) -> std::result::Result<ShellSandboxPlan, String> {
+    // `root` is only consumed when synthesising the macOS sandbox-exec
+    // profile; on Linux and other targets the plan is otherwise the same.
+    // Touch the binding so non-macOS clippy doesn't flag it as unused.
+    #[cfg(not(target_os = "macos"))]
+    let _ = root;
     let required = config.mode == ShellSandboxMode::Required;
     // The sandbox-level network posture has THREE distinct states:
     //   - "allowed_approved": classified network + user opted into
@@ -4988,6 +4990,11 @@ fn shell_writable_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
+/// Resolve the list of absolute paths the macOS sandbox profile should
+/// explicitly deny on top of the (deny default) base. Only the macOS
+/// profile generator calls this; gated to avoid dead-code warnings on
+/// Linux and other targets where no sandbox-exec profile is generated.
+#[cfg(target_os = "macos")]
 fn sensitive_absolute_paths(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for pattern in &config.sensitive_path_patterns {
@@ -5256,10 +5263,10 @@ fn linux_write_proc(path: &str, contents: &[u8]) -> std::io::Result<()> {
 /// silently failing inside the child.
 #[cfg(target_os = "linux")]
 fn linux_unshare_supported() -> bool {
-    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone") {
-        if value.trim() == "0" {
-            return false;
-        }
+    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        && value.trim() == "0"
+    {
+        return false;
     }
     // /proc/self/ns/user existing is necessary for the syscall to do
     // anything useful; this also covers WSL1 (no namespaces).
