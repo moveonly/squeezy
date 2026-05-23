@@ -9,13 +9,25 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OpenAiProvider {
     name: &'static str,
     client: reqwest::Client,
     api_key: String,
     base_url: String,
     api_version: Option<String>,
+}
+
+impl std::fmt::Debug for OpenAiProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenAiProvider")
+            .field("name", &self.name)
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("api_version", &self.api_version)
+            .finish()
+    }
 }
 
 impl OpenAiProvider {

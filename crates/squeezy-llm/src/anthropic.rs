@@ -13,11 +13,21 @@ use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolC
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+impl std::fmt::Debug for AnthropicProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnthropicProvider")
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl AnthropicProvider {

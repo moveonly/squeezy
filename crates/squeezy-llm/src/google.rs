@@ -9,11 +9,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GoogleProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+impl std::fmt::Debug for GoogleProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleProvider")
+            .field("client", &self.client)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish()
+    }
 }
 
 impl GoogleProvider {
