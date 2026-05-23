@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     env,
     sync::{
         Arc,
@@ -7,12 +8,14 @@ use std::{
 };
 
 use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionScope, SqueezyError, TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec};
 use squeezy_tools::{
-    ToolCall, ToolOutputConfig, ToolRegistry, ToolResult, ToolSpec, WebToolConfig,
+    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
+    ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -130,6 +133,7 @@ impl TurnRuntime {
         let mut previous_response_id = None;
         let mut assistant_text = String::new();
         let mut total_cost = CostSnapshot::default();
+        let mut seen_tool_outputs = SeenToolOutputs::default();
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let request = LlmRequest {
@@ -251,14 +255,16 @@ impl TurnRuntime {
                 self.approval_ids.clone(),
             )
             .await;
+            let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            seen_tool_outputs.remember_results(&results);
 
             let outputs = results
                 .into_iter()
-                .map(|result| {
-                    let output = result.model_output();
+                .map(|pending| {
+                    let output = pending.result.model_output();
                     LlmInputItem::FunctionCallOutput {
-                        call_id: result.call_id,
+                        call_id: pending.result.call_id,
                         output,
                     }
                 })
@@ -492,26 +498,226 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
 }
 
-fn pack_tool_results(results: Vec<ToolResult>, budget_bytes: usize) -> Vec<ToolResult> {
+#[derive(Debug, Clone)]
+struct SeenToolOutput {
+    call_id: String,
+    tool_name: String,
+    stable_output_sha256: String,
+    content_sha256: Option<String>,
+    model_output_bytes: usize,
+}
+
+impl SeenToolOutput {
+    fn from_result(result: &ToolResult) -> Self {
+        Self {
+            call_id: result.call_id.clone(),
+            tool_name: result.tool_name.clone(),
+            stable_output_sha256: stable_output_sha256(result),
+            content_sha256: result.receipt.content_sha256.clone(),
+            model_output_bytes: result.model_output().len(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingToolResult {
+    result: ToolResult,
+    remember: Option<SeenToolOutput>,
+    same_as_current_call_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct SeenToolOutputs {
+    by_tool_output: BTreeMap<(String, String), SeenToolOutput>,
+}
+
+impl SeenToolOutputs {
+    fn prepare_results(&self, results: Vec<ToolResult>) -> Vec<PendingToolResult> {
+        let mut prepared = Vec::with_capacity(results.len());
+        let mut seen = self
+            .by_tool_output
+            .iter()
+            .map(|(key, seen)| {
+                (
+                    key.clone(),
+                    RoundSeenToolOutput {
+                        output: seen.clone(),
+                        current_round: false,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        for result in results {
+            prepared.push(Self::prepare_result(result, &mut seen));
+        }
+        prepared
+    }
+
+    fn prepare_result(
+        result: ToolResult,
+        seen: &mut BTreeMap<(String, String), RoundSeenToolOutput>,
+    ) -> PendingToolResult {
+        if !is_receipt_stub_candidate(&result) {
+            return PendingToolResult {
+                result,
+                remember: None,
+                same_as_current_call_id: None,
+            };
+        }
+
+        let key = (result.tool_name.clone(), stable_output_sha256(&result));
+        if let Some(seen) = seen.get(&key) {
+            return PendingToolResult {
+                result: receipt_stub_result(result, &seen.output),
+                remember: None,
+                same_as_current_call_id: seen.current_round.then(|| seen.output.call_id.clone()),
+            };
+        }
+
+        let output = SeenToolOutput::from_result(&result);
+        seen.insert(
+            key,
+            RoundSeenToolOutput {
+                output: output.clone(),
+                current_round: true,
+            },
+        );
+        PendingToolResult {
+            remember: Some(output),
+            result,
+            same_as_current_call_id: None,
+        }
+    }
+
+    fn remember_results(&mut self, results: &[PendingToolResult]) {
+        for result in results {
+            if let Some(seen) = result.remember.clone() {
+                self.by_tool_output
+                    .entry((seen.tool_name.clone(), seen.stable_output_sha256.clone()))
+                    .or_insert(seen);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RoundSeenToolOutput {
+    output: SeenToolOutput,
+    current_round: bool,
+}
+
+fn is_receipt_stub_candidate(result: &ToolResult) -> bool {
+    result.status == ToolStatus::Success
+        && matches!(
+            result.tool_name.as_str(),
+            "glob" | "grep" | "read_file" | "read_tool_output" | "webfetch" | "websearch"
+        )
+}
+
+fn stable_output_sha256(result: &ToolResult) -> String {
+    result
+        .content
+        .get("original_output_sha256")
+        .and_then(Value::as_str)
+        .unwrap_or(&result.receipt.output_sha256)
+        .to_string()
+}
+
+fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult {
+    let content = json!({
+        "receipt_stub": true,
+        "message": "identical tool output already sent to the model in this turn",
+        "same_as_call_id": &seen.call_id,
+        "same_as_tool_name": &seen.tool_name,
+        "original_output_sha256": &seen.stable_output_sha256,
+        "original_content_sha256": &seen.content_sha256,
+        "original_model_output_bytes": seen.model_output_bytes,
+    });
+    let output_bytes = serde_json::to_vec(&content).unwrap_or_default();
+    let mut cost_hint = result.cost_hint;
+    cost_hint.output_bytes = output_bytes.len() as u64;
+    cost_hint.truncated = true;
+
+    ToolResult {
+        call_id: result.call_id,
+        tool_name: result.tool_name,
+        status: result.status,
+        content,
+        cost_hint,
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: result.receipt.content_sha256,
+        },
+    }
+}
+
+fn pack_tool_results(
+    results: Vec<PendingToolResult>,
+    budget_bytes: usize,
+) -> Vec<PendingToolResult> {
     if budget_bytes == 0 {
         return results;
     }
 
     let mut used = 0usize;
+    let mut visible_current_call_ids = BTreeSet::new();
     results
         .into_iter()
-        .map(|result| {
-            let bytes = result.model_output().len();
+        .map(|mut pending| {
+            if pending
+                .same_as_current_call_id
+                .as_ref()
+                .is_some_and(|call_id| !visible_current_call_ids.contains(call_id))
+            {
+                pending.result = receipt_stub_reference_omitted(pending.result);
+                pending.remember = None;
+                pending.same_as_current_call_id = None;
+            }
+
+            let bytes = pending.result.model_output().len();
             if used.saturating_add(bytes) <= budget_bytes {
                 used += bytes;
-                result
+                if pending.remember.is_some() {
+                    visible_current_call_ids.insert(pending.result.call_id.clone());
+                }
+                pending
             } else {
-                let compact = result.aggregate_budget_exceeded(budget_bytes, bytes);
+                let compact = pending
+                    .result
+                    .aggregate_budget_exceeded(budget_bytes, bytes);
                 used = used.saturating_add(compact.model_output().len());
-                compact
+                PendingToolResult {
+                    result: compact,
+                    remember: None,
+                    same_as_current_call_id: None,
+                }
             }
         })
         .collect()
+}
+
+fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {
+    let content = json!({
+        "error": "tool result omitted because the identical result it references was omitted by the aggregate tool-result budget",
+    });
+    let output_bytes = serde_json::to_vec(&content).unwrap_or_default();
+
+    ToolResult {
+        call_id: result.call_id,
+        tool_name: result.tool_name,
+        status: ToolStatus::Error,
+        content,
+        cost_hint: ToolCostHint {
+            output_bytes: output_bytes.len() as u64,
+            truncated: true,
+            ..Default::default()
+        },
+        receipt: ToolReceipt {
+            output_sha256: sha256_hex(&output_bytes),
+            content_sha256: result.receipt.content_sha256,
+        },
+    }
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {

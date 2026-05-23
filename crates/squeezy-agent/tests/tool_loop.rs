@@ -292,6 +292,250 @@ async fn large_read_result_returns_spill_handle_to_model() {
 }
 
 #[tokio::test]
+async fn repeated_read_result_returns_receipt_stub_to_model() {
+    let root = temp_workspace("receipt_stub");
+    fs::write(root.join("sample.txt"), "same content\n").expect("write sample");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("deduped".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn("read twice".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[2]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].0, "first_read");
+    assert_eq!(outputs[0].1["content"]["content"], "same content\n");
+    assert_eq!(outputs[1].0, "second_read");
+    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
+    assert_eq!(
+        outputs[1].1["content"]["original_output_sha256"],
+        outputs[0].1["receipt"]["output_sha256"]
+    );
+    assert!(outputs[1].1["content"]["content"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repeated_read_result_in_same_round_returns_receipt_stub_to_model() {
+    let root = temp_workspace("receipt_stub_same_round");
+    fs::write(root.join("sample.txt"), "same round\n").expect("write sample");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("deduped".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn(
+        "read same file twice in one round".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].0, "first_read");
+    assert_eq!(outputs[0].1["content"]["content"], "same round\n");
+    assert_eq!(outputs[1].0, "second_read");
+    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repeated_spilled_read_result_returns_receipt_stub_to_model() {
+    let root = temp_workspace("receipt_stub_spill");
+    fs::write(root.join("large.txt"), "x".repeat(30_000)).expect("write large");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "large.txt", "limit": 40_000}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("deduped spill".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn(
+        "read large file twice in one round".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].0, "first_read");
+    assert_eq!(outputs[0].1["content"]["spilled"], true);
+    assert!(
+        outputs[0].1["content"]["original_output_sha256"]
+            .as_str()
+            .is_some_and(|hash| hash.len() == 64)
+    );
+    assert_eq!(outputs[1].0, "second_read");
+    assert_eq!(outputs[1].1["content"]["receipt_stub"], true);
+    assert_eq!(outputs[1].1["content"]["same_as_call_id"], "first_read");
+    assert_eq!(
+        outputs[1].1["content"]["original_output_sha256"],
+        outputs[0].1["content"]["original_output_sha256"]
+    );
+    assert!(outputs[1].1["content"]["handle"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn changed_read_result_is_not_receipt_stubbed() {
+    let root = temp_workspace("receipt_stub_changed");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let before_hash = sha256_hex("before".as_bytes());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "write_call".to_string(),
+                name: "write_file".to_string(),
+                arguments: serde_json::json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": before_hash,
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_write".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("changed".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn(
+        "read, edit, read again".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[3]);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[2].0, "second_read");
+    assert_eq!(outputs[2].1["content"]["content"], "after");
+    assert_ne!(outputs[2].1["content"]["receipt_stub"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn aggregate_tool_result_budget_compacts_later_outputs() {
     let root = temp_workspace("aggregate_budget");
     fs::write(root.join("small.txt"), "small").expect("write small");
@@ -341,6 +585,80 @@ async fn aggregate_tool_result_budget_compacts_later_outputs() {
             .expect("budget error")
             .contains("aggregate tool-result budget")
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn aggregate_budget_omission_is_not_remembered_as_seen_output() {
+    let root = temp_workspace("aggregate_budget_receipts");
+    fs::write(root.join("first.txt"), "a".repeat(900)).expect("write first");
+    fs::write(root.join("second.txt"), "b".repeat(900)).expect("write second");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "first.txt"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "second.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_retry".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "second.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_retry".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("not remembered".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.max_tool_result_bytes_per_round = 1_500;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn(
+        "read both then retry omitted output".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    let first_round_outputs = function_outputs(&requests[1]);
+    assert_eq!(first_round_outputs[0].1["status"], "Success");
+    assert_eq!(first_round_outputs[1].1["status"], "Error");
+    assert!(
+        first_round_outputs[1].1["content"]["error"]
+            .as_str()
+            .expect("budget error")
+            .contains("aggregate tool-result budget")
+    );
+
+    let retry_outputs = function_outputs(&requests[2]);
+    assert_eq!(retry_outputs[2].0, "second_retry");
+    assert_eq!(retry_outputs[2].1["status"], "Success");
+    assert_eq!(retry_outputs[2].1["content"]["content"], "b".repeat(900));
+    assert_ne!(retry_outputs[2].1["content"]["receipt_stub"], true);
 
     let _ = fs::remove_dir_all(root);
 }

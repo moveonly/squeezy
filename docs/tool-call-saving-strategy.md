@@ -23,7 +23,13 @@ model-facing tool output compact enough to be useful.
   serialized.
 - **Output spill previews.** Large tool outputs are written to a local
   content-addressed store. The model receives a compact preview plus a handle
-  for fetching exact ranges.
+  for fetching exact ranges. Spill previews also carry the original output
+  receipt so repeated large results can be deduped even when each call receives
+  a different spill handle.
+- **Receipt-backed output stubs.** During one turn, repeated successful
+  read-style tool outputs with the same receipt are replaced with a compact
+  stub that points back to the first model-visible result. Outputs omitted by
+  the aggregate result budget are not remembered as seen.
 - **Aggregate result budgets.** A round with many parallel tools enforces a
   combined model-facing output cap, not only per-tool caps.
 - **Permission-gated mutation.** Edit and shell tools route through
@@ -57,8 +63,9 @@ model-facing tool output compact enough to be useful.
 
 ## Later Structural Savings
 
-- **Receipt-backed read stubs.** Re-reading an unchanged range can return a
-  short receipt reference instead of the same bytes.
+- **MCP tool spill routing.** External MCP tool execution should pass through
+  the same spill, preview, and receipt-stub layer once MCP tool execution
+  exists.
 - **Graph-backed navigation.** Symbol lookup, references, call candidates,
   test-of relationships, and span reads should answer common code questions
   without shell/search/read loops.

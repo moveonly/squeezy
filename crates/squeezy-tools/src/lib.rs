@@ -1432,6 +1432,8 @@ impl ToolOutputStore {
             mut cost_hint,
             receipt,
         } = result;
+        let original_output_sha256 = receipt.output_sha256;
+        let content_sha256 = receipt.content_sha256;
         let call = ToolCall {
             call_id,
             name: tool_name,
@@ -1447,13 +1449,14 @@ impl ToolOutputStore {
                 "spilled": true,
                 "handle": sha256,
                 "sha256": sha256,
+                "original_output_sha256": original_output_sha256,
                 "total_bytes": output.len(),
                 "preview_bytes": preview.len(),
                 "preview": preview,
                 "truncated": true,
             }),
             cost_hint,
-            receipt.content_sha256,
+            content_sha256,
         )
     }
 
