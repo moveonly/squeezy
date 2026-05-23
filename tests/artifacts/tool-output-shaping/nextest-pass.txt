@@ -1,0 +1,5 @@
+{"type":"test-started","binary":"target/debug/deps/probe-abc","test":"tests::ok"}
+{"type":"test-finished","binary":"target/debug/deps/probe-abc","test":"tests::ok","status":"PASS"}
+{"type":"test-started","binary":"target/debug/deps/probe-abc","test":"tests::also_ok"}
+{"type":"test-finished","binary":"target/debug/deps/probe-abc","test":"tests::also_ok","status":"PASS"}
+{"type":"test-run-finished","summary":{"total":2,"passed":2,"failed":0,"skipped":0}}

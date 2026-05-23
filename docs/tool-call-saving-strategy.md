@@ -30,10 +30,13 @@ model-facing tool output compact enough to be useful.
   shaped output, with an `output_mode="raw"` override for exact stdout/stderr.
   Squeezy-owned Rust verification commands request Cargo JSON output where
   supported and parse it into warnings, errors, failures, and exit summaries.
-  Direct shell commands are not rewritten; recognized structured output is
-  parsed when present, and otherwise narrow line shapers drop progress and
-  repeated noise while preserving error, warning, failure, and status lines.
-  Spill handles continue to store the unshaped raw result for exact follow-up
+  Cargo JSON output is interleaved with libtest's plain-text harness lines, so
+  the shaper also keeps those failure markers ("test result:", panics,
+  `FAILED`) when JSON is present. Direct shell commands are not rewritten;
+  recognized structured output is parsed when present, and otherwise narrow
+  line shapers drop progress and repeated noise while preserving error,
+  warning, failure, and status lines plus a tail window of context. Spill
+  handles continue to store the unshaped raw result for exact follow-up
   reads.
 - **Receipt-backed output stubs.** During one turn, repeated successful
   read-style tool outputs with the same receipt are replaced with a compact

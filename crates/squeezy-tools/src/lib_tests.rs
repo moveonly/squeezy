@@ -1840,6 +1840,118 @@ fn unstructured_shape_drops_noise_and_keeps_signal() {
 }
 
 #[test]
+fn cargo_json_with_libtest_plain_text_preserves_test_failure() {
+    // `cargo test --message-format=json` interleaves JSON cargo events with
+    // libtest's plain-text harness output (panics, "test result: FAILED",
+    // etc.). The shaped output has to surface those plain-text failure lines
+    // or shaped verify runs silently hide test failures.
+    let mixed = include_str!("../../../tests/artifacts/tool-output-shaping/cargo-test-mixed.txt");
+
+    let shaped = shape_shell_output(
+        "cargo test --workspace --message-format=json",
+        mixed,
+        "",
+        false,
+        Some(101),
+    );
+
+    assert_eq!(shaped.family, "cargo");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("build-finished success=true"));
+    assert!(
+        shaped.stdout.contains("test result: FAILED"),
+        "expected libtest failure summary in shaped output: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("panicked at"),
+        "expected panic line preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("error: test failed"),
+        "expected libtest error tail preserved: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn test_report_json_parses_when_stderr_has_non_json_chatter() {
+    // npm/jest commonly print warnings to stderr while the structured report
+    // lands on stdout. The shaper has to ignore the stderr chatter instead of
+    // concatenating both streams into a single malformed document.
+    let jest_stdout =
+        include_str!("../../../tests/artifacts/tool-output-shaping/jest-json.txt").to_string();
+    let stderr = "npm WARN deprecated foo@1.0.0\nnpm notice using cache\n";
+
+    let shaped = shape_shell_output("jest --json", &jest_stdout, stderr, false, Some(1));
+
+    assert_eq!(shaped.family, "jest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("numFailedTests=1"));
+    assert!(shaped.stdout.contains("Error: expected true to be false"));
+}
+
+#[test]
+fn nextest_json_emits_pass_fail_summary_even_when_all_pass() {
+    let pass = include_str!("../../../tests/artifacts/tool-output-shaping/nextest-pass.txt");
+
+    let shaped = shape_shell_output("cargo nextest run", pass, "", false, Some(0));
+
+    assert_eq!(shaped.family, "nextest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(
+        shaped.stdout.contains("family=nextest"),
+        "expected nextest summary line, got {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("passed=2"),
+        "expected pass tally in shaped output: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("failed=0"),
+        "expected fail tally in shaped output: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn unstructured_shape_keeps_head_and_tail_around_long_quiet_runs() {
+    // Build an output where the only "signal" line lives at the very end, and
+    // a large block of quiet (but non-noise) lines in the middle. The shaper
+    // should retain the head, the trailing context, and the signal line.
+    let mut output = String::new();
+    for i in 0..200 {
+        output.push_str(&format!("quiet line {i}\n"));
+    }
+    output.push_str("error: something blew up at the end\n");
+
+    let shaped = shape_shell_output("/usr/bin/custom-tool", &output, "", false, Some(1));
+
+    assert_eq!(shaped.family, "shell");
+    assert!(
+        shaped.stdout.contains("quiet line 0"),
+        "expected head preserved"
+    );
+    assert!(
+        shaped.stdout.contains("quiet line 199"),
+        "expected tail line preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("error: something blew up"),
+        "expected signal line preserved"
+    );
+    assert!(
+        shaped.stdout.contains("dropped"),
+        "expected drop accounting in shaped output: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
 fn web_tool_config_normalizes_blank_values() {
     let config = WebToolConfig {
         exa_mcp_url: "  ".to_string(),

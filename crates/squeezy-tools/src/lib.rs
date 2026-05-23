@@ -3047,10 +3047,18 @@ fn structured_shell_output(family: &str, stdout: &str, stderr: &str) -> Option<(
 
 fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut kept = Vec::new();
+    let mut plain_lines = Vec::new();
     let mut parsed = 0usize;
     let mut finished = None;
     for line in stdout.lines().chain(stderr.lines()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            // Cargo emits libtest's plain-text harness output (e.g. "test result:
+            // FAILED.", panic backtraces, "FAILED" markers) interleaved with the
+            // JSON stream. Preserve those signal lines so shaped output still
+            // surfaces test failures.
+            if libtest_signal_line(line) {
+                plain_lines.push(trim_shaped_block(line.trim_end(), 4_000));
+            }
             continue;
         };
         parsed += 1;
@@ -3097,18 +3105,44 @@ fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, Stri
             }
         }
     }
+    // Only claim structured output when at least one JSON line actually
+    // parsed. Plain libtest text on its own should fall through to the
+    // unstructured shaper, which preserves dedupe markers and noise accounting.
     if parsed == 0 {
         return None;
     }
     if let Some(finished) = finished {
         kept.push(finished);
     }
+    kept.extend(plain_lines);
     Some((join_shaped_lines(kept), String::new()))
+}
+
+fn libtest_signal_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.starts_with("test result:")
+        || lower.starts_with("failures:")
+        || lower.starts_with("thread '") && lower.contains("panicked")
+        || lower.starts_with("panicked at")
+        || lower.contains(" ... failed")
+        || lower.starts_with("error: test failed")
+        || lower.starts_with("error: ")
+        || lower.starts_with("warning: ")
+        || lower.starts_with("---- ") && lower.contains(" stdout ----")
 }
 
 fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     let mut kept = Vec::new();
     let mut parsed = 0usize;
+    let mut total = 0usize;
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut last_summary: Option<Value> = None;
     for line in stdout.lines().chain(stderr.lines()) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -3120,6 +3154,23 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
             .and_then(Value::as_str)
             .unwrap_or("");
         let status = value.get("status").and_then(Value::as_str).unwrap_or("");
+        let status_lower = status.to_ascii_lowercase();
+        let event_lower = event.to_ascii_lowercase();
+        let is_per_test_finish = event_lower.contains("test")
+            && (event_lower.contains("finish") || event_lower.contains("complete"));
+        if is_per_test_finish || !status.is_empty() {
+            total += 1;
+            if status_lower.contains("pass") || status_lower == "ok" {
+                passed += 1;
+            } else if status_lower.contains("fail") || status_lower.contains("error") {
+                failed += 1;
+            } else if status_lower.contains("skip") || status_lower.contains("ignore") {
+                skipped += 1;
+            }
+        }
+        if event_lower.contains("summary") || event_lower.contains("run-finished") {
+            last_summary = Some(value.clone());
+        }
         if line_has_signal(event) || line_has_signal(status) || value_contains_signal(&value) {
             kept.push(trim_shaped_block(&value.to_string(), 4_000));
         }
@@ -3127,19 +3178,25 @@ fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
     if parsed == 0 {
         return None;
     }
+    let mut summary_parts = vec!["family=nextest".to_string()];
+    if total > 0 {
+        summary_parts.push(format!(
+            "total={total} passed={passed} failed={failed} skipped={skipped}"
+        ));
+    }
+    if let Some(summary) = last_summary {
+        summary_parts.push(trim_shaped_block(&summary.to_string(), 4_000));
+    }
+    kept.insert(0, summary_parts.join(" "));
     Some((join_shaped_lines(kept), String::new()))
 }
 
 fn parse_test_report_json(stdout: &str, stderr: &str, family: &str) -> Option<(String, String)> {
-    let text = [stdout.trim(), stderr.trim()]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.is_empty() {
-        return None;
-    }
-    let value = serde_json::from_str::<Value>(&text).ok()?;
+    // jest/pytest/vitest emit a single JSON document on either stdout or
+    // stderr. Combining them with a newline produces invalid JSON when both
+    // streams have content (e.g. npm warnings on stderr alongside a real
+    // report on stdout), so try each stream individually.
+    let value = parse_first_valid_json(stdout).or_else(|| parse_first_valid_json(stderr))?;
     let mut kept = Vec::new();
     collect_json_signal_lines(&value, "$", &mut kept);
     let summary = json_test_summary(&value, family);
@@ -3147,6 +3204,22 @@ fn parse_test_report_json(stdout: &str, stderr: &str, family: &str) -> Option<(S
         kept.insert(0, summary);
     }
     Some((join_shaped_lines(kept), String::new()))
+}
+
+fn parse_first_valid_json(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    // Fall back to scanning for the first line that parses as JSON, so a
+    // header line ("Running tests...") or trailer doesn't defeat the parser.
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
 }
 
 fn json_test_summary(value: &Value, family: &str) -> String {
@@ -3212,34 +3285,64 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
     if text.trim().is_empty() {
         return String::new();
     }
-    let mut kept = Vec::new();
+    const HEAD_BUDGET: usize = 20;
+    const TAIL_BUDGET: usize = 20;
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_BUDGET);
+    let mut signal_lines: Vec<String> = Vec::new();
     let mut dropped = 0usize;
-    let mut last = "";
+    let mut last_emitted: String = String::new();
     let mut repeats = 0usize;
+    let flush_repeats =
+        |target: &mut Vec<String>, repeats: &mut usize, tail: &mut VecDeque<String>| {
+            if *repeats == 0 {
+                return;
+            }
+            let line = format!("[repeated previous line {} more times]", *repeats);
+            if target.len() < HEAD_BUDGET {
+                target.push(line);
+            } else {
+                if tail.len() == TAIL_BUDGET {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+            *repeats = 0;
+        };
     for line in text.lines() {
         let trimmed = line.trim_end();
         if trimmed.is_empty() || line_is_noise(trimmed) {
             dropped += 1;
             continue;
         }
-        if trimmed == last {
+        if trimmed == last_emitted.as_str() {
             repeats += 1;
             dropped += 1;
             continue;
         }
-        if repeats > 0 {
-            kept.push(format!("[repeated previous line {repeats} more times]"));
-            repeats = 0;
-        }
-        last = trimmed;
-        if line_has_signal(trimmed) || kept.len() < 20 {
-            kept.push(trim_shaped_block(trimmed, 2_000));
+        flush_repeats(&mut head, &mut repeats, &mut tail);
+        last_emitted = trimmed.to_string();
+        let shaped = trim_shaped_block(trimmed, 2_000);
+        if line_has_signal(trimmed) {
+            signal_lines.push(shaped);
+        } else if head.len() < HEAD_BUDGET {
+            head.push(shaped);
         } else {
-            dropped += 1;
+            if tail.len() == TAIL_BUDGET {
+                tail.pop_front();
+                dropped += 1;
+            }
+            tail.push_back(shaped);
         }
     }
-    if repeats > 0 {
-        kept.push(format!("[repeated previous line {repeats} more times]"));
+    flush_repeats(&mut head, &mut repeats, &mut tail);
+
+    let mut kept = head;
+    if !signal_lines.is_empty() {
+        kept.extend(signal_lines);
+    }
+    if !tail.is_empty() {
+        kept.extend(tail);
     }
     if dropped > 0 {
         kept.push(format!("[dropped {dropped} low-signal lines]"));
