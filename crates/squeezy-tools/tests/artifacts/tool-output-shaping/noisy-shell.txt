@@ -1,0 +1,8 @@
+Compiling crate_a v0.1.0
+Compiling crate_b v0.1.0
+Compiling crate_c v0.1.0
+warning: unused variable `value`
+error: expected `;`
+error: expected `;`
+error: expected `;`
+test result: FAILED. 1 passed; 1 failed

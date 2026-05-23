@@ -422,9 +422,8 @@ impl AppConfig {
     /// Returns a TOML-shaped report of the effective configuration with
     /// sensitive values redacted. The output is valid TOML and the same
     /// document can be parsed back by `SettingsFile::from_toml_str`
-    /// (note: `[graph]`, `[tui].status_verbosity`, and `[mcp.servers.*]`
-    /// sections currently round-trip into the typed model but no consumer
-    /// reads them yet).
+    /// (note: `[graph]` and `[mcp.servers.*]` sections currently round-trip
+    /// into the typed model but no consumer reads them yet).
     pub fn inspect_redacted(&self) -> String {
         let mut output = String::new();
         output.push_str("# effective Squeezy config\n");
@@ -3025,9 +3024,8 @@ pub fn project_settings_template() -> &'static str {
 # action = "allow"
 # source = "project"
 
-# `[graph]` controls workspace indexing. `[tui].status_verbosity` and
-# `[mcp.servers.*]` are parsed and round-trip through `squeezy config inspect`
-# but are still v0 reservations.
+# `[graph]` controls workspace indexing. `[mcp.servers.*]` is parsed and
+# round-trips through `squeezy config inspect` but is still a v0 reservation.
 
 # [graph]
 # languages = ["rust", "python"]
@@ -3046,7 +3044,7 @@ pub fn project_settings_template() -> &'static str {
 
 [tui]
 # tick_rate_ms = 50
-# status_verbosity = "compact"   # not wired yet
+# status_verbosity = "compact"   # compact | verbose
 "#
 }
 
@@ -4043,6 +4041,8 @@ pub enum EdgeKind {
     Reexports,
     Calls,
     References,
+    Extends,
+    PartialOf,
     Implements,
     InherentImpl,
     TraitImpl,

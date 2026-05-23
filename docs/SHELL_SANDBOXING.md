@@ -214,6 +214,15 @@ the strong gate; the sandbox is best-effort defense in depth.
 
 Known limits:
 
+- CI covers backend selection, required-mode unavailable behavior, runtime
+  unavailable detection, and platform-gated smoke execution. It does not prove
+  full OS-boundary denial semantics such as blocking reads from real credential
+  files, blocking writes outside the workspace, or blocking routed network
+  traffic; those checks require controlled self-hosted machines. The smoke
+  tests also skip themselves when the host kills the sandboxed child before
+  it produces any output (signal-terminated, empty stdout/stderr, no exit
+  code), since that is indistinguishable post-hoc from a third-party EDR or
+  shell-intercept toolchain refusing to run under `sandbox-exec` / `unshare`.
 - macOS `sandbox-exec` is deprecated by Apple, but remains the available native
   command-line sandbox backend on supported macOS systems.
 - Some host sandboxes (CI runners, third-party VPN/EDR products) can prevent

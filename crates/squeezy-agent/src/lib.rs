@@ -889,6 +889,7 @@ fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
             output_sha256: sha256_hex(&output_bytes),
             content_sha256: None,
         },
+        spill_model_output: None,
     }
 }
 
@@ -1754,6 +1755,7 @@ fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult 
             output_sha256: sha256_hex(&output_bytes),
             content_sha256: result.receipt.content_sha256,
         },
+        spill_model_output: None,
     }
 }
 
@@ -1846,6 +1848,7 @@ fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {
             output_sha256: sha256_hex(&output_bytes),
             content_sha256: result.receipt.content_sha256,
         },
+        spill_model_output: None,
     }
 }
 

@@ -51,7 +51,24 @@ The planned crate layout should separate:
 
 Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
-Integration-test fixtures and reusable test artifacts belong under `tests/artifacts/`; do not add top-level `examples/` directories for them.
+Integration-test fixtures and reusable test artifacts belong under the owning crate's `tests/artifacts/` directory. If a fixture is crate-specific, keep it inside that crate (e.g. `crates/squeezy-tools/tests/artifacts/`). Do not add top-level `examples/` directories or a workspace-level `tests/artifacts/` for crate-specific fixtures.
+
+## Test Layout
+
+`docs/TEST_LAYOUT.md` is the source of truth. Quick decision rule:
+
+- Unit tests that need crate-private items → `src/<module>_tests.rs` paired
+  with a real `src/<module>.rs` source file. Declare via `#[cfg(test)]
+  #[path = "<module>_tests.rs"] mod tests;` inside `<module>.rs`. Never create
+  an empty `<module>.rs` just to satisfy the pair convention.
+- Integration / end-to-end tests that only use the crate's public API →
+  `crates/<crate>/tests/<scenario>.rs`. Each file is its own binary and
+  needs no sibling source file. Use this when the scenario is naturally a
+  whole-crate exercise (e.g. host-backed smoke tests, public-API workflows).
+- Cross-crate integration suites → workspace-level `tests/`.
+
+If a new test does not have a natural source-file owner, prefer the
+crate-level `tests/` directory over inventing one.
 
 ## Constraints
 

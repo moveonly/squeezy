@@ -19,13 +19,20 @@ use super::*;
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
+    registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
+}
+
+fn registry_with_shell_sandbox_off_and_output_config(
+    root: &Path,
+    output_config: ToolOutputConfig,
+) -> ToolRegistry {
     let shell_sandbox = squeezy_core::ShellSandboxConfig {
         mode: squeezy_core::ShellSandboxMode::Off,
         ..squeezy_core::ShellSandboxConfig::default()
     };
     ToolRegistry::new_inner(
         root,
-        ToolOutputConfig::default(),
+        output_config,
         WebToolConfig::default(),
         shell_sandbox,
         SkillCatalog::empty(),
@@ -650,7 +657,10 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
         &["crates/example/src/lib.rs".to_string()],
     );
 
-    assert_eq!(command, "cargo test -p squeezy-example");
+    assert_eq!(
+        command,
+        "cargo test -p squeezy-example --message-format=json"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1079,8 +1089,7 @@ async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
     // Disable the OS sandbox so this test focuses on checkpoint behavior;
-    // the deny-default macOS profile + Linux unshare probing are exercised
-    // in dedicated sandbox tests, not the checkpoint suite.
+    // OS sandbox backend coverage lives in shell_sandbox_tests.
     let registry = registry_with_shell_sandbox_off(&root);
 
     let result = registry
@@ -1622,6 +1631,118 @@ async fn shell_output_cap_is_enforced_while_command_runs() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn shell_shaped_output_drops_noise_but_raw_mode_keeps_it() {
+    let root = temp_workspace("shell_shaped_raw");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let shaped = registry
+        .execute(
+            ToolCall {
+                call_id: "call_shaped".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nerror: bad\\n'",
+                    "description": "shape noisy output"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(shaped.status, ToolStatus::Success);
+    assert_eq!(shaped.content["output_shape"]["mode"], "shaped");
+    assert!(
+        shaped.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("error: bad")
+    );
+    assert!(
+        !shaped.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("Compiling crate_a")
+    );
+
+    let raw = registry
+        .execute(
+            ToolCall {
+                call_id: "call_raw".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nerror: bad\\n'",
+                    "description": "raw noisy output",
+                    "output_mode": "raw"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(raw.status, ToolStatus::Success);
+    assert!(raw.content.get("output_shape").is_none());
+    assert!(
+        raw.content["stdout"]
+            .as_str()
+            .expect("stdout")
+            .contains("Compiling crate_a")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
+    let root = temp_workspace("shell_shaped_spill_raw");
+    let registry = registry_with_shell_sandbox_off_and_output_config(
+        &root,
+        ToolOutputConfig {
+            spill_threshold_bytes: 100,
+            preview_bytes: 512,
+            retention_days: 1,
+            output_dir: None,
+        },
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spill".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'Compiling crate_a\\nCompiling crate_b\\nerror: bad\\n'",
+                    "description": "spill shaped output"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["spilled"], true);
+    let preview = result.content["preview"].as_str().expect("preview");
+    assert!(preview.contains("output_shape"));
+    let handle = result.content["handle"].as_str().expect("handle");
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_spill".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({"handle": handle, "offset": 0, "limit": 8_000}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(fetched.status, ToolStatus::Success);
+    let raw = fetched.content["content"].as_str().expect("content");
+    assert!(raw.contains("Compiling crate_a"));
+    assert!(!raw.contains("output_shape"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn shell_call_description_summary_carries_only_description() {
     // The shell `describe_call` summary intentionally surfaces ONLY the
@@ -1667,6 +1788,165 @@ fn websearch_parser_accepts_json_and_sse_mcp_responses() {
             "event: message\ndata: {payload}\n\ndata: [DONE]\n\n"
         )),
         Some("search results".to_string())
+    );
+}
+
+#[test]
+fn cargo_json_output_shape_preserves_warnings_errors_and_summary() {
+    let cargo_json = include_str!("../tests/artifacts/tool-output-shaping/cargo-json.txt");
+
+    let shaped = shape_shell_output(
+        "cargo test --workspace --message-format=json",
+        cargo_json,
+        "",
+        false,
+        Some(101),
+    );
+
+    assert_eq!(shaped.family, "cargo");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("warning: unused variable"));
+    assert!(shaped.stdout.contains("error[E0425]"));
+    assert!(shaped.stdout.contains("build-finished success=false"));
+    assert!(shaped.stderr.is_empty());
+    assert_eq!(shaped.fallback_reason, None);
+}
+
+#[test]
+fn jest_json_output_shape_preserves_failure_and_summary() {
+    let jest_json = include_str!("../tests/artifacts/tool-output-shaping/jest-json.txt");
+
+    let shaped = shape_shell_output("jest --json", jest_json, "", false, Some(1));
+
+    assert_eq!(shaped.family, "jest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("numFailedTests=1"));
+    assert!(shaped.stdout.contains("Error: expected true to be false"));
+}
+
+#[test]
+fn unstructured_shape_drops_noise_and_keeps_signal() {
+    let noisy = include_str!("../tests/artifacts/tool-output-shaping/noisy-shell.txt");
+
+    let shaped = shape_shell_output("cargo fmt --check", noisy, "", false, Some(1));
+
+    assert_eq!(shaped.family, "cargo");
+    assert!(shaped.stdout.contains("warning: unused variable"));
+    assert!(shaped.stdout.contains("error: expected `;`"));
+    assert!(shaped.stdout.contains("test result: FAILED"));
+    assert!(!shaped.stdout.contains("Compiling crate_a"));
+    assert!(shaped.stdout.contains("repeated previous line"));
+}
+
+#[test]
+fn cargo_json_with_libtest_plain_text_preserves_test_failure() {
+    // `cargo test --message-format=json` interleaves JSON cargo events with
+    // libtest's plain-text harness output (panics, "test result: FAILED",
+    // etc.). The shaped output has to surface those plain-text failure lines
+    // or shaped verify runs silently hide test failures.
+    let mixed = include_str!("../tests/artifacts/tool-output-shaping/cargo-test-mixed.txt");
+
+    let shaped = shape_shell_output(
+        "cargo test --workspace --message-format=json",
+        mixed,
+        "",
+        false,
+        Some(101),
+    );
+
+    assert_eq!(shaped.family, "cargo");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("build-finished success=true"));
+    assert!(
+        shaped.stdout.contains("test result: FAILED"),
+        "expected libtest failure summary in shaped output: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("panicked at"),
+        "expected panic line preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("error: test failed"),
+        "expected libtest error tail preserved: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn test_report_json_parses_when_stderr_has_non_json_chatter() {
+    // npm/jest commonly print warnings to stderr while the structured report
+    // lands on stdout. The shaper has to ignore the stderr chatter instead of
+    // concatenating both streams into a single malformed document.
+    let jest_stdout =
+        include_str!("../tests/artifacts/tool-output-shaping/jest-json.txt").to_string();
+    let stderr = "npm WARN deprecated foo@1.0.0\nnpm notice using cache\n";
+
+    let shaped = shape_shell_output("jest --json", &jest_stdout, stderr, false, Some(1));
+
+    assert_eq!(shaped.family, "jest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(shaped.stdout.contains("numFailedTests=1"));
+    assert!(shaped.stdout.contains("Error: expected true to be false"));
+}
+
+#[test]
+fn nextest_json_emits_pass_fail_summary_even_when_all_pass() {
+    let pass = include_str!("../tests/artifacts/tool-output-shaping/nextest-pass.txt");
+
+    let shaped = shape_shell_output("cargo nextest run", pass, "", false, Some(0));
+
+    assert_eq!(shaped.family, "nextest");
+    assert_eq!(shaped.kind, "structured");
+    assert!(
+        shaped.stdout.contains("family=nextest"),
+        "expected nextest summary line, got {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("passed=2"),
+        "expected pass tally in shaped output: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("failed=0"),
+        "expected fail tally in shaped output: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn unstructured_shape_keeps_head_and_tail_around_long_quiet_runs() {
+    // Build an output where the only "signal" line lives at the very end, and
+    // a large block of quiet (but non-noise) lines in the middle. The shaper
+    // should retain the head, the trailing context, and the signal line.
+    let mut output = String::new();
+    for i in 0..200 {
+        output.push_str(&format!("quiet line {i}\n"));
+    }
+    output.push_str("error: something blew up at the end\n");
+
+    let shaped = shape_shell_output("/usr/bin/custom-tool", &output, "", false, Some(1));
+
+    assert_eq!(shaped.family, "shell");
+    assert!(
+        shaped.stdout.contains("quiet line 0"),
+        "expected head preserved"
+    );
+    assert!(
+        shaped.stdout.contains("quiet line 199"),
+        "expected tail line preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("error: something blew up"),
+        "expected signal line preserved"
+    );
+    assert!(
+        shaped.stdout.contains("dropped"),
+        "expected drop accounting in shaped output: {}",
+        shaped.stdout
     );
 }
 
@@ -2907,4 +3187,249 @@ fn shell_approval_summary_no_longer_duplicates_command_or_cwd() {
     );
     assert!(request.summary.contains("description=\"tests\""));
     let _ = fs::remove_dir_all(root);
+}
+
+// ---------------------------------------------------------------------------
+// Shell sandbox planner + runtime-detection unit tests.
+//
+// These cover internal seams (`prepare_shell_sandbox_plan_with_probe`,
+// `shell_sandbox_runtime_unavailable_with_probe`, `ShellSandboxPlan`,
+// `analyze_shell_command`) and therefore must stay in the crate as unit
+// tests. The host-backed smoke tests that exercise the sandboxed
+// `ToolRegistry::execute` path live in
+// `crates/squeezy-tools/tests/shell_sandbox_smoke.rs` so they can use the
+// public API surface only.
+
+fn sandbox_config(
+    mode: ShellSandboxMode,
+    network: ShellSandboxNetworkPolicy,
+) -> ShellSandboxConfig {
+    ShellSandboxConfig {
+        mode,
+        network,
+        ..ShellSandboxConfig::default()
+    }
+}
+
+fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan {
+    ShellSandboxPlan {
+        program: "sh".to_string(),
+        args: vec!["-lc".to_string(), "true".to_string()],
+        backend,
+        mode: if required { "required" } else { "best_effort" },
+        network: "denied",
+        required,
+    }
+}
+
+fn prepare_sandbox_plan_with_probes(
+    command: &str,
+    config: &ShellSandboxConfig,
+    macos_available: bool,
+    linux_available: bool,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    let analysis = analyze_shell_command(command);
+    prepare_shell_sandbox_plan_with_probe(
+        command,
+        &analysis,
+        Path::new("/tmp"),
+        config,
+        macos_available,
+        linux_available,
+    )
+}
+
+#[test]
+fn shell_sandbox_plan_mode_off_returns_direct() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Off,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "off");
+    assert_eq!(plan.program, "sh");
+    assert!(!plan.required);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_plan_required_when_sandbox_exec_absent() {
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect_err("required mode must fail closed");
+
+    assert!(err.contains("/usr/bin/sandbox-exec not found"));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        false,
+        true,
+    )
+    .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "best_effort");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_required_when_userns_unavailable() {
+    let err = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect_err("required mode must fail closed");
+
+    assert!(err.contains("required shell sandbox unavailable: linux unshare"));
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::BestEffort,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        false,
+    )
+    .expect("best effort falls back");
+
+    assert_eq!(plan.backend, "none");
+    assert_eq!(plan.mode, "best_effort");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_allow_when_approved() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "curl https://example.com",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::AllowWhenApproved,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "allowed_approved");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_denied_classified() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "curl https://example.com",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "denied_classified");
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn shell_sandbox_plan_network_posture_denied_non_network() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::Required,
+            ShellSandboxNetworkPolicy::AllowWhenApproved,
+        ),
+        true,
+        true,
+    )
+    .expect("plan");
+
+    assert_eq!(plan.network, "denied");
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_detects_macos_exit_71_with_sandbox_apply() {
+    let plan = fake_sandbox_plan("macos-sandbox-exec", true);
+
+    assert!(shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(71),
+        "sandbox_apply: Operation not permitted",
+        true,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_detects_linux_exit_1_empty_stderr_when_userns_gone() {
+    let plan = fake_sandbox_plan("linux-direct-syscalls", true);
+
+    assert!(shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(1),
+        "",
+        false,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_ignores_nonzero_exit_with_stderr() {
+    let linux_plan = fake_sandbox_plan("linux-direct-syscalls", true);
+    let macos_plan = fake_sandbox_plan("macos-sandbox-exec", true);
+
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &linux_plan,
+        Some(1),
+        "command failed",
+        false,
+    ));
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &macos_plan,
+        Some(71),
+        "ordinary exit",
+        true,
+    ));
+}
+
+#[test]
+fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
+    let plan = fake_sandbox_plan("none", true);
+
+    assert!(!shell_sandbox_runtime_unavailable_with_probe(
+        &plan,
+        Some(1),
+        "",
+        false,
+    ));
 }

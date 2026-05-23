@@ -200,6 +200,7 @@ pub(crate) struct CsharpOracleReport {
     pub(crate) oracle_unparseable_files: usize,
     pub(crate) oracle_unparseable_examples: Vec<String>,
     pub(crate) symbols: AccuracySetReport,
+    pub(crate) edges: AccuracySetReport,
     pub(crate) limitations: Vec<String>,
 }
 
@@ -324,4 +325,3 @@ impl SymbolKey {
         format!("{}:{}:{}", self.file, self.kind, self.name)
     }
 }
-
