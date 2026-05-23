@@ -215,10 +215,8 @@ impl AnthropicStreamState {
         CostSnapshot {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
-            cached_input_tokens: add_optional(
-                self.cache_read_input_tokens,
-                self.cache_creation_input_tokens,
-            ),
+            cached_input_tokens: self.cache_read_input_tokens,
+            cache_write_input_tokens: self.cache_creation_input_tokens,
             estimated_usd_micros: None,
         }
     }
@@ -456,15 +454,6 @@ fn merge_usage(state: &mut AnthropicStreamState, usage: Option<&Value>) {
         .get("cache_creation_input_tokens")
         .and_then(Value::as_u64)
         .or(state.cache_creation_input_tokens);
-}
-
-fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
 }
 
 #[cfg(test)]

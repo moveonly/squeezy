@@ -19,8 +19,8 @@ const EVENT_NAMES = new Set([
   "squeezy_failure_seen",
 ]);
 
-const PROVIDERS = new Set(["open_ai", "anthropic"]);
-const MODEL_FAMILIES = new Set(["gpt", "claude", "other"]);
+const PROVIDERS = new Set(["open_ai", "anthropic", "google", "azure_open_ai", "bedrock", "ollama"]);
+const MODEL_FAMILIES = new Set(["gpt", "claude", "gemini", "bedrock", "ollama", "other"]);
 const TOOL_NAMES = new Set([
   "glob",
   "grep",

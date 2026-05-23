@@ -201,6 +201,7 @@ fn parser_extracts_completed_response_id_and_usage() {
                 input_tokens: Some(10),
                 output_tokens: Some(4),
                 cached_input_tokens: Some(3),
+                cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
         })

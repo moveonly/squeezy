@@ -22,3 +22,27 @@ async fn unavailable_provider_reports_configuration_error() {
     assert!(err.to_string().contains("missing OPENAI_API_KEY"));
     assert!(stream.next().await.is_none());
 }
+
+#[test]
+fn registry_estimates_known_model_costs() {
+    let cost = CostSnapshot {
+        input_tokens: Some(1_000_000),
+        output_tokens: Some(1_000_000),
+        cached_input_tokens: Some(1_000_000),
+        cache_write_input_tokens: None,
+        estimated_usd_micros: None,
+    };
+
+    let estimate = estimate_cost("openai", squeezy_core::DEFAULT_OPENAI_MODEL, &cost);
+
+    assert_eq!(estimate, Some(405_000));
+}
+
+#[test]
+fn registry_lists_ollama_as_zero_cost_local_provider() {
+    let model = models_for_provider("ollama").next().expect("ollama model");
+
+    assert_eq!(model.provider, "ollama");
+    assert_eq!(model.pricing.unwrap().input_usd_micros_per_mtok, 0);
+    assert!(model.capabilities.streaming);
+}

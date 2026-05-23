@@ -5,10 +5,10 @@ use std::{
 
 use clap::Parser;
 use futures_util::StreamExt;
-use squeezy_core::{AppConfig, ProviderConfig};
+use squeezy_core::{AppConfig, ModelProfile};
 use squeezy_llm::{
-    AnthropicProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider,
-    UnavailableProvider,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
+    models_for_provider, provider_from_config,
 };
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
@@ -16,12 +16,22 @@ use tokio_util::sync::CancellationToken;
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
 struct Cli {
-    #[arg(long, env = "SQUEEZY_PROVIDER", help = "Provider: openai or anthropic")]
+    #[arg(long, env = "SQUEEZY_PROVIDER", help = "Provider id")]
     provider: Option<String>,
     #[arg(long, env = "SQUEEZY_MODEL")]
     model: Option<String>,
+    #[arg(
+        long,
+        env = "SQUEEZY_PROFILE",
+        help = "Model profile: cheap, balanced, or strong"
+    )]
+    profile: Option<String>,
     #[arg(long, default_value_t = squeezy_core::DEFAULT_MAX_OUTPUT_TOKENS)]
     max_output_tokens: u32,
+    #[arg(long, help = "List configured built-in providers")]
+    list_providers: bool,
+    #[arg(long, help = "List built-in model metadata")]
+    list_models: bool,
     #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
     prompt: Option<String>,
     #[arg(long, help = "Check configuration and exit without opening the TUI")]
@@ -36,11 +46,44 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let mut config = config_from_cli_provider(cli.provider.as_deref());
+    let mut config = config_from_cli_provider(cli.provider.as_deref())?;
     if let Some(model) = cli.model {
         config.model = model;
     }
+    if let Some(profile) = cli.profile.as_deref().and_then(ModelProfile::parse) {
+        config.profile = profile;
+    }
     config.max_output_tokens = Some(cli.max_output_tokens);
+
+    if cli.list_providers {
+        for provider in PROVIDERS {
+            println!("{provider}");
+        }
+        return Ok(());
+    }
+
+    if cli.list_models {
+        let provider = cli.provider.as_deref();
+        for model in PROVIDERS
+            .iter()
+            .copied()
+            .filter(|candidate| provider.is_none_or(|provider| provider == *candidate))
+            .flat_map(models_for_provider)
+        {
+            println!(
+                "{}\t{}\t{:?}\tstreaming={} tools={} json={} vision={} state={}",
+                model.provider,
+                model.id,
+                model.profile,
+                model.capabilities.streaming,
+                model.capabilities.tool_calling,
+                model.capabilities.json_mode,
+                model.capabilities.vision,
+                model.capabilities.response_state
+            );
+        }
+        return Ok(());
+    }
 
     if cli.health {
         println!("squeezy: ok");
@@ -50,7 +93,7 @@ async fn main() -> squeezy_core::Result<()> {
     let telemetry = TelemetryClient::from_config(&config);
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
-    let provider = provider_from_config(&config);
+    let provider = provider_from_app_config(&config);
     if let Some(prompt) = cli.prompt {
         let result = run_prompt(config, provider, prompt).await;
         let _ = telemetry.flush().await;
@@ -96,10 +139,12 @@ async fn run_prompt(
                 writeln!(stdout)?;
                 stdout.flush()?;
                 eprintln!(
-                    "tokens: input={} output={} cached={}",
+                    "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
                     format_token(cost.input_tokens),
                     format_token(cost.output_tokens),
-                    format_token(cost.cached_input_tokens)
+                    format_token(cost.cached_input_tokens),
+                    format_token(cost.cache_write_input_tokens),
+                    format_usd_micros(cost.estimated_usd_micros)
                 );
             }
             LlmEvent::Cancelled => {
@@ -116,23 +161,23 @@ fn format_token(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
 
-fn provider_from_config(config: &AppConfig) -> Arc<dyn LlmProvider> {
-    match &config.provider {
-        ProviderConfig::OpenAi(openai) => match OpenAiProvider::from_config(openai) {
-            Ok(provider) => Arc::new(provider),
-            Err(error) => Arc::new(UnavailableProvider::new("openai", error.to_string())),
-        },
-        ProviderConfig::Anthropic(anthropic) => match AnthropicProvider::from_config(anthropic) {
-            Ok(provider) => Arc::new(provider),
-            Err(error) => Arc::new(UnavailableProvider::new("anthropic", error.to_string())),
-        },
+fn format_usd_micros(value: Option<u64>) -> String {
+    match value {
+        Some(value) => format!("${:.6}", value as f64 / 1_000_000.0),
+        None => "-".to_string(),
     }
 }
 
-fn config_from_cli_provider(provider: Option<&str>) -> AppConfig {
-    let Some(provider) = provider else {
-        return AppConfig::from_env();
-    };
+fn provider_from_app_config(config: &AppConfig) -> Arc<dyn LlmProvider> {
+    match provider_from_config(&config.provider) {
+        Ok(provider) => provider,
+        Err(error) => Arc::new(UnavailableProvider::new("unavailable", error.to_string())),
+    }
+}
 
-    AppConfig::from_env_with_provider(provider)
+fn config_from_cli_provider(provider: Option<&str>) -> squeezy_core::Result<AppConfig> {
+    let Some(provider) = provider else {
+        return AppConfig::from_env_and_settings();
+    };
+    AppConfig::from_env_and_settings_with_provider(provider)
 }

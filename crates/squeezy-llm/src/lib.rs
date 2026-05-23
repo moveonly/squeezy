@@ -6,10 +6,21 @@ use squeezy_core::{CostSnapshot, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
 mod anthropic;
+mod bedrock;
+mod google;
+mod ollama;
 mod openai;
+mod registry;
 
 pub use anthropic::AnthropicProvider;
+pub use bedrock::BedrockProvider;
+pub use google::GoogleProvider;
+pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
+pub use registry::{
+    MODEL_REGISTRY, ModelCapabilities, ModelInfo, PROVIDERS, TokenPricing, estimate_cost,
+    models_for_provider, provider_from_config, provider_name,
+};
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 

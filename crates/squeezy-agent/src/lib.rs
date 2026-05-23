@@ -8,13 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{StreamExt, stream};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionScope, SessionMetrics, SqueezyError,
     TranscriptItem, TurnId, TurnMetrics,
 };
-use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec};
+use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_telemetry::{
     ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
     ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
@@ -167,6 +167,7 @@ impl TurnRuntime {
                 tools: self.tool_specs.clone(),
                 store: self.config.store_responses,
             };
+            let request_model = request.model.clone();
             let mut stream = self.provider.stream_response(request, self.cancel.clone());
             let mut tool_calls = Vec::new();
             let mut completed = false;
@@ -221,8 +222,12 @@ impl TurnRuntime {
                     }
                     Ok(LlmEvent::Completed {
                         response_id: id,
-                        cost,
+                        mut cost,
                     }) => {
+                        if cost.estimated_usd_micros.is_none() {
+                            cost.estimated_usd_micros =
+                                estimate_cost(self.provider.name(), &request_model, &cost);
+                        }
                         broker.metrics.record_provider(&cost);
                         merge_cost(&mut total_cost, &cost);
                         response_id = id;
@@ -272,16 +277,20 @@ impl TurnRuntime {
                 return Ok(());
             }
 
-            let tool_context = ToolExecutionContext {
-                turn_id: self.turn_id,
-                tools: self.tools.clone(),
-                config: self.config.clone(),
-                telemetry: self.telemetry.clone(),
-                tx: self.tx.clone(),
-                cancel: self.cancel.clone(),
-                approval_ids: self.approval_ids.clone(),
-            };
-            let results = execute_tool_calls(&tool_context, tool_calls.clone(), &mut broker).await;
+            let results = execute_tool_calls(
+                tool_calls.clone(),
+                ToolExecutionContext {
+                    turn_id: self.turn_id,
+                    tools: &self.tools,
+                    config: &self.config,
+                    telemetry: self.telemetry.clone(),
+                    tx: self.tx.clone(),
+                    cancel: self.cancel.clone(),
+                    approval_ids: self.approval_ids.clone(),
+                },
+                &mut broker,
+            )
+            .await;
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             for pending in &results {
@@ -327,10 +336,10 @@ impl TurnRuntime {
 }
 
 #[derive(Clone)]
-struct ToolExecutionContext {
+struct ToolExecutionContext<'a> {
     turn_id: TurnId,
-    tools: ToolRegistry,
-    config: AppConfig,
+    tools: &'a ToolRegistry,
+    config: &'a AppConfig,
     telemetry: TelemetryClient,
     tx: mpsc::Sender<AgentEvent>,
     cancel: CancellationToken,
@@ -338,12 +347,13 @@ struct ToolExecutionContext {
 }
 
 async fn execute_tool_calls(
-    context: &ToolExecutionContext,
     calls: Vec<ToolCall>,
+    context: ToolExecutionContext<'_>,
     broker: &mut CostBroker,
 ) -> Vec<ToolResult> {
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
+    let mut recorded = vec![false; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
         let tool_sequence = match broker.reserve_call() {
@@ -351,7 +361,7 @@ async fn execute_tool_calls(
             Err((tool_sequence, reason)) => {
                 let result = budget_denied_result(call, reason);
                 emit_tool_telemetry(
-                    &context.config,
+                    context.config,
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
@@ -367,14 +377,16 @@ async fn execute_tool_calls(
                     })
                     .await;
                 results[index] = Some(result);
+                recorded[index] = true;
                 continue;
             }
         };
+
         match permission_decision(
             context.turn_id,
             call,
-            &context.tools,
-            &context.config,
+            context.tools,
+            context.config,
             &context.tx,
             &context.cancel,
             context.approval_ids.clone(),
@@ -385,7 +397,7 @@ async fn execute_tool_calls(
             ApprovalDecision::Denied(reason) => {
                 let result = ToolResult::denied(call, reason);
                 emit_tool_telemetry(
-                    &context.config,
+                    context.config,
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
@@ -401,11 +413,12 @@ async fn execute_tool_calls(
                     })
                     .await;
                 results[index] = Some(result);
+                recorded[index] = true;
             }
             ApprovalDecision::Cancelled => {
                 let result = ToolResult::cancelled(call);
                 emit_tool_telemetry(
-                    &context.config,
+                    context.config,
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
@@ -421,7 +434,14 @@ async fn execute_tool_calls(
                     })
                     .await;
                 results[index] = Some(result);
-                return results.into_iter().flatten().collect();
+                recorded[index] = true;
+                return collect_recorded_results(
+                    results,
+                    recorded,
+                    broker,
+                    context.config,
+                    &context.telemetry,
+                );
             }
         }
     }
@@ -432,7 +452,7 @@ async fn execute_tool_calls(
             if let Some(reason) = broker.deny_reason() {
                 let result = budget_denied_result(&call, reason);
                 emit_tool_telemetry(
-                    &context.config,
+                    context.config,
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
@@ -441,15 +461,16 @@ async fn execute_tool_calls(
                 );
                 broker.record_executed_result(&result);
                 results[index] = Some(result);
+                recorded[index] = true;
                 continue;
             }
             parallel_batch.push((index, call, tool_sequence));
         } else {
-            flush_parallel_batch(context, broker, &mut results, &mut parallel_batch).await;
+            flush_parallel_batch(&context, broker, &mut results, &mut parallel_batch).await;
             if let Some(reason) = broker.deny_reason() {
                 let result = budget_denied_result(&call, reason);
                 emit_tool_telemetry(
-                    &context.config,
+                    context.config,
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
@@ -458,20 +479,38 @@ async fn execute_tool_calls(
                 );
                 broker.record_executed_result(&result);
                 results[index] = Some(result);
+                recorded[index] = true;
                 continue;
             }
-            let result = run_one_tool(context, tool_sequence, call).await;
+            let result = run_one_tool(context.clone(), tool_sequence, call).await;
             broker.record_executed_result(&result);
             results[index] = Some(result);
+            recorded[index] = true;
         }
     }
-    flush_parallel_batch(context, broker, &mut results, &mut parallel_batch).await;
+    flush_parallel_batch(&context, broker, &mut results, &mut parallel_batch).await;
 
+    collect_recorded_results(
+        results,
+        recorded,
+        broker,
+        context.config,
+        &context.telemetry,
+    )
+}
+
+fn collect_recorded_results(
+    results: Vec<Option<ToolResult>>,
+    _recorded: Vec<bool>,
+    _broker: &mut CostBroker,
+    _config: &AppConfig,
+    _telemetry: &TelemetryClient,
+) -> Vec<ToolResult> {
     results.into_iter().flatten().collect()
 }
 
 async fn flush_parallel_batch(
-    context: &ToolExecutionContext,
+    context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
     results: &mut [Option<ToolResult>],
     batch: &mut Vec<(usize, ToolCall, u64)>,
@@ -481,16 +520,47 @@ async fn flush_parallel_batch(
     }
 
     let calls = std::mem::take(batch);
-    let completions = stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
-        let context = context.clone();
-        async move {
-            let result = run_one_tool(&context, tool_sequence, call).await;
-            (index, result)
+    if broker.enforces_result_budgets() {
+        for (index, call, tool_sequence) in calls {
+            if let Some(reason) = broker.deny_reason() {
+                let result = budget_denied_result(&call, reason);
+                emit_tool_telemetry(
+                    context.config,
+                    &context.telemetry,
+                    context.turn_id,
+                    tool_sequence,
+                    &result,
+                    Duration::ZERO,
+                );
+                broker.record_executed_result(&result);
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolCallCompleted {
+                        turn_id: context.turn_id,
+                        result: result.clone(),
+                    })
+                    .await;
+                results[index] = Some(result);
+                continue;
+            }
+            let result = run_one_tool(context.clone(), tool_sequence, call).await;
+            broker.record_executed_result(&result);
+            results[index] = Some(result);
         }
-    }))
-    .buffer_unordered(context.config.max_parallel_tools.max(1))
-    .collect::<Vec<_>>()
-    .await;
+        return;
+    }
+
+    let completions =
+        futures_util::stream::iter(calls.into_iter().map(|(index, call, tool_sequence)| {
+            let context = context.clone();
+            async move {
+                let result = run_one_tool(context, tool_sequence, call).await;
+                (index, result)
+            }
+        }))
+        .buffer_unordered(context.config.max_parallel_tools.max(1))
+        .collect::<Vec<_>>()
+        .await;
 
     for (index, result) in completions {
         broker.record_executed_result(&result);
@@ -499,7 +569,7 @@ async fn flush_parallel_batch(
 }
 
 async fn run_one_tool(
-    context: &ToolExecutionContext,
+    context: ToolExecutionContext<'_>,
     tool_sequence: u64,
     call: ToolCall,
 ) -> ToolResult {
@@ -513,7 +583,7 @@ async fn run_one_tool(
     let started = Instant::now();
     let result = context.tools.execute(call, context.cancel.clone()).await;
     emit_tool_telemetry(
-        &context.config,
+        context.config,
         &context.telemetry,
         context.turn_id,
         tool_sequence,
@@ -578,6 +648,10 @@ impl CostBroker {
         } else {
             None
         }
+    }
+
+    fn enforces_result_budgets(&self) -> bool {
+        self.max_bytes_read < u64::MAX || self.max_search_files < u64::MAX
     }
 
     fn record_executed_result(&mut self, result: &ToolResult) {
@@ -691,6 +765,7 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
         SqueezyError::Permission(_) => ErrorKind::Permission,
         SqueezyError::Graph(_) => ErrorKind::Graph,
         SqueezyError::Io(_) => ErrorKind::Io,
+        SqueezyError::Config(_) => ErrorKind::Config,
         SqueezyError::Agent(_)
         | SqueezyError::Terminal(_)
         | SqueezyError::Workspace(_)
@@ -767,6 +842,10 @@ fn merge_cost(total: &mut CostSnapshot, next: &CostSnapshot) {
     total.input_tokens = add_optional(total.input_tokens, next.input_tokens);
     total.output_tokens = add_optional(total.output_tokens, next.output_tokens);
     total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
+    total.cache_write_input_tokens = add_optional(
+        total.cache_write_input_tokens,
+        next.cache_write_input_tokens,
+    );
     total.estimated_usd_micros =
         add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
 }
@@ -898,8 +977,10 @@ fn stable_output_sha256(result: &ToolResult) -> String {
 }
 
 fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult {
+    let negative_receipt_stub = is_negative_receipt_result(&result);
     let content = json!({
         "receipt_stub": true,
+        "negative_receipt_stub": negative_receipt_stub,
         "message": "identical tool output already sent to the model in this turn",
         "same_as_call_id": &seen.call_id,
         "same_as_tool_name": &seen.tool_name,
@@ -922,6 +1003,30 @@ fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult 
             output_sha256: sha256_hex(&output_bytes),
             content_sha256: result.receipt.content_sha256,
         },
+    }
+}
+
+fn is_negative_receipt_result(result: &ToolResult) -> bool {
+    match result.tool_name.as_str() {
+        "grep" => {
+            result
+                .content
+                .get("matches")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.is_empty())
+                || result
+                    .content
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.is_empty())
+                || result.content.get("count").and_then(Value::as_u64) == Some(0)
+        }
+        "glob" => result
+            .content
+            .get("paths")
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.is_empty()),
+        _ => false,
     }
 }
 

@@ -479,6 +479,10 @@ pub enum GraphSequenceScope {
 pub enum ProviderKind {
     OpenAi,
     Anthropic,
+    Google,
+    AzureOpenAi,
+    Bedrock,
+    Ollama,
 }
 
 impl ProviderKind {
@@ -486,6 +490,10 @@ impl ProviderKind {
         match provider {
             ProviderConfig::OpenAi(_) => Self::OpenAi,
             ProviderConfig::Anthropic(_) => Self::Anthropic,
+            ProviderConfig::Google(_) => Self::Google,
+            ProviderConfig::AzureOpenAi(_) => Self::AzureOpenAi,
+            ProviderConfig::Bedrock(_) => Self::Bedrock,
+            ProviderConfig::Ollama(_) => Self::Ollama,
         }
     }
 }
@@ -495,6 +503,9 @@ impl ProviderKind {
 pub enum ModelFamily {
     Gpt,
     Claude,
+    Gemini,
+    Bedrock,
+    Ollama,
     Other,
 }
 
@@ -505,6 +516,12 @@ impl ModelFamily {
             Self::Gpt
         } else if model.starts_with("claude") || matches!(provider, ProviderConfig::Anthropic(_)) {
             Self::Claude
+        } else if model.starts_with("gemini") || matches!(provider, ProviderConfig::Google(_)) {
+            Self::Gemini
+        } else if matches!(provider, ProviderConfig::Bedrock(_)) {
+            Self::Bedrock
+        } else if matches!(provider, ProviderConfig::Ollama(_)) {
+            Self::Ollama
         } else {
             Self::Other
         }

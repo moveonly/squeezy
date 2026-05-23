@@ -29,3 +29,5 @@ Developer setup and verification commands live in the repository root `CONTRIBUT
 Platform support details live in `docs/PLATFORMS.md`.
 
 Validation harness details live in `docs/VALIDATION_HARNESS.md`.
+
+Provider and model configuration lives in `docs/PROVIDERS.md`.

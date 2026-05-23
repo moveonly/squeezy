@@ -104,6 +104,70 @@ async fn parallel_read_and_search_outputs_return_to_model_by_call_id() {
 }
 
 #[tokio::test]
+async fn parallel_read_batch_denies_remaining_calls_after_byte_budget() {
+    let root = temp_workspace("parallel_byte_budget");
+    fs::write(root.join("first.txt"), "first content").expect("write first");
+    fs::write(root.join("second.txt"), "second content").expect("write second");
+    fs::write(root.join("third.txt"), "third content").expect("write third");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "first.txt"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "second.txt"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "third_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "third.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("budgeted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.max_parallel_tools = 8;
+    config.max_tool_bytes_read_per_turn = 1;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("read all files".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 3);
+    assert_eq!(outputs[0].0, "first_read");
+    assert_eq!(outputs[0].1["status"], "Success");
+    assert_eq!(outputs[1].0, "second_read");
+    assert_eq!(outputs[1].1["status"], "Denied");
+    assert!(
+        outputs[1].1["content"]["error"]
+            .as_str()
+            .expect("budget error")
+            .contains("byte-read budget")
+    );
+    assert_eq!(outputs[2].0, "third_read");
+    assert_eq!(outputs[2].1["status"], "Denied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn glob_and_count_search_outputs_return_to_model() {
     let root = temp_workspace("glob_count");
     fs::write(root.join("one.rs"), "fn needle() {}\n").expect("write one");

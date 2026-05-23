@@ -1,0 +1,62 @@
+use serde_json::json;
+
+use super::*;
+use crate::{LlmInputItem, LlmToolSpec};
+
+#[test]
+fn request_body_uses_chat_stream_shape() {
+    let request = LlmRequest {
+        model: "qwen3".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: Some(16),
+        previous_response_id: None,
+        tools: vec![LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }],
+        store: false,
+    };
+
+    let body = OllamaProvider::request_body(&request);
+
+    assert_eq!(body["model"], "qwen3");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][1]["role"], "user");
+    assert_eq!(body["options"]["num_predict"], 16);
+    assert_eq!(body["tools"][0]["function"]["name"], "grep");
+}
+
+#[test]
+fn parser_extracts_text_tool_calls_and_usage() {
+    let events = parse_ollama_line(
+        r#"{"message":{"content":"hi","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]},"done":true,"prompt_eval_count":10,"eval_count":2}"#,
+    )
+    .expect("valid event");
+
+    assert_eq!(events[0], LlmEvent::TextDelta("hi".to_string()));
+    assert_eq!(
+        events[1],
+        LlmEvent::ToolCall(LlmToolCall {
+            call_id: "ollama_call_0".to_string(),
+            name: "grep".to_string(),
+            arguments: json!({"pattern": "needle"}),
+        })
+    );
+    assert_eq!(
+        events[2],
+        LlmEvent::Completed {
+            response_id: None,
+            cost: CostSnapshot {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                cached_input_tokens: None,
+                cache_write_input_tokens: None,
+                estimated_usd_micros: Some(0),
+            },
+        }
+    );
+}

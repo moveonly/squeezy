@@ -264,13 +264,13 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let tokens = format!(
-        "provider={} model={} status={} tools={} read={} receipts={} denials={} in={} out={} cached={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
+        "provider={} model={} status={} tools={} read={}B receipt_hits={} budget_denials={} in={} out={} cached={} cache_write={} cost={} | Enter send | y/n approve | Ctrl-C cancel/quit | Esc quit",
         app.provider_name,
         app.model,
         app.status,
         app.metrics.tool_calls,
         app.metrics.bytes_read,
-        app.metrics.receipt_stub_hits,
+        app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
         app.metrics.budget_denials,
         app.cost
             .input_tokens
@@ -281,6 +281,15 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         app.cost
             .cached_input_tokens
             .map_or("-".to_string(), |value| value.to_string()),
+        app.cost
+            .cache_write_input_tokens
+            .map_or("-".to_string(), |value| value.to_string()),
+        app.cost
+            .estimated_usd_micros
+            .map_or("-".to_string(), |value| format!(
+                "${:.6}",
+                value as f64 / 1_000_000.0
+            )),
     );
     frame.render_widget(Paragraph::new(tokens), area);
 }

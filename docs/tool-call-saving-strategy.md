@@ -44,9 +44,10 @@ model-facing tool output compact enough to be useful.
 - **Per-turn broker metrics.** Tool-call, read-byte, search-file, receipt-hit,
   spill, denial, provider-token, cache, and estimated-cost counters are tracked
   per turn and surfaced to the TUI/harness.
-- **Anonymous telemetry hooks.** Tool completions and turn aggregates emit typed
-  telemetry with sequence numbers, timings, statuses, and numeric cost counters.
-  Tool arguments, prompts, paths, commands, URLs, and content are not sent.
+- **Anonymous telemetry hooks.** Tool completions and turn aggregates emit
+  typed telemetry with sequence numbers, timings, statuses, and numeric cost
+  counters. Tool arguments, prompts, paths, commands, URLs, and content are not
+  sent.
 
 ## Runtime Knobs
 

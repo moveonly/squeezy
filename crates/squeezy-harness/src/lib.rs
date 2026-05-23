@@ -16,11 +16,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use squeezy_agent::{Agent, AgentEvent};
 use squeezy_core::{
-    AppConfig, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_MAX_OUTPUT_TOKENS,
-    DEFAULT_OPENAI_MODEL, ProviderConfig, Result, SqueezyError,
+    AppConfig, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
+    DEFAULT_BEDROCK_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OLLAMA_MODEL,
+    DEFAULT_OPENAI_MODEL, Result, SqueezyError,
 };
 use squeezy_llm::{
-    AnthropicProvider, LlmEvent, LlmProvider, LlmRequest, LlmStream, OpenAiProvider,
+    LlmEvent, LlmProvider, LlmRequest, LlmStream, provider_from_config as llm_provider_from_config,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -35,11 +36,23 @@ pub enum RunnerKind {
     GrepBaseline,
     CostlyOpenai,
     CostlyAnthropic,
+    CostlyGoogle,
+    CostlyAzureOpenai,
+    CostlyOllama,
+    CostlyBedrock,
 }
 
 impl RunnerKind {
     pub const fn is_costly(self) -> bool {
-        matches!(self, Self::CostlyOpenai | Self::CostlyAnthropic)
+        matches!(
+            self,
+            Self::CostlyOpenai
+                | Self::CostlyAnthropic
+                | Self::CostlyGoogle
+                | Self::CostlyAzureOpenai
+                | Self::CostlyOllama
+                | Self::CostlyBedrock
+        )
     }
 
     pub const fn is_mock(self) -> bool {
@@ -53,6 +66,10 @@ impl RunnerKind {
             Self::GrepBaseline => "grep-baseline",
             Self::CostlyOpenai => "costly-openai",
             Self::CostlyAnthropic => "costly-anthropic",
+            Self::CostlyGoogle => "costly-google",
+            Self::CostlyAzureOpenai => "costly-azure-openai",
+            Self::CostlyOllama => "costly-ollama",
+            Self::CostlyBedrock => "costly-bedrock",
         }
     }
 }
@@ -276,6 +293,10 @@ pub async fn run_task(task: &TaskSpec, runner: RunnerKind, trace_dir: Option<&Pa
         RunnerKind::GrepBaseline => run_baseline(task),
         RunnerKind::CostlyOpenai => run_costly(task, runner, "openai", trace_dir).await,
         RunnerKind::CostlyAnthropic => run_costly(task, runner, "anthropic", trace_dir).await,
+        RunnerKind::CostlyGoogle => run_costly(task, runner, "google", trace_dir).await,
+        RunnerKind::CostlyAzureOpenai => run_costly(task, runner, "azure_openai", trace_dir).await,
+        RunnerKind::CostlyOllama => run_costly(task, runner, "ollama", trace_dir).await,
+        RunnerKind::CostlyBedrock => run_costly(task, runner, "bedrock", trace_dir).await,
     };
 
     match outcome {
@@ -504,6 +525,19 @@ async fn run_agent_with_config(
                 metrics.output_tokens = cost.output_tokens;
                 metrics.cached_input_tokens = cost.cached_input_tokens;
                 metrics.estimated_usd_micros = cost.estimated_usd_micros;
+                metrics.tool_calls = turn_metrics.tool_calls;
+                metrics.tool_successes = turn_metrics.tool_successes;
+                metrics.tool_errors = turn_metrics.tool_errors;
+                metrics.tool_denials = turn_metrics.tool_denials;
+                metrics.tool_cancellations = turn_metrics.tool_cancellations;
+                metrics.files_scanned = turn_metrics.files_scanned;
+                metrics.bytes_read = turn_metrics.bytes_read;
+                metrics.matches_returned = turn_metrics.matches_returned;
+                metrics.receipt_stub_hits = turn_metrics.receipt_stub_hits;
+                metrics.negative_receipt_hits = turn_metrics.negative_receipt_hits;
+                metrics.spill_writes = turn_metrics.spill_writes;
+                metrics.spill_reads = turn_metrics.spill_reads;
+                metrics.budget_denials = turn_metrics.budget_denials;
                 trace.push(trace_completed(response_id, cost));
                 break;
             }
@@ -590,6 +624,7 @@ fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
                 input_tokens: event.input_tokens,
                 output_tokens: event.output_tokens,
                 cached_input_tokens: event.cached_input_tokens,
+                cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
         }),
@@ -597,12 +632,7 @@ fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
 }
 
 fn provider_from_config(config: &AppConfig) -> Result<Arc<dyn LlmProvider>> {
-    match &config.provider {
-        ProviderConfig::OpenAi(openai) => Ok(Arc::new(OpenAiProvider::from_config(openai)?)),
-        ProviderConfig::Anthropic(anthropic) => {
-            Ok(Arc::new(AnthropicProvider::from_config(anthropic)?))
-        }
-    }
+    llm_provider_from_config(&config.provider)
 }
 
 fn mock_events(task: &TaskSpec, provider: &str) -> Result<Vec<TraceEvent>> {
@@ -766,6 +796,20 @@ fn require_costly(provider: &str) -> Result<()> {
     }
     let key = match provider {
         "anthropic" => "ANTHROPIC_API_KEY",
+        "google" => "GEMINI_API_KEY",
+        "azure_openai" => "AZURE_OPENAI_API_KEY",
+        "ollama" => return Ok(()),
+        "bedrock" => {
+            if std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+                || std::env::var("AWS_PROFILE").is_ok()
+                || std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_ok()
+            {
+                return Ok(());
+            }
+            return Err(SqueezyError::ProviderNotConfigured(
+                "bedrock costly runner requires AWS credentials".to_string(),
+            ));
+        }
         _ => "OPENAI_API_KEY",
     };
     if std::env::var(key).is_ok_and(|value| !value.trim().is_empty()) {
@@ -782,6 +826,18 @@ fn costly_model(provider: &str) -> String {
         "anthropic" => std::env::var("SQUEEZY_COSTLY_ANTHROPIC_MODEL")
             .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
             .unwrap_or_else(|_| DEFAULT_ANTHROPIC_MODEL.to_string()),
+        "google" => std::env::var("SQUEEZY_COSTLY_GOOGLE_MODEL")
+            .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_GOOGLE_MODEL.to_string()),
+        "azure_openai" => std::env::var("SQUEEZY_COSTLY_AZURE_OPENAI_MODEL")
+            .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_AZURE_OPENAI_MODEL.to_string()),
+        "ollama" => std::env::var("SQUEEZY_COSTLY_OLLAMA_MODEL")
+            .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string()),
+        "bedrock" => std::env::var("SQUEEZY_COSTLY_BEDROCK_MODEL")
+            .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
+            .unwrap_or_else(|_| DEFAULT_BEDROCK_MODEL.to_string()),
         _ => std::env::var("SQUEEZY_COSTLY_OPENAI_MODEL")
             .or_else(|_| std::env::var("SQUEEZY_COSTLY_MODEL"))
             .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),

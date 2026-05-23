@@ -4,7 +4,7 @@ A coding agent that treats cost, speed, and code understanding as first-class ci
 
 Squeezy parses repositories and builds a persistent local semantic graph. The agent queries this graph through structured tools that return compact evidence packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early development. The foundation TUI scaffold is runnable, OpenAI and Anthropic streaming providers are available, and deterministic validation harness tasks run in CI. Graph-backed navigation is still planned. Committed decisions live in [`docs/`](docs).
+> **Status:** early development. The foundation TUI scaffold is runnable, provider/model selection is registry-backed, OpenAI, Anthropic, Gemini, Azure OpenAI, and Ollama adapters are available, and deterministic validation harness tasks run in CI. Graph-backed navigation is still planned. Committed decisions live in [`docs/`](docs).
 
 ## Cost
 
@@ -20,6 +20,7 @@ Every model token is a budgeted resource.
   `websearch`/`webfetch` for current external evidence.
 - The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
 - Anonymous product telemetry is documented in [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
+- Provider and model configuration is documented in [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
 
 ## Speed
 

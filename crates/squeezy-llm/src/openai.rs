@@ -4,16 +4,18 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{CostSnapshot, OpenAiConfig, Result, SqueezyError};
+use squeezy_core::{AzureOpenAiConfig, CostSnapshot, OpenAiConfig, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
+    name: &'static str,
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    api_version: Option<String>,
 }
 
 impl OpenAiProvider {
@@ -22,9 +24,29 @@ impl OpenAiProvider {
             SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
         })?;
         Ok(Self {
+            name: "openai",
             client: reqwest::Client::new(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
+            api_version: None,
+        })
+    }
+
+    pub fn from_azure_config(config: &AzureOpenAiConfig) -> Result<Self> {
+        if config.base_url.trim().is_empty() {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "missing AZURE_OPENAI_BASE_URL or providers.azure_openai.base_url".to_string(),
+            ));
+        }
+        let api_key = env::var(&config.api_key_env).map_err(|_| {
+            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
+        })?;
+        Ok(Self {
+            name: "azure_openai",
+            client: reqwest::Client::new(),
+            api_key,
+            base_url: config.base_url.trim_end_matches('/').to_string(),
+            api_version: Some(config.api_version.clone()),
         })
     }
 
@@ -66,13 +88,18 @@ impl OpenAiProvider {
 
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &'static str {
-        "openai"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
-        let url = format!("{}/responses", self.base_url);
+        let provider_name = self.name;
+        let mut url = format!("{}/responses", self.base_url);
+        if let Some(api_version) = &self.api_version {
+            url.push_str("?api-version=");
+            url.push_str(api_version);
+        }
         let body = Self::request_body(&request);
 
         Box::pin(try_stream! {
@@ -81,11 +108,15 @@ impl LlmProvider for OpenAiProvider {
                     yield LlmEvent::Cancelled;
                     return;
                 }
-                response = client
-                    .post(&url)
-                    .bearer_auth(api_key)
-                    .json(&body)
-                    .send() => response,
+                response = {
+                    let builder = client.post(&url);
+                    let builder = if provider_name == "azure_openai" {
+                        builder.header("api-key", api_key)
+                    } else {
+                        builder.bearer_auth(api_key)
+                    };
+                    builder.json(&body).send()
+                } => response,
             };
             let response = response_result
                 .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
@@ -352,6 +383,7 @@ fn parse_cost(response: Option<&Value>) -> CostSnapshot {
             .get("input_tokens_details")
             .and_then(|details| details.get("cached_tokens"))
             .and_then(Value::as_u64),
+        cache_write_input_tokens: None,
         estimated_usd_micros: None,
     }
 }
