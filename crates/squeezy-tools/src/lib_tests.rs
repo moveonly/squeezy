@@ -18,6 +18,91 @@ use super::*;
 
 static WORKSPACE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
+    let root = temp_workspace("permission_metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let destructive = registry.permission_request(&ToolCall {
+        call_id: "rm".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "rm -rf target",
+            "description": "clean"
+        }),
+    });
+    assert_eq!(destructive.capability, PermissionCapability::Destructive);
+    assert_eq!(destructive.risk, PermissionRisk::Critical);
+    assert_eq!(destructive.target, "rm:*");
+
+    let compiler = registry.permission_request(&ToolCall {
+        call_id: "test".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "cargo test --workspace",
+            "description": "run tests"
+        }),
+    });
+    assert_eq!(compiler.capability, PermissionCapability::Compiler);
+    assert_eq!(compiler.target, "cargo test:*");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn write_file_permission_request_target_matches_suggested_rule_target() {
+    let root = temp_workspace("permission_write_target");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}",
+            "expected_sha256": "deadbeef"
+        }),
+    });
+    assert_eq!(request.capability, PermissionCapability::Edit);
+    assert_eq!(request.target, "path:src/foo.rs");
+    assert_eq!(request.risk, PermissionRisk::High);
+    let suggested = request
+        .suggested_rules
+        .first()
+        .expect("write_file should propose a session rule");
+    assert_eq!(
+        suggested.target, request.target,
+        "suggested rule target must match the request target so future calls match the persisted rule",
+    );
+    assert_eq!(suggested.capability, "edit");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn webfetch_and_websearch_requests_carry_expected_targets() {
+    let root = temp_workspace("permission_web_targets");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let webfetch = registry.permission_request(&ToolCall {
+        call_id: "fetch".to_string(),
+        name: "webfetch".to_string(),
+        arguments: json!({"url": "https://docs.rs/foo"}),
+    });
+    assert_eq!(webfetch.capability, PermissionCapability::Network);
+    assert_eq!(webfetch.target, "domain:docs.rs");
+
+    let websearch = registry.permission_request(&ToolCall {
+        call_id: "search".to_string(),
+        name: "websearch".to_string(),
+        arguments: json!({"query": "rust async runtime"}),
+    });
+    assert_eq!(websearch.capability, PermissionCapability::Network);
+    assert_eq!(websearch.target, "search:exa");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
     let root = temp_workspace("grep_ignore");

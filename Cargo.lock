@@ -1592,6 +1592,7 @@ dependencies = [
  "squeezy-tools",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

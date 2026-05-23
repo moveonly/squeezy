@@ -24,8 +24,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
     DEFAULT_EXA_MCP_URL, DEFAULT_TOOL_OUTPUT_RETENTION_DAYS, DEFAULT_TOOL_PREVIEW_BYTES,
-    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionScope, Result, SkillsConfig,
-    SqueezyError,
+    DEFAULT_TOOL_SPILL_THRESHOLD_BYTES, FileId, GraphConfig, PermissionCapability, PermissionMode,
+    PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
+    Result, SkillsConfig, SqueezyError,
 };
 use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
@@ -191,10 +192,14 @@ impl ToolResult {
     }
 
     pub fn denied(call: &ToolCall, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
         make_result(
             call,
             ToolStatus::Denied,
-            json!({ "error": reason.into() }),
+            json!({
+                "error": reason,
+                "permission_denied": true,
+            }),
             ToolCostHint::default(),
             None,
         )
@@ -627,6 +632,136 @@ impl ToolRegistry {
             "diff_context" | "glob" | "grep" | "read_file" | "read_tool_output"
             | "symbol_context" | "list_skills" | "load_skill" => PermissionScope::Read,
             _ => PermissionScope::Read,
+        }
+    }
+
+    pub fn permission_request(&self, call: &ToolCall) -> PermissionRequest {
+        let mut metadata = BTreeMap::new();
+        let mut suggested_rules = Vec::new();
+        let summary = self.describe_call(call);
+        let (capability, target, risk) = match call.name.as_str() {
+            "write_file" => {
+                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
+                let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
+                let rule_target = format!("path:{path}");
+                metadata.insert("path".to_string(), path.to_string());
+                suggested_rules.push(PermissionRule::new(
+                    "edit",
+                    rule_target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved edit path".to_string()),
+                ));
+                (
+                    PermissionCapability::Edit,
+                    rule_target,
+                    PermissionRisk::High,
+                )
+            }
+            "shell" => {
+                let args = serde_json::from_value::<ShellArgs>(call.arguments.clone()).ok();
+                let command = args
+                    .as_ref()
+                    .map(|args| args.command.as_str())
+                    .unwrap_or("");
+                let analysis = analyze_shell_command(command);
+                metadata.insert("command".to_string(), command.to_string());
+                metadata.insert("shell_prefix".to_string(), analysis.rule_target.clone());
+                if let Some(description) =
+                    args.as_ref().and_then(|args| args.description.as_deref())
+                {
+                    metadata.insert("description".to_string(), description.to_string());
+                }
+                suggested_rules.push(PermissionRule::new(
+                    analysis.capability.as_str(),
+                    analysis.rule_target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved shell command prefix".to_string()),
+                ));
+                (analysis.capability, analysis.rule_target, analysis.risk)
+            }
+            "verify" => {
+                let target = "cargo verify:*".to_string();
+                suggested_rules.push(PermissionRule::new(
+                    "compiler",
+                    target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved verification command family".to_string()),
+                ));
+                (
+                    PermissionCapability::Compiler,
+                    target,
+                    PermissionRisk::Medium,
+                )
+            }
+            "webfetch" => {
+                let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
+                let target = args
+                    .as_ref()
+                    .and_then(|args| web_url_host(&args.url).ok())
+                    .map(|host| format!("domain:{host}"))
+                    .unwrap_or_else(|| "domain:*".to_string());
+                suggested_rules.push(PermissionRule::new(
+                    "network",
+                    target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved web domain".to_string()),
+                ));
+                (
+                    PermissionCapability::Network,
+                    target,
+                    PermissionRisk::Medium,
+                )
+            }
+            "websearch" => {
+                let args = serde_json::from_value::<WebSearchArgs>(call.arguments.clone()).ok();
+                let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("*");
+                metadata.insert("query".to_string(), truncate_text(query, 200));
+                (
+                    PermissionCapability::Network,
+                    "search:exa".to_string(),
+                    PermissionRisk::Medium,
+                )
+            }
+            "glob" if tool_include_ignored(&call.arguments) => (
+                PermissionCapability::Search,
+                "ignored:*".to_string(),
+                PermissionRisk::Medium,
+            ),
+            "grep" if grep_include_ignored(&call.arguments) => (
+                PermissionCapability::Search,
+                "ignored:*".to_string(),
+                PermissionRisk::Medium,
+            ),
+            "grep" | "glob" => (
+                PermissionCapability::Search,
+                "workspace:*".to_string(),
+                PermissionRisk::Low,
+            ),
+            "diff_context" | "read_file" | "read_tool_output" | "symbol_context"
+            | "list_skills" | "load_skill" => (
+                PermissionCapability::Read,
+                "workspace:*".to_string(),
+                PermissionRisk::Low,
+            ),
+            _ => (
+                PermissionCapability::Read,
+                format!("tool:{}", call.name),
+                PermissionRisk::Medium,
+            ),
+        };
+        PermissionRequest {
+            call_id: call.call_id.clone(),
+            tool_name: call.name.clone(),
+            capability,
+            target,
+            risk,
+            summary,
+            metadata,
+            suggested_rules,
         }
     }
 
@@ -2455,6 +2590,131 @@ fn decode_html_entities(input: &str) -> String {
 
 fn collapse_whitespace(input: &str) -> String {
     input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellPermissionAnalysis {
+    capability: PermissionCapability,
+    risk: PermissionRisk,
+    rule_target: String,
+}
+
+fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
+    let normalized = collapse_whitespace(command);
+    let segments = shell_segments(&normalized);
+    let first = segments
+        .first()
+        .map(|segment| shell_command_prefix(segment))
+        .filter(|prefix| !prefix.is_empty())
+        .unwrap_or_else(|| "shell".to_string());
+
+    if segments
+        .iter()
+        .any(|segment| is_destructive_shell_segment(segment))
+    {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Destructive,
+            risk: PermissionRisk::Critical,
+            rule_target: format!("{first}:*"),
+        };
+    }
+    if segments
+        .iter()
+        .all(|segment| is_compiler_shell_segment(segment))
+    {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Compiler,
+            risk: PermissionRisk::Medium,
+            rule_target: format!(
+                "{}:*",
+                shell_command_prefix(segments.first().unwrap_or(&normalized))
+            ),
+        };
+    }
+    if segments.iter().all(|segment| is_git_shell_segment(segment)) {
+        return ShellPermissionAnalysis {
+            capability: PermissionCapability::Git,
+            risk: if segments
+                .iter()
+                .all(|segment| is_git_read_only_segment(segment))
+            {
+                PermissionRisk::Low
+            } else {
+                PermissionRisk::High
+            },
+            rule_target: format!(
+                "{}:*",
+                shell_command_prefix(segments.first().unwrap_or(&normalized))
+            ),
+        };
+    }
+
+    ShellPermissionAnalysis {
+        capability: PermissionCapability::Shell,
+        risk: PermissionRisk::High,
+        rule_target: format!("{first}:*"),
+    }
+}
+
+fn shell_segments(command: &str) -> Vec<String> {
+    command
+        .split("&&")
+        .flat_map(|part| part.split("||"))
+        .flat_map(|part| part.split(';'))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn shell_command_prefix(segment: &str) -> String {
+    let mut parts = segment.split_whitespace();
+    let first = parts.next().unwrap_or("shell");
+    match first {
+        "cargo" | "git" | "npm" | "pnpm" | "yarn" | "bun" | "make" | "just" => parts
+            .next()
+            .map(|sub| format!("{first} {sub}"))
+            .unwrap_or_else(|| first.to_string()),
+        _ => first.to_string(),
+    }
+}
+
+fn is_destructive_shell_segment(segment: &str) -> bool {
+    let first = segment.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "rm" | "rmdir" | "mv" | "dd" | "truncate" | "shred" | "chmod" | "chown" | "sudo"
+    ) || segment.contains(" > ")
+        || segment.contains(">>")
+        || segment.contains("git reset")
+        || segment.contains("git clean")
+        || segment.contains("git checkout")
+}
+
+fn is_compiler_shell_segment(segment: &str) -> bool {
+    matches!(
+        shell_command_prefix(segment).as_str(),
+        "cargo test"
+            | "cargo nextest"
+            | "cargo check"
+            | "cargo clippy"
+            | "cargo fmt"
+            | "cargo build"
+            | "rustc"
+            | "make test"
+            | "just test"
+    )
+}
+
+fn is_git_shell_segment(segment: &str) -> bool {
+    segment.split_whitespace().next() == Some("git")
+}
+
+fn is_git_read_only_segment(segment: &str) -> bool {
+    matches!(
+        shell_command_prefix(segment).as_str(),
+        "git status" | "git diff" | "git log" | "git show" | "git branch"
+    )
 }
 
 #[derive(Debug, Deserialize)]
