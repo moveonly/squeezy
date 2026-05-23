@@ -1,4 +1,8 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io::{self, Write},
+    sync::Arc,
+    time::Duration,
+};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -14,21 +18,20 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
-use squeezy_core::{AppConfig, Result, Role, SessionMode, SqueezyError, TranscriptItem};
+use squeezy_core::{
+    AppConfig, PermissionPolicy, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
+    TelemetryConfig, TranscriptItem,
+};
 use squeezy_llm::LlmProvider;
 use squeezy_tools::ToolCall;
+use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let agent = Agent::new(config.clone(), provider);
-    let mut app = TuiApp::new(
-        agent.provider_name(),
-        config.model.clone(),
-        config.config_source_labels().join(","),
-        agent.session_mode(),
-    );
+    let mut app = TuiApp::new(agent.provider_name(), &config, agent.session_mode());
 
     loop {
         terminal.draw(|frame| render(frame, &app))?;
@@ -51,30 +54,40 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::UserMessage { message, .. } => {
                     app.transcript.push(message);
                     app.pending_assistant.clear();
+                    app.transcript_scroll_from_bottom = 0;
                 }
                 AgentEvent::Started { .. } => {
-                    app.status = "streaming response".to_string();
+                    app.status = "thinking".to_string();
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     app.pending_assistant.push_str(&delta);
+                    // Intentionally preserve `transcript_scroll_from_bottom`
+                    // here: if the user paged up to read history we would
+                    // otherwise yank them back to the bottom on every delta.
+                    // The End key (or any tool/status event that explicitly
+                    // resets) brings them back to live view.
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
-                    app.status = format!("tool queued: {}", call.name);
+                    app.status = format!("queued {}", call.name);
                 }
                 AgentEvent::ToolCallStarted { call, .. } => {
-                    app.status = format!("running tool: {}", call.name);
+                    app.status = format!("running {}", call.name);
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = format!(
-                        "tool {}: {:?} bytes={} truncated={}",
+                        "{} {:?} {}B{}",
                         result.tool_name,
                         result.status,
                         result.cost_hint.output_bytes,
-                        result.cost_hint.truncated
+                        if result.cost_hint.truncated {
+                            " truncated"
+                        } else {
+                            ""
+                        }
                     );
                     if result.cost_hint.redactions > 0 {
                         app.status
-                            .push_str(&format!(" redactions={}", result.cost_hint.redactions));
+                            .push_str(&format!(" redacted={}", result.cost_hint.redactions));
                     }
                 }
                 AgentEvent::ApprovalRequested {
@@ -100,19 +113,21 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
+                    // Preserve the user's scroll position; if they paged up
+                    // mid-turn we shouldn't snap them down on completion.
                     app.turn_rx = None;
                     app.cancel = None;
                     break;
                 }
                 AgentEvent::Cancelled { .. } => {
-                    app.status = "cancelled".to_string();
+                    app.status = "cancelled; edit prompt or retry".to_string();
                     app.pending_assistant.clear();
                     app.turn_rx = None;
                     app.cancel = None;
                     break;
                 }
                 AgentEvent::Failed { error, .. } => {
-                    app.status = format!("provider error: {error}");
+                    app.status = format_error_status(&error);
                     app.pending_assistant.clear();
                     app.turn_rx = None;
                     app.cancel = None;
@@ -146,6 +161,11 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
         return Ok(true);
     }
 
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+        copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+        return Ok(false);
+    }
+
     if key.code == KeyCode::BackTab {
         switch_mode(app, agent, None, "tui_shift_tab");
         return Ok(false);
@@ -173,6 +193,26 @@ async fn handle_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> Result<bo
 
     match key.code {
         KeyCode::Esc => Ok(true),
+        // Scroll keys intentionally leave `app.status` alone so that
+        // useful messages (tool results, errors, approval prompts) stay
+        // visible while the user navigates history. The status footer
+        // already surfaces a "scrolled" marker when off the bottom.
+        KeyCode::PageUp => {
+            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(8);
+            Ok(false)
+        }
+        KeyCode::PageDown => {
+            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(8);
+            Ok(false)
+        }
+        KeyCode::Home => {
+            app.transcript_scroll_from_bottom = u16::MAX;
+            Ok(false)
+        }
+        KeyCode::End => {
+            app.transcript_scroll_from_bottom = 0;
+            Ok(false)
+        }
         KeyCode::Enter => {
             if app.turn_rx.is_some() {
                 app.status = "turn already running; press Ctrl-C to cancel".to_string();
@@ -212,6 +252,14 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &Agent, input: &str) -> b
     let Some(command) = parts.next() else {
         return false;
     };
+    if command == "/copy" {
+        match parts.next() {
+            None => copy_to_clipboard(app, ClipboardTarget::LastAssistant),
+            Some("transcript") => copy_to_clipboard(app, ClipboardTarget::Transcript),
+            Some(_) => app.status = "usage: /copy [transcript]".to_string(),
+        }
+        return true;
+    }
     let (name, arguments) = match command {
         "/checkpoints" => ("checkpoint_list", serde_json::json!({})),
         "/undo" => ("checkpoint_undo", serde_json::json!({})),
@@ -291,6 +339,65 @@ fn summarize_local_tool_result(content: &serde_json::Value) -> String {
         return format!("restored={restored} deleted={deleted} conflicts={conflicts}");
     }
     String::new()
+}
+
+fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
+    let Some(text) = clipboard_text(app, target) else {
+        app.status = match target {
+            ClipboardTarget::LastAssistant => "nothing to copy yet".to_string(),
+            ClipboardTarget::Transcript => "transcript is empty".to_string(),
+        };
+        return;
+    };
+    match app.clipboard.copy_text(&text) {
+        Ok(()) => {
+            app.status = match target {
+                ClipboardTarget::LastAssistant => {
+                    format!("copied assistant message ({} chars)", text.chars().count())
+                }
+                ClipboardTarget::Transcript => {
+                    format!("copied transcript ({} chars)", text.chars().count())
+                }
+            };
+        }
+        Err(error) => {
+            app.status = format!("copy failed: {error}");
+        }
+    }
+}
+
+fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
+    match target {
+        ClipboardTarget::LastAssistant => {
+            if !app.pending_assistant.trim().is_empty() {
+                return Some(app.pending_assistant.clone());
+            }
+            app.transcript
+                .iter()
+                .rev()
+                .find(|item| item.role == Role::Assistant && !item.content.trim().is_empty())
+                .map(|item| item.content.clone())
+        }
+        ClipboardTarget::Transcript => {
+            let text = transcript_plain_text(app);
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+    }
+}
+
+fn transcript_plain_text(app: &TuiApp) -> String {
+    let mut lines = Vec::new();
+    for item in &app.transcript {
+        lines.push(format!("{}: {}", role_label(&item.role), item.content));
+    }
+    if !app.pending_assistant.is_empty() {
+        lines.push(format!("assistant: {}", app.pending_assistant));
+    }
+    lines.join("\n")
 }
 
 fn mode_command(input: &str) -> Option<SessionMode> {
@@ -455,7 +562,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
                 Constraint::Min(3),
                 Constraint::Length(approval_height),
                 Constraint::Length(3),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
             .split(area);
         render_transcript(frame, chunks[0], app);
@@ -468,7 +575,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
             .constraints([
                 Constraint::Min(5),
                 Constraint::Length(3),
-                Constraint::Length(1),
+                Constraint::Length(2),
             ])
             .split(area);
         render_transcript(frame, chunks[0], app);
@@ -510,14 +617,23 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         ));
     }
 
+    let scroll =
+        transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().title("Squeezy").borders(Borders::ALL))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
+fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u16) -> u16 {
+    let visible_lines = area_height.saturating_sub(2) as usize;
+    let max_scroll = line_count.saturating_sub(visible_lines);
+    max_scroll.saturating_sub(from_bottom as usize) as u16
+}
+
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
-    let (label, color) = match item.role {
+    let (label, color) = match &item.role {
         Role::User => ("user ", Color::Cyan),
         Role::Assistant => ("assistant ", Color::Green),
         Role::System => ("system ", Color::Yellow),
@@ -538,41 +654,258 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    frame.render_widget(Paragraph::new(format_status_tokens(app)), area);
+    let paragraph =
+        Paragraph::new(format_status_tokens(app)).style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(paragraph, area);
 }
 
 fn format_status_tokens(app: &TuiApp) -> String {
-    format!(
-        "provider={} model={} mode={} cfg={} status={} tools={} read={}B receipt_hits={} budget_denials={} redactions={} in={} out={} cached={} cache_write={} cost={} | Enter send | Shift-Tab mode | /plan /build | /undo /checkpoint /checkpoints /revert-turn | y/a/p approve | n/u/d deny | Ctrl-C cancel/quit | Esc quit",
+    let scroll_marker = if app.transcript_scroll_from_bottom > 0 {
+        "  scroll=history"
+    } else {
+        ""
+    };
+    let context = format!(
+        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  status={}{}",
         app.provider_name,
         app.model,
         app.mode.as_str(),
-        app.config_sources,
+        app.repo.compact(),
+        app.permissions.compact(),
+        app.permissions.sandbox,
+        app.telemetry.as_str(),
         app.status,
+        scroll_marker,
+    );
+    let spend = format!(
+        "cost={} tok={}/{} tools={} budget={}",
+        format_cost(&app.cost),
+        format_optional_u64(app.cost.input_tokens),
+        format_optional_u64(app.cost.output_tokens),
         app.metrics.tool_calls,
-        app.metrics.bytes_read,
-        app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
-        app.metrics.budget_denials,
-        app.metrics.redactions,
-        app.cost
-            .input_tokens
-            .map_or("-".to_string(), |value| value.to_string()),
-        app.cost
-            .output_tokens
-            .map_or("-".to_string(), |value| value.to_string()),
-        app.cost
-            .cached_input_tokens
-            .map_or("-".to_string(), |value| value.to_string()),
-        app.cost
-            .cache_write_input_tokens
-            .map_or("-".to_string(), |value| value.to_string()),
-        app.cost
-            .estimated_usd_micros
-            .map_or("-".to_string(), |value| format!(
-                "${:.6}",
-                value as f64 / 1_000_000.0
-            )),
-    )
+        if app.metrics.budget_denials == 0 {
+            "ok".to_string()
+        } else {
+            format!("denied:{}", app.metrics.budget_denials)
+        },
+    );
+    let hints = if app.pending_approval.is_some() {
+        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
+    } else {
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | Ctrl-C cancel | Esc quit"
+    };
+    match app.status_verbosity {
+        StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
+        StatusVerbosity::Verbose => format!(
+            "{context}  {spend}\ncfg={} read={}B receipts={} redactions={} cached={} cache_write={} | {hints}",
+            app.config_sources,
+            app.metrics.bytes_read,
+            app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
+            app.metrics.redactions,
+            format_optional_u64(app.cost.cached_input_tokens),
+            format_optional_u64(app.cost.cache_write_input_tokens),
+        ),
+    }
+}
+
+fn format_optional_u64(value: Option<u64>) -> String {
+    value.map_or("-".to_string(), |value| value.to_string())
+}
+
+fn format_cost(cost: &squeezy_core::CostSnapshot) -> String {
+    cost.estimated_usd_micros.map_or("-".to_string(), |value| {
+        format!("${:.6}", value as f64 / 1_000_000.0)
+    })
+}
+
+fn format_error_status(error: &SqueezyError) -> String {
+    match error {
+        SqueezyError::ProviderNotConfigured(_) => {
+            format!("{error}; configure provider credentials or pick another provider")
+        }
+        SqueezyError::ProviderRequest(_) | SqueezyError::ProviderStream(_) => {
+            format!("{error}; retry or check provider/network status")
+        }
+        SqueezyError::Permission(_) => {
+            format!("{error}; approve, adjust policy, or change request")
+        }
+        SqueezyError::Config(_) => format!("{error}; run squeezy config inspect"),
+        _ => format!("{error}"),
+    }
+}
+
+fn role_label(role: &Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClipboardTarget {
+    LastAssistant,
+    Transcript,
+}
+
+trait Clipboard {
+    fn copy_text(&mut self, text: &str) -> std::result::Result<(), String>;
+}
+
+struct Osc52Clipboard;
+
+/// Conservative cap on OSC52 clipboard payloads. xterm's default
+/// `selectToClipboard` buffer is 8 KiB; many other emulators silently
+/// drop sequences past their (usually undocumented) limit. We refuse
+/// oversized copies up-front so the status line reports an actionable
+/// error instead of claiming "copied N chars" while the terminal
+/// quietly discarded the escape.
+pub(crate) const OSC52_MAX_PAYLOAD_BYTES: usize = 8 * 1024;
+
+impl Clipboard for Osc52Clipboard {
+    fn copy_text(&mut self, text: &str) -> std::result::Result<(), String> {
+        if text.len() > OSC52_MAX_PAYLOAD_BYTES {
+            return Err(format!(
+                "payload {} bytes exceeds terminal clipboard cap of {} bytes",
+                text.len(),
+                OSC52_MAX_PAYLOAD_BYTES,
+            ));
+        }
+        let sequence = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+        let mut stdout = io::stdout();
+        stdout
+            .write_all(sequence.as_bytes())
+            .and_then(|()| stdout.flush())
+            .map_err(|err| format!("terminal clipboard write failed: {err}"))
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        output.push(TABLE[(b0 >> 2) as usize] as char);
+        output.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoStatus {
+    branch: Option<String>,
+    changed_files: usize,
+    operation: Option<String>,
+    available: bool,
+}
+
+impl RepoStatus {
+    fn detect(config: &AppConfig) -> Self {
+        let Ok(vcs) = GitVcs::open(&config.workspace_root) else {
+            return Self::none();
+        };
+        let snapshot = vcs.snapshot(DiffMode::Worktree, DiffOptions::default());
+        if snapshot.vcs.kind != VcsKind::Git {
+            return Self::none();
+        }
+        Self {
+            branch: snapshot
+                .vcs
+                .branch
+                .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head))),
+            changed_files: snapshot.summary.files_changed,
+            operation: snapshot.vcs.operation_state,
+            available: true,
+        }
+    }
+
+    fn none() -> Self {
+        Self {
+            branch: None,
+            changed_files: 0,
+            operation: None,
+            available: false,
+        }
+    }
+
+    fn compact(&self) -> String {
+        if !self.available {
+            return "repo=none".to_string();
+        }
+        let mut value = format!("repo={}", self.branch.as_deref().unwrap_or("detached"));
+        if self.changed_files > 0 {
+            value.push_str(&format!("*{}", self.changed_files));
+        }
+        if let Some(operation) = &self.operation {
+            value.push_str(&format!(":{operation}"));
+        }
+        value
+    }
+}
+
+fn short_commit(head: &str) -> String {
+    head.chars().take(7).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PermissionStatus {
+    read: String,
+    edit: String,
+    shell: String,
+    web: String,
+    sandbox: String,
+}
+
+impl PermissionStatus {
+    fn from_policy(policy: &PermissionPolicy) -> Self {
+        Self {
+            read: policy.read.as_str().to_string(),
+            edit: policy.edit.as_str().to_string(),
+            shell: policy.shell.as_str().to_string(),
+            web: policy.web.as_str().to_string(),
+            sandbox: format!(
+                "{}/net={}",
+                policy.shell_sandbox.mode.as_str(),
+                policy.shell_sandbox.network.as_str()
+            ),
+        }
+    }
+
+    fn compact(&self) -> String {
+        format!(
+            "perm=r:{} e:{} sh:{} web:{}",
+            self.read, self.edit, self.shell, self.web
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TelemetryStatus {
+    enabled: bool,
+}
+
+impl TelemetryStatus {
+    fn from_config(config: &TelemetryConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        if self.enabled { "on" } else { "off" }
+    }
 }
 
 struct TuiApp {
@@ -580,8 +913,13 @@ struct TuiApp {
     model: String,
     mode: SessionMode,
     config_sources: String,
+    status_verbosity: StatusVerbosity,
+    repo: RepoStatus,
+    permissions: PermissionStatus,
+    telemetry: TelemetryStatus,
     input: String,
     transcript: Vec<TranscriptItem>,
+    transcript_scroll_from_bottom: u16,
     pending_assistant: String,
     status: String,
     cost: squeezy_core::CostSnapshot,
@@ -589,22 +927,32 @@ struct TuiApp {
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
+    clipboard: Box<dyn Clipboard>,
 }
 
 impl TuiApp {
-    fn new(
+    fn new(provider_name: &'static str, config: &AppConfig, mode: SessionMode) -> Self {
+        Self::new_with_clipboard(provider_name, config, mode, Box::new(Osc52Clipboard))
+    }
+
+    fn new_with_clipboard(
         provider_name: &'static str,
-        model: String,
-        config_sources: String,
+        config: &AppConfig,
         mode: SessionMode,
+        clipboard: Box<dyn Clipboard>,
     ) -> Self {
         Self {
             provider_name,
-            model,
+            model: config.model.clone(),
             mode,
-            config_sources,
+            config_sources: config.config_source_labels().join(","),
+            status_verbosity: config.tui.status_verbosity,
+            repo: RepoStatus::detect(config),
+            permissions: PermissionStatus::from_policy(&config.permissions),
+            telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             transcript: Vec::new(),
+            transcript_scroll_from_bottom: 0,
             pending_assistant: String::new(),
             status: "ready".to_string(),
             cost: squeezy_core::CostSnapshot::default(),
@@ -612,6 +960,7 @@ impl TuiApp {
             turn_rx: None,
             cancel: None,
             pending_approval: None,
+            clipboard,
         }
     }
 }

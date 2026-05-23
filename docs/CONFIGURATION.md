@@ -124,6 +124,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 
 [tui]
 # tick_rate_ms = 50
+# status_verbosity = "compact"
 ```
 
 ## Sections
@@ -236,6 +237,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
+  `status_verbosity = "compact"` keeps the footer calm and focused on
+  provider/model, mode, repo, permissions, telemetry, activity, and spend.
+  `status_verbosity = "verbose"` adds config sources, token/cache counters,
+  tool bytes, receipt hits, budget denials, and redaction counts.
 
 ### Parse-only (v0)
 
@@ -244,7 +249,6 @@ The following sections are accepted, validated, and surfaced by
 reserved so that you can start writing configuration today and have it
 keep working when wiring lands:
 
-- `[tui].status_verbosity` (`"compact"` or `"verbose"`).
 - `[mcp.servers.<name>]`: `enabled`, `transport`, `command`, `args`,
   `url`, `timeout_ms`, and `env`.
 

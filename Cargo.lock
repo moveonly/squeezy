@@ -1746,6 +1746,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-llm",
  "squeezy-tools",
+ "squeezy-vcs",
  "tokio",
  "tokio-util",
 ]
