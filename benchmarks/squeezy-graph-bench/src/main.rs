@@ -106,7 +106,7 @@ struct MixedWorkloadReport {
 
 #[derive(Debug, Serialize)]
 struct RefreshProbeReport {
-    copied_rust_files: usize,
+    copied_source_files: usize,
     edited_files: usize,
     refresh_ms: u128,
     reparsed_files: usize,
@@ -258,10 +258,12 @@ fn main() -> Result<()> {
         .map_err(|err| SqueezyError::Graph(format!("invalid benchmark spec: {err}")))?;
 
     let validation_ms = match args.language {
+        BenchmarkLanguage::CSharp => time_dotnet_build(&args.fixture)?,
         BenchmarkLanguage::Rust => time_cargo_check(&args.fixture)?,
         BenchmarkLanguage::Python => time_python_ast_oracle(&args.fixture)?,
     };
     let validation_status = match args.language {
+        BenchmarkLanguage::CSharp => "dotnet build".to_string(),
         BenchmarkLanguage::Rust => "cargo check".to_string(),
         BenchmarkLanguage::Python => "CPython ast oracle".to_string(),
     };
@@ -280,17 +282,21 @@ fn main() -> Result<()> {
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
     let accuracy = match args.language {
         BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
+        BenchmarkLanguage::CSharp => empty_accuracy("C# semantic oracle not implemented yet"),
         BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
     };
     let python_oracle = match args.language {
+        BenchmarkLanguage::CSharp => None,
         BenchmarkLanguage::Rust => None,
         BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
     };
 
-    let mixed_workload = if args.language == BenchmarkLanguage::Rust {
+    let mixed_workload = if matches!(args.language, BenchmarkLanguage::Rust | BenchmarkLanguage::CSharp) {
         args.mixed_repo
             .as_ref()
-            .map(|repo| run_mixed_workload(repo, args.mixed_iterations, args.ra_lsp_probes))
+            .map(|repo| {
+                run_mixed_workload(repo, args.language, args.mixed_iterations, args.ra_lsp_probes)
+            })
             .transpose()?
     } else {
         None
@@ -448,16 +454,29 @@ fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
 
 fn run_mixed_workload(
     repo: &Path,
+    language: BenchmarkLanguage,
     requested_scenarios: usize,
     ra_lsp_probes: usize,
 ) -> Result<MixedWorkloadReport> {
-    let (compiler_check_ms, compiler_check_status) = time_cargo_check_optional(repo);
-    let (rust_analyzer_ms, rust_analyzer_status) = time_rust_analyzer(repo);
+    let (compiler_check_ms, compiler_check_status) = match language {
+        BenchmarkLanguage::CSharp => time_dotnet_build_optional(repo),
+        BenchmarkLanguage::Rust => time_cargo_check_optional(repo),
+        BenchmarkLanguage::Python => (None, "compiler validation not used".to_string()),
+    };
+    let (rust_analyzer_ms, rust_analyzer_status) = match language {
+        BenchmarkLanguage::Rust => time_rust_analyzer(repo),
+        BenchmarkLanguage::CSharp => (None, "rust-analyzer oracle not used for C#".to_string()),
+        BenchmarkLanguage::Python => (None, "rust-analyzer oracle not used for Python".to_string()),
+    };
 
     let build_started = Instant::now();
     let graph = build_graph(repo)?;
     let squeezy_build_ms = build_started.elapsed().as_millis();
-    let accuracy = collect_accuracy(repo, &graph, ra_lsp_probes);
+    let accuracy = match language {
+        BenchmarkLanguage::Rust => collect_accuracy(repo, &graph, ra_lsp_probes),
+        BenchmarkLanguage::CSharp => empty_accuracy("C# semantic oracle not implemented yet"),
+        BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
+    };
 
     let scenarios = build_mixed_scenarios(&graph);
     let scenario_indexes = select_scenarios(scenarios.len(), requested_scenarios);
@@ -487,7 +506,7 @@ fn run_mixed_workload(
         .map(|(tool, micros)| (tool, micros / 1_000))
         .collect::<BTreeMap<_, _>>();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
-    let refresh_probe = run_refresh_probe(repo)?;
+    let refresh_probe = run_refresh_probe(repo, language)?;
 
     Ok(MixedWorkloadReport {
         repo: repo.display().to_string(),
@@ -1670,14 +1689,14 @@ fn run_mixed_scenario(graph: &SemanticGraph, scenario: &MixedScenario) -> usize 
     }
 }
 
-fn run_refresh_probe(repo: &Path) -> Result<RefreshProbeReport> {
+fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<RefreshProbeReport> {
     let source_snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(repo)?;
     let temp_root = temp_dir("squeezy-refresh-probe")?;
     let mut copied = Vec::new();
     for record in source_snapshot
         .files
         .iter()
-        .filter(|record| record.language == LanguageKind::Rust)
+        .filter(|record| language.matches_record(record.language))
         .take(250)
     {
         let dest = temp_root.join(&record.relative_path);
@@ -1711,7 +1730,7 @@ fn run_refresh_probe(repo: &Path) -> Result<RefreshProbeReport> {
     fs::remove_dir_all(&temp_root)?;
 
     Ok(RefreshProbeReport {
-        copied_rust_files: copied.len(),
+        copied_source_files: copied.len(),
         edited_files: edits.len(),
         refresh_ms,
         reparsed_files: report.reparsed_files,
@@ -1782,10 +1801,93 @@ fn time_cargo_check(fixture: &Path) -> Result<u128> {
     }
 }
 
+fn time_dotnet_build(fixture: &Path) -> Result<u128> {
+    let build_target = find_dotnet_build_target(fixture);
+    let started = Instant::now();
+    let mut command = Command::new("dotnet");
+    command.arg("build");
+    if let Some(target) = build_target {
+        command.arg(target);
+    }
+    let status = command
+        .arg("--nologo")
+        .arg("-v")
+        .arg("minimal")
+        .current_dir(fixture)
+        .status()?;
+    let elapsed = started.elapsed().as_millis();
+    if status.success() {
+        Ok(elapsed)
+    } else {
+        Err(SqueezyError::Graph(format!(
+            "dotnet build validation failed with {status}"
+        )))
+    }
+}
+
+fn find_dotnet_build_target(root: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    collect_dotnet_build_targets(root, root, 0, &mut candidates);
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    candidates.into_iter().map(|(_, _, path)| path).next()
+}
+
+fn collect_dotnet_build_targets(
+    root: &Path,
+    dir: &Path,
+    depth: usize,
+    out: &mut Vec<(usize, usize, PathBuf)>,
+) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries = entries.filter_map(|entry| entry.ok()).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if matches!(name, ".git" | "bin" | "obj" | "packages" | "target") {
+                continue;
+            }
+            collect_dotnet_build_targets(root, &path, depth + 1, out);
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+            continue;
+        };
+        let priority = match extension {
+            "slnx" => 0,
+            "sln" => 1,
+            "csproj" => 2,
+            _ => continue,
+        };
+        let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        out.push((priority, depth, relative));
+    }
+}
+
 fn time_python_ast_oracle(fixture: &Path) -> Result<u128> {
     let started = Instant::now();
     let _ = collect_python_ast_symbol_scan(fixture)?;
     Ok(started.elapsed().as_millis())
+}
+
+fn time_dotnet_build_optional(repo: &Path) -> (Option<u128>, String) {
+    match time_dotnet_build(repo) {
+        Ok(ms) => (Some(ms), "dotnet build succeeded".to_string()),
+        Err(err) => (None, format!("dotnet build failed: {err}")),
+    }
 }
 
 fn time_cargo_check_optional(repo: &Path) -> (Option<u128>, String) {
@@ -2443,6 +2545,7 @@ impl DeterministicRng {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchmarkLanguage {
+    CSharp,
     Python,
     Rust,
 }
@@ -2450,6 +2553,7 @@ enum BenchmarkLanguage {
 impl BenchmarkLanguage {
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "csharp" | "cs" => Ok(Self::CSharp),
             "python" => Ok(Self::Python),
             "rust" => Ok(Self::Rust),
             other => Err(SqueezyError::Graph(format!(
@@ -2460,8 +2564,17 @@ impl BenchmarkLanguage {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::CSharp => "csharp",
             Self::Python => "python",
             Self::Rust => "rust",
+        }
+    }
+
+    fn matches_record(self, language: LanguageKind) -> bool {
+        match self {
+            Self::CSharp => language == LanguageKind::CSharp,
+            Self::Python => language == LanguageKind::Python,
+            Self::Rust => language == LanguageKind::Rust,
         }
     }
 }
@@ -2519,7 +2632,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--language rust|python] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--language rust|python|csharp] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }

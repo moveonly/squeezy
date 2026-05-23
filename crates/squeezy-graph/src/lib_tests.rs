@@ -217,6 +217,7 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     .unwrap();
     assert!(!manager.graph().find_symbol_by_name("one").is_empty());
     assert_eq!(manager.build_report().language.rust_files, 1);
+    assert_eq!(manager.build_report().language.csharp_files, 0);
     assert_eq!(manager.build_report().language.supported_files, 1);
 
     thread::sleep(Duration::from_millis(2));

@@ -205,6 +205,7 @@ impl WorkspaceCrawler {
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("cs") | Some("csx") => LanguageKind::CSharp,
         Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
@@ -366,6 +367,8 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     [
         "Cargo.toml",
         "CMakeLists.txt",
+        "Directory.Build.props",
+        "Directory.Build.targets",
         "Dockerfile",
         "Justfile",
         "Makefile",
@@ -377,10 +380,12 @@ fn code_project_markers(root: &Path) -> Vec<String> {
         "composer.json",
         "docker-compose.yml",
         "go.mod",
+        "global.json",
         "gradlew",
         "noxfile.py",
         "package.json",
         "package-lock.json",
+        "packages.lock.json",
         "pom.xml",
         "pnpm-lock.yaml",
         "pyproject.toml",
@@ -400,7 +405,23 @@ fn code_project_markers(root: &Path) -> Vec<String> {
     .into_iter()
     .filter(|marker| root.join(marker).exists())
     .map(|marker| format!("project marker {marker}"))
+    .chain(dotnet_project_markers(root))
     .collect()
+}
+
+fn dotnet_project_markers(root: &Path) -> Vec<String> {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let extension = path.extension()?.to_str()?;
+            matches!(extension, "csproj" | "sln" | "slnx").then(|| format!("project marker {name}"))
+        })
+        .collect()
 }
 
 fn shallow_source_markers(root: &Path) -> Vec<String> {
@@ -437,6 +458,7 @@ fn collect_source_markers(
             continue;
         }
         match classify_language(&path) {
+            LanguageKind::CSharp => signals.push("shallow C# source".to_string()),
             LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
             LanguageKind::Python => signals.push("shallow Python source".to_string()),
             _ => {

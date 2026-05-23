@@ -1,4 +1,9 @@
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use squeezy_core::{AppConfig, CostSnapshot, DEFAULT_TELEMETRY_ENDPOINT, TurnMetrics};
 
@@ -37,7 +42,7 @@ fn telemetry_disabled_when_install_id_cannot_be_persisted() {
 
 #[test]
 fn install_id_is_persisted() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = telemetry_temp_root();
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -57,7 +62,7 @@ fn install_id_is_persisted() {
 
 #[tokio::test]
 async fn record_buffers_events_for_periodic_batch_flush() {
-    let root = std::env::temp_dir().join(format!("squeezy-telemetry-{}", now_ms()));
+    let root = telemetry_temp_root();
     let path = root.join("install_id");
     let config = AppConfig {
         telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
@@ -72,6 +77,16 @@ async fn record_buffers_events_for_periodic_batch_flush() {
     assert_eq!(queue.events.len(), 1);
     assert!(queue.flush_scheduled);
     let _ = fs::remove_dir_all(root);
+}
+
+fn telemetry_temp_root() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "squeezy-telemetry-{}-{}-{}",
+        now_ms(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[test]
@@ -147,8 +162,9 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
         symbols: 77,
         edges: 42,
         language_distribution: LanguageDistribution {
+            csharp_files: 2,
             rust_files: 8,
-            supported_files: 8,
+            supported_files: 10,
             unsupported_files: 3,
             unknown_files: 1,
         },
@@ -158,6 +174,7 @@ fn graph_event_carries_timing_counts_and_language_distribution() {
 
     assert!(text.contains("squeezy_graph_build_completed"));
     assert!(text.contains("\"duration_ms\":125"));
+    assert!(text.contains("\"csharp_files\":2"));
     assert!(text.contains("\"rust_files\":8"));
     assert!(text.contains("\"unsupported_files\":3"));
     assert!(!text.contains("/Users/"));

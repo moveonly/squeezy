@@ -96,6 +96,29 @@ fn crawler_classifies_python_files() {
 }
 
 #[test]
+fn crawler_classifies_csharp_files() {
+    let root = temp_root("crawler_classifies_csharp_files");
+    fs::write(root.join("Program.cs"), "class Program {}\n").unwrap();
+    fs::write(root.join("script.csx"), "System.Console.WriteLine(1);\n").unwrap();
+
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default())
+        .crawl(&root)
+        .unwrap();
+
+    for path in ["Program.cs", "script.csx"] {
+        assert_eq!(
+            snapshot
+                .files
+                .iter()
+                .find(|file| file.relative_path == path)
+                .unwrap()
+                .language,
+            LanguageKind::CSharp
+        );
+    }
+}
+
+#[test]
 fn crawler_skips_roots_without_code_signals() {
     let root = temp_root("crawler_skips_roots_without_code_signals");
     fs::write(root.join("notes.txt"), "plain notes\n").unwrap();
@@ -278,7 +301,14 @@ fn common_project_config_is_an_indexing_signal() {
 fn extended_project_markers_are_indexing_signals() {
     for marker in [
         "Dockerfile",
+        "Directory.Build.props",
+        "Directory.Build.targets",
+        "App.csproj",
+        "App.sln",
+        "App.slnx",
+        "global.json",
         "package-lock.json",
+        "packages.lock.json",
         "pnpm-lock.yaml",
         "yarn.lock",
         "tox.ini",

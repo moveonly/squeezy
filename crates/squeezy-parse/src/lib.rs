@@ -169,6 +169,7 @@ struct CachedParsedFile {
 }
 
 pub struct RustParser {
+    csharp_parser: Parser,
     rust_parser: Parser,
     python_parser: Parser,
     cache: HashMap<FileId, CachedParsedFile>,
@@ -189,9 +190,11 @@ struct ParseOutput {
 
 impl RustParser {
     pub fn new() -> Result<Self> {
+        let csharp_parser = parser_with_csharp_language()?;
         let rust_parser = parser_with_rust_language()?;
         let python_parser = parser_with_python_language()?;
         Ok(Self {
+            csharp_parser,
             rust_parser,
             python_parser,
             cache: HashMap::new(),
@@ -370,6 +373,7 @@ impl RustParser {
 
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::CSharp => Ok(&mut self.csharp_parser),
             LanguageKind::Rust => Ok(&mut self.rust_parser),
             LanguageKind::Python => Ok(&mut self.python_parser),
             _ => Err(SqueezyError::Parse(format!(
@@ -381,6 +385,7 @@ impl RustParser {
 
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
     let mut parsers = WorkerParsers {
+        csharp: parser_with_csharp_language()?,
         rust: parser_with_rust_language()?,
         python: parser_with_python_language()?,
     };
@@ -392,6 +397,7 @@ fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
 }
 
 struct WorkerParsers {
+    csharp: Parser,
     rust: Parser,
     python: Parser,
 }
@@ -399,6 +405,7 @@ struct WorkerParsers {
 impl WorkerParsers {
     fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
         match language {
+            LanguageKind::CSharp => Ok(&mut self.csharp),
             LanguageKind::Rust => Ok(&mut self.rust),
             LanguageKind::Python => Ok(&mut self.python),
             _ => Err(SqueezyError::Parse(format!(
@@ -509,6 +516,15 @@ fn update_parse_summary(summary: &mut ParseSummary, parsed_file: &ParsedFile) {
     }
 }
 
+fn parser_with_csharp_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = csharp_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load C# grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn parser_with_rust_language() -> Result<Parser> {
     let mut parser = Parser::new();
     let language = rust_language();
@@ -527,6 +543,10 @@ fn parser_with_python_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn csharp_language() -> tree_sitter::Language {
+    tree_sitter_c_sharp::LANGUAGE.into()
+}
+
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
@@ -536,17 +556,45 @@ fn python_language() -> tree_sitter::Language {
 }
 
 fn is_supported_language(language: LanguageKind) -> bool {
-    matches!(language, LanguageKind::Rust | LanguageKind::Python)
+    matches!(
+        language,
+        LanguageKind::CSharp | LanguageKind::Rust | LanguageKind::Python
+    )
 }
 
 fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     match file.language {
+        LanguageKind::CSharp => extract_csharp(file, source, tree),
         LanguageKind::Rust => extract_rust(file, source, tree),
         LanguageKind::Python => extract_python(file, source, tree),
         _ => ParsedFile::unsupported(
             file.clone(),
             format!("unsupported language for {}", file.relative_path),
         ),
+    }
+}
+
+fn extract_csharp(file: FileRecord, _source: &str, tree: &Tree) -> ParsedFile {
+    let mut diagnostics = Vec::new();
+    let root = tree.root_node();
+    if root.has_error() {
+        diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    ParsedFile {
+        file,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        unsupported: None,
+        diagnostics,
+        changed_ranges: Vec::new(),
     }
 }
 

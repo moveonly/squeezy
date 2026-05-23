@@ -202,6 +202,27 @@ def test_runner():
 }
 
 #[test]
+fn parser_accepts_csharp_and_tracks_cached_changes() {
+    let first = "namespace Demo;\nclass Runner { void Run() { } }\n";
+    let second = "namespace Demo;\nclass Runner { void Run() { System.Console.WriteLine(1); } }\n";
+    let mut parser = RustParser::new().unwrap();
+    let mut record = csharp_record("src/Runner.cs", first);
+
+    let initial = parser.parse_source(&record, first.to_string()).unwrap();
+    assert!(initial.unsupported.is_none());
+    assert!(initial.diagnostics.is_empty());
+    assert!(initial.changed_ranges.is_empty());
+
+    record.hash = ContentHash::new(stable_content_hash(second.as_bytes()));
+    record.size_bytes = second.len() as u64;
+    let updated = parser.parse_source(&record, second.to_string()).unwrap();
+
+    assert!(updated.unsupported.is_none());
+    assert!(updated.diagnostics.is_empty());
+    assert!(!updated.changed_ranges.is_empty());
+}
+
+#[test]
 fn python_parser_skips_calls_inside_decorators() {
     let source = r#"
 from fastapi import APIRouter
@@ -522,6 +543,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
 fn python_record(relative_path: &str, source: &str) -> FileRecord {
     let mut record = record(relative_path, source);
     record.language = LanguageKind::Python;
+    record
+}
+
+fn csharp_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::CSharp;
     record
 }
 

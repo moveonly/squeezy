@@ -339,6 +339,8 @@ pub struct TelemetryProperties {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_scanned: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub csharp_files: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rust_files: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_files: Option<u64>,
@@ -413,6 +415,7 @@ impl TelemetryProperties {
         Self {
             duration_ms: Some(report.duration_ms),
             files_scanned: Some(report.files_seen),
+            csharp_files: Some(report.language_distribution.csharp_files),
             rust_files: Some(report.language_distribution.rust_files),
             supported_files: Some(report.language_distribution.supported_files),
             unsupported_files: Some(report.language_distribution.unsupported_files),
@@ -469,6 +472,7 @@ pub struct GraphPerfReport {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LanguageDistribution {
+    pub csharp_files: u64,
     pub rust_files: u64,
     pub supported_files: u64,
     pub unsupported_files: u64,
