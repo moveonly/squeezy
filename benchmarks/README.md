@@ -2,18 +2,20 @@
 
 This directory contains end-to-end semantic graph benchmarks for `squeezy-cfa.4`.
 
-The production graph runner uses Squeezy's Rust tree-sitter parser and in-memory
-graph. The oracle tier validates each fixture with the Rust compiler and compares
-Squeezy query output against checked query specifications. The oracle is a
-benchmark/testing aid only; production navigation must not call `rustc`, LSP, or
-`rust-analyzer`.
+The production graph runner uses Squeezy's tree-sitter parsers and in-memory
+graph. The oracle tier validates each fixture with a slower language-specific
+checker and compares Squeezy query output against checked query specifications.
+The oracle is a benchmark/testing aid only; production navigation must not call
+`rustc`, LSP, `rust-analyzer`, or Python runtime analysis.
 
 ## Layout
 
 ```text
 benchmarks/
   fixtures/rust/semantic-cases/     # small Rust crate used by smoke CI
+  fixtures/python/semantic-cases/   # small Python package used by smoke CI
   specs/smoke-queries.json          # expected query results and miss policy
+  specs/python-smoke-queries.json   # Python expected query results
   squeezy-graph-bench/              # benchmark CLI
 ```
 
@@ -30,6 +32,29 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
   --mixed-repo target/benchmark-repos/ripgrep \
   --mixed-iterations 1000 \
   --ra-lsp-probes 25
+```
+
+Python smoke:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language python \
+  --fixture benchmarks/fixtures/python/semantic-cases \
+  --spec benchmarks/specs/python-smoke-queries.json \
+  --report target/semantic-graph-benchmark/python-smoke.json \
+  --ra-lsp-probes 0
+```
+
+Python external oracle comparison:
+
+```sh
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --language python \
+  --fixture target/benchmark-repos/requests/src/requests \
+  --spec benchmarks/specs/empty-queries.json \
+  --report target/semantic-graph-benchmark/python-real/requests.json \
+  --ra-lsp-probes 0 \
+  --no-speed-gate
 ```
 
 The run fails if required expected results are missing, the fixture graph build
@@ -86,6 +111,12 @@ already supplies the definition span. `references_to_symbol` is intentionally
 more conservative than broad `reference_search`: it uses resolved call/reference
 edges, type-context filters, package-local scoping, and declaration-name-span
 checks to avoid same-name lexical false positives.
+
+For Python, the benchmark runs a CPython `ast` oracle over the fixture and
+compares class/function/method declarations against Squeezy's tree-sitter graph.
+The oracle intentionally avoids executing user code; it is slower and more
+accurate for declaration discovery than the production parser, but it does not
+model dynamic attributes, metaclasses, import side effects, or runtime dispatch.
 
 ## Local Results
 
@@ -154,3 +185,15 @@ writes timing, symbol accuracy, and rust-analyzer LSP navigation accuracy
 summaries to the GitHub Actions step summary. The workflow also uploads the raw
 JSON reports and rendered summary as the `semantic-graph-benchmark-<tier>`
 artifact so benchmark runs can be audited after the job completes.
+
+`.github/workflows/python-semantic-graph-benchmark.yml` runs the Python smoke
+benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or
+workflow files. It writes the Squeezy timing, CPython AST oracle accuracy, query
+diffs, and raw JSON report as a workflow artifact. Manual `workflow_dispatch`
+with `tier=full` additionally clones requests, flask, click, black, and fastapi,
+then runs oracle-only FP/FN comparison against their importable package source
+roots with the fixture speed gate disabled so external-corpus variance is
+reported rather than blocking the run. The full tier intentionally avoids whole
+repository roots because formatter snapshots, parser fixtures, and future-syntax
+test corpora can contain Python files that tree-sitter can recover from but
+CPython `ast` rejects as non-modules.

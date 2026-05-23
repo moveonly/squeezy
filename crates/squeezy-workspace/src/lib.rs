@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -17,6 +17,7 @@ pub fn crate_name() -> &'static str {
 pub struct CrawlOptions {
     pub include_hidden: bool,
     pub max_file_bytes: u64,
+    pub require_indexing_signal: bool,
 }
 
 impl Default for CrawlOptions {
@@ -24,6 +25,7 @@ impl Default for CrawlOptions {
         Self {
             include_hidden: false,
             max_file_bytes: 1_000_000,
+            require_indexing_signal: true,
         }
     }
 }
@@ -63,6 +65,15 @@ pub struct WorkspaceSnapshot {
     pub files: Vec<FileRecord>,
     pub unsupported: Vec<UnsupportedFile>,
     pub walk_errors: Vec<String>,
+    pub indexing_decision: IndexingDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexingDecision {
+    pub should_index: bool,
+    pub reason: String,
+    pub positive_signals: Vec<String>,
+    pub negative_signals: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +88,17 @@ impl WorkspaceCrawler {
 
     pub fn crawl(&self, root: impl AsRef<Path>) -> Result<WorkspaceSnapshot> {
         let root = fs::canonicalize(root.as_ref())?;
+        let indexing_decision = decide_indexing(&root, self.options.require_indexing_signal);
+        if !indexing_decision.should_index {
+            return Ok(WorkspaceSnapshot {
+                root,
+                files: Vec::new(),
+                unsupported: Vec::new(),
+                walk_errors: Vec::new(),
+                indexing_decision,
+            });
+        }
+
         let mut walker = WalkBuilder::new(&root);
         walker
             .hidden(!self.options.include_hidden)
@@ -174,16 +196,208 @@ impl WorkspaceCrawler {
             files,
             unsupported,
             walk_errors,
+            indexing_decision,
         })
     }
 }
 
 pub fn classify_language(path: &Path) -> LanguageKind {
     match path.extension().and_then(|extension| extension.to_str()) {
+        Some("py") => LanguageKind::Python,
         Some("rs") => LanguageKind::Rust,
         Some(_) => LanguageKind::Unsupported,
         None => LanguageKind::Unknown,
     }
+}
+
+pub fn decide_indexing(root: &Path, require_signal: bool) -> IndexingDecision {
+    if !require_signal {
+        return IndexingDecision {
+            should_index: true,
+            reason: "indexing signal check disabled".to_string(),
+            positive_signals: Vec::new(),
+            negative_signals: Vec::new(),
+        };
+    }
+
+    let mut positive_signals = Vec::new();
+    let mut negative_signals = Vec::new();
+
+    if is_home_dir(root) {
+        negative_signals.push("workspace root is the user's home directory".to_string());
+    }
+    if is_protected_root(root) {
+        negative_signals.push("workspace root is a protected system directory".to_string());
+    }
+
+    if root.join(".git").exists() || ancestor_contains_git(root) {
+        positive_signals.push("git repository marker".to_string());
+    }
+    if has_readme(root) {
+        positive_signals.push("README at workspace root".to_string());
+    }
+    for marker in code_project_markers(root) {
+        positive_signals.push(marker);
+    }
+    for source in shallow_source_markers(root) {
+        positive_signals.push(source);
+    }
+
+    let blocked_by_root = negative_signals
+        .iter()
+        .any(|signal| signal.contains("home directory") || signal.contains("protected system"));
+    let should_index = !blocked_by_root && !positive_signals.is_empty();
+    let reason = if should_index {
+        format!("indexing allowed: {}", positive_signals.join(", "))
+    } else if blocked_by_root {
+        format!("indexing skipped: {}", negative_signals.join(", "))
+    } else {
+        "indexing skipped: no git marker, README, project config, or shallow source file"
+            .to_string()
+    };
+
+    IndexingDecision {
+        should_index,
+        reason,
+        positive_signals,
+        negative_signals,
+    }
+}
+
+fn is_home_dir(root: &Path) -> bool {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| fs::canonicalize(home).ok())
+        .map(|home| home == root)
+        .unwrap_or(false)
+}
+
+fn is_protected_root(root: &Path) -> bool {
+    const PROTECTED: &[&str] = &[
+        "/",
+        "/Applications",
+        "/Library",
+        "/Network",
+        "/System",
+        "/Users",
+        "/Volumes",
+        "/bin",
+        "/dev",
+        "/etc",
+        "/opt",
+        "/private",
+        "/sbin",
+        "/usr",
+        "/var",
+    ];
+    PROTECTED.iter().any(|path| Path::new(path) == root)
+}
+
+fn ancestor_contains_git(root: &Path) -> bool {
+    root.ancestors()
+        .skip(1)
+        .take(4)
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
+fn has_readme(root: &Path) -> bool {
+    fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .map(|name| {
+                    name.eq_ignore_ascii_case("readme.md") || name.eq_ignore_ascii_case("readme")
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn code_project_markers(root: &Path) -> Vec<String> {
+    [
+        "Cargo.toml",
+        "CMakeLists.txt",
+        "Makefile",
+        "build.gradle",
+        "build.gradle.kts",
+        "composer.json",
+        "go.mod",
+        "gradlew",
+        "package.json",
+        "pom.xml",
+        "pyproject.toml",
+        "requirements.txt",
+        "setup.cfg",
+        "setup.py",
+        "tsconfig.json",
+        "Pipfile",
+        "poetry.lock",
+        "uv.lock",
+    ]
+    .into_iter()
+    .filter(|marker| root.join(marker).is_file())
+    .map(|marker| format!("project marker {marker}"))
+    .collect()
+}
+
+fn shallow_source_markers(root: &Path) -> Vec<String> {
+    let mut signals = Vec::new();
+    collect_source_markers(root, 0, &mut signals);
+    signals.sort();
+    signals.dedup();
+    signals
+}
+
+fn collect_source_markers(dir: &Path, depth: usize, signals: &mut Vec<String>) {
+    if depth > 1 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth == 0 {
+                collect_source_markers(&path, depth + 1, signals);
+            }
+            continue;
+        }
+        match classify_language(&path) {
+            LanguageKind::Rust => signals.push("shallow Rust source".to_string()),
+            LanguageKind::Python => signals.push("shallow Python source".to_string()),
+            _ => {
+                if let Some(label) = code_extension_signal(&path) {
+                    signals.push(label);
+                }
+            }
+        }
+    }
+}
+
+fn code_extension_signal(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let language = match extension.as_str() {
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hxx" => "C/C++",
+        "cs" | "csx" => "C#",
+        "css" | "html" | "scss" | "vue" | "svelte" => "web",
+        "go" => "Go",
+        "java" => "Java",
+        "js" | "jsx" | "mjs" | "cjs" => "JavaScript",
+        "kt" | "kts" => "Kotlin",
+        "php" => "PHP",
+        "rb" => "Ruby",
+        "scala" | "sc" => "Scala",
+        "sh" | "bash" | "zsh" => "shell",
+        "swift" => "Swift",
+        "ts" | "tsx" | "mts" | "cts" => "TypeScript",
+        _ => return None,
+    };
+    Some(format!("shallow {language} source"))
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String> {

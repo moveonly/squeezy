@@ -42,15 +42,20 @@ struct DocumentedMiss {
 
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
+    language: String,
     fixture: String,
     spec: String,
     rustc_check_ms: u128,
+    validation_ms: u128,
+    validation_status: String,
     squeezy_build_ms: u128,
     squeezy_query_ms: u128,
     squeezy_total_ms: u128,
     faster_than_rustc_check: bool,
+    faster_than_validation: bool,
     graph: GraphReport,
     accuracy: AccuracyReport,
+    python_oracle: Option<PythonOracleReport>,
     queries: Vec<QueryReport>,
     mixed_workload: Option<MixedWorkloadReport>,
 }
@@ -136,6 +141,14 @@ struct AccuracySetReport {
     recall: f64,
     false_positive_examples: Vec<String>,
     false_negative_examples: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PythonOracleReport {
+    oracle_ms: u128,
+    status: String,
+    symbols: AccuracySetReport,
+    limitations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -241,7 +254,14 @@ fn main() -> Result<()> {
     let spec: QuerySpecFile = serde_json::from_str(&spec_text)
         .map_err(|err| SqueezyError::Graph(format!("invalid benchmark spec: {err}")))?;
 
-    let rustc_check_ms = time_cargo_check(&args.fixture)?;
+    let validation_ms = match args.language {
+        BenchmarkLanguage::Rust => time_cargo_check(&args.fixture)?,
+        BenchmarkLanguage::Python => time_python_ast_oracle(&args.fixture)?,
+    };
+    let validation_status = match args.language {
+        BenchmarkLanguage::Rust => "cargo check".to_string(),
+        BenchmarkLanguage::Python => "CPython ast oracle".to_string(),
+    };
 
     let build_started = Instant::now();
     let graph = build_graph(&args.fixture)?;
@@ -255,23 +275,37 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let squeezy_query_ms = query_started.elapsed().as_millis();
     let squeezy_total_ms = squeezy_build_ms + squeezy_query_ms;
-    let accuracy = collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes);
+    let accuracy = match args.language {
+        BenchmarkLanguage::Rust => collect_accuracy(&args.fixture, &graph, args.ra_lsp_probes),
+        BenchmarkLanguage::Python => empty_accuracy("rust-analyzer oracle not used for Python"),
+    };
+    let python_oracle = match args.language {
+        BenchmarkLanguage::Rust => None,
+        BenchmarkLanguage::Python => Some(collect_python_oracle_accuracy(&args.fixture, &graph)?),
+    };
 
-    let mixed_workload = args
-        .mixed_repo
-        .as_ref()
-        .map(|repo| run_mixed_workload(repo, args.mixed_iterations, args.ra_lsp_probes))
-        .transpose()?;
+    let mixed_workload = if args.language == BenchmarkLanguage::Rust {
+        args.mixed_repo
+            .as_ref()
+            .map(|repo| run_mixed_workload(repo, args.mixed_iterations, args.ra_lsp_probes))
+            .transpose()?
+    } else {
+        None
+    };
 
     let stats = graph.stats();
     let report = BenchmarkReport {
+        language: args.language.as_str().to_string(),
         fixture: args.fixture.display().to_string(),
         spec: args.spec.display().to_string(),
-        rustc_check_ms,
+        rustc_check_ms: validation_ms,
+        validation_ms,
+        validation_status,
         squeezy_build_ms,
         squeezy_query_ms,
         squeezy_total_ms,
-        faster_than_rustc_check: squeezy_total_ms < rustc_check_ms,
+        faster_than_rustc_check: squeezy_total_ms < validation_ms,
+        faster_than_validation: squeezy_total_ms < validation_ms,
         graph: GraphReport {
             files: stats.files,
             symbols: stats.symbols,
@@ -281,13 +315,14 @@ fn main() -> Result<()> {
             calls: stats.calls,
         },
         accuracy,
+        python_oracle,
         queries: query_reports,
         mixed_workload,
     };
 
     write_report(&args.report, &report)?;
     print_summary(&report);
-    enforce_gates(&report)
+    enforce_gates(&report, args.no_speed_gate)
 }
 
 fn build_graph(root: &Path) -> Result<SemanticGraph> {
@@ -485,6 +520,41 @@ fn collect_accuracy(root: &Path, graph: &SemanticGraph, ra_lsp_probes: usize) ->
     }
 }
 
+fn empty_accuracy(status: &str) -> AccuracyReport {
+    AccuracyReport {
+        rust_analyzer_symbols_ms: None,
+        rust_analyzer_symbol_status: status.to_string(),
+        symbols: compare_symbol_sets(&SymbolScan::default(), &SymbolScan::default()),
+        navigation: NavigationAccuracyReport {
+            rust_analyzer_lsp_ms: None,
+            rust_analyzer_lsp_status: status.to_string(),
+            requested_probe_limit: 0,
+            definitions: DefinitionAccuracyReport::default(),
+            references: ReferenceAccuracyReport::default(),
+            limitations: vec![status.to_string()],
+        },
+        limitations: vec![status.to_string()],
+    }
+}
+
+fn collect_python_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> Result<PythonOracleReport> {
+    let squeezy_symbols = collect_squeezy_symbol_scan(graph);
+    let started = Instant::now();
+    let oracle = collect_python_ast_symbol_scan(root)?;
+    let oracle_ms = started.elapsed().as_millis();
+    let symbols = compare_symbol_sets(&squeezy_symbols, &oracle);
+
+    Ok(PythonOracleReport {
+        oracle_ms,
+        status: "CPython ast oracle succeeded".to_string(),
+        symbols,
+        limitations: vec![
+            "The Python oracle uses CPython ast for declarations and does not execute imports, infer dynamic attributes, or model metaclass-generated members.".to_string(),
+            "Symbol comparison is file/name/kind based so it tracks declaration loss without pretending to prove runtime dispatch.".to_string(),
+        ],
+    })
+}
+
 fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     let mut scan = SymbolScan::default();
     for symbol in graph.symbols.values() {
@@ -509,6 +579,76 @@ fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     }
     scan
 }
+
+fn collect_python_ast_symbol_scan(root: &Path) -> Result<SymbolScan> {
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(PYTHON_AST_ORACLE)
+        .arg(root)
+        .output()
+        .map_err(|err| SqueezyError::Graph(format!("failed to run Python AST oracle: {err}")))?;
+    if !output.status.success() {
+        return Err(SqueezyError::Graph(format!(
+            "Python AST oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let rows: Vec<[String; 3]> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| SqueezyError::Graph(format!("invalid Python AST oracle JSON: {err}")))?;
+    let mut scan = SymbolScan::default();
+    for [file, kind, name] in rows {
+        scan.raw_total += 1;
+        increment_symbol(
+            &mut scan.counts,
+            SymbolKey {
+                file,
+                kind,
+                name: normalize_symbol_name(&name),
+            },
+        );
+    }
+    Ok(scan)
+}
+
+const PYTHON_AST_ORACLE: &str = r#"
+import ast
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+rows = []
+
+class Visitor(ast.NodeVisitor):
+    def __init__(self, rel):
+        self.rel = rel
+        self.parents = []
+
+    def visit_ClassDef(self, node):
+        rows.append([self.rel, "Class", node.name])
+        self.parents.append("Class")
+        self.generic_visit(node)
+        self.parents.pop()
+
+    def visit_FunctionDef(self, node):
+        kind = "Method" if self.parents and self.parents[-1] == "Class" else "Function"
+        rows.append([self.rel, kind, node.name])
+        self.parents.append(kind)
+        self.generic_visit(node)
+        self.parents.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+for path in sorted(root.rglob("*.py")):
+    rel = path.relative_to(root).as_posix()
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        continue
+    Visitor(rel).visit(tree)
+
+print(json.dumps(rows))
+"#;
 
 fn collect_rust_analyzer_symbol_scan(graph: &SemanticGraph) -> (SymbolScan, String) {
     let Some(program) = rust_analyzer_program() else {
@@ -674,6 +814,7 @@ fn normalize_rust_analyzer_kind(kind: &str) -> Option<String> {
 
 fn normalize_squeezy_kind(kind: SymbolKind) -> Option<String> {
     match kind {
+        SymbolKind::Class => Some("Class".to_string()),
         SymbolKind::Module => Some("Module".to_string()),
         SymbolKind::Struct => Some("Struct".to_string()),
         SymbolKind::Enum => Some("Enum".to_string()),
@@ -754,6 +895,7 @@ fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> Accu
 
     AccuracySetReport {
         compared_kinds: vec![
+            "Class".to_string(),
             "Module".to_string(),
             "Struct".to_string(),
             "Enum".to_string(),
@@ -1539,6 +1681,7 @@ fn flatten_hierarchy(graph: &SemanticGraph) -> Vec<String> {
 
 fn parse_symbol_kind(value: &str) -> Result<SymbolKind> {
     match value {
+        "Class" => Ok(SymbolKind::Class),
         "Crate" => Ok(SymbolKind::Crate),
         "File" => Ok(SymbolKind::File),
         "Module" => Ok(SymbolKind::Module),
@@ -1581,6 +1724,12 @@ fn time_cargo_check(fixture: &Path) -> Result<u128> {
             "compiler validation failed with {status}"
         )))
     }
+}
+
+fn time_python_ast_oracle(fixture: &Path) -> Result<u128> {
+    let started = Instant::now();
+    let _ = collect_python_ast_symbol_scan(fixture)?;
+    Ok(started.elapsed().as_millis())
 }
 
 fn time_cargo_check_optional(repo: &Path) -> (Option<u128>, String) {
@@ -2051,15 +2200,32 @@ fn write_report(path: &Path, report: &BenchmarkReport) -> Result<()> {
 
 fn print_summary(report: &BenchmarkReport) {
     println!("semantic graph benchmark");
+    println!("language: {}", report.language);
     println!("fixture: {}", report.fixture);
-    println!("rustc_check_ms: {}", report.rustc_check_ms);
+    println!(
+        "validation: {} ({}ms)",
+        report.validation_status, report.validation_ms
+    );
     println!("squeezy_total_ms: {}", report.squeezy_total_ms);
     println!(
-        "faster_than_rustc_check: {}",
-        report.faster_than_rustc_check
+        "faster_than_validation: {}",
+        report.faster_than_validation
     );
     print_accuracy_summary("fixture", &report.accuracy);
     print_navigation_summary("fixture", &report.accuracy.navigation);
+    if let Some(python) = &report.python_oracle {
+        println!(
+            "python_oracle_symbol_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_symbols={} squeezy_symbols={} oracle={}",
+            python.symbols.true_positive,
+            python.symbols.false_positive,
+            python.symbols.false_negative,
+            python.symbols.precision,
+            python.symbols.recall,
+            python.symbols.rust_analyzer_total,
+            python.symbols.squeezy_total,
+            format!("{}ms", python.oracle_ms)
+        );
+    }
     for query in &report.queries {
         println!(
             "{}: actual={} missing={} extras={}",
@@ -2140,7 +2306,7 @@ fn print_navigation_summary(label: &str, navigation: &NavigationAccuracyReport) 
     );
 }
 
-fn enforce_gates(report: &BenchmarkReport) -> Result<()> {
+fn enforce_gates(report: &BenchmarkReport, no_speed_gate: bool) -> Result<()> {
     let missing = report
         .queries
         .iter()
@@ -2158,10 +2324,10 @@ fn enforce_gates(report: &BenchmarkReport) -> Result<()> {
         )));
     }
 
-    if !report.faster_than_rustc_check {
+    if !no_speed_gate && !report.faster_than_validation {
         return Err(SqueezyError::Graph(format!(
-            "Squeezy graph was not faster than rustc validation: {}ms >= {}ms",
-            report.squeezy_total_ms, report.rustc_check_ms
+            "Squeezy graph was not faster than {} validation: {}ms >= {}ms",
+            report.validation_status, report.squeezy_total_ms, report.validation_ms
         )));
     }
 
@@ -2218,30 +2384,66 @@ impl DeterministicRng {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkLanguage {
+    Python,
+    Rust,
+}
+
+impl BenchmarkLanguage {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "python" => Ok(Self::Python),
+            "rust" => Ok(Self::Rust),
+            other => Err(SqueezyError::Graph(format!(
+                "unknown benchmark language {other}"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::Rust => "rust",
+        }
+    }
+}
+
 struct Args {
+    language: BenchmarkLanguage,
     fixture: PathBuf,
     spec: PathBuf,
     report: PathBuf,
     mixed_repo: Option<PathBuf>,
     mixed_iterations: usize,
     ra_lsp_probes: usize,
+    no_speed_gate: bool,
 }
 
 impl Args {
     fn parse() -> Result<Self> {
         let mut fixture = None;
+        let mut language = BenchmarkLanguage::Rust;
         let mut spec = None;
         let mut report = None;
         let mut mixed_repo = None;
         let mut mixed_iterations = 0;
         let mut ra_lsp_probes = 25;
+        let mut no_speed_gate = false;
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--language" => {
+                    let raw = args.next().ok_or_else(|| {
+                        SqueezyError::Graph("missing --language value".to_string())
+                    })?;
+                    language = BenchmarkLanguage::parse(&raw)?;
+                }
                 "--fixture" => fixture = args.next().map(PathBuf::from),
                 "--spec" => spec = args.next().map(PathBuf::from),
                 "--report" => report = args.next().map(PathBuf::from),
                 "--mixed-repo" => mixed_repo = args.next().map(PathBuf::from),
+                "--no-speed-gate" => no_speed_gate = true,
                 "--mixed-iterations" => {
                     let raw = args.next().ok_or_else(|| {
                         SqueezyError::Graph("missing --mixed-iterations value".to_string())
@@ -2260,7 +2462,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>]"
+                        "usage: squeezy-graph-bench [--language rust|python] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -2271,12 +2473,14 @@ impl Args {
         }
 
         Ok(Self {
+            language,
             fixture: fixture.ok_or_else(|| SqueezyError::Graph("missing --fixture".to_string()))?,
             spec: spec.ok_or_else(|| SqueezyError::Graph("missing --spec".to_string()))?,
             report: report.ok_or_else(|| SqueezyError::Graph("missing --report".to_string()))?,
             mixed_repo,
             mixed_iterations,
             ra_lsp_probes,
+            no_speed_gate,
         })
     }
 }

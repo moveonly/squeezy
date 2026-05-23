@@ -1,0 +1,42 @@
+{
+  "queries": [
+    {
+      "id": "python-hierarchy",
+      "kind": "hierarchy_contains",
+      "expected_contains": [
+        "Class:Runner",
+        "Class:Greeter",
+        "Function:prepare_name",
+        "Function:build_runner",
+        "Method:run",
+        "Method:greet"
+      ]
+    },
+    {
+      "id": "python-class-signature",
+      "kind": "signature_search",
+      "text": "class Runner",
+      "symbol_kind": "Class",
+      "expected_contains": [
+        "Class:Runner"
+      ]
+    },
+    {
+      "id": "python-call-chain",
+      "kind": "call_chain",
+      "from": "run",
+      "to": "prepare_name",
+      "expected_contains": [
+        "run -> prepare_name"
+      ]
+    },
+    {
+      "id": "python-references",
+      "kind": "reference_search",
+      "text": "Runner",
+      "expected_contains": [
+        "Runner"
+      ]
+    }
+  ]
+}

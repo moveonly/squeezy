@@ -612,7 +612,10 @@ impl SemanticGraph {
                     .map(|symbol| {
                         matches!(
                             symbol.kind,
-                            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+                            SymbolKind::Class
+                                | SymbolKind::Function
+                                | SymbolKind::Method
+                                | SymbolKind::Test
                         )
                     })
                     .unwrap_or(false)
@@ -817,7 +820,10 @@ impl SemanticGraph {
             .filter_map(|id| self.symbols.get(id))
             .filter(|symbol| {
                 symbol.file_id == caller.file_id
-                    && matches!(symbol.kind, SymbolKind::Function | SymbolKind::Test)
+                    && matches!(
+                        symbol.kind,
+                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
+                    )
             })
             .map(|symbol| symbol.id.clone())
             .collect::<Vec<_>>();
@@ -885,7 +891,7 @@ impl SemanticGraph {
             caller.parent_id.clone()?
         };
         let parent = self.symbols.get(&impl_id)?;
-        if parent.kind != SymbolKind::Impl {
+        if !matches!(parent.kind, SymbolKind::Class | SymbolKind::Impl) {
             return None;
         }
         self.children_by_parent
@@ -1533,7 +1539,8 @@ fn reference_text_matches_symbol(reference: &ParsedReference, symbol: &GraphSymb
 
 fn reference_kind_can_bind_symbol(kind: ReferenceKind, symbol_kind: SymbolKind) -> bool {
     match symbol_kind {
-        SymbolKind::Struct
+        SymbolKind::Class
+        | SymbolKind::Struct
         | SymbolKind::Enum
         | SymbolKind::Union
         | SymbolKind::Trait

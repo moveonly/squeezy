@@ -61,6 +61,39 @@ fn helper() {}
 }
 
 #[test]
+fn graph_answers_python_navigation_queries() {
+    let source = r#"
+class Greeter:
+    def greet(self, name):
+        return name
+
+def make():
+    greeter = Greeter()
+    return greeter.greet("Ada")
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = python_record("app.py", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    assert!(
+        graph
+            .signature_search(&SignatureQuery {
+                text: "class Greeter".to_string(),
+                kind: Some(SymbolKind::Class),
+                visibility: None,
+                attribute: None,
+            })
+            .iter()
+            .any(|symbol| symbol.name == "Greeter")
+    );
+    let make = graph.find_symbol_by_name("make").pop().unwrap();
+    let greeter = graph.find_symbol_by_name("Greeter").pop().unwrap();
+    assert!(graph.call_chain(&make.id, &greeter.id, 2).is_some());
+    assert!(!graph.reference_search("Greeter").is_empty());
+}
+
+#[test]
 fn graph_manager_refresh_replaces_changed_file_only() {
     let root = temp_root("graph-manager-refresh");
     fs::create_dir_all(root.join("src")).unwrap();
@@ -415,6 +448,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
         language: LanguageKind::Rust,
         freshness: Freshness::Fresh,
     }
+}
+
+fn python_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Python;
+    record
 }
 
 fn temp_root(name: &str) -> PathBuf {

@@ -158,35 +158,39 @@ pub struct ParseSummary {
 }
 
 #[derive(Debug, Clone)]
-struct CachedRustFile {
+struct CachedParsedFile {
     hash: ContentHash,
+    language: LanguageKind,
     source: String,
     tree: Tree,
 }
 
 pub struct RustParser {
-    parser: Parser,
-    cache: HashMap<FileId, CachedRustFile>,
+    rust_parser: Parser,
+    python_parser: Parser,
+    cache: HashMap<FileId, CachedParsedFile>,
 }
 
 #[derive(Debug, Clone)]
 struct ParseJob {
     index: usize,
     record: FileRecord,
-    old: Option<CachedRustFile>,
+    old: Option<CachedParsedFile>,
 }
 
 struct ParseOutput {
     index: usize,
     parsed: ParsedFile,
-    cache: Option<CachedRustFile>,
+    cache: Option<CachedParsedFile>,
 }
 
 impl RustParser {
     pub fn new() -> Result<Self> {
-        let parser = parser_with_rust_language()?;
+        let rust_parser = parser_with_rust_language()?;
+        let python_parser = parser_with_python_language()?;
         Ok(Self {
-            parser,
+            rust_parser,
+            python_parser,
             cache: HashMap::new(),
         })
     }
@@ -276,7 +280,7 @@ impl RustParser {
     }
 
     pub fn parse_record(&mut self, record: &FileRecord) -> Result<ParsedFile> {
-        if record.language != LanguageKind::Rust {
+        if !is_supported_language(record.language) {
             self.cache.remove(&record.id);
             return Ok(ParsedFile::unsupported(
                 record.clone(),
@@ -290,7 +294,7 @@ impl RustParser {
                 self.cache.remove(&record.id);
                 return Ok(ParsedFile::unsupported(
                     record.clone(),
-                    format!("non-UTF-8 Rust source for {}", record.relative_path),
+                    format!("non-UTF-8 source for {}", record.relative_path),
                 ));
             }
             Err(err) => return Err(err.into()),
@@ -299,7 +303,7 @@ impl RustParser {
     }
 
     pub fn parse_source(&mut self, record: &FileRecord, source: String) -> Result<ParsedFile> {
-        if record.language != LanguageKind::Rust {
+        if !is_supported_language(record.language) {
             self.cache.remove(&record.id);
             return Ok(ParsedFile::unsupported(
                 record.clone(),
@@ -308,16 +312,17 @@ impl RustParser {
         }
 
         let old = self.cache.remove(&record.id);
-        let (tree, changed_ranges) = match old {
+        let (tree, changed_ranges) = match old.filter(|cached| cached.language == record.language) {
             Some(mut cached) if cached.hash != record.hash => {
                 let edit = input_edit(&cached.source, &source);
                 cached.tree.edit(&edit);
-                let new_tree = self
-                    .parser
-                    .parse(&source, Some(&cached.tree))
-                    .ok_or_else(|| {
-                        SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
-                    })?;
+                let parser = self.parser_for_language(record.language)?;
+                let new_tree = parser.parse(&source, Some(&cached.tree)).ok_or_else(|| {
+                    SqueezyError::Parse(format!(
+                        "tree-sitter returned no {:?} tree",
+                        record.language
+                    ))
+                })?;
                 let mut changed_ranges = cached
                     .tree
                     .changed_ranges(&new_tree)
@@ -330,44 +335,79 @@ impl RustParser {
             }
             Some(cached) => {
                 self.cache.insert(record.id.clone(), cached.clone());
-                let mut parsed = extract_rust(record.clone(), &source, &cached.tree);
+                let mut parsed = extract_language(record.clone(), &source, &cached.tree);
                 parsed.changed_ranges = Vec::new();
                 return Ok(parsed);
             }
             None => {
-                let tree = self.parser.parse(&source, None).ok_or_else(|| {
-                    SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
+                let parser = self.parser_for_language(record.language)?;
+                let tree = parser.parse(&source, None).ok_or_else(|| {
+                    SqueezyError::Parse(format!(
+                        "tree-sitter returned no {:?} tree",
+                        record.language
+                    ))
                 })?;
                 (tree, Vec::new())
             }
         };
 
-        let mut parsed = extract_rust(record.clone(), &source, &tree);
+        let mut parsed = extract_language(record.clone(), &source, &tree);
         parsed.changed_ranges = changed_ranges;
         self.cache.insert(
             record.id.clone(),
-            CachedRustFile {
+            CachedParsedFile {
                 hash: record.hash.clone(),
+                language: record.language,
                 source,
                 tree,
             },
         );
         Ok(parsed)
     }
+
+    fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
+        match language {
+            LanguageKind::Rust => Ok(&mut self.rust_parser),
+            LanguageKind::Python => Ok(&mut self.python_parser),
+            _ => Err(SqueezyError::Parse(format!(
+                "unsupported parser language {language:?}"
+            ))),
+        }
+    }
 }
 
 fn parse_job_chunk(jobs: Vec<ParseJob>) -> Result<Vec<ParseOutput>> {
-    let mut parser = parser_with_rust_language()?;
+    let mut parsers = WorkerParsers {
+        rust: parser_with_rust_language()?,
+        python: parser_with_python_language()?,
+    };
     let mut outputs = Vec::with_capacity(jobs.len());
     for job in jobs {
-        outputs.push(parse_record_with_cache(&mut parser, job)?);
+        outputs.push(parse_record_with_cache(&mut parsers, job)?);
     }
     Ok(outputs)
 }
 
-fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOutput> {
+struct WorkerParsers {
+    rust: Parser,
+    python: Parser,
+}
+
+impl WorkerParsers {
+    fn parser_for_language(&mut self, language: LanguageKind) -> Result<&mut Parser> {
+        match language {
+            LanguageKind::Rust => Ok(&mut self.rust),
+            LanguageKind::Python => Ok(&mut self.python),
+            _ => Err(SqueezyError::Parse(format!(
+                "unsupported parser language {language:?}"
+            ))),
+        }
+    }
+}
+
+fn parse_record_with_cache(parsers: &mut WorkerParsers, job: ParseJob) -> Result<ParseOutput> {
     let ParseJob { index, record, old } = job;
-    if record.language != LanguageKind::Rust {
+    if !is_supported_language(record.language) {
         return Ok(ParseOutput {
             index,
             parsed: ParsedFile::unsupported(
@@ -379,8 +419,8 @@ fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOu
     }
 
     let old = match old {
-        Some(cached) if cached.hash == record.hash => {
-            let mut parsed = extract_rust(record.clone(), &cached.source, &cached.tree);
+        Some(cached) if cached.language == record.language && cached.hash == record.hash => {
+            let mut parsed = extract_language(record.clone(), &cached.source, &cached.tree);
             parsed.changed_ranges = Vec::new();
             return Ok(ParseOutput {
                 index,
@@ -398,7 +438,7 @@ fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOu
                 index,
                 parsed: ParsedFile::unsupported(
                     record.clone(),
-                    format!("non-UTF-8 Rust source for {}", record.relative_path),
+                    format!("non-UTF-8 source for {}", record.relative_path),
                 ),
                 cache: None,
             });
@@ -406,12 +446,17 @@ fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOu
         Err(err) => return Err(err.into()),
     };
 
+    let old = old.filter(|cached| cached.language == record.language);
     let (tree, changed_ranges) = match old {
         Some(mut cached) => {
             let edit = input_edit(&cached.source, &source);
             cached.tree.edit(&edit);
+            let parser = parsers.parser_for_language(record.language)?;
             let new_tree = parser.parse(&source, Some(&cached.tree)).ok_or_else(|| {
-                SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
+                SqueezyError::Parse(format!(
+                    "tree-sitter returned no {:?} tree",
+                    record.language
+                ))
             })?;
             let mut changed_ranges = cached
                 .tree
@@ -424,20 +469,25 @@ fn parse_record_with_cache(parser: &mut Parser, job: ParseJob) -> Result<ParseOu
             (new_tree, changed_ranges)
         }
         None => {
+            let parser = parsers.parser_for_language(record.language)?;
             let tree = parser.parse(&source, None).ok_or_else(|| {
-                SqueezyError::Parse("tree-sitter returned no Rust tree".to_string())
+                SqueezyError::Parse(format!(
+                    "tree-sitter returned no {:?} tree",
+                    record.language
+                ))
             })?;
             (tree, Vec::new())
         }
     };
 
-    let mut parsed = extract_rust(record.clone(), &source, &tree);
+    let mut parsed = extract_language(record.clone(), &source, &tree);
     parsed.changed_ranges = changed_ranges;
     Ok(ParseOutput {
         index,
         parsed,
-        cache: Some(CachedRustFile {
+        cache: Some(CachedParsedFile {
             hash: record.hash.clone(),
+            language: record.language,
             source,
             tree,
         }),
@@ -465,8 +515,36 @@ fn parser_with_rust_language() -> Result<Parser> {
     Ok(parser)
 }
 
+fn parser_with_python_language() -> Result<Parser> {
+    let mut parser = Parser::new();
+    let language = python_language();
+    parser
+        .set_language(&language)
+        .map_err(|err| SqueezyError::Parse(format!("failed to load Python grammar: {err}")))?;
+    Ok(parser)
+}
+
 fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
+}
+
+fn python_language() -> tree_sitter::Language {
+    tree_sitter_python::LANGUAGE.into()
+}
+
+fn is_supported_language(language: LanguageKind) -> bool {
+    matches!(language, LanguageKind::Rust | LanguageKind::Python)
+}
+
+fn extract_language(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    match file.language {
+        LanguageKind::Rust => extract_rust(file, source, tree),
+        LanguageKind::Python => extract_python(file, source, tree),
+        _ => ParsedFile::unsupported(
+            file.clone(),
+            format!("unsupported language for {}", file.relative_path),
+        ),
+    }
 }
 
 fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
@@ -504,6 +582,41 @@ fn extract_rust(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
     }
 }
 
+fn extract_python(file: FileRecord, source: &str, tree: &Tree) -> ParsedFile {
+    let mut ctx = ExtractContext {
+        file: file.clone(),
+        source,
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        calls: Vec::new(),
+        references: Vec::new(),
+        body_hits: Vec::new(),
+        diagnostics: Vec::new(),
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: "tree-sitter reported parse errors".to_string(),
+            span: Some(span_from_node(root)),
+            confidence: Confidence::Partial,
+        });
+    }
+
+    visit_python_node(root, &mut ctx, None, None);
+
+    ParsedFile {
+        file,
+        symbols: ctx.symbols,
+        imports: ctx.imports,
+        calls: ctx.calls,
+        references: ctx.references,
+        body_hits: ctx.body_hits,
+        unsupported: None,
+        diagnostics: ctx.diagnostics,
+        changed_ranges: Vec::new(),
+    }
+}
+
 struct ExtractContext<'source> {
     file: FileRecord,
     source: &'source str,
@@ -513,6 +626,63 @@ struct ExtractContext<'source> {
     references: Vec<ParsedReference>,
     body_hits: Vec<BodyHit>,
     diagnostics: Vec<ParseDiagnostic>,
+}
+
+fn visit_python_node(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    if node.is_missing() {
+        ctx.diagnostics.push(ParseDiagnostic {
+            message: format!("missing {}", node.kind()),
+            span: Some(span_from_node(node)),
+            confidence: Confidence::Partial,
+        });
+        return;
+    }
+
+    let kind = node.kind();
+    if matches!(kind, "import_statement" | "import_from_statement") {
+        extract_python_import(node, ctx, owner_symbol.clone());
+    }
+
+    if let Some(symbol) = python_symbol_from_node(node, ctx, parent_symbol.as_ref()) {
+        let next_parent = Some((symbol.id.clone(), symbol.kind));
+        let next_owner = if symbol.body_span.is_some() {
+            Some(symbol.id.clone())
+        } else {
+            owner_symbol.clone()
+        };
+        ctx.symbols.push(symbol);
+        visit_python_children(node, ctx, next_parent, next_owner);
+        return;
+    }
+
+    if kind == "call" {
+        extract_python_call(node, ctx, owner_symbol.clone());
+    } else if kind == "identifier" {
+        extract_python_reference(node, ReferenceKind::Identifier, ctx, owner_symbol.clone());
+    } else if kind == "attribute" {
+        extract_python_reference(node, ReferenceKind::Field, ctx, owner_symbol.clone());
+    } else if is_python_literal(kind) {
+        extract_body_hit(node, BodyHitKind::Literal, ctx, owner_symbol.clone());
+    }
+
+    visit_python_children(node, ctx, parent_symbol, owner_symbol);
+}
+
+fn visit_python_children(
+    node: Node<'_>,
+    ctx: &mut ExtractContext<'_>,
+    parent_symbol: Option<(SymbolId, SymbolKind)>,
+    owner_symbol: Option<SymbolId>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        visit_python_node(child, ctx, parent_symbol.clone(), owner_symbol.clone());
+    }
 }
 
 fn visit_node(
@@ -633,6 +803,72 @@ fn symbol_from_node(
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
     })
+}
+
+fn python_symbol_from_node(
+    node: Node<'_>,
+    ctx: &ExtractContext<'_>,
+    parent_symbol: Option<&(SymbolId, SymbolKind)>,
+) -> Option<ParsedSymbol> {
+    let mut kind = match node.kind() {
+        "class_definition" => SymbolKind::Class,
+        "function_definition" => SymbolKind::Function,
+        _ => return None,
+    };
+    if kind == SymbolKind::Function
+        && parent_symbol
+            .map(|(_, parent_kind)| *parent_kind == SymbolKind::Class)
+            .unwrap_or(false)
+    {
+        kind = SymbolKind::Method;
+    }
+
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|child| node_text(child, ctx.source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())?;
+    let body = node.child_by_field_name("body");
+    let span = span_from_node(node);
+    let body_span = body.map(span_from_node);
+    let signature = signature_text(node, body, ctx.source);
+    let parent_id = parent_symbol.map(|(id, _)| id.clone());
+    let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
+    let attributes = python_attributes_for_node(node, ctx.source);
+
+    Some(ParsedSymbol {
+        id,
+        file_id: ctx.file.id.clone(),
+        parent_id,
+        name,
+        kind,
+        span,
+        body_span,
+        signature,
+        visibility: None,
+        docs: Vec::new(),
+        attributes,
+        provenance: Provenance::new("tree-sitter-python", format!("{} declaration", node.kind())),
+        confidence: Confidence::ExactSyntax,
+        freshness: Freshness::Fresh,
+    })
+}
+
+fn python_attributes_for_node(node: Node<'_>, source: &str) -> Vec<String> {
+    let Some(parent) = node.parent() else {
+        return Vec::new();
+    };
+    if parent.kind() != "decorated_definition" {
+        return Vec::new();
+    }
+    let mut cursor = parent.walk();
+    parent
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() == "decorator")
+        .filter_map(|child| node_text(child, source).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect()
 }
 
 fn parent_symbol_is_impl_or_trait(parent_symbol: &Option<SymbolId>) -> bool {
@@ -828,6 +1064,73 @@ fn extract_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option
     });
 }
 
+fn extract_python_import(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let raw = node_text(node, ctx.source).unwrap_or_default().trim();
+    let imports = if let Some(rest) = raw.strip_prefix("from ") {
+        python_from_imports(rest)
+    } else if let Some(rest) = raw.strip_prefix("import ") {
+        python_plain_imports(rest)
+    } else {
+        Vec::new()
+    };
+
+    for (path, alias, is_glob) in imports {
+        ctx.imports.push(ParsedImport {
+            file_id: ctx.file.id.clone(),
+            owner_id: owner_id.clone(),
+            path,
+            alias,
+            is_glob,
+            is_reexport: false,
+            span: span_from_node(node),
+            provenance: Provenance::new("tree-sitter-python", "import declaration"),
+        });
+    }
+}
+
+fn python_plain_imports(rest: &str) -> Vec<(String, Option<String>, bool)> {
+    rest.split(',')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            let (path, alias) = split_python_alias(part);
+            Some((path.to_string(), alias.map(str::to_string), false))
+        })
+        .collect()
+}
+
+fn python_from_imports(rest: &str) -> Vec<(String, Option<String>, bool)> {
+    let Some((module, names)) = rest.split_once(" import ") else {
+        return Vec::new();
+    };
+    let module = module.trim();
+    names
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim().trim_matches(['(', ')']);
+            if part.is_empty() {
+                return None;
+            }
+            let (name, alias) = split_python_alias(part);
+            let is_glob = name == "*";
+            let path = if is_glob {
+                format!("{module}.*")
+            } else {
+                format!("{module}.{name}")
+            };
+            Some((path, alias.map(str::to_string), is_glob))
+        })
+        .collect()
+}
+
+fn split_python_alias(text: &str) -> (&str, Option<&str>) {
+    text.split_once(" as ")
+        .map(|(path, alias)| (path.trim(), Some(alias.trim())))
+        .unwrap_or_else(|| (text.trim(), None))
+}
+
 fn extract_direct_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
     let Some(function_node) = node.child_by_field_name("function") else {
         return;
@@ -855,6 +1158,51 @@ fn extract_direct_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: O
         kind: ParsedCallKind::Direct,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-rust", "call_expression"),
+        confidence: Confidence::Heuristic,
+    });
+    extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
+}
+
+fn extract_python_call(node: Node<'_>, ctx: &mut ExtractContext<'_>, owner_id: Option<SymbolId>) {
+    let Some(function_node) = node.child_by_field_name("function").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor).next()
+    }) else {
+        return;
+    };
+    let target_text = node_text(function_node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if target_text.is_empty() {
+        return;
+    }
+    let name = last_path_segment(&target_text);
+    let receiver = receiver_from_direct_call(&target_text);
+    let arity = node
+        .child_by_field_name("arguments")
+        .or_else(|| {
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor)
+                .find(|child| child.kind() == "argument_list")
+        })
+        .map(|arguments| named_child_count(arguments))
+        .unwrap_or_default();
+
+    ctx.calls.push(ParsedCall {
+        file_id: ctx.file.id.clone(),
+        caller_id: owner_id.clone(),
+        name,
+        target_text: target_text.clone(),
+        receiver,
+        arity,
+        kind: if target_text.contains('.') {
+            ParsedCallKind::Method
+        } else {
+            ParsedCallKind::Direct
+        },
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", "call"),
         confidence: Confidence::Heuristic,
     });
     extract_body_hit(node, BodyHitKind::Call, ctx, owner_id);
@@ -956,6 +1304,44 @@ fn extract_reference(
     });
 }
 
+fn extract_python_reference(
+    node: Node<'_>,
+    kind: ReferenceKind,
+    ctx: &mut ExtractContext<'_>,
+    owner_id: Option<SymbolId>,
+) {
+    let text = node_text(node, ctx.source)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return;
+    }
+    let body_kind = match kind {
+        ReferenceKind::Identifier => BodyHitKind::Identifier,
+        ReferenceKind::Field => BodyHitKind::Identifier,
+        ReferenceKind::Attribute => BodyHitKind::Attribute,
+        ReferenceKind::Type => BodyHitKind::Type,
+        ReferenceKind::Path => BodyHitKind::Path,
+    };
+
+    ctx.references.push(ParsedReference {
+        file_id: ctx.file.id.clone(),
+        owner_id: owner_id.clone(),
+        text: text.clone(),
+        kind,
+        span: span_from_node(node),
+        provenance: Provenance::new("tree-sitter-python", format!("{} reference", node.kind())),
+    });
+    ctx.body_hits.push(BodyHit {
+        file_id: ctx.file.id.clone(),
+        owner_id,
+        text,
+        kind: body_kind,
+        span: span_from_node(node),
+    });
+}
+
 fn extract_body_hit(
     node: Node<'_>,
     kind: BodyHitKind,
@@ -1000,6 +1386,13 @@ fn is_literal(kind: &str) -> bool {
             | "float_literal"
             | "boolean_literal"
             | "char_literal"
+    )
+}
+
+fn is_python_literal(kind: &str) -> bool {
+    matches!(
+        kind,
+        "string" | "integer" | "float" | "true" | "false" | "none"
     )
 }
 

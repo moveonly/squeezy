@@ -74,6 +74,66 @@ fn helper() {}
 }
 
 #[test]
+fn parser_extracts_python_symbols_imports_calls_and_references() {
+    let source = r#"
+from services.greeter import Greeter as GreeterAlias
+import helpers
+
+class Runner(GreeterAlias):
+    @decorator
+    def run(self, name: str) -> str:
+        helper = helpers.build(name)
+        return self.greet(helper)
+
+def make_runner():
+    return Runner()
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = python_record("src/app.py", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+
+    assert!(parsed.unsupported.is_none());
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "Runner" && symbol.kind == SymbolKind::Class)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "run" && symbol.kind == SymbolKind::Method)
+    );
+    assert!(
+        parsed
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "make_runner" && symbol.kind == SymbolKind::Function)
+    );
+    assert!(
+        parsed
+            .imports
+            .iter()
+            .any(|import| import.path == "services.greeter.Greeter"
+                && import.alias.as_deref() == Some("GreeterAlias"))
+    );
+    assert!(
+        parsed
+            .calls
+            .iter()
+            .any(|call| call.name == "build" && call.kind == ParsedCallKind::Method)
+    );
+    assert!(parsed.calls.iter().any(|call| call.name == "Runner"));
+    assert!(
+        parsed
+            .references
+            .iter()
+            .any(|reference| reference.text == "GreeterAlias")
+    );
+}
+
+#[test]
 fn parser_reports_changed_ranges_for_cached_file() {
     let first = "fn one() { alpha(); }\n";
     let second = "fn one() { beta(); }\n";
@@ -212,6 +272,12 @@ fn record(relative_path: &str, source: &str) -> FileRecord {
         language: LanguageKind::Rust,
         freshness: Freshness::Fresh,
     }
+}
+
+fn python_record(relative_path: &str, source: &str) -> FileRecord {
+    let mut record = record(relative_path, source);
+    record.language = LanguageKind::Python;
+    record
 }
 
 fn temp_root(name: &str) -> PathBuf {
