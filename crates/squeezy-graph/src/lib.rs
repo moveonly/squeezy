@@ -2485,7 +2485,7 @@ fn file_symbol(file: &FileRecord) -> GraphSymbol {
         kind: SymbolKind::File,
         span: SourceSpan::new(
             0,
-            file.size_bytes.min(u64::from(u32::MAX)) as u32,
+            0,
             squeezy_core::SourcePoint::new(0, 0),
             squeezy_core::SourcePoint::new(0, 0),
         ),
