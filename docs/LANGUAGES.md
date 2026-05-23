@@ -62,17 +62,23 @@ Oracle: `javac` compiler-tree scans for symbols and navigation query checks.
 ## C#
 
 Indexed: namespaces, using directives, classes, interfaces, records, structs,
-enums, methods, constructors, fields, properties, attributes, calls, references,
-and base-type facts.
+enums, methods, constructors, operators, fields, properties, events, enum
+members, attributes, calls, references, stable language identities, partial-type
+links, inheritance and implements edges, and .NET project facts from `.csproj`,
+`.sln`, `.slnx`, `Directory.Build.props`, `Directory.Build.targets`,
+`global.json`, and `packages.lock.json`.
 
 Known limitations: generic constraint solving, overload resolution, extension
 methods, partial project system behavior, generated code, and full MSBuild
-semantics are not compiler-equivalent.
+semantics are not compiler-equivalent. Razor, Blazor `.razor`, and `.cshtml`
+files are intentionally discovered as bounded fallback inputs for v0; embedded
+C# is not assigned graph confidence yet.
 
-TODO: C# declaration, edge, corpus, benchmark, and incremental follow-ups are
-tracked under `squeezy-cfa.26`.
+TODO: broader C# graph behavior after v0 is tracked under `squeezy-cfa.38` and
+follow-up extraction/navigation tasks.
 
-Oracle: Roslyn project in `benchmarks/oracle/csharp`.
+Oracle: Roslyn project in `benchmarks/oracle/csharp` for declaration symbols and
+syntactic extends/implements edges.
 
 ## Go
 

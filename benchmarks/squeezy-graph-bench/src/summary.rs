@@ -110,6 +110,16 @@ pub(crate) fn print_summary(report: &BenchmarkReport) {
                 .unwrap_or_else(|| "cached".to_string()),
             csharp.oracle_unparseable_files,
         );
+        println!(
+            "csharp_oracle_edge_accuracy: tp={} fp={} fn={} precision={} recall={} oracle_edges={} squeezy_edges={}",
+            csharp.edges.true_positive,
+            csharp.edges.false_positive,
+            csharp.edges.false_negative,
+            csharp.edges.precision,
+            csharp.edges.recall,
+            csharp.edges.rust_analyzer_total,
+            csharp.edges.squeezy_total,
+        );
     }
     if let Some(go) = &report.go_oracle {
         println!(
@@ -221,4 +231,3 @@ pub(crate) fn print_navigation_summary(label: &str, navigation: &NavigationAccur
             .unwrap_or_else(|| navigation.rust_analyzer_lsp_status.clone())
     );
 }
-

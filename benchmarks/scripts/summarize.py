@@ -196,6 +196,18 @@ def csharp_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
                     unparseable=oracle["oracle_unparseable_files"],
                 )
             )
+            edges = oracle.get("edges")
+            if edges:
+                out.append(
+                    "- Roslyn edge oracle: tp={tp} fp={fp} fn={fn} precision={precision:.3f} "
+                    "recall={recall:.3f}".format(
+                        tp=edges["true_positive"],
+                        fp=edges["false_positive"],
+                        fn=edges["false_negative"],
+                        precision=edges["precision"],
+                        recall=edges["recall"],
+                    )
+                )
         if report.get("mixed_workload"):
             write_mixed_common(out, report["mixed_workload"], "dotnet build")
             out.append(

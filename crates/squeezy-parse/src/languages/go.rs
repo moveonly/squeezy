@@ -201,6 +201,7 @@ pub(crate) fn go_function_symbol(
         parent_id: parent_symbol,
         name,
         kind,
+        language_identity: None,
         span,
         body_span,
         signature,
@@ -246,6 +247,7 @@ pub(crate) fn go_type_symbol(
         parent_id: parent_symbol,
         name,
         kind,
+        language_identity: None,
         span,
         body_span,
         signature,
@@ -312,6 +314,7 @@ pub(crate) fn go_field_symbols(
                 parent_id: Some(parent_id.clone()),
                 name,
                 kind: SymbolKind::Field,
+                language_identity: None,
                 span,
                 body_span: None,
                 signature: node_text(node, ctx.source)
@@ -348,6 +351,7 @@ pub(crate) fn extract_go_value_declarations(
                 parent_id: parent_symbol.clone(),
                 name,
                 kind,
+                language_identity: None,
                 span,
                 body_span: None,
                 signature: node_text(child, ctx.source)

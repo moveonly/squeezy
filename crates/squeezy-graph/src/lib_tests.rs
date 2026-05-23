@@ -650,6 +650,96 @@ public class Dog : Animal
 }
 
 #[test]
+fn graph_resolves_csharp_partial_direct_calls_and_project_facts() {
+    let mut parser = LanguageParser::new().unwrap();
+    let records = [
+        csharp_record(
+            "src/Runner.cs",
+            r#"
+namespace App;
+public partial class Runner {
+    public string Run(string input) { return input; }
+}
+"#,
+        ),
+        csharp_record(
+            "src/Runner.Partial.cs",
+            r#"
+namespace App;
+public partial class Runner {
+    public string RunAsync(string input) { return Run(input); }
+}
+"#,
+        ),
+        unsupported_record(
+            "App.csproj",
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Example.Dependency" Version="1.2.3" />
+    <ProjectReference Include="src/Lib/Lib.csproj" />
+  </ItemGroup>
+</Project>"#,
+        ),
+        unsupported_record("global.json", r#"{ "sdk": { "version": "8.0.100" } }"#),
+        unsupported_record(
+            "Directory.Build.props",
+            r#"<Project><ItemGroup><Compile Include="generated/*.cs" /></ItemGroup></Project>"#,
+        ),
+        unsupported_record(
+            "packages.lock.json",
+            r#"{ "dependencies": { "net8.0": { "Locked.Package": { "resolved": "4.5.6" } } } }"#,
+        ),
+    ];
+    let parsed = records
+        .into_iter()
+        .map(|record| {
+            let source = fs::read_to_string(&record.path).unwrap();
+            parser.parse_source(&record, source).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    let run_async = graph
+        .find_symbol_by_name("RunAsync")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("RunAsync method");
+    let run = graph
+        .find_symbol_by_name("Run")
+        .into_iter()
+        .find(|symbol| symbol.kind == SymbolKind::Method)
+        .expect("Run method");
+    let edge = graph
+        .edges()
+        .iter()
+        .find(|edge| edge.from == run_async.id && edge.kind == EdgeKind::Calls)
+        .expect("RunAsync call edge");
+    assert_eq!(edge.to.as_ref(), Some(&run.id));
+    assert_eq!(edge.confidence, Confidence::ExactSyntax);
+
+    let facts = graph
+        .dotnet_project_facts()
+        .iter()
+        .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+        .collect::<Vec<_>>();
+    for expected in [
+        "csproj:target_framework:net8.0",
+        "csproj:target_framework:net9.0",
+        "csproj:dependency:Example.Dependency:1.2.3",
+        "csproj:project_reference:src/Lib/Lib.csproj",
+        "global-json:sdk:8.0.100",
+        "directory-build-props:configured_source:generated/*.cs",
+        "packages-lock:dependency:Locked.Package:4.5.6",
+    ] {
+        assert!(
+            facts.iter().any(|fact| fact == expected),
+            "missing {expected}; facts={facts:?}"
+        );
+    }
+}
+
+#[test]
 fn graph_manager_refresh_replaces_changed_file_only() {
     let root = temp_root("graph-manager-refresh");
     fs::create_dir_all(root.join("src")).unwrap();
@@ -684,6 +774,87 @@ fn graph_manager_refresh_replaces_changed_file_only() {
     assert_eq!(report.language.rust_files, 1);
     assert!(manager.graph().find_symbol_by_name("one").is_empty());
     assert!(!manager.graph().find_symbol_by_name("two").is_empty());
+}
+
+#[test]
+fn graph_manager_refresh_converges_for_csharp_changes_and_ignores_unsupported_only() {
+    let root = temp_root("graph-manager-csharp-refresh");
+    fs::create_dir_all(root.join("src")).unwrap();
+    let project = root.join("App.csproj");
+    fs::write(
+        &project,
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>",
+    )
+    .unwrap();
+    let runner = root.join("src").join("Runner.cs");
+    fs::write(
+        &runner,
+        "namespace App;\npublic partial class Runner { public string One() => \"one\"; }\n",
+    )
+    .unwrap();
+    let notes = root.join("notes.txt");
+    fs::write(&notes, "first\n").unwrap();
+
+    let mut manager = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.build_report().language.csharp_files, 1);
+    assert!(!manager.graph().find_symbol_by_name("One").is_empty());
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(&notes, "second\n").unwrap();
+    manager.record_changed_path(notes.clone());
+    let unsupported = manager.refresh_before_query().unwrap();
+    assert!(!unsupported.refreshed);
+    assert_eq!(unsupported.reparsed_files, 0);
+    assert_eq!(unsupported.changed_paths_from_events, 0);
+    assert_eq!(unsupported.unchanged_event_paths, 1);
+
+    thread::sleep(Duration::from_millis(2));
+    fs::write(
+        &runner,
+        "namespace App;\npublic partial class Runner { public string Two() => \"two\"; }\n",
+    )
+    .unwrap();
+    manager.record_changed_paths([runner.clone(), notes]);
+    let changed = manager.refresh_before_query().unwrap();
+    assert!(changed.refreshed);
+    assert_eq!(changed.reparsed_files, 1);
+    assert_eq!(changed.changed_paths_from_events, 1);
+    assert_eq!(changed.language.csharp_files, 1);
+    assert!(manager.graph().find_symbol_by_name("One").is_empty());
+    assert!(!manager.graph().find_symbol_by_name("Two").is_empty());
+
+    let fresh = GraphManager::open_with_config(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_millis(0),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+    )
+    .unwrap();
+    assert_eq!(manager.graph().stats(), fresh.graph().stats());
+    assert_eq!(
+        manager
+            .graph()
+            .find_symbol_by_name("Two")
+            .into_iter()
+            .map(|symbol| symbol.language_identity)
+            .collect::<Vec<_>>(),
+        fresh
+            .graph()
+            .find_symbol_by_name("Two")
+            .into_iter()
+            .map(|symbol| symbol.language_identity)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

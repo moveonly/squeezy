@@ -273,6 +273,28 @@ pub(crate) fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<Quer
             .iter()
             .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
             .collect(),
+        "dotnet_project_facts" => graph
+            .dotnet_project_facts()
+            .iter()
+            .map(|fact| format!("{}:{}:{}", fact.provider, fact.kind, fact.value))
+            .collect(),
+        "edges" => graph
+            .edges()
+            .iter()
+            .filter_map(|edge| {
+                let from = graph.symbols.get(&edge.from)?;
+                let to = edge
+                    .to
+                    .as_ref()
+                    .and_then(|id| graph.symbols.get(id))
+                    .map(|symbol| symbol.name.as_str())
+                    .unwrap_or("<unresolved>");
+                Some(format!(
+                    "{:?}:{}->{}:{}:{:?}",
+                    edge.kind, from.name, to, edge.target_text, edge.confidence
+                ))
+            })
+            .collect(),
         "references_to_symbol" => {
             let to = required(&query.to, "to")?;
             let symbol = benchmark_symbol_by_name(graph, to)

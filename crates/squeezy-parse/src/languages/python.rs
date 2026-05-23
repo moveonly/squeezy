@@ -263,6 +263,7 @@ pub(crate) fn extract_python_field_symbol(
         parent_id: Some(parent_id.clone()),
         name,
         kind: SymbolKind::Field,
+        language_identity: None,
         span,
         body_span: None,
         signature: raw.trim().to_string(),
