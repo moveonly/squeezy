@@ -154,6 +154,35 @@ impl Runner {
 }
 
 #[test]
+fn parser_expands_grouped_use_trees() {
+    let source = r#"
+pub use crate::flags::lowargs::{ContextMode, LowArgs as Args};
+use crate::{config::Config, flags::{defs::Generate, parse::*}};
+"#;
+    let mut parser = RustParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let imports = parsed
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.path.as_str(),
+                import.alias.as_deref(),
+                import.is_glob,
+                import.is_reexport,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(imports.contains(&("crate::flags::lowargs::ContextMode", None, false, true)));
+    assert!(imports.contains(&("crate::flags::lowargs::LowArgs", Some("Args"), false, true)));
+    assert!(imports.contains(&("crate::config::Config", None, false, false)));
+    assert!(imports.contains(&("crate::flags::defs::Generate", None, false, false)));
+    assert!(imports.contains(&("crate::flags::parse::*", None, true, false)));
+}
+
+#[test]
 fn parser_parallel_records_preserve_order_and_cache_changes() {
     let mut parser = RustParser::new().unwrap();
     let mut records = (0..10)
