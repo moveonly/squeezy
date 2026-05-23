@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::BTreeMap, env};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -131,6 +131,7 @@ impl LlmProvider for GoogleProvider {
 
 fn google_contents(input: &[LlmInputItem]) -> Value {
     let mut contents = Vec::new();
+    let mut tool_names_by_call_id = BTreeMap::new();
     for item in input {
         match item {
             LlmInputItem::UserText(text) => contents.push(json!({
@@ -138,20 +139,29 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 "parts": [{"text": text}],
             })),
             LlmInputItem::FunctionCall {
-                call_id: _,
+                call_id,
                 name,
                 arguments,
-            } => contents.push(json!({
-                "role": "model",
-                "parts": [{"functionCall": {"name": name, "args": arguments}}],
-            })),
-            LlmInputItem::FunctionCallOutput { call_id: _, output } => contents.push(json!({
+            } => {
+                tool_names_by_call_id.insert(call_id.as_str(), name.as_str());
+                contents.push(json!({
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": name, "args": arguments}}],
+                }));
+            }
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                let name = tool_names_by_call_id
+                    .get(call_id.as_str())
+                    .copied()
+                    .unwrap_or("tool");
+                contents.push(json!({
                 "role": "function",
                 "parts": [{"functionResponse": {
-                    "name": "tool",
+                    "name": name,
                     "response": {"output": output},
                 }}],
-            })),
+                }));
+            }
         }
     }
     Value::Array(contents)

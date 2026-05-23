@@ -35,7 +35,7 @@ fn registry_estimates_known_model_costs() {
 
     let estimate = estimate_cost("openai", squeezy_core::DEFAULT_OPENAI_MODEL, &cost);
 
-    assert_eq!(estimate, Some(455_000));
+    assert_eq!(estimate, Some(405_000));
 }
 
 #[test]

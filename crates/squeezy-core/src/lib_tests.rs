@@ -216,6 +216,38 @@ default_model = "gemini-local"
 }
 
 #[test]
+fn provider_override_uses_selected_provider_settings_and_default_model() {
+    let settings: SettingsFile = toml::from_str(
+        r#"
+provider = "openai"
+
+[providers.openai]
+default_model = "openai-settings-model"
+
+[providers.anthropic]
+api_key_env = "CUSTOM_ANTHROPIC_KEY"
+base_url = "https://anthropic.example/v1"
+default_model = "claude-settings-model"
+"#,
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(config.model, "claude-settings-model");
+    match config.provider {
+        ProviderConfig::Anthropic(anthropic) => {
+            assert_eq!(anthropic.api_key_env, "CUSTOM_ANTHROPIC_KEY");
+            assert_eq!(anthropic.base_url, "https://anthropic.example/v1");
+        }
+        _ => panic!("expected Anthropic provider"),
+    }
+}
+
+#[test]
 fn config_can_select_azure_bedrock_and_ollama_defaults() {
     let azure = AppConfig::from_env_vars(|name| match name {
         "SQUEEZY_PROVIDER" => Some("azure_openai".to_string()),

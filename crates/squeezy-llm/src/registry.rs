@@ -169,20 +169,31 @@ pub fn estimate_cost(provider: &str, model: &str, cost: &CostSnapshot) -> Option
         .iter()
         .find(|entry| entry.provider == provider && entry.id == model)
         .and_then(|entry| entry.pricing)?;
+    let cached_input_tokens = cost.cached_input_tokens.unwrap_or(0);
+    let cache_write_input_tokens = cost.cache_write_input_tokens.unwrap_or(0);
+    let standard_input_tokens = cost
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_sub(cached_input_tokens)
+        .saturating_sub(cache_write_input_tokens);
     Some(
-        estimate(cost.input_tokens, pricing.input_usd_micros_per_mtok)
+        estimate_tokens(standard_input_tokens, pricing.input_usd_micros_per_mtok)
             + estimate(cost.output_tokens, pricing.output_usd_micros_per_mtok)
-            + estimate(
-                cost.cached_input_tokens,
+            + estimate_tokens(
+                cached_input_tokens,
                 pricing.cache_read_usd_micros_per_mtok.unwrap_or(0),
             )
-            + estimate(
-                cost.cache_write_input_tokens,
+            + estimate_tokens(
+                cache_write_input_tokens,
                 pricing.cache_write_usd_micros_per_mtok.unwrap_or(0),
             ),
     )
 }
 
 fn estimate(tokens: Option<u64>, usd_micros_per_mtok: u64) -> u64 {
-    tokens.unwrap_or(0).saturating_mul(usd_micros_per_mtok) / 1_000_000
+    estimate_tokens(tokens.unwrap_or(0), usd_micros_per_mtok)
+}
+
+fn estimate_tokens(tokens: u64, usd_micros_per_mtok: u64) -> u64 {
+    tokens.saturating_mul(usd_micros_per_mtok) / 1_000_000
 }

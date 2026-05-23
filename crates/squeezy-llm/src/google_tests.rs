@@ -33,6 +33,36 @@ fn request_body_uses_generate_content_shape() {
 }
 
 #[test]
+fn request_body_preserves_function_response_name() {
+    let request = LlmRequest {
+        model: "gemini-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![
+            LlmInputItem::FunctionCall {
+                call_id: "call-1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            LlmInputItem::FunctionCallOutput {
+                call_id: "call-1".to_string(),
+                output: "match".to_string(),
+            },
+        ],
+        max_output_tokens: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = GoogleProvider::request_body(&request);
+
+    assert_eq!(
+        body["contents"][1]["parts"][0]["functionResponse"]["name"],
+        "grep"
+    );
+}
+
+#[test]
 fn parser_extracts_text_tool_calls_and_usage() {
     let mut cost = CostSnapshot::default();
     let events = parse_google_event(
