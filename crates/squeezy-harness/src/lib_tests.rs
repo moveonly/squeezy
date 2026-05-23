@@ -60,6 +60,21 @@ fn rejects_workspace_paths_outside_root() {
 }
 
 #[test]
+fn path_matches_requires_segment_boundary_for_literal_patterns() {
+    assert!(path_matches("*.rs", "src/lib.rs"));
+    assert!(path_matches("lib.rs", "src/lib.rs"));
+    assert!(path_matches("src/main.rs", "src/main.rs"));
+    assert!(path_matches("/src/main.rs", "src/main.rs"));
+    // Multi-segment patterns still match at any directory depth, but only
+    // when the suffix lands on a directory boundary.
+    assert!(path_matches("src/main.rs", "tests/src/main.rs"));
+    // The boundary check rejects mid-filename suffix matches.
+    assert!(!path_matches("lib.rs", "src/sublib.rs"));
+    assert!(!path_matches("lib.rs", "vendor/anylib.rs"));
+    assert!(!path_matches("main.rs", "src/zmain.rs"));
+}
+
+#[test]
 fn baseline_paths_skips_ignored_directories() {
     let task = TaskSpec {
         id: "ignore".to_string(),

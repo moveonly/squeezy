@@ -752,7 +752,14 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
         return path.ends_with(&format!(".{suffix}"));
     }
-    path == pattern || path.ends_with(pattern.trim_start_matches('/'))
+    let normalized = pattern.trim_start_matches('/');
+    if path == normalized {
+        return true;
+    }
+    // Literal patterns must match on a path-segment boundary so that
+    // `lib.rs` does not also match `src/sublib.rs`.
+    path.strip_suffix(normalized)
+        .is_some_and(|prefix| prefix.ends_with('/'))
 }
 
 fn write_jsonl(path: &Path, results: &[TaskResult]) -> Result<()> {
@@ -766,6 +773,12 @@ fn write_jsonl(path: &Path, results: &[TaskResult]) -> Result<()> {
             .map_err(|err| SqueezyError::Agent(format!("failed to write JSONL: {err}")))?;
         writer.write_all(b"\n")?;
     }
+    // Flush explicitly so a failure surfaces here instead of being swallowed
+    // by `BufWriter::drop`; the harness JSONL is uploaded as a CI artifact
+    // and must not silently truncate.
+    writer
+        .flush()
+        .map_err(|err| SqueezyError::Agent(format!("failed to flush JSONL: {err}")))?;
     Ok(())
 }
 
