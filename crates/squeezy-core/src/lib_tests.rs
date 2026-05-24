@@ -1673,7 +1673,7 @@ url = "https://docs.example/mcp"
     assert!(inspect.contains("response_verbosity = \"normal\""));
     assert!(inspect.contains("tool_output_verbosity = \"compact\""));
     assert!(inspect.contains("transcript_default = \"compact\""));
-    assert!(inspect.contains("alternate_screen = \"never\""));
+    assert!(inspect.contains("alternate_screen = \"auto\""));
     assert!(inspect.contains("show_reasoning_usage = true"));
     assert!(inspect.contains("transport = \"http\""));
     assert!(!inspect.contains("Balanced"));

@@ -1052,12 +1052,16 @@ fn startup_card_scrolls_with_transcript_history() {
 }
 
 #[test]
-fn inline_mode_is_default_terminal_model() {
+fn auto_mode_is_default_terminal_model() {
     let config = test_config(SessionMode::Build);
 
-    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Never);
+    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Auto);
     assert_eq!(
         TerminalMode::from(config.tui.alternate_screen),
+        TerminalMode::AlternateScreen
+    );
+    assert_eq!(
+        TerminalMode::from(TuiAlternateScreen::Never),
         TerminalMode::Inline
     );
     assert_eq!(

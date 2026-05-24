@@ -3820,6 +3820,7 @@ impl TranscriptDefault {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiAlternateScreen {
+    Auto,
     Never,
     Always,
 }
@@ -3827,6 +3828,7 @@ pub enum TuiAlternateScreen {
 impl TuiAlternateScreen {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Never => "never",
             Self::Always => "always",
         }
@@ -3862,7 +3864,7 @@ impl TuiConfig {
                 .unwrap_or(TranscriptDefault::Compact),
             alternate_screen: settings
                 .alternate_screen
-                .unwrap_or(TuiAlternateScreen::Never),
+                .unwrap_or(TuiAlternateScreen::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
         }
     }
@@ -4199,7 +4201,7 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "never"    # never | always
+# alternate_screen = "auto"     # auto | always | never
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -4296,7 +4298,7 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
-# alternate_screen = "never"    # never | always
+# alternate_screen = "auto"     # auto | always | never
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -5066,10 +5068,11 @@ fn tui_alternate_screen_value(
         return Ok(None);
     };
     match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(Some(TuiAlternateScreen::Auto)),
         "never" => Ok(Some(TuiAlternateScreen::Never)),
         "always" => Ok(Some(TuiAlternateScreen::Always)),
         _ => Err(SqueezyError::Config(format!(
-            "{source}: {path}: invalid TUI alternate screen {value:?}; expected never or always"
+            "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
 }
