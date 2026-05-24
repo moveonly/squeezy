@@ -145,6 +145,30 @@ fn tool_event_does_not_include_arguments_or_paths() {
 }
 
 #[test]
+fn graph_navigation_tool_events_are_classified_as_graph_family() {
+    let config = AppConfig::default();
+    let event = TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: 1,
+        tool_sequence: 1,
+        tool_name: "read_slice",
+        status: ToolStatusKind::Success,
+        duration: Duration::from_millis(5),
+        cost: ToolCostProperties {
+            files_scanned: 0,
+            bytes_read: 32,
+            matches_returned: 1,
+            output_bytes: 64,
+        },
+    });
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(text.contains("\"tool_name\":\"graph\""));
+    assert!(text.contains("\"tool_family\":\"graph\""));
+}
+
+#[test]
 fn graph_event_carries_timing_counts_and_language_distribution() {
     let event = TelemetryEvent::graph_build_completed(GraphPerfReport {
         refresh_kind: RefreshKind::Cold,

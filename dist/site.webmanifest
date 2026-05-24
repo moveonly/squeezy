@@ -1,0 +1,16 @@
+{
+  "name": "SqueezyAgent",
+  "short_name": "Squeezy",
+  "description": "Local semantic code understanding before model spend.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080807",
+  "theme_color": "#080807",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

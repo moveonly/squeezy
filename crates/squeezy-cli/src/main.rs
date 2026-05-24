@@ -8,8 +8,8 @@ use std::{
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
 use squeezy_core::{
-    AppConfig, ModelProfile, PROJECT_SETTINGS_FILE, SessionMode, SqueezyError,
-    default_settings_path, project_settings_template, user_settings_template,
+    AppConfig, McpTransport, ModelProfile, PROJECT_SETTINGS_FILE, PermissionMode, SessionMode,
+    SqueezyError, default_settings_path, project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, PROVIDERS, UnavailableProvider,
@@ -21,6 +21,7 @@ use squeezy_store::{
 };
 use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
+use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
@@ -66,6 +67,11 @@ enum Command {
         #[command(subcommand)]
         command: SessionsCommand,
     },
+    #[command(about = "Manage configured MCP servers")]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -87,6 +93,60 @@ struct InitScope {
     #[arg(long, help = "Write the user-level settings file")]
     user: bool,
     #[arg(long, help = "Write the project-level settings file")]
+    project: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    #[command(about = "List configured MCP servers")]
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Add an MCP server to user or project settings")]
+    Add(McpAddArgs),
+    #[command(about = "Enable a configured MCP server")]
+    Enable(McpNameScope),
+    #[command(about = "Disable a configured MCP server")]
+    Disable(McpNameScope),
+    #[command(about = "Remove a configured MCP server")]
+    Remove(McpNameScope),
+}
+
+#[derive(Debug, Args)]
+struct McpAddArgs {
+    name: String,
+    #[command(flatten)]
+    scope: McpConfigScope,
+    #[arg(long, help = "Transport: stdio, http, or sse")]
+    transport: String,
+    #[arg(long, help = "Command for stdio MCP servers")]
+    command: Option<String>,
+    #[arg(long = "arg", help = "Command argument; repeat for multiple args")]
+    args: Vec<String>,
+    #[arg(long, help = "URL for http or sse MCP servers")]
+    url: Option<String>,
+    #[arg(long, help = "Timeout in milliseconds")]
+    timeout_ms: Option<u64>,
+    #[arg(long = "env", help = "Environment entry in KEY=VALUE form")]
+    env: Vec<String>,
+    #[arg(long, help = "Per-server default permission: allow, ask, or deny")]
+    permission_default: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct McpNameScope {
+    name: String,
+    #[command(flatten)]
+    scope: McpConfigScope,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct McpConfigScope {
+    #[arg(long, help = "Edit the user-level settings file")]
+    user: bool,
+    #[arg(long, help = "Edit the project-level settings file")]
     project: bool,
 }
 
@@ -153,6 +213,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Sessions { command }) => {
             return handle_sessions_command(command, &cli).await;
         }
+        Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
         None => {}
     }
 
@@ -289,6 +350,281 @@ fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Re
             Ok(())
         }
     }
+}
+
+fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<()> {
+    match command {
+        McpCommand::List { json } => {
+            let config = config_from_cli(cli)?;
+            if *json {
+                let servers = config
+                    .mcp_servers
+                    .iter()
+                    .map(|(name, server)| {
+                        serde_json::json!({
+                            "name": name,
+                            "enabled": server.enabled,
+                            "transport": server.transport.as_str(),
+                            "command": server.command,
+                            "args": server.args,
+                            "url": server.url,
+                            "timeout_ms": server.timeout_ms,
+                            "env": server.env.keys().collect::<Vec<_>>(),
+                            "permission_default": server.permissions.default.map(|value| value.as_str()),
+                            "permission_rules": server.permissions.rules.len(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&servers).unwrap_or_default()
+                );
+            } else if config.mcp_servers.is_empty() {
+                println!("No MCP servers configured.");
+            } else {
+                let mut rows: Vec<[String; 4]> = Vec::with_capacity(config.mcp_servers.len() + 1);
+                rows.push([
+                    "NAME".to_string(),
+                    "STATE".to_string(),
+                    "TRANSPORT".to_string(),
+                    "ENDPOINT".to_string(),
+                ]);
+                for (name, server) in &config.mcp_servers {
+                    let state = if server.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    };
+                    let endpoint = server
+                        .command
+                        .as_deref()
+                        .or(server.url.as_deref())
+                        .unwrap_or("-");
+                    rows.push([
+                        name.clone(),
+                        state.to_string(),
+                        server.transport.as_str().to_string(),
+                        endpoint.to_string(),
+                    ]);
+                }
+                let widths = (0..4)
+                    .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+                    .collect::<Vec<_>>();
+                for row in rows {
+                    println!(
+                        "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        w0 = widths[0],
+                        w1 = widths[1],
+                        w2 = widths[2],
+                    );
+                }
+            }
+            Ok(())
+        }
+        McpCommand::Add(args) => {
+            let config = config_from_cli(cli)?;
+            update_mcp_settings(&config, &args.scope, |servers| {
+                validate_mcp_name(&args.name)?;
+                if servers.contains_key(&args.name) {
+                    return Err(SqueezyError::Config(format!(
+                        "MCP server {:?} already exists in selected settings file",
+                        args.name
+                    )));
+                }
+                let transport = parse_mcp_transport(&args.transport)?;
+                match transport {
+                    McpTransport::Stdio if args.command.as_deref().unwrap_or("").is_empty() => {
+                        return Err(SqueezyError::Config(
+                            "stdio MCP servers require --command".to_string(),
+                        ));
+                    }
+                    McpTransport::Http | McpTransport::Sse
+                        if args.url.as_deref().unwrap_or("").is_empty() =>
+                    {
+                        return Err(SqueezyError::Config(
+                            "http and sse MCP servers require --url".to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+                let mut server = Table::new();
+                server.insert("enabled", Item::Value(TomlValue::from(true)));
+                server.insert(
+                    "transport",
+                    Item::Value(TomlValue::from(transport.as_str())),
+                );
+                if let Some(command) = &args.command {
+                    server.insert("command", Item::Value(TomlValue::from(command.as_str())));
+                }
+                if !args.args.is_empty() {
+                    let mut array = toml_edit::Array::default();
+                    for arg in &args.args {
+                        array.push(arg.as_str());
+                    }
+                    server.insert("args", Item::Value(TomlValue::Array(array)));
+                }
+                if let Some(url) = &args.url {
+                    server.insert("url", Item::Value(TomlValue::from(url.as_str())));
+                }
+                if let Some(timeout_ms) = args.timeout_ms {
+                    server.insert(
+                        "timeout_ms",
+                        Item::Value(TomlValue::from(timeout_ms as i64)),
+                    );
+                }
+                if !args.env.is_empty() {
+                    let mut env = toml_edit::InlineTable::default();
+                    for entry in &args.env {
+                        let (key, value) = parse_env_entry(entry)?;
+                        env.insert(key, TomlValue::from(value));
+                    }
+                    server.insert("env", Item::Value(TomlValue::InlineTable(env)));
+                }
+                if let Some(default) = &args.permission_default {
+                    let default = parse_permission(default)?;
+                    let mut permissions = Table::new();
+                    permissions.insert("default", Item::Value(TomlValue::from(default.as_str())));
+                    server.insert("permissions", Item::Table(permissions));
+                }
+                servers.insert(&args.name, Item::Table(server));
+                Ok(())
+            })
+        }
+        McpCommand::Enable(args) => set_mcp_enabled(cli, args, true),
+        McpCommand::Disable(args) => set_mcp_enabled(cli, args, false),
+        McpCommand::Remove(args) => {
+            let config = config_from_cli(cli)?;
+            update_mcp_settings(&config, &args.scope, |servers| {
+                if servers.remove(&args.name).is_none() {
+                    return Err(SqueezyError::Config(format!(
+                        "MCP server {:?} was not found in selected settings file",
+                        args.name
+                    )));
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+fn set_mcp_enabled(cli: &Cli, args: &McpNameScope, enabled: bool) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    update_mcp_settings(&config, &args.scope, |servers| {
+        let Some(item) = servers.get_mut(&args.name) else {
+            return Err(SqueezyError::Config(format!(
+                "MCP server {:?} was not found in selected settings file",
+                args.name
+            )));
+        };
+        let Some(table) = item.as_table_mut() else {
+            return Err(SqueezyError::Config(format!(
+                "MCP server {:?} is not a table",
+                args.name
+            )));
+        };
+        table.insert("enabled", Item::Value(TomlValue::from(enabled)));
+        Ok(())
+    })
+}
+
+fn update_mcp_settings(
+    config: &AppConfig,
+    scope: &McpConfigScope,
+    update: impl FnOnce(&mut Table) -> squeezy_core::Result<()>,
+) -> squeezy_core::Result<()> {
+    let path = mcp_settings_path(config, scope);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|err| SqueezyError::Config(format!("{}: {err}", path.display())))?;
+    let servers = ensure_mcp_servers_table(&mut doc)?;
+    update(servers)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, doc.to_string())?;
+    println!("updated {}", path.display());
+    Ok(())
+}
+
+fn mcp_settings_path(config: &AppConfig, scope: &McpConfigScope) -> PathBuf {
+    if scope.user {
+        default_settings_path()
+    } else {
+        config.workspace_root.join(PROJECT_SETTINGS_FILE)
+    }
+}
+
+fn ensure_mcp_servers_table(doc: &mut DocumentMut) -> squeezy_core::Result<&mut Table> {
+    let mcp = ensure_table(doc.as_table_mut(), "mcp")?;
+    ensure_table(mcp, "servers")
+}
+
+fn ensure_table<'a>(table: &'a mut Table, key: &str) -> squeezy_core::Result<&'a mut Table> {
+    let item = table
+        .entry(key)
+        .or_insert_with(|| Item::Table(Table::new()));
+    if !item.is_table() {
+        return Err(SqueezyError::Config(format!(
+            "{key} exists but is not a TOML table"
+        )));
+    }
+    Ok(item.as_table_mut().expect("checked table"))
+}
+
+fn validate_mcp_name(name: &str) -> squeezy_core::Result<()> {
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-');
+    if valid {
+        Ok(())
+    } else {
+        Err(SqueezyError::Config(
+            "MCP server names may contain only ASCII letters, digits, '_' and '-'".to_string(),
+        ))
+    }
+}
+
+fn parse_mcp_transport(value: &str) -> squeezy_core::Result<McpTransport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "stdio" => Ok(McpTransport::Stdio),
+        "http" => Ok(McpTransport::Http),
+        "sse" => Ok(McpTransport::Sse),
+        _ => Err(SqueezyError::Config(format!(
+            "invalid MCP transport {value:?}; expected stdio, http, or sse"
+        ))),
+    }
+}
+
+fn parse_permission(value: &str) -> squeezy_core::Result<PermissionMode> {
+    PermissionMode::parse(value).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "invalid permission mode {value:?}; expected allow, ask, or deny"
+        ))
+    })
+}
+
+fn parse_env_entry(entry: &str) -> squeezy_core::Result<(&str, &str)> {
+    let Some((key, value)) = entry.split_once('=') else {
+        return Err(SqueezyError::Config(format!(
+            "invalid --env entry {entry:?}; expected KEY=VALUE"
+        )));
+    };
+    if key.trim().is_empty() {
+        return Err(SqueezyError::Config(
+            "invalid --env entry with empty key".to_string(),
+        ));
+    }
+    Ok((key, value))
 }
 
 fn handle_repo_command(command: &RepoCommand, cli: &Cli) -> squeezy_core::Result<()> {

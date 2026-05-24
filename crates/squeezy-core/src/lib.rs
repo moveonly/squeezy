@@ -342,8 +342,18 @@ impl AppConfig {
             &mut get_var,
         );
         let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
+        let mcp_servers = settings.mcp.map(|mcp| mcp.servers).unwrap_or_default();
+        let mut permission_settings = settings.permissions.unwrap_or_default();
+        // Insert MCP-derived rules *before* the user's explicit
+        // `[[permissions.rules]]`. Permission matching is "last rule wins",
+        // so this keeps any deliberate user deny/allow as the final word
+        // and prevents an MCP server's own permission block from silently
+        // overriding admin policy.
+        let mut combined_rules = mcp_permission_rules(&mcp_servers);
+        combined_rules.append(&mut permission_settings.rules);
+        permission_settings.rules = combined_rules;
         let permissions = PermissionPolicy::from_settings_and_env(
-            settings.permissions.unwrap_or_default(),
+            permission_settings,
             &sources.join(","),
             &mut get_var,
         )?;
@@ -394,7 +404,7 @@ impl AppConfig {
             graph,
             cache,
             tui,
-            mcp_servers: settings.mcp.map(|mcp| mcp.servers).unwrap_or_default(),
+            mcp_servers,
             config_sources: sources,
         })
     }
@@ -522,6 +532,10 @@ impl AppConfig {
         output.push_str(&format!(
             "web = {}\n",
             toml_string(self.permissions.web.as_str())
+        ));
+        output.push_str(&format!(
+            "mcp = {}\n",
+            toml_string(self.permissions.mcp.as_str())
         ));
         output.push_str(&format!(
             "shell_classifier = {}\n\n",
@@ -684,7 +698,44 @@ impl AppConfig {
                 output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
             }
             if !server.env.is_empty() {
-                output.push_str("env = \"<redacted>\"\n");
+                let entries = server
+                    .env
+                    .keys()
+                    .map(|key| {
+                        format!(
+                            "{} = {}",
+                            toml_bare_or_quoted_key(key),
+                            toml_string("<redacted>")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!("env = {{ {entries} }}\n"));
+            }
+            if let Some(default) = server.permissions.default {
+                output.push('\n');
+                output.push_str(&format!(
+                    "[mcp.servers.{}.permissions]\n",
+                    toml_bare_or_quoted_key(name)
+                ));
+                output.push_str(&format!("default = {}\n", toml_string(default.as_str())));
+            }
+            for rule in &server.permissions.rules {
+                output.push('\n');
+                output.push_str(&format!(
+                    "[[mcp.servers.{}.permissions.rules]]\n",
+                    toml_bare_or_quoted_key(name)
+                ));
+                let target = rule
+                    .target
+                    .strip_prefix(&format!("{name}/"))
+                    .unwrap_or(&rule.target);
+                output.push_str(&format!("target = {}\n", toml_string(target)));
+                output.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
+                output.push_str(&format!("source = {}\n", toml_string(rule.source.as_str())));
+                if let Some(reason) = &rule.reason {
+                    output.push_str(&format!("reason = {}\n", toml_string(reason)));
+                }
             }
             output.push('\n');
         }
@@ -1545,6 +1596,7 @@ pub struct PermissionSettings {
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
+    pub mcp: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
     pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
@@ -1560,6 +1612,7 @@ impl PermissionSettings {
                 "shell",
                 "ignored_search",
                 "web",
+                "mcp",
                 "shell_classifier",
                 "shell_sandbox",
                 "rules",
@@ -1578,6 +1631,7 @@ impl PermissionSettings {
                 &field(path, "ignored_search"),
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
+            mcp: permission_value(table, "mcp", source, &field(path, "mcp"))?,
             shell_classifier: bool_value(
                 table,
                 "shell_classifier",
@@ -1599,6 +1653,7 @@ impl PermissionSettings {
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
+        replace_if_some(&mut self.mcp, next.mcp);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
         merge_option(
             &mut self.shell_sandbox,
@@ -1945,6 +2000,10 @@ pub enum PermissionScope {
     Shell,
     IgnoredSearch,
     Web,
+    /// External MCP tools. Treated as its own scope so the shell sandbox
+    /// gating (network policy, plan-mode shell denial) does not accidentally
+    /// extend to MCP calls without explicit opt-in.
+    Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1954,6 +2013,7 @@ pub struct PermissionPolicy {
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
+    pub mcp: PermissionMode,
     pub shell_classifier: bool,
     pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
@@ -1991,6 +2051,10 @@ impl PermissionPolicy {
                 var("SQUEEZY_WEB_PERMISSION"),
                 settings.web.unwrap_or(PermissionMode::Ask),
             ),
+            mcp: parse_permission(
+                var("SQUEEZY_MCP_PERMISSION"),
+                settings.mcp.unwrap_or(PermissionMode::Ask),
+            ),
             shell_classifier: parse_bool(
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
@@ -2007,6 +2071,7 @@ impl PermissionPolicy {
             PermissionScope::Shell => self.shell,
             PermissionScope::IgnoredSearch => self.ignored_search,
             PermissionScope::Web => self.web,
+            PermissionScope::Mcp => self.mcp,
         }
     }
 
@@ -2114,6 +2179,7 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
+            mcp: PermissionMode::Ask,
             shell_classifier: false,
             shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
@@ -2154,7 +2220,7 @@ fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionSc
         PermissionCapability::Edit => PermissionScope::Edit,
         PermissionCapability::Shell => PermissionScope::Shell,
         PermissionCapability::Network => PermissionScope::Web,
-        PermissionCapability::Mcp => PermissionScope::Shell,
+        PermissionCapability::Mcp => PermissionScope::Mcp,
         PermissionCapability::Git => PermissionScope::Shell,
         PermissionCapability::Compiler => PermissionScope::Shell,
         PermissionCapability::Destructive => PermissionScope::Shell,
@@ -3042,6 +3108,7 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
@@ -3095,6 +3162,15 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
+
+# [mcp.servers.docs]
+# enabled = true
+# transport = "stdio"       # stdio | http | sse
+# command = "docs-mcp"
+# args = []
+#
+# [mcp.servers.docs.permissions]
+# default = "ask"
 "#
 }
 
@@ -3127,6 +3203,7 @@ pub fn project_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 #
 # [[permissions.rules]]
 # capability = "compiler"
@@ -3134,8 +3211,8 @@ pub fn project_settings_template() -> &'static str {
 # action = "allow"
 # source = "project"
 
-# `[graph]` controls workspace indexing. `[mcp.servers.*]` is parsed and
-# round-trips through `squeezy config inspect` but is still a v0 reservation.
+# `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
+# external MCP tools that are discovered before each agent turn.
 
 # [graph]
 # languages = ["rust", "python"]
@@ -3155,6 +3232,15 @@ pub fn project_settings_template() -> &'static str {
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"   # compact | verbose
+
+# [mcp.servers.docs]
+# enabled = true
+# transport = "stdio"       # stdio | http | sse
+# command = "docs-mcp"
+# args = []
+#
+# [mcp.servers.docs.permissions]
+# default = "ask"
 "#
 }
 
@@ -3230,6 +3316,7 @@ impl McpSettings {
             result.insert(
                 name.clone(),
                 McpServerConfig::from_table(
+                    name,
                     server_table,
                     source,
                     &field(&field(path, "servers"), name),
@@ -3275,10 +3362,16 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
     pub env: BTreeMap<String, String>,
+    pub permissions: McpPermissionConfig,
 }
 
 impl McpServerConfig {
-    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+    fn from_table(
+        name: &str,
+        table: &toml::value::Table,
+        source: &str,
+        path: &str,
+    ) -> Result<Self> {
         reject_unknown_keys(
             table,
             &[
@@ -3289,6 +3382,7 @@ impl McpServerConfig {
                 "url",
                 "timeout_ms",
                 "env",
+                "permissions",
             ],
             source,
             path,
@@ -3296,6 +3390,12 @@ impl McpServerConfig {
         let transport = mcp_transport_value(table, "transport", source, &field(path, "transport"))?
             .unwrap_or(McpTransport::Stdio);
         let env = string_map_value(table, "env", source, &field(path, "env"))?.unwrap_or_default();
+        let permissions = optional_table(table, "permissions", source)?
+            .map(|table| {
+                McpPermissionConfig::from_table(name, table, source, &field(path, "permissions"))
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?.unwrap_or(true),
             transport,
@@ -3305,6 +3405,7 @@ impl McpServerConfig {
             url: string_value(table, "url", source, &field(path, "url"))?,
             timeout_ms: u64_value(table, "timeout_ms", source, &field(path, "timeout_ms"))?,
             env,
+            permissions,
         })
     }
 
@@ -3320,7 +3421,63 @@ impl McpServerConfig {
         if !next.env.is_empty() {
             self.env.extend(next.env);
         }
+        self.permissions.merge(next.permissions);
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpPermissionConfig {
+    pub default: Option<PermissionMode>,
+    #[serde(default, skip)]
+    pub default_source: Option<PermissionRuleSource>,
+    pub rules: Vec<PermissionRule>,
+}
+
+impl McpPermissionConfig {
+    fn from_table(
+        server_name: &str,
+        table: &toml::value::Table,
+        source: &str,
+        path: &str,
+    ) -> Result<Self> {
+        reject_unknown_keys(table, &["default", "rules"], source, path)?;
+        let default = permission_value(table, "default", source, &field(path, "default"))?;
+        let default_source = default.map(|_| default_permission_rule_source(source));
+        let rules = mcp_permission_rules_value(server_name, table, source, &field(path, "rules"))?;
+        Ok(Self {
+            default,
+            default_source,
+            rules,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        if next.default.is_some() {
+            self.default = next.default;
+            self.default_source = next.default_source;
+        }
+        self.rules.extend(next.rules);
+    }
+}
+
+fn mcp_permission_rules(servers: &BTreeMap<String, McpServerConfig>) -> Vec<PermissionRule> {
+    let mut rules = Vec::new();
+    for (server_name, server) in servers {
+        if let Some(default) = server.permissions.default {
+            rules.push(PermissionRule::new(
+                "mcp",
+                format!("{server_name}/*"),
+                default,
+                server
+                    .permissions
+                    .default_source
+                    .unwrap_or(PermissionRuleSource::Project),
+                Some(format!("default MCP policy for server {server_name}")),
+            ));
+        }
+        rules.extend(server.permissions.rules.clone());
+    }
+    rules
 }
 
 fn providers_settings(
@@ -3608,6 +3765,68 @@ fn permission_rules_value(
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
             Ok(PermissionRule::new(
                 capability,
+                target,
+                action,
+                source_value,
+                reason,
+            ))
+        })
+        .collect()
+}
+
+fn mcp_permission_rules_value(
+    server_name: &str,
+    table: &toml::value::Table,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PermissionRule>> {
+    let Some(value) = table.get("rules") else {
+        return Ok(Vec::new());
+    };
+    let rules = value
+        .as_array()
+        .ok_or_else(|| type_error(source, path, "array of tables"))?;
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let rule_path = format!("{path}[{index}]");
+            let table = value
+                .as_table()
+                .ok_or_else(|| type_error(source, &rule_path, "table"))?;
+            reject_unknown_keys(
+                table,
+                &["target", "action", "source", "reason"],
+                source,
+                &rule_path,
+            )?;
+            let target =
+                required_string_value(table, "target", source, &field(&rule_path, "target"))?;
+            let target = if target.starts_with(&format!("{server_name}/")) {
+                target
+            } else {
+                format!("{server_name}/{target}")
+            };
+            let action = permission_value(table, "action", source, &field(&rule_path, "action"))?
+                .ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "{source}: {} missing required permission action",
+                        field(&rule_path, "action")
+                    ))
+                })?;
+            if action == PermissionAction::Allow && target_is_effectively_wildcard(&target) {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: refuse to load Allow rule with bare wildcard target {target:?}; \
+                     narrow the target to a specific MCP server/tool"
+                )));
+            }
+            let source_value = string_value(table, "source", source, &field(&rule_path, "source"))?
+                .as_deref()
+                .and_then(PermissionRuleSource::parse)
+                .unwrap_or_else(|| default_permission_rule_source(source));
+            let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
+            Ok(PermissionRule::new(
+                "mcp",
                 target,
                 action,
                 source_value,
@@ -4509,7 +4728,222 @@ pub enum SqueezyError {
 
 pub type Result<T> = std::result::Result<T, SqueezyError>;
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStateStatus {
+    #[default]
+    Running,
+    Blocked,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TaskStateStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStepStatus {
+    #[default]
+    Pending,
+    Active,
+    Completed,
+    Blocked,
+    Skipped,
+}
+
+impl TaskStepStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskVerificationState {
+    #[default]
+    NotStarted,
+    Running,
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TaskVerificationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Running => "running",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStateStep {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: TaskStepStatus,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStateSnapshot {
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub status: TaskStateStatus,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<TaskStateStep>,
+    #[serde(default)]
+    pub blocker: Option<String>,
+    #[serde(default)]
+    pub next_action: Option<String>,
+    #[serde(default)]
+    pub verification: TaskVerificationState,
+    #[serde(default)]
+    pub recent_changes: Vec<String>,
+    #[serde(default)]
+    pub replan_reason: Option<String>,
+}
+
+impl TaskStateSnapshot {
+    pub fn starting(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            status: TaskStateStatus::Running,
+            steps: vec![TaskStateStep {
+                title: "Start turn".to_string(),
+                status: TaskStepStatus::Active,
+                detail: Some("Preparing the first model request".to_string()),
+            }],
+            next_action: Some("wait for agent task-state update".to_string()),
+            ..Self::default()
+        }
+        .normalized()
+    }
+
+    pub fn terminal_from(
+        latest: Option<&Self>,
+        fallback_task: impl Into<String>,
+        status: TaskStateStatus,
+        summary: Option<String>,
+    ) -> Self {
+        let mut snapshot = latest
+            .cloned()
+            .unwrap_or_else(|| Self::starting(fallback_task));
+        snapshot.status = status;
+        snapshot.summary = summary.or(snapshot.summary);
+        if matches!(
+            status,
+            TaskStateStatus::Completed | TaskStateStatus::Cancelled | TaskStateStatus::Failed
+        ) {
+            snapshot.next_action = None;
+        }
+        snapshot.normalized()
+    }
+
+    pub fn active_step_title(&self) -> Option<&str> {
+        self.steps
+            .iter()
+            .find(|step| {
+                matches!(
+                    step.status,
+                    TaskStepStatus::Active | TaskStepStatus::Blocked
+                )
+            })
+            .map(|step| step.title.as_str())
+    }
+
+    pub fn compact_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.task.is_empty() {
+            parts.push(self.task.clone());
+        }
+        parts.push(format!("status={}", self.status.as_str()));
+        if let Some(step) = self.active_step_title()
+            && !step.is_empty()
+        {
+            parts.push(format!("active={step}"));
+        }
+        if let Some(blocker) = &self.blocker {
+            parts.push(format!("blocker={blocker}"));
+        }
+        if let Some(next_action) = &self.next_action {
+            parts.push(format!("next={next_action}"));
+        }
+        parts.push(format!("verification={}", self.verification.as_str()));
+        parts.join(" | ")
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.task = normalize_task_text(self.task, 500);
+        self.summary = normalize_optional_task_text(self.summary, 500);
+        self.blocker = normalize_optional_task_text(self.blocker, 500);
+        self.next_action = normalize_optional_task_text(self.next_action, 500);
+        self.replan_reason = normalize_optional_task_text(self.replan_reason, 500);
+        self.steps = self
+            .steps
+            .into_iter()
+            .take(20)
+            .map(|mut step| {
+                step.title = normalize_task_text(step.title, 200);
+                step.detail = normalize_optional_task_text(step.detail, 300);
+                step
+            })
+            .collect();
+        self.recent_changes = self
+            .recent_changes
+            .into_iter()
+            .filter_map(|change| normalize_optional_task_text(Some(change), 300))
+            .take(20)
+            .collect();
+        if self.blocker.is_some() && self.status == TaskStateStatus::Running {
+            self.status = TaskStateStatus::Blocked;
+        }
+        self
+    }
+}
+
+fn normalize_optional_task_text(value: Option<String>, limit: usize) -> Option<String> {
+    value.and_then(|text| {
+        let text = normalize_task_text(text, limit);
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+fn normalize_task_text(text: String, limit: usize) -> String {
+    let mut output = text.trim().replace('\n', " ");
+    if output.chars().count() > limit {
+        output = output.chars().take(limit.saturating_sub(3)).collect();
+        output.push_str("...");
+    }
+    output
+}
+
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use update_task_state at turn start, before and after meaningful step transitions, when blocked, before verification, after verification, and whenever new evidence changes the plan. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

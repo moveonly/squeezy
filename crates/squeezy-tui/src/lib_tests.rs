@@ -8,6 +8,7 @@ use ratatui::backend::TestBackend;
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, Role, SessionMode, StatusVerbosity,
+    TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
     TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
@@ -496,6 +497,85 @@ fn render_uses_two_line_status_footer() {
     assert!(output.contains("Ctrl-Y copy"), "{output}");
 }
 
+#[test]
+fn task_panel_renders_progress_blocker_next_action_and_verification() {
+    let mut app = test_app(SessionMode::Build);
+    app.task_state = Some(sample_task_state());
+
+    let output = render_to_string(&app, 120, 24);
+    assert!(output.contains("Task"), "{output}");
+    assert!(output.contains("Implement task UX"), "{output}");
+    assert!(output.contains("[completed] Inspect TUI"), "{output}");
+    assert!(output.contains("[active] Wire task panel"), "{output}");
+    assert!(output.contains("Blocker: approval pending"), "{output}");
+    assert!(output.contains("Next: run focused tests"), "{output}");
+    assert!(output.contains("Verification: running"), "{output}");
+    assert!(
+        output.contains("Replan: status footer is too compact"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_p_collapses_and_expands_task_panel() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.task_state = Some(sample_task_state());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("collapse task panel");
+    assert!(app.task_panel_collapsed);
+    let collapsed = render_to_string(&app, 120, 16);
+    assert!(collapsed.contains("Task (collapsed)"), "{collapsed}");
+    assert!(collapsed.contains("active=Wire task panel"), "{collapsed}");
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("expand task panel");
+    assert!(!app.task_panel_collapsed);
+}
+
+#[tokio::test]
+async fn esc_cancels_active_turn_but_quits_when_idle() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    app.turn_rx = Some(rx);
+    app.cancel = Some(cancel.clone());
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("active esc");
+    assert!(!quit);
+    assert!(cancel.is_cancelled());
+    assert_eq!(app.status, "cancelling");
+
+    app.turn_rx = None;
+    app.cancel = None;
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("idle esc");
+    assert!(quit);
+}
+
 #[tokio::test]
 async fn ctrl_y_copies_last_assistant_message() {
     let mut agent = test_agent(SessionMode::Build);
@@ -806,6 +886,31 @@ fn test_config_with_root(mode: SessionMode, root: PathBuf) -> AppConfig {
     AppConfig {
         workspace_root: root,
         ..test_config(mode)
+    }
+}
+
+fn sample_task_state() -> TaskStateSnapshot {
+    TaskStateSnapshot {
+        task: "Implement task UX".to_string(),
+        status: TaskStateStatus::Blocked,
+        summary: Some("Task panel is live".to_string()),
+        steps: vec![
+            TaskStateStep {
+                title: "Inspect TUI".to_string(),
+                status: TaskStepStatus::Completed,
+                detail: None,
+            },
+            TaskStateStep {
+                title: "Wire task panel".to_string(),
+                status: TaskStepStatus::Active,
+                detail: Some("render workflow state".to_string()),
+            },
+        ],
+        blocker: Some("approval pending".to_string()),
+        next_action: Some("run focused tests".to_string()),
+        verification: TaskVerificationState::Running,
+        recent_changes: vec!["added state model".to_string()],
+        replan_reason: Some("status footer is too compact".to_string()),
     }
 }
 

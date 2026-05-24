@@ -130,16 +130,25 @@ async fn plan_mode_advertises_only_read_only_tools() {
     assert_eq!(
         tool_names,
         vec![
+            "update_task_state",
             "checkpoint_list",
             "checkpoint_show",
+            "decl_search",
+            "definition_search",
             "diff_context",
+            "downstream_flow",
             "glob",
             "grep",
+            "hierarchy",
             "list_skills",
             "load_skill",
             "read_file",
+            "read_slice",
             "read_tool_output",
+            "reference_search",
+            "repo_map",
             "symbol_context",
+            "upstream_flow",
         ]
     );
 

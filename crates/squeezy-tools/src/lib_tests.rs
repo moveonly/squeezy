@@ -2692,21 +2692,389 @@ fn tool_specs_are_sorted_by_name() {
             "checkpoint_revert",
             "checkpoint_show",
             "checkpoint_undo",
+            "decl_search",
+            "definition_search",
             "diff_context",
+            "downstream_flow",
             "glob",
             "grep",
+            "hierarchy",
             "list_skills",
             "load_skill",
             "read_file",
+            "read_slice",
             "read_tool_output",
+            "reference_search",
+            "repo_map",
             "shell",
             "symbol_context",
+            "upstream_flow",
             "verify",
             "webfetch",
             "websearch",
             "write_file"
         ]
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn graph_navigation_tools_answer_architecture_calls_and_exact_slices() {
+    let root = temp_workspace("graph_navigation_tools");
+    write_rust_crate(
+        &root,
+        r#"
+pub mod service {
+    pub struct Runner;
+
+    impl Runner {
+        pub fn run(&self) {
+            helper();
+        }
+    }
+
+    pub fn helper() {}
+}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let repo_map = registry
+        .execute(
+            ToolCall {
+                call_id: "repo_map".to_string(),
+                name: "repo_map".to_string(),
+                arguments: json!({"max_depth": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(repo_map.status, ToolStatus::Success);
+    assert!(repo_map.content["graph_available"].as_bool().unwrap());
+    assert!(
+        repo_map.content["packets"]
+            .as_array()
+            .expect("repo_map packets")
+            .iter()
+            .any(|packet| packet.to_string().contains("src/lib.rs"))
+    );
+
+    let decl = registry
+        .execute(
+            ToolCall {
+                call_id: "decl".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "run", "kind": "method"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(decl.status, ToolStatus::Success);
+    let packet = &decl.content["packets"][0];
+    assert_uniform_evidence_packet(packet);
+    let run_id = packet["symbol"]["id"].as_str().expect("symbol id");
+
+    let read = registry
+        .execute(
+            ToolCall {
+                call_id: "read".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({"symbol_id": run_id, "span_kind": "body"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(read.status, ToolStatus::Success);
+    assert!(
+        read.content["content"]
+            .as_str()
+            .unwrap()
+            .contains("helper();")
+    );
+    assert_uniform_evidence_packet(&read.content["packets"][0]);
+
+    let upstream = registry
+        .execute(
+            ToolCall {
+                call_id: "upstream".to_string(),
+                name: "upstream_flow".to_string(),
+                arguments: json!({"query": "helper", "kind": "function"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(upstream.status, ToolStatus::Success);
+    assert!(
+        upstream.content["packets"]
+            .as_array()
+            .expect("upstream packets")
+            .iter()
+            .any(|packet| packet["claim"].as_str().unwrap_or("").contains("run"))
+    );
+
+    let hierarchy = registry
+        .execute(
+            ToolCall {
+                call_id: "hierarchy".to_string(),
+                name: "hierarchy".to_string(),
+                arguments: json!({"query": "service", "kind": "module", "max_depth": 3}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(hierarchy.status, ToolStatus::Success);
+    assert!(
+        hierarchy.content["hierarchy"]
+            .to_string()
+            .contains("Runner")
+    );
+
+    let context = registry
+        .execute(
+            ToolCall {
+                call_id: "context".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "Runner"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(context.status, ToolStatus::Success);
+    assert_uniform_evidence_packet(&context.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn graph_navigation_tools_return_unsupported_language_fallback() {
+    let root = temp_workspace("graph_unsupported_fallback");
+    write_rust_crate(&root, "pub fn marker() {}\n");
+    fs::write(root.join("notes.foo"), "needle\n").expect("write unsupported");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "unsupported".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "needle", "path": "notes.foo"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["fallback"]["status"].as_str(),
+        Some("unsupported_language")
+    );
+    assert_eq!(
+        result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
+        Some("grep")
+    );
+    assert!(result.content["packets"].as_array().unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn definition_search_reference_search_and_downstream_flow_resolve_targets() {
+    let root = temp_workspace("graph_definition_reference_downstream");
+    write_rust_crate(
+        &root,
+        r#"
+pub mod service {
+    pub fn entry() {
+        crate::pipeline::stage_one();
+    }
+}
+
+pub mod pipeline {
+    pub fn stage_one() {
+        stage_two();
+    }
+
+    pub fn stage_two() {
+        complete();
+    }
+
+    pub fn complete() {}
+}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let definition = registry
+        .execute(
+            ToolCall {
+                call_id: "definition".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "stage_one"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(definition.status, ToolStatus::Success);
+    let first_definition = &definition.content["packets"][0];
+    assert_uniform_evidence_packet(first_definition);
+    let stage_one_id = first_definition["symbol"]["id"]
+        .as_str()
+        .expect("definition packet carries a symbol id")
+        .to_string();
+    assert_eq!(
+        first_definition["next_action"]["tool"].as_str(),
+        Some("read_slice"),
+        "definition_search must point at read_slice for the exact declaration"
+    );
+
+    let reference_by_text = registry
+        .execute(
+            ToolCall {
+                call_id: "reference_text".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"text": "stage_one"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(reference_by_text.status, ToolStatus::Success);
+    let text_packets = reference_by_text.content["packets"]
+        .as_array()
+        .expect("reference_search packets");
+    assert!(
+        text_packets
+            .iter()
+            .any(|packet| packet["reference"]["text"].as_str() == Some("stage_one")),
+        "text-mode reference_search must surface lexical hits, got {text_packets:?}"
+    );
+
+    let reference_by_symbol = registry
+        .execute(
+            ToolCall {
+                call_id: "reference_symbol".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"symbol_id": stage_one_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(reference_by_symbol.status, ToolStatus::Success);
+    let symbol_packets = reference_by_symbol.content["packets"]
+        .as_array()
+        .expect("reference_search packets");
+    assert!(
+        !symbol_packets.is_empty(),
+        "symbol-bound reference_search must return at least one reference for stage_one"
+    );
+    for packet in symbol_packets {
+        assert_uniform_evidence_packet(packet);
+    }
+
+    let downstream_bfs = registry
+        .execute(
+            ToolCall {
+                call_id: "downstream_bfs".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({"query": "stage_one", "max_depth": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream_bfs.status, ToolStatus::Success);
+    let bfs_packets = downstream_bfs.content["packets"]
+        .as_array()
+        .expect("downstream_flow packets");
+    let depths = bfs_packets
+        .iter()
+        .filter_map(|packet| packet["depth"].as_u64())
+        .collect::<Vec<_>>();
+    assert!(
+        depths.contains(&1) && depths.contains(&2),
+        "BFS at max_depth=2 must surface both depth 1 (stage_one→stage_two) and depth 2 (stage_two→complete), got depths {depths:?}"
+    );
+
+    let entry_definition = registry
+        .execute(
+            ToolCall {
+                call_id: "entry_def".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "entry"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let entry_id = entry_definition.content["packets"][0]["symbol"]["id"]
+        .as_str()
+        .expect("entry symbol id")
+        .to_string();
+
+    let downstream_chain = registry
+        .execute(
+            ToolCall {
+                call_id: "downstream_chain".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({
+                    "symbol_id": entry_id,
+                    "target_query": "complete",
+                    "max_depth": 5,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream_chain.status, ToolStatus::Success);
+    let chain_packets = downstream_chain.content["packets"]
+        .as_array()
+        .expect("downstream_flow chain packets");
+    assert!(
+        chain_packets.iter().any(|packet| packet["claim"]
+            .as_str()
+            .unwrap_or("")
+            .contains("call chain found")),
+        "downstream_flow with target_query must emit a call_chain packet, got {chain_packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn upstream_flow_truncates_when_callers_exceed_max_results() {
+    let root = temp_workspace("graph_upstream_truncation");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn target() {}
+
+pub fn caller_a() { target(); }
+pub fn caller_b() { target(); }
+pub fn caller_c() { target(); }
+pub fn caller_d() { target(); }
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let upstream = registry
+        .execute(
+            ToolCall {
+                call_id: "upstream_truncated".to_string(),
+                name: "upstream_flow".to_string(),
+                arguments: json!({"query": "target", "kind": "function", "max_results": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(upstream.status, ToolStatus::Success);
+    assert_eq!(
+        upstream.content["truncated"].as_bool(),
+        Some(true),
+        "upstream_flow must report truncated=true when callers exceed max_results"
+    );
+    assert_eq!(
+        upstream.content["packets"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert!(upstream.cost_hint.truncated);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2772,6 +3140,23 @@ fn match_paths(result: &ToolResult) -> Vec<String> {
         .iter()
         .map(|value| value["path"].as_str().expect("path").to_string())
         .collect()
+}
+
+fn assert_uniform_evidence_packet(packet: &Value) {
+    for key in [
+        "claim",
+        "spans",
+        "confidence",
+        "freshness",
+        "provenance",
+        "cost_hint",
+        "next_action",
+    ] {
+        assert!(
+            packet.get(key).is_some(),
+            "missing evidence key {key}: {packet}"
+        );
+    }
 }
 
 fn temp_workspace(name: &str) -> PathBuf {

@@ -1,5 +1,5 @@
 [package]
-name = "squeezy-cli"
+name = "squeezy-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,21 +7,13 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "squeezy"
-path = "src/main.rs"
-
 [dependencies]
-clap.workspace = true
 futures-util.workspace = true
+rmcp.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 squeezy-core.workspace = true
-squeezy-llm.workspace = true
-squeezy-store.workspace = true
-squeezy-telemetry.workspace = true
-squeezy-tui.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-toml_edit.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+thiserror.workspace = true

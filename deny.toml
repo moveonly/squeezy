@@ -42,7 +42,13 @@ allow = []
 deny = [
     { crate = "indexmap:>=2.14", reason = "Pulls in hashbrown 0.17 which duplicates the 0.16 pinned by ratatui-core; remove when ratatui-core upgrades hashbrown." },
 ]
-skip = []
+skip = [
+    # rmcp 1.7 requires reqwest 0.13 for its Streamable HTTP transport;
+    # the rest of the workspace pins reqwest 0.12. The two versions coexist
+    # cleanly (no symbol conflicts, separate feature sets). Revisit when
+    # either rmcp downgrades its reqwest dep or we upgrade the workspace.
+    { crate = "reqwest:0.13.3", reason = "rmcp 1.7 streamable-http transport requires reqwest 0.13; workspace on 0.12" },
+]
 skip-tree = []
 
 [sources]

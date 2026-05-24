@@ -6,6 +6,7 @@ members = [
     "crates/squeezy-graph",
     "crates/squeezy-harness",
     "crates/squeezy-llm",
+    "crates/squeezy-mcp",
     "crates/squeezy-parse",
     "crates/squeezy-rank",
     "crates/squeezy-skills",
@@ -39,6 +40,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 regex = "1"
 redb = "4.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rmcp = { version = "1.7", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -46,6 +48,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
 toml = "0.5.11"
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.25"
@@ -65,6 +68,7 @@ squeezy-core = { path = "crates/squeezy-core" }
 squeezy-graph = { path = "crates/squeezy-graph" }
 squeezy-harness = { path = "crates/squeezy-harness" }
 squeezy-llm = { path = "crates/squeezy-llm" }
+squeezy-mcp = { path = "crates/squeezy-mcp" }
 squeezy-parse = { path = "crates/squeezy-parse" }
 squeezy-skills = { path = "crates/squeezy-skills" }
 squeezy-store = { path = "crates/squeezy-store" }

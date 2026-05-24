@@ -32,6 +32,9 @@ which layers actually contributed to a given run.
 squeezy config inspect
 squeezy config init --user
 squeezy config init --project
+squeezy mcp list
+squeezy mcp add docs --project --transport stdio --command docs-mcp
+squeezy mcp disable docs --project
 squeezy --health
 squeezy --mode plan
 ```
@@ -104,6 +107,15 @@ commented examples so that built-in defaults can evolve over time:
 
 # [redaction]
 # custom_patterns = []
+
+# [mcp.servers.docs]
+# enabled = true
+# transport = "stdio"
+# command = "docs-mcp"
+# args = []
+#
+# [mcp.servers.docs.permissions]
+# default = "ask"
 ```
 
 ## Example Project Settings
@@ -196,6 +208,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   - `workspace:*` for ordinary read/search rules.
   - `ignored:*` for read/search rules that include git-ignored files.
   - `tool:<name>` as a catch-all for tools that do not specify their own scope.
+  - `<mcp-server>/<tool-name>` for external MCP tools.
   - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
     `rm:*`). `*` itself is treated as a wildcard segment in any position.
   - `shell:<cmd-prefix>:*` for shell commands classified as network attempts
@@ -230,6 +243,31 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   rules last, returning the most recently added matching rule. Permission
   decisions are emitted on the `squeezy::permissions` tracing target with the
   capability, target, risk, action, matched-rule source, and reason fields.
+- `[mcp.servers.<name>]`: external MCP server configuration. `transport` is
+  `stdio`, `http` (Streamable HTTP), or `sse` (legacy-compatible remote
+  stream handling). `stdio` servers use `command`, optional `args`, and
+  optional `env`; remote servers use `url`. `enabled = false` keeps the
+  server configured without discovering or advertising its tools. MCP tools
+  are discovered once per agent turn — concurrently across servers and
+  reusing a long-lived session per server — and advertised as
+  `mcp__<server>__<tool>`; calls are routed back to the raw server/tool name.
+  A transient discovery failure preserves the prior turn's cached entries
+  for that server so a flaky server does not vanish mid-session. Tool
+  results are always treated as untrusted external bytes and flow through
+  ordinary redaction, spill previews, receipts, and result budgets.
+- `[mcp.servers.<name>.permissions]`: per-server MCP permission defaults.
+  `default = "allow" | "ask" | "deny"` expands to an ordinary `mcp` rule with
+  target `<name>/*`. `[[mcp.servers.<name>.permissions.rules]]` accepts
+  `target`, `action`, optional `source`, and optional `reason`; targets are
+  server-qualified automatically, so `target = "query:*"` matches
+  `<name>/query:*`. MCP-derived rules are layered *before* any explicit
+  `[[permissions.rules]]` in the resolved rule list, so a user-pinned
+  `[[permissions.rules]]` deny remains the last word over a server's own
+  default. Session rules created from the TUI approval prompt still layer
+  on top of file rules.
+- The `mcp` permission scope has its own default (`mcp = "ask"`) in
+  `[permissions]` so MCP tool execution does not inherit the shell-sandbox
+  policy. Override via TOML or `SQUEEZY_MCP_PERMISSION`.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.
@@ -258,16 +296,6 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   provider/model, mode, repo, permissions, telemetry, activity, and spend.
   `status_verbosity = "verbose"` adds config sources, token/cache counters,
   tool bytes, receipt hits, budget denials, and redaction counts.
-
-### Parse-only (v0)
-
-The following sections are accepted, validated, and surfaced by
-`config inspect`, but no runtime consumer reads them yet. They are
-reserved so that you can start writing configuration today and have it
-keep working when wiring lands:
-
-- `[mcp.servers.<name>]`: `enabled`, `transport`, `command`, `args`,
-  `url`, `timeout_ms`, and `env`.
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.
