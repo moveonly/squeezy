@@ -26,7 +26,7 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
     capabilities_for, estimate_cost, estimate_request_context, fetch_ollama_context_window,
 };
-use squeezy_skills::{HelpAnswer, SqueezyHelp};
+use squeezy_skills::{HelpAnswer, SqueezyHelp, matches_squeezy_help_input};
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
@@ -1414,23 +1414,28 @@ impl Agent {
             {
                 return;
             }
-            if let Some(answer) =
-                SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
+            // Cheap pre-check first so unrelated coding turns do not pay for a
+            // full `inspect_redacted()` rendering on every turn.
+            if matches_squeezy_help_input(&task_title)
+                && let Some(answer) =
+                    SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
             {
                 complete_squeezy_help_turn(
                     turn_id,
                     task_title,
                     answer,
-                    tx.clone(),
-                    redactor.clone(),
-                    session_log.clone(),
-                    conversation_state.clone(),
-                    session_metrics.clone(),
-                    telemetry.clone(),
-                    config.clone(),
-                    task_state.clone(),
                     redacted_input.redactions,
-                    session_mode.clone(),
+                    HelpTurnDeps {
+                        tx: tx.clone(),
+                        redactor: redactor.clone(),
+                        session_log: session_log.clone(),
+                        conversation_state: conversation_state.clone(),
+                        session_metrics: session_metrics.clone(),
+                        telemetry: telemetry.clone(),
+                        config: config.clone(),
+                        task_state: task_state.clone(),
+                        session_mode: session_mode.clone(),
+                    },
                 )
                 .await;
                 return;
@@ -1513,10 +1518,7 @@ impl Agent {
     }
 }
 
-async fn complete_squeezy_help_turn(
-    turn_id: TurnId,
-    task_title: String,
-    answer: HelpAnswer,
+struct HelpTurnDeps {
     tx: mpsc::Sender<AgentEvent>,
     redactor: Arc<Redactor>,
     session_log: Option<SessionHandle>,
@@ -1525,9 +1527,27 @@ async fn complete_squeezy_help_turn(
     telemetry: TelemetryClient,
     config: AppConfig,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
-    seed_redactions: u64,
     session_mode: Arc<AtomicU8>,
+}
+
+async fn complete_squeezy_help_turn(
+    turn_id: TurnId,
+    task_title: String,
+    answer: HelpAnswer,
+    seed_redactions: u64,
+    deps: HelpTurnDeps,
 ) {
+    let HelpTurnDeps {
+        tx,
+        redactor,
+        session_log,
+        conversation_state,
+        session_metrics,
+        telemetry,
+        config,
+        task_state,
+        session_mode,
+    } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
     let rendered = redactor.redact(&answer.render_markdown());
@@ -1584,7 +1604,9 @@ async fn complete_squeezy_help_turn(
         state
             .conversation
             .push(LlmInputItem::AssistantText(message.content.clone()));
-        state.previous_response_id = None;
+        // Help turns never call the provider, so any prior response-chain id
+        // (e.g. OpenAI Responses) stays valid for the next real turn. Leaving
+        // it untouched avoids forcing the following turn to resend full history.
         state.transcript.push(user_transcript);
         state.transcript.push(message.clone());
         merge_cost(&mut state.cost, &cost);

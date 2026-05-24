@@ -339,6 +339,161 @@ fn squeezy_help_ignores_unrelated_questions() {
 }
 
 #[test]
+fn squeezy_help_ignores_implementation_and_debugging_requests() {
+    let help = SqueezyHelp::new("");
+    let cases = [
+        "How do I implement a new provider in Squeezy?",
+        "refactor the squeezy graph crate",
+        "debug squeezy cache eviction",
+        "Add a new MCP server config to Squeezy",
+        "Can you fix the squeezy --health crash?",
+        "Please write a new squeezy skill for me",
+    ];
+    for input in cases {
+        assert!(
+            help.answer_for_input(input).is_none(),
+            "intercept must not capture implementation request: {input}"
+        );
+        assert!(
+            !help::matches_squeezy_help_input(input),
+            "matches_squeezy_help_input must agree: {input}"
+        );
+    }
+}
+
+#[test]
+fn matches_squeezy_help_input_agrees_with_answer_for_input() {
+    let help = SqueezyHelp::new("");
+    let positives = [
+        "/help",
+        "/help providers",
+        "How do I configure Squeezy providers?",
+        "Does Squeezy support quantum billing?",
+    ];
+    for input in positives {
+        assert!(
+            help::matches_squeezy_help_input(input),
+            "matches_squeezy_help_input should accept: {input}"
+        );
+        assert!(
+            help.answer_for_input(input).is_some(),
+            "answer_for_input should accept: {input}"
+        );
+    }
+    let negatives = ["How do I configure serde?", "build a new tool"];
+    for input in negatives {
+        assert!(
+            !help::matches_squeezy_help_input(input),
+            "matches_squeezy_help_input should reject: {input}"
+        );
+        assert!(
+            help.answer_for_input(input).is_none(),
+            "answer_for_input should reject: {input}"
+        );
+    }
+}
+
+#[test]
+fn squeezy_help_alias_routes_to_providers_topic() {
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_for_input("/help model").expect("alias answer");
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert_eq!(answer.topic, "providers");
+}
+
+#[test]
+fn extract_config_sections_wildcard_does_not_match_unrelated_prefix() {
+    let inspect = r#"[providers.openai]
+api_key_env = "<redacted>"
+
+[providers.anthropic]
+api_key_env = "<redacted>"
+
+[providers_extra]
+note = "should not be selected by providers.* wildcard"
+"#;
+    let help = SqueezyHelp::new(inspect);
+    let answer = help.answer_topic("providers");
+
+    assert!(
+        answer
+            .config_sections
+            .iter()
+            .any(|name| name == "providers.openai"),
+        "expected providers.openai, got {:?}",
+        answer.config_sections
+    );
+    assert!(
+        answer
+            .config_sections
+            .iter()
+            .any(|name| name == "providers.anthropic"),
+        "expected providers.anthropic, got {:?}",
+        answer.config_sections
+    );
+    assert!(
+        answer
+            .config_sections
+            .iter()
+            .all(|name| name != "providers_extra"),
+        "providers.* must not match providers_extra: {:?}",
+        answer.config_sections
+    );
+    let rendered = answer.render_markdown();
+    assert!(
+        !rendered.contains("[providers_extra]"),
+        "rendered output should not include providers_extra: {rendered}"
+    );
+}
+
+#[test]
+fn extract_config_sections_skips_array_of_tables_headers() {
+    // `[[providers.openai]]` must not be parsed as a section name; otherwise
+    // the array-of-tables body could leak into help answers untouched by the
+    // wildcard filter.
+    let inspect = r#"[[providers.openai]]
+api_key_env = "<redacted>"
+secret = "sk-should-not-leak"
+
+[providers.anthropic]
+api_key_env = "<redacted>"
+"#;
+    let help = SqueezyHelp::new(inspect);
+    let answer = help.answer_topic("providers");
+
+    assert!(
+        answer
+            .config_sections
+            .iter()
+            .all(|name| name != "providers.openai"),
+        "array-of-tables header must not register as providers.openai: {:?}",
+        answer.config_sections
+    );
+    let rendered = answer.render_markdown();
+    assert!(
+        !rendered.contains("sk-should-not-leak"),
+        "array-of-tables body must not leak into rendered help: {rendered}"
+    );
+}
+
+#[test]
+fn bundled_doc_paths_exist_on_disk() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    for path in help::bundled_doc_paths() {
+        let full = workspace_root.join(path);
+        assert!(
+            full.is_file(),
+            "bundled doc {path} should exist at {}",
+            full.display()
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = help::bundled_doc_paths()
         .into_iter()

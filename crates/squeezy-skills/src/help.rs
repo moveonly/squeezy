@@ -2,7 +2,11 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+/// Public documentation site, surfaced in help bodies and refusal text. Keep stable;
+/// renames change user-visible output.
 pub const SQUEEZY_WEBSITE_URL: &str = "https://squeezyagent.com/docs/";
+/// Public repository URL, surfaced in help bodies and refusal text. Keep stable;
+/// renames change user-visible output.
 pub const SQUEEZY_REPO_URL: &str = "https://github.com/esqueezy/squeezy";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,58 +423,28 @@ const TOPICS: &[TopicDefinition] = &[
     },
 ];
 
-const DOCS: &[(&str, &str)] = &[
-    ("README.md", include_str!("../../../README.md")),
-    (
-        "docs/CHECKPOINTS.md",
-        include_str!("../../../docs/CHECKPOINTS.md"),
-    ),
-    (
-        "docs/CONFIGURATION.md",
-        include_str!("../../../docs/CONFIGURATION.md"),
-    ),
-    (
-        "docs/FEEDBACK.md",
-        include_str!("../../../docs/FEEDBACK.md"),
-    ),
-    (
-        "docs/LANGUAGES.md",
-        include_str!("../../../docs/LANGUAGES.md"),
-    ),
-    (
-        "docs/PLATFORMS.md",
-        include_str!("../../../docs/PLATFORMS.md"),
-    ),
-    (
-        "docs/PROVIDERS.md",
-        include_str!("../../../docs/PROVIDERS.md"),
-    ),
-    (
-        "docs/REPO_PROFILE.md",
-        include_str!("../../../docs/REPO_PROFILE.md"),
-    ),
-    ("docs/README.md", include_str!("../../../docs/README.md")),
-    (
-        "docs/SEMANTIC_GRAPH.md",
-        include_str!("../../../docs/SEMANTIC_GRAPH.md"),
-    ),
-    (
-        "docs/SESSIONS.md",
-        include_str!("../../../docs/SESSIONS.md"),
-    ),
-    (
-        "docs/SHELL_SANDBOXING.md",
-        include_str!("../../../docs/SHELL_SANDBOXING.md"),
-    ),
-    ("docs/SKILLS.md", include_str!("../../../docs/SKILLS.md")),
-    (
-        "docs/TELEMETRY.md",
-        include_str!("../../../docs/TELEMETRY.md"),
-    ),
-    (
-        "docs/tool-call-saving-strategy.md",
-        include_str!("../../../docs/tool-call-saving-strategy.md"),
-    ),
+// Documentation paths cited in help answers. These are intentionally *not*
+// embedded into the binary via `include_str!`; the topic bodies use curated
+// `summary` strings and the renderer only emits the path as a citation, so
+// shipping the full corpus would add ~95 KB of unused bytes per CLI build.
+// Presence of each file is verified by a unit test in `lib_tests.rs` so a
+// renamed or deleted doc still fails CI.
+const BUNDLED_DOC_PATHS: &[&str] = &[
+    "README.md",
+    "docs/CHECKPOINTS.md",
+    "docs/CONFIGURATION.md",
+    "docs/FEEDBACK.md",
+    "docs/LANGUAGES.md",
+    "docs/PLATFORMS.md",
+    "docs/PROVIDERS.md",
+    "docs/REPO_PROFILE.md",
+    "docs/README.md",
+    "docs/SEMANTIC_GRAPH.md",
+    "docs/SESSIONS.md",
+    "docs/SHELL_SANDBOXING.md",
+    "docs/SKILLS.md",
+    "docs/TELEMETRY.md",
+    "docs/tool-call-saving-strategy.md",
 ];
 
 fn parse_help_command(input: &str) -> Option<&str> {
@@ -485,6 +459,9 @@ fn parse_help_command(input: &str) -> Option<&str> {
 }
 
 fn looks_like_squeezy_help_question(input: &str) -> bool {
+    // `raw` keeps slashes and dashes so we can match the slash-command markers
+    // (`/help`, `/plan`, `--health`, ...) verbatim. `lowered` strips them via
+    // `normalize` so the natural-language checks work on plain word tokens.
     let raw = input.trim().to_ascii_lowercase();
     let lowered = normalize(input);
     if lowered.is_empty() {
@@ -508,6 +485,12 @@ fn looks_like_squeezy_help_question(input: &str) -> bool {
     if !product_marker {
         return false;
     }
+    // Implementation/debugging requests that happen to mention "squeezy" are
+    // coding work, not product-help questions. Bail out so the model handles them
+    // instead of returning a canned topic summary.
+    if contains_implementation_verb(&lowered) {
+        return false;
+    }
     lowered.ends_with('?')
         || starts_with_any(
             &lowered,
@@ -528,6 +511,54 @@ fn looks_like_squeezy_help_question(input: &str) -> bool {
                 "explain",
             ],
         )
+}
+
+fn contains_implementation_verb(lowered: &str) -> bool {
+    // Word forms (already lower-cased; `normalize` collapsed `-` and `_` to spaces).
+    // Kept as exact word matches so common nouns like `address`, `addition`, or
+    // `fixture` do not accidentally trip the gate.
+    const VERB_WORDS: &[&str] = &[
+        "implement",
+        "implements",
+        "implementing",
+        "implementation",
+        "refactor",
+        "refactors",
+        "refactoring",
+        "refactored",
+        "debug",
+        "debugs",
+        "debugging",
+        "debugged",
+        "port",
+        "porting",
+        "ported",
+        "add",
+        "adds",
+        "adding",
+        "added",
+        "fix",
+        "fixes",
+        "fixing",
+        "fixed",
+        "write",
+        "writes",
+        "writing",
+        "wrote",
+        "written",
+        "create",
+        "creates",
+        "creating",
+        "created",
+        "modify",
+        "modifies",
+        "modifying",
+        "modified",
+    ];
+    lowered.split_whitespace().any(|word| {
+        let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        VERB_WORDS.contains(&trimmed)
+    })
 }
 
 fn find_topic(input: &str) -> Option<&'static TopicDefinition> {
@@ -567,15 +598,18 @@ fn extract_config_sections(config_inspect: &str, wanted: &[&str]) -> Vec<ConfigS
     if wanted.is_empty() {
         return Vec::new();
     }
-    let wanted = wanted.iter().copied().collect::<Vec<_>>();
     let parsed = parse_config_sections(config_inspect);
     let mut seen = BTreeSet::new();
     let mut sections = Vec::new();
     for pattern in wanted {
         if let Some(prefix) = pattern.strip_suffix(".*") {
+            // Require a dot separator so `providers.*` matches `[providers.openai]`
+            // but not `[providers_extra]` or `[providersanything]`. The parent
+            // section name itself (`[providers]`) is also accepted.
+            let dotted = format!("{prefix}.");
             for section in parsed
                 .iter()
-                .filter(|section| section.name.starts_with(prefix))
+                .filter(|section| section.name == prefix || section.name.starts_with(&dotted))
             {
                 if seen.insert(section.name.clone()) {
                     sections.push(section.clone());
@@ -583,7 +617,7 @@ fn extract_config_sections(config_inspect: &str, wanted: &[&str]) -> Vec<ConfigS
             }
             continue;
         }
-        for section in parsed.iter().filter(|section| section.name == pattern) {
+        for section in parsed.iter().filter(|section| section.name == *pattern) {
             if seen.insert(section.name.clone()) {
                 sections.push(section.clone());
             }
@@ -597,14 +631,14 @@ fn parse_config_sections(config_inspect: &str) -> Vec<ConfigSection> {
     let mut current_name: Option<String> = None;
     let mut current = String::new();
     for line in config_inspect.lines() {
-        if let Some(name) = parse_section_header(line) {
-            if let Some(previous) = current_name.replace(name.to_string()) {
-                sections.push(ConfigSection {
-                    name: previous,
-                    content: current.trim_end().to_string(),
-                });
-                current.clear();
-            }
+        if let Some(name) = parse_section_header(line)
+            && let Some(previous) = current_name.replace(name.to_string())
+        {
+            sections.push(ConfigSection {
+                name: previous,
+                content: current.trim_end().to_string(),
+            });
+            current.clear();
         }
         if current_name.is_some() {
             current.push_str(line);
@@ -621,6 +655,11 @@ fn parse_config_sections(config_inspect: &str) -> Vec<ConfigSection> {
 }
 
 fn parse_section_header(line: &str) -> Option<&str> {
+    // Only recognises bare `[section.name]` headers as emitted by
+    // `inspect_redacted`. Array-of-tables headers (`[[...]]`) are rejected so
+    // their contents are skipped, and quoted keys like `["foo bar"]` are not
+    // handled here because `inspect_redacted` never emits them today; future
+    // config additions that introduce quoted keys must extend this parser.
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
     if inner.starts_with('[') || inner.ends_with(']') {
@@ -648,5 +687,14 @@ fn starts_with_any(haystack: &str, prefixes: &[&str]) -> bool {
 }
 
 pub fn bundled_doc_paths() -> Vec<&'static str> {
-    DOCS.iter().map(|(path, _)| *path).collect()
+    BUNDLED_DOC_PATHS.to_vec()
+}
+
+/// Cheap predicate that returns true when [`SqueezyHelp::answer_for_input`] would
+/// produce an answer for `input`. Lets callers (e.g. the agent) skip the cost of
+/// rendering a redacted config snapshot on turns where the help intercept does
+/// not apply.
+pub fn matches_squeezy_help_input(input: &str) -> bool {
+    let trimmed = input.trim();
+    parse_help_command(trimmed).is_some() || looks_like_squeezy_help_question(trimmed)
 }

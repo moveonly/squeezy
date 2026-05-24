@@ -12,7 +12,7 @@ use tracing::warn;
 
 pub mod help;
 
-pub use help::{HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp};
+pub use help::{HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input};
 
 const SKILL_FILE: &str = "SKILL.md";
 const PROJECT_SKILLS_DIR: &str = ".squeezy/skills";
