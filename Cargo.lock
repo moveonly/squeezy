@@ -2010,6 +2010,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-util",
+ "serde_json",
+ "squeezy-core",
+ "squeezy-llm",
+ "squeezy-store",
+ "squeezy-telemetry",
+ "squeezy-tui",
+ "tokio",
+ "tokio-util",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "squeezy-agent"
 version = "0.1.0"
 dependencies = [
@@ -2024,25 +2043,6 @@ dependencies = [
  "squeezy-tools",
  "tokio",
  "tokio-util",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "squeezy-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "futures-util",
- "serde_json",
- "squeezy-core",
- "squeezy-llm",
- "squeezy-store",
- "squeezy-telemetry",
- "squeezy-tui",
- "tokio",
- "tokio-util",
- "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]

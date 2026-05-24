@@ -451,6 +451,30 @@ const TOPICS: &[TopicDefinition] = &[
         config: &["web", "mcp.servers.*"],
     },
     TopicDefinition {
+        id: "install",
+        title: "installation, first run, upgrades, and uninstall",
+        aliases: &[
+            "install",
+            "installation",
+            "brew",
+            "homebrew",
+            "cargo install",
+            "github release",
+            "release archive",
+            "first run",
+            "uninstall",
+            "upgrade",
+        ],
+        summary: "Squeezy can be installed from the `esqueezy/tap` Homebrew tap, with `cargo install squeezy --locked`, or from GitHub release archives for macOS and Linux. Run `squeezy --health` after install, initialize user settings with `squeezy config init --user`, and remove the binary plus optional `~/.squeezy` state when uninstalling.",
+        docs: &[
+            "docs/external/INSTALL.md",
+            "docs/external/PLATFORMS.md",
+            "docs/external/PROVIDERS.md",
+            "docs/external/CONFIGURATION.md",
+        ],
+        config: &["model", "providers.*", "session"],
+    },
+    TopicDefinition {
         id: "health",
         title: "health checks, platforms, and startup mode",
         aliases: &[
@@ -484,76 +508,7 @@ pub struct BundledDoc {
 // The in-product help corpus is intentionally the external docs directory only.
 // Internal implementation, benchmark, and deployment notes stay out of normal
 // user help so answers remain user-focused.
-const BUNDLED_DOCS: &[BundledDoc] = &[
-    BundledDoc {
-        path: "docs/external/README.md",
-        content: include_str!("../../../docs/external/README.md"),
-    },
-    BundledDoc {
-        path: "docs/external/AGENT_APPROACH.md",
-        content: include_str!("../../../docs/external/AGENT_APPROACH.md"),
-    },
-    BundledDoc {
-        path: "docs/external/CHECKPOINTS.md",
-        content: include_str!("../../../docs/external/CHECKPOINTS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/CONFIGURATION.md",
-        content: include_str!("../../../docs/external/CONFIGURATION.md"),
-    },
-    BundledDoc {
-        path: "docs/external/FEEDBACK.md",
-        content: include_str!("../../../docs/external/FEEDBACK.md"),
-    },
-    BundledDoc {
-        path: "docs/external/LANGUAGES.md",
-        content: include_str!("../../../docs/external/LANGUAGES.md"),
-    },
-    BundledDoc {
-        path: "docs/external/MCP_AND_WEB.md",
-        content: include_str!("../../../docs/external/MCP_AND_WEB.md"),
-    },
-    BundledDoc {
-        path: "docs/external/PLATFORMS.md",
-        content: include_str!("../../../docs/external/PLATFORMS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/PROVIDERS.md",
-        content: include_str!("../../../docs/external/PROVIDERS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/REPO_PROFILE.md",
-        content: include_str!("../../../docs/external/REPO_PROFILE.md"),
-    },
-    BundledDoc {
-        path: "docs/external/SESSIONS.md",
-        content: include_str!("../../../docs/external/SESSIONS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/SHELL_SANDBOXING.md",
-        content: include_str!("../../../docs/external/SHELL_SANDBOXING.md"),
-    },
-    BundledDoc {
-        path: "docs/external/SKILLS.md",
-        content: include_str!("../../../docs/external/SKILLS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/TELEMETRY.md",
-        content: include_str!("../../../docs/external/TELEMETRY.md"),
-    },
-    BundledDoc {
-        path: "docs/external/TOOLS.md",
-        content: include_str!("../../../docs/external/TOOLS.md"),
-    },
-    BundledDoc {
-        path: "docs/external/TROUBLESHOOTING.md",
-        content: include_str!("../../../docs/external/TROUBLESHOOTING.md"),
-    },
-    BundledDoc {
-        path: "docs/external/tool-call-saving-strategy.md",
-        content: include_str!("../../../docs/external/tool-call-saving-strategy.md"),
-    },
-];
+include!(concat!(env!("OUT_DIR"), "/bundled_docs.rs"));
 
 fn parse_help_command(input: &str) -> Option<&str> {
     let rest = input.strip_prefix("/help")?;

@@ -6,6 +6,25 @@ Squeezy parses repositories and builds a persistent local semantic graph. The ag
 
 > **Status:** early development. The foundation TUI scaffold is runnable, provider/model selection is registry-backed, OpenAI, Anthropic, Gemini, Azure OpenAI, and Ollama adapters are available, deterministic validation harness tasks run in CI, and graph-backed navigation tools expose compact evidence packets. User docs live in [`docs/external/`](docs/external) and contributor docs live in [`docs/internal/`](docs/internal).
 
+## Install
+
+On macOS, install with Homebrew:
+
+```sh
+brew install esqueezy/tap/squeezy
+squeezy --health
+```
+
+Rust users can install with Cargo:
+
+```sh
+cargo install squeezy --locked
+```
+
+Tagged releases also publish macOS Intel, macOS Apple Silicon, and Linux
+x86_64 musl archives. Full install, first-run, upgrade, and uninstall
+instructions are in [`docs/external/INSTALL.md`](docs/external/INSTALL.md).
+
 ## Cost
 
 Every model token is a budgeted resource.

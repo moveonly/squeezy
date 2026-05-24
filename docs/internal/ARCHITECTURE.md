@@ -7,8 +7,9 @@ tree-sitter and Squeezy's own semantic graph rather than LSP or
 
 ## Crate Boundaries
 
-- `squeezy-cli`: command-line entrypoint, config initialization/inspection,
-  provider startup, repo/session/feedback/MCP subcommands, and health checks.
+- `squeezy` (`crates/squeezy-cli/`): command-line entrypoint, config
+  initialization/inspection, provider startup, repo/session/feedback/MCP
+  subcommands, and health checks.
 - `squeezy-tui`: terminal UI, slash commands, approval prompts, status lines,
   local command handlers, and transcript rendering.
 - `squeezy-agent`: turn orchestration, mode gating, help interception, lazy tool

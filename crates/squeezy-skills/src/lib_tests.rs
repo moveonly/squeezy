@@ -557,6 +557,34 @@ fn bundled_docs_are_complete_external_corpus() {
 }
 
 #[test]
+fn packaged_help_docs_match_external_docs() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let packaged_root = manifest_dir.join("bundled-docs/external");
+
+    for path in help::bundled_doc_paths() {
+        let relative = path
+            .strip_prefix("docs/external/")
+            .expect("external doc path");
+        let canonical = workspace_root.join(path);
+        let packaged = packaged_root.join(relative);
+        assert!(
+            packaged.is_file(),
+            "packaged help doc should exist: {}",
+            packaged.display()
+        );
+        assert_eq!(
+            fs::read(&packaged).expect("read packaged doc"),
+            fs::read(&canonical).expect("read canonical doc"),
+            "packaged help doc should match canonical docs/external copy: {relative}"
+        );
+    }
+}
+
+#[test]
 fn squeezy_help_doc_citations_are_bundled_paths() {
     let bundled = help::bundled_doc_paths()
         .into_iter()
@@ -574,6 +602,7 @@ fn squeezy_help_doc_citations_are_bundled_paths() {
         "checkpoints",
         "cost",
         "mcp-web",
+        "install",
         "health",
     ];
     let help = SqueezyHelp::new("");

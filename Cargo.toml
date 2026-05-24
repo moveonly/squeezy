@@ -23,9 +23,14 @@ resolver = "3"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93.1"
+description = "Cost-aware coding agent TUI with local semantic code navigation"
 license = "Apache-2.0"
-repository = "https://github.com/opensqueezy/squeezy"
-publish = false
+repository = "https://github.com/esqueezy/squeezy"
+homepage = "https://github.com/esqueezy/squeezy"
+readme = "README.md"
+keywords = ["coding-agent", "tui", "semantic-search", "llm"]
+categories = ["command-line-utilities", "development-tools"]
+publish = true
 
 [workspace.dependencies]
 async-stream = "0.3"
@@ -63,20 +68,20 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 
-squeezy-agent = { path = "crates/squeezy-agent" }
-squeezy-core = { path = "crates/squeezy-core" }
-squeezy-graph = { path = "crates/squeezy-graph" }
-squeezy-harness = { path = "crates/squeezy-harness" }
-squeezy-llm = { path = "crates/squeezy-llm" }
-squeezy-mcp = { path = "crates/squeezy-mcp" }
-squeezy-parse = { path = "crates/squeezy-parse" }
-squeezy-skills = { path = "crates/squeezy-skills" }
-squeezy-store = { path = "crates/squeezy-store" }
-squeezy-telemetry = { path = "crates/squeezy-telemetry" }
-squeezy-tools = { path = "crates/squeezy-tools" }
-squeezy-tui = { path = "crates/squeezy-tui" }
-squeezy-vcs = { path = "crates/squeezy-vcs" }
-squeezy-workspace = { path = "crates/squeezy-workspace" }
+squeezy-agent = { path = "crates/squeezy-agent", version = "=0.1.0" }
+squeezy-core = { path = "crates/squeezy-core", version = "=0.1.0" }
+squeezy-graph = { path = "crates/squeezy-graph", version = "=0.1.0" }
+squeezy-harness = { path = "crates/squeezy-harness", version = "=0.1.0" }
+squeezy-llm = { path = "crates/squeezy-llm", version = "=0.1.0" }
+squeezy-mcp = { path = "crates/squeezy-mcp", version = "=0.1.0" }
+squeezy-parse = { path = "crates/squeezy-parse", version = "=0.1.0" }
+squeezy-skills = { path = "crates/squeezy-skills", version = "=0.1.0" }
+squeezy-store = { path = "crates/squeezy-store", version = "=0.1.0" }
+squeezy-telemetry = { path = "crates/squeezy-telemetry", version = "=0.1.0" }
+squeezy-tools = { path = "crates/squeezy-tools", version = "=0.1.0" }
+squeezy-tui = { path = "crates/squeezy-tui", version = "=0.1.0" }
+squeezy-vcs = { path = "crates/squeezy-vcs", version = "=0.1.0" }
+squeezy-workspace = { path = "crates/squeezy-workspace", version = "=0.1.0" }
 
 [profile.release]
 opt-level = 3
