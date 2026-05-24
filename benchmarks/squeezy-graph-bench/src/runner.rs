@@ -113,7 +113,15 @@ fn run_corpus(args: crate::cli::CorpusArgs) -> Result<()> {
         cases: outcomes,
     };
     fs::create_dir_all(&args.report_dir)?;
-    let summary_path = args.report_dir.join("corpus-summary.json");
+    // Write the corpus summary one directory above the per-report tree so it
+    // is not picked up by the summarize.py glob (target/.../**/*.json).
+    let summary_dir = args
+        .report_dir
+        .parent()
+        .unwrap_or(&args.report_dir)
+        .to_path_buf();
+    fs::create_dir_all(&summary_dir)?;
+    let summary_path = summary_dir.join("corpus-summary.json");
     let summary_text = serde_json::to_string_pretty(&summary)
         .map_err(|err| SqueezyError::Graph(format!("failed to serialize corpus summary: {err}")))?;
     fs::write(&summary_path, summary_text)?;
