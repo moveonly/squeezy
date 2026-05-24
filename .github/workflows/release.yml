@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to release.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  build-assets:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: squeezy-x86_64-apple-darwin.tar.gz
+            binary-path: target/x86_64-apple-darwin/release/squeezy
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: squeezy-aarch64-apple-darwin.tar.gz
+            binary-path: target/aarch64-apple-darwin/release/squeezy
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            archive: squeezy-x86_64-unknown-linux-musl.tar.gz
+            binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+
+    steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?$ ]]; then
+            echo "release tag must match vMAJOR.MINOR.PATCH[-PRERELEASE]: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Ensure Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install Linux release tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools file binutils
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check dependency policy
+        uses: EmbarkStudios/cargo-deny-action@091bd13faf7e96935df105635d17ce9a607bc99d # v2
+        with:
+          rust-version: "1.93.1"
+          command: check
+          arguments: --all-features
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+          fi
+
+          cargo build --release -p squeezy-cli --target "${{ matrix.target }}"
+
+      - name: Smoke-test release binary
+        shell: bash
+        run: |
+          binary="${{ matrix.binary-path }}"
+
+          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
+            file "$binary"
+            if readelf -l "$binary" | grep -q INTERP; then
+              echo "Linux release binary has a dynamic program interpreter" >&2
+              exit 1
+            fi
+
+            if readelf -d "$binary" 2>/dev/null | grep -q NEEDED; then
+              echo "Linux release binary has dynamic library dependencies" >&2
+              exit 1
+            fi
+          fi
+
+          "$binary" --health
+          "$binary" --version
+          "$binary" --help >/dev/null
+
+      - name: Package release archive
+        shell: bash
+        run: |
+          mkdir -p dist/package
+          cp "${{ matrix.binary-path }}" dist/package/squeezy
+          chmod +x dist/package/squeezy
+          tar -C dist/package -czf "dist/${{ matrix.archive }}" squeezy
+          shasum -a 256 "dist/${{ matrix.archive }}" > "dist/${{ matrix.archive }}.sha256"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build-assets
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          path: release-assets
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          mapfile -t assets < <(find release-assets -type f | sort)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "no release assets found" >&2
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" "${assets[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes

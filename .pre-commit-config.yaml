@@ -29,3 +29,15 @@ repos:
         entry: actionlint
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
+
+      # Runs the docs typo lint whenever any file under README.md, CONTRIBUTING.md,
+      # docs/, or .github/ is staged. `pass_filenames: false` keeps `typos`
+      # scanning the full set of doc paths (not just the staged subset) so
+      # cross-file usages are still checked; `files:` keeps the hook idle on
+      # pure code-only commits.
+      - id: typos-docs
+        name: Docs text lint
+        entry: typos README.md CONTRIBUTING.md docs .github
+        language: system
+        pass_filenames: false
+        files: ^(README\.md|CONTRIBUTING\.md|docs/|\.github/)

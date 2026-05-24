@@ -15,8 +15,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   dependency-policy:
@@ -80,7 +85,7 @@ jobs:
 
       - name: Install CI tools
         if: matrix.platform == 'macos'
-        run: brew install actionlint
+        run: brew install actionlint typos-cli
 
       - name: Check secrets
         if: matrix.platform == 'macos'
@@ -94,26 +99,65 @@ jobs:
         if: matrix.platform == 'macos'
         run: actionlint
 
+      - name: Check docs text
+        if: matrix.platform == 'macos'
+        run: typos README.md CONTRIBUTING.md docs .github
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Check unit test layout
         run: python3 scripts/check_test_layout.py
 
-      - name: Lint, test, harness, and build debug artifact
+      - name: Lint Rust
         shell: bash
         run: |
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
             cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D warnings
-            cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
-            cargo run -p squeezy-harness --target x86_64-unknown-linux-musl -- run --jsonl "target/harness-${{ matrix.platform }}.jsonl"
-            cargo build -p squeezy-cli --target x86_64-unknown-linux-musl
           else
             cargo clippy --workspace --all-targets -- -D warnings
+          fi
+
+      - name: Test Rust
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo test --workspace --all-targets --target x86_64-unknown-linux-musl
+          else
             cargo test --workspace --all-targets
-            cargo run -p squeezy-harness -- run --jsonl "target/harness-${{ matrix.platform }}.jsonl"
+          fi
+
+      - name: Run deterministic validation harness
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo run -p squeezy-harness --target x86_64-unknown-linux-musl -- run \
+              --runner mock-openai \
+              --runner mock-anthropic \
+              --runner grep-baseline \
+              --jsonl "target/harness-${{ matrix.platform }}.jsonl"
+          else
+            cargo run -p squeezy-harness -- run \
+              --runner mock-openai \
+              --runner mock-anthropic \
+              --runner grep-baseline \
+              --jsonl "target/harness-${{ matrix.platform }}.jsonl"
+          fi
+
+      - name: Build debug artifact
+        shell: bash
+        run: |
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+            cargo build -p squeezy-cli --target x86_64-unknown-linux-musl
+          else
             cargo build -p squeezy-cli
           fi
 
