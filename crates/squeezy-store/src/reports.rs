@@ -201,6 +201,7 @@ impl SessionStore {
                     .resume_state
                     .as_ref()
                     .and_then(|state| state.previous_response_id.clone()),
+                "tape": record.replay,
             }),
         )?;
 

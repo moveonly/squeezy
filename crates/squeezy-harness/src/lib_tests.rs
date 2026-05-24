@@ -1,4 +1,5 @@
 use super::*;
+use squeezy_core::SessionLogConfig;
 use squeezy_llm::{LlmInputItem, LlmToolCall};
 
 #[test]
@@ -96,6 +97,7 @@ fn baseline_paths_skips_ignored_directories() {
             contains: vec!["src/lib.rs".to_string()],
         },
         mock: None,
+        replay: None,
         baseline: Some(BaselineSpec {
             pattern: "needle".to_string(),
             include: vec!["*.rs".to_string()],
@@ -151,6 +153,7 @@ async fn mock_runner_records_non_zero_prompt_bytes() {
             }),
             anthropic: None,
         }),
+        replay: None,
         baseline: None,
     };
 
@@ -205,6 +208,7 @@ async fn mock_runner_uses_trace_events_and_scores_correctness() {
             }),
             anthropic: None,
         }),
+        replay: None,
         baseline: None,
     };
 
@@ -213,6 +217,80 @@ async fn mock_runner_uses_trace_events_and_scores_correctness() {
     assert_eq!(result.status, TaskStatus::Passed);
     assert_eq!(result.metrics.input_tokens, Some(3));
     assert_eq!(result.metrics.output_tokens, Some(1));
+}
+
+#[tokio::test]
+async fn replay_runner_uses_recorded_session_tape() {
+    let root = std::env::temp_dir().join(format!("squeezy-harness-replay-{}", unique_suffix()));
+    fs::create_dir_all(&root).expect("create root");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let provider = Arc::new(ScriptedProvider::new(
+        "mock-openai",
+        vec![
+            TraceEvent {
+                kind: TraceEventKind::Started,
+                text: None,
+                response_id: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+            },
+            TraceEvent {
+                kind: TraceEventKind::TextDelta,
+                text: Some("fixture answer".to_string()),
+                response_id: None,
+                input_tokens: None,
+                output_tokens: None,
+                cached_input_tokens: None,
+            },
+            trace_completed(Some("resp_fixture".to_string()), CostSnapshot::default()),
+        ],
+    ));
+    let agent = Agent::new(config.clone(), provider);
+    let mut rx = agent.start_turn("answer from fixture".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+    let session_id = agent.session_id().expect("session id");
+    let tape = agent
+        .show_session(&session_id)
+        .expect("show session")
+        .replay
+        .expect("replay tape");
+
+    let tasks_dir = root.join("tasks");
+    fs::create_dir_all(&tasks_dir).expect("create tasks dir");
+    fs::write(
+        tasks_dir.join("trace.json"),
+        serde_json::to_vec_pretty(&tape).expect("serialize tape"),
+    )
+    .expect("write trace");
+    let task = TaskSpec {
+        id: "replay-fixture".to_string(),
+        title: "Replay fixture".to_string(),
+        prompt: "answer from fixture".to_string(),
+        workspace: WorkspaceSpec { files: Vec::new() },
+        expect: ExpectSpec {
+            contains: vec!["fixture answer".to_string()],
+        },
+        mock: None,
+        replay: Some(ReplaySpec {
+            trace: "trace.json".to_string(),
+            provider: Some("mock-openai".to_string()),
+            model: Some(config.model),
+            mode: Some(SessionMode::Build),
+        }),
+        baseline: None,
+    };
+
+    let result = run_task_with_base(&task, RunnerKind::Replay, None, &tasks_dir).await;
+    assert_eq!(result.status, TaskStatus::Passed, "{result:?}");
+    assert_eq!(result.final_answer, "fixture answer");
 }
 
 #[tokio::test]
@@ -234,6 +312,7 @@ async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cos
             contains: vec![path.clone()],
         },
         mock: None,
+        replay: None,
         baseline: None,
     };
     let provider = Arc::new(ToolUsingProvider::new(marker, path.clone()));
@@ -277,6 +356,7 @@ async fn planner_probe_compares_enabled_and_disabled_runs() {
             contains: vec!["src/lib.rs".to_string()],
         },
         mock: None,
+        replay: None,
         baseline: Some(BaselineSpec {
             pattern: "make_widget".to_string(),
             include: vec!["*.rs".to_string()],

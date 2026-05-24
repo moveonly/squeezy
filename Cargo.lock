@@ -2015,6 +2015,7 @@ version = "0.1.0"
 dependencies = [
  "futures-core",
  "futures-util",
+ "serde",
  "serde_json",
  "squeezy-core",
  "squeezy-llm",
@@ -2034,6 +2035,7 @@ dependencies = [
  "clap",
  "futures-util",
  "serde_json",
+ "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
  "squeezy-store",
@@ -2081,6 +2083,7 @@ dependencies = [
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",
+ "squeezy-store",
  "tokio",
  "tokio-util",
  "toml",

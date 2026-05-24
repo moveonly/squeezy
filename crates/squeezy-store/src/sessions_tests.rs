@@ -185,6 +185,110 @@ fn malformed_event_lines_are_counted_as_warnings() {
 }
 
 #[test]
+fn replay_tape_round_trips_and_exports() {
+    let root = temp_root("replay-round-trip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::UserMessage,
+            Some("1".to_string()),
+            json!({"input": "find a bug"}),
+        ))
+        .expect("append user");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelCompleted,
+            Some("1".to_string()),
+            json!({"response_id": "resp_1", "cost": CostSnapshot::default()}),
+        ))
+        .expect("append completion");
+
+    let tape = store.replay_tape(handle.session_id()).expect("read replay");
+    assert_eq!(tape.schema_version, SESSION_REPLAY_SCHEMA_VERSION);
+    assert_eq!(tape.session_id, handle.session_id());
+    assert_eq!(tape.events.len(), 2);
+    assert_eq!(tape.events[0].sequence, 1);
+    assert_eq!(tape.events[1].sequence, 2);
+    assert_eq!(tape.warnings, 0);
+
+    let exported = store.export(handle.session_id()).expect("export");
+    assert_eq!(
+        exported["replay"]["events"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
+#[test]
+fn replay_tape_counts_tampered_lines_as_warnings() {
+    let root = temp_root("replay-tamper");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    fs::write(
+        store.root().join(handle.session_id()).join("replay.jsonl"),
+        br#"{"schema_version":1,"ts_unix_ms":1,"sequence":1,"kind":"user_message","turn_id":"1","payload_sha256":"bad","payload":{"input":"changed"}}"#,
+    )
+    .expect("write tampered replay");
+
+    let tape = store.replay_tape(handle.session_id()).expect("read replay");
+    assert!(tape.events.is_empty());
+    assert_eq!(tape.warnings, 1);
+}
+
+#[test]
+fn bug_report_redacts_replay_tape() {
+    let root = temp_root("bug-report-replay-redaction");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelTextDelta,
+            Some("1".to_string()),
+            json!({"text": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"}),
+        ))
+        .expect("append replay");
+
+    let bundle = store
+        .build_bug_report(
+            &config,
+            handle.session_id(),
+            BugReportOptions {
+                excluded_sections: BTreeSet::new(),
+                max_section_bytes: 4096,
+                max_archive_bytes: 2 * 1024 * 1024,
+            },
+        )
+        .expect("build report");
+    let archive = String::from_utf8_lossy(&bundle.archive_bytes);
+    assert!(archive.contains("replay.json"));
+    assert!(archive.contains("<redacted:"));
+    assert!(!archive.contains("abcdefghijklmnopqrstuvwxyz123456"));
+}
+
+#[test]
 fn bug_report_archive_redacts_events_and_records_exclusions() {
     let root = temp_root("bug-report-redaction");
     let config = AppConfig {

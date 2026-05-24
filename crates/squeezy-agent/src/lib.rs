@@ -2,14 +2,17 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
     path::PathBuf,
+    pin::Pin,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex as StdMutex, RwLock,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use futures_core::Stream;
 use futures_util::StreamExt;
+use serde::Serialize;
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
@@ -23,13 +26,15 @@ use squeezy_core::{
     detect_context_attachment_kind, escape_toml_basic_string,
 };
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
-    capabilities_for, estimate_cost, estimate_request_context, fetch_ollama_context_window,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolCall, LlmToolSpec,
+    RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context,
+    fetch_ollama_context_window,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
-    SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore, StoredReadSnapshot, StoredToolReceipt,
+    SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent, SessionReplayEventKind,
+    SessionReplayTape, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
+    StoredReadSnapshot, StoredToolReceipt,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -114,6 +119,249 @@ impl ConversationState {
             context_attachments: self.context_attachments.clone(),
             context_compaction: self.context_compaction.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionReplayReport {
+    pub session_id: String,
+    pub turns: usize,
+    pub events_replayed: usize,
+    pub request_count: usize,
+    pub tool_results: usize,
+    pub final_answer: String,
+}
+
+#[derive(Debug)]
+struct ReplayRuntime {
+    tape: SessionReplayTape,
+    cursor: StdMutex<usize>,
+    strict_requests: bool,
+}
+
+impl ReplayRuntime {
+    fn new(tape: SessionReplayTape, strict_requests: bool) -> Self {
+        Self {
+            tape,
+            cursor: StdMutex::new(0),
+            strict_requests,
+        }
+    }
+
+    fn model_events_for_request(
+        &self,
+        request: &LlmRequest,
+    ) -> Vec<squeezy_core::Result<LlmEvent>> {
+        match self.try_model_events_for_request(request) {
+            Ok(events) => events.into_iter().map(Ok).collect(),
+            Err(error) => vec![Err(error)],
+        }
+    }
+
+    fn try_model_events_for_request(
+        &self,
+        request: &LlmRequest,
+    ) -> squeezy_core::Result<Vec<LlmEvent>> {
+        let request_event = self.pop_expected(SessionReplayEventKind::ModelRequest)?;
+        let expected = request_event
+            .payload
+            .get("hash")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let actual = replay_hash(request);
+        if self.strict_requests && expected != actual {
+            return Err(SqueezyError::Agent(format!(
+                "replay model request diverged: expected {expected}, got {actual}"
+            )));
+        }
+
+        let mut events = Vec::new();
+        loop {
+            let event = self.pop_next_non_user()?;
+            match event.kind {
+                SessionReplayEventKind::ModelStarted => events.push(LlmEvent::Started),
+                SessionReplayEventKind::ModelTextDelta => events.push(LlmEvent::TextDelta(
+                    event
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                )),
+                SessionReplayEventKind::ModelToolCall => {
+                    let call = serde_json::from_value::<LlmToolCall>(
+                        event.payload.get("call").cloned().unwrap_or(Value::Null),
+                    )
+                    .map_err(|err| {
+                        SqueezyError::Agent(format!("invalid replay model tool call: {err}"))
+                    })?;
+                    events.push(LlmEvent::ToolCall(call));
+                }
+                SessionReplayEventKind::ModelCompleted => {
+                    let response_id = event
+                        .payload
+                        .get("response_id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    let cost = serde_json::from_value::<CostSnapshot>(
+                        event.payload.get("cost").cloned().unwrap_or(Value::Null),
+                    )
+                    .unwrap_or_default();
+                    events.push(LlmEvent::Completed { response_id, cost });
+                    return Ok(events);
+                }
+                SessionReplayEventKind::ModelCancelled => {
+                    events.push(LlmEvent::Cancelled);
+                    return Ok(events);
+                }
+                other => {
+                    return Err(SqueezyError::Agent(format!(
+                        "unexpected replay event while reading model stream: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn replay_tool_results(&self, calls: &[ToolCall]) -> squeezy_core::Result<Vec<ToolResult>> {
+        let mut results = Vec::with_capacity(calls.len());
+        for call in calls {
+            let call_event = self.pop_expected(SessionReplayEventKind::ToolCall)?;
+            let expected = call_event
+                .payload
+                .get("hash")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let actual = replay_hash(call);
+            if expected != actual {
+                return Err(SqueezyError::Agent(format!(
+                    "replay tool call diverged for {}: expected {expected}, got {actual}",
+                    call.call_id
+                )));
+            }
+
+            let result_event = self.pop_expected(SessionReplayEventKind::ToolResult)?;
+            let mut result = serde_json::from_value::<ToolResult>(
+                result_event
+                    .payload
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            )
+            .map_err(|err| SqueezyError::Agent(format!("invalid replay tool result: {err}")))?;
+            if result.call_id != call.call_id {
+                return Err(SqueezyError::Agent(format!(
+                    "replay tool result call_id diverged: expected {}, got {}",
+                    call.call_id, result.call_id
+                )));
+            }
+            if let Some(model_output) = result_event
+                .payload
+                .get("model_output")
+                .and_then(Value::as_str)
+            {
+                result = result.with_spill_model_output(model_output.to_string());
+            }
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    fn consumed(&self) -> usize {
+        *self.cursor.lock().expect("replay cursor")
+    }
+
+    fn finish(&self) -> squeezy_core::Result<()> {
+        let mut cursor = self.cursor.lock().expect("replay cursor");
+        while let Some(event) = self.tape.events.get(*cursor) {
+            if matches!(
+                event.kind,
+                SessionReplayEventKind::UserMessage | SessionReplayEventKind::CostDecision
+            ) {
+                *cursor += 1;
+                continue;
+            }
+            return Err(SqueezyError::Agent(format!(
+                "replay finished with unconsumed event {:?} at sequence {}",
+                event.kind, event.sequence
+            )));
+        }
+        Ok(())
+    }
+
+    fn request_count(&self) -> usize {
+        self.tape
+            .events
+            .iter()
+            .filter(|event| event.kind == SessionReplayEventKind::ModelRequest)
+            .count()
+    }
+
+    fn tool_result_count(&self) -> usize {
+        self.tape
+            .events
+            .iter()
+            .filter(|event| event.kind == SessionReplayEventKind::ToolResult)
+            .count()
+    }
+
+    fn pop_expected(
+        &self,
+        expected: SessionReplayEventKind,
+    ) -> squeezy_core::Result<SessionReplayEvent> {
+        let event = self.pop_next_non_user()?;
+        if event.kind == expected {
+            return Ok(event);
+        }
+        Err(SqueezyError::Agent(format!(
+            "unexpected replay event: expected {expected:?}, got {:?}",
+            event.kind
+        )))
+    }
+
+    fn pop_next_non_user(&self) -> squeezy_core::Result<SessionReplayEvent> {
+        let mut cursor = self.cursor.lock().expect("replay cursor");
+        while let Some(event) = self.tape.events.get(*cursor) {
+            *cursor += 1;
+            if !matches!(
+                event.kind,
+                SessionReplayEventKind::UserMessage | SessionReplayEventKind::CostDecision
+            ) {
+                return Ok(event.clone());
+            }
+        }
+        Err(SqueezyError::Agent(
+            "replay trace ended before the agent turn completed".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct ReplayProvider {
+    name: &'static str,
+    runtime: Arc<ReplayRuntime>,
+}
+
+impl ReplayProvider {
+    fn new(name: &'static str, runtime: Arc<ReplayRuntime>) -> Self {
+        Self { name, runtime }
+    }
+}
+
+impl LlmProvider for ReplayProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn stream_response(
+        &self,
+        request: LlmRequest,
+        _cancel: CancellationToken,
+    ) -> squeezy_llm::LlmStream {
+        let events = self.runtime.model_events_for_request(&request);
+        let stream: Pin<Box<dyn Stream<Item = squeezy_core::Result<LlmEvent>> + Send>> =
+            Box::pin(futures_util::stream::iter(events));
+        stream
     }
 }
 
@@ -563,12 +811,19 @@ pub struct Agent {
     session_mode: Arc<AtomicU8>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     store: Option<Arc<SqueezyStore>>,
+    replay: Option<Arc<ReplayRuntime>>,
 }
 
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
         let session_log = start_session_log(&config, provider.name());
-        Self::build(config, provider, session_log, ConversationState::default())
+        Self::build(
+            config,
+            provider,
+            session_log,
+            ConversationState::default(),
+            None,
+        )
     }
 
     pub fn resume(
@@ -587,7 +842,13 @@ impl Agent {
         let metadata = handle.metadata()?;
         let transcript = resume_state.transcript.clone();
         let conversation_state = ConversationState::from_resume(resume_state, &metadata);
-        let agent = Self::build(config, provider, Some(handle.clone()), conversation_state);
+        let agent = Self::build(
+            config,
+            provider,
+            Some(handle.clone()),
+            conversation_state,
+            None,
+        );
         let _ = handle.update_metadata(|metadata| {
             metadata.status = SessionStatus::Running;
             metadata.ended_at_ms = None;
@@ -602,11 +863,107 @@ impl Agent {
         Ok((agent, transcript))
     }
 
+    pub async fn replay_session(
+        mut config: AppConfig,
+        session_id: &str,
+    ) -> squeezy_core::Result<SessionReplayReport> {
+        let store = SessionStore::open(&config);
+        let record = store.show(session_id)?;
+        let tape = record.replay.clone().ok_or_else(|| {
+            SqueezyError::Agent(format!("session {session_id} has no replay tape"))
+        })?;
+        if tape.events.is_empty() {
+            return Err(SqueezyError::Agent(format!(
+                "session {session_id} has an empty replay tape"
+            )));
+        }
+        if tape.warnings > 0 {
+            return Err(SqueezyError::Agent(format!(
+                "session {session_id} replay tape has {} unreadable events",
+                tape.warnings
+            )));
+        }
+
+        let recorded_root = PathBuf::from(&record.metadata.workspace_root);
+        if recorded_root.exists() {
+            config.workspace_root = recorded_root;
+        }
+        Self::replay_tape(
+            config,
+            session_id,
+            tape,
+            &record.metadata.provider,
+            record.metadata.model,
+            record.metadata.mode,
+        )
+        .await
+    }
+
+    pub async fn replay_tape(
+        mut config: AppConfig,
+        session_id: impl Into<String>,
+        tape: SessionReplayTape,
+        provider_name: &str,
+        model: String,
+        mode: SessionMode,
+    ) -> squeezy_core::Result<SessionReplayReport> {
+        let session_id = session_id.into();
+        config.model = model;
+        config.session_mode = mode;
+        let user_inputs = replay_user_inputs(&tape);
+        if user_inputs.is_empty() {
+            return Err(SqueezyError::Agent(format!(
+                "session {session_id} replay tape has no user turns"
+            )));
+        }
+
+        let runtime = Arc::new(ReplayRuntime::new(tape, true));
+        let provider = Arc::new(ReplayProvider::new(
+            replay_provider_name(provider_name),
+            runtime.clone(),
+        ));
+        let agent = Self::build(
+            config,
+            provider,
+            None,
+            ConversationState::default(),
+            Some(runtime.clone()),
+        );
+
+        let mut final_answer = String::new();
+        for input in &user_inputs {
+            let mut rx = agent.start_turn(input.clone(), CancellationToken::new());
+            while let Some(event) = rx.recv().await {
+                match event {
+                    AgentEvent::AssistantDelta { delta, .. } => final_answer.push_str(&delta),
+                    AgentEvent::Completed { message, .. } => {
+                        if final_answer.is_empty() {
+                            final_answer = message.content;
+                        }
+                    }
+                    AgentEvent::Failed { error, .. } => return Err(error),
+                    _ => {}
+                }
+            }
+        }
+
+        runtime.finish()?;
+        Ok(SessionReplayReport {
+            session_id,
+            turns: user_inputs.len(),
+            events_replayed: runtime.consumed(),
+            request_count: runtime.request_count(),
+            tool_results: runtime.tool_result_count(),
+            final_answer,
+        })
+    }
+
     fn build(
         config: AppConfig,
         provider: Arc<dyn LlmProvider>,
         session_log: Option<SessionHandle>,
         conversation_state: ConversationState,
+        replay: Option<Arc<ReplayRuntime>>,
     ) -> Self {
         let output_config = ToolOutputConfig {
             spill_threshold_bytes: config.tool_spill_threshold_bytes,
@@ -688,6 +1045,7 @@ impl Agent {
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
+            replay,
         }
     }
 
@@ -1395,6 +1753,7 @@ impl Agent {
         let store = self.store.clone();
         let task_state = Arc::new(Mutex::new(None));
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
+        let replay = self.replay.clone();
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
@@ -1449,6 +1808,7 @@ impl Agent {
                 store,
                 task_state: task_state.clone(),
                 loaded_tool_schemas,
+                replay,
             }
             .run(task_title.clone())
             .await;
@@ -1515,6 +1875,7 @@ struct TurnRuntime {
     store: Option<Arc<SqueezyStore>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
+    replay: Option<Arc<ReplayRuntime>>,
 }
 
 fn request_response_verbosity(
@@ -1706,6 +2067,10 @@ impl TurnRuntime {
             user_item_summary(&user_item),
             json!({}),
         );
+        self.record_replay(
+            SessionReplayEventKind::UserMessage,
+            json!({ "input": input }),
+        );
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
 
@@ -1734,30 +2099,41 @@ impl TurnRuntime {
                 .cloned()
                 .map(|call| llm_function_call_item(call, &self.redactor))
                 .collect::<Vec<_>>();
-            let results = execute_tool_calls(
-                planned_calls,
-                ToolExecutionContext {
-                    turn_id: self.turn_id,
-                    provider: self.provider.clone(),
-                    tools: &self.tools,
-                    jobs: &self.jobs,
-                    config: &self.config,
-                    telemetry: self.telemetry.clone(),
-                    redactor: self.redactor.clone(),
-                    tx: self.tx.clone(),
-                    cancel: self.cancel.clone(),
-                    approval_ids: self.approval_ids.clone(),
-                    session_rules: self.session_rules.clone(),
-                    session_mode: self.session_mode.clone(),
-                    session_log: self.session_log.clone(),
-                    task_state: self.task_state.clone(),
-                    all_tool_specs: &self.all_tool_specs,
-                    loaded_tool_schemas: self.loaded_tool_schemas.clone(),
-                    exploration_state: exploration_state.clone(),
-                },
-                &mut broker,
-            )
-            .await;
+            let results = if let Some(replay) = &self.replay {
+                replay_tool_calls(
+                    replay,
+                    planned_calls.clone(),
+                    self.turn_id,
+                    self.tx.clone(),
+                    &mut broker,
+                )
+                .await?
+            } else {
+                execute_tool_calls(
+                    planned_calls.clone(),
+                    ToolExecutionContext {
+                        turn_id: self.turn_id,
+                        provider: self.provider.clone(),
+                        tools: &self.tools,
+                        jobs: &self.jobs,
+                        config: &self.config,
+                        telemetry: self.telemetry.clone(),
+                        redactor: self.redactor.clone(),
+                        tx: self.tx.clone(),
+                        cancel: self.cancel.clone(),
+                        approval_ids: self.approval_ids.clone(),
+                        session_rules: self.session_rules.clone(),
+                        session_mode: self.session_mode.clone(),
+                        session_log: self.session_log.clone(),
+                        task_state: self.task_state.clone(),
+                        all_tool_specs: &self.all_tool_specs,
+                        loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+                        exploration_state: exploration_state.clone(),
+                    },
+                    &mut broker,
+                )
+                .await
+            };
             // The planner is advisory: once the preflight block has executed,
             // the model has the planner outputs (success or not) in context, so
             // we lift the raw-read guard to avoid locking the turn on misfires
@@ -1765,6 +2141,7 @@ impl TurnRuntime {
             exploration_state.lock().await.mark_preflight_complete();
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            self.record_replay_tool_results(&planned_calls, &results);
             for pending in &results {
                 broker.record_model_result(&pending.result);
             }
@@ -1823,14 +2200,19 @@ impl TurnRuntime {
                 store: self.config.store_responses,
             };
             let request_model = request.model.clone();
-            let mut stream = self.provider.stream_response(request, self.cancel.clone());
+            self.record_replay_request(&request);
+            let mut stream = self
+                .provider
+                .stream_response(request.clone(), self.cancel.clone());
             let mut tool_calls = Vec::new();
             let mut completed = false;
             let mut response_id = None;
+            let mut completed_cost = CostSnapshot::default();
 
             while let Some(event) = stream.next().await {
                 match event {
                     Ok(LlmEvent::Started) => {
+                        self.record_replay_model_started();
                         if self
                             .tx
                             .send(AgentEvent::Started {
@@ -1847,6 +2229,7 @@ impl TurnRuntime {
                         if chunk.text.is_empty() {
                             continue;
                         }
+                        self.record_replay_model_text_delta(&chunk.text);
                         assistant_message.push_str(&chunk.text);
                         if self
                             .tx
@@ -1866,6 +2249,7 @@ impl TurnRuntime {
                             name: tool_call.name,
                             arguments: tool_call.arguments,
                         };
+                        self.record_replay_model_tool_call(&call);
                         self.log_event(
                             "tool_call",
                             Some(self.turn_id),
@@ -1899,6 +2283,7 @@ impl TurnRuntime {
                         }
                         broker.metrics.record_provider(&cost);
                         merge_cost(&mut total_cost, &cost);
+                        completed_cost = cost;
                         response_id = id;
                         completed = true;
                         break;
@@ -1922,6 +2307,7 @@ impl TurnRuntime {
                             Some("turn cancelled".to_string()),
                             json!({}),
                         );
+                        self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
                         let _ = self
                             .tx
                             .send(AgentEvent::Cancelled {
@@ -1935,8 +2321,12 @@ impl TurnRuntime {
             }
 
             if !completed {
-                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
-                    .await;
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
@@ -1967,8 +2357,13 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
-                self.flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
-                    .await;
+                if let Some(tail) = self
+                    .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                    .await
+                {
+                    self.record_replay_model_text_delta(&tail);
+                }
+                self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
                 conversation.push(LlmInputItem::AssistantText(message.content.clone()));
@@ -1998,32 +2393,46 @@ impl TurnRuntime {
                 return Ok(());
             }
 
-            let results = execute_tool_calls(
-                tool_calls.clone(),
-                ToolExecutionContext {
-                    turn_id: self.turn_id,
-                    provider: self.provider.clone(),
-                    tools: &self.tools,
-                    jobs: &self.jobs,
-                    config: &self.config,
-                    telemetry: self.telemetry.clone(),
-                    redactor: self.redactor.clone(),
-                    tx: self.tx.clone(),
-                    cancel: self.cancel.clone(),
-                    approval_ids: self.approval_ids.clone(),
-                    session_rules: self.session_rules.clone(),
-                    session_mode: self.session_mode.clone(),
-                    session_log: self.session_log.clone(),
-                    task_state: self.task_state.clone(),
-                    all_tool_specs: &self.all_tool_specs,
-                    loaded_tool_schemas: self.loaded_tool_schemas.clone(),
-                    exploration_state: exploration_state.clone(),
-                },
-                &mut broker,
-            )
-            .await;
+            self.record_replay_model_completed(response_id.clone(), &completed_cost);
+
+            let results = if let Some(replay) = &self.replay {
+                replay_tool_calls(
+                    replay,
+                    tool_calls.clone(),
+                    self.turn_id,
+                    self.tx.clone(),
+                    &mut broker,
+                )
+                .await?
+            } else {
+                execute_tool_calls(
+                    tool_calls.clone(),
+                    ToolExecutionContext {
+                        turn_id: self.turn_id,
+                        provider: self.provider.clone(),
+                        tools: &self.tools,
+                        jobs: &self.jobs,
+                        config: &self.config,
+                        telemetry: self.telemetry.clone(),
+                        redactor: self.redactor.clone(),
+                        tx: self.tx.clone(),
+                        cancel: self.cancel.clone(),
+                        approval_ids: self.approval_ids.clone(),
+                        session_rules: self.session_rules.clone(),
+                        session_mode: self.session_mode.clone(),
+                        session_log: self.session_log.clone(),
+                        task_state: self.task_state.clone(),
+                        all_tool_specs: &self.all_tool_specs,
+                        loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+                        exploration_state: exploration_state.clone(),
+                    },
+                    &mut broker,
+                )
+                .await
+            };
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            self.record_replay_tool_results(&tool_calls, &results);
             for pending in &results {
                 broker.record_model_result(&pending.result);
             }
@@ -2125,6 +2534,13 @@ impl TurnRuntime {
                 assistant.content.clone()
             }
         });
+        self.record_replay(
+            SessionReplayEventKind::CostDecision,
+            json!({
+                "cost": cost,
+                "metrics": metrics,
+            }),
+        );
         self.log_event(
             "assistant_completed",
             Some(self.turn_id),
@@ -2190,6 +2606,85 @@ impl TurnRuntime {
         );
     }
 
+    fn record_replay(&self, kind: SessionReplayEventKind, payload: Value) {
+        if self.replay.is_some() {
+            return;
+        }
+        if let Some(session) = &self.session_log {
+            let payload = redact_json_payload(payload, &self.redactor);
+            let _ = session.append_replay_event(SessionReplayEvent::new(
+                kind,
+                Some(self.turn_id.to_string()),
+                payload,
+            ));
+        }
+    }
+
+    fn record_replay_request(&self, request: &LlmRequest) {
+        self.record_replay(
+            SessionReplayEventKind::ModelRequest,
+            json!({
+                "hash": replay_hash(request),
+                "request": request,
+            }),
+        );
+    }
+
+    fn record_replay_model_started(&self) {
+        self.record_replay(SessionReplayEventKind::ModelStarted, json!({}));
+    }
+
+    fn record_replay_model_text_delta(&self, text: &str) {
+        self.record_replay(
+            SessionReplayEventKind::ModelTextDelta,
+            json!({ "text": text }),
+        );
+    }
+
+    fn record_replay_model_tool_call(&self, call: &ToolCall) {
+        let call = redact_tool_call(call.clone(), &self.redactor);
+        self.record_replay(
+            SessionReplayEventKind::ModelToolCall,
+            json!({
+                "call": {
+                    "call_id": call.call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                },
+            }),
+        );
+    }
+
+    fn record_replay_model_completed(&self, response_id: Option<String>, cost: &CostSnapshot) {
+        self.record_replay(
+            SessionReplayEventKind::ModelCompleted,
+            json!({
+                "response_id": response_id,
+                "cost": cost,
+            }),
+        );
+    }
+
+    fn record_replay_tool_results(&self, calls: &[ToolCall], results: &[PendingToolResult]) {
+        for (call, pending) in calls.iter().zip(results.iter()) {
+            let redacted_call = redact_tool_call(call.clone(), &self.redactor);
+            self.record_replay(
+                SessionReplayEventKind::ToolCall,
+                json!({
+                    "hash": replay_hash(&redacted_call),
+                    "call": redacted_call,
+                }),
+            );
+            self.record_replay(
+                SessionReplayEventKind::ToolResult,
+                json!({
+                    "result": &pending.result,
+                    "model_output": pending.result.model_output(),
+                }),
+            );
+        }
+    }
+
     /// Flushes any text the stream redactor is still holding behind its
     /// tail buffer, emitting it as a final AssistantDelta and appending
     /// it to the running message accumulator. Idempotent on an already
@@ -2198,19 +2693,21 @@ impl TurnRuntime {
         &self,
         assistant_stream: &mut StreamRedactor,
         assistant_message: &mut String,
-    ) {
+    ) -> Option<String> {
         let tail = assistant_stream.finish();
         if tail.text.is_empty() {
-            return;
+            return None;
         }
-        assistant_message.push_str(&tail.text);
+        let text = tail.text;
+        assistant_message.push_str(&text);
         let _ = self
             .tx
             .send(AgentEvent::AssistantDelta {
                 turn_id: self.turn_id,
-                delta: tail.text,
+                delta: text.clone(),
             })
             .await;
+        Some(text)
     }
 }
 
@@ -2645,6 +3142,32 @@ async fn execute_tool_calls(
         context.config,
         &context.telemetry,
     )
+}
+
+async fn replay_tool_calls(
+    replay: &ReplayRuntime,
+    calls: Vec<ToolCall>,
+    turn_id: TurnId,
+    tx: mpsc::Sender<AgentEvent>,
+    broker: &mut CostBroker,
+) -> squeezy_core::Result<Vec<ToolResult>> {
+    let results = replay.replay_tool_results(&calls)?;
+    for (call, result) in calls.iter().zip(results.iter()) {
+        let _ = tx
+            .send(AgentEvent::ToolCallStarted {
+                turn_id,
+                call: call.clone(),
+            })
+            .await;
+        broker.record_executed_result(result);
+        let _ = tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id,
+                result: result.clone(),
+            })
+            .await;
+    }
+    Ok(results)
 }
 
 fn collect_recorded_results(
@@ -4215,6 +4738,40 @@ fn unix_timestamp_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn replay_hash(value: &impl Serialize) -> String {
+    sha256_hex(serde_json::to_vec(value).unwrap_or_default())
+}
+
+fn replay_user_inputs(tape: &SessionReplayTape) -> Vec<String> {
+    tape.events
+        .iter()
+        .filter(|event| event.kind == SessionReplayEventKind::UserMessage)
+        .filter_map(|event| {
+            event
+                .payload
+                .get("input")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn replay_provider_name(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "openai",
+        "anthropic" => "anthropic",
+        "google" => "google",
+        "azure_openai" => "azure_openai",
+        "ollama" => "ollama",
+        "bedrock" => "bedrock",
+        "mock-openai" => "mock-openai",
+        "mock-anthropic" => "mock-anthropic",
+        "planner-probe" => "planner-probe",
+        other if other.contains("anthropic") => "mock-anthropic",
+        _ => "mock-openai",
+    }
 }
 
 fn user_item_summary(item: &LlmInputItem) -> Option<String> {

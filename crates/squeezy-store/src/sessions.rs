@@ -12,12 +12,14 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, Result, SessionMetrics,
     SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -81,6 +83,11 @@ impl SessionStore {
                 .has_first_user_task
                 .store(metadata.first_user_task.is_some(), Ordering::Relaxed);
         }
+        if let Ok(tape) = self.replay_tape(&session_id) {
+            counters
+                .replay_count
+                .store(tape.events.len() as u64, Ordering::Relaxed);
+        }
         SessionHandle {
             store: self.clone(),
             session_id,
@@ -119,12 +126,25 @@ impl SessionStore {
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
         let attachments = read_context_attachments(&dir.join("attachments"))?;
+        let replay = self.replay_tape(session_id).ok();
         Ok(SessionRecord {
             metadata,
             events,
             event_warnings,
             resume_state,
             attachments,
+            replay,
+        })
+    }
+
+    pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
+        let (events, warnings) =
+            read_replay_jsonl(&self.session_dir(session_id).join("replay.jsonl"))?;
+        Ok(SessionReplayTape {
+            schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+            session_id: session_id.to_string(),
+            events,
+            warnings,
         })
     }
 
@@ -134,6 +154,7 @@ impl SessionStore {
             "metadata": record.metadata,
             "events": record.events,
             "event_warnings": record.event_warnings,
+            "replay": record.replay,
             "attachments": record.attachments,
             "resume_available": record
                 .resume_state
@@ -208,6 +229,7 @@ pub struct SessionHandle {
 #[derive(Debug, Default)]
 struct HandleCounters {
     event_count: AtomicU64,
+    replay_count: AtomicU64,
     has_first_user_task: AtomicBool,
 }
 
@@ -294,6 +316,39 @@ impl SessionHandle {
                 }
             })?;
         }
+        Ok(())
+    }
+
+    pub fn append_replay_event(&self, mut event: SessionReplayEvent) -> Result<()> {
+        let dir = self.dir();
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("replay.jsonl");
+        event.sequence = self.counters.replay_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut payload = to_json_vec(&event)?;
+        if payload.len() > self.store.max_event_bytes {
+            event.payload = json!({
+                    "truncated": true,
+                    "reason": "replay event exceeded max_event_bytes",
+                    "original_bytes": payload.len(),
+            });
+            event.payload_sha256 = replay_payload_sha256(&event.payload);
+            payload = to_json_vec(&event)?;
+        }
+        payload.push(b'\n');
+
+        let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+        if current_size.saturating_add(payload.len()) > self.store.max_session_bytes {
+            self.update_metadata(|metadata| {
+                metadata.status = SessionStatus::Truncated;
+                metadata.resume_available = false;
+                metadata.resume_unavailable_reason =
+                    Some("replay trace exceeded max_session_bytes".to_string());
+            })?;
+            return Ok(());
+        }
+
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        file.write_all(&payload)?;
         Ok(())
     }
 
@@ -426,6 +481,55 @@ pub struct SessionEvent {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionReplayEventKind {
+    UserMessage,
+    ModelRequest,
+    ModelStarted,
+    ModelTextDelta,
+    ModelToolCall,
+    ModelCompleted,
+    ModelCancelled,
+    ToolCall,
+    ToolResult,
+    CostDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplayEvent {
+    pub schema_version: u32,
+    pub ts_unix_ms: u64,
+    pub sequence: u64,
+    pub kind: SessionReplayEventKind,
+    pub turn_id: Option<String>,
+    pub payload_sha256: String,
+    pub payload: Value,
+}
+
+impl SessionReplayEvent {
+    pub fn new(kind: SessionReplayEventKind, turn_id: Option<String>, payload: Value) -> Self {
+        let payload_sha256 = replay_payload_sha256(&payload);
+        Self {
+            schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+            ts_unix_ms: now_ms(),
+            sequence: 0,
+            kind,
+            turn_id,
+            payload_sha256,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReplayTape {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub events: Vec<SessionReplayEvent>,
+    pub warnings: u64,
+}
+
 impl SessionEvent {
     pub fn new(
         kind: impl Into<String>,
@@ -544,6 +648,7 @@ pub struct SessionRecord {
     pub event_warnings: u64,
     pub resume_state: Option<SessionResumeState>,
     pub attachments: Vec<ContextAttachment>,
+    pub replay: Option<SessionReplayTape>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,6 +741,37 @@ fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
         }
     }
     Ok((events, warnings))
+}
+
+fn read_replay_jsonl(path: &Path) -> Result<(Vec<SessionReplayEvent>, u64)> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) => return Err(error.into()),
+    };
+    let mut events = Vec::new();
+    let mut warnings = 0;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<SessionReplayEvent>(line) {
+            Ok(event)
+                if event.schema_version == SESSION_REPLAY_SCHEMA_VERSION
+                    && event.payload_sha256 == replay_payload_sha256(&event.payload) =>
+            {
+                events.push(event)
+            }
+            Ok(_) | Err(_) => warnings += 1,
+        }
+    }
+    Ok((events, warnings))
+}
+
+fn replay_payload_sha256(payload: &Value) -> String {
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn now_ms() -> u64 {

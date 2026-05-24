@@ -335,6 +335,68 @@ async fn turn_stream_reports_provider_error() {
 }
 
 #[tokio::test]
+async fn session_replay_replays_recorded_model_response() {
+    let root = temp_workspace("session_replay");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("hello from replay".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_replay".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config.clone(), provider);
+
+    let mut rx = agent.start_turn("say hello".to_string(), CancellationToken::new());
+    let mut final_answer = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::AssistantDelta { delta, .. } => final_answer.push_str(&delta),
+            AgentEvent::Completed { message, .. } if final_answer.is_empty() => {
+                final_answer = message.content
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(final_answer, "hello from replay");
+
+    let session_id = agent.session_id().expect("session id");
+    let record = agent.show_session(&session_id).expect("show session");
+    let replay = record.replay.expect("replay tape");
+    assert!(
+        replay
+            .events
+            .iter()
+            .any(|event| event.kind == SessionReplayEventKind::ModelRequest),
+        "expected replay model request: {replay:?}",
+    );
+
+    let report = Agent::replay_session(config.clone(), &session_id)
+        .await
+        .expect("replay session");
+    assert_eq!(report.turns, 1);
+    assert_eq!(report.final_answer, "hello from replay");
+
+    let mut drifted = config;
+    drifted.instructions.push_str("\nextra replay drift");
+    let error = Agent::replay_session(drifted, &session_id)
+        .await
+        .expect_err("drift should fail replay");
+    assert!(
+        error.to_string().contains("model request diverged"),
+        "{error}",
+    );
+}
+
+#[tokio::test]
 async fn user_input_is_redacted_before_model_request_and_transcript() {
     let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
         response_id: Some("resp_1".to_string()),

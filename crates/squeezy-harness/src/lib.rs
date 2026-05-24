@@ -21,12 +21,13 @@ use squeezy_agent::{Agent, AgentEvent};
 use squeezy_core::{
     AppConfig, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
     DEFAULT_BEDROCK_MODEL, DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_MODEL, Result, SqueezyError,
+    DEFAULT_OPENAI_MODEL, Result, SessionMode, SqueezyError,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     provider_from_config as llm_provider_from_config,
 };
+use squeezy_store::SessionReplayTape;
 use tokio_util::sync::CancellationToken;
 
 const COSTLY_FLAG: &str = "SQUEEZY_RUN_COSTLY_TESTS";
@@ -38,6 +39,7 @@ pub enum RunnerKind {
     MockOpenai,
     MockAnthropic,
     GrepBaseline,
+    Replay,
     PlannerProbe,
     PlannerProbeNoPlanner,
     CostlyOpenai,
@@ -76,6 +78,7 @@ impl RunnerKind {
             Self::MockOpenai => "mock-openai",
             Self::MockAnthropic => "mock-anthropic",
             Self::GrepBaseline => "grep-baseline",
+            Self::Replay => "replay",
             Self::PlannerProbe => "planner-probe",
             Self::PlannerProbeNoPlanner => "planner-probe-no-planner",
             Self::CostlyOpenai => "costly-openai",
@@ -116,6 +119,7 @@ pub struct TaskSpec {
     pub workspace: WorkspaceSpec,
     pub expect: ExpectSpec,
     pub mock: Option<MockSpec>,
+    pub replay: Option<ReplaySpec>,
     pub baseline: Option<BaselineSpec>,
 }
 
@@ -145,6 +149,17 @@ pub struct MockSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MockProviderSpec {
     pub events: Vec<TraceEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaySpec {
+    pub trace: String,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub mode: Option<SessionMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,7 +309,13 @@ pub async fn run_harness(config: HarnessConfig) -> Result<Vec<TaskResult>> {
 
     for task in &tasks {
         for runner in &runners {
-            let result = run_task(task, *runner, config.trace_dir.as_deref()).await;
+            let result = run_task_with_base(
+                task,
+                *runner,
+                config.trace_dir.as_deref(),
+                &config.tasks_dir,
+            )
+            .await;
             results.push(result);
         }
     }
@@ -307,11 +328,21 @@ pub async fn run_harness(config: HarnessConfig) -> Result<Vec<TaskResult>> {
 }
 
 pub async fn run_task(task: &TaskSpec, runner: RunnerKind, trace_dir: Option<&Path>) -> TaskResult {
+    run_task_with_base(task, runner, trace_dir, Path::new(".")).await
+}
+
+async fn run_task_with_base(
+    task: &TaskSpec,
+    runner: RunnerKind,
+    trace_dir: Option<&Path>,
+    tasks_dir: &Path,
+) -> TaskResult {
     let started = Instant::now();
     let outcome = match runner {
         RunnerKind::MockOpenai => run_mock(task, runner, mock_events(task, "openai")).await,
         RunnerKind::MockAnthropic => run_mock(task, runner, mock_events(task, "anthropic")).await,
         RunnerKind::GrepBaseline => run_baseline(task),
+        RunnerKind::Replay => run_replay(task, tasks_dir).await,
         RunnerKind::PlannerProbe => run_planner_probe(task, runner, true).await,
         RunnerKind::PlannerProbeNoPlanner => run_planner_probe(task, runner, false).await,
         RunnerKind::CostlyOpenai => run_costly(task, runner, "openai", trace_dir).await,
@@ -381,6 +412,34 @@ async fn run_mock(
     let mut output = run_agent(task, runner, provider.clone()).await?;
     output.metrics.prompt_bytes = provider.prompt_bytes();
     Ok(output)
+}
+
+async fn run_replay(task: &TaskSpec, tasks_dir: &Path) -> Result<RunnerOutput> {
+    let replay = task
+        .replay
+        .as_ref()
+        .ok_or_else(|| SqueezyError::Agent(format!("task {} has no replay spec", task.id)))?;
+    let path = resolve_harness_path(tasks_dir, &replay.trace);
+    let text = fs::read_to_string(&path)?;
+    let tape = serde_json::from_str::<SessionReplayTape>(&text).map_err(|err| {
+        SqueezyError::Agent(format!(
+            "failed to parse replay trace {}: {err}",
+            path.display()
+        ))
+    })?;
+    let mut config = AppConfig::from_env();
+    config.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+    let provider = replay.provider.as_deref().unwrap_or("mock-openai");
+    let model = replay.model.clone().unwrap_or_else(|| provider.to_string());
+    let mode = replay.mode.unwrap_or(SessionMode::Build);
+    let report = Agent::replay_tape(config, task.id.clone(), tape, provider, model, mode).await?;
+    let mut metrics = HarnessMetrics::default();
+    metrics.output_bytes = report.final_answer.len() as u64;
+    Ok(RunnerOutput {
+        final_answer: report.final_answer,
+        metrics,
+        trace: Vec::new(),
+    })
 }
 
 async fn run_planner_probe(
@@ -893,6 +952,15 @@ fn materialize_workspace(task: &TaskSpec) -> Result<PathBuf> {
         fs::write(path, &file.content)?;
     }
     Ok(root)
+}
+
+fn resolve_harness_path(base: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }
 
 fn safe_relative_path(path: &str) -> Result<PathBuf> {

@@ -16,6 +16,7 @@ serde_json.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
+squeezy-store.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true

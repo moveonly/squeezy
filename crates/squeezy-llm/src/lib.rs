@@ -1,6 +1,7 @@
 use std::{pin::Pin, sync::Arc};
 
 use futures_core::Stream;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
@@ -26,7 +27,7 @@ pub use registry::{
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmRequest {
     pub model: String,
     pub instructions: String,
@@ -60,7 +61,8 @@ impl LlmRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmInputItem {
     UserText(String),
     AssistantText(String),
@@ -75,7 +77,7 @@ pub enum LlmInputItem {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmToolSpec {
     pub name: String,
     pub description: String,
@@ -83,14 +85,15 @@ pub struct LlmToolSpec {
     pub strict: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmEvent {
     Started,
     TextDelta(String),

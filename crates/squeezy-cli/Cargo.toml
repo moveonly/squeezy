@@ -15,6 +15,7 @@ path = "src/main.rs"
 clap.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
+squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
 squeezy-store.workspace = true

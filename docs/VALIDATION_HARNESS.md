@@ -10,6 +10,8 @@ Tasks are TOML files with:
 - `workspace.files` inline fixture files
 - `expect.contains` required substrings in the final answer
 - `mock.openai.events` and `mock.anthropic.events` normalized provider traces
+- `replay.trace` path to a redacted session replay tape for replay regression
+  runs
 - `baseline` grep/read hints for the deterministic baseline runner
 
 Mock traces use the same event shape that costly live runs can emit: `started`, `text_delta`, and `completed` events with optional token counts.
@@ -35,6 +37,17 @@ cargo run -p squeezy-harness -- run \
 `planner-probe-no-planner` disables that setting for the same task fixtures.
 Both runners report `planner_turns`, `planner_tool_calls`,
 `planner_refusals`, and the usual read/tool metrics in JSONL output.
+
+Replay a recorded session tape:
+
+```sh
+cargo run -p squeezy-harness -- run --runner replay --jsonl target/replay.jsonl
+```
+
+Replay tasks declare a `[replay]` table with a `trace` path relative to the
+tasks directory, plus optional `provider`, `model`, and `mode`. The replay
+runner uses the recorded model stream and tool results without provider keys or
+live tool effects, and fails when recorded request/tool hashes diverge.
 
 List bundled tasks:
 

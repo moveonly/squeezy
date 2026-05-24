@@ -25,8 +25,10 @@ squeezy sessions report <session_id> --output /tmp/report.tar
 ```
 
 Report archives contain redacted version, config, repo profile, session,
-tool/cost, permission, diagnostic, and replay-pointer sections. Archives are
-uploaded to private Cloudflare R2 storage; PostHog receives only report
+tool/cost, permission, diagnostic, and replay sections. The replay section uses
+the redacted shareable tape or omits it when size limits require truncation; raw
+local-only traces are never included in report archives. Archives are uploaded
+to private Cloudflare R2 storage; PostHog receives only report
 metadata such as `report_id`, byte size, section names, platform, and redaction
 count. If upload fails, Squeezy writes the archive locally instead.
 
