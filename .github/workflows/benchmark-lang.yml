@@ -65,7 +65,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Setup benchmark
         uses: ./.github/actions/setup-bench
@@ -96,7 +96,7 @@ jobs:
           cat "${{ inputs.summary-file || format('__{0}_summary.md', inputs.language) }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark report
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: semantic-graph-benchmark-${{ inputs.artifact-suffix || inputs.language }}-${{ inputs.tier || 'smoke' }}
           path: |
