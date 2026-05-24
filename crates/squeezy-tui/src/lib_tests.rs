@@ -593,10 +593,10 @@ fn compact_status_surfaces_context_without_dense_counters() {
     app.status = "running search".to_string();
 
     let status = format_status_tokens(&app);
-    assert!(status.contains("openai:gpt-test"), "{status}");
     assert!(status.contains(" build "), "{status}");
     assert!(status.contains("feature*2"), "{status}");
     assert!(status.contains("running search"), "{status}");
+    assert!(!status.contains("openai:gpt-test"), "{status}");
     assert!(!status.contains("perm="), "{status}");
     assert!(!status.contains("sandbox"), "{status}");
     assert!(!status.contains("telemetry"), "{status}");
@@ -693,6 +693,29 @@ fn render_uses_two_line_status_footer() {
     assert!(output.contains("openai:gpt-test"), "{output}");
     assert!(output.contains("feature"), "{output}");
     assert!(output.contains("Ctrl-E fold"), "{output}");
+}
+
+#[test]
+fn render_keeps_header_when_transcript_has_content() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hello"));
+    app.push_transcript_item(TranscriptItem::assistant("answer"));
+
+    let output = render_to_string(&app, 120, 16);
+    assert!(output.contains(">_ Squeezy v"), "{output}");
+    assert!(output.contains("scripted:gpt-test"), "{output}");
+    assert!(output.contains("> hello"), "{output}");
+    assert!(output.contains("● answer"), "{output}");
+}
+
+#[test]
+fn render_prompt_uses_turn_state_dot() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "ship it".to_string();
+    app.turn_visual = TurnVisualState::Running;
+
+    let output = render_to_string(&app, 100, 12);
+    assert!(output.contains("•  ship it"), "{output}");
 }
 
 #[test]

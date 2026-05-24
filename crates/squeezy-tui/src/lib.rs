@@ -47,9 +47,10 @@ const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 const AMBER: Color = Color::Rgb(245, 158, 11);
-const AMBER_DIM: Color = Color::Rgb(180, 83, 9);
 const GOLD: Color = Color::Rgb(251, 191, 36);
+const ORANGE: Color = Color::Rgb(249, 115, 22);
 const QUIET: Color = Color::DarkGray;
+const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
@@ -138,6 +139,7 @@ async fn run_inner(
     }
 
     loop {
+        app.animation_tick = app.animation_tick.wrapping_add(1);
         terminal.draw(|frame| render(frame, &app))?;
 
         drain_job_events(&mut app);
@@ -167,6 +169,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
+                    app.turn_visual = TurnVisualState::Running;
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     app.pending_assistant.push_str(&delta);
@@ -250,6 +253,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.cost = cost;
                     app.metrics = metrics;
                     app.status = "ready".to_string();
+                    app.turn_visual = TurnVisualState::Succeeded;
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
                     app.cancel = None;
@@ -258,6 +262,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Cancelled { .. } => {
                     app.status = "cancelled; edit prompt or retry".to_string();
+                    app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
                     app.cancel = None;
@@ -266,6 +271,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::Failed { error, .. } => {
                     app.status = format_error_status(&error);
+                    app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
                     app.cancel = None;
@@ -481,6 +487,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             ));
             app.cancel = Some(cancel);
             app.status = "starting turn".to_string();
+            app.turn_visual = TurnVisualState::Running;
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -1692,6 +1699,7 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    let header_height = if area.height >= 12 { 6 } else { 0 };
     let attachment_height = attachment_panel_height(app);
     let approval_prompt = app.pending_approval.as_ref().map(|pending| {
         // When an approval is pending, reserve a dedicated panel large
@@ -1712,7 +1720,11 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         None
     };
     let transcript_min = if approval_prompt.is_some() { 3 } else { 5 };
-    let mut constraints = vec![Constraint::Min(transcript_min)];
+    let mut constraints = Vec::new();
+    if header_height > 0 {
+        constraints.push(Constraint::Length(header_height));
+    }
+    constraints.push(Constraint::Min(transcript_min));
     if let Some(h) = task_height {
         constraints.push(Constraint::Length(h));
     }
@@ -1729,6 +1741,10 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         .constraints(constraints)
         .split(area);
     let mut index = 0;
+    if header_height > 0 {
+        render_startup_header(frame, chunks[index], app);
+        index += 1;
+    }
     render_transcript(frame, chunks[index], app);
     index += 1;
     if task_height.is_some() {
@@ -1746,6 +1762,11 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     render_input(frame, chunks[index], app);
     index += 1;
     render_status(frame, chunks[index], app);
+}
+
+fn render_startup_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let paragraph = Paragraph::new(startup_card_lines(app, area.width));
+    frame.render_widget(paragraph, area);
 }
 
 fn should_show_task_panel(app: &TuiApp) -> bool {
@@ -1879,12 +1900,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
     if !app.pending_assistant.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("◐ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+            turn_dot_span(app),
+            Span::raw(" "),
             Span::raw(&app.pending_assistant),
         ]));
-    }
-    if lines.is_empty() {
-        lines.extend(startup_card_lines(app, area.width));
     }
 
     let scroll =
@@ -1902,7 +1921,7 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(
             format!("╭{border}╮"),
-            Style::default().fg(AMBER_DIM),
+            Style::default().fg(GOLD),
         )),
         startup_card_row(
             inner,
@@ -1912,7 +1931,12 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
-        startup_card_row(inner, "model", app.model.clone(), Style::default().fg(GOLD)),
+        startup_card_row(
+            inner,
+            "model",
+            format!("{}:{}", app.provider_name, app.model),
+            Style::default().fg(GOLD),
+        ),
         startup_card_row(
             inner,
             "directory",
@@ -1927,7 +1951,7 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
         ),
         Line::from(Span::styled(
             format!("╰{border}╯"),
-            Style::default().fg(AMBER_DIM),
+            Style::default().fg(GOLD),
         )),
     ]
 }
@@ -1945,14 +1969,14 @@ fn startup_card_row(
     let padding = " ".repeat(inner_width.saturating_sub(used));
     if label.is_empty() {
         return Line::from(vec![
-            Span::styled("│ ", Style::default().fg(AMBER_DIM)),
+            Span::styled("│ ", Style::default().fg(GOLD)),
             Span::styled(value, value_style),
             Span::raw(padding),
-            Span::styled("│", Style::default().fg(AMBER_DIM)),
+            Span::styled("│", Style::default().fg(GOLD)),
         ]);
     }
     Line::from(vec![
-        Span::styled("│ ", Style::default().fg(AMBER_DIM)),
+        Span::styled("│ ", Style::default().fg(GOLD)),
         Span::styled(
             format!("{label}:"),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
@@ -1960,7 +1984,7 @@ fn startup_card_row(
         Span::raw(" ".repeat(label_width.saturating_sub(label.len() + 1))),
         Span::styled(value, value_style),
         Span::raw(padding),
-        Span::styled("│", Style::default().fg(AMBER_DIM)),
+        Span::styled("│", Style::default().fg(GOLD)),
     ])
 }
 
@@ -2104,16 +2128,17 @@ fn format_tool_result_entry(
 }
 
 fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    let color = log_color(message);
     if collapsed {
         let preview = compact_text(message, 140);
         return vec![line_with_label(
             selected,
-            "! ",
-            GOLD,
+            "• ",
+            color,
             format!("… {} chars  {}", message.chars().count(), preview),
         )];
     }
-    text_lines(selected, "! ", GOLD, message)
+    text_lines(selected, "• ", color, message)
 }
 
 fn role_style(role: &Role) -> (&'static str, Color) {
@@ -2121,6 +2146,15 @@ fn role_style(role: &Role) -> (&'static str, Color) {
         Role::User => ("> ", AMBER),
         Role::Assistant => ("● ", Color::Green),
         Role::System => ("• ", GOLD),
+    }
+}
+
+fn log_color(message: &str) -> Color {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("failed") || lower.contains("error") {
+        Color::Red
+    } else {
+        GOLD
     }
 }
 
@@ -2214,6 +2248,40 @@ fn tool_status_label(status: ToolStatus) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnVisualState {
+    Idle,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl TurnVisualState {
+    fn color(self, tick: u64) -> Color {
+        match self {
+            Self::Idle => ORANGE,
+            Self::Running => {
+                if tick % 8 < 4 {
+                    GOLD
+                } else {
+                    ORANGE
+                }
+            }
+            Self::Succeeded => Color::Green,
+            Self::Failed => Color::Red,
+        }
+    }
+}
+
+fn turn_dot_span(app: &TuiApp) -> Span<'static> {
+    Span::styled(
+        "•",
+        Style::default()
+            .fg(app.turn_visual.color(app.animation_tick))
+            .add_modifier(Modifier::BOLD),
+    )
+}
+
 fn compact_text(text: &str, limit: usize) -> String {
     truncate_bytes(&text.replace('\n', " "), limit)
 }
@@ -2247,12 +2315,12 @@ fn short_hash(hash: &str) -> &str {
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(
-            "◆ ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(app.input.as_str()),
-    ]));
+        Span::styled(" ", Style::default().bg(PROMPT_BG)),
+        turn_dot_span(app),
+        Span::styled("  ", Style::default().bg(PROMPT_BG)),
+        Span::styled(app.input.as_str(), Style::default().bg(PROMPT_BG)),
+    ]))
+    .style(Style::default().fg(Color::White).bg(PROMPT_BG));
     frame.render_widget(paragraph, area);
 }
 
@@ -2276,12 +2344,9 @@ fn format_status_tokens(app: &TuiApp) -> String {
 fn format_status_lines(app: &TuiApp) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(app.repo.branch_display(), Style::default().fg(AMBER)),
+            turn_dot_span(app),
             Span::styled("  ", Style::default().fg(QUIET)),
-            Span::styled(
-                format!("{}:{}", app.provider_name, app.model),
-                Style::default().fg(GOLD),
-            ),
+            Span::styled(app.repo.branch_display(), Style::default().fg(AMBER)),
             Span::styled("  ", Style::default().fg(QUIET)),
             Span::styled(app.mode.as_str().to_string(), Style::default().fg(AMBER)),
             Span::styled("  ", Style::default().fg(QUIET)),
@@ -2309,10 +2374,8 @@ fn format_status_lines(app: &TuiApp) -> Vec<Line<'static>> {
 #[cfg(test)]
 fn format_status_context(app: &TuiApp) -> String {
     format!(
-        "{}  {}:{}  {}  {}{}",
+        "{}  {}  {}{}",
         app.repo.branch_display(),
-        app.provider_name,
-        app.model,
         app.mode.as_str(),
         app.status,
         format_status_activity(app),
@@ -2665,6 +2728,8 @@ struct TuiApp {
     task_state: Option<TaskStateSnapshot>,
     task_panel_collapsed: bool,
     status: String,
+    turn_visual: TurnVisualState,
+    animation_tick: u64,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -2774,6 +2839,8 @@ impl TuiApp {
             task_state: None,
             task_panel_collapsed: false,
             status,
+            turn_visual: TurnVisualState::Idle,
+            animation_tick: 0,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
