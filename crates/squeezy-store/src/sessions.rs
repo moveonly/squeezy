@@ -13,8 +13,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, ContextAttachment, CostSnapshot, Result, SessionMetrics, SessionMode, SqueezyError,
-    TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, Result, SessionMetrics,
+    SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -451,6 +451,8 @@ pub struct SessionResumeState {
     pub transcript: Vec<TranscriptItem>,
     #[serde(default)]
     pub context_attachments: Vec<ContextAttachment>,
+    #[serde(default)]
+    pub context_compaction: ContextCompactionState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

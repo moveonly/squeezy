@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt;
@@ -33,14 +33,15 @@ use squeezy_core::{
     SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind, sensitive_pattern_base,
 };
 use squeezy_graph::{
-    CallEdgeHit, DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode,
-    ReferenceHit, SignatureQuery,
+    CallEdgeHit, CargoDiagnosticHit, CargoFactFreshness, CargoFactProvenance, CargoFactsSummary,
+    DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode, ReferenceHit,
+    SignatureQuery,
 };
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_store::SqueezyStore;
 use squeezy_vcs::{
-    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
 };
 use squeezy_workspace::{
@@ -80,6 +81,10 @@ const MAX_GRAPH_MAX_RESULTS: usize = 100;
 const DEFAULT_GRAPH_MAX_DEPTH: usize = 3;
 const MAX_GRAPH_MAX_DEPTH: usize = 8;
 const GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES: u64 = 5_000_000;
+const DEFAULT_PATCH_MAX_SYMBOLS: usize = 8;
+const DEFAULT_PATCH_MAX_RELATED: usize = 12;
+const MAX_PATCH_BLOCKS: usize = 32;
+const PATCH_SNIPPET_MAX_CHARS: usize = 2_000;
 
 /// Per-process runtime bits the registry needs alongside its tool-specific
 /// configs. Grouping them keeps the public constructor signature under
@@ -446,6 +451,16 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    /// Shared persistent state store. When `None`, `read_mode=diff` with
+    /// `diff_baseline=last_receipt` cannot reach any stored read snapshots and
+    /// silently falls back to the `worktree` baseline (with a
+    /// `baseline_fallback.reason = "last_receipt_store_unavailable"` label on
+    /// the result). Several test-only registry constructors leave this as
+    /// `None` on purpose — integration tests that need the receipt-stub path
+    /// should build the registry through `new_with_configs_and_skills`
+    /// (or `new_with_configs_skills_and_mcp`) with a populated
+    /// [`ToolRegistryRuntime`].
+    state_store: Option<Arc<SqueezyStore>>,
     checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
@@ -773,7 +788,7 @@ impl ToolRegistry {
             &root,
             Default::default(),
             crawl_options.clone(),
-            state_store,
+            state_store.clone(),
         )
         .ok();
         let vcs = GitVcs::open(&root)?;
@@ -786,6 +801,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
@@ -825,6 +841,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store: None,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
@@ -988,6 +1005,7 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
+            apply_patch_spec(),
             checkpoint_list_spec(),
             checkpoint_revert_spec(),
             checkpoint_show_spec(),
@@ -999,10 +1017,12 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            plan_patch_spec(),
             read_file_spec(),
             read_slice_spec(),
             read_tool_output_spec(),
             reference_search_spec(),
+            refresh_compiler_facts_spec(),
             repo_map_spec(),
             write_file_spec(),
             symbol_context_spec(),
@@ -1037,9 +1057,9 @@ impl ToolRegistry {
             return PermissionScope::Mcp;
         }
         match call.name.as_str() {
-            "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
+            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
             "write_file" => PermissionScope::Edit,
-            "shell" | "verify" => PermissionScope::Shell,
+            "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
@@ -1050,8 +1070,8 @@ impl ToolRegistry {
                 PermissionScope::IgnoredSearch
             }
             "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
-            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "read_file"
-            | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
+            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
+            | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
             | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => {
                 PermissionScope::Read
             }
@@ -1094,6 +1114,41 @@ impl ToolRegistry {
             };
         }
         let (capability, target, risk) = match call.name.as_str() {
+            "apply_patch" => {
+                let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
+                let paths = args
+                    .as_ref()
+                    .map(|args| {
+                        args.patches
+                            .iter()
+                            .map(|patch| patch.path.as_str())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let target = if paths.len() == 1 {
+                    format!("path:{}", paths[0])
+                } else {
+                    "workspace:patches".to_string()
+                };
+                metadata.insert(
+                    "paths".to_string(),
+                    if paths.is_empty() {
+                        "*".to_string()
+                    } else {
+                        paths.join(", ")
+                    },
+                );
+                for path in paths.iter().take(5) {
+                    suggested_rules.push(PermissionRule::new(
+                        "edit",
+                        format!("path:{path}"),
+                        PermissionMode::Allow,
+                        PermissionRuleSource::Session,
+                        Some("approved patch path".to_string()),
+                    ));
+                }
+                (PermissionCapability::Edit, target, PermissionRisk::High)
+            }
             "checkpoint_undo" | "checkpoint_revert" => (
                 PermissionCapability::Edit,
                 "workspace:*".to_string(),
@@ -1197,6 +1252,42 @@ impl ToolRegistry {
                     PermissionRisk::Medium,
                 )
             }
+            "refresh_compiler_facts" => {
+                let args =
+                    serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone()).ok();
+                let diagnostics = args
+                    .as_ref()
+                    .and_then(|args| args.diagnostics)
+                    .unwrap_or(false);
+                metadata.insert("diagnostics".to_string(), diagnostics.to_string());
+                metadata.insert(
+                    "commands".to_string(),
+                    if diagnostics {
+                        "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+                            .to_string()
+                    } else {
+                        "cargo metadata --format-version=1 --no-deps".to_string()
+                    },
+                );
+                let target = if diagnostics {
+                    "cargo facts+check:*"
+                } else {
+                    "cargo facts:*"
+                }
+                .to_string();
+                suggested_rules.push(PermissionRule::new(
+                    "compiler",
+                    target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved compiler fact refresh".to_string()),
+                ));
+                (
+                    PermissionCapability::Compiler,
+                    target,
+                    PermissionRisk::Medium,
+                )
+            }
             "webfetch" => {
                 let args = serde_json::from_value::<WebFetchArgs>(call.arguments.clone()).ok();
                 let target = args
@@ -1248,8 +1339,8 @@ impl ToolRegistry {
                 PermissionRisk::Low,
             ),
             "checkpoint_list" | "checkpoint_show" | "diff_context" | "downstream_flow"
-            | "hierarchy" | "read_file" | "read_slice" | "read_tool_output" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => (
+            | "hierarchy" | "plan_patch" | "read_file" | "read_slice" | "read_tool_output"
+            | "repo_map" | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
@@ -1284,6 +1375,7 @@ impl ToolRegistry {
                 | "glob"
                 | "grep"
                 | "hierarchy"
+                | "plan_patch"
                 | "read_file"
                 | "read_slice"
                 | "read_tool_output"
@@ -1329,6 +1421,21 @@ impl ToolRegistry {
                     ),
                     (None, None) => "checkpoint_revert".to_string(),
                 }
+            }
+            "apply_patch" => {
+                let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
+                let paths = args
+                    .as_ref()
+                    .map(|args| {
+                        args.patches
+                            .iter()
+                            .map(|patch| patch.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|paths| !paths.is_empty())
+                    .unwrap_or_else(|| "?".to_string());
+                format!("apply_patch paths={paths:?}")
             }
             "repo_map" => "repo_map".to_string(),
             "decl_search" | "definition_search" | "reference_search" => {
@@ -1408,6 +1515,14 @@ impl ToolRegistry {
                 let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("?");
                 format!("symbol_context query={query:?}")
             }
+            "plan_patch" => {
+                let args = serde_json::from_value::<PlanPatchArgs>(call.arguments.clone()).ok();
+                let objective = args
+                    .as_ref()
+                    .map(|args| args.objective.as_str())
+                    .unwrap_or("?");
+                format!("plan_patch objective={objective:?}")
+            }
             "verify" => {
                 let args = serde_json::from_value::<VerifyArgs>(call.arguments.clone()).ok();
                 let scope = args
@@ -1421,6 +1536,15 @@ impl ToolRegistry {
                     .map(verify_level_str)
                     .unwrap_or("quick");
                 format!("verify scope={scope:?} level={level:?}")
+            }
+            "refresh_compiler_facts" => {
+                let args =
+                    serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone()).ok();
+                let diagnostics = args
+                    .as_ref()
+                    .and_then(|args| args.diagnostics)
+                    .unwrap_or(false);
+                format!("refresh_compiler_facts diagnostics={diagnostics}")
             }
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
@@ -1499,6 +1623,7 @@ impl ToolRegistry {
             self.execute_mcp_tool(&call, cancel).await
         } else {
             match call.name.as_str() {
+                "apply_patch" => self.execute_apply_patch(&call, &group_id).await,
                 "checkpoint_list" => self.execute_checkpoint_list(&call).await,
                 "checkpoint_show" => self.execute_checkpoint_show(&call).await,
                 "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
@@ -1507,10 +1632,15 @@ impl ToolRegistry {
                 | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
                 | "symbol_context" => self.execute_graph_tool(&call).await,
                 "diff_context" => self.execute_diff_context(&call).await,
+                "plan_patch" => self.execute_plan_patch(&call).await,
                 "glob" => self.execute_glob(&call, cancel).await,
                 "grep" => self.execute_grep(&call, cancel).await,
                 "read_file" => self.execute_read_file(&call).await,
                 "read_tool_output" => self.execute_read_tool_output(&call).await,
+                "refresh_compiler_facts" => {
+                    self.execute_refresh_compiler_facts(&call, cancel, &group_id)
+                        .await
+                }
                 "verify" => self.execute_verify(&call, cancel, &group_id).await,
                 "write_file" => self.execute_write_file(&call, &group_id).await,
                 "shell" => self.execute_shell(&call, cancel, &group_id).await,
@@ -1744,6 +1874,222 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: snapshot.files.len().min(max_files) as u64,
                 truncated,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    async fn execute_plan_patch(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<PlanPatchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let registry = self.clone();
+        let call_for_error = call.clone();
+        let call_for_blocking = call.clone();
+        tokio::task::spawn_blocking(move || {
+            registry.execute_plan_patch_blocking(&call_for_blocking, args)
+        })
+        .await
+        .unwrap_or_else(|err| {
+            make_result(
+                &call_for_error,
+                ToolStatus::Error,
+                json!({ "error": format!("plan_patch join failed: {err}") }),
+                ToolCostHint::default(),
+                None,
+            )
+        })
+    }
+
+    fn execute_plan_patch_blocking(&self, call: &ToolCall, args: PlanPatchArgs) -> ToolResult {
+        let max_symbols = args
+            .max_symbols
+            .unwrap_or(DEFAULT_PATCH_MAX_SYMBOLS)
+            .clamp(1, MAX_GRAPH_MAX_RESULTS);
+        let max_related = args
+            .max_related
+            .unwrap_or(DEFAULT_PATCH_MAX_RELATED)
+            .clamp(1, MAX_GRAPH_MAX_RESULTS);
+        let candidate_paths = normalized_path_set(args.candidate_paths.as_deref().unwrap_or(&[]));
+        let mut graph = match self.graph.lock() {
+            Ok(graph) => graph,
+            Err(_) => {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({"error": "semantic graph lock poisoned"}),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+        };
+        let Some(manager) = graph.as_mut() else {
+            let locality = patch_locality_json(&candidate_paths, &BTreeSet::new());
+            let plan_id = patch_plan_id(&call.arguments, &candidate_paths);
+            let next_action = if candidate_paths.is_empty() {
+                json!({
+                    "tool": "decl_search",
+                    "arguments_template": {
+                        "query": args.query.as_deref().unwrap_or("<symbol or text>")
+                    },
+                    "reason": "semantic graph is unavailable; widen the search with decl_search or grep before patching",
+                    "fallback_tools": ["decl_search", "grep"]
+                })
+            } else {
+                patch_next_action(&candidate_paths, plan_id.clone())
+            };
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "tool": "plan_patch",
+                    "status": "graph_unavailable",
+                    "graph_available": false,
+                    "reason": "semantic graph is unavailable for this workspace",
+                    "objective": args.objective,
+                    "patch_format": "search_replace",
+                    "plan_id": plan_id,
+                    "impact": {
+                        "neighborhood_paths": candidate_paths.iter().cloned().collect::<Vec<_>>(),
+                        "fallback": {
+                            "status": "graph_unavailable",
+                            "suggested_tools": [
+                                {"tool": "grep", "arguments_template": {"pattern": args.query.as_deref().unwrap_or("<query>"), "output_mode": "files_with_matches"}},
+                                {"tool": "read_file", "arguments_template": {"path": "<candidate-path>"}}
+                            ]
+                        }
+                    },
+                    "locality": locality,
+                    "next_action": next_action,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let refresh = match manager.refresh_before_query() {
+            Ok(report) => report,
+            Err(err) => return tool_error(call, err),
+        };
+        let graph = manager.graph();
+        let mut symbols = resolve_definition_candidates(
+            graph,
+            args.symbol_id.as_deref(),
+            args.query.as_deref(),
+            args.kind.as_deref(),
+            args.path.as_deref(),
+            None,
+        );
+        let symbols_truncated = symbols.len() > max_symbols;
+        symbols.truncate(max_symbols);
+
+        let mut direct_paths = BTreeSet::new();
+        let mut reference_paths = BTreeSet::new();
+        let mut caller_paths = BTreeSet::new();
+        let mut callee_paths = BTreeSet::new();
+        let mut references = Vec::new();
+        let mut callers = Vec::new();
+        let mut callees = Vec::new();
+
+        for symbol in &symbols {
+            direct_paths.insert(symbol.file_id.0.clone());
+            for hit in graph
+                .references_to_symbol(&symbol.id)
+                .into_iter()
+                .take(max_related)
+            {
+                reference_paths.insert(hit.reference.file_id.0.clone());
+                references.push(reference_json(hit));
+            }
+            for hit in graph.callers(&symbol.id).into_iter().take(max_related) {
+                if let Some(caller) = hit.caller {
+                    caller_paths.insert(caller.file_id.0.clone());
+                    callers.push(symbol_summary_json(&caller));
+                }
+            }
+            for hit in graph.callees(&symbol.id).into_iter().take(max_related) {
+                if let Some(callee) = hit.callee {
+                    callee_paths.insert(callee.file_id.0.clone());
+                    callees.push(symbol_summary_json(&callee));
+                }
+            }
+        }
+
+        let graph_paths = graph
+            .files
+            .keys()
+            .map(|file_id| file_id.0.as_str())
+            .collect::<Vec<_>>();
+        let mut neighborhood = BTreeSet::new();
+        neighborhood.extend(direct_paths.iter().cloned());
+        neighborhood.extend(reference_paths.iter().cloned());
+        neighborhood.extend(caller_paths.iter().cloned());
+        neighborhood.extend(callee_paths.iter().cloned());
+        let test_paths = test_candidate_paths(&graph_paths, &neighborhood);
+        let config_paths = config_candidate_paths(&self.root, &neighborhood);
+        let owner_paths = owner_candidate_paths(&self.root);
+        neighborhood.extend(test_paths.iter().cloned());
+        neighborhood.extend(config_paths.iter().cloned());
+        neighborhood.extend(owner_paths.iter().cloned());
+
+        let plan_id = patch_plan_id(&call.arguments, &neighborhood);
+        let owners = codeowner_matches(&self.root, &neighborhood);
+        let locality = patch_locality_json(&candidate_paths, &neighborhood);
+        let mut payload = graph_payload("plan_patch", manager, &refresh);
+        payload.insert("objective".to_string(), json!(args.objective));
+        payload.insert("query".to_string(), json!(args.query));
+        payload.insert("symbol_id".to_string(), json!(args.symbol_id));
+        payload.insert("patch_format".to_string(), json!("search_replace"));
+        payload.insert("plan_id".to_string(), json!(plan_id.clone()));
+        payload.insert(
+            "symbols".to_string(),
+            json!(
+                symbols
+                    .iter()
+                    .map(|symbol| symbol_json(graph, symbol))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert(
+            "impact".to_string(),
+            json!({
+                "direct_paths": direct_paths.iter().cloned().collect::<Vec<_>>(),
+                "reference_paths": reference_paths.iter().cloned().collect::<Vec<_>>(),
+                "caller_paths": caller_paths.iter().cloned().collect::<Vec<_>>(),
+                "callee_paths": callee_paths.iter().cloned().collect::<Vec<_>>(),
+                "test_paths": test_paths.iter().cloned().collect::<Vec<_>>(),
+                "config_paths": config_paths.iter().cloned().collect::<Vec<_>>(),
+                "owner_paths": owner_paths.iter().cloned().collect::<Vec<_>>(),
+                "neighborhood_paths": neighborhood.iter().cloned().collect::<Vec<_>>(),
+                "references": references,
+                "callers": callers,
+                "callees": callees,
+                "owners": owners,
+            }),
+        );
+        payload.insert("locality".to_string(), locality);
+        let next_action = if symbols.is_empty() && neighborhood.is_empty() {
+            json!({
+                "tool": "decl_search",
+                "arguments_template": {
+                    "query": args.query.as_deref().unwrap_or("<symbol or text>")
+                },
+                "reason": "plan_patch found no graph evidence; widen the search with decl_search or fall back to grep before patching",
+                "fallback_tools": ["decl_search", "grep"]
+            })
+        } else {
+            patch_next_action(&neighborhood, plan_id)
+        };
+        payload.insert("next_action".to_string(), next_action);
+
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: symbols.len() as u64,
+                truncated: symbols_truncated,
                 ..ToolCostHint::default()
             },
             None,
@@ -2330,12 +2676,20 @@ impl ToolRegistry {
                 Ok(target) => target,
                 Err(err) => return tool_error(call, err),
             };
-        let path = match self.resolve_existing(&path_arg) {
-            Ok(path) => path,
-            Err(err) => return tool_error(call, err),
+        let diff_mode = args.read_mode.unwrap_or_default() == ReadSliceReadMode::Diff;
+        let path = if diff_mode {
+            match self.join_workspace(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
+        } else {
+            match self.resolve_existing(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
         };
         let rel = self.relative(&path);
-        if args.diff_only.unwrap_or(false) {
+        if !diff_mode && args.diff_only.unwrap_or(false) {
             let diff_paths =
                 diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
             if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
@@ -2357,6 +2711,30 @@ impl ToolRegistry {
                 None,
             );
         }
+        if diff_mode {
+            let rel_str = rel.to_string_lossy().to_string();
+            let ctx = ReadSliceDiffCtx {
+                call,
+                args: &args,
+                path: &path,
+                rel: rel_str.as_str(),
+                graph_available: graph.is_some(),
+                graph_status,
+                confidence,
+                provenance,
+                span,
+            };
+            return self.execute_read_slice_diff_blocking(&ctx);
+        }
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                return tool_error(
+                    call,
+                    format!("path does not exist or is inaccessible: {err}"),
+                );
+            }
+        };
 
         let total_bytes = match file_len(&path) {
             Ok(len) => len,
@@ -2423,7 +2801,7 @@ impl ToolRegistry {
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(content_sha256));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
         payload.insert("truncated".to_string(), json!(truncated));
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
@@ -2438,6 +2816,484 @@ impl ToolRegistry {
             cost,
             Some(content_sha256),
         )
+    }
+
+    fn execute_read_slice_diff_blocking(&self, ctx: &ReadSliceDiffCtx<'_>) -> ToolResult {
+        let baseline_requested = ctx.args.diff_baseline.unwrap_or_default();
+        if baseline_requested == DiffReadBaseline::LastReceipt {
+            match self.read_slice_last_receipt_diff(ctx) {
+                LastReceiptDiffOutcome::Result(result) => return result,
+                LastReceiptDiffOutcome::Fallback(reason) => {
+                    return self.read_slice_git_diff(
+                        ctx,
+                        DiffReadBaseline::Worktree,
+                        Some(json!({
+                            "requested": diff_read_baseline_str(baseline_requested),
+                            "used": diff_read_baseline_str(DiffReadBaseline::Worktree),
+                            "reason": reason,
+                        })),
+                    );
+                }
+            }
+        }
+        self.read_slice_git_diff(ctx, baseline_requested, None)
+    }
+
+    fn read_slice_git_diff(
+        &self,
+        ctx: &ReadSliceDiffCtx<'_>,
+        baseline: DiffReadBaseline,
+        baseline_fallback: Option<Value>,
+    ) -> ToolResult {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            ..
+        } = ctx;
+        let rel = *rel;
+        let snapshot_mode = match baseline {
+            DiffReadBaseline::Worktree | DiffReadBaseline::LastReceipt => DiffMode::Worktree,
+            DiffReadBaseline::BranchBase => DiffMode::BranchBase,
+            DiffReadBaseline::Index => DiffMode::Index,
+        };
+        let max_ranges = args.max_ranges.unwrap_or(20).clamp(1, 100);
+        // Cap diff reads at the same per-file budget the crawler uses to skip
+        // oversized files. A multi-hundred-MB modified file would otherwise be
+        // fully slurped before any per-range cap applies; the slice mode
+        // already pages through `read_slice_byte_window`, but the diff path
+        // needs the whole current file to attribute hunks to byte ranges.
+        if let Ok(size) = file_len(path) {
+            let limit = self.crawl_options.max_file_bytes;
+            if limit > 0 && size > limit {
+                let mut payload = serde_json::Map::new();
+                payload.insert("tool".to_string(), json!("read_slice"));
+                payload.insert("read_mode".to_string(), json!("diff"));
+                payload.insert("status".to_string(), json!("file_too_large"));
+                payload.insert("graph_available".to_string(), json!(*graph_available));
+                payload.insert("graph_status".to_string(), json!(*graph_status));
+                payload.insert(
+                    "baseline_requested".to_string(),
+                    json!(diff_read_baseline_str(
+                        args.diff_baseline.unwrap_or_default()
+                    )),
+                );
+                payload.insert(
+                    "baseline_used".to_string(),
+                    json!(diff_read_baseline_str(baseline)),
+                );
+                if let Some(fallback) = baseline_fallback {
+                    payload.insert("baseline_fallback".to_string(), fallback);
+                }
+                payload.insert("path".to_string(), json!(rel));
+                payload.insert("total_bytes".to_string(), json!(size));
+                payload.insert("max_file_bytes".to_string(), json!(limit));
+                payload.insert("ranges".to_string(), json!([]));
+                payload.insert("packets".to_string(), json!([]));
+                payload.insert("truncated".to_string(), json!(true));
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    Value::Object(payload),
+                    ToolCostHint {
+                        truncated: true,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                );
+            }
+        }
+        let snapshot = self.diff_snapshot(
+            snapshot_mode,
+            DiffOptions {
+                include_patch: true,
+                max_patch_bytes: 5_000_000,
+            },
+        );
+        let file = snapshot.files.iter().find(|file| file.path == rel);
+        let content_sha256 = path.exists().then(|| sha256_file(path).ok()).flatten();
+        let current_text = path
+            .exists()
+            .then(|| fs::read(path).ok())
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+        let mut cost = ToolCostHint::default();
+        let mut truncated = snapshot.truncated;
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+
+        if let Some(file) = file {
+            if file.binary {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a changed binary file; source bytes were omitted",
+                    *confidence,
+                    provenance,
+                    ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
+                ));
+                ranges.push(json!({
+                    "status": diff_status_str(file.status),
+                    "binary": true,
+                    "content_omitted": "binary_file",
+                }));
+            } else if file.status == DiffFileStatus::Deleted {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a deleted file; current source bytes are unavailable",
+                    *confidence,
+                    provenance,
+                    ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
+                ));
+                ranges.push(json!({
+                    "status": "deleted",
+                    "content_omitted": "deleted_file",
+                }));
+            } else if let Some(text) = current_text.as_deref() {
+                let changed_ranges = file
+                    .patch
+                    .as_deref()
+                    .map(|patch| changed_byte_ranges_from_patch(patch, text))
+                    .filter(|ranges| !ranges.is_empty())
+                    .unwrap_or_else(|| {
+                        if file.status == DiffFileStatus::Added {
+                            vec![ChangedByteRange::new(
+                                0,
+                                text.len(),
+                                1,
+                                text.lines().count().max(1) as u32,
+                                "added",
+                            )]
+                        } else {
+                            diff_hunks_to_byte_ranges(&file.hunks, text)
+                        }
+                    });
+                for range in changed_ranges.into_iter().take(max_ranges) {
+                    let bytes = text.as_bytes();
+                    let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+                    let content =
+                        String::from_utf8_lossy(&bytes[range.start..capped_end]).to_string();
+                    let range_truncated = capped_end < range.end;
+                    truncated |= range_truncated;
+                    let range_cost = ToolCostHint {
+                        bytes_read: content.len() as u64,
+                        output_bytes: content.len() as u64,
+                        truncated: range_truncated,
+                        ..ToolCostHint::default()
+                    };
+                    cost.bytes_read += range_cost.bytes_read;
+                    cost.truncated |= range_truncated;
+                    let span = SourceSpan::new(
+                        range.start.min(u32::MAX as usize) as u32,
+                        range.end.min(u32::MAX as usize) as u32,
+                        squeezy_core::SourcePoint::new(range.start_line.saturating_sub(1), 0),
+                        squeezy_core::SourcePoint::new(range.end_line.saturating_sub(1), 0),
+                    );
+                    packets.push(read_diff_packet(
+                        rel,
+                        Some(span),
+                        "read_slice diff returned changed source bytes",
+                        *confidence,
+                        provenance,
+                        range_cost,
+                        // Range carries `content` inline, so steer the model to
+                        // graph-backed context for the enclosing symbol rather
+                        // than re-fetching the same bytes via slice mode.
+                        DiffNextActionKind::SymbolContextOrSlice {
+                            rust_graph: *graph_available && *graph_status == "rust",
+                        },
+                    ));
+                    ranges.push(json!({
+                        "status": range.status,
+                        "start_byte": range.start,
+                        "end_byte": range.end,
+                        "start_line": range.start_line,
+                        "end_line": range.end_line,
+                        "bytes_returned": content.len(),
+                        "truncated": range_truncated,
+                        "content": content,
+                    }));
+                }
+                truncated |= file.patch_truncated
+                    || (ranges.len() >= max_ranges && file.hunks.len() > max_ranges);
+            }
+        }
+
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changed source ranges for this path",
+                *confidence,
+                provenance,
+                ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
+            ));
+        }
+
+        cost.matches_returned = ranges.len() as u64;
+        cost.truncated |= truncated;
+        let mut payload = serde_json::Map::new();
+        payload.insert("tool".to_string(), json!("read_slice"));
+        payload.insert("read_mode".to_string(), json!("diff"));
+        payload.insert("graph_available".to_string(), json!(*graph_available));
+        payload.insert("graph_status".to_string(), json!(*graph_status));
+        payload.insert(
+            "baseline_requested".to_string(),
+            json!(diff_read_baseline_str(
+                args.diff_baseline.unwrap_or_default()
+            )),
+        );
+        payload.insert(
+            "baseline_used".to_string(),
+            json!(diff_read_baseline_str(baseline)),
+        );
+        if let Some(fallback) = baseline_fallback {
+            payload.insert("baseline_fallback".to_string(), fallback);
+        }
+        payload.insert("path".to_string(), json!(rel));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
+        // `path_in_diff` is the literal "git reports a diff for this path"
+        // signal: it stays true even when no source ranges survive (e.g.
+        // binary/deleted files) so callers can distinguish "clean file" from
+        // "changed file with no readable content".
+        let path_in_diff = file.is_some();
+        payload.insert("path_in_diff".to_string(), json!(path_in_diff));
+        // Back-compat alias: pre-fix consumers read `unchanged` to mean "git
+        // reports no diff for this path". Keep the same wire shape but only
+        // claim "unchanged" when both git is clean *and* we produced no
+        // packets, so binary/deleted entries no longer masquerade as clean.
+        payload.insert(
+            "unchanged".to_string(),
+            json!(!path_in_diff && ranges.is_empty()),
+        );
+        payload.insert("ranges".to_string(), json!(ranges));
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("truncated".to_string(), json!(cost.truncated));
+        payload.insert("vcs".to_string(), json!(snapshot.vcs));
+        payload.insert("errors".to_string(), json!(snapshot.errors));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            cost,
+            content_sha256,
+        )
+    }
+
+    fn read_slice_last_receipt_diff(&self, ctx: &ReadSliceDiffCtx<'_>) -> LastReceiptDiffOutcome {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            span,
+        } = ctx;
+        let rel = *rel;
+        let Some(store) = self.state_store.as_deref() else {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_store_unavailable");
+        };
+        let snapshots = match store.read_snapshots_for_path(rel) {
+            Ok(snapshots) => snapshots,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_store_error"),
+        };
+        if snapshots.is_empty() {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_snapshot_missing");
+        }
+        let content_sha256 = match sha256_file(path) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let total_bytes = match file_len(path) {
+            Ok(len) => len,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let (offset, limit, _) = match read_slice_byte_window(path, total_bytes, args, *span) {
+            Ok(window) => window,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_window_unavailable"),
+        };
+        let end = offset.saturating_add(limit).min(total_bytes as usize);
+        // Pick the most recent snapshot whose stored window exactly matches the
+        // requested `[offset, end)`. Storage is keyed by
+        // `(path, start_byte, end_byte)`, so distinct windows of the same file
+        // do not overwrite each other and the requested window is found even
+        // if a subsequent unrelated read landed for the same path.
+        let snapshot = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.start_byte == offset as u64 && snapshot.end_byte == end as u64
+            })
+            .max_by_key(|snapshot| snapshot.created_unix_millis);
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => return LastReceiptDiffOutcome::Fallback("last_receipt_window_mismatch"),
+        };
+        if snapshot.content_sha256.as_deref() == Some(content_sha256.as_str()) {
+            // `cost_hint.truncated` semantically means "we omitted bytes the
+            // caller would have got". The unchanged stub omits bytes by design
+            // because they were unchanged, so report it as a dedup save rather
+            // than a truncation — the latter biases the budget broker against
+            // the receipt-stub path.
+            let cost = ToolCostHint::default();
+            let packet = read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes since the last receipt",
+                *confidence,
+                provenance,
+                cost.clone(),
+                DiffNextActionKind::ReadSlice,
+            );
+            return LastReceiptDiffOutcome::Result(make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "tool": "read_slice",
+                    "read_mode": "diff",
+                    "graph_available": *graph_available,
+                    "graph_status": *graph_status,
+                    "baseline_requested": "last_receipt",
+                    "baseline_used": "last_receipt",
+                    "path": rel,
+                    "sha256": &content_sha256,
+                    "unchanged": true,
+                    "receipt_stub": true,
+                    "dedup": true,
+                    "same_as_call_id": snapshot.call_id,
+                    "same_as_tool_name": snapshot.tool_name,
+                    "original_output_sha256": snapshot.stable_output_sha256,
+                    "original_content_sha256": snapshot.content_sha256,
+                    "original_model_output_bytes": snapshot.model_output_bytes,
+                    "ranges": [],
+                    "packets": [packet],
+                    "truncated": false,
+                }),
+                cost,
+                Some(content_sha256.clone()),
+            ));
+        }
+
+        let bytes = match read_range(path, offset as u64, limit) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let current = String::from_utf8_lossy(&bytes).to_string();
+        // Line numbers must be reported against the full file, not against the
+        // window. `current` covers `[offset, offset+limit)` only, so count the
+        // newlines that precede `offset` once and apply that offset to each
+        // window-local line number.
+        let line_offset_before_window = match window_line_offset(path, offset) {
+            Ok(value) => value,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
+        let mut cost = ToolCostHint::default();
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+        for range in local_ranges
+            .into_iter()
+            .take(args.max_ranges.unwrap_or(20).clamp(1, 100))
+        {
+            let start = offset.saturating_add(range.start);
+            let end_bytes = offset.saturating_add(range.end);
+            let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+            let content =
+                String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
+            let range_truncated = capped_end < range.end;
+            let start_line = line_number_for_byte(&current, range.start)
+                .saturating_add(line_offset_before_window);
+            let end_line =
+                line_number_for_byte(&current, range.end.saturating_sub(1).max(range.start))
+                    .saturating_add(line_offset_before_window);
+            let span = SourceSpan::new(
+                start.min(u32::MAX as usize) as u32,
+                end_bytes.min(u32::MAX as usize) as u32,
+                squeezy_core::SourcePoint::new(start_line.saturating_sub(1), 0),
+                squeezy_core::SourcePoint::new(end_line.saturating_sub(1), 0),
+            );
+            let range_cost = ToolCostHint {
+                bytes_read: content.len() as u64,
+                output_bytes: content.len() as u64,
+                truncated: range_truncated,
+                ..ToolCostHint::default()
+            };
+            cost.bytes_read += range_cost.bytes_read;
+            cost.truncated |= range_truncated;
+            packets.push(read_diff_packet(
+                rel,
+                Some(span),
+                "read_slice diff returned source bytes changed since the last receipt",
+                *confidence,
+                provenance,
+                range_cost,
+                DiffNextActionKind::SymbolContextOrSlice {
+                    rust_graph: *graph_available && *graph_status == "rust",
+                },
+            ));
+            ranges.push(json!({
+                "status": "modified",
+                "start_byte": start,
+                "end_byte": end_bytes,
+                "start_line": start_line,
+                "end_line": end_line,
+                "bytes_returned": content.len(),
+                "truncated": range_truncated,
+                "content": content,
+            }));
+        }
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes in the last receipt window",
+                *confidence,
+                provenance,
+                ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
+            ));
+        }
+        cost.matches_returned = ranges.len() as u64;
+        let result = make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "tool": "read_slice",
+                "read_mode": "diff",
+                "graph_available": *graph_available,
+                "graph_status": *graph_status,
+                "baseline_requested": "last_receipt",
+                "baseline_used": "last_receipt",
+                "path": rel,
+                "sha256": &content_sha256,
+                "unchanged": false,
+                "ranges": ranges,
+                "packets": packets,
+                "truncated": cost.truncated,
+            }),
+            cost,
+            Some(content_sha256.clone()),
+        );
+        LastReceiptDiffOutcome::Result(result)
     }
 
     fn graph_context_for_snapshot(
@@ -2987,6 +3843,518 @@ impl ToolRegistry {
                 "content": output.content,
             }),
             cost,
+            None,
+        )
+    }
+
+    async fn execute_refresh_compiler_facts(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        let args = match serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone())
+        {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let include_diagnostics = args.diagnostics.unwrap_or(false);
+        let metadata_command = "cargo metadata --format-version=1 --no-deps";
+        let metadata_result = self
+            .execute_compiler_fact_command(
+                call,
+                metadata_command,
+                120_000,
+                MAX_SHELL_OUTPUT_BYTE_CAP,
+                cancel.clone(),
+                group_id,
+            )
+            .await;
+        if metadata_result.status != ToolStatus::Success {
+            return compiler_fact_command_error(call, "cargo metadata failed", metadata_result);
+        }
+        if metadata_result
+            .content
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({"error": "cargo metadata output was truncated"}),
+                metadata_result.cost_hint,
+                None,
+            );
+        }
+        let metadata_stdout = shell_stdout(&metadata_result).to_string();
+
+        let diagnostics_result = if include_diagnostics {
+            Some(
+                self.execute_compiler_fact_command(
+                    call,
+                    "cargo check --message-format=json",
+                    VERIFY_SHELL_TIMEOUT_MS,
+                    MAX_SHELL_OUTPUT_BYTE_CAP,
+                    cancel.clone(),
+                    group_id,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if diagnostics_result
+            .as_ref()
+            .and_then(|result| result.content.get("truncated").and_then(Value::as_bool))
+            .unwrap_or(false)
+        {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({"error": "cargo check output was truncated"}),
+                diagnostics_result
+                    .as_ref()
+                    .map(|result| result.cost_hint.clone())
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        let diagnostics_stdout = diagnostics_result.as_ref().map(shell_stdout);
+
+        let cargo_version = self
+            .compiler_version("cargo", "cargo --version", cancel.clone(), group_id)
+            .await;
+        let rustc_version = self
+            .compiler_version("rustc", "rustc --version", cancel.clone(), group_id)
+            .await;
+        let command = if include_diagnostics {
+            "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+        } else {
+            metadata_command
+        };
+        let provenance = CargoFactProvenance {
+            command: command.to_string(),
+            cargo_version,
+            rustc_version,
+            captured_unix_millis: unix_millis(),
+        };
+
+        let report = {
+            let mut graph = match self.graph.lock() {
+                Ok(graph) => graph,
+                Err(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({"error": "semantic graph lock poisoned"}),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
+            };
+            let Some(manager) = graph.as_mut() else {
+                return graph_unavailable_result(call);
+            };
+            if let Err(err) = manager.refresh_before_query() {
+                return tool_error(call, err);
+            }
+            match manager.graph_mut().refresh_cargo_facts_from_json(
+                &metadata_stdout,
+                diagnostics_stdout,
+                provenance,
+                &self.root,
+            ) {
+                Ok(report) => report,
+                Err(err) => return tool_error(call, err),
+            }
+        };
+
+        let diagnostics_exit_code = if report.diagnostics_loaded {
+            diagnostics_result
+                .as_ref()
+                .and_then(|result| result.content.get("exit_code").and_then(Value::as_i64))
+        } else {
+            None
+        };
+        let metadata_bytes =
+            shell_stdout(&metadata_result).len() + shell_stderr(&metadata_result).len();
+        let diagnostics_bytes = diagnostics_result.as_ref().map_or(0, |result| {
+            shell_stdout(result).len() + shell_stderr(result).len()
+        });
+        let output_bytes = metadata_bytes + diagnostics_bytes;
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "tool": "refresh_compiler_facts",
+                "metadata_command": metadata_command,
+                "diagnostics_command": include_diagnostics.then_some("cargo check --message-format=json"),
+                "diagnostics_exit_code": diagnostics_exit_code,
+                "diagnostics_loaded": report.diagnostics_loaded,
+                "summary": cargo_facts_summary_json(&report.summary),
+            }),
+            ToolCostHint {
+                bytes_read: output_bytes as u64,
+                output_bytes: output_bytes as u64,
+                matches_returned: report.summary.diagnostics as u64,
+                truncated: false,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    async fn execute_compiler_fact_command(
+        &self,
+        call: &ToolCall,
+        command: &str,
+        timeout_ms: u64,
+        output_byte_cap: usize,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        let shell_call = ToolCall {
+            call_id: call.call_id.clone(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": command,
+                "description": "refresh cached cargo compiler facts",
+                "timeout_ms": timeout_ms,
+                "output_byte_cap": output_byte_cap,
+                "output_mode": "raw",
+            }),
+        };
+        self.execute_shell_capped(&shell_call, cancel, timeout_ms, group_id)
+            .await
+    }
+
+    async fn compiler_version(
+        &self,
+        tool: &str,
+        command: &str,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> Option<String> {
+        let call = ToolCall {
+            call_id: format!("compiler-version-{tool}"),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": command,
+                "description": "capture compiler fact provenance version",
+                "timeout_ms": 10_000,
+                "output_byte_cap": 1024,
+                "output_mode": "raw",
+            }),
+        };
+        let result = self
+            .execute_shell_capped(&call, cancel, 10_000, group_id)
+            .await;
+        (result.status == ToolStatus::Success)
+            .then(|| shell_stdout(&result).trim().to_string())
+            .filter(|version| !version.is_empty())
+    }
+
+    async fn execute_apply_patch(&self, call: &ToolCall, group_id: &str) -> ToolResult {
+        let args = match serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        if args.patches.is_empty() {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "apply_patch requires at least one patch block" }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+        if args.patches.len() > MAX_PATCH_BLOCKS {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": format!("apply_patch accepts at most {MAX_PATCH_BLOCKS} patch blocks")
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        let dry_run = args.dry_run.unwrap_or(false);
+        let impact_paths = normalized_path_set(args.impact_paths.as_deref().unwrap_or(&[]));
+        let patch_paths = normalized_path_set(
+            &args
+                .patches
+                .iter()
+                .map(|patch| patch.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        let locality = patch_locality_json(&patch_paths, &impact_paths);
+        let warnings = patch_locality_warnings(&patch_paths, &impact_paths);
+        let mut files: BTreeMap<String, PatchFileState> = BTreeMap::new();
+        let mut operations = Vec::new();
+
+        for (index, patch) in args.patches.iter().enumerate() {
+            if patch.search.is_empty() {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "error": "search text must not be empty",
+                        "patch_index": index,
+                        "path": patch.path,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+            let path = match self.resolve_existing(&patch.path) {
+                Ok(path) => path,
+                Err(err) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({
+                            "error": format!("search-replace patches require an existing file: {err}"),
+                            "path": patch.path,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
+            };
+            let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
+            if is_secret_path(Path::new(&rel)) {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": "refusing to patch a likely secret file",
+                        "path": rel,
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+            let state = match files.entry(rel.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let before = match fs::read_to_string(&path) {
+                        Ok(content) => content,
+                        Err(err) => {
+                            return tool_error(
+                                call,
+                                format!("failed to read text file {rel}: {err}"),
+                            );
+                        }
+                    };
+                    let before_sha256 = sha256_hex(before.as_bytes());
+                    entry.insert(PatchFileState {
+                        path,
+                        before: before.clone(),
+                        current: before,
+                        before_sha256,
+                    })
+                }
+            };
+            match patch.expected_sha256.as_deref() {
+                Some(expected) if expected == state.before_sha256 => {}
+                Some(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 does not match current file",
+                            "path": rel,
+                            "current_sha256": state.before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        Some(state.before_sha256.clone()),
+                    );
+                }
+                None => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 is required for search-replace patches",
+                            "path": rel,
+                            "current_sha256": state.before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        Some(state.before_sha256.clone()),
+                    );
+                }
+            }
+
+            let matches = state.current.match_indices(&patch.search).count();
+            if matches == 0 {
+                return make_result(
+                    call,
+                    ToolStatus::Stale,
+                    json!({
+                        "error": "search text was not found",
+                        "path": rel,
+                        "patch_index": index,
+                    }),
+                    ToolCostHint::default(),
+                    Some(state.before_sha256.clone()),
+                );
+            }
+            let allow_multiple = patch.allow_multiple.unwrap_or(false);
+            if matches > 1 && !allow_multiple {
+                return make_result(
+                    call,
+                    ToolStatus::Stale,
+                    json!({
+                        "error": "search text matched more than once; set allow_multiple=true to replace all matches",
+                        "path": rel,
+                        "patch_index": index,
+                        "matches": matches,
+                    }),
+                    ToolCostHint::default(),
+                    Some(state.before_sha256.clone()),
+                );
+            }
+
+            let before_len = state.current.len();
+            state.current = if allow_multiple {
+                state.current.replace(&patch.search, &patch.replace)
+            } else {
+                state.current.replacen(&patch.search, &patch.replace, 1)
+            };
+            let after_len = state.current.len();
+            operations.push(json!({
+                "patch_index": index,
+                "path": rel,
+                "matches": matches,
+                "allow_multiple": allow_multiple,
+                "bytes_delta": after_len as i64 - before_len as i64,
+                "preview": {
+                    "search": truncate_text(&patch.search, PATCH_SNIPPET_MAX_CHARS),
+                    "replace": truncate_text(&patch.replace, PATCH_SNIPPET_MAX_CHARS),
+                }
+            }));
+        }
+
+        let mut changed_files = Vec::new();
+        let mut bytes_read = 0u64;
+        let mut bytes_written = 0u64;
+        for (rel, state) in &files {
+            bytes_read += state.before.len() as u64;
+            bytes_written += state.current.len() as u64;
+            changed_files.push(json!({
+                "path": rel,
+                "before_sha256": state.before_sha256,
+                "after_sha256": sha256_hex(state.current.as_bytes()),
+                "bytes_before": state.before.len(),
+                "bytes_after": state.current.len(),
+                "changed": state.before != state.current,
+            }));
+        }
+
+        if dry_run {
+            let content = json!({
+                "dry_run": true,
+                "plan_id": args.plan_id,
+                "patch_format": "search_replace",
+                "operations": operations,
+                "files": changed_files,
+                "locality": locality,
+                "warnings": warnings,
+            });
+            return make_result(
+                call,
+                ToolStatus::Success,
+                content,
+                ToolCostHint {
+                    bytes_read,
+                    output_bytes: bytes_written,
+                    ..ToolCostHint::default()
+                },
+                None,
+            );
+        }
+
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
+        let mut write_failure: Option<(String, String)> = None;
+        for state in files.values() {
+            if state.before == state.current {
+                continue;
+            }
+            if let Err(err) = fs::write(&state.path, state.current.as_bytes()) {
+                let rel = self
+                    .relative(&state.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                write_failure = Some((rel, err.to_string()));
+                break;
+            }
+        }
+        self.invalidate_diff_cache();
+        if let Some((failed_path, error)) = write_failure {
+            let mut error_content = json!({
+                "error": format!("failed to write {failed_path}: {error}"),
+                "failed_path": failed_path,
+                "plan_id": args.plan_id,
+                "patch_format": "search_replace",
+                "operations": operations,
+                "files": changed_files,
+                "locality": locality,
+                "warnings": warnings,
+            });
+            self.append_checkpoint_to_content(
+                &mut error_content,
+                &checkpoint_before,
+                call,
+                group_id,
+                ToolStatus::Error,
+                Vec::new(),
+            );
+            return make_result(
+                call,
+                ToolStatus::Error,
+                error_content,
+                ToolCostHint {
+                    bytes_read,
+                    output_bytes: bytes_written,
+                    ..ToolCostHint::default()
+                },
+                None,
+            );
+        }
+        let mut content = json!({
+            "dry_run": false,
+            "plan_id": args.plan_id,
+            "patch_format": "search_replace",
+            "operations": operations,
+            "files": changed_files,
+            "locality": locality,
+            "warnings": warnings,
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            &checkpoint_before,
+            call,
+            group_id,
+            ToolStatus::Success,
+            Vec::new(),
+        );
+        make_result(
+            call,
+            ToolStatus::Success,
+            content,
+            ToolCostHint {
+                bytes_read,
+                output_bytes: bytes_written,
+                ..ToolCostHint::default()
+            },
             None,
         )
     }
@@ -5644,6 +7012,18 @@ struct DiffContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanPatchArgs {
+    objective: String,
+    query: Option<String>,
+    symbol_id: Option<String>,
+    kind: Option<String>,
+    path: Option<String>,
+    candidate_paths: Option<Vec<String>>,
+    max_symbols: Option<usize>,
+    max_related: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CheckpointListArgs {}
 
 #[derive(Debug, Deserialize)]
@@ -5738,6 +7118,9 @@ struct ReadSliceArgs {
     path: Option<String>,
     symbol_id: Option<String>,
     span_kind: Option<ReadSliceSpanKind>,
+    read_mode: Option<ReadSliceReadMode>,
+    diff_baseline: Option<DiffReadBaseline>,
+    max_ranges: Option<usize>,
     start_byte: Option<usize>,
     end_byte: Option<usize>,
     start_line: Option<u32>,
@@ -5746,6 +7129,25 @@ struct ReadSliceArgs {
     offset: Option<usize>,
     limit: Option<usize>,
     diff_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadSliceReadMode {
+    #[default]
+    Slice,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffReadBaseline {
+    #[default]
+    Worktree,
+    #[serde(alias = "branch")]
+    BranchBase,
+    Index,
+    LastReceipt,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -5761,6 +7163,11 @@ struct VerifyArgs {
     scope: Option<VerifyScope>,
     level: Option<VerifyLevel>,
     output_mode: Option<OutputMode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefreshCompilerFactsArgs {
+    diagnostics: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -5820,6 +7227,23 @@ struct WriteFileArgs {
     path: String,
     content: String,
     expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchArgs {
+    patches: Vec<SearchReplacePatch>,
+    impact_paths: Option<Vec<String>>,
+    plan_id: Option<String>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchReplacePatch {
+    path: String,
+    search: String,
+    replace: String,
+    expected_sha256: Option<String>,
+    allow_multiple: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5975,6 +7399,8 @@ fn diff_mode_str(mode: DiffMode) -> &'static str {
     match mode {
         DiffMode::Worktree => "worktree",
         DiffMode::Branch => "branch",
+        DiffMode::BranchBase => "branch_base",
+        DiffMode::Index => "index",
     }
 }
 
@@ -6014,6 +7440,603 @@ fn diff_status_str(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Deleted => "deleted",
         DiffFileStatus::Modified => "modified",
     }
+}
+
+fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
+    match baseline {
+        DiffReadBaseline::Worktree => "worktree",
+        DiffReadBaseline::BranchBase => "branch_base",
+        DiffReadBaseline::Index => "index",
+        DiffReadBaseline::LastReceipt => "last_receipt",
+    }
+}
+
+enum LastReceiptDiffOutcome {
+    Result(ToolResult),
+    Fallback(&'static str),
+}
+
+/// Bundle of arguments shared by the three `read_mode=diff` helpers. Grouping
+/// them keeps each helper under `clippy::too_many_arguments` and removes the
+/// duplicated argument forwarding between `execute_read_slice_diff_blocking`
+/// → `read_slice_git_diff` / `read_slice_last_receipt_diff` plus the
+/// `LastReceipt` → `Worktree` fallback re-call.
+struct ReadSliceDiffCtx<'a> {
+    call: &'a ToolCall,
+    args: &'a ReadSliceArgs,
+    path: &'a Path,
+    rel: &'a str,
+    graph_available: bool,
+    graph_status: &'static str,
+    confidence: Confidence,
+    provenance: Vec<Provenance>,
+    span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedByteRange {
+    start: usize,
+    end: usize,
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+impl ChangedByteRange {
+    fn new(start: usize, end: usize, start_line: u32, end_line: u32, status: &'static str) -> Self {
+        Self {
+            start,
+            end,
+            start_line,
+            end_line,
+            status,
+        }
+    }
+}
+
+/// Next-action recommendation for a diff packet. Diff ranges that already
+/// carry the changed bytes inline should not steer the model back to
+/// `read_slice` in slice mode for the same path — that just re-fetches the
+/// same content. Prefer `symbol_context` (Rust graph available) so the model
+/// can pull the enclosing symbol's callers/callees instead.
+#[derive(Debug, Clone, Copy)]
+enum DiffNextActionKind {
+    /// Recommend the slice mode of `read_slice` for cases that did not
+    /// already include source bytes (binary files, deleted files, empty
+    /// range lists). Surrounding context still needs a real fetch.
+    ReadSlice,
+    /// Recommend either `symbol_context` (when the Rust semantic graph is
+    /// available for this path) or the slice mode of `read_slice` (as a
+    /// language-agnostic fallback). Used when the diff range already includes
+    /// `content` inline.
+    SymbolContextOrSlice { rust_graph: bool },
+}
+
+fn read_diff_next_action(path: &str, kind: DiffNextActionKind) -> Value {
+    match kind {
+        DiffNextActionKind::ReadSlice => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read the exact current source slice if surrounding context is needed"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: true } => json!({
+            "tool": "symbol_context",
+            "arguments": {
+                "path": path
+            },
+            "reason": "look up the enclosing symbol's callers and callees instead of refetching the same diff bytes"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: false } => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read additional surrounding source if context beyond the diff bytes is needed"
+        }),
+    }
+}
+
+fn read_diff_packet(
+    path: &str,
+    span: Option<SourceSpan>,
+    claim: &'static str,
+    confidence: Confidence,
+    provenance: &[Provenance],
+    cost_hint: ToolCostHint,
+    next_action_kind: DiffNextActionKind,
+) -> Value {
+    evidence_packet(
+        claim,
+        vec![span_for_path_json(path, span)],
+        confidence,
+        Freshness::Fresh,
+        provenance.to_vec(),
+        cost_hint,
+        read_diff_next_action(path, next_action_kind),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedLineRange {
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+fn changed_byte_ranges_from_patch(patch: &str, text: &str) -> Vec<ChangedByteRange> {
+    let mut line_ranges = Vec::<ChangedLineRange>::new();
+    let mut new_line = 0u32;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line).unwrap_or(1);
+            continue;
+        }
+        if new_line == 0 || line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            push_changed_line(&mut line_ranges, new_line, "modified");
+            new_line = new_line.saturating_add(1);
+        } else if line.starts_with('-') {
+            push_changed_line(&mut line_ranges, new_line.max(1), "deleted");
+        } else if line.starts_with(' ') {
+            new_line = new_line.saturating_add(1);
+        }
+    }
+    let modified_ranges = line_ranges
+        .iter()
+        .filter(|range| range.status == "modified")
+        .cloned()
+        .collect::<Vec<_>>();
+    line_ranges
+        .into_iter()
+        .filter(|range| {
+            range.status != "deleted"
+                || !modified_ranges.iter().any(|modified| {
+                    range.start_line <= modified.end_line && range.end_line >= modified.start_line
+                })
+        })
+        .map(|range| line_range_to_byte_range(text, range))
+        .collect()
+}
+
+fn push_changed_line(ranges: &mut Vec<ChangedLineRange>, line: u32, status: &'static str) {
+    if let Some(last) = ranges.last_mut()
+        && last.status == status
+        && line <= last.end_line.saturating_add(1)
+    {
+        last.end_line = last.end_line.max(line);
+        return;
+    }
+    ranges.push(ChangedLineRange {
+        start_line: line,
+        end_line: line,
+        status,
+    });
+}
+
+fn parse_hunk_new_start(line: &str) -> Option<u32> {
+    let plus = line.find('+')?;
+    let rest = line.get(plus + 1..)?;
+    let end = rest
+        .find(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+fn diff_hunks_to_byte_ranges(hunks: &[DiffHunk], text: &str) -> Vec<ChangedByteRange> {
+    hunks
+        .iter()
+        .map(|hunk| {
+            let start_line = hunk.start_line.saturating_add(1).max(1);
+            let end_line = hunk.end_line.saturating_add(1).max(start_line);
+            line_range_to_byte_range(
+                text,
+                ChangedLineRange {
+                    start_line,
+                    end_line,
+                    status: "modified",
+                },
+            )
+        })
+        .collect()
+}
+
+fn line_range_to_byte_range(text: &str, range: ChangedLineRange) -> ChangedByteRange {
+    let offsets = line_start_offsets(text);
+    let start = byte_for_line(&offsets, text.len(), range.start_line);
+    let end = if range.status == "deleted" {
+        start
+    } else {
+        byte_after_line(&offsets, text.len(), range.end_line)
+    };
+    ChangedByteRange::new(
+        start,
+        end.max(start),
+        range.start_line,
+        range.end_line,
+        range.status,
+    )
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < text.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn byte_for_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets
+        .get(line.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(text_len)
+}
+
+fn byte_after_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets.get(line as usize).copied().unwrap_or(text_len)
+}
+
+fn byte_diff_ranges(old: &[u8], new: &[u8]) -> Vec<ChangedByteRange> {
+    if old == new {
+        return Vec::new();
+    }
+    let mut prefix = 0usize;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut old_suffix = old.len();
+    let mut new_suffix = new.len();
+    while old_suffix > prefix && new_suffix > prefix && old[old_suffix - 1] == new[new_suffix - 1] {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+    let mut start = prefix;
+    while start > 0 && new[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = new_suffix.max(start);
+    while end < new.len() && new[end.saturating_sub(1)] != b'\n' {
+        end += 1;
+    }
+    // Compute line numbers honestly so the resulting range stands on its own
+    // (callers can still overwrite, but the type no longer lies about being
+    // line-aware). `new` here is the window-local current bytes; the caller
+    // is responsible for offsetting to file-absolute lines if needed.
+    let start_line = line_number_for_byte_bytes(new, start);
+    let end_line =
+        line_number_for_byte_bytes(new, end.saturating_sub(1).max(start)).max(start_line);
+    vec![ChangedByteRange::new(
+        start, end, start_line, end_line, "modified",
+    )]
+}
+
+fn line_number_for_byte(text: &str, byte: usize) -> u32 {
+    line_number_for_byte_bytes(text.as_bytes(), byte)
+}
+
+fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
+    let clamped = byte.min(bytes.len());
+    bytes[..clamped]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1) as u32
+}
+
+/// Count the number of newlines strictly before `offset` in `path`. Used to
+/// promote window-local line numbers to file-absolute ones in
+/// `read_slice_last_receipt_diff` without slurping the full file into memory
+/// twice. Returns the count of `\n` bytes in `[0, offset)`.
+fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, std::io::Error> {
+    if offset == 0 {
+        return Ok(0);
+    }
+    use std::io::{BufReader, Read};
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut remaining = offset;
+    let mut buf = [0u8; 8192];
+    let mut newlines: u32 = 0;
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let read = reader.read(&mut buf[..to_read])?;
+        if read == 0 {
+            break;
+        }
+        newlines = newlines
+            .saturating_add(buf[..read].iter().filter(|byte| **byte == b'\n').count() as u32);
+        remaining -= read;
+    }
+    Ok(newlines)
+}
+
+#[derive(Debug)]
+struct PatchFileState {
+    path: PathBuf,
+    before: String,
+    current: String,
+    before_sha256: String,
+}
+
+fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {
+    paths
+        .iter()
+        .filter_map(|path| normalize_workspace_path_str(path))
+        .collect()
+}
+
+fn normalize_workspace_path_str(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    let normalized = normalized
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn path_in_neighborhood(path: &str, neighborhood: &BTreeSet<String>) -> bool {
+    if neighborhood.is_empty() {
+        return false;
+    }
+    neighborhood.iter().any(|candidate| {
+        path == candidate
+            || path
+                .strip_prefix(candidate)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || candidate
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn patch_locality_json(patch_paths: &BTreeSet<String>, neighborhood: &BTreeSet<String>) -> Value {
+    if neighborhood.is_empty() {
+        return json!({
+            "checked": false,
+            "status": "unchecked",
+            "reason": "no impact paths were supplied",
+            "inside_paths": [],
+            "outside_paths": patch_paths.iter().cloned().collect::<Vec<_>>(),
+        });
+    }
+    let inside = patch_paths
+        .iter()
+        .filter(|path| path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    let outside = patch_paths
+        .iter()
+        .filter(|path| !path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({
+        "checked": true,
+        "status": if outside.is_empty() { "inside" } else { "outside" },
+        "inside_paths": inside,
+        "outside_paths": outside,
+        "neighborhood_paths": neighborhood.iter().cloned().collect::<Vec<_>>(),
+        "warning": (!outside.is_empty()).then_some("patch touches paths outside the impacted graph neighborhood"),
+    })
+}
+
+fn patch_locality_warnings(
+    patch_paths: &BTreeSet<String>,
+    neighborhood: &BTreeSet<String>,
+) -> Vec<String> {
+    if neighborhood.is_empty() {
+        return Vec::new();
+    }
+    let outside = patch_paths
+        .iter()
+        .filter(|path| !path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    if outside.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "patch touches paths outside the impacted graph neighborhood: {}",
+            outside.join(", ")
+        )]
+    }
+}
+
+fn patch_plan_id(arguments: &Value, paths: &BTreeSet<String>) -> String {
+    let payload = json!({
+        "arguments": arguments,
+        "paths": paths.iter().cloned().collect::<Vec<_>>(),
+    });
+    let digest = sha256_hex(payload.to_string().as_bytes());
+    format!("patch-{}", &digest[..12])
+}
+
+fn patch_next_action(paths: &BTreeSet<String>, plan_id: String) -> Value {
+    json!({
+        "tool": "apply_patch",
+        "arguments": {
+            "plan_id": plan_id,
+            "impact_paths": paths.iter().cloned().collect::<Vec<_>>(),
+            "patches": [
+                {
+                    "path": "<workspace-relative-path>",
+                    "search": "<exact current text>",
+                    "replace": "<replacement text>",
+                    "expected_sha256": "<sha256 from read_file or read_slice context>"
+                }
+            ]
+        },
+        "reason": "apply exact search-replace blocks after reviewing the impacted neighborhood"
+    })
+}
+
+fn test_candidate_paths(graph_paths: &[&str], neighborhood: &BTreeSet<String>) -> BTreeSet<String> {
+    graph_paths
+        .iter()
+        .filter(|path| {
+            neighborhood.iter().any(|impacted| {
+                same_crate_path(path, impacted)
+                    && (path.contains("/tests/")
+                        || path.ends_with("_tests.rs")
+                        || path.ends_with("/tests.rs"))
+            })
+        })
+        .map(|path| (*path).to_string())
+        .collect()
+}
+
+fn same_crate_path(left: &str, right: &str) -> bool {
+    let mut left_parts = left.split('/');
+    let mut right_parts = right.split('/');
+    match (
+        left_parts.next(),
+        left_parts.next(),
+        right_parts.next(),
+        right_parts.next(),
+    ) {
+        (Some("crates"), Some(left_crate), Some("crates"), Some(right_crate)) => {
+            left_crate == right_crate
+        }
+        _ => !left.starts_with("crates/") && !right.starts_with("crates/"),
+    }
+}
+
+fn config_candidate_paths(root: &Path, neighborhood: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for candidate in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+        if root.join(candidate).exists() {
+            paths.insert(candidate.to_string());
+        }
+    }
+    for path in neighborhood {
+        let mut parts = path.split('/');
+        if let (Some("crates"), Some(crate_dir)) = (parts.next(), parts.next()) {
+            let manifest = format!("crates/{crate_dir}/Cargo.toml");
+            if root.join(&manifest).exists() {
+                paths.insert(manifest);
+            }
+        }
+    }
+    paths
+}
+
+fn owner_candidate_paths(root: &Path) -> BTreeSet<String> {
+    [".github/CODEOWNERS", "CODEOWNERS"]
+        .into_iter()
+        .filter(|path| root.join(path).exists())
+        .map(str::to_string)
+        .collect()
+}
+
+fn codeowner_matches(root: &Path, paths: &BTreeSet<String>) -> Vec<Value> {
+    [".github/CODEOWNERS", "CODEOWNERS"]
+        .into_iter()
+        .find_map(|path| {
+            fs::read_to_string(root.join(path))
+                .ok()
+                .map(|content| (path, content))
+        })
+        .map(|(owner_path, content)| {
+            content
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        return None;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let pattern = parts.next()?;
+                    let owners = parts.map(str::to_string).collect::<Vec<_>>();
+                    if owners.is_empty()
+                        || !paths
+                            .iter()
+                            .any(|path| codeowner_pattern_matches(pattern, path))
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "path": owner_path,
+                        "pattern": pattern,
+                        "owners": owners,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn codeowner_pattern_matches(pattern: &str, path: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    let anchored = pattern.starts_with('/');
+    let bare = pattern.trim_start_matches('/');
+    let bare = bare.trim_end_matches('/');
+    if bare.is_empty() {
+        return false;
+    }
+    let has_glob_meta = bare.contains(['*', '?', '[']);
+    if !has_glob_meta {
+        if anchored {
+            return path == bare || path.starts_with(&format!("{bare}/"));
+        }
+        if path == bare {
+            return true;
+        }
+        for (idx, _) in path.match_indices(bare) {
+            let before_ok = idx == 0 || path.as_bytes().get(idx - 1) == Some(&b'/');
+            let after = &path[idx + bare.len()..];
+            let after_ok = after.is_empty() || after.starts_with('/');
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        return false;
+    }
+    let mut builder = GlobSetBuilder::new();
+    let primary = if anchored {
+        bare.to_string()
+    } else {
+        format!("**/{bare}")
+    };
+    let Ok(primary_glob) = Glob::new(&primary) else {
+        return false;
+    };
+    builder.add(primary_glob);
+    if !anchored
+        && !bare.contains('/')
+        && let Ok(extra) = Glob::new(bare)
+    {
+        builder.add(extra);
+    }
+    if !bare.ends_with("/**") {
+        let trailing = if anchored {
+            format!("{bare}/**")
+        } else {
+            format!("**/{bare}/**")
+        };
+        if let Ok(glob) = Glob::new(&trailing) {
+            builder.add(glob);
+        }
+    }
+    builder
+        .build()
+        .map(|set| set.is_match(path))
+        .unwrap_or(false)
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {
@@ -6066,6 +8089,44 @@ fn verify_command(
             "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && {test_command}"
         ),
     }
+}
+
+fn shell_stdout(result: &ToolResult) -> &str {
+    result
+        .content
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn shell_stderr(result: &ToolResult) -> &str {
+    result
+        .content
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn compiler_fact_command_error(call: &ToolCall, reason: &str, result: ToolResult) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Error,
+        json!({
+            "error": reason,
+            "exit_code": result.content.get("exit_code").cloned(),
+            "stdout": shell_stdout(&result),
+            "stderr": shell_stderr(&result),
+        }),
+        result.cost_hint,
+        None,
+    )
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn diff_package_names(root: &Path, changed_paths: &[String]) -> BTreeSet<String> {
@@ -6161,6 +8222,12 @@ fn symbol_context_json(
             })
         })
         .collect::<Vec<_>>();
+    let diagnostics = graph
+        .cargo_diagnostics_for_symbol(symbol)
+        .into_iter()
+        .take(max_references)
+        .map(|hit| cargo_diagnostic_hit_json(&hit))
+        .collect::<Vec<_>>();
     json!({
         "id": symbol.id.0,
         "name": symbol.name,
@@ -6178,6 +8245,7 @@ fn symbol_context_json(
         })),
         "references": references,
         "callers": callers,
+        "diagnostics": diagnostics,
         "confidence": format!("{:?}", symbol.confidence),
         "freshness": format!("{:?}", symbol.freshness),
     })
@@ -6258,9 +8326,50 @@ fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
         "body_hits": stats.body_hits,
         "references": stats.references,
         "calls": stats.calls,
+        "cargo_workspaces": stats.cargo_workspaces,
+        "cargo_packages": stats.cargo_packages,
+        "cargo_targets": stats.cargo_targets,
+        "cargo_features": stats.cargo_features,
+        "cargo_diagnostics": stats.cargo_diagnostics,
         "body_hit_trigram_indexed": stats.body_hit_trigram_indexed,
         "body_hit_trigram_terms": stats.body_hit_trigram_terms,
         "reference_index_terms": stats.reference_index_terms,
+    })
+}
+
+fn cargo_facts_summary_json(summary: &CargoFactsSummary) -> Value {
+    json!({
+        "workspaces": summary.workspaces,
+        "packages": summary.packages,
+        "targets": summary.targets,
+        "features": summary.features,
+        "diagnostics": summary.diagnostics,
+        "freshness": summary.freshness.as_ref().map(cargo_freshness_json),
+    })
+}
+
+fn cargo_freshness_json(freshness: &CargoFactFreshness) -> Value {
+    json!({
+        "status": format!("{:?}", freshness.status),
+        "input_fingerprint": freshness.input_fingerprint.0,
+        "current_fingerprint": freshness.current_fingerprint.0,
+        "stale_reasons": freshness.stale_reasons,
+    })
+}
+
+fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
+    let diagnostic = &hit.diagnostic;
+    json!({
+        "level": diagnostic.level,
+        "message": diagnostic.message,
+        "code": diagnostic.code,
+        "path": diagnostic.file_id.as_ref().map(|id| id.0.clone()),
+        "span": diagnostic.span.map(span_json),
+        "label": diagnostic.label,
+        "package_id": diagnostic.package_id,
+        "target_name": diagnostic.target_name,
+        "freshness": cargo_freshness_json(&hit.freshness),
+        "provenance": provenance_json(diagnostic.provenance.clone()),
     })
 }
 
@@ -6567,6 +8676,17 @@ fn symbol_context_packet(
                     .take(max_references)
                     .filter_map(|hit| hit.callee)
                     .map(|callee| symbol_summary_json(&callee))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        object.insert(
+            "diagnostics".to_string(),
+            json!(
+                graph
+                    .cargo_diagnostics_for_symbol(symbol)
+                    .into_iter()
+                    .take(max_references)
+                    .map(|hit| cargo_diagnostic_hit_json(&hit))
                     .collect::<Vec<_>>()
             ),
         );
@@ -8528,7 +10648,7 @@ fn diff_context_spec() -> ToolSpec {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "mode": {"type": "string", "enum": ["worktree", "branch"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch compares the current branch to the default-branch merge base. Default worktree."},
+                "mode": {"type": "string", "enum": ["worktree", "branch", "branch_base", "index"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch and branch_base compare the current branch to the default-branch merge base; index compares staged changes to HEAD. Default worktree."},
                 "include_patch": {"type": "boolean", "description": "Include unified patch text. Default false to keep output compact."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": 500},
                 "max_symbols_per_file": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -8769,7 +10889,7 @@ fn hierarchy_spec() -> ToolSpec {
 fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Prefer spans returned by graph evidence packets.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. Prefer spans returned by graph evidence packets.".to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
@@ -8778,6 +10898,9 @@ fn read_slice_spec() -> ToolSpec {
                 "path": {"type": "string"},
                 "symbol_id": {"type": "string"},
                 "span_kind": {"type": "string", "enum": ["signature", "body"]},
+                "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
+                "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
+                "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
                 "start_line": {"type": "integer", "minimum": 1},
@@ -8840,6 +10963,64 @@ fn load_skill_spec() -> ToolSpec {
     }
 }
 
+fn plan_patch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "plan_patch".to_string(),
+        description: "Plan a search-replace edit by consulting the semantic graph for impacted declarations, callers, references, tests, configs, and owners before patching.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "objective": {"type": "string", "description": "Short description of the intended code change."},
+                "query": {"type": "string", "description": "Declaration or symbol text to anchor the edit plan."},
+                "symbol_id": {"type": "string", "description": "Exact graph symbol id to anchor the edit plan."},
+                "kind": {"type": "string", "description": "Optional symbol kind filter such as function, method, struct, module, trait, or class."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter."},
+                "candidate_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths already suspected to need edits; locality is scored against graph impact."},
+                "max_symbols": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "max_related": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+            },
+            "required": ["objective"]
+        }),
+    }
+}
+
+fn apply_patch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "apply_patch".to_string(),
+        description: "Apply exact search-replace patch blocks to existing workspace files after preview, stale-content checks, locality scoring, and checkpoint creation.".to_string(),
+        capability: PermissionCapability::Edit,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "patches": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_PATCH_BLOCKS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
+                            "search": {"type": "string", "description": "Exact current text to replace."},
+                            "replace": {"type": "string", "description": "Replacement text. Pass an empty string to delete the matched range."},
+                            "expected_sha256": {"type": "string", "description": "sha256 of the file as currently on disk (from read_file/read_slice). The same on-disk hash is used for every patch block that targets the file in a single call; do not pass the post-patch hash for later blocks."},
+                            "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."}
+                        },
+                        "required": ["path", "search", "replace", "expected_sha256"]
+                    }
+                },
+                "impact_paths": {"type": "array", "items": {"type": "string"}, "description": "Impacted neighborhood paths from plan_patch; outside paths emit warnings."},
+                "plan_id": {"type": "string", "description": "Plan id returned by plan_patch."},
+                "dry_run": {"type": "boolean", "description": "Preview validation and replacement metadata without writing files. Default false."}
+            },
+            "required": ["patches"]
+        }),
+    }
+}
+
 fn write_file_spec() -> ToolSpec {
     ToolSpec {
         name: "write_file".to_string(),
@@ -8875,6 +11056,21 @@ fn shell_spec() -> ToolSpec {
                 "description": {"type": "string", "description": "Short reason this command is needed."}
             },
             "required": ["command", "description"]
+        }),
+    }
+}
+
+fn refresh_compiler_facts_spec() -> ToolSpec {
+    ToolSpec {
+        name: "refresh_compiler_facts".to_string(),
+        description: "Explicitly refresh cached Cargo compiler facts for the Rust workspace. Runs cargo metadata, and optionally cargo check JSON diagnostics, then annotates the semantic graph without making navigation tools invoke cargo.".to_string(),
+        capability: PermissionCapability::Compiler,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "diagnostics": {"type": "boolean", "description": "When true, also run cargo check --message-format=json and cache compiler diagnostics. Default false."}
+            }
         }),
     }
 }

@@ -31,10 +31,9 @@ impl OllamaProvider {
             body["options"] = json!({ "num_predict": max_output_tokens });
         }
         if !request.tools.is_empty() {
-            let mut tools = request.tools.iter().collect::<Vec<_>>();
-            tools.sort_by(|left, right| left.name.cmp(&right.name));
             body["tools"] = json!(
-                tools
+                request
+                    .tools
                     .iter()
                     .map(|tool| json!({
                         "type": "function",

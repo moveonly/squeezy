@@ -50,10 +50,9 @@ impl GoogleProvider {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
         }
         if !request.tools.is_empty() {
-            let mut tools = request.tools.iter().collect::<Vec<_>>();
-            tools.sort_by(|left, right| left.name.cmp(&right.name));
             body["tools"] = json!([{
-                "functionDeclarations": tools
+                "functionDeclarations": request
+                    .tools
                     .iter()
                     .map(|tool| json!({
                         "name": tool.name,

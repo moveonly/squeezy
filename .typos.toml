@@ -1,0 +1,13 @@
+[files]
+extend-exclude = [
+    "dist/",
+    "target/",
+]
+
+[default.extend-words]
+ratatui = "ratatui"
+redb = "redb"
+rustfmt = "rustfmt"
+serde = "serde"
+squeezy = "squeezy"
+unparseable = "unparseable"

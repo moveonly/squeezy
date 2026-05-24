@@ -130,6 +130,24 @@ can be benchmarked without sending paths or source text. Telemetry callers use
 these reports for one-shot graph build events and repeated graph refresh events
 without sending paths or source text.
 
+## Compiler Facts
+
+Cargo is an explicit fact-refresh source, not a navigation dependency. The
+`refresh_compiler_facts` tool is permission-scoped as `compiler` and runs
+`cargo metadata --format-version=1 --no-deps`; when requested, it also runs
+`cargo check --message-format=json` to cache diagnostics. Navigation tools do
+not invoke cargo. They only read the cached compiler facts already attached to
+the in-memory graph.
+
+The cargo fact cache records workspace, package, target, and feature nodes from
+metadata, plus compiler diagnostics from JSON check output. Each batch stores
+command provenance, cargo/rustc versions when available, capture time, and an
+input fingerprint derived from Cargo manifests, lock/config files visible to the
+graph, toolchain files such as `rust-toolchain.toml`, `build.rs` scripts, and
+Rust source hashes. If those inputs change after refresh, the
+`symbol_context.diagnostics` field still surfaces the cached diagnostics but
+marks them stale via the per-hit freshness verdict.
+
 ## Traversal Surface
 
 The in-memory graph supports:
@@ -151,7 +169,12 @@ The agent-facing graph tool surface is:
   bounded call-chain context
 - `symbol_context` and `hierarchy` for focused symbol/module exploration
 - `read_slice` for exact bounded source slices from graph spans or explicit
-  byte/line ranges
+  byte/line ranges, plus `read_mode="diff"` for changed ranges against
+  `worktree`, `branch_base`, `index`, or `last_receipt` baselines. The
+  changed-range schema is line/byte hunks derived from git today; a
+  graph-driven variant that expands each changed range to the smallest
+  enclosing symbol span (function, method, impl, test) is a follow-up rather
+  than something this surface already implements.
 
 Graph navigation tools return uniform evidence packets with `claim`, `spans`,
 `confidence`, `freshness`, `provenance`, `cost_hint`, and `next_action`.

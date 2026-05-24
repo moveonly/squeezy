@@ -83,10 +83,9 @@ impl OpenAiProvider {
             body["reasoning"] = json!({ "effort": reasoning_effort.as_str() });
         }
         if !request.tools.is_empty() {
-            let mut tools = request.tools.iter().collect::<Vec<_>>();
-            tools.sort_by(|left, right| left.name.cmp(&right.name));
             body["tools"] = json!(
-                tools
+                request
+                    .tools
                     .iter()
                     .map(|tool| {
                         json!({

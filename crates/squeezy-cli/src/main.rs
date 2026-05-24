@@ -1049,6 +1049,7 @@ async fn run_prompt(
                             squeezy_core::TranscriptItem::assistant(redacted_assistant.clone()),
                         ],
                         context_attachments: Vec::new(),
+                        context_compaction: Default::default(),
                     });
                     let metrics = squeezy_core::SessionMetrics {
                         turns: 1,

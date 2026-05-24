@@ -69,6 +69,64 @@ fn branch_mode_snapshot_reports_files_changed_since_default_branch() {
 }
 
 #[test]
+fn branch_base_mode_matches_branch_merge_base_diff() {
+    let root = temp_repo("branch_base_mode");
+    init_repo(&root);
+    fs::write(root.join("base.txt"), "base\n").expect("write base");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "initial"]);
+    git(&root, &["checkout", "-b", "feature"]);
+    fs::write(root.join("feature.txt"), "feature\n").expect("write feature");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "feature work"]);
+
+    let vcs = GitVcs::open(&root).expect("open vcs");
+    let snapshot = vcs.snapshot(DiffMode::BranchBase, DiffOptions::default());
+
+    assert_eq!(snapshot.mode, DiffMode::BranchBase);
+    assert!(snapshot.vcs.merge_base.is_some());
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["feature.txt"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn index_mode_reports_only_staged_changes() {
+    let root = temp_repo("index_mode");
+    init_repo(&root);
+    fs::write(root.join("staged.txt"), "before\n").expect("write staged");
+    fs::write(root.join("unstaged.txt"), "before\n").expect("write unstaged");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "initial"]);
+    fs::write(root.join("staged.txt"), "after\n").expect("modify staged");
+    git(&root, &["add", "staged.txt"]);
+    fs::write(root.join("unstaged.txt"), "after\n").expect("modify unstaged");
+
+    let vcs = GitVcs::open(&root).expect("open vcs");
+    let snapshot = vcs.snapshot(DiffMode::Index, DiffOptions::default());
+
+    assert_eq!(snapshot.mode, DiffMode::Index);
+    assert_eq!(
+        snapshot
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["staged.txt"]
+    );
+    assert_eq!(snapshot.summary.files_changed, 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn checkpoint_rollback_restores_modified_added_and_deleted_files() {
     let root = temp_repo("checkpoint_restore");
     fs::write(root.join("a.txt"), "A\n").expect("write a");

@@ -26,9 +26,9 @@ use squeezy_agent::{
     MAX_JOBS_RETAINED, SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
-    AppConfig, ContextAttachment, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
-    SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
-    TranscriptDefault, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
+    PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
+    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
@@ -88,6 +88,8 @@ async fn run_inner(
         app.push_transcript_item(item);
     }
     app.attachments = agent.context_attachments_snapshot().await;
+    app.context_compaction = agent.context_compaction_snapshot().await;
+    app.context_estimate = agent.context_estimate_snapshot().await;
     app.job_rx = Some(agent.subscribe_jobs());
     app.jobs = agent
         .jobs_snapshot()
@@ -172,6 +174,22 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::JobNotification { notification } => {
                     apply_job_notification(app, notification);
+                }
+                AgentEvent::ContextCompacted { report, .. } => {
+                    app.context_compaction.last = Some(report.record.clone());
+                    app.context_compaction.generation = report.record.generation;
+                    app.context_compaction.summary = Some(report.summary.clone());
+                    app.context_compaction.history.push(report.record.clone());
+                    app.context_estimate = report.record.after.clone();
+                    app.status = compaction_status_line(&report.record);
+                    app.push_log(format!(
+                        "context compacted gen={} trigger={} items={} tok {}->{}",
+                        report.record.generation,
+                        report.record.trigger.as_str(),
+                        report.record.dropped_items,
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens
+                    ));
                 }
                 AgentEvent::ApprovalRequested {
                     request,
@@ -546,6 +564,75 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     app.status = format!("detached {}", attachment.id);
                 }
                 Err(error) => app.status = format!("detach failed: {error}"),
+            }
+            return true;
+        }
+        "/compact" => {
+            match agent.compact_context_manual().await {
+                Ok(report) => {
+                    app.context_compaction = agent.context_compaction_snapshot().await;
+                    app.context_estimate = report.record.after.clone();
+                    app.status = compaction_status_line(&report.record);
+                    app.push_log(format!(
+                        "context compacted gen={} items={} tok {}->{}",
+                        report.record.generation,
+                        report.record.dropped_items,
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens
+                    ));
+                }
+                Err(error) => app.status = format!("compact failed: {error}"),
+            }
+            return true;
+        }
+        "/pins" => {
+            app.context_compaction = agent.context_compaction_snapshot().await;
+            if app.context_compaction.pinned.is_empty() {
+                app.status = "no pinned context".to_string();
+            } else {
+                app.status = format!(
+                    "{} pinned context item(s)",
+                    app.context_compaction.pinned.len()
+                );
+                app.push_transcript_item(TranscriptItem::system(format_pin_list(
+                    &app.context_compaction,
+                )));
+            }
+            return true;
+        }
+        "/pin" => {
+            let target = parts.next().unwrap_or("selected");
+            match pin_source(app, target) {
+                PinSourceResult::Found(label, summary, source) => {
+                    match agent.pin_context_entry(label, summary, source).await {
+                        Ok(pin) => {
+                            app.context_compaction = agent.context_compaction_snapshot().await;
+                            app.status = format!("pinned {}", pin.id);
+                        }
+                        Err(error) => app.status = format!("pin failed: {error}"),
+                    }
+                }
+                PinSourceResult::NoEntry => {
+                    app.status = "no transcript entry to pin".to_string();
+                }
+                PinSourceResult::UnknownTarget => {
+                    app.status = "usage: /pin selected|last".to_string();
+                }
+            }
+            return true;
+        }
+        "/unpin" => {
+            let id = parts.next().map(str::trim).filter(|raw| !raw.is_empty());
+            let Some(id) = id else {
+                app.status = "usage: /unpin <pin_id>".to_string();
+                return true;
+            };
+            match agent.unpin_context_entry(id).await {
+                Ok(pin) => {
+                    app.context_compaction = agent.context_compaction_snapshot().await;
+                    app.status = format!("unpinned {}", pin.id);
+                }
+                Err(error) => app.status = format!("unpin failed: {error}"),
             }
             return true;
         }
@@ -1129,6 +1216,56 @@ fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> Stri
 
 fn format_percent_x100(value: u32) -> String {
     format!("{}.{:02}%", value / 100, value % 100)
+}
+
+fn format_pin_list(context: &ContextCompactionState) -> String {
+    if context.pinned.is_empty() {
+        return "No pinned context.".to_string();
+    }
+    context
+        .pinned
+        .iter()
+        .map(|pin| {
+            format!(
+                "{} {} {}",
+                pin.id,
+                pin.label,
+                compact_text(&pin.summary, 120)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn compaction_status_line(record: &ContextCompactionRecord) -> String {
+    format!(
+        "compacted context {}->{} tok",
+        record.before.estimated_tokens, record.after.estimated_tokens
+    )
+}
+
+enum PinSourceResult {
+    Found(String, String, String),
+    NoEntry,
+    UnknownTarget,
+}
+
+fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
+    let entry = match target {
+        "selected" => app
+            .selected_entry
+            .and_then(|index| app.transcript.get(index))
+            .or_else(|| app.transcript.last()),
+        "last" => app.transcript.last(),
+        _ => return PinSourceResult::UnknownTarget,
+    };
+    match entry {
+        Some(entry) => {
+            let (label, summary, source) = entry.pin_payload();
+            PinSourceResult::Found(label, summary, source)
+        }
+        None => PinSourceResult::NoEntry,
+    }
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
@@ -2021,11 +2158,14 @@ fn format_status_tokens(app: &TuiApp) -> String {
         scroll_marker,
     );
     let spend = format!(
-        "cost={} tok={}/{}{} tools={} budget={}",
+        "cost={} tok={}/{}{} ctx={} pins={} compact={} tools={} budget={}",
         format_cost(&app.cost),
         format_optional_u64(app.cost.input_tokens),
         format_optional_u64(app.cost.output_tokens),
         reasoning_status_fragment(app),
+        app.context_estimate.estimated_tokens,
+        app.context_compaction.pinned.len(),
+        app.context_compaction.generation,
         app.metrics.tool_calls,
         if app.metrics.budget_denials == 0 {
             "ok".to_string()
@@ -2038,7 +2178,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     } else if app.cancel.is_some() {
         "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /cost /context /attach /attachments /detach /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /cost /context /attach /attachments /detach /compact /pin /pins /unpin /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -2280,6 +2420,8 @@ struct TuiApp {
     telemetry: TelemetryStatus,
     input: String,
     attachments: Vec<ContextAttachment>,
+    context_compaction: ContextCompactionState,
+    context_estimate: ContextEstimate,
     transcript: Vec<TranscriptEntry>,
     selected_entry: Option<usize>,
     next_entry_id: u64,
@@ -2359,6 +2501,8 @@ impl TuiApp {
             telemetry: TelemetryStatus::from_config(&config.telemetry),
             input: String::new(),
             attachments: Vec::new(),
+            context_compaction: ContextCompactionState::default(),
+            context_estimate: ContextEstimate::default(),
             transcript,
             selected_entry: None,
             next_entry_id,
@@ -2513,6 +2657,32 @@ impl TranscriptEntry {
                 Some(item.content.clone())
             }
             _ => None,
+        }
+    }
+
+    fn pin_payload(&self) -> (String, String, String) {
+        match &self.kind {
+            TranscriptEntryKind::Message(item) => (
+                format!("{} message", role_label(&item.role)),
+                item.content.clone(),
+                format!("transcript:{}", self.id),
+            ),
+            TranscriptEntryKind::ToolCall(call) => (
+                format!("tool call {}", call.name),
+                serde_json::to_string(&call.arguments)
+                    .unwrap_or_else(|_| call.arguments.to_string()),
+                format!("transcript:{}", self.id),
+            ),
+            TranscriptEntryKind::ToolResult(result) => (
+                format!("tool result {}", result.tool_name),
+                tool_result_summary(result),
+                format!("transcript:{}", self.id),
+            ),
+            TranscriptEntryKind::Log(message) => (
+                "log entry".to_string(),
+                message.clone(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }

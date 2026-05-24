@@ -12,6 +12,7 @@ use std::{
 
 use serde_json::{Value, json};
 use squeezy_core::{GraphConfig, SkillsConfig};
+use squeezy_store::{SqueezyStore, StoredReadSnapshot};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -38,6 +39,19 @@ fn registry_with_shell_sandbox_off_and_output_config(
         SkillCatalog::empty(),
         CrawlOptions::default(),
         ToolRegistryRuntime::default(),
+    )
+    .expect("registry")
+}
+
+fn registry_with_state_store(root: &Path, store: Arc<SqueezyStore>) -> ToolRegistry {
+    ToolRegistry::new_inner(
+        root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        squeezy_core::ShellSandboxConfig::default(),
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        ToolRegistryRuntime::new(Some(store), Arc::new(Redactor::default())),
     )
     .expect("registry")
 }
@@ -71,6 +85,15 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     });
     assert_eq!(compiler.capability, PermissionCapability::Compiler);
     assert_eq!(compiler.target, "cargo test:*");
+
+    let refresh = registry.permission_request(&ToolCall {
+        call_id: "facts".to_string(),
+        name: "refresh_compiler_facts".to_string(),
+        arguments: json!({"diagnostics": true}),
+    });
+    assert_eq!(refresh.capability, PermissionCapability::Compiler);
+    assert_eq!(refresh.target, "cargo facts+check:*");
+    assert_eq!(refresh.metadata["diagnostics"], "true");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -614,6 +637,393 @@ async fn diff_only_filters_glob_grep_and_read_file() {
 }
 
 #[tokio::test]
+async fn read_slice_diff_mode_returns_only_changed_worktree_ranges() {
+    let root = temp_workspace("read_slice_diff_worktree");
+    write_rust_crate(
+        &root,
+        "pub fn changed() -> usize { 1 }\npub fn same() -> usize { 1 }\n",
+    );
+    git_init_commit(&root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn changed() -> usize { 2 }\npub fn same() -> usize { 1 }\n",
+    )
+    .expect("modify source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "worktree"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["read_mode"], "diff");
+    assert_eq!(result.content["baseline_used"], "worktree");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(ranges.len(), 1);
+    assert!(
+        ranges[0]["content"]
+            .as_str()
+            .expect("range content")
+            .contains("changed() -> usize { 2 }")
+    );
+    assert!(
+        !ranges[0]["content"]
+            .as_str()
+            .expect("range content")
+            .contains("same()")
+    );
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_returns_stub_when_file_is_unchanged() {
+    let root = temp_workspace("read_slice_last_receipt_unchanged");
+    fs::write(root.join("sample.txt"), "alpha\nbeta\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex("alpha\nbeta\n".as_bytes())),
+            start_byte: 0,
+            end_byte: 11,
+            content: "alpha\nbeta\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": 11
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["receipt_stub"], true);
+    assert_eq!(result.content["same_as_call_id"], "prior_read");
+    assert!(
+        result.content["ranges"]
+            .as_array()
+            .expect("ranges")
+            .is_empty()
+    );
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_returns_changed_window() {
+    let root = temp_workspace("read_slice_last_receipt_changed");
+    fs::write(root.join("sample.txt"), "alpha\nzeta\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex("alpha\nbeta\n".as_bytes())),
+            start_byte: 0,
+            end_byte: 11,
+            content: "alpha\nbeta\n".to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "limit": 11
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_used"], "last_receipt");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0]["content"], "zeta\n");
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_reports_absolute_line_numbers_for_non_zero_offset() {
+    // Regression: window-local line numbers used to leak through, so any
+    // non-zero offset reported `start_line`/`end_line` off by exactly the
+    // count of newlines preceding the window. Stage a four-line file, snapshot
+    // only lines 3-4, mutate them, and assert the reported line numbers point
+    // at the file's lines 3-4 — not 1-2.
+    let root = temp_workspace("read_slice_last_receipt_offset_lines");
+    let original = "line1\nline2\nline3\nline4\n";
+    let modified = "line1\nline2\nLINE3\nLINE4\n";
+    let window_start: u64 = 12; // length of "line1\nline2\n"
+    let window_end: u64 = 24; // end of file
+    fs::write(root.join("sample.txt"), modified).expect("write modified");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(original.as_bytes())),
+            start_byte: window_start,
+            end_byte: window_end,
+            content: original[window_start as usize..window_end as usize].to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "offset": window_start,
+                    "limit": window_end - window_start,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_used"], "last_receipt");
+    let ranges = result.content["ranges"].as_array().expect("ranges");
+    assert!(!ranges.is_empty(), "expected at least one changed range");
+    let first = &ranges[0];
+    assert_eq!(
+        first["start_line"], 3,
+        "start_line must be absolute (file line 3), not window-local: {first}"
+    );
+    assert!(
+        first["end_line"].as_u64().expect("end_line") >= 3,
+        "end_line must be absolute: {first}"
+    );
+    assert!(
+        first["start_byte"].as_u64().expect("start_byte") >= window_start,
+        "start_byte must be file-absolute: {first}"
+    );
+    assert_uniform_evidence_packet(&result.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_falls_back_to_worktree_when_window_mismatches() {
+    let root = temp_workspace("read_slice_last_receipt_window_mismatch");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    git_init_commit(&root);
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() -> usize { 2 }\n").expect("modify");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    // Snapshot covers a window that does not match the request below
+    // (start_byte/end_byte differ) so last_receipt must fall back to
+    // `worktree` and surface `last_receipt_window_mismatch`.
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "src/lib.rs".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some("some-other-hash".to_string()),
+            start_byte: 5,
+            end_byte: 10,
+            content: "n alp".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["baseline_requested"], "last_receipt");
+    assert_eq!(result.content["baseline_used"], "worktree");
+    assert_eq!(
+        result.content["baseline_fallback"]["reason"],
+        "last_receipt_window_mismatch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_falls_back_to_worktree_when_snapshot_is_missing() {
+    let root = temp_workspace("read_slice_last_receipt_snapshot_missing");
+    write_rust_crate(&root, "pub fn alpha() -> usize { 1 }\n");
+    git_init_commit(&root);
+    fs::write(root.join("src/lib.rs"), "pub fn alpha() -> usize { 2 }\n").expect("modify");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "diff".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["baseline_fallback"]["reason"],
+        "last_receipt_snapshot_missing"
+    );
+    assert_eq!(result.content["baseline_used"], "worktree");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_slice_diff_last_receipt_keeps_distinct_windows_for_same_path() {
+    // Two snapshots for the same path with non-overlapping windows must
+    // coexist under the new `(path, start_byte, end_byte)` keying.
+    // Asking for window B's bytes must hit window B's snapshot, not silently
+    // fall back because window A's hash matches the current file.
+    let root = temp_workspace("read_slice_last_receipt_two_windows");
+    // 24 bytes, two halves of 12 bytes each:
+    let original = "aaaaaaaaaaaa" // bytes 0..12
+        .to_string()
+        + "bbbbbbbbbbbb"; // bytes 12..24
+    let modified = "aaaaaaaaaaaa".to_string() + "ZZZZbbbbbbbb"; // window B mutated
+    fs::write(root.join("blob.txt"), modified.as_bytes()).expect("write blob");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let original_sha = sha256_hex(original.as_bytes());
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "blob.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "window_a".to_string(),
+            stable_output_sha256: "window-a-out".to_string(),
+            content_sha256: Some(original_sha.clone()),
+            start_byte: 0,
+            end_byte: 12,
+            content: "aaaaaaaaaaaa".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put window A snapshot");
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "blob.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "window_b".to_string(),
+            stable_output_sha256: "window-b-out".to_string(),
+            content_sha256: Some(original_sha),
+            start_byte: 12,
+            end_byte: 24,
+            content: "bbbbbbbbbbbb".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 2,
+        })
+        .expect("put window B snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let window_b = registry
+        .execute(
+            ToolCall {
+                call_id: "diff_b".to_string(),
+                name: "read_slice".to_string(),
+                arguments: json!({
+                    "path": "blob.txt",
+                    "read_mode": "diff",
+                    "diff_baseline": "last_receipt",
+                    "offset": 12,
+                    "limit": 12
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(window_b.status, ToolStatus::Success);
+    assert_eq!(window_b.content["baseline_used"], "last_receipt");
+    let ranges = window_b.content["ranges"].as_array().expect("ranges");
+    assert!(
+        !ranges.is_empty(),
+        "expected window B to surface modified bytes: {}",
+        window_b.content
+    );
+    assert!(
+        ranges[0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("ZZZZ"),
+        "unexpected ranges payload: {}",
+        window_b.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn verify_defaults_to_diff_scope_and_noops_for_non_rust_diff() {
     let root = temp_workspace("verify_noop");
     fs::write(root.join("README.md"), "before\n").expect("write readme");
@@ -660,6 +1070,399 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
     assert_eq!(
         command,
         "cargo test -p squeezy-example --message-format=json"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_reports_graph_impact_and_locality_warning() {
+    let root = temp_workspace("plan_patch");
+    write_rust_crate(
+        &root,
+        "pub fn changed() -> usize { 1 }\nfn caller() -> usize { changed() }\n",
+    );
+    fs::create_dir_all(root.join(".github")).expect("mkdir github");
+    fs::write(root.join(".github/CODEOWNERS"), "* @owner\n").expect("write codeowners");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "plan".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "change changed return value",
+                    "query": "changed",
+                    "kind": "function",
+                    "candidate_paths": ["README.md"],
+                    "max_symbols": 4,
+                    "max_related": 4
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["patch_format"], "search_replace");
+    assert!(
+        result.content["impact"]["neighborhood_paths"]
+            .as_array()
+            .expect("neighborhood")
+            .iter()
+            .any(|path| path == "src/lib.rs")
+    );
+    assert_eq!(result.content["locality"]["status"], "outside");
+    assert!(
+        result.content["impact"]["owners"]
+            .as_array()
+            .expect("owners")
+            .iter()
+            .any(|owner| owner["owners"][0] == "@owner")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_edits_file_and_checkpoint_undo_restores_it() {
+    let root = temp_workspace("apply_patch_undo");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": "patch-test",
+                    "impact_paths": ["sample.txt"],
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-patch".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-patch");
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after\n"
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(undo.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_dry_run_previews_without_writing() {
+    let root = temp_workspace("apply_patch_dry_run");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "dry_run": true,
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["dry_run"], true);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_stale_hash_without_modifying_file() {
+    let root = temp_workspace("apply_patch_stale_hash");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("other\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_multiple_matches_unless_allowed() {
+    let root = temp_workspace("apply_patch_multiple");
+    fs::write(root.join("sample.txt"), "same same\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let rejected = registry
+        .execute(
+            ToolCall {
+                call_id: "patch1".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "same",
+                        "replace": "next",
+                        "expected_sha256": sha256_hex("same same\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(rejected.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "same same\n"
+    );
+
+    let accepted = registry
+        .execute(
+            ToolCall {
+                call_id: "patch2".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "same",
+                        "replace": "next",
+                        "expected_sha256": sha256_hex("same same\n".as_bytes()),
+                        "allow_multiple": true
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(accepted.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "next next\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_warns_for_paths_outside_impact_neighborhood() {
+    let root = temp_workspace("apply_patch_locality");
+    fs::write(root.join("inside.txt"), "inside\n").expect("write inside");
+    fs::write(root.join("outside.txt"), "outside\n").expect("write outside");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "impact_paths": ["inside.txt"],
+                    "patches": [{
+                        "path": "outside.txt",
+                        "search": "outside\n",
+                        "replace": "changed\n",
+                        "expected_sha256": sha256_hex("outside\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["locality"]["status"], "outside");
+    assert!(
+        result.content["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or("").contains("outside.txt"))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_workspace("apply_patch_partial_failure");
+    fs::write(root.join("first.txt"), "first-before\n").expect("write first");
+    fs::write(root.join("second.txt"), "second-before\n").expect("write second");
+    let read_only = root.join("second.txt");
+    let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).expect("set readonly");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_partial".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "first.txt",
+                            "search": "first-before\n",
+                            "replace": "first-after\n",
+                            "expected_sha256": sha256_hex("first-before\n".as_bytes())
+                        },
+                        {
+                            "path": "second.txt",
+                            "search": "second-before\n",
+                            "replace": "second-after\n",
+                            "expected_sha256": sha256_hex("second-before\n".as_bytes())
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-partial".to_string(),
+        )
+        .await;
+
+    // Restore writable perms so cleanup works regardless of how the platform
+    // reacts to the read-only target.
+    if let Ok(meta) = fs::metadata(&read_only) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = fs::set_permissions(&read_only, perms);
+    }
+
+    if result.status == ToolStatus::Error {
+        assert!(
+            result.content.get("checkpoint").is_some(),
+            "expected partial-failure result to carry a checkpoint, got: {}",
+            result.content
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).unwrap(),
+            "first-after\n",
+            "first file should have been written before the second failed"
+        );
+        let undo = registry
+            .execute(
+                ToolCall {
+                    call_id: "undo_partial".to_string(),
+                    name: "checkpoint_undo".to_string(),
+                    arguments: json!({}),
+                },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(undo.status, ToolStatus::Success);
+        assert_eq!(
+            fs::read_to_string(root.join("first.txt")).unwrap(),
+            "first-before\n",
+            "checkpoint_undo should restore the partial mutation"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("second.txt")).unwrap(),
+            "second-before\n",
+            "second file should be unchanged after partial failure"
+        );
+    } else {
+        // Some sandboxes (e.g. CI running as root) ignore 0o444, in which case
+        // both writes succeed and the assertion above does not apply.
+        assert_eq!(result.status, ToolStatus::Success);
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_denies_secret_paths() {
+    let root = temp_workspace("apply_patch_secret");
+    fs::write(root.join(".env"), "KEY=val\n").expect("write env");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_secret".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": ".env",
+                        "search": "KEY=val\n",
+                        "replace": "KEY=new\n",
+                        "expected_sha256": sha256_hex("KEY=val\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["path"], ".env");
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(
+        fs::read_to_string(root.join(".env")).unwrap(),
+        "KEY=val\n",
+        ".env must not be modified by a denied patch"
     );
 
     let _ = fs::remove_dir_all(root);
@@ -2768,6 +3571,7 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         names,
         vec![
+            "apply_patch",
             "checkpoint_list",
             "checkpoint_revert",
             "checkpoint_show",
@@ -2781,10 +3585,12 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "plan_patch",
             "read_file",
             "read_slice",
             "read_tool_output",
             "reference_search",
+            "refresh_compiler_facts",
             "repo_map",
             "shell",
             "symbol_context",
@@ -2922,6 +3728,69 @@ pub mod service {
         .await;
     assert_eq!(context.status, ToolStatus::Success);
     assert_uniform_evidence_packet(&context.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn refresh_compiler_facts_caches_diagnostics_for_symbol_context() {
+    let root = temp_workspace("compiler_facts_symbol_context");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn bad() -> i32 {
+    "nope"
+}
+"#,
+    );
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let refresh = registry
+        .execute(
+            ToolCall {
+                call_id: "facts".to_string(),
+                name: "refresh_compiler_facts".to_string(),
+                arguments: json!({"diagnostics": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(refresh.status, ToolStatus::Success, "{:?}", refresh.content);
+    assert_eq!(refresh.content["summary"]["packages"].as_u64(), Some(1));
+    assert_eq!(refresh.content["summary"]["targets"].as_u64(), Some(1));
+    assert!(
+        refresh.content["summary"]["diagnostics"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "{}",
+        refresh.content
+    );
+
+    let context = registry
+        .execute(
+            ToolCall {
+                call_id: "context".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "bad"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(context.status, ToolStatus::Success);
+    let diagnostics = context.content["packets"][0]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mismatched types")),
+        "{}",
+        context.content
+    );
 
     let _ = fs::remove_dir_all(root);
 }

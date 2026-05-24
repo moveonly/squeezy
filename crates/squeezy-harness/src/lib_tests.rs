@@ -111,6 +111,60 @@ fn baseline_paths_skips_ignored_directories() {
 }
 
 #[tokio::test]
+async fn mock_runner_records_non_zero_prompt_bytes() {
+    let task = TaskSpec {
+        id: "mock-prompt-bytes".to_string(),
+        title: "Mock prompt bytes".to_string(),
+        prompt: "answer".to_string(),
+        workspace: WorkspaceSpec { files: Vec::new() },
+        expect: ExpectSpec {
+            contains: vec!["done".to_string()],
+        },
+        mock: Some(MockSpec {
+            openai: Some(MockProviderSpec {
+                events: vec![
+                    TraceEvent {
+                        kind: TraceEventKind::Started,
+                        text: None,
+                        response_id: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                    },
+                    TraceEvent {
+                        kind: TraceEventKind::TextDelta,
+                        text: Some("done".to_string()),
+                        response_id: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                    },
+                    TraceEvent {
+                        kind: TraceEventKind::Completed,
+                        text: None,
+                        response_id: Some("resp".to_string()),
+                        input_tokens: Some(3),
+                        output_tokens: Some(1),
+                        cached_input_tokens: None,
+                    },
+                ],
+            }),
+            anthropic: None,
+        }),
+        baseline: None,
+    };
+
+    let result = run_task(&task, RunnerKind::MockOpenai, None).await;
+
+    assert_eq!(result.status, TaskStatus::Passed);
+    assert!(
+        result.metrics.prompt_bytes > 0,
+        "scripted runs must populate prompt_bytes; got {}",
+        result.metrics.prompt_bytes
+    );
+}
+
+#[tokio::test]
 async fn mock_runner_uses_trace_events_and_scores_correctness() {
     let task = TaskSpec {
         id: "mock".to_string(),
@@ -197,6 +251,67 @@ async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cos
     assert!(output.metrics.files_scanned >= 1);
     assert!(output.metrics.bytes_read > 0);
     assert_eq!(output.metrics.matches_returned, 1);
+}
+
+#[tokio::test]
+async fn planner_probe_compares_enabled_and_disabled_runs() {
+    let task = TaskSpec {
+        id: "planner-probe".to_string(),
+        title: "Planner probe".to_string(),
+        prompt: "Which file defines make_widget?".to_string(),
+        workspace: WorkspaceSpec {
+            files: vec![
+                WorkspaceFile {
+                    path: "Cargo.toml".to_string(),
+                    content:
+                        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+                            .to_string(),
+                },
+                WorkspaceFile {
+                    path: "src/lib.rs".to_string(),
+                    content: "pub fn make_widget() {}\n".to_string(),
+                },
+            ],
+        },
+        expect: ExpectSpec {
+            contains: vec!["src/lib.rs".to_string()],
+        },
+        mock: None,
+        baseline: Some(BaselineSpec {
+            pattern: "make_widget".to_string(),
+            include: vec!["*.rs".to_string()],
+            mode: BaselineMode::Paths,
+            read_path: None,
+        }),
+    };
+
+    let enabled = run_task(&task, RunnerKind::PlannerProbe, None).await;
+    let disabled = run_task(&task, RunnerKind::PlannerProbeNoPlanner, None).await;
+
+    assert_eq!(enabled.status, TaskStatus::Passed);
+    assert_eq!(disabled.status, TaskStatus::Passed);
+    assert_eq!(enabled.metrics.planner_turns, 1);
+    assert!(enabled.metrics.planner_tool_calls > 0);
+    assert_eq!(disabled.metrics.planner_turns, 0);
+    // Compare a planner-specific invariant: when the planner is enabled the
+    // preflight block carries the deterministic navigation work, so the
+    // model itself should issue strictly fewer tool calls than the
+    // planner-off baseline. This avoids coupling the assertion to
+    // graph-tool byte counts, which would drift whenever the graph payload
+    // shape changes.
+    let enabled_model_calls = enabled
+        .metrics
+        .tool_calls
+        .saturating_sub(enabled.metrics.planner_tool_calls);
+    let disabled_model_calls = disabled
+        .metrics
+        .tool_calls
+        .saturating_sub(disabled.metrics.planner_tool_calls);
+    assert!(
+        enabled_model_calls < disabled_model_calls,
+        "planner-on should leave fewer model-issued tool calls than planner-off; \
+         enabled_model_calls={enabled_model_calls}, disabled_model_calls={disabled_model_calls}",
+    );
 }
 
 #[derive(Debug)]

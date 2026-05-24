@@ -22,6 +22,20 @@ Run deterministic tasks:
 cargo run -p squeezy-harness -- run --jsonl target/harness.jsonl
 ```
 
+Compare exploration-compiler behavior without live provider spend:
+
+```sh
+cargo run -p squeezy-harness -- run \
+  --runner planner-probe \
+  --runner planner-probe-no-planner \
+  --jsonl target/planner-probe.jsonl
+```
+
+`planner-probe` uses the normal agent with `[agent].exploration_compiler=true`.
+`planner-probe-no-planner` disables that setting for the same task fixtures.
+Both runners report `planner_turns`, `planner_tool_calls`,
+`planner_refusals`, and the usual read/tool metrics in JSONL output.
+
 List bundled tasks:
 
 ```sh
@@ -54,6 +68,8 @@ CI runs only deterministic harness modes:
 
 - `mock-openai`
 - `mock-anthropic`
+- `planner-probe`
+- `planner-probe-no-planner`
 - `grep-baseline`
 
 Costly runners are never enabled by default and require `SQUEEZY_RUN_COSTLY_TESTS=1` plus the provider API key.

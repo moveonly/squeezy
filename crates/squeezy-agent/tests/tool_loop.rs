@@ -12,7 +12,8 @@ use futures_util::stream;
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, PermissionScope, Result, SessionMode,
+    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionMode, PermissionPolicy,
+    PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
@@ -137,20 +138,18 @@ async fn plan_mode_advertises_only_read_only_tools() {
         tool_names,
         vec![
             "update_task_state",
-            "checkpoint_list",
-            "checkpoint_show",
+            "load_tool_schema",
+            "glob",
+            "grep",
+            "read_file",
+            "read_tool_output",
             "decl_search",
             "definition_search",
             "diff_context",
             "downstream_flow",
-            "glob",
-            "grep",
             "hierarchy",
-            "list_skills",
-            "load_skill",
-            "read_file",
+            "plan_patch",
             "read_slice",
-            "read_tool_output",
             "reference_search",
             "repo_map",
             "symbol_context",
@@ -162,7 +161,49 @@ async fn plan_mode_advertises_only_read_only_tools() {
 }
 
 #[tokio::test]
-async fn build_mode_advertises_full_tool_set() {
+async fn exploration_compiler_prefetches_graph_context_before_model_request() {
+    let root = temp_workspace("exploration_preflight");
+    write_rust_crate(&root, "pub fn make_widget() {}\n");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "src/lib.rs defines make_widget.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn(
+        "Which file defines make_widget?".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let outputs = function_outputs(&requests[0]);
+    let call_ids = outputs
+        .iter()
+        .map(|(call_id, _)| *call_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_ids,
+        vec!["planner_definition_search", "planner_symbol_context"]
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|(_, output)| output["tool_name"] == "definition_search")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn build_mode_advertises_core_tool_set_and_compact_index() {
     let root = temp_workspace("build_tools");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
         Ok(LlmEvent::Started),
@@ -178,12 +219,255 @@ async fn build_mode_advertises_full_tool_set() {
 
     let requests = provider.requests();
     let tool_names = tool_names(&requests[0]);
-    for expected in ["write_file", "shell", "verify", "webfetch", "websearch"] {
+    for expected in ["load_tool_schema", "apply_patch", "write_file", "shell"] {
         assert!(
             tool_names.contains(&expected),
             "build mode should advertise {expected}: {tool_names:?}"
         );
     }
+    for hidden in ["verify", "webfetch", "websearch"] {
+        assert!(
+            !tool_names.contains(&hidden),
+            "build mode should leave {hidden} in the compact index: {tool_names:?}"
+        );
+    }
+    assert!(requests[0].instructions.contains("<tools_index>"));
+    assert!(requests[0].instructions.contains("webfetch"));
+    assert!(requests[0].instructions.contains("verify"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
+    let root = temp_workspace("lazy_schema_load");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_websearch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "websearch"}),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("schemas loaded".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("load web tools".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let first_names = tool_names(&requests[0]);
+    assert!(first_names.contains(&"load_tool_schema"));
+    assert!(!first_names.contains(&"websearch"));
+    assert!(!first_names.contains(&"webfetch"));
+    assert!(requests[0].instructions.contains("websearch"));
+    assert!(requests[0].instructions.contains("webfetch"));
+
+    let second_names = tool_names(&requests[1]);
+    assert!(
+        second_names.starts_with(&first_names),
+        "second request should append schemas without reordering: first={first_names:?} second={second_names:?}"
+    );
+    assert_eq!(
+        &second_names[second_names.len() - 2..],
+        &["websearch", "webfetch"]
+    );
+    let websearch_spec = requests[1]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "websearch")
+        .expect("loaded websearch schema");
+    let webfetch_spec = requests[1]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "webfetch")
+        .expect("loaded webfetch schema");
+    assert!(
+        websearch_spec.parameters["properties"].is_object(),
+        "loaded websearch schema must carry full parameters: {websearch_spec:?}"
+    );
+    assert!(
+        webfetch_spec.parameters["properties"]["url"].is_object(),
+        "loaded webfetch schema must carry the `url` property: {webfetch_spec:?}"
+    );
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 2);
+    assert_eq!(outputs[0].1["content"]["status"], "attached");
+    assert_eq!(outputs[0].1["content"]["position"], 0);
+    assert_eq!(outputs[1].1["content"]["status"], "attached");
+    assert_eq!(outputs[1].1["content"]["position"], 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn loaded_tool_schemas_persist_across_turns() {
+    let root = temp_workspace("lazy_schema_across_turns");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done turn 1".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done turn 2".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_done2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("turn one".to_string(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("turn two".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    let first_turn_round_zero = tool_names(&requests[0]);
+    assert!(!first_turn_round_zero.contains(&"webfetch"));
+    let second_turn_round_zero = tool_names(&requests[2]);
+    assert!(
+        second_turn_round_zero.contains(&"webfetch"),
+        "tools loaded in turn 1 should already appear in round 0 of turn 2: {second_turn_round_zero:?}"
+    );
+    let webfetch_spec = requests[2]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "webfetch")
+        .expect("loaded webfetch schema in turn 2");
+    assert!(
+        webfetch_spec.parameters["properties"]["url"].is_object(),
+        "turn-2 webfetch schema must still carry full parameters: {webfetch_spec:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index() {
+    let root = temp_workspace("lazy_schema_disabled");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("eager".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    config.tools.lazy_schema_loading = false;
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("eager run".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let names = tool_names(&requests[0]);
+    for expected in [
+        "update_task_state",
+        "grep",
+        "webfetch",
+        "websearch",
+        "verify",
+    ] {
+        assert!(
+            names.contains(&expected),
+            "lazy=off should advertise the full set including {expected}: {names:?}"
+        );
+    }
+    // `load_tool_schema` is a control tool that only exists in the lazy
+    // path; with lazy=off it should not be advertised at all.
+    assert!(
+        !names.contains(&"load_tool_schema"),
+        "lazy=off should not advertise the synthetic load_tool_schema control tool: {names:?}"
+    );
+    assert!(
+        !requests[0].instructions.contains("<tools_index>"),
+        "lazy=off should not emit a tools_index section: {:?}",
+        requests[0].instructions
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_mode_refuses_disallowed_discoverable_schema_loads() {
+    let root = temp_workspace("lazy_schema_plan_refusal");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "load_webfetch".to_string(),
+                name: "load_tool_schema".to_string(),
+                arguments: serde_json::json!({"name": "webfetch"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_load".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("refused".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    config.permissions.web = PermissionMode::Allow;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("load webfetch".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!tool_names(&requests[1]).contains(&"webfetch"));
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert_eq!(outputs[0].1["content"]["status"], "refused");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -647,6 +931,53 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
         outputs[0].1["receipt"]["output_sha256"]
     );
     assert!(outputs[1].1["content"]["content"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn successful_read_result_persists_model_visible_snapshot() {
+    let root = temp_workspace("read_snapshot");
+    fs::write(root.join("sample.txt"), "visible content\n").expect("write sample");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_once".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+
+    drain_turn(agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+    drop(agent);
+
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    let snapshot = store
+        .read_snapshot("sample.txt")
+        .expect("read snapshot")
+        .expect("snapshot exists");
+    assert_eq!(snapshot.call_id, "read_once");
+    assert_eq!(snapshot.content, "visible content\n");
+    let expected_hash = sha256_hex("visible content\n".as_bytes());
+    assert_eq!(
+        snapshot.content_sha256.as_deref(),
+        Some(expected_hash.as_str())
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1130,7 +1461,7 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
 }
 
 #[tokio::test]
-async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_advertised() {
+async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
     let root = temp_workspace("approved_webfetch_validation");
     let provider = Arc::new(ScriptedProvider::new(vec![
         vec![
@@ -1170,8 +1501,10 @@ async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_a
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"webfetch"));
-    assert!(tool_names.contains(&"websearch"));
+    assert!(!tool_names.contains(&"webfetch"));
+    assert!(!tool_names.contains(&"websearch"));
+    assert!(requests[0].instructions.contains("webfetch"));
+    assert!(requests[0].instructions.contains("websearch"));
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs[0].0, "web_call");
     assert_eq!(outputs[0].1["status"], "Error");
@@ -1322,6 +1655,73 @@ async fn empty_session_accounting_snapshot_reports_zero_completed_state() {
 }
 
 #[tokio::test]
+async fn automatic_context_compaction_replaces_old_raw_history() {
+    let root = temp_workspace("auto_context_compaction");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(format!(
+                "first answer {}",
+                "plan ".repeat(500)
+            ))),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10,
+        min_items: 3,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+    };
+    let old_prompt = format!("first prompt {}", "raw-old-context ".repeat(400));
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn(old_prompt.clone(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("second prompt".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].input.len(), 2);
+    let LlmInputItem::UserText(summary) = &requests[1].input[0] else {
+        panic!("first compacted item should be user summary");
+    };
+    assert!(summary.contains("Squeezy compacted conversation context"));
+    assert!(summary.contains("Compacted 2 older model-visible item"));
+    assert!(!summary.contains(&old_prompt));
+    assert!(summary.len() < old_prompt.len());
+    assert!(
+        matches!(&requests[1].input[1], LlmInputItem::UserText(text) if text == "second prompt")
+    );
+
+    let record = agent
+        .show_session(&agent.session_id().expect("session id"))
+        .expect("show session");
+    assert_eq!(
+        record
+            .resume_state
+            .expect("resume")
+            .context_compaction
+            .generation,
+        1
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn store_responses_accounting_marks_provider_stored_context_gap() {
     let root = temp_workspace("store_response_accounting");
     let provider = Arc::new(ScriptedProvider::named(
@@ -1364,6 +1764,198 @@ async fn store_responses_accounting_marks_provider_stored_context_gap() {
             .transmitted_request
             .used_input_percent_x100
             .is_some()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn manual_context_compaction_preserves_pins_in_resume_state() {
+    let root = temp_workspace("manual_context_compaction");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(format!(
+            "important decision {}",
+            "must ".repeat(200)
+        ))),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_first".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10_000,
+        min_items: 99,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+    };
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let pin = agent
+        .pin_context_entry(
+            "decision".to_string(),
+            "Use deterministic compaction".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .expect("pin");
+    let report = agent.compact_context_manual().await.expect("compact");
+
+    assert_eq!(report.record.trigger.as_str(), "manual");
+    assert!(report.summary.contains("Use deterministic compaction"));
+    let record = agent
+        .show_session(&agent.session_id().expect("session id"))
+        .expect("show session");
+    let compaction = record.resume_state.expect("resume").context_compaction;
+    assert_eq!(compaction.generation, 1);
+    assert_eq!(compaction.pinned[0].id, pin.id);
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.kind == "context_compacted")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn auto_compaction_does_not_orphan_function_call_output() {
+    let root = temp_workspace("auto_compaction_pair");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": "src.rs" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tool".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(format!(
+                "first answer {}",
+                "plan ".repeat(500)
+            ))),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.store_responses = false;
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10,
+        min_items: 3,
+        recent_items: 2,
+        max_summary_bytes: 1_200,
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("second prompt".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 3,
+        "expected at least three provider requests, got {}",
+        requests.len()
+    );
+    let compacted_input = &requests[2].input;
+    let declared_calls: std::collections::HashSet<&str> = compacted_input
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for item in compacted_input {
+        if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+            assert!(
+                declared_calls.contains(call_id.as_str()),
+                "orphan function_call_output for call_id {} in compacted input: {:?}",
+                call_id,
+                compacted_input
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn pinned_context_is_visible_to_model_before_compaction() {
+    let root = temp_workspace("pinned_visible");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ack".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ack2".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 1_000_000,
+        min_items: 1_000,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("first".to_string(), CancellationToken::new())).await;
+    agent
+        .pin_context_entry(
+            "decision".to_string(),
+            "Use deterministic compaction".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .expect("pin");
+    drain_turn(agent.start_turn("second".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1].instructions.contains("Pinned context"),
+        "second-turn instructions must surface pinned block, got: {}",
+        requests[1].instructions
+    );
+    assert!(
+        requests[1]
+            .instructions
+            .contains("Use deterministic compaction"),
+        "pinned summary text must reach the model: {}",
+        requests[1].instructions
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1435,4 +2027,14 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_agent_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+fn write_rust_crate(root: &std::path::Path, source: &str) {
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), source).expect("write source");
 }

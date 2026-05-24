@@ -4,12 +4,14 @@ use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, CostSnapshot, FileId, SessionLogConfig, SessionMetrics,
+    ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
+    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot, FileId, SessionLogConfig,
+    SessionMetrics,
 };
 
 use crate::{
     BugReportOptions, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
-    StoredToolReceipt,
+    StoredReadSnapshot, StoredToolReceipt,
 };
 
 use super::*;
@@ -93,6 +95,71 @@ fn session_export_preserves_task_state_events() {
         events[0]["payload"]["snapshot"]["replan_reason"],
         "new evidence changed the next step"
     );
+}
+
+#[test]
+fn session_resume_state_preserves_context_compaction() {
+    let root = temp_root("context-compaction");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let compaction = ContextCompactionState {
+        generation: 2,
+        summary: Some("compacted facts".to_string()),
+        pinned: vec![ContextPin {
+            id: "pin-0001".to_string(),
+            label: "decision".to_string(),
+            summary: "keep this decision".to_string(),
+            source: "transcript:1".to_string(),
+            created_unix_ms: 42,
+        }],
+        last: Some(ContextCompactionRecord {
+            generation: 2,
+            trigger: ContextCompactionTrigger::Manual,
+            compacted_at_ms: 43,
+            before: ContextEstimate {
+                bytes: 4000,
+                estimated_tokens: 1000,
+                items: 20,
+            },
+            after: ContextEstimate {
+                bytes: 800,
+                estimated_tokens: 200,
+                items: 5,
+            },
+            dropped_items: 15,
+            summary_bytes: 700,
+        }),
+        history: Vec::new(),
+    };
+    handle
+        .write_resume_state(&SessionResumeState {
+            resume_available: true,
+            context_compaction: compaction.clone(),
+            ..SessionResumeState::default()
+        })
+        .expect("write resume");
+    handle
+        .append_event(SessionEvent::new(
+            "context_compacted",
+            Some("turn-1".to_string()),
+            Some("compacted context".to_string()),
+            json!({ "record": compaction.last.clone() }),
+        ))
+        .expect("append compaction event");
+
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(
+        record.resume_state.expect("resume").context_compaction,
+        compaction
+    );
+    let exported = store.export(handle.session_id()).expect("export");
+    assert_eq!(exported["events"][0]["kind"], "context_compacted");
 }
 
 #[test]
@@ -446,9 +513,82 @@ fn state_store_round_trips_graph_receipts_and_observations() {
             content_sha256: Some("content".to_string()),
             model_output_bytes: 42,
             created_unix_millis: 1,
+            summary: Some("read_file sample".to_string()),
         })
         .expect("put receipt");
     assert_eq!(store.tool_receipts().expect("receipts").len(), 1);
+
+    let read_snapshot = StoredReadSnapshot {
+        path: "src/lib.rs".to_string(),
+        tool_name: "read_slice".to_string(),
+        call_id: "read_1".to_string(),
+        stable_output_sha256: "read-out".to_string(),
+        content_sha256: Some("read-content".to_string()),
+        start_byte: 0,
+        end_byte: 12,
+        content: "fn main() {}".to_string(),
+        model_output_bytes: 128,
+        created_unix_millis: 2,
+    };
+    store
+        .put_read_snapshot(&read_snapshot)
+        .expect("put read snapshot");
+    assert_eq!(
+        store
+            .read_snapshot("src/lib.rs")
+            .expect("read snapshot")
+            .expect("snapshot exists"),
+        read_snapshot
+    );
+
+    // A second snapshot for a non-overlapping window must coexist with the
+    // first rather than overwriting it: read_snapshots are keyed by
+    // `(path, start_byte, end_byte)` so distinct windows of the same file
+    // remain independently retrievable.
+    let second_window = StoredReadSnapshot {
+        path: "src/lib.rs".to_string(),
+        tool_name: "read_slice".to_string(),
+        call_id: "read_2".to_string(),
+        stable_output_sha256: "read-out-2".to_string(),
+        content_sha256: Some("read-content".to_string()),
+        start_byte: 64,
+        end_byte: 96,
+        content: "    println!(\"hello\");          ".to_string(),
+        model_output_bytes: 256,
+        created_unix_millis: 3,
+    };
+    store
+        .put_read_snapshot(&second_window)
+        .expect("put second window snapshot");
+    let mut snapshots = store
+        .read_snapshots_for_path("src/lib.rs")
+        .expect("snapshots for path");
+    snapshots.sort_by_key(|snapshot| snapshot.start_byte);
+    assert_eq!(
+        snapshots,
+        vec![read_snapshot.clone(), second_window.clone()]
+    );
+    assert_eq!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 0, 12)
+            .expect("first window")
+            .expect("first window stored"),
+        read_snapshot
+    );
+    assert_eq!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 64, 96)
+            .expect("second window")
+            .expect("second window stored"),
+        second_window
+    );
+    assert!(
+        store
+            .read_snapshot_for_window("src/lib.rs", 0, 64)
+            .expect("missing window")
+            .is_none(),
+        "windows that were never stored must not match a stale snapshot"
+    );
 
     let mut observation = Observation::new(
         ObservationKind::Decision,

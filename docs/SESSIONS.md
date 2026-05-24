@@ -14,7 +14,8 @@ Each session directory contains:
 - `events.jsonl`: append-only redacted user-visible events, tool calls/results,
   approvals, errors, and lifecycle events.
 - `resume_state.json`: redacted model-visible conversation state used by
-  `squeezy sessions resume <id>` and `/resume <id>`.
+  `squeezy sessions resume <id>` and `/resume <id>`, including compaction
+  summaries and pinned context entries.
 - `attachments/`: redacted attached-context metadata plus bounded redacted text
   for pasted context and attached text files.
 
@@ -56,6 +57,11 @@ usage is unknown, so `/context` labels that gap explicitly.
 Attached context is managed with `/attach <path>`, `/attachments`, and
 `/detach <attachment_id>`. Multi-line or large bracketed paste input is stored
 as attached context; small single-line paste input stays in the prompt editor.
+Long sessions compact automatically when local prompt-size estimates cross the
+configured `[context]` thresholds. `/compact` forces compaction, `/pin` protects
+the selected or latest transcript entry from being dropped, `/pins` lists pinned
+entries, and `/unpin <pin_id>` removes a pin. Compaction events record
+before/after estimated tokens in `events.jsonl`.
 
 Session logs are local files. Prompt text, tool arguments, tool outputs,
 approval metadata, provider errors, and assistant text are passed through the
