@@ -21,9 +21,11 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
 pub mod repo_profile;
+pub mod reports;
 pub mod sessions;
 
 pub use repo_profile::*;
+pub use reports::*;
 pub use sessions::*;
 
 pub const CRATE_NAME: &str = "squeezy-store";

@@ -30,6 +30,9 @@ Local skill discovery and activation are documented in [`SKILLS.md`](SKILLS.md).
 
 Anonymous product telemetry is documented in [`TELEMETRY.md`](TELEMETRY.md).
 
+Consented maintainer feedback and bug-report intake are documented in
+[`FEEDBACK.md`](FEEDBACK.md).
+
 Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
 
 Platform support details live in `docs/PLATFORMS.md`.

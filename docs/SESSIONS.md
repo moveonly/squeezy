@@ -24,11 +24,14 @@ squeezy sessions list --branch main --status completed --query "refactor"
 squeezy sessions show <session_id>
 squeezy sessions resume <session_id>
 squeezy sessions export <session_id>
+squeezy sessions report <session_id> --preview
+squeezy sessions report <session_id> --send
 squeezy sessions cleanup
 ```
 
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
-<session_id>`, `/session-export <session_id>`, and `/session-cleanup`.
+<session_id>`, `/session-export <session_id>`, `/report [session_id]`, and
+`/session-cleanup`.
 
 Session logs are local files. Prompt text, tool arguments, tool outputs,
 approval metadata, provider errors, and assistant text are passed through the

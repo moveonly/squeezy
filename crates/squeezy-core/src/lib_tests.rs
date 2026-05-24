@@ -969,6 +969,38 @@ env = { TOKEN = "secret-value" }
 }
 
 #[test]
+fn feedback_config_parses_endpoints_and_size_limits() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[feedback]
+enabled = true
+feedback_endpoint = "https://collector.example/v1/feedback"
+report_endpoint = "https://collector.example/v1/report"
+max_feedback_bytes = 4096
+max_report_bytes = 1048576
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert!(config.feedback.enabled);
+    assert_eq!(
+        config.feedback.feedback_endpoint,
+        "https://collector.example/v1/feedback"
+    );
+    assert_eq!(
+        config.feedback.report_endpoint,
+        "https://collector.example/v1/report"
+    );
+    assert_eq!(config.feedback.max_feedback_bytes, 4096);
+    assert_eq!(config.feedback.max_report_bytes, 1_048_576);
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("[feedback]"));
+    assert!(inspect.contains("max_feedback_bytes = 4096"));
+}
+
+#[test]
 fn redactor_masks_builtin_secret_patterns_with_stable_markers() {
     let redactor = RedactionConfig::default().redactor().expect("redactor");
     let input = concat!(

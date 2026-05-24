@@ -37,6 +37,12 @@ pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
+pub const DEFAULT_FEEDBACK_ENDPOINT: &str =
+    "https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback";
+pub const DEFAULT_REPORT_ENDPOINT: &str =
+    "https://squeezy-telemetry.esqueezy.workers.dev/v1/report";
+pub const DEFAULT_FEEDBACK_MAX_BYTES: usize = 16 * 1024;
+pub const DEFAULT_REPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const PROJECT_SETTINGS_FILE: &str = "squeezy.toml";
 pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
 pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
@@ -68,6 +74,7 @@ pub struct AppConfig {
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
     pub telemetry: TelemetryConfig,
+    pub feedback: FeedbackConfig,
     pub redaction: RedactionConfig,
     pub skills: SkillsConfig,
     pub graph: GraphConfig,
@@ -340,6 +347,10 @@ impl AppConfig {
             settings.telemetry.unwrap_or_default(),
             &mut get_var,
         );
+        let feedback = FeedbackConfig::from_settings_and_env(
+            settings.feedback.unwrap_or_default(),
+            &mut get_var,
+        );
         let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
         let permissions = PermissionPolicy::from_settings_and_env(
             settings.permissions.unwrap_or_default(),
@@ -388,6 +399,7 @@ impl AppConfig {
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
             telemetry,
+            feedback,
             redaction,
             skills,
             graph,
@@ -577,6 +589,25 @@ impl AppConfig {
         output.push_str(&format!(
             "endpoint = {}\n\n",
             toml_string(&self.telemetry.endpoint)
+        ));
+
+        output.push_str("[feedback]\n");
+        output.push_str(&format!("enabled = {}\n", self.feedback.enabled));
+        output.push_str(&format!(
+            "feedback_endpoint = {}\n",
+            toml_string(&self.feedback.feedback_endpoint)
+        ));
+        output.push_str(&format!(
+            "report_endpoint = {}\n",
+            toml_string(&self.feedback.report_endpoint)
+        ));
+        output.push_str(&format!(
+            "max_feedback_bytes = {}\n",
+            self.feedback.max_feedback_bytes
+        ));
+        output.push_str(&format!(
+            "max_report_bytes = {}\n\n",
+            self.feedback.max_report_bytes
         ));
 
         output.push_str("[redaction]\n");
@@ -842,6 +873,7 @@ pub struct SettingsFile {
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
+    pub feedback: Option<FeedbackSettings>,
     pub redaction: Option<RedactionSettings>,
     pub web: Option<WebSettings>,
     pub skills: Option<SkillsSettings>,
@@ -898,6 +930,7 @@ impl SettingsFile {
                 "budgets",
                 "permissions",
                 "telemetry",
+                "feedback",
                 "redaction",
                 "web",
                 "skills",
@@ -937,6 +970,9 @@ impl SettingsFile {
             .transpose()?;
         settings.telemetry = optional_table(table, "telemetry", source)?
             .map(|table| TelemetrySettings::from_table(table, source, "telemetry"))
+            .transpose()?;
+        settings.feedback = optional_table(table, "feedback", source)?
+            .map(|table| FeedbackSettings::from_table(table, source, "feedback"))
             .transpose()?;
         settings.redaction = optional_table(table, "redaction", source)?
             .map(|table| RedactionSettings::from_table(table, source, "redaction"))
@@ -984,6 +1020,7 @@ impl SettingsFile {
             next.telemetry,
             TelemetrySettings::merge,
         );
+        merge_option(&mut self.feedback, next.feedback, FeedbackSettings::merge);
         merge_option(
             &mut self.redaction,
             next.redaction,
@@ -2250,6 +2287,124 @@ impl Default for TelemetryConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackConfig {
+    pub enabled: bool,
+    pub feedback_endpoint: String,
+    pub report_endpoint: String,
+    pub max_feedback_bytes: usize,
+    pub max_report_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FeedbackSettings {
+    pub enabled: Option<bool>,
+    pub feedback_endpoint: Option<String>,
+    pub report_endpoint: Option<String>,
+    pub max_feedback_bytes: Option<usize>,
+    pub max_report_bytes: Option<usize>,
+}
+
+impl FeedbackSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "enabled",
+                "feedback_endpoint",
+                "report_endpoint",
+                "max_feedback_bytes",
+                "max_report_bytes",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?,
+            feedback_endpoint: string_value(
+                table,
+                "feedback_endpoint",
+                source,
+                &field(path, "feedback_endpoint"),
+            )?,
+            report_endpoint: string_value(
+                table,
+                "report_endpoint",
+                source,
+                &field(path, "report_endpoint"),
+            )?,
+            max_feedback_bytes: usize_value(
+                table,
+                "max_feedback_bytes",
+                source,
+                &field(path, "max_feedback_bytes"),
+            )?,
+            max_report_bytes: usize_value(
+                table,
+                "max_report_bytes",
+                source,
+                &field(path, "max_report_bytes"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.enabled, next.enabled);
+        replace_if_some(&mut self.feedback_endpoint, next.feedback_endpoint);
+        replace_if_some(&mut self.report_endpoint, next.report_endpoint);
+        replace_if_some(&mut self.max_feedback_bytes, next.max_feedback_bytes);
+        replace_if_some(&mut self.max_report_bytes, next.max_report_bytes);
+    }
+}
+
+impl FeedbackConfig {
+    fn from_settings_and_env(
+        settings: FeedbackSettings,
+        mut var: impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        let disabled = parse_disabled_bool(var("SQUEEZY_FEEDBACK").as_deref());
+        let feedback_endpoint = var("SQUEEZY_FEEDBACK_ENDPOINT")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or(settings.feedback_endpoint)
+            .unwrap_or_else(|| DEFAULT_FEEDBACK_ENDPOINT.to_string());
+        let report_endpoint = var("SQUEEZY_REPORT_ENDPOINT")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or(settings.report_endpoint)
+            .unwrap_or_else(|| DEFAULT_REPORT_ENDPOINT.to_string());
+        Self {
+            enabled: if disabled {
+                false
+            } else {
+                settings.enabled.unwrap_or(true)
+            },
+            feedback_endpoint,
+            report_endpoint,
+            max_feedback_bytes: settings
+                .max_feedback_bytes
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_FEEDBACK_MAX_BYTES),
+            max_report_bytes: settings
+                .max_report_bytes
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_REPORT_MAX_BYTES),
+        }
+    }
+}
+
+impl Default for FeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            feedback_endpoint: DEFAULT_FEEDBACK_ENDPOINT.to_string(),
+            report_endpoint: DEFAULT_REPORT_ENDPOINT.to_string(),
+            max_feedback_bytes: DEFAULT_FEEDBACK_MAX_BYTES,
+            max_report_bytes: DEFAULT_REPORT_MAX_BYTES,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct RedactionSettings {
     pub custom_patterns: Option<Vec<String>>,
@@ -3083,6 +3238,13 @@ pub fn user_settings_template() -> &'static str {
 
 [telemetry]
 # enabled = true
+
+[feedback]
+# enabled = true
+# feedback_endpoint = "https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback"
+# report_endpoint = "https://squeezy-telemetry.esqueezy.workers.dev/v1/report"
+# max_feedback_bytes = 16384
+# max_report_bytes = 2097152
 
 # [redaction]
 # custom_patterns = []

@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     io::{self, Write},
     sync::Arc,
     time::Duration,
@@ -23,7 +24,8 @@ use squeezy_core::{
     TelemetryConfig, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
-use squeezy_store::SessionQuery;
+use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
+use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::ToolCall;
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{mpsc, oneshot};
@@ -296,7 +298,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     let Some(command) = parts.next() else {
         return false;
     };
+    let rest = input
+        .strip_prefix(command)
+        .map(str::trim)
+        .unwrap_or_default();
     match command {
+        "/feedback" => {
+            handle_feedback_command(app, agent, rest).await;
+            return true;
+        }
+        "/report" => {
+            handle_report_command(app, agent, rest).await;
+            return true;
+        }
         "/sessions" => {
             match agent.list_sessions(&SessionQuery::default()) {
                 Ok(sessions) => {
@@ -442,6 +456,133 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         summarize_local_tool_result(&result.content)
     );
     true
+}
+
+async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    match rest {
+        "send" => {
+            let Some(feedback) = app.pending_feedback.take() else {
+                app.status = "no feedback pending".to_string();
+                return;
+            };
+            match agent.submit_feedback(&feedback).await {
+                Ok(result) => {
+                    app.status = format!("feedback sent {}", result.id);
+                    app.transcript.push(TranscriptItem::system(format!(
+                        "feedback sent\nfeedback_id={}",
+                        result.id
+                    )));
+                }
+                Err(error) => {
+                    app.pending_feedback = Some(feedback);
+                    app.status = format!("feedback send failed: {error}");
+                }
+            }
+        }
+        "cancel" => {
+            app.pending_feedback = None;
+            app.status = "feedback cancelled".to_string();
+        }
+        "" => {
+            app.status =
+                "usage: /feedback <what happened> | /feedback send | /feedback cancel".to_string();
+        }
+        message => match agent.prepare_feedback(message) {
+            Ok(feedback) => {
+                let preview = format!(
+                    "feedback preview\nfeedback_id={}\nbytes={} redactions={}\n\n{}\n\nRun /feedback send to submit or /feedback cancel.",
+                    feedback.feedback_id,
+                    feedback.message_bytes,
+                    feedback.redactions,
+                    feedback.message
+                );
+                app.pending_feedback = Some(feedback);
+                app.status = "feedback preview ready".to_string();
+                app.transcript.push(TranscriptItem::system(preview));
+            }
+            Err(error) => app.status = format!("feedback preview failed: {error}"),
+        },
+    }
+}
+
+async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
+    match rest {
+        "send" => {
+            let Some(report) = app.pending_report.take() else {
+                app.status = "no report pending".to_string();
+                return;
+            };
+            match agent.submit_bug_report(&report).await {
+                Ok(result) => {
+                    app.status = format!("report sent {}", result.id);
+                    app.transcript.push(TranscriptItem::system(format!(
+                        "report sent\nreport_id={}",
+                        result.id
+                    )));
+                }
+                Err(error) => {
+                    app.pending_report = Some(report);
+                    app.status = format!("report send failed: {error}");
+                }
+            }
+        }
+        "cancel" => {
+            app.pending_report = None;
+            app.status = "report cancelled".to_string();
+        }
+        _ => {
+            let (session_id, excluded_sections) = match parse_report_preview_args(agent, rest) {
+                Ok(value) => value,
+                Err(error) => {
+                    app.status = error;
+                    return;
+                }
+            };
+            let options = BugReportOptions {
+                excluded_sections,
+                ..BugReportOptions::default()
+            };
+            match agent.build_bug_report(&session_id, options) {
+                Ok(report) => {
+                    let mut preview = report.preview_text();
+                    preview.push_str("\nRun /report send to upload or /report cancel.");
+                    app.pending_report = Some(report);
+                    app.status = "report preview ready".to_string();
+                    app.transcript.push(TranscriptItem::system(preview));
+                }
+                Err(error) => app.status = format!("report preview failed: {error}"),
+            }
+        }
+    }
+}
+
+fn parse_report_preview_args(
+    agent: &Agent,
+    rest: &str,
+) -> std::result::Result<(String, BTreeSet<String>), String> {
+    let mut session_id = None;
+    let mut excluded_sections = BTreeSet::new();
+    for part in rest.split_whitespace() {
+        if let Some(raw) = part.strip_prefix("exclude=") {
+            for section in raw.split(',').filter(|section| !section.trim().is_empty()) {
+                let Some(parsed) = parse_bug_report_section(section) else {
+                    return Err(format!("unknown report section {section:?}"));
+                };
+                excluded_sections.insert(parsed.to_string());
+            }
+        } else if session_id.is_none() {
+            session_id = Some(part.to_string());
+        } else {
+            return Err(
+                "usage: /report [session_id] [exclude=a,b] | /report send | /report cancel"
+                    .to_string(),
+            );
+        }
+    }
+    let session_id = session_id
+        .or_else(|| agent.session_id())
+        .ok_or_else(|| "usage: /report <session_id> [exclude=a,b]".to_string())?;
+    Ok((session_id, excluded_sections))
 }
 
 fn summarize_local_tool_result(content: &serde_json::Value) -> String {
@@ -835,7 +976,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume /feedback /report | Ctrl-C cancel | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -1070,6 +1211,8 @@ struct TuiApp {
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
+    pending_feedback: Option<PreparedFeedback>,
+    pending_report: Option<BugReportBundle>,
     clipboard: Box<dyn Clipboard>,
 }
 
@@ -1129,6 +1272,8 @@ impl TuiApp {
             turn_rx: None,
             cancel: None,
             pending_approval: None,
+            pending_feedback: None,
+            pending_report: None,
             clipboard,
         }
     }

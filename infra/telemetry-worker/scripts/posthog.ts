@@ -105,6 +105,40 @@ ORDER BY failures DESC
 `.trim(),
   },
   {
+    name: "Squeezy Feedback Intake",
+    description: "Explicit user-submitted feedback counts and redaction volume.",
+    query: `
+SELECT
+  toDate(timestamp) AS day,
+  properties.source AS source,
+  count() AS feedback,
+  sum(toUInt64OrZero(toString(properties.message_bytes))) AS message_bytes,
+  sum(toUInt64OrZero(toString(properties.redactions))) AS redactions
+FROM events
+WHERE event = 'squeezy_feedback_submitted'
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY day, source
+ORDER BY day ASC, source ASC
+`.trim(),
+  },
+  {
+    name: "Squeezy Report Uploads",
+    description: "Explicit bug-report archive uploads with metadata only.",
+    query: `
+SELECT
+  toDate(timestamp) AS day,
+  properties.source AS source,
+  count() AS reports,
+  sum(toUInt64OrZero(toString(properties.archive_bytes))) AS archive_bytes,
+  sum(toUInt64OrZero(toString(properties.redactions))) AS redactions
+FROM events
+WHERE event = 'squeezy_report_submitted'
+  AND timestamp > now() - INTERVAL 30 DAY
+GROUP BY day, source
+ORDER BY day ASC, source ASC
+`.trim(),
+  },
+  {
     name: "Squeezy Graph Build Performance",
     description: "AST/graph build and refresh performance counters.",
     query: `

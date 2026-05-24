@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     env, fs,
     io::{self, Write},
     path::PathBuf,
@@ -16,10 +17,13 @@ use squeezy_llm::{
     models_for_provider, provider_from_config,
 };
 use squeezy_store::{
-    RepoProfileLoad, ResumeItem, SessionEvent, SessionMetadata, SessionQuery, SessionResumeState,
-    SessionStatus, SessionStore, ensure_repo_profile, refresh_repo_profile,
+    BugReportOptions, RepoProfileLoad, ResumeItem, SessionEvent, SessionMetadata, SessionQuery,
+    SessionResumeState, SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
+    parse_bug_report_section, refresh_repo_profile,
 };
-use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
+use squeezy_telemetry::{
+    FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
+};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Parser)]
@@ -66,6 +70,8 @@ enum Command {
         #[command(subcommand)]
         command: SessionsCommand,
     },
+    #[command(about = "Submit short redacted feedback to Squeezy maintainers")]
+    Feedback(FeedbackArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -110,6 +116,8 @@ enum SessionsCommand {
     Resume { id: String },
     #[command(about = "Export a redacted local session bundle as JSON")]
     Export { id: String },
+    #[command(about = "Preview, save, or send a redacted bug-report archive")]
+    Report(SessionReportArgs),
     #[command(about = "Remove expired sessions or explicit session ids")]
     Cleanup {
         #[arg(long = "id")]
@@ -139,6 +147,31 @@ struct SessionListArgs {
     query: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct FeedbackArgs {
+    #[arg(value_name = "TEXT", num_args = 0.., trailing_var_arg = true)]
+    message: Vec<String>,
+    #[arg(long, help = "Print the redacted payload without sending")]
+    preview: bool,
+    #[arg(long, help = "Send without an interactive confirmation prompt")]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct SessionReportArgs {
+    id: String,
+    #[arg(long, help = "Write archive to this path")]
+    output: Option<PathBuf>,
+    #[arg(long, help = "Print the redacted report manifest preview")]
+    preview: bool,
+    #[arg(long, help = "Upload the archive to the configured feedback endpoint")]
+    send: bool,
+    #[arg(long, help = "Send without an interactive confirmation prompt")]
+    yes: bool,
+    #[arg(long = "exclude", help = "Exclude a report section")]
+    exclude: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
     tracing_subscriber::fmt()
@@ -153,6 +186,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Sessions { command }) => {
             return handle_sessions_command(command, &cli).await;
         }
+        Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         None => {}
     }
 
@@ -392,6 +426,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             );
             Ok(())
         }
+        SessionsCommand::Report(args) => handle_session_report_command(args, &config).await,
         SessionsCommand::Cleanup { ids } => {
             let report = store.cleanup(ids)?;
             for id in report.removed {
@@ -400,6 +435,128 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
     }
+}
+
+async fn handle_feedback_command(args: &FeedbackArgs, cli: &Cli) -> squeezy_core::Result<()> {
+    let config = config_from_cli(cli)?;
+    let message = feedback_message(args)?;
+    let prepared = prepare_feedback(&config, &message, "cli")?;
+    println!("feedback preview:");
+    println!("{}", prepared.message);
+    println!(
+        "bytes={} redactions={}",
+        prepared.message_bytes, prepared.redactions
+    );
+    if args.preview {
+        return Ok(());
+    }
+    if !args.yes && !confirm("Send feedback to Squeezy maintainers?")? {
+        println!("feedback not sent");
+        return Ok(());
+    }
+    let result = FeedbackClient::from_config(&config)
+        .submit_feedback(&prepared)
+        .await
+        .map_err(|error| SqueezyError::Tool(error.to_string()))?;
+    println!("feedback sent: {}", result.id);
+    Ok(())
+}
+
+async fn handle_session_report_command(
+    args: &SessionReportArgs,
+    config: &AppConfig,
+) -> squeezy_core::Result<()> {
+    let excluded_sections = parse_excluded_sections(&args.exclude)?;
+    let options = BugReportOptions {
+        excluded_sections,
+        max_section_bytes: config.session_logs.max_event_bytes,
+        max_archive_bytes: config.feedback.max_report_bytes,
+    };
+    let bundle = SessionStore::open(config).build_bug_report(config, &args.id, options)?;
+    if args.preview || args.send {
+        print!("{}", bundle.preview_text());
+    }
+    if args.preview && !args.send && args.output.is_none() {
+        return Ok(());
+    }
+    if args.send {
+        if !args.yes && !confirm("Upload this redacted report archive to Squeezy maintainers?")? {
+            println!("report not sent");
+            return Ok(());
+        }
+        let sections = bundle
+            .sections
+            .iter()
+            .map(|section| section.name.clone())
+            .collect::<Vec<_>>();
+        match FeedbackClient::from_config(config)
+            .submit_report(ReportUpload {
+                report_id: &bundle.report_id,
+                session_id: &bundle.session_id,
+                archive_bytes: &bundle.archive_bytes,
+                redactions: bundle.redactions,
+                sections,
+                source: "cli",
+            })
+            .await
+        {
+            Ok(result) => {
+                println!("report sent: {}", result.id);
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("report upload failed: {error}");
+                eprintln!("writing local archive instead");
+            }
+        }
+    }
+    let path = args
+        .output
+        .clone()
+        .unwrap_or_else(|| default_bug_report_path(config, &args.id));
+    bundle.write_archive(&path)?;
+    println!("report archive: {}", path.display());
+    Ok(())
+}
+
+fn feedback_message(args: &FeedbackArgs) -> squeezy_core::Result<String> {
+    if !args.message.is_empty() {
+        return Ok(args.message.join(" "));
+    }
+    eprint!("What happened? ");
+    io::stderr().flush()?;
+    let mut message = String::new();
+    io::stdin().read_line(&mut message)?;
+    Ok(message)
+}
+
+fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
+    eprint!("{prompt} [y/N] ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn parse_excluded_sections(values: &[String]) -> squeezy_core::Result<BTreeSet<String>> {
+    let mut excluded = BTreeSet::new();
+    for value in values {
+        for part in value.split(',') {
+            if part.trim().is_empty() {
+                continue;
+            }
+            let Some(section) = parse_bug_report_section(part) else {
+                return Err(SqueezyError::Config(format!(
+                    "unknown report section {part:?}"
+                )));
+            };
+            excluded.insert(section.to_string());
+        }
+    }
+    Ok(excluded)
 }
 
 struct PreparedRepoProfile {

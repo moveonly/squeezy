@@ -28,6 +28,19 @@ https://squeezy-telemetry.esqueezy.workers.dev/v1/batch
 Override it with `SQUEEZY_TELEMETRY_ENDPOINT` when testing a local or staging
 collector.
 
+The same Worker also exposes consented intake endpoints for `/feedback` and
+`/report`:
+
+```text
+https://squeezy-telemetry.esqueezy.workers.dev/v1/feedback
+https://squeezy-telemetry.esqueezy.workers.dev/v1/report
+```
+
+Those endpoints are not anonymous background telemetry. `/feedback` sends
+short redacted user text after explicit confirmation. `/report` uploads a
+redacted archive to private R2 storage after explicit confirmation and forwards
+only metadata to PostHog.
+
 ## Identity
 
 Squeezy creates one random anonymous `user_id` and stores it at
@@ -77,6 +90,10 @@ Telemetry must not include:
 - API keys, tokens, environment variable values, or settings file contents,
 - exact model names when they may be user/private configured; telemetry uses
   model family buckets instead.
+
+These restrictions describe automatic telemetry events. Consented feedback and
+report submission have their own preview, redaction, and size caps documented
+in [`FEEDBACK.md`](FEEDBACK.md).
 
 ## Redaction Boundary
 

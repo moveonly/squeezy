@@ -6,3 +6,9 @@ preview_urls = false
 
 [vars]
 POSTHOG_HOST = "https://eu.i.posthog.com"
+
+# Required for POST /v1/report. Create a private bucket and add a lifecycle
+# rule in Cloudflare to expire report archives after 30 or 90 days.
+# [[r2_buckets]]
+# binding = "REPORT_BUCKET"
+# bucket_name = "squeezy-reports"

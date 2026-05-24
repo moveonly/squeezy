@@ -19,13 +19,14 @@ use squeezy_core::{
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_store::{
-    CleanupReport, ResumeItem, SessionEvent, SessionHandle, SessionMetadata, SessionQuery,
-    SessionRecord, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
-    StoredToolReceipt,
+    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
+    SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
+    SqueezyStore, StoredToolReceipt,
 };
 use squeezy_telemetry::{
-    ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
-    ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
+    ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
+    TelemetryClient, TelemetryEvent, ToolCostProperties, ToolStatusKind as TelemetryToolStatusKind,
+    ToolTelemetryReport, prepare_feedback,
 };
 use squeezy_tools::{
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
@@ -304,6 +305,50 @@ impl Agent {
 
     pub fn export_session(&self, session_id: &str) -> squeezy_core::Result<Value> {
         SessionStore::open(&self.config).export(session_id)
+    }
+
+    pub fn prepare_feedback(&self, message: &str) -> squeezy_core::Result<PreparedFeedback> {
+        prepare_feedback(&self.config, message, "tui")
+    }
+
+    pub async fn submit_feedback(
+        &self,
+        feedback: &PreparedFeedback,
+    ) -> squeezy_core::Result<FeedbackSubmitResult> {
+        FeedbackClient::from_config(&self.config)
+            .submit_feedback(feedback)
+            .await
+            .map_err(|error| SqueezyError::Tool(error.to_string()))
+    }
+
+    pub fn build_bug_report(
+        &self,
+        session_id: &str,
+        options: BugReportOptions,
+    ) -> squeezy_core::Result<BugReportBundle> {
+        SessionStore::open(&self.config).build_bug_report(&self.config, session_id, options)
+    }
+
+    pub async fn submit_bug_report(
+        &self,
+        bundle: &BugReportBundle,
+    ) -> squeezy_core::Result<FeedbackSubmitResult> {
+        let sections = bundle
+            .sections
+            .iter()
+            .map(|section| section.name.clone())
+            .collect::<Vec<_>>();
+        FeedbackClient::from_config(&self.config)
+            .submit_report(ReportUpload {
+                report_id: &bundle.report_id,
+                session_id: &bundle.session_id,
+                archive_bytes: &bundle.archive_bytes,
+                redactions: bundle.redactions,
+                sections,
+                source: "tui",
+            })
+            .await
+            .map_err(|error| SqueezyError::Tool(error.to_string()))
     }
 
     pub fn cleanup_sessions(&self, ids: &[String]) -> squeezy_core::Result<CleanupReport> {

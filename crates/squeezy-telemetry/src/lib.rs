@@ -33,6 +33,22 @@ struct TelemetryState {
     http: reqwest::Client,
 }
 
+#[derive(Debug, Clone)]
+pub struct FeedbackClient {
+    state: Option<Arc<FeedbackState>>,
+}
+
+#[derive(Debug)]
+struct FeedbackState {
+    feedback_endpoint: String,
+    report_endpoint: String,
+    max_feedback_bytes: usize,
+    max_report_bytes: usize,
+    install_id: String,
+    session_id: String,
+    http: reqwest::Client,
+}
+
 #[derive(Debug, Default)]
 struct TelemetryQueue {
     events: Vec<TelemetryEvent>,
@@ -115,6 +131,264 @@ impl TelemetryClient {
         let events = drain_queued_events(&state).await;
         send_batch(state, events).await
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedFeedback {
+    pub feedback_id: String,
+    pub message: String,
+    pub message_bytes: usize,
+    pub redactions: u64,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportUpload<'a> {
+    pub report_id: &'a str,
+    pub session_id: &'a str,
+    pub archive_bytes: &'a [u8],
+    pub redactions: u64,
+    pub sections: Vec<String>,
+    pub source: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackSubmitResult {
+    pub id: String,
+}
+
+#[derive(Debug)]
+pub enum FeedbackError {
+    Disabled,
+    Io(std::io::Error),
+    Http(reqwest::Error),
+    Status(reqwest::StatusCode),
+    InvalidResponse(String),
+    TooLarge { bytes: usize, max_bytes: usize },
+}
+
+impl std::fmt::Display for FeedbackError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => write!(f, "feedback is disabled"),
+            Self::Io(error) => write!(f, "feedback setup failed: {error}"),
+            Self::Http(error) => write!(f, "feedback request failed: {error}"),
+            Self::Status(status) => write!(f, "feedback endpoint returned HTTP {status}"),
+            Self::InvalidResponse(message) => {
+                write!(f, "feedback endpoint response was invalid: {message}")
+            }
+            Self::TooLarge { bytes, max_bytes } => {
+                write!(
+                    f,
+                    "feedback payload is {bytes} bytes, exceeding limit {max_bytes}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FeedbackError {}
+
+impl FeedbackClient {
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self::from_config_with_install_path(config, default_install_id_path())
+    }
+
+    pub fn disabled() -> Self {
+        Self { state: None }
+    }
+
+    pub fn from_config_with_install_path(
+        config: &AppConfig,
+        install_id_path: impl AsRef<Path>,
+    ) -> Self {
+        if !config.feedback.enabled {
+            return Self::disabled();
+        }
+        let install_id = match load_or_create_install_id(install_id_path.as_ref()) {
+            Ok(id) => id,
+            Err(_) => return Self::disabled(),
+        };
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            state: Some(Arc::new(FeedbackState {
+                feedback_endpoint: config.feedback.feedback_endpoint.clone(),
+                report_endpoint: config.feedback.report_endpoint.clone(),
+                max_feedback_bytes: config.feedback.max_feedback_bytes,
+                max_report_bytes: config.feedback.max_report_bytes,
+                install_id,
+                session_id: random_uuid_like(),
+                http,
+            })),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.state.is_some()
+    }
+
+    pub async fn submit_feedback(
+        &self,
+        feedback: &PreparedFeedback,
+    ) -> Result<FeedbackSubmitResult, FeedbackError> {
+        let Some(state) = &self.state else {
+            return Err(FeedbackError::Disabled);
+        };
+        if feedback.message_bytes > state.max_feedback_bytes {
+            return Err(FeedbackError::TooLarge {
+                bytes: feedback.message_bytes,
+                max_bytes: state.max_feedback_bytes,
+            });
+        }
+        let request = FeedbackRequest {
+            schema_version: SCHEMA_VERSION,
+            feedback_id: feedback.feedback_id.as_str(),
+            user_id: state.install_id.as_str(),
+            install_id: state.install_id.as_str(),
+            session_id: state.session_id.as_str(),
+            app_version: env!("CARGO_PKG_VERSION"),
+            os: env::consts::OS,
+            arch: env::consts::ARCH,
+            source: feedback.source.as_str(),
+            timestamp_ms: now_ms(),
+            message: feedback.message.as_str(),
+            message_bytes: feedback.message_bytes,
+            redactions: feedback.redactions,
+        };
+        let response = state
+            .http
+            .post(&state.feedback_endpoint)
+            .json(&request)
+            .send()
+            .await
+            .map_err(FeedbackError::Http)?;
+        parse_submit_response(response, &feedback.feedback_id).await
+    }
+
+    pub async fn submit_report(
+        &self,
+        report: ReportUpload<'_>,
+    ) -> Result<FeedbackSubmitResult, FeedbackError> {
+        let Some(state) = &self.state else {
+            return Err(FeedbackError::Disabled);
+        };
+        if report.archive_bytes.len() > state.max_report_bytes {
+            return Err(FeedbackError::TooLarge {
+                bytes: report.archive_bytes.len(),
+                max_bytes: state.max_report_bytes,
+            });
+        }
+        let response = state
+            .http
+            .post(&state.report_endpoint)
+            .header("content-type", "application/x-tar")
+            .header("x-squeezy-schema-version", SCHEMA_VERSION.to_string())
+            .header("x-squeezy-report-id", report.report_id)
+            .header("x-squeezy-session-id", report.session_id)
+            .header("x-squeezy-source", report.source)
+            .header("x-squeezy-app-version", env!("CARGO_PKG_VERSION"))
+            .header("x-squeezy-os", env::consts::OS)
+            .header("x-squeezy-arch", env::consts::ARCH)
+            .header("x-squeezy-install-id", state.install_id.as_str())
+            .header("x-squeezy-user-id", state.install_id.as_str())
+            .header("x-squeezy-client-session-id", state.session_id.as_str())
+            .header(
+                "x-squeezy-archive-bytes",
+                report.archive_bytes.len().to_string(),
+            )
+            .header("x-squeezy-redactions", report.redactions.to_string())
+            .header("x-squeezy-sections", report.sections.join(","))
+            .body(report.archive_bytes.to_vec())
+            .send()
+            .await
+            .map_err(FeedbackError::Http)?;
+        parse_submit_response(response, report.report_id).await
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FeedbackRequest<'a> {
+    schema_version: u32,
+    feedback_id: &'a str,
+    user_id: &'a str,
+    install_id: &'a str,
+    session_id: &'a str,
+    app_version: &'static str,
+    os: &'static str,
+    arch: &'static str,
+    source: &'a str,
+    timestamp_ms: u128,
+    message: &'a str,
+    message_bytes: usize,
+    redactions: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubmitResponse {
+    id: Option<String>,
+    feedback_id: Option<String>,
+    report_id: Option<String>,
+}
+
+pub fn prepare_feedback(
+    config: &AppConfig,
+    message: &str,
+    source: impl Into<String>,
+) -> squeezy_core::Result<PreparedFeedback> {
+    if !config.feedback.enabled {
+        return Err(squeezy_core::SqueezyError::Tool(
+            "feedback is disabled".to_string(),
+        ));
+    }
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Err(squeezy_core::SqueezyError::Tool(
+            "feedback message cannot be empty".to_string(),
+        ));
+    }
+    let redactor = config.redaction.redactor()?;
+    let redacted = redactor.redact(trimmed);
+    let message_bytes = redacted.text.len();
+    if message_bytes > config.feedback.max_feedback_bytes {
+        return Err(squeezy_core::SqueezyError::Tool(format!(
+            "feedback message is {message_bytes} bytes, exceeding max_feedback_bytes {}",
+            config.feedback.max_feedback_bytes
+        )));
+    }
+    Ok(PreparedFeedback {
+        feedback_id: random_uuid_like(),
+        message: redacted.text,
+        message_bytes,
+        redactions: redacted.redactions,
+        source: source.into(),
+    })
+}
+
+async fn parse_submit_response(
+    response: reqwest::Response,
+    fallback_id: &str,
+) -> Result<FeedbackSubmitResult, FeedbackError> {
+    if !response.status().is_success() {
+        return Err(FeedbackError::Status(response.status()));
+    }
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        return Ok(FeedbackSubmitResult {
+            id: fallback_id.to_string(),
+        });
+    }
+    let parsed = response
+        .json::<SubmitResponse>()
+        .await
+        .map_err(FeedbackError::Http)?;
+    let id = parsed
+        .id
+        .or(parsed.feedback_id)
+        .or(parsed.report_id)
+        .unwrap_or_else(|| fallback_id.to_string());
+    Ok(FeedbackSubmitResult { id })
 }
 
 #[derive(Debug)]

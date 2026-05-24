@@ -5,7 +5,9 @@ use std::{
     time::Duration,
 };
 
-use squeezy_core::{AppConfig, CostSnapshot, DEFAULT_TELEMETRY_ENDPOINT, TurnMetrics};
+use squeezy_core::{
+    AppConfig, CostSnapshot, DEFAULT_TELEMETRY_ENDPOINT, FeedbackConfig, TurnMetrics,
+};
 
 use super::*;
 
@@ -54,6 +56,35 @@ fn install_id_is_persisted() {
     assert!(is_uuid_like(&first_id));
     assert!(fs::read_to_string(path).unwrap().contains(&first_id));
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn feedback_preview_is_redacted_and_size_checked() {
+    let config = AppConfig {
+        feedback: FeedbackConfig {
+            max_feedback_bytes: 128,
+            ..FeedbackConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let prepared = prepare_feedback(
+        &config,
+        "fails with OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456",
+        "cli",
+    )
+    .expect("prepare feedback");
+
+    assert_eq!(prepared.source, "cli");
+    assert!(prepared.message.contains("<redacted:"));
+    assert!(
+        !prepared
+            .message
+            .contains("sk-abcdefghijklmnopqrstuvwxyz123456")
+    );
+
+    let error = prepare_feedback(&config, &"x".repeat(129), "cli")
+        .expect_err("oversized feedback must fail");
+    assert!(error.to_string().contains("max_feedback_bytes"));
 }
 
 #[tokio::test]

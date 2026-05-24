@@ -1,10 +1,13 @@
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::{AppConfig, CostSnapshot, FileId, SessionLogConfig, SessionMetrics};
 
-use crate::{GraphStoreMetadata, Observation, ObservationKind, SqueezyStore, StoredToolReceipt};
+use crate::{
+    BugReportOptions, GraphStoreMetadata, Observation, ObservationKind, SqueezyStore,
+    StoredToolReceipt,
+};
 
 use super::*;
 
@@ -70,6 +73,77 @@ fn malformed_event_lines_are_counted_as_warnings() {
     let record = store.show(handle.session_id()).expect("show");
     assert_eq!(record.event_warnings, 1);
     assert!(record.events.is_empty());
+}
+
+#[test]
+fn bug_report_archive_redacts_events_and_records_exclusions() {
+    let root = temp_root("bug-report-redaction");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz123456".to_string()),
+            json!({
+                "OPENAI_API_KEY=sk-keyonlyabcdefghijklmnopqrstuvwxyz123456": "secret-shaped key",
+                "stderr": "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456",
+                "path": "src/lib.rs",
+            }),
+        ))
+        .expect("append event");
+    handle
+        .append_event(SessionEvent::new(
+            "approval_requested",
+            Some("1".to_string()),
+            Some("shell".to_string()),
+            json!({"permission": {"metadata": {"env": "TOKEN=secret-token-value"}}}),
+        ))
+        .expect("append approval");
+
+    let bundle = store
+        .build_bug_report(
+            &config,
+            handle.session_id(),
+            BugReportOptions {
+                excluded_sections: BTreeSet::from(["replay".to_string()]),
+                max_section_bytes: 4096,
+                max_archive_bytes: 2 * 1024 * 1024,
+            },
+        )
+        .expect("build report");
+    let archive = String::from_utf8_lossy(&bundle.archive_bytes);
+
+    assert_eq!(
+        bundle.manifest["archive_bytes"].as_u64(),
+        Some(bundle.archive_bytes.len() as u64)
+    );
+    assert!(archive.contains("manifest.json"));
+    assert!(archive.contains("session/events.jsonl"));
+    assert!(archive.contains("\"excluded_sections\""));
+    assert!(archive.contains("replay"));
+    assert!(archive.contains("<redacted:"), "{archive}");
+    assert!(!archive.contains("sk-abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(!archive.contains("sk-keyonlyabcdefghijklmnopqrstuvwxyz123456"));
+    assert!(!archive.contains("abcdefghijklmnopqrstuvwxyz123456"));
+    assert!(!archive.contains("secret-token-value"));
+    assert!(
+        bundle
+            .sections
+            .iter()
+            .any(|section| section.name == "events" && section.redactions > 0)
+    );
+    assert!(bundle.preview_text().contains("archive_bytes="));
 }
 
 #[test]
