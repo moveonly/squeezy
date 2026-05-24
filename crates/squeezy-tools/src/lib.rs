@@ -80,6 +80,10 @@ const MAX_GRAPH_MAX_RESULTS: usize = 100;
 const DEFAULT_GRAPH_MAX_DEPTH: usize = 3;
 const MAX_GRAPH_MAX_DEPTH: usize = 8;
 const GRAPH_READ_SLICE_MAX_LINE_SCAN_BYTES: u64 = 5_000_000;
+const DEFAULT_PATCH_MAX_SYMBOLS: usize = 8;
+const DEFAULT_PATCH_MAX_RELATED: usize = 12;
+const MAX_PATCH_BLOCKS: usize = 32;
+const PATCH_SNIPPET_MAX_CHARS: usize = 2_000;
 
 /// Per-process runtime bits the registry needs alongside its tool-specific
 /// configs. Grouping them keeps the public constructor signature under
@@ -988,6 +992,7 @@ impl ToolRegistry {
 
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
+            apply_patch_spec(),
             checkpoint_list_spec(),
             checkpoint_revert_spec(),
             checkpoint_show_spec(),
@@ -999,6 +1004,7 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            plan_patch_spec(),
             read_file_spec(),
             read_slice_spec(),
             read_tool_output_spec(),
@@ -1037,7 +1043,7 @@ impl ToolRegistry {
             return PermissionScope::Mcp;
         }
         match call.name.as_str() {
-            "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
+            "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
             "write_file" => PermissionScope::Edit,
             "shell" | "verify" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
@@ -1050,8 +1056,8 @@ impl ToolRegistry {
                 PermissionScope::IgnoredSearch
             }
             "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
-            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "read_file"
-            | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
+            | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
+            | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
             | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => {
                 PermissionScope::Read
             }
@@ -1094,6 +1100,41 @@ impl ToolRegistry {
             };
         }
         let (capability, target, risk) = match call.name.as_str() {
+            "apply_patch" => {
+                let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
+                let paths = args
+                    .as_ref()
+                    .map(|args| {
+                        args.patches
+                            .iter()
+                            .map(|patch| patch.path.as_str())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let target = if paths.len() == 1 {
+                    format!("path:{}", paths[0])
+                } else {
+                    "workspace:patches".to_string()
+                };
+                metadata.insert(
+                    "paths".to_string(),
+                    if paths.is_empty() {
+                        "*".to_string()
+                    } else {
+                        paths.join(", ")
+                    },
+                );
+                for path in paths.iter().take(5) {
+                    suggested_rules.push(PermissionRule::new(
+                        "edit",
+                        format!("path:{path}"),
+                        PermissionMode::Allow,
+                        PermissionRuleSource::Session,
+                        Some("approved patch path".to_string()),
+                    ));
+                }
+                (PermissionCapability::Edit, target, PermissionRisk::High)
+            }
             "checkpoint_undo" | "checkpoint_revert" => (
                 PermissionCapability::Edit,
                 "workspace:*".to_string(),
@@ -1248,8 +1289,8 @@ impl ToolRegistry {
                 PermissionRisk::Low,
             ),
             "checkpoint_list" | "checkpoint_show" | "diff_context" | "downstream_flow"
-            | "hierarchy" | "read_file" | "read_slice" | "read_tool_output" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => (
+            | "hierarchy" | "plan_patch" | "read_file" | "read_slice" | "read_tool_output"
+            | "repo_map" | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => (
                 PermissionCapability::Read,
                 "workspace:*".to_string(),
                 PermissionRisk::Low,
@@ -1284,6 +1325,7 @@ impl ToolRegistry {
                 | "glob"
                 | "grep"
                 | "hierarchy"
+                | "plan_patch"
                 | "read_file"
                 | "read_slice"
                 | "read_tool_output"
@@ -1329,6 +1371,21 @@ impl ToolRegistry {
                     ),
                     (None, None) => "checkpoint_revert".to_string(),
                 }
+            }
+            "apply_patch" => {
+                let args = serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()).ok();
+                let paths = args
+                    .as_ref()
+                    .map(|args| {
+                        args.patches
+                            .iter()
+                            .map(|patch| patch.path.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .filter(|paths| !paths.is_empty())
+                    .unwrap_or_else(|| "?".to_string());
+                format!("apply_patch paths={paths:?}")
             }
             "repo_map" => "repo_map".to_string(),
             "decl_search" | "definition_search" | "reference_search" => {
@@ -1407,6 +1464,14 @@ impl ToolRegistry {
                 let args = serde_json::from_value::<SymbolContextArgs>(call.arguments.clone()).ok();
                 let query = args.as_ref().map(|args| args.query.as_str()).unwrap_or("?");
                 format!("symbol_context query={query:?}")
+            }
+            "plan_patch" => {
+                let args = serde_json::from_value::<PlanPatchArgs>(call.arguments.clone()).ok();
+                let objective = args
+                    .as_ref()
+                    .map(|args| args.objective.as_str())
+                    .unwrap_or("?");
+                format!("plan_patch objective={objective:?}")
             }
             "verify" => {
                 let args = serde_json::from_value::<VerifyArgs>(call.arguments.clone()).ok();
@@ -1499,6 +1564,7 @@ impl ToolRegistry {
             self.execute_mcp_tool(&call, cancel).await
         } else {
             match call.name.as_str() {
+                "apply_patch" => self.execute_apply_patch(&call, &group_id).await,
                 "checkpoint_list" => self.execute_checkpoint_list(&call).await,
                 "checkpoint_show" => self.execute_checkpoint_show(&call).await,
                 "checkpoint_undo" => self.execute_checkpoint_undo(&call).await,
@@ -1507,6 +1573,7 @@ impl ToolRegistry {
                 | "upstream_flow" | "downstream_flow" | "hierarchy" | "read_slice"
                 | "symbol_context" => self.execute_graph_tool(&call).await,
                 "diff_context" => self.execute_diff_context(&call).await,
+                "plan_patch" => self.execute_plan_patch(&call).await,
                 "glob" => self.execute_glob(&call, cancel).await,
                 "grep" => self.execute_grep(&call, cancel).await,
                 "read_file" => self.execute_read_file(&call).await,
@@ -1744,6 +1811,201 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: snapshot.files.len().min(max_files) as u64,
                 truncated,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    async fn execute_plan_patch(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<PlanPatchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let registry = self.clone();
+        let call = call.clone();
+        tokio::task::spawn_blocking(move || registry.execute_plan_patch_blocking(&call, args))
+            .await
+            .unwrap_or_else(|err| {
+                make_result(
+                    &ToolCall {
+                        call_id: String::new(),
+                        name: "plan_patch".to_string(),
+                        arguments: Value::Null,
+                    },
+                    ToolStatus::Error,
+                    json!({ "error": format!("plan_patch join failed: {err}") }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            })
+    }
+
+    fn execute_plan_patch_blocking(&self, call: &ToolCall, args: PlanPatchArgs) -> ToolResult {
+        let max_symbols = args
+            .max_symbols
+            .unwrap_or(DEFAULT_PATCH_MAX_SYMBOLS)
+            .clamp(1, MAX_GRAPH_MAX_RESULTS);
+        let max_related = args
+            .max_related
+            .unwrap_or(DEFAULT_PATCH_MAX_RELATED)
+            .clamp(1, MAX_GRAPH_MAX_RESULTS);
+        let candidate_paths = normalized_path_set(args.candidate_paths.as_deref().unwrap_or(&[]));
+        let mut graph = match self.graph.lock() {
+            Ok(graph) => graph,
+            Err(_) => {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({"error": "semantic graph lock poisoned"}),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+        };
+        let Some(manager) = graph.as_mut() else {
+            let locality = patch_locality_json(&candidate_paths, &BTreeSet::new());
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "tool": "plan_patch",
+                    "graph_available": false,
+                    "reason": "semantic graph is unavailable for this workspace",
+                    "objective": args.objective,
+                    "patch_format": "search_replace",
+                    "plan_id": patch_plan_id(&call.arguments, &candidate_paths),
+                    "impact": {
+                        "neighborhood_paths": candidate_paths.iter().cloned().collect::<Vec<_>>(),
+                        "fallback": {
+                            "status": "graph_unavailable",
+                            "suggested_tools": [
+                                {"tool": "grep", "arguments": {"pattern": args.query.as_deref().unwrap_or("<query>"), "output_mode": "files_with_matches"}},
+                                {"tool": "read_file", "arguments": {"path": "<candidate-path>"}}
+                            ]
+                        }
+                    },
+                    "locality": locality,
+                    "next_action": patch_next_action(&candidate_paths, patch_plan_id(&call.arguments, &candidate_paths)),
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let refresh = match manager.refresh_before_query() {
+            Ok(report) => report,
+            Err(err) => return tool_error(call, err),
+        };
+        let graph = manager.graph();
+        let symbols = resolve_definition_candidates(
+            graph,
+            args.symbol_id.as_deref(),
+            args.query.as_deref(),
+            args.kind.as_deref(),
+            args.path.as_deref(),
+            None,
+        )
+        .into_iter()
+        .take(max_symbols)
+        .collect::<Vec<_>>();
+
+        let mut direct_paths = BTreeSet::new();
+        let mut reference_paths = BTreeSet::new();
+        let mut caller_paths = BTreeSet::new();
+        let mut callee_paths = BTreeSet::new();
+        let mut references = Vec::new();
+        let mut callers = Vec::new();
+        let mut callees = Vec::new();
+
+        for symbol in &symbols {
+            direct_paths.insert(symbol.file_id.0.clone());
+            for hit in graph
+                .references_to_symbol(&symbol.id)
+                .into_iter()
+                .take(max_related)
+            {
+                reference_paths.insert(hit.reference.file_id.0.clone());
+                references.push(reference_json(hit));
+            }
+            for hit in graph.callers(&symbol.id).into_iter().take(max_related) {
+                if let Some(caller) = hit.caller {
+                    caller_paths.insert(caller.file_id.0.clone());
+                    callers.push(symbol_summary_json(&caller));
+                }
+            }
+            for hit in graph.callees(&symbol.id).into_iter().take(max_related) {
+                if let Some(callee) = hit.callee {
+                    callee_paths.insert(callee.file_id.0.clone());
+                    callees.push(symbol_summary_json(&callee));
+                }
+            }
+        }
+
+        let graph_paths = graph
+            .files
+            .keys()
+            .map(|file_id| file_id.0.as_str())
+            .collect::<Vec<_>>();
+        let mut neighborhood = BTreeSet::new();
+        neighborhood.extend(direct_paths.iter().cloned());
+        neighborhood.extend(reference_paths.iter().cloned());
+        neighborhood.extend(caller_paths.iter().cloned());
+        neighborhood.extend(callee_paths.iter().cloned());
+        let test_paths = test_candidate_paths(&graph_paths, &neighborhood);
+        let config_paths = config_candidate_paths(&self.root, &neighborhood);
+        let owner_paths = owner_candidate_paths(&self.root);
+        neighborhood.extend(test_paths.iter().cloned());
+        neighborhood.extend(config_paths.iter().cloned());
+        neighborhood.extend(owner_paths.iter().cloned());
+
+        let plan_id = patch_plan_id(&call.arguments, &neighborhood);
+        let owners = codeowner_matches(&self.root, &neighborhood);
+        let locality = patch_locality_json(&candidate_paths, &neighborhood);
+        let mut payload = graph_payload("plan_patch", manager, &refresh);
+        payload.insert("objective".to_string(), json!(args.objective));
+        payload.insert("query".to_string(), json!(args.query));
+        payload.insert("symbol_id".to_string(), json!(args.symbol_id));
+        payload.insert("patch_format".to_string(), json!("search_replace"));
+        payload.insert("plan_id".to_string(), json!(plan_id.clone()));
+        payload.insert(
+            "symbols".to_string(),
+            json!(
+                symbols
+                    .iter()
+                    .map(|symbol| symbol_json(graph, symbol))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        payload.insert(
+            "impact".to_string(),
+            json!({
+                "direct_paths": direct_paths.iter().cloned().collect::<Vec<_>>(),
+                "reference_paths": reference_paths.iter().cloned().collect::<Vec<_>>(),
+                "caller_paths": caller_paths.iter().cloned().collect::<Vec<_>>(),
+                "callee_paths": callee_paths.iter().cloned().collect::<Vec<_>>(),
+                "test_paths": test_paths.iter().cloned().collect::<Vec<_>>(),
+                "config_paths": config_paths.iter().cloned().collect::<Vec<_>>(),
+                "owner_paths": owner_paths.iter().cloned().collect::<Vec<_>>(),
+                "neighborhood_paths": neighborhood.iter().cloned().collect::<Vec<_>>(),
+                "references": references,
+                "callers": callers,
+                "callees": callees,
+                "owners": owners,
+            }),
+        );
+        payload.insert("locality".to_string(), locality);
+        payload.insert(
+            "next_action".to_string(),
+            patch_next_action(&neighborhood, plan_id),
+        );
+
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            ToolCostHint {
+                matches_returned: symbols.len() as u64,
+                truncated: symbols.len() >= max_symbols,
                 ..ToolCostHint::default()
             },
             None,
@@ -2987,6 +3249,259 @@ impl ToolRegistry {
                 "content": output.content,
             }),
             cost,
+            None,
+        )
+    }
+
+    async fn execute_apply_patch(&self, call: &ToolCall, group_id: &str) -> ToolResult {
+        let args = match serde_json::from_value::<ApplyPatchArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        if args.patches.is_empty() {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "apply_patch requires at least one patch block" }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+        if args.patches.len() > MAX_PATCH_BLOCKS {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": format!("apply_patch accepts at most {MAX_PATCH_BLOCKS} patch blocks")
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        let dry_run = args.dry_run.unwrap_or(false);
+        let impact_paths = normalized_path_set(args.impact_paths.as_deref().unwrap_or(&[]));
+        let patch_paths = normalized_path_set(
+            &args
+                .patches
+                .iter()
+                .map(|patch| patch.path.clone())
+                .collect::<Vec<_>>(),
+        );
+        let locality = patch_locality_json(&patch_paths, &impact_paths);
+        let warnings = patch_locality_warnings(&patch_paths, &impact_paths);
+        let mut files: BTreeMap<String, PatchFileState> = BTreeMap::new();
+        let mut operations = Vec::new();
+
+        for (index, patch) in args.patches.iter().enumerate() {
+            if patch.search.is_empty() {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "error": "search text must not be empty",
+                        "patch_index": index,
+                        "path": patch.path,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+            let path = match self.resolve_for_write(&patch.path) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            };
+            if !path.exists() {
+                return make_result(
+                    call,
+                    ToolStatus::Error,
+                    json!({
+                        "error": "search-replace patches require an existing file",
+                        "path": patch.path,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+            let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
+            if is_secret_path(Path::new(&rel)) {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({ "error": "refusing to patch a likely secret file", "path": rel }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
+            let state = match files.entry(rel.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let before = match fs::read_to_string(&path) {
+                        Ok(content) => content,
+                        Err(err) => {
+                            return tool_error(
+                                call,
+                                format!("failed to read text file {rel}: {err}"),
+                            );
+                        }
+                    };
+                    let before_sha256 = sha256_hex(before.as_bytes());
+                    entry.insert(PatchFileState {
+                        path,
+                        before: before.clone(),
+                        current: before,
+                        before_sha256,
+                    })
+                }
+            };
+            match patch.expected_sha256.as_deref() {
+                Some(expected) if expected == state.before_sha256 => {}
+                Some(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 does not match current file",
+                            "path": rel,
+                            "current_sha256": state.before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        Some(state.before_sha256.clone()),
+                    );
+                }
+                None => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 is required for search-replace patches",
+                            "path": rel,
+                            "current_sha256": state.before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        Some(state.before_sha256.clone()),
+                    );
+                }
+            }
+
+            let matches = state.current.match_indices(&patch.search).count();
+            if matches == 0 {
+                return make_result(
+                    call,
+                    ToolStatus::Stale,
+                    json!({
+                        "error": "search text was not found",
+                        "path": rel,
+                        "patch_index": index,
+                    }),
+                    ToolCostHint::default(),
+                    Some(state.before_sha256.clone()),
+                );
+            }
+            let allow_multiple = patch.allow_multiple.unwrap_or(false);
+            if matches > 1 && !allow_multiple {
+                return make_result(
+                    call,
+                    ToolStatus::Stale,
+                    json!({
+                        "error": "search text matched more than once; set allow_multiple=true to replace all matches",
+                        "path": rel,
+                        "patch_index": index,
+                        "matches": matches,
+                    }),
+                    ToolCostHint::default(),
+                    Some(state.before_sha256.clone()),
+                );
+            }
+
+            let before_len = state.current.len();
+            state.current = if allow_multiple {
+                state.current.replace(&patch.search, &patch.replace)
+            } else {
+                state.current.replacen(&patch.search, &patch.replace, 1)
+            };
+            let after_len = state.current.len();
+            operations.push(json!({
+                "patch_index": index,
+                "path": rel,
+                "matches": matches,
+                "allow_multiple": allow_multiple,
+                "bytes_delta": after_len as i64 - before_len as i64,
+                "preview": {
+                    "search": truncate_text(&patch.search, PATCH_SNIPPET_MAX_CHARS),
+                    "replace": truncate_text(&patch.replace, PATCH_SNIPPET_MAX_CHARS),
+                }
+            }));
+        }
+
+        let mut changed_files = Vec::new();
+        let mut bytes_read = 0u64;
+        let mut bytes_written = 0u64;
+        for (rel, state) in &files {
+            bytes_read += state.before.len() as u64;
+            bytes_written += state.current.len() as u64;
+            changed_files.push(json!({
+                "path": rel,
+                "before_sha256": state.before_sha256,
+                "after_sha256": sha256_hex(state.current.as_bytes()),
+                "bytes_before": state.before.len(),
+                "bytes_after": state.current.len(),
+                "changed": state.before != state.current,
+            }));
+        }
+
+        let mut content = json!({
+            "dry_run": dry_run,
+            "plan_id": args.plan_id,
+            "patch_format": "search_replace",
+            "operations": operations,
+            "files": changed_files,
+            "locality": locality,
+            "warnings": warnings,
+        });
+        if dry_run {
+            return make_result(
+                call,
+                ToolStatus::Success,
+                content,
+                ToolCostHint {
+                    bytes_read,
+                    output_bytes: bytes_written,
+                    ..ToolCostHint::default()
+                },
+                None,
+            );
+        }
+
+        let checkpoint_before = match self.checkpoints.track_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
+        for state in files.values() {
+            if state.before != state.current
+                && let Err(err) = fs::write(&state.path, state.current.as_bytes())
+            {
+                return tool_error(call, err);
+            }
+        }
+        self.invalidate_diff_cache();
+        self.append_checkpoint_to_content(
+            &mut content,
+            &checkpoint_before,
+            call,
+            group_id,
+            ToolStatus::Success,
+            Vec::new(),
+        );
+        make_result(
+            call,
+            ToolStatus::Success,
+            content,
+            ToolCostHint {
+                bytes_read,
+                output_bytes: bytes_written,
+                ..ToolCostHint::default()
+            },
             None,
         )
     }
@@ -5644,6 +6159,18 @@ struct DiffContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanPatchArgs {
+    objective: String,
+    query: Option<String>,
+    symbol_id: Option<String>,
+    kind: Option<String>,
+    path: Option<String>,
+    candidate_paths: Option<Vec<String>>,
+    max_symbols: Option<usize>,
+    max_related: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CheckpointListArgs {}
 
 #[derive(Debug, Deserialize)]
@@ -5820,6 +6347,23 @@ struct WriteFileArgs {
     path: String,
     content: String,
     expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchArgs {
+    patches: Vec<SearchReplacePatch>,
+    impact_paths: Option<Vec<String>>,
+    plan_id: Option<String>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchReplacePatch {
+    path: String,
+    search: String,
+    replace: String,
+    expected_sha256: Option<String>,
+    allow_multiple: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6014,6 +6558,232 @@ fn diff_status_str(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Deleted => "deleted",
         DiffFileStatus::Modified => "modified",
     }
+}
+
+#[derive(Debug)]
+struct PatchFileState {
+    path: PathBuf,
+    before: String,
+    current: String,
+    before_sha256: String,
+}
+
+fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {
+    paths
+        .iter()
+        .filter_map(|path| normalize_workspace_path_str(path))
+        .collect()
+}
+
+fn normalize_workspace_path_str(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty() {
+        return None;
+    }
+    let normalized = normalized
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn path_in_neighborhood(path: &str, neighborhood: &BTreeSet<String>) -> bool {
+    if neighborhood.is_empty() {
+        return false;
+    }
+    neighborhood.iter().any(|candidate| {
+        path == candidate
+            || path
+                .strip_prefix(candidate)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+            || candidate
+                .strip_prefix(path)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    })
+}
+
+fn patch_locality_json(patch_paths: &BTreeSet<String>, neighborhood: &BTreeSet<String>) -> Value {
+    if neighborhood.is_empty() {
+        return json!({
+            "checked": false,
+            "status": "unchecked",
+            "reason": "no impact paths were supplied",
+            "inside_paths": [],
+            "outside_paths": patch_paths.iter().cloned().collect::<Vec<_>>(),
+        });
+    }
+    let inside = patch_paths
+        .iter()
+        .filter(|path| path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    let outside = patch_paths
+        .iter()
+        .filter(|path| !path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    json!({
+        "checked": true,
+        "status": if outside.is_empty() { "inside" } else { "outside" },
+        "inside_paths": inside,
+        "outside_paths": outside,
+        "neighborhood_paths": neighborhood.iter().cloned().collect::<Vec<_>>(),
+        "warning": (!outside.is_empty()).then_some("patch touches paths outside the impacted graph neighborhood"),
+    })
+}
+
+fn patch_locality_warnings(
+    patch_paths: &BTreeSet<String>,
+    neighborhood: &BTreeSet<String>,
+) -> Vec<String> {
+    if neighborhood.is_empty() {
+        return Vec::new();
+    }
+    let outside = patch_paths
+        .iter()
+        .filter(|path| !path_in_neighborhood(path, neighborhood))
+        .cloned()
+        .collect::<Vec<_>>();
+    if outside.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "patch touches paths outside the impacted graph neighborhood: {}",
+            outside.join(", ")
+        )]
+    }
+}
+
+fn patch_plan_id(arguments: &Value, paths: &BTreeSet<String>) -> String {
+    let payload = json!({
+        "arguments": arguments,
+        "paths": paths.iter().cloned().collect::<Vec<_>>(),
+    });
+    let digest = sha256_hex(payload.to_string().as_bytes());
+    format!("patch-{}", &digest[..12])
+}
+
+fn patch_next_action(paths: &BTreeSet<String>, plan_id: String) -> Value {
+    json!({
+        "tool": "apply_patch",
+        "arguments": {
+            "plan_id": plan_id,
+            "impact_paths": paths.iter().cloned().collect::<Vec<_>>(),
+            "patches": [
+                {
+                    "path": "<workspace-relative-path>",
+                    "search": "<exact current text>",
+                    "replace": "<replacement text>",
+                    "expected_sha256": "<sha256 from read_file or read_slice context>"
+                }
+            ]
+        },
+        "reason": "apply exact search-replace blocks after reviewing the impacted neighborhood"
+    })
+}
+
+fn test_candidate_paths(graph_paths: &[&str], neighborhood: &BTreeSet<String>) -> BTreeSet<String> {
+    graph_paths
+        .iter()
+        .filter(|path| {
+            neighborhood.iter().any(|impacted| {
+                same_crate_path(path, impacted)
+                    && (path.contains("/tests/")
+                        || path.ends_with("_tests.rs")
+                        || path.ends_with("/tests.rs"))
+            })
+        })
+        .map(|path| (*path).to_string())
+        .collect()
+}
+
+fn same_crate_path(left: &str, right: &str) -> bool {
+    let mut left_parts = left.split('/');
+    let mut right_parts = right.split('/');
+    match (
+        left_parts.next(),
+        left_parts.next(),
+        right_parts.next(),
+        right_parts.next(),
+    ) {
+        (Some("crates"), Some(left_crate), Some("crates"), Some(right_crate)) => {
+            left_crate == right_crate
+        }
+        _ => !left.starts_with("crates/") && !right.starts_with("crates/"),
+    }
+}
+
+fn config_candidate_paths(root: &Path, neighborhood: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for candidate in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"] {
+        if root.join(candidate).exists() {
+            paths.insert(candidate.to_string());
+        }
+    }
+    for path in neighborhood {
+        let mut parts = path.split('/');
+        if let (Some("crates"), Some(crate_dir)) = (parts.next(), parts.next()) {
+            let manifest = format!("crates/{crate_dir}/Cargo.toml");
+            if root.join(&manifest).exists() {
+                paths.insert(manifest);
+            }
+        }
+    }
+    paths
+}
+
+fn owner_candidate_paths(root: &Path) -> BTreeSet<String> {
+    [".github/CODEOWNERS", "CODEOWNERS"]
+        .into_iter()
+        .filter(|path| root.join(path).exists())
+        .map(str::to_string)
+        .collect()
+}
+
+fn codeowner_matches(root: &Path, paths: &BTreeSet<String>) -> Vec<Value> {
+    [".github/CODEOWNERS", "CODEOWNERS"]
+        .into_iter()
+        .find_map(|path| {
+            fs::read_to_string(root.join(path))
+                .ok()
+                .map(|content| (path, content))
+        })
+        .map(|(owner_path, content)| {
+            content
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        return None;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let pattern = parts.next()?;
+                    let owners = parts.map(str::to_string).collect::<Vec<_>>();
+                    if owners.is_empty()
+                        || !paths
+                            .iter()
+                            .any(|path| codeowner_pattern_matches(pattern, path))
+                    {
+                        return None;
+                    }
+                    Some(json!({
+                        "path": owner_path,
+                        "pattern": pattern,
+                        "owners": owners,
+                    }))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn codeowner_pattern_matches(pattern: &str, path: &str) -> bool {
+    pattern == "*"
+        || path == pattern.trim_start_matches('/')
+        || path.ends_with(pattern.trim_start_matches('/'))
+        || pattern
+            .strip_suffix('*')
+            .is_some_and(|prefix| path.starts_with(prefix.trim_start_matches('/')))
 }
 
 fn verify_scope_str(scope: VerifyScope) -> &'static str {
@@ -8836,6 +9606,64 @@ fn load_skill_spec() -> ToolSpec {
                 "name": {"type": "string", "description": "Exact skill name from list_skills."}
             },
             "required": ["name"]
+        }),
+    }
+}
+
+fn plan_patch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "plan_patch".to_string(),
+        description: "Plan a search-replace edit by consulting the semantic graph for impacted declarations, callers, references, tests, configs, and owners before patching.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "objective": {"type": "string", "description": "Short description of the intended code change."},
+                "query": {"type": "string", "description": "Declaration or symbol text to anchor the edit plan."},
+                "symbol_id": {"type": "string", "description": "Exact graph symbol id to anchor the edit plan."},
+                "kind": {"type": "string", "description": "Optional symbol kind filter such as function, method, struct, module, trait, or class."},
+                "path": {"type": "string", "description": "Optional workspace-relative path filter."},
+                "candidate_paths": {"type": "array", "items": {"type": "string"}, "description": "Paths already suspected to need edits; locality is scored against graph impact."},
+                "max_symbols": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
+                "max_related": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS}
+            },
+            "required": ["objective"]
+        }),
+    }
+}
+
+fn apply_patch_spec() -> ToolSpec {
+    ToolSpec {
+        name: "apply_patch".to_string(),
+        description: "Apply exact search-replace patch blocks to existing workspace files after preview, stale-content checks, locality scoring, and checkpoint creation.".to_string(),
+        capability: PermissionCapability::Edit,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "patches": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_PATCH_BLOCKS,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
+                            "search": {"type": "string", "description": "Exact current text to replace."},
+                            "replace": {"type": "string", "description": "Replacement text."},
+                            "expected_sha256": {"type": "string", "description": "sha256 of the current file content from read_file/read_slice context."},
+                            "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."}
+                        },
+                        "required": ["path", "search", "replace", "expected_sha256"]
+                    }
+                },
+                "impact_paths": {"type": "array", "items": {"type": "string"}, "description": "Impacted neighborhood paths from plan_patch; outside paths emit warnings."},
+                "plan_id": {"type": "string", "description": "Plan id returned by plan_patch."},
+                "dry_run": {"type": "boolean", "description": "Preview validation and replacement metadata without writing files. Default false."}
+            },
+            "required": ["patches"]
         }),
     }
 }

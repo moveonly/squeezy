@@ -666,6 +666,273 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
 }
 
 #[tokio::test]
+async fn plan_patch_reports_graph_impact_and_locality_warning() {
+    let root = temp_workspace("plan_patch");
+    write_rust_crate(
+        &root,
+        "pub fn changed() -> usize { 1 }\nfn caller() -> usize { changed() }\n",
+    );
+    fs::create_dir_all(root.join(".github")).expect("mkdir github");
+    fs::write(root.join(".github/CODEOWNERS"), "* @owner\n").expect("write codeowners");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "plan".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "change changed return value",
+                    "query": "changed",
+                    "kind": "function",
+                    "candidate_paths": ["README.md"],
+                    "max_symbols": 4,
+                    "max_related": 4
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["patch_format"], "search_replace");
+    assert!(
+        result.content["impact"]["neighborhood_paths"]
+            .as_array()
+            .expect("neighborhood")
+            .iter()
+            .any(|path| path == "src/lib.rs")
+    );
+    assert_eq!(result.content["locality"]["status"], "outside");
+    assert!(
+        result.content["impact"]["owners"]
+            .as_array()
+            .expect("owners")
+            .iter()
+            .any(|owner| owner["owners"][0] == "@owner")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_edits_file_and_checkpoint_undo_restores_it() {
+    let root = temp_workspace("apply_patch_undo");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": "patch-test",
+                    "impact_paths": ["sample.txt"],
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-patch".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-patch");
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after\n"
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(undo.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_dry_run_previews_without_writing() {
+    let root = temp_workspace("apply_patch_dry_run");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "dry_run": true,
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["dry_run"], true);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_stale_hash_without_modifying_file() {
+    let root = temp_workspace("apply_patch_stale_hash");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("other\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_multiple_matches_unless_allowed() {
+    let root = temp_workspace("apply_patch_multiple");
+    fs::write(root.join("sample.txt"), "same same\n").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let rejected = registry
+        .execute(
+            ToolCall {
+                call_id: "patch1".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "same",
+                        "replace": "next",
+                        "expected_sha256": sha256_hex("same same\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(rejected.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "same same\n"
+    );
+
+    let accepted = registry
+        .execute(
+            ToolCall {
+                call_id: "patch2".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "same",
+                        "replace": "next",
+                        "expected_sha256": sha256_hex("same same\n".as_bytes()),
+                        "allow_multiple": true
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(accepted.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "next next\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_warns_for_paths_outside_impact_neighborhood() {
+    let root = temp_workspace("apply_patch_locality");
+    fs::write(root.join("inside.txt"), "inside\n").expect("write inside");
+    fs::write(root.join("outside.txt"), "outside\n").expect("write outside");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "impact_paths": ["inside.txt"],
+                    "patches": [{
+                        "path": "outside.txt",
+                        "search": "outside\n",
+                        "replace": "changed\n",
+                        "expected_sha256": sha256_hex("outside\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["locality"]["status"], "outside");
+    assert!(
+        result.content["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or("").contains("outside.txt"))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn secret_name_checks_use_workspace_relative_paths() {
     let root = temp_workspace("secret_parent");
     fs::write(root.join("plain.txt"), "visible").expect("write plain");
@@ -2768,6 +3035,7 @@ fn tool_specs_are_sorted_by_name() {
     assert_eq!(
         names,
         vec![
+            "apply_patch",
             "checkpoint_list",
             "checkpoint_revert",
             "checkpoint_show",
@@ -2781,6 +3049,7 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "plan_patch",
             "read_file",
             "read_slice",
             "read_tool_output",

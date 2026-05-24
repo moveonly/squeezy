@@ -1327,6 +1327,7 @@ fn agent_session_mode_transition_logs_structured_fields() {
 #[test]
 fn advertised_tool_specs_are_mode_aware() {
     let tools = [
+        ("apply_patch", PermissionCapability::Edit),
         ("decl_search", PermissionCapability::Search),
         ("definition_search", PermissionCapability::Search),
         ("diff_context", PermissionCapability::Read),
@@ -1336,6 +1337,7 @@ fn advertised_tool_specs_are_mode_aware() {
         ("hierarchy", PermissionCapability::Read),
         ("list_skills", PermissionCapability::Read),
         ("load_skill", PermissionCapability::Read),
+        ("plan_patch", PermissionCapability::Read),
         ("read_file", PermissionCapability::Read),
         ("read_slice", PermissionCapability::Read),
         ("read_tool_output", PermissionCapability::Read),
@@ -1375,6 +1377,7 @@ fn advertised_tool_specs_are_mode_aware() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "plan_patch",
             "read_file",
             "read_slice",
             "read_tool_output",
