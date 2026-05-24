@@ -235,7 +235,7 @@ async fn main() -> squeezy_core::Result<()> {
             .flat_map(models_for_provider)
         {
             println!(
-                "{}\t{}\t{:?}\tstreaming={} tools={} json={} vision={} state={}",
+                "{}\t{}\t{:?}\tstreaming={} tools={} json={} vision={} state={} reasoning_tokens={} reasoning_effort={} verbosity={}",
                 model.provider,
                 model.id,
                 model.profile,
@@ -243,7 +243,10 @@ async fn main() -> squeezy_core::Result<()> {
                 model.capabilities.tool_calling,
                 model.capabilities.json_mode,
                 model.capabilities.vision,
-                model.capabilities.response_state
+                model.capabilities.response_state,
+                model.capabilities.reasoning_tokens,
+                model.capabilities.reasoning_effort,
+                model.capabilities.text_verbosity
             );
         }
         return Ok(());
@@ -824,6 +827,8 @@ async fn run_prompt(
         instructions: redacted_instructions,
         input: vec![LlmInputItem::UserText(redacted_prompt.clone())],
         max_output_tokens: config.max_output_tokens,
+        response_verbosity: Some(config.tui.response_verbosity),
+        reasoning_effort: config.reasoning_effort,
         previous_response_id: None,
         tools: Vec::new(),
         store: config.store_responses,

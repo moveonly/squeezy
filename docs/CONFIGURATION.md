@@ -56,6 +56,7 @@ commented examples so that built-in defaults can evolve over time:
 # provider = "openai"
 # profile = "balanced"
 # model = "gpt-5-nano"
+# reasoning_effort = "low"
 # max_output_tokens = 128
 # store_responses = false
 
@@ -149,12 +150,18 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"
+# response_verbosity = "normal"
+# tool_output_verbosity = "compact"
+# transcript_default = "compact"
+# show_reasoning_usage = true
 ```
 
 ## Sections
 
-- `[model]`: `provider`, `model`, `profile`, `max_output_tokens`, and
-  `store_responses`.
+- `[model]`: `provider`, `model`, `profile`, `reasoning_effort`,
+  `max_output_tokens`, and `store_responses`. `reasoning_effort` is only sent
+  to providers whose model registry entry marks native reasoning controls as
+  supported.
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
@@ -296,6 +303,10 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   provider/model, mode, repo, permissions, telemetry, activity, and spend.
   `status_verbosity = "verbose"` adds config sources, token/cache counters,
   tool bytes, receipt hits, budget denials, and redaction counts.
+  `response_verbosity` controls answer-length guidance, `tool_output_verbosity`
+  controls expanded tool-result preview size, `transcript_default` chooses
+  compact or expanded transcript entries, and `show_reasoning_usage` hides or
+  shows provider-reported reasoning-token accounting when available.
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.

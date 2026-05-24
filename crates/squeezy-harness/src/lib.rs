@@ -614,6 +614,7 @@ fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
             cost: CostSnapshot {
                 input_tokens: event.input_tokens,
                 output_tokens: event.output_tokens,
+                reasoning_output_tokens: None,
                 cached_input_tokens: event.cached_input_tokens,
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,

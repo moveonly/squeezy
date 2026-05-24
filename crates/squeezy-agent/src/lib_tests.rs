@@ -400,6 +400,57 @@ fn agent_new_falls_back_to_current_dir_for_invalid_workspace_root() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn provider_capability_gate_controls_native_reasoning_and_verbosity_fields() {
+    let mut config = AppConfig {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
+        ..Default::default()
+    };
+    config.tui.response_verbosity = squeezy_core::ResponseVerbosity::Verbose;
+
+    assert_eq!(
+        request_response_verbosity(&config, "openai"),
+        Some(squeezy_core::ResponseVerbosity::Verbose)
+    );
+    assert_eq!(
+        request_reasoning_effort(&config, "openai"),
+        Some(squeezy_core::ReasoningEffort::High)
+    );
+    assert_eq!(request_response_verbosity(&config, "anthropic"), None);
+    assert_eq!(request_reasoning_effort(&config, "anthropic"), None);
+}
+
+#[test]
+fn instructions_skip_prompt_hint_on_default_and_native_capable_models() {
+    use squeezy_core::ResponseVerbosity;
+
+    let base = "system rules";
+
+    // Normal verbosity is the implicit default; never burn tokens
+    // re-stating it in the prompt.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Normal, false),
+        base,
+    );
+
+    // Native-capable providers receive verbosity via the API
+    // parameter; do not pay for a redundant prompt-side hint.
+    assert_eq!(
+        instructions_with_response_verbosity(base, ResponseVerbosity::Concise, true),
+        base,
+    );
+
+    // For non-native providers, surface the hint so the model still
+    // gets the signal.
+    let concise = instructions_with_response_verbosity(base, ResponseVerbosity::Concise, false);
+    assert!(concise.starts_with(base), "{concise}");
+    assert!(concise.contains("Response verbosity: concise"), "{concise}");
+
+    let verbose = instructions_with_response_verbosity(base, ResponseVerbosity::Verbose, false);
+    assert!(verbose.contains("Response verbosity: verbose"), "{verbose}");
+}
+
 #[tokio::test]
 async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let root = temp_workspace("agent_tool_loop");
@@ -417,6 +468,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                 cost: CostSnapshot {
                     input_tokens: Some(10),
                     output_tokens: Some(1),
+                    reasoning_output_tokens: Some(2),
                     cached_input_tokens: None,
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
@@ -431,6 +483,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                 cost: CostSnapshot {
                     input_tokens: Some(4),
                     output_tokens: Some(2),
+                    reasoning_output_tokens: Some(3),
                     cached_input_tokens: None,
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
@@ -463,6 +516,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     let (message, cost) = completed.expect("completed");
     assert_eq!(message, "found it");
     assert_eq!(cost.input_tokens, Some(14));
+    assert_eq!(cost.reasoning_output_tokens, Some(5));
     assert_eq!(provider.requests().len(), 2);
     assert!(!provider.requests()[0].tools.is_empty());
 

@@ -13,6 +13,9 @@ pub struct ModelCapabilities {
     pub json_mode: bool,
     pub vision: bool,
     pub response_state: bool,
+    pub reasoning_tokens: bool,
+    pub reasoning_effort: bool,
+    pub text_verbosity: bool,
 }
 
 impl ModelCapabilities {
@@ -22,6 +25,9 @@ impl ModelCapabilities {
         json_mode: true,
         vision: false,
         response_state: false,
+        reasoning_tokens: false,
+        reasoning_effort: false,
+        text_verbosity: false,
     };
 }
 
@@ -49,6 +55,9 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities {
             response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
             ..ModelCapabilities::TEXT_TOOLS
         },
         pricing: Some(TokenPricing {
@@ -88,6 +97,9 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities {
             response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
             ..ModelCapabilities::TEXT_TOOLS
         },
         pricing: Some(TokenPricing {
@@ -136,6 +148,13 @@ pub fn models_for_provider(provider: &str) -> impl Iterator<Item = &'static Mode
     MODEL_REGISTRY
         .iter()
         .filter(move |model| model.provider == provider)
+}
+
+pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
+    MODEL_REGISTRY
+        .iter()
+        .find(|entry| entry.provider == provider && entry.id == model)
+        .map(|entry| entry.capabilities)
 }
 
 pub fn provider_name(config: &ProviderConfig) -> &'static str {

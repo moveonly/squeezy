@@ -9,6 +9,8 @@ fn request_body_uses_responses_streaming_shape() {
         instructions: "be brief".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         tools: vec![LlmToolSpec {
             name: "grep".to_string(),
@@ -108,6 +110,8 @@ fn request_body_serializes_tool_outputs_as_input_items() {
             },
         ],
         max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
@@ -127,6 +131,8 @@ fn request_body_sorts_function_tools_by_name() {
         instructions: "be brief".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: vec![
             LlmToolSpec {
@@ -149,6 +155,26 @@ fn request_body_sorts_function_tools_by_name() {
 
     assert_eq!(body["tools"][0]["name"], "grep");
     assert_eq!(body["tools"][1]["name"], "write_file");
+}
+
+#[test]
+fn request_body_includes_reasoning_and_text_verbosity_when_set() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: Some(squeezy_core::ResponseVerbosity::Verbose),
+        reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+
+    assert_eq!(body["text"]["verbosity"], "verbose");
+    assert_eq!(body["reasoning"]["effort"], "high");
 }
 
 #[test]
@@ -186,6 +212,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             "usage":{
               "input_tokens":10,
               "output_tokens":4,
+              "output_tokens_details":{"reasoning_tokens":2},
               "input_tokens_details":{"cached_tokens":3}
             }
           }
@@ -200,6 +227,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             cost: CostSnapshot {
                 input_tokens: Some(10),
                 output_tokens: Some(4),
+                reasoning_output_tokens: Some(2),
                 cached_input_tokens: Some(3),
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,

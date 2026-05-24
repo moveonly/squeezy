@@ -26,6 +26,8 @@ fn request_body_uses_generate_content_shape() {
         instructions: "be brief".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: vec![LlmToolSpec {
             name: "read_file".to_string(),
@@ -65,6 +67,8 @@ fn request_body_preserves_function_response_name() {
             },
         ],
         max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,

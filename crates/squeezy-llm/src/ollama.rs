@@ -226,6 +226,7 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
             cost: CostSnapshot {
                 input_tokens: value.get("prompt_eval_count").and_then(Value::as_u64),
                 output_tokens: value.get("eval_count").and_then(Value::as_u64),
+                reasoning_output_tokens: None,
                 cached_input_tokens: None,
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),
