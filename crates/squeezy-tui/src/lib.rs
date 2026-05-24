@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -34,8 +34,7 @@ use squeezy_agent::{
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TaskStateSnapshot, TaskStepStatus, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault,
-    TranscriptItem,
+    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_skills::{HelpStatus, SqueezyHelp};
@@ -63,6 +62,7 @@ const PROMPT_MAX_HEIGHT: u16 = 8;
 const SLASH_MENU_MAX_ITEMS: usize = 5;
 const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
 const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
+const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlashCommand {
@@ -323,6 +323,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
                     app.turn_visual = TurnVisualState::Running;
+                    app.note_turn_started();
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     app.pending_assistant.push_str(&delta);
@@ -411,6 +412,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.active_tool = None;
+                    app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
                     app.cancel = None;
@@ -423,6 +425,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
                     app.active_tool = None;
+                    app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
                     break;
@@ -433,6 +436,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
                     app.active_tool = None;
+                    app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
                     break;
@@ -685,6 +689,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             let cancel = CancellationToken::new();
             app.task_state = None;
             app.task_panel_collapsed = false;
+            app.note_turn_started();
             app.turn_rx = Some(agent.start_turn_with_response_verbosity(
                 input,
                 cancel.clone(),
@@ -2204,140 +2209,105 @@ fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
 }
 
 fn should_show_task_panel(app: &TuiApp) -> bool {
-    app.turn_rx.is_some()
+    turn_in_progress(app)
+        || app.last_turn_duration.is_some()
         || app
             .task_state
             .as_ref()
             .is_some_and(|snapshot| snapshot.status != squeezy_core::TaskStateStatus::Completed)
 }
 
-fn task_panel_height(app: &TuiApp) -> u16 {
-    if app.task_panel_collapsed {
-        return 1;
-    }
-    if app.task_state.is_none() {
-        return 1;
-    }
-    let line_count = app
-        .task_state
-        .as_ref()
-        .map(|snapshot| {
-            format_task_state_lines(snapshot, false, app.active_tool.as_deref()).len() as u16
-        })
-        .unwrap_or(1);
-    line_count.clamp(1, 7)
+fn task_panel_height(_app: &TuiApp) -> u16 {
+    1
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = if let Some(snapshot) = app.task_state.as_ref() {
-        format_task_state_lines(
-            snapshot,
-            app.task_panel_collapsed,
-            app.active_tool.as_deref(),
-        )
+    let line = if turn_in_progress(app) {
+        working_line(app)
+    } else if let Some(duration) = app.last_turn_duration {
+        worked_divider_line(duration, area.width)
+    } else if let Some(snapshot) = app.task_state.as_ref() {
+        compact_task_state_line(snapshot)
     } else {
-        vec![turn_state_line(
-            "Working",
-            active_tool_detail(app.active_tool.as_deref()),
-            AMBER,
-        )]
+        working_line(app)
     };
-    let paragraph = Paragraph::new(lines)
+    let paragraph = Paragraph::new(vec![line])
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
-fn format_task_state_lines(
-    snapshot: &TaskStateSnapshot,
-    collapsed: bool,
-    active_tool: Option<&str>,
-) -> Vec<Line<'static>> {
-    let (label, color) = task_status_label_color(snapshot.status);
-    if collapsed {
-        let mut detail = format!(
-            "active {} · blocker {} · next {} · verify {}",
-            snapshot.active_step_title().unwrap_or("-"),
-            snapshot.blocker.as_deref().unwrap_or("-"),
-            snapshot.next_action.as_deref().unwrap_or("-"),
-            snapshot.verification.as_str(),
-        );
-        if let Some(tool) = active_tool.filter(|tool| !tool.trim().is_empty()) {
-            detail.push_str(" · running ");
-            detail.push_str(tool);
-        }
-        return vec![turn_state_line(label, Some(detail), color)];
-    }
+fn turn_in_progress(app: &TuiApp) -> bool {
+    app.turn_rx.is_some()
+        || app.cancel.is_some()
+        || (app.last_turn_duration.is_none()
+            && app
+                .task_state
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status == squeezy_core::TaskStateStatus::Running))
+}
 
-    let mut lines = Vec::new();
-    let title = if task_title(snapshot) == "current turn" {
+fn working_line(app: &TuiApp) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            "• ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(working_word_spans(app));
+    spans.push(Span::styled(
+        format!(
+            " ({} • esc to interrupt)",
+            format_turn_duration(current_turn_duration(app))
+        ),
+        Style::default().fg(QUIET),
+    ));
+    Line::from(spans)
+}
+
+fn working_word_spans(app: &TuiApp) -> Vec<Span<'static>> {
+    let highlight_index = ((prompt_elapsed_ms(app) / 650) as usize) % "Working".chars().count();
+    "Working"
+        .chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let color = if index == highlight_index {
+                GOLD
+            } else {
+                AMBER
+            };
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
+
+fn current_turn_duration(app: &TuiApp) -> Duration {
+    app.turn_started_at
+        .map(|started_at| started_at.elapsed())
+        .unwrap_or_default()
+}
+
+fn worked_divider_line(duration: Duration, width: u16) -> Line<'static> {
+    let label = format!("─ Worked for {} ", format_turn_duration(duration));
+    let label_width = label.chars().count();
+    let fill_width = (width as usize).saturating_sub(label_width);
+    let mut text = label;
+    text.push_str(&"─".repeat(fill_width));
+    Line::from(Span::styled(text, Style::default().fg(QUIET)))
+}
+
+fn compact_task_state_line(snapshot: &TaskStateSnapshot) -> Line<'static> {
+    let (label, color) = task_status_label_color(snapshot.status);
+    let detail = if task_title(snapshot) == "current turn" {
         None
     } else {
         Some(task_title(snapshot).to_string())
     };
-    lines.push(turn_state_line(
-        label,
-        turn_title_with_active_tool(title, active_tool),
-        color,
-    ));
-    if let Some(summary) = &snapshot.summary {
-        lines.push(Line::from(format!("  {summary}")));
-    }
-    if snapshot.steps.is_empty() {
-        lines.push(Line::from("  -"));
-    } else {
-        for step in snapshot
-            .steps
-            .iter()
-            .filter(|step| step.status == TaskStepStatus::Active)
-            .take(1)
-        {
-            let detail = step
-                .detail
-                .as_ref()
-                .map(|detail| format!(" - {detail}"))
-                .unwrap_or_default();
-            lines.push(Line::from(format!(
-                "  {} {}{}",
-                step.status.as_str(),
-                step.title,
-                detail
-            )));
-        }
-    }
-    if let Some(blocker) = &snapshot.blocker {
-        lines.push(Line::from(format!("  blocker {blocker}")));
-    }
-    if !snapshot.recent_changes.is_empty() {
-        lines.push(Line::from(format!(
-            "  recent {}",
-            snapshot.recent_changes.join("; ")
-        )));
-    }
-    let next = snapshot.next_action.as_deref().unwrap_or("-");
-    lines.push(Line::from(format!(
-        "  next {next} · verify {}",
-        snapshot.verification.as_str()
-    )));
-    if let Some(reason) = &snapshot.replan_reason {
-        lines.push(Line::from(format!("  replan {reason}")));
-    }
-    lines
-}
-
-fn active_tool_detail(active_tool: Option<&str>) -> Option<String> {
-    active_tool
-        .filter(|tool| !tool.trim().is_empty())
-        .map(|tool| format!("running {tool}"))
-}
-
-fn turn_title_with_active_tool(title: Option<String>, active_tool: Option<&str>) -> Option<String> {
-    match (title, active_tool_detail(active_tool)) {
-        (Some(title), Some(tool)) => Some(format!("{title} · {tool}")),
-        (Some(title), None) => Some(title),
-        (None, Some(tool)) => Some(tool),
-        (None, None) => None,
-    }
+    turn_state_line(label, detail, color)
 }
 
 fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static str, Color) {
@@ -2367,6 +2337,20 @@ fn turn_state_line(label: &'static str, detail: Option<String>, color: Color) ->
         spans.push(Span::styled(detail, Style::default().fg(QUIET)));
     }
     Line::from(spans)
+}
+
+fn format_turn_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn task_title(snapshot: &TaskStateSnapshot) -> &str {
@@ -3756,6 +3740,8 @@ struct TuiApp {
     active_tool: Option<String>,
     status: String,
     turn_visual: TurnVisualState,
+    turn_started_at: Option<Instant>,
+    last_turn_duration: Option<Duration>,
     animation_tick: u64,
     animation_tick_rate: Duration,
     exit_armed: bool,
@@ -3858,6 +3844,8 @@ impl TuiApp {
             active_tool: None,
             status,
             turn_visual: TurnVisualState::Idle,
+            turn_started_at: None,
+            last_turn_duration: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
             exit_armed: false,
@@ -3873,6 +3861,19 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
+        }
+    }
+
+    fn note_turn_started(&mut self) {
+        if self.turn_started_at.is_none() {
+            self.turn_started_at = Some(Instant::now());
+        }
+        self.last_turn_duration = None;
+    }
+
+    fn note_turn_finished(&mut self) {
+        if let Some(started_at) = self.turn_started_at.take() {
+            self.last_turn_duration = Some(started_at.elapsed());
         }
     }
 
@@ -4073,6 +4074,9 @@ impl Drop for TerminalGuard {
             self.terminal.backend_mut(),
             DisableBracketedPaste,
             Print(DISABLE_ALTERNATE_SCROLL),
+            Print(DISABLE_MOUSE_MODES),
+            Clear(ClearType::All),
+            MoveTo(0, 0),
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();

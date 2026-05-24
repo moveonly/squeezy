@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
@@ -1209,7 +1209,23 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
     let output = render_to_string(&app, 120, 18);
 
     assert!(output.contains("> why?"), "{output}");
-    assert!(output.contains("• Working why?"), "{output}");
+    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("esc to interrupt"), "{output}");
+    assert!(!output.contains("• Done"), "{output}");
+    assert!(!output.contains("active Start turn"), "{output}");
+}
+
+#[test]
+fn completed_turn_shows_worked_duration_divider() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("why?"));
+    app.push_transcript_item(TranscriptItem::assistant("Because."));
+    app.last_turn_duration = Some(Duration::from_secs(13 * 60 + 23));
+
+    let output = render_to_string(&app, 120, 18);
+
+    assert!(output.contains("─ Worked for 13m 23s"), "{output}");
+    assert!(!output.contains("• Working"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
 
@@ -1344,7 +1360,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
 }
 
 #[test]
-fn active_tool_is_summarized_in_working_line() {
+fn active_tool_does_not_clutter_working_line() {
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);
     app.turn_rx = Some(rx);
@@ -1352,10 +1368,9 @@ fn active_tool_is_summarized_in_working_line() {
 
     let output = render_to_string(&app, 120, 16);
 
-    assert!(
-        output.contains("• Working running definition_search"),
-        "{output}"
-    );
+    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("esc to interrupt"), "{output}");
+    assert!(!output.contains("definition_search"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
 }
 
@@ -1381,7 +1396,9 @@ async fn queued_tool_event_updates_working_status_without_transcript_row() {
     assert_eq!(app.active_tool.as_deref(), Some("grep"));
     assert!(app.transcript.is_empty());
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("• Working running grep"), "{output}");
+    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("esc to interrupt"), "{output}");
+    assert!(!output.contains("grep"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
     assert!(!output.contains("args="), "{output}");
 }
@@ -1447,22 +1464,17 @@ fn prompt_height_grows_for_multiline_input() {
 }
 
 #[test]
-fn task_panel_renders_progress_blocker_next_action_and_verification() {
+fn task_panel_keeps_non_running_state_compact() {
     let mut app = test_app(SessionMode::Build);
     app.task_state = Some(sample_task_state());
 
     let output = render_to_string(&app, 120, 24);
     assert!(output.contains("• Blocked Implement task UX"), "{output}");
-    assert!(output.contains("Implement task UX"), "{output}");
     assert!(!output.contains("completed Inspect TUI"), "{output}");
-    assert!(output.contains("active Wire task panel"), "{output}");
-    assert!(output.contains("blocker approval pending"), "{output}");
-    assert!(output.contains("next run focused tests"), "{output}");
-    assert!(output.contains("verify running"), "{output}");
-    assert!(
-        output.contains("replan status footer is too compact"),
-        "{output}"
-    );
+    assert!(!output.contains("active Wire task panel"), "{output}");
+    assert!(!output.contains("blocker approval pending"), "{output}");
+    assert!(!output.contains("next run focused tests"), "{output}");
+    assert!(!output.contains("verify running"), "{output}");
 }
 
 #[tokio::test]
@@ -1481,7 +1493,8 @@ async fn ctrl_p_collapses_and_expands_task_panel() {
     assert!(app.task_panel_collapsed);
     let collapsed = render_to_string(&app, 120, 16);
     assert!(collapsed.contains("• Blocked"), "{collapsed}");
-    assert!(collapsed.contains("active Wire task panel"), "{collapsed}");
+    assert!(collapsed.contains("Implement task UX"), "{collapsed}");
+    assert!(!collapsed.contains("active Wire task panel"), "{collapsed}");
 
     handle_key(
         &mut app,
