@@ -11,7 +11,14 @@ machine-local and keyed by canonical repo path. It records compact facts Squeezy
 detected so later sessions can avoid repeated project-shape exploration:
 languages, package/build systems, likely commands, config files, Git state,
 ignored/indexing coverage, semantic support, and suggested `squeezy.toml`
-settings.
+settings. Each profile also stores a stable `repo_id` derived from the
+canonical repo path.
+
+Per-repo user-authored overrides live at
+`~/.squeezy/projects/<repo-id>/settings.toml`. Use this file for personal
+machine paths that should not be committed, such as extra shell sandbox
+`read_roots` or `write_roots`. Shared team policy still belongs in the
+project's committed `squeezy.toml`.
 
 The generated profile does not store source contents, secrets, raw command
 output, or a long repo map. Squeezy refreshes it on first run, explicit
@@ -20,7 +27,8 @@ later sessions reuse it silently. When a profile is created or refreshed, CLI
 and TUI startup show a compact onboarding summary.
 
 Set `SQUEEZY_REPOS_PATH` to use a different registry path, which is useful for
-tests and isolated runs.
+tests and isolated runs. Set `SQUEEZY_PROJECTS_DIR` to use a different
+per-repo settings directory.
 
 Useful commands:
 

@@ -49,6 +49,27 @@ fn temp_workspace(name: &str) -> PathBuf {
     root
 }
 
+fn home_workspace(name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let counter = WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst);
+    let root = home.join(format!(
+        "squeezy_shell_sandbox_smoke_{name}_{pid}_{base}_{counter}",
+        pid = std::process::id()
+    ));
+    if let Err(error) = fs::create_dir_all(&root) {
+        eprintln!(
+            "SKIP: cannot create home-backed outside root {}: {error}",
+            root.display()
+        );
+        return None;
+    }
+    Some(root)
+}
+
 fn smoke_registry(root: &Path, shell_sandbox: ShellSandboxConfig) -> ToolRegistry {
     ToolRegistry::new_with_configs_and_skills(
         root,
@@ -98,6 +119,38 @@ fn required_deny_config() -> ShellSandboxConfig {
         network: ShellSandboxNetworkPolicy::DenyByDefault,
         ..ShellSandboxConfig::default()
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+async fn run_shell(registry: &ToolRegistry, command: &str, description: &str) -> ToolResult {
+    registry
+        .execute(
+            ToolCall {
+                call_id: description.replace(' ', "_"),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": command,
+                    "description": description
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await
 }
 
 #[tokio::test]
@@ -175,6 +228,84 @@ async fn shell_sandbox_exec_result_carries_network_metadata() {
     assert_eq!(result.content["sandbox"]["backend"], "macos-sandbox-exec");
     assert_eq!(result.content["sandbox"]["network"], "denied_classified");
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn shell_sandbox_allows_configured_extra_write_root() {
+    #[cfg(target_os = "macos")]
+    if !Path::new("/usr/bin/sandbox-exec").exists() {
+        eprintln!("SKIP: /usr/bin/sandbox-exec not present");
+        return;
+    }
+
+    let root = temp_workspace("extra_write_workspace");
+    let extra = temp_workspace("extra_write_root");
+    let extra = fs::canonicalize(&extra).expect("canonical extra root");
+    let config = ShellSandboxConfig {
+        write_roots: vec![extra.clone()],
+        ..required_deny_config()
+    };
+    let registry = smoke_registry(&root, config);
+    let target = extra.join("allowed.txt");
+    let result = run_shell(
+        &registry,
+        &format!("printf ok > {}", shell_quote(&target.display().to_string())),
+        "write configured extra root",
+    )
+    .await;
+
+    if smoke_host_cannot_run_sandbox(&result) {
+        eprintln!("SKIP: shell sandbox backend unavailable at runtime");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(extra);
+        return;
+    }
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(&target).expect("extra write"), "ok");
+    assert_eq!(
+        result.content["sandbox"]["write_roots"][0],
+        extra.display().to_string()
+    );
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(extra);
+}
+
+#[tokio::test]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn shell_sandbox_blocks_unconfigured_outside_write() {
+    #[cfg(target_os = "macos")]
+    if !Path::new("/usr/bin/sandbox-exec").exists() {
+        eprintln!("SKIP: /usr/bin/sandbox-exec not present");
+        return;
+    }
+
+    let root = temp_workspace("blocked_outside_workspace");
+    let Some(outside) = home_workspace("blocked_outside_root") else {
+        let _ = fs::remove_dir_all(root);
+        return;
+    };
+    let registry = smoke_registry(&root, required_deny_config());
+    let target = outside.join("blocked.txt");
+    let result = run_shell(
+        &registry,
+        &format!("printf no > {}", shell_quote(&target.display().to_string())),
+        "block unconfigured outside write",
+    )
+    .await;
+
+    if smoke_host_cannot_run_sandbox(&result) {
+        eprintln!("SKIP: shell sandbox backend unavailable at runtime");
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
+        return;
+    }
+
+    assert_ne!(result.status, ToolStatus::Success);
+    assert!(!target.exists(), "outside write should be blocked");
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
 }
 
 #[tokio::test]

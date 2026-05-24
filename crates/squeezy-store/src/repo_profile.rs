@@ -8,7 +8,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use squeezy_core::{GraphConfig, LanguageKind, Result, SqueezyError};
+use squeezy_core::{GraphConfig, LanguageKind, Result, SqueezyError, repo_settings_id};
 use squeezy_workspace::{
     CrawlOptions, ExclusionReason, IndexingPolicy, WorkspaceCrawler, WorkspaceSnapshot,
 };
@@ -129,6 +129,7 @@ impl RepoRegistry {
             out.push_str("\n[[repos]]\n");
             out.push_str(&format!("profile_version = {}\n", profile.profile_version));
             out.push_str(&format!("root = {}\n", toml_string(&profile.root)));
+            out.push_str(&format!("repo_id = {}\n", toml_string(&profile.repo_id)));
             out.push_str(&format!(
                 "updated_unix_millis = {}\n",
                 profile.updated_unix_millis
@@ -224,6 +225,8 @@ impl RepoRegistry {
 pub struct RepoProfile {
     pub profile_version: u32,
     pub root: String,
+    #[serde(default)]
+    pub repo_id: String,
     pub updated_unix_millis: u64,
     #[serde(default)]
     pub languages: Vec<DetectedLanguage>,
@@ -259,6 +262,7 @@ impl RepoProfile {
         Ok(Self {
             profile_version: REPO_REGISTRY_VERSION,
             root: root.display().to_string(),
+            repo_id: repo_settings_id(&root),
             updated_unix_millis: now_unix_millis(),
             languages,
             package_managers,
@@ -625,6 +629,7 @@ pub fn ensure_repo_profile_at(
     let light = RepoFingerprint::detect(&root, None, &git)?;
     if let Some(profile) = registry.profile_for_root(&root)
         && profile.fingerprint.light_value == light.light_value
+        && !profile.repo_id.is_empty()
     {
         return Ok(RepoProfileLoad {
             profile: profile.clone(),

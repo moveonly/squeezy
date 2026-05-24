@@ -6,22 +6,23 @@ definitions, and TUI preferences.
 
 ## Source Precedence
 
-Squeezy merges configuration from up to five sources. Each step overrides
+Squeezy merges configuration from up to six sources. Each step overrides
 the previous one (later wins):
 
 1. Built-in defaults (lowest precedence)
 2. User settings at `~/.squeezy/settings.toml`
 3. Project settings in the nearest ancestor `squeezy.toml`
-4. Environment variables
-5. CLI flags (highest precedence)
+4. Per-repo user settings at `~/.squeezy/projects/<repo-id>/settings.toml`
+5. Environment variables
+6. CLI flags (highest precedence)
 
 Set `SQUEEZY_SETTINGS_PATH` to use a different user settings file. Shared
 project configuration should live in `squeezy.toml`; `.squeezy/` remains local
 runtime state and is ignored by git in this repository.
 
 Generated repo profiles are separate from project configuration. Squeezy stores
-detected, machine-local repo knowledge in `~/.squeezy/repos.toml`; see
-`docs/REPO_PROFILE.md`.
+detected, machine-local repo knowledge in `~/.squeezy/repos.toml` and uses its
+stable repo id for per-repo user settings; see `docs/REPO_PROFILE.md`.
 
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
@@ -98,6 +99,8 @@ commented examples so that built-in defaults can evolve over time:
 # audit = true
 # kill_grace_ms = 250                          # bounded to 10..=60000
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# read_roots = []                              # extra absolute directories shell may read
+# write_roots = []                             # extra absolute directories shell may read/write
 # # The list below EXTENDS the built-in floor; set
 # # replace_sensitive_path_patterns = true to replace it instead.
 # sensitive_path_patterns = ["secrets/**", ".vault/**"]
@@ -185,11 +188,19 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   is unavailable. macOS launches through `sandbox-exec` with a `(deny default)`
   profile that re-allows reads under system prefixes and reads+writes inside
   the workspace, tmp dirs, and toolchain caches (`$CARGO_HOME`, `$RUSTUP_HOME`,
-  `$HOME/.cargo`, `$HOME/.rustup`). Linux probes
+  `$HOME/.cargo`, `$HOME/.rustup`). `read_roots` and `write_roots` are
+  opt-in absolute directories layered on top of those defaults. `write_roots`
+  imply read access. Put shared project roots in `squeezy.toml`; put
+  machine-specific roots in `~/.squeezy/projects/<repo-id>/settings.toml`.
+  Linux probes
   `/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user` before
   spawn; when namespacing is available, the child runs in a fresh user, mount,
   and (optionally) network namespace via `unshare(CLONE_NEWUSER | CLONE_NEWNS |
-  ...)` with a uid_map back to the parent. `network = "deny_by_default"` keeps
+  ...)` with a uid_map back to the parent. Linux also applies Landlock
+  filesystem allowlists for workspace/default roots plus configured roots; in
+  `required` mode missing Landlock support denies pre-spawn, while
+  `best_effort` records that filesystem enforcement was unavailable.
+  `network = "deny_by_default"` keeps
   the network namespace closed for every shell command, including classified
   network commands (the permission policy still decides whether to RUN them).
   `network = "allow_when_approved"` opens the network namespace only when the
@@ -200,9 +211,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   union semantics: a project-supplied list EXTENDS the built-in floor
   (`.ssh/**`, `.aws/**`, `.netrc`, etc.). To replace the floor wholesale, set
   `replace_sensitive_path_patterns = true`. `env_allowlist` entries must be
-  exact names or use a single trailing `*` (e.g. `LC_*`); `kill_grace_ms` is
-  bounded to `10..=60_000`. See [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md)
-  for the full operational model and the known limits of the OS layer.
+  exact names or use a single trailing `*` (e.g. `LC_*`); root lists reject
+  missing, relative, duplicate, non-directory, or sensitive-path roots;
+  `kill_grace_ms` is bounded to `10..=60_000`. See
+  [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md) for the full operational model
+  and the known limits of the OS layer.
 - `[[permissions.rules]]`: ordered allow/ask/deny rules with `capability`,
   `target`, `action`, optional `source`, and optional `reason`. Later matching
   rules win, and any session-scoped approvals added through the TUI also stack

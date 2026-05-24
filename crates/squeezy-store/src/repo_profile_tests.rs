@@ -4,7 +4,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::GraphConfig;
+use squeezy_core::{GraphConfig, repo_settings_id};
 
 use super::*;
 
@@ -165,6 +165,49 @@ fn generated_and_vendor_coverage_appears_in_profile() {
             .iter()
             .any(|ignored| ignored.reason == "vendor")
     );
+}
+
+#[test]
+fn registry_round_trip_preserves_repo_id_and_refreshes_legacy_profiles() {
+    // Guards the per-repo settings handshake: each persisted profile carries
+    // the stable repo id used to locate
+    // ~/.squeezy/projects/<repo-id>/settings.toml, and profiles written
+    // before the field existed must be regenerated rather than reused with
+    // an empty id.
+    let root = temp_root("repo_profile_repo_id_roundtrip");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+    let registry_path = root.join("repos.toml");
+    let first = ensure_repo_profile_at(&registry_path, &root, &GraphConfig::default()).unwrap();
+    let expected_id = repo_settings_id(&root);
+    assert!(!expected_id.is_empty());
+    assert_eq!(first.profile.repo_id, expected_id);
+
+    let reloaded = RepoRegistry::load(&registry_path).unwrap();
+    let canonical_root = fs::canonicalize(&root).unwrap();
+    let loaded = reloaded
+        .profile_for_root(&canonical_root)
+        .expect("profile present");
+    assert_eq!(loaded.repo_id, expected_id);
+
+    let mut legacy = reloaded;
+    let mut legacy_profile = legacy
+        .profile_for_root(&canonical_root)
+        .expect("profile present")
+        .clone();
+    legacy_profile.repo_id.clear();
+    legacy.upsert(legacy_profile);
+    legacy.save(&registry_path).unwrap();
+
+    let refreshed = ensure_repo_profile_at(&registry_path, &root, &GraphConfig::default()).unwrap();
+    assert_eq!(refreshed.status, RepoProfileStatus::Refreshed);
+    assert_eq!(refreshed.profile.repo_id, expected_id);
 }
 
 fn temp_root(name: &str) -> PathBuf {

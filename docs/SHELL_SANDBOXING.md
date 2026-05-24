@@ -135,10 +135,19 @@ If the command is allowed, Squeezy prepares a sandbox plan:
 
 - `required`: deny if the backend cannot be used. On macOS this catches a
   missing or refused `sandbox-exec`; on Linux it catches missing
-  `unprivileged_userns_clone` / `/proc/self/ns/user`.
+  `unprivileged_userns_clone` / `/proc/self/ns/user` or unavailable Landlock
+  filesystem enforcement.
 - `best_effort`: use the backend when possible and otherwise run with the
   remaining shell policy controls (env allowlist, timeout/output cap, audit).
 - `off`: run directly with no OS sandbox.
+
+Filesystem roots are opt-in. The default writable set is the workspace, temp
+directories, and Rust toolchain caches. Add shared project roots in committed
+`squeezy.toml`, and add personal absolute paths in
+`~/.squeezy/projects/<repo-id>/settings.toml`. `read_roots` are read-only;
+`write_roots` allow read/write. Both lists must contain existing absolute
+directories. Sensitive path patterns still deny before spawn, and macOS adds
+explicit deny rules for sensitive paths inside allowed roots.
 
 For process cleanup, Squeezy creates a process group for the shell command. On
 timeout or cancellation it sends `SIGTERM`, waits for `kill_grace_ms`, then
@@ -154,10 +163,12 @@ The audit record includes:
 
 - timestamp (`ts_unix_ms`), call id, and tool name,
 - redacted (then truncated) command string and optional redacted description,
-- workspace-relative cwd (no redaction applied; cwd is a workspace path),
+- cwd as workspace-relative when inside the workspace, otherwise the configured
+  absolute shell root path,
 - classification capability, target, risk, network/destructive flags, and
   parser metadata,
-- sandbox backend, mode, network posture, and required flag,
+- sandbox backend, mode, network posture, filesystem posture, configured extra
+  roots, and required flag,
 - allowlisted environment variable names (values are never recorded),
 - timeout and output caps,
 - outcome, denial reason, and exit code,
@@ -176,6 +187,8 @@ network = "deny_by_default"
 audit = true
 kill_grace_ms = 250
 env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+read_roots = []
+write_roots = []
 sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 # replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
 ```
@@ -195,6 +208,11 @@ All other commands still run with network denied. The audit record shows
 `env_allowlist` patterns support exact names (e.g. `PATH`) and single
 trailing wildcards (e.g. `LC_*`). Other glob shapes are rejected at config
 load time.
+
+`read_roots` and `write_roots` are empty by default. They are merged across
+user, project, and per-repo user settings, canonicalized, and rejected when a
+path is missing, relative, a file, duplicated across read/write roots, or
+inside a sensitive path base. `write_roots` imply read access.
 
 `sensitive_path_patterns` patterns must include a literal prefix before any
 wildcard. By default a user-supplied list **extends** the built-in floor —
