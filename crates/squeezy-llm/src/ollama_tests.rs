@@ -33,6 +33,39 @@ fn request_body_uses_chat_stream_shape() {
 }
 
 #[test]
+fn request_body_preserves_function_tool_order() {
+    let request = LlmRequest {
+        model: "qwen3".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: vec![
+            LlmToolSpec {
+                name: "write_file".to_string(),
+                description: "write".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            },
+        ],
+        store: false,
+    };
+
+    let body = OllamaProvider::request_body(&request);
+
+    assert_eq!(body["tools"][0]["function"]["name"], "write_file");
+    assert_eq!(body["tools"][1]["function"]["name"], "grep");
+}
+
+#[test]
 fn parser_extracts_text_tool_calls_and_usage() {
     let events = parse_ollama_line(
         r#"{"message":{"content":"hi","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]},"done":true,"prompt_eval_count":10,"eval_count":2}"#,

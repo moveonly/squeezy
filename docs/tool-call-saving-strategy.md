@@ -21,8 +21,21 @@ model-facing tool output compact enough to be useful.
   reading file contents.
 - **Search output modes.** `grep` supports `content`, `files_with_matches`, and
   `count` modes so broad exploration does not always return matching lines.
-- **Stable tool surface.** Tool schemas are sorted deterministically so
-  provider-side prompt/cache prefixes can remain stable.
+- **Stable tool surface.** Core tool schemas are sent in deterministic order
+  and discoverable schemas are appended in first-load order so provider-side
+  prompt/cache prefixes can remain stable.
+- **Lazy schema loading.** Long-tail and MCP tools are advertised in a compact
+  `tools_index` by default. The always-core `load_tool_schema` tool attaches a
+  discoverable tool's full schema when the model needs it, and later rounds in
+  the same session reuse the expanded schema set. The `tools_index` text is
+  intentionally byte-stable across rounds: a tool stays listed in the index
+  even after its schema has been attached, so the provider's prompt-cache
+  prefix does not invalidate every time the model loads a new tool. The
+  `tools_index` and `load_tool_schema` are an advisory hint, not an enforced
+  precondition: the registry still owns the actual executors, and the
+  permission engine remains the real safety boundary, so a tool call made
+  without a prior `load_tool_schema` is routed through the normal permission
+  path rather than refused on schema grounds.
 - **Parallel read/search calls.** Independent `glob`, `grep`, `read_file`, and
   `read_tool_output` calls can run concurrently while write and shell calls stay
   serialized. Graph-backed navigation tools use the same read-only execution
@@ -161,8 +174,6 @@ model-facing tool output compact enough to be useful.
   `last_receipt_current_file_unavailable`, or `last_receipt_store_error`) so
   the model can tell apart "no snapshot" from "snapshot for a different
   window" from "transient IO error".
-- **Deferred tool loading.** Long-tail tools, including MCP tools, should load
-  schemas only when the model actually needs them.
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly
   request shaping should preserve stable prompt prefixes.
 - **Approval persistence.** TUI prompts can allow once, allow a user/project

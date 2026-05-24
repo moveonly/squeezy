@@ -125,7 +125,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
 }
 
 #[test]
-fn request_body_sorts_function_tools_by_name() {
+fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
         model: "gpt-test".to_string(),
         instructions: "be brief".to_string(),
@@ -153,8 +153,8 @@ fn request_body_sorts_function_tools_by_name() {
 
     let body = OpenAiProvider::request_body(&request);
 
-    assert_eq!(body["tools"][0]["name"], "grep");
-    assert_eq!(body["tools"][1]["name"], "write_file");
+    assert_eq!(body["tools"][0]["name"], "write_file");
+    assert_eq!(body["tools"][1]["name"], "grep");
 }
 
 #[test]

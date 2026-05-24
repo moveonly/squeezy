@@ -43,6 +43,39 @@ fn request_body_uses_messages_streaming_shape() {
 }
 
 #[test]
+fn request_body_preserves_function_tool_order() {
+    let request = LlmRequest {
+        model: "claude-test".to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: vec![
+            LlmToolSpec {
+                name: "write_file".to_string(),
+                description: "write".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: true,
+            },
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: true,
+            },
+        ],
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+
+    assert_eq!(body["tools"][0]["name"], "write_file");
+    assert_eq!(body["tools"][1]["name"], "grep");
+}
+
+#[test]
 fn request_body_maps_tool_roundtrip_messages() {
     let request = LlmRequest {
         model: "claude-test".to_string(),

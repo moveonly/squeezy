@@ -1403,6 +1403,110 @@ fn task_state_tool_is_advertised_in_build_and_plan_modes() {
 }
 
 #[test]
+fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+
+    let tools = [
+        task_state_advertised_tool(),
+        test_advertised_tool("grep", PermissionCapability::Search),
+        test_advertised_tool("webfetch", PermissionCapability::Network),
+    ];
+    let schema_config = squeezy_core::ToolSchemaConfig {
+        lazy_schema_loading: true,
+        core: vec![
+            "grep".to_string(),
+            "webfectch".to_string(), // intentional typo
+            "load_tool_schema".to_string(),
+        ],
+        discoverable: vec!["totally_made_up".to_string()],
+    };
+
+    tracing::subscriber::with_default(subscriber, || {
+        warn_unknown_tool_schema_names(&tools, &schema_config);
+    });
+
+    let logs = writer.contents();
+    assert!(
+        logs.contains("webfectch"),
+        "typo in [tools].core should appear in warn output: {logs}"
+    );
+    assert!(
+        logs.contains("totally_made_up"),
+        "typo in [tools].discoverable should appear in warn output: {logs}"
+    );
+    assert!(
+        !logs.contains("\"grep\"") && !logs.contains("tool=grep"),
+        "known names must not trigger a warning: {logs}"
+    );
+    assert!(
+        !logs.contains("load_tool_schema"),
+        "synthetic always-core names must not trigger a warning: {logs}"
+    );
+}
+
+#[test]
+fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
+    let tools = [
+        task_state_advertised_tool(),
+        test_advertised_tool("grep", PermissionCapability::Search),
+        test_advertised_tool("webfetch", PermissionCapability::Network),
+        test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),
+    ];
+    let config = ToolSchemaConfig::default();
+
+    let initial_specs = request_tool_specs(&tools, SessionMode::Build, &config, &[]);
+    let initial_names = advertised_tool_names(&initial_specs);
+    assert_eq!(
+        initial_names,
+        vec![TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME, "grep"]
+    );
+
+    let loaded_specs = request_tool_specs(
+        &tools,
+        SessionMode::Build,
+        &config,
+        &[
+            "mcp__docs__lookup".to_string(),
+            "webfetch".to_string(),
+            "mcp__docs__lookup".to_string(),
+        ],
+    );
+    let loaded_names = advertised_tool_names(&loaded_specs);
+    assert_eq!(
+        loaded_names,
+        vec![
+            TASK_STATE_TOOL_NAME,
+            LOAD_TOOL_SCHEMA_TOOL_NAME,
+            "grep",
+            "mcp__docs__lookup",
+            "webfetch",
+        ]
+    );
+}
+
+#[test]
+fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
+    let tools = [
+        task_state_advertised_tool(),
+        test_advertised_tool("grep", PermissionCapability::Search),
+        test_advertised_tool("webfetch", PermissionCapability::Network),
+        test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),
+    ];
+    let config = ToolSchemaConfig::default();
+
+    let index = tool_schema_index(&tools, SessionMode::Build, &config).expect("index");
+
+    assert!(index.contains("webfetch | capability=network"));
+    assert!(index.contains("mcp__docs__lookup | capability=mcp"));
+    assert!(!index.contains("grep | capability=search"));
+}
+
+#[test]
 fn registry_specs_carry_capability_aligned_with_permission_request() {
     let tools = ToolRegistry::new("/tmp").expect("registry");
     for spec in tools.specs() {

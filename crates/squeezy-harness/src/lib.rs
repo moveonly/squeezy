@@ -5,7 +5,10 @@ use std::{
     io::{BufWriter, Write},
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -212,6 +215,7 @@ pub struct HarnessMetrics {
     pub planner_tool_calls: u64,
     pub planner_refusals: u64,
     pub redactions: u64,
+    pub prompt_bytes: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
@@ -374,7 +378,9 @@ async fn run_mock(
 ) -> Result<RunnerOutput> {
     let events = events?;
     let provider = Arc::new(ScriptedProvider::new(runner.name(), events));
-    run_agent(task, runner, provider).await
+    let mut output = run_agent(task, runner, provider.clone()).await?;
+    output.metrics.prompt_bytes = provider.prompt_bytes();
+    Ok(output)
 }
 
 async fn run_planner_probe(
@@ -609,6 +615,11 @@ fn trace_completed(response_id: Option<String>, cost: CostSnapshot) -> TraceEven
 struct ScriptedProvider {
     name: &'static str,
     events: Mutex<VecDeque<TraceEvent>>,
+    // `prompt_bytes` is updated exactly once per request and read at most
+    // once per task, so contention is effectively zero. Using `AtomicU64`
+    // avoids the awkward poisoning-on-panic surface that `Mutex<u64>` would
+    // introduce while keeping the increment lock-free.
+    prompt_bytes: AtomicU64,
 }
 
 impl ScriptedProvider {
@@ -621,7 +632,12 @@ impl ScriptedProvider {
         Self {
             name,
             events: Mutex::new(events.into()),
+            prompt_bytes: AtomicU64::new(0),
         }
+    }
+
+    fn prompt_bytes(&self) -> u64 {
+        self.prompt_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -630,7 +646,9 @@ impl LlmProvider for ScriptedProvider {
         self.name
     }
 
-    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        self.prompt_bytes
+            .fetch_add(request_prompt_bytes(&request), Ordering::Relaxed);
         let events = self
             .events
             .lock()
@@ -642,6 +660,25 @@ impl LlmProvider for ScriptedProvider {
             Box::pin(stream::iter(events));
         stream
     }
+}
+
+fn request_prompt_bytes(request: &LlmRequest) -> u64 {
+    let input_bytes = request
+        .input
+        .iter()
+        .map(|item| format!("{item:?}").len() as u64)
+        .sum::<u64>();
+    let tool_bytes = request
+        .tools
+        .iter()
+        .map(|tool| {
+            (tool.name.len()
+                + tool.description.len()
+                + tool.parameters.to_string().len()
+                + usize::from(tool.strict)) as u64
+        })
+        .sum::<u64>();
+    request.instructions.len() as u64 + input_bytes + tool_bytes
 }
 
 #[derive(Debug)]

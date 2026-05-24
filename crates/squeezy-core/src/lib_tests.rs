@@ -111,6 +111,17 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.max_search_files_per_turn,
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
+    assert!(config.tools.lazy_schema_loading);
+    assert!(config.tools.core.contains(&"grep".to_string()));
+    assert!(config.tools.core.contains(&"plan_patch".to_string()));
+    assert!(config.tools.core.contains(&"apply_patch".to_string()));
+    // `update_task_state` and `load_tool_schema` are always-core control
+    // tools and are intentionally absent from the configurable `core` list;
+    // `squeezy_agent::request_tool_specs` forces them into the request by
+    // name.
+    assert!(!config.tools.core.contains(&"load_tool_schema".to_string()));
+    assert!(!config.tools.core.contains(&"update_task_state".to_string()));
+    assert!(config.tools.discoverable.is_empty());
     assert_eq!(
         config.context_compaction,
         ContextCompactionConfig::default()
@@ -1028,6 +1039,11 @@ exclude_classes = ["generated"]
 root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
 
+[tools]
+lazy_schema_loading = true
+core = ["webfetch"]
+discoverable = ["read_file"]
+
 [tui]
 tick_rate_ms = 75
 status_verbosity = "verbose"
@@ -1078,6 +1094,10 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert!(config.tools.lazy_schema_loading);
+    assert!(config.tools.core.contains(&"webfetch".to_string()));
+    assert!(!config.tools.core.contains(&"read_file".to_string()));
+    assert_eq!(config.tools.discoverable, vec!["read_file"]);
     assert_eq!(config.tui.tick_rate_ms, 75);
     assert_eq!(config.tui.status_verbosity, StatusVerbosity::Verbose);
     assert_eq!(config.tui.response_verbosity, ResponseVerbosity::Concise);
@@ -1100,6 +1120,27 @@ reason = "docs lookups are safe"
             .any(|rule| rule.capability == "mcp"
                 && rule.target == "docs/lookup:*"
                 && rule.action == PermissionMode::Allow)
+    );
+}
+
+#[test]
+fn tools_settings_reject_explicit_core_discoverable_overlap() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[tools]
+core = ["webfetch"]
+discoverable = ["webfetch"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let error =
+        AppConfig::try_from_settings_and_env_vars(settings, None, |_| None).expect_err("overlap");
+    assert!(
+        error
+            .to_string()
+            .contains("[tools] core and discoverable overlap")
     );
 }
 

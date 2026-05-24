@@ -178,6 +178,16 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 [cache]
 # tool_outputs = ".squeezy/tool_outputs"
 
+# [tools]
+# lazy_schema_loading = true
+# `update_task_state` and `load_tool_schema` are always-core control tools and
+# do not need to appear in `core`. The authoritative default list lives in
+# `DEFAULT_CORE_TOOL_NAMES` in `squeezy_core` so future changes only have to
+# touch one place. The values shown here are the current defaults and only
+# need to be set when overriding them.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "apply_patch", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "plan_patch", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# discoverable = []
+
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"
@@ -363,6 +373,15 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   workspace root, not the process working directory. Graph warm-start state,
   cross-session receipt metadata, and internal observations are stored in
   `state.redb` under `root` or `.squeezy/cache` when `root` is unset.
+- `[tools]`: lazy schema loading controls. With
+  `lazy_schema_loading = true` (default), Squeezy sends full JSON schemas for
+  the core tool list plus `load_tool_schema`; other tools are listed in a
+  compact `tools_index` with name, one-line description, and capability tag.
+  Calling `load_tool_schema` appends that tool's full schema for later rounds
+  in the same session. MCP tools default to discoverable. `core` adds tools to
+  the default core set; `discoverable` removes tools from the core set and
+  forces index-only advertisement until loaded. A tool name cannot appear in
+  both explicit lists.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
   `status_verbosity = "compact"` keeps the footer calm and focused on
   provider/model, mode, repo, permissions, telemetry, activity, and spend.

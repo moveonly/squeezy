@@ -111,6 +111,60 @@ fn baseline_paths_skips_ignored_directories() {
 }
 
 #[tokio::test]
+async fn mock_runner_records_non_zero_prompt_bytes() {
+    let task = TaskSpec {
+        id: "mock-prompt-bytes".to_string(),
+        title: "Mock prompt bytes".to_string(),
+        prompt: "answer".to_string(),
+        workspace: WorkspaceSpec { files: Vec::new() },
+        expect: ExpectSpec {
+            contains: vec!["done".to_string()],
+        },
+        mock: Some(MockSpec {
+            openai: Some(MockProviderSpec {
+                events: vec![
+                    TraceEvent {
+                        kind: TraceEventKind::Started,
+                        text: None,
+                        response_id: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                    },
+                    TraceEvent {
+                        kind: TraceEventKind::TextDelta,
+                        text: Some("done".to_string()),
+                        response_id: None,
+                        input_tokens: None,
+                        output_tokens: None,
+                        cached_input_tokens: None,
+                    },
+                    TraceEvent {
+                        kind: TraceEventKind::Completed,
+                        text: None,
+                        response_id: Some("resp".to_string()),
+                        input_tokens: Some(3),
+                        output_tokens: Some(1),
+                        cached_input_tokens: None,
+                    },
+                ],
+            }),
+            anthropic: None,
+        }),
+        baseline: None,
+    };
+
+    let result = run_task(&task, RunnerKind::MockOpenai, None).await;
+
+    assert_eq!(result.status, TaskStatus::Passed);
+    assert!(
+        result.metrics.prompt_bytes > 0,
+        "scripted runs must populate prompt_bytes; got {}",
+        result.metrics.prompt_bytes
+    );
+}
+
+#[tokio::test]
 async fn mock_runner_uses_trace_events_and_scores_correctness() {
     let task = TaskSpec {
         id: "mock".to_string(),
