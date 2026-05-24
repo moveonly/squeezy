@@ -1137,16 +1137,12 @@ impl SettingsFile {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let value = text
-            .parse::<toml::Value>()
+        let table = toml::from_str::<toml::value::Table>(text)
             .map_err(|err| SqueezyError::Config(format!("{source}: {err}")))?;
-        Self::from_toml_value(value, source)
+        Self::from_toml_table(&table, source)
     }
 
-    fn from_toml_value(value: toml::Value, source: &str) -> Result<Self> {
-        let table = value.as_table().ok_or_else(|| {
-            SqueezyError::Config(format!("{source}: settings root must be a TOML table"))
-        })?;
+    fn from_toml_table(table: &toml::value::Table, source: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
             &[
