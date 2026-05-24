@@ -4225,8 +4225,15 @@ fn is_receipt_stub_candidate(result: &ToolResult) -> bool {
 fn stable_output_sha256(result: &ToolResult) -> String {
     result
         .content
-        .get("original_output_sha256")
+        .get("cache_receipt")
+        .and_then(|value| value.get("stable_output_sha256"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .content
+                .get("original_output_sha256")
+                .and_then(Value::as_str)
+        })
         .unwrap_or(&result.receipt.output_sha256)
         .to_string()
 }

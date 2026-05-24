@@ -301,6 +301,14 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   rules last, returning the most recently added matching rule. Permission
   decisions are emitted on the `squeezy::permissions` tracing target with the
   capability, target, risk, action, matched-rule source, and reason fields.
+- Web lookup uses the same permission engine. `webfetch` requests
+  `network`/`domain:<host>` and can be allowed or denied per domain;
+  `websearch` requests `network`/`search:exa`. Successful web results are
+  remote evidence, not local graph facts: they carry source URL fields,
+  retrieval time, citation metadata, redacted quote hashes, and
+  cache-receipt metadata. The receipt is metadata only; Squeezy still performs
+  the approved network request and does not serve cached remote page content
+  from the receipt.
 - `[mcp.servers.<name>]`: external MCP server configuration. `transport` is
   `stdio`, `http` (Streamable HTTP), or `sse` (legacy-compatible remote
   stream handling). `stdio` servers use `command`, optional `args`, and
@@ -405,7 +413,9 @@ Custom patterns extend the built-in set and are validated at config load time.
 leak into copied diagnostics. Redaction happens before tool output is returned
 to the model, before large tool output is spilled to disk, before model
 requests are sent, and before TUI/status surfaces display provider errors or
-tool results.
+tool results. Web lookup additionally redacts fetched or searched remote text
+before applying quote byte caps, so quote limits are measured against the
+model-visible redacted text.
 
 ### Pattern Syntax
 
