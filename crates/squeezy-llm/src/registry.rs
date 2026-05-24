@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use serde_json::Value;
 use squeezy_core::{CostSnapshot, ModelProfile, ProviderConfig, Result};
 
 use crate::{
-    AnthropicProvider, BedrockProvider, GoogleProvider, LlmProvider, OllamaProvider, OpenAiProvider,
+    AnthropicProvider, BedrockProvider, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest,
+    OllamaProvider, OpenAiProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,12 +42,69 @@ pub struct TokenPricing {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerKind {
+    OpenAiCompatible,
+    Anthropic,
+    Google,
+    Ollama,
+}
+
+impl TokenizerKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai_compatible_estimate",
+            Self::Anthropic => "anthropic_estimate",
+            Self::Google => "google_estimate",
+            Self::Ollama => "ollama_estimate",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelLifecycle {
+    Active,
+    Local,
+}
+
+impl ModelLifecycle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Local => "local",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelLimits {
+    pub context_window_tokens: u64,
+    pub max_output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelInfo {
     pub provider: &'static str,
     pub id: &'static str,
     pub profile: ModelProfile,
     pub capabilities: ModelCapabilities,
     pub pricing: Option<TokenPricing>,
+    pub limits: Option<ModelLimits>,
+    pub tokenizer: TokenizerKind,
+    pub lifecycle: ModelLifecycle,
+    pub metadata_source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTokenEstimate {
+    pub input_tokens: u64,
+    pub context_window_tokens: Option<u64>,
+    pub max_output_tokens: Option<u64>,
+    pub input_budget_tokens: Option<u64>,
+    pub remaining_input_tokens: Option<u64>,
+    /// Hundredths of one percent. `10_000` means 100.00%.
+    pub used_input_percent_x100: Option<u32>,
+    pub tokenizer: TokenizerKind,
+    pub estimated: bool,
 }
 
 pub const MODEL_REGISTRY: &[ModelInfo] = &[
@@ -66,6 +125,13 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             cache_read_usd_micros_per_mtok: Some(5_000),
             cache_write_usd_micros_per_mtok: None,
         }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://platform.openai.com/docs/models/gpt-5-nano/",
     },
     ModelInfo {
         provider: "anthropic",
@@ -73,11 +139,18 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities::TEXT_TOOLS,
         pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 800_000,
-            output_usd_micros_per_mtok: 4_000_000,
-            cache_read_usd_micros_per_mtok: Some(80_000),
-            cache_write_usd_micros_per_mtok: Some(1_000_000),
+            input_usd_micros_per_mtok: 1_000_000,
+            output_usd_micros_per_mtok: 5_000_000,
+            cache_read_usd_micros_per_mtok: Some(100_000),
+            cache_write_usd_micros_per_mtok: Some(1_250_000),
         }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 64_000,
+        }),
+        tokenizer: TokenizerKind::Anthropic,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
     },
     ModelInfo {
         provider: "google",
@@ -90,6 +163,13 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             cache_read_usd_micros_per_mtok: Some(25_000),
             cache_write_usd_micros_per_mtok: None,
         }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 1_048_576,
+            max_output_tokens: 65_536,
+        }),
+        tokenizer: TokenizerKind::Google,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
     },
     ModelInfo {
         provider: "azure_openai",
@@ -108,6 +188,13 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             cache_read_usd_micros_per_mtok: Some(5_000),
             cache_write_usd_micros_per_mtok: None,
         }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://platform.openai.com/docs/models/gpt-5-nano/",
     },
     ModelInfo {
         provider: "bedrock",
@@ -115,11 +202,18 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities::TEXT_TOOLS,
         pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 800_000,
-            output_usd_micros_per_mtok: 4_000_000,
-            cache_read_usd_micros_per_mtok: Some(80_000),
-            cache_write_usd_micros_per_mtok: Some(1_000_000),
+            input_usd_micros_per_mtok: 1_000_000,
+            output_usd_micros_per_mtok: 5_000_000,
+            cache_read_usd_micros_per_mtok: Some(100_000),
+            cache_write_usd_micros_per_mtok: Some(1_250_000),
         }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 64_000,
+        }),
+        tokenizer: TokenizerKind::Anthropic,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html",
     },
     ModelInfo {
         provider: "ollama",
@@ -132,6 +226,10 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             cache_read_usd_micros_per_mtok: Some(0),
             cache_write_usd_micros_per_mtok: Some(0),
         }),
+        limits: None,
+        tokenizer: TokenizerKind::Ollama,
+        lifecycle: ModelLifecycle::Local,
+        metadata_source: "runtime ollama /api/show metadata",
     },
 ];
 
@@ -150,11 +248,58 @@ pub fn models_for_provider(provider: &str) -> impl Iterator<Item = &'static Mode
         .filter(move |model| model.provider == provider)
 }
 
-pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
+pub fn model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo> {
     MODEL_REGISTRY
         .iter()
         .find(|entry| entry.provider == provider && entry.id == model)
-        .map(|entry| entry.capabilities)
+}
+
+pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
+    model_info_for(provider, model).map(|entry| entry.capabilities)
+}
+
+pub fn estimate_request_context(
+    provider: &str,
+    model: &str,
+    request: &LlmRequest,
+    context_window_override: Option<u64>,
+) -> RequestTokenEstimate {
+    let info = model_info_for(provider, model);
+    let tokenizer = info
+        .map(|entry| entry.tokenizer)
+        .unwrap_or(TokenizerKind::OpenAiCompatible);
+    let input_tokens = estimate_request_input_tokens(request);
+    let model_limits = info.and_then(|entry| entry.limits);
+    let context_window_tokens =
+        context_window_override.or(model_limits.map(|limits| limits.context_window_tokens));
+    let max_output_tokens = request
+        .max_output_tokens
+        .map(u64::from)
+        .or(model_limits.map(|limits| limits.max_output_tokens))
+        .map(|tokens| {
+            model_limits
+                .map(|limits| tokens.min(limits.max_output_tokens))
+                .unwrap_or(tokens)
+        });
+    let input_budget_tokens =
+        context_window_tokens.map(|window| window.saturating_sub(max_output_tokens.unwrap_or(0)));
+    let remaining_input_tokens =
+        input_budget_tokens.map(|budget| budget.saturating_sub(input_tokens));
+    let used_input_percent_x100 = input_budget_tokens
+        .filter(|budget| *budget > 0)
+        .map(|budget| {
+            ((input_tokens.saturating_mul(10_000)) / budget).min(u64::from(u32::MAX)) as u32
+        });
+    RequestTokenEstimate {
+        input_tokens,
+        context_window_tokens,
+        max_output_tokens,
+        input_budget_tokens,
+        remaining_input_tokens,
+        used_input_percent_x100,
+        tokenizer,
+        estimated: true,
+    }
 }
 
 pub fn provider_name(config: &ProviderConfig) -> &'static str {
@@ -224,4 +369,63 @@ fn estimate(tokens: Option<u64>, usd_micros_per_mtok: u64) -> u64 {
 
 fn estimate_tokens(tokens: u64, usd_micros_per_mtok: u64) -> u64 {
     tokens.saturating_mul(usd_micros_per_mtok) / 1_000_000
+}
+
+fn estimate_request_input_tokens(request: &LlmRequest) -> u64 {
+    let mut total = estimate_text_tokens(&request.instructions).saturating_add(8);
+    if let Some(verbosity) = request.response_verbosity {
+        total = total.saturating_add(estimate_text_tokens(verbosity.as_str()) + 4);
+    }
+    if let Some(effort) = request.reasoning_effort {
+        total = total.saturating_add(estimate_text_tokens(effort.as_str()) + 4);
+    }
+    if request.previous_response_id.is_some() {
+        total = total.saturating_add(8);
+    }
+    if request.store {
+        total = total.saturating_add(2);
+    }
+    for item in &request.input {
+        total = total.saturating_add(estimate_input_item_tokens(item));
+    }
+    for tool in &request.tools {
+        total = total.saturating_add(12);
+        total = total.saturating_add(estimate_text_tokens(&tool.name));
+        total = total.saturating_add(estimate_text_tokens(&tool.description));
+        total = total.saturating_add(estimate_json_tokens(&tool.parameters));
+    }
+    total
+}
+
+fn estimate_input_item_tokens(item: &LlmInputItem) -> u64 {
+    match item {
+        LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => {
+            estimate_text_tokens(text).saturating_add(8)
+        }
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => estimate_text_tokens(call_id)
+            .saturating_add(estimate_text_tokens(name))
+            .saturating_add(estimate_json_tokens(arguments))
+            .saturating_add(12),
+        LlmInputItem::FunctionCallOutput { call_id, output } => estimate_text_tokens(call_id)
+            .saturating_add(estimate_text_tokens(output))
+            .saturating_add(12),
+    }
+}
+
+fn estimate_json_tokens(value: &Value) -> u64 {
+    serde_json::to_string(value)
+        .map(|text| estimate_text_tokens(&text))
+        .unwrap_or(0)
+}
+
+fn estimate_text_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    if chars == 0 {
+        return 0;
+    }
+    chars.div_ceil(4).max(1)
 }

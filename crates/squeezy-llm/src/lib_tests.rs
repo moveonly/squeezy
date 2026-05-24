@@ -91,3 +91,80 @@ fn registry_lists_ollama_as_zero_cost_local_provider() {
     assert_eq!(model.pricing.unwrap().input_usd_micros_per_mtok, 0);
     assert!(model.capabilities.streaming);
 }
+
+#[test]
+fn registry_lists_context_limits_for_hosted_defaults() {
+    let openai = model_info_for("openai", squeezy_core::DEFAULT_OPENAI_MODEL).expect("openai");
+    assert_eq!(openai.limits.unwrap().context_window_tokens, 400_000);
+    assert_eq!(openai.limits.unwrap().max_output_tokens, 128_000);
+
+    let anthropic =
+        model_info_for("anthropic", squeezy_core::DEFAULT_ANTHROPIC_MODEL).expect("anthropic");
+    assert_eq!(
+        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        "claude-haiku-4-5-20251001"
+    );
+    assert_eq!(anthropic.limits.unwrap().context_window_tokens, 200_000);
+    assert_eq!(anthropic.limits.unwrap().max_output_tokens, 64_000);
+
+    let bedrock = model_info_for("bedrock", squeezy_core::DEFAULT_BEDROCK_MODEL).expect("bedrock");
+    assert_eq!(
+        squeezy_core::DEFAULT_BEDROCK_MODEL,
+        "anthropic.claude-haiku-4-5-20251001-v1:0"
+    );
+    assert_eq!(bedrock.limits.unwrap().context_window_tokens, 200_000);
+
+    let google = model_info_for("google", squeezy_core::DEFAULT_GOOGLE_MODEL).expect("google");
+    assert_eq!(google.limits.unwrap().context_window_tokens, 1_048_576);
+
+    let ollama = model_info_for("ollama", squeezy_core::DEFAULT_OLLAMA_MODEL).expect("ollama");
+    assert!(ollama.limits.is_none());
+}
+
+#[test]
+fn request_context_estimate_reports_budget_when_model_limit_exists() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        instructions: "short system prompt".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: Some(128),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let estimate =
+        estimate_request_context("openai", squeezy_core::DEFAULT_OPENAI_MODEL, &request, None);
+
+    assert!(estimate.input_tokens > 0);
+    assert_eq!(estimate.context_window_tokens, Some(400_000));
+    assert_eq!(estimate.max_output_tokens, Some(128));
+    assert_eq!(estimate.input_budget_tokens, Some(399_872));
+    assert!(estimate.remaining_input_tokens.unwrap() < 399_872);
+    assert!(estimate.used_input_percent_x100.is_some());
+}
+
+#[test]
+fn request_context_estimate_omits_budget_when_model_limit_is_unknown() {
+    let request = LlmRequest {
+        model: "custom-model".to_string(),
+        instructions: "system".to_string(),
+        input: Vec::new(),
+        max_output_tokens: Some(128),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let estimate = estimate_request_context("openai", "custom-model", &request, None);
+
+    assert!(estimate.input_tokens > 0);
+    assert_eq!(estimate.context_window_tokens, None);
+    assert_eq!(estimate.input_budget_tokens, None);
+    assert_eq!(estimate.remaining_input_tokens, None);
+    assert_eq!(estimate.used_input_percent_x100, None);
+}

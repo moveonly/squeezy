@@ -58,7 +58,7 @@ ANTHROPIC_API_KEY=... \
 cargo run -p squeezy-harness -- run --runner costly-anthropic --trace-dir target/harness-traces
 ```
 
-The default Anthropic costly model is `claude-3-5-haiku-20241022`. Override costly models with `SQUEEZY_COSTLY_OPENAI_MODEL`, `SQUEEZY_COSTLY_ANTHROPIC_MODEL`, provider-specific variables such as `SQUEEZY_COSTLY_GOOGLE_MODEL`, or the shared `SQUEEZY_COSTLY_MODEL`.
+The default Anthropic costly model is `claude-haiku-4-5-20251001`. Override costly models with `SQUEEZY_COSTLY_OPENAI_MODEL`, `SQUEEZY_COSTLY_ANTHROPIC_MODEL`, provider-specific variables such as `SQUEEZY_COSTLY_GOOGLE_MODEL`, or the shared `SQUEEZY_COSTLY_MODEL`.
 
 Additional explicit live runners are available for provider smoke testing: `costly-google`, `costly-azure-openai`, `costly-ollama`, and `costly-bedrock`. They use the same provider configuration described in `docs/PROVIDERS.md`.
 
