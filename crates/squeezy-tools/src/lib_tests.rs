@@ -72,6 +72,15 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(compiler.capability, PermissionCapability::Compiler);
     assert_eq!(compiler.target, "cargo test:*");
 
+    let refresh = registry.permission_request(&ToolCall {
+        call_id: "facts".to_string(),
+        name: "refresh_compiler_facts".to_string(),
+        arguments: json!({"diagnostics": true}),
+    });
+    assert_eq!(refresh.capability, PermissionCapability::Compiler);
+    assert_eq!(refresh.target, "cargo facts+check:*");
+    assert_eq!(refresh.metadata["diagnostics"], "true");
+
     let _ = fs::remove_dir_all(root);
 }
 
@@ -2785,6 +2794,7 @@ fn tool_specs_are_sorted_by_name() {
             "read_slice",
             "read_tool_output",
             "reference_search",
+            "refresh_compiler_facts",
             "repo_map",
             "shell",
             "symbol_context",
@@ -2922,6 +2932,69 @@ pub mod service {
         .await;
     assert_eq!(context.status, ToolStatus::Success);
     assert_uniform_evidence_packet(&context.content["packets"][0]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn refresh_compiler_facts_caches_diagnostics_for_symbol_context() {
+    let root = temp_workspace("compiler_facts_symbol_context");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn bad() -> i32 {
+    "nope"
+}
+"#,
+    );
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let refresh = registry
+        .execute(
+            ToolCall {
+                call_id: "facts".to_string(),
+                name: "refresh_compiler_facts".to_string(),
+                arguments: json!({"diagnostics": true}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(refresh.status, ToolStatus::Success, "{:?}", refresh.content);
+    assert_eq!(refresh.content["summary"]["packages"].as_u64(), Some(1));
+    assert_eq!(refresh.content["summary"]["targets"].as_u64(), Some(1));
+    assert!(
+        refresh.content["summary"]["diagnostics"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "{}",
+        refresh.content
+    );
+
+    let context = registry
+        .execute(
+            ToolCall {
+                call_id: "context".to_string(),
+                name: "symbol_context".to_string(),
+                arguments: json!({"query": "bad"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(context.status, ToolStatus::Success);
+    let diagnostics = context.content["packets"][0]["diagnostics"]
+        .as_array()
+        .expect("diagnostics");
+    assert!(
+        diagnostics.iter().any(|diagnostic| diagnostic["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("mismatched types")),
+        "{}",
+        context.content
+    );
 
     let _ = fs::remove_dir_all(root);
 }

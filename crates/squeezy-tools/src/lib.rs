@@ -9,7 +9,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{Arc, Mutex as StdMutex},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt;
@@ -33,8 +33,9 @@ use squeezy_core::{
     SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind, sensitive_pattern_base,
 };
 use squeezy_graph::{
-    CallEdgeHit, DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode,
-    ReferenceHit, SignatureQuery,
+    CallEdgeHit, CargoDiagnosticHit, CargoFactFreshness, CargoFactProvenance, CargoFactsSummary,
+    DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode, ReferenceHit,
+    SignatureQuery,
 };
 use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
@@ -1003,6 +1004,7 @@ impl ToolRegistry {
             read_slice_spec(),
             read_tool_output_spec(),
             reference_search_spec(),
+            refresh_compiler_facts_spec(),
             repo_map_spec(),
             write_file_spec(),
             symbol_context_spec(),
@@ -1039,7 +1041,7 @@ impl ToolRegistry {
         match call.name.as_str() {
             "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
             "write_file" => PermissionScope::Edit,
-            "shell" | "verify" => PermissionScope::Shell,
+            "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
             "glob" if tool_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
             "grep" if grep_include_ignored(&call.arguments) => PermissionScope::IgnoredSearch,
@@ -1190,6 +1192,42 @@ impl ToolRegistry {
                     PermissionMode::Allow,
                     PermissionRuleSource::Session,
                     Some("approved verification command family".to_string()),
+                ));
+                (
+                    PermissionCapability::Compiler,
+                    target,
+                    PermissionRisk::Medium,
+                )
+            }
+            "refresh_compiler_facts" => {
+                let args =
+                    serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone()).ok();
+                let diagnostics = args
+                    .as_ref()
+                    .and_then(|args| args.diagnostics)
+                    .unwrap_or(false);
+                metadata.insert("diagnostics".to_string(), diagnostics.to_string());
+                metadata.insert(
+                    "commands".to_string(),
+                    if diagnostics {
+                        "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+                            .to_string()
+                    } else {
+                        "cargo metadata --format-version=1 --no-deps".to_string()
+                    },
+                );
+                let target = if diagnostics {
+                    "cargo facts+check:*"
+                } else {
+                    "cargo facts:*"
+                }
+                .to_string();
+                suggested_rules.push(PermissionRule::new(
+                    "compiler",
+                    target.clone(),
+                    PermissionMode::Allow,
+                    PermissionRuleSource::Session,
+                    Some("approved compiler fact refresh".to_string()),
                 ));
                 (
                     PermissionCapability::Compiler,
@@ -1422,6 +1460,15 @@ impl ToolRegistry {
                     .unwrap_or("quick");
                 format!("verify scope={scope:?} level={level:?}")
             }
+            "refresh_compiler_facts" => {
+                let args =
+                    serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone()).ok();
+                let diagnostics = args
+                    .as_ref()
+                    .and_then(|args| args.diagnostics)
+                    .unwrap_or(false);
+                format!("refresh_compiler_facts diagnostics={diagnostics}")
+            }
             "write_file" => {
                 let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("?");
@@ -1511,6 +1558,10 @@ impl ToolRegistry {
                 "grep" => self.execute_grep(&call, cancel).await,
                 "read_file" => self.execute_read_file(&call).await,
                 "read_tool_output" => self.execute_read_tool_output(&call).await,
+                "refresh_compiler_facts" => {
+                    self.execute_refresh_compiler_facts(&call, cancel, &group_id)
+                        .await
+                }
                 "verify" => self.execute_verify(&call, cancel, &group_id).await,
                 "write_file" => self.execute_write_file(&call, &group_id).await,
                 "shell" => self.execute_shell(&call, cancel, &group_id).await,
@@ -2989,6 +3040,209 @@ impl ToolRegistry {
             cost,
             None,
         )
+    }
+
+    async fn execute_refresh_compiler_facts(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        let args = match serde_json::from_value::<RefreshCompilerFactsArgs>(call.arguments.clone())
+        {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let include_diagnostics = args.diagnostics.unwrap_or(false);
+        let metadata_command = "cargo metadata --format-version=1 --no-deps";
+        let metadata_result = self
+            .execute_compiler_fact_command(
+                call,
+                metadata_command,
+                120_000,
+                MAX_SHELL_OUTPUT_BYTE_CAP,
+                cancel.clone(),
+                group_id,
+            )
+            .await;
+        if metadata_result.status != ToolStatus::Success {
+            return compiler_fact_command_error(call, "cargo metadata failed", metadata_result);
+        }
+        if metadata_result
+            .content
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({"error": "cargo metadata output was truncated"}),
+                metadata_result.cost_hint,
+                None,
+            );
+        }
+        let metadata_stdout = shell_stdout(&metadata_result).to_string();
+
+        let diagnostics_result = if include_diagnostics {
+            Some(
+                self.execute_compiler_fact_command(
+                    call,
+                    "cargo check --message-format=json",
+                    VERIFY_SHELL_TIMEOUT_MS,
+                    MAX_SHELL_OUTPUT_BYTE_CAP,
+                    cancel.clone(),
+                    group_id,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if diagnostics_result
+            .as_ref()
+            .and_then(|result| result.content.get("truncated").and_then(Value::as_bool))
+            .unwrap_or(false)
+        {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({"error": "cargo check output was truncated"}),
+                diagnostics_result
+                    .as_ref()
+                    .map(|result| result.cost_hint.clone())
+                    .unwrap_or_default(),
+                None,
+            );
+        }
+        let diagnostics_stdout = diagnostics_result.as_ref().map(shell_stdout);
+
+        let cargo_version = self
+            .compiler_version("cargo --version", cancel.clone(), group_id)
+            .await;
+        let rustc_version = self
+            .compiler_version("rustc --version", cancel.clone(), group_id)
+            .await;
+        let command = if include_diagnostics {
+            "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+        } else {
+            metadata_command
+        };
+        let provenance = CargoFactProvenance {
+            command: command.to_string(),
+            cargo_version,
+            rustc_version,
+            captured_unix_millis: unix_millis(),
+        };
+
+        let report = {
+            let mut graph = match self.graph.lock() {
+                Ok(graph) => graph,
+                Err(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({"error": "semantic graph lock poisoned"}),
+                        ToolCostHint::default(),
+                        None,
+                    );
+                }
+            };
+            let Some(manager) = graph.as_mut() else {
+                return graph_unavailable_result(call);
+            };
+            if let Err(err) = manager.refresh_before_query() {
+                return tool_error(call, err);
+            }
+            match manager.graph_mut().refresh_cargo_facts_from_json(
+                &metadata_stdout,
+                diagnostics_stdout,
+                provenance,
+                &self.root,
+            ) {
+                Ok(report) => report,
+                Err(err) => return tool_error(call, err),
+            }
+        };
+
+        let diagnostics_exit_code = diagnostics_result
+            .as_ref()
+            .and_then(|result| result.content.get("exit_code").and_then(Value::as_i64));
+        let metadata_bytes =
+            shell_stdout(&metadata_result).len() + shell_stderr(&metadata_result).len();
+        let diagnostics_bytes = diagnostics_result.as_ref().map_or(0, |result| {
+            shell_stdout(result).len() + shell_stderr(result).len()
+        });
+        let output_bytes = metadata_bytes + diagnostics_bytes;
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "tool": "refresh_compiler_facts",
+                "metadata_command": metadata_command,
+                "diagnostics_command": include_diagnostics.then_some("cargo check --message-format=json"),
+                "diagnostics_exit_code": diagnostics_exit_code,
+                "diagnostics_loaded": report.diagnostics_loaded,
+                "summary": cargo_facts_summary_json(&report.summary),
+            }),
+            ToolCostHint {
+                bytes_read: output_bytes as u64,
+                output_bytes: output_bytes as u64,
+                matches_returned: report.summary.diagnostics as u64,
+                truncated: false,
+                ..ToolCostHint::default()
+            },
+            None,
+        )
+    }
+
+    async fn execute_compiler_fact_command(
+        &self,
+        call: &ToolCall,
+        command: &str,
+        timeout_ms: u64,
+        output_byte_cap: usize,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> ToolResult {
+        let shell_call = ToolCall {
+            call_id: call.call_id.clone(),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": command,
+                "description": "refresh cached cargo compiler facts",
+                "timeout_ms": timeout_ms,
+                "output_byte_cap": output_byte_cap,
+                "output_mode": "raw",
+            }),
+        };
+        self.execute_shell_capped(&shell_call, cancel, timeout_ms, group_id)
+            .await
+    }
+
+    async fn compiler_version(
+        &self,
+        command: &str,
+        cancel: CancellationToken,
+        group_id: &str,
+    ) -> Option<String> {
+        let call = ToolCall {
+            call_id: format!("compiler-version-{command}"),
+            name: "shell".to_string(),
+            arguments: json!({
+                "command": command,
+                "description": "capture compiler fact provenance version",
+                "timeout_ms": 10_000,
+                "output_byte_cap": 1024,
+                "output_mode": "raw",
+            }),
+        };
+        let result = self
+            .execute_shell_capped(&call, cancel, 10_000, group_id)
+            .await;
+        (result.status == ToolStatus::Success)
+            .then(|| shell_stdout(&result).trim().to_string())
+            .filter(|version| !version.is_empty())
     }
 
     async fn execute_verify(
@@ -5763,6 +6017,11 @@ struct VerifyArgs {
     output_mode: Option<OutputMode>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RefreshCompilerFactsArgs {
+    diagnostics: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum VerifyScope {
@@ -6068,6 +6327,44 @@ fn verify_command(
     }
 }
 
+fn shell_stdout(result: &ToolResult) -> &str {
+    result
+        .content
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn shell_stderr(result: &ToolResult) -> &str {
+    result
+        .content
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
+fn compiler_fact_command_error(call: &ToolCall, reason: &str, result: ToolResult) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Error,
+        json!({
+            "error": reason,
+            "exit_code": result.content.get("exit_code").cloned(),
+            "stdout": shell_stdout(&result),
+            "stderr": shell_stderr(&result),
+        }),
+        result.cost_hint,
+        None,
+    )
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn diff_package_names(root: &Path, changed_paths: &[String]) -> BTreeSet<String> {
     changed_paths
         .iter()
@@ -6161,6 +6458,11 @@ fn symbol_context_json(
             })
         })
         .collect::<Vec<_>>();
+    let diagnostics = graph
+        .cargo_diagnostics_for_symbol(symbol)
+        .into_iter()
+        .map(|hit| cargo_diagnostic_hit_json(&hit))
+        .collect::<Vec<_>>();
     json!({
         "id": symbol.id.0,
         "name": symbol.name,
@@ -6178,6 +6480,7 @@ fn symbol_context_json(
         })),
         "references": references,
         "callers": callers,
+        "diagnostics": diagnostics,
         "confidence": format!("{:?}", symbol.confidence),
         "freshness": format!("{:?}", symbol.freshness),
     })
@@ -6258,9 +6561,50 @@ fn graph_stats_json(graph: &squeezy_graph::SemanticGraph) -> Value {
         "body_hits": stats.body_hits,
         "references": stats.references,
         "calls": stats.calls,
+        "cargo_workspaces": stats.cargo_workspaces,
+        "cargo_packages": stats.cargo_packages,
+        "cargo_targets": stats.cargo_targets,
+        "cargo_features": stats.cargo_features,
+        "cargo_diagnostics": stats.cargo_diagnostics,
         "body_hit_trigram_indexed": stats.body_hit_trigram_indexed,
         "body_hit_trigram_terms": stats.body_hit_trigram_terms,
         "reference_index_terms": stats.reference_index_terms,
+    })
+}
+
+fn cargo_facts_summary_json(summary: &CargoFactsSummary) -> Value {
+    json!({
+        "workspaces": summary.workspaces,
+        "packages": summary.packages,
+        "targets": summary.targets,
+        "features": summary.features,
+        "diagnostics": summary.diagnostics,
+        "freshness": summary.freshness.as_ref().map(cargo_freshness_json),
+    })
+}
+
+fn cargo_freshness_json(freshness: &CargoFactFreshness) -> Value {
+    json!({
+        "status": format!("{:?}", freshness.status),
+        "input_fingerprint": freshness.input_fingerprint.0,
+        "current_fingerprint": freshness.current_fingerprint.0,
+        "stale_reasons": freshness.stale_reasons,
+    })
+}
+
+fn cargo_diagnostic_hit_json(hit: &CargoDiagnosticHit) -> Value {
+    let diagnostic = &hit.diagnostic;
+    json!({
+        "level": diagnostic.level,
+        "message": diagnostic.message,
+        "code": diagnostic.code,
+        "path": diagnostic.file_id.as_ref().map(|id| id.0.clone()),
+        "span": diagnostic.span.map(span_json),
+        "label": diagnostic.label,
+        "package_id": diagnostic.package_id,
+        "target_name": diagnostic.target_name,
+        "freshness": cargo_freshness_json(&hit.freshness),
+        "provenance": provenance_json(diagnostic.provenance.clone()),
     })
 }
 
@@ -6567,6 +6911,16 @@ fn symbol_context_packet(
                     .take(max_references)
                     .filter_map(|hit| hit.callee)
                     .map(|callee| symbol_summary_json(&callee))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        object.insert(
+            "diagnostics".to_string(),
+            json!(
+                graph
+                    .cargo_diagnostics_for_symbol(symbol)
+                    .into_iter()
+                    .map(|hit| cargo_diagnostic_hit_json(&hit))
                     .collect::<Vec<_>>()
             ),
         );
@@ -8875,6 +9229,21 @@ fn shell_spec() -> ToolSpec {
                 "description": {"type": "string", "description": "Short reason this command is needed."}
             },
             "required": ["command", "description"]
+        }),
+    }
+}
+
+fn refresh_compiler_facts_spec() -> ToolSpec {
+    ToolSpec {
+        name: "refresh_compiler_facts".to_string(),
+        description: "Explicitly refresh cached Cargo compiler facts for the Rust workspace. Runs cargo metadata, and optionally cargo check JSON diagnostics, then annotates the semantic graph without making navigation tools invoke cargo.".to_string(),
+        capability: PermissionCapability::Compiler,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "diagnostics": {"type": "boolean", "description": "When true, also run cargo check --message-format=json and cache compiler diagnostics. Default false."}
+            }
         }),
     }
 }

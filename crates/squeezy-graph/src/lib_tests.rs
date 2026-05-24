@@ -61,6 +61,102 @@ fn helper() {}
 }
 
 #[test]
+fn cargo_compiler_facts_attach_diagnostics_and_track_staleness() {
+    let source = "pub fn bad() -> i32 {\n    \"nope\"\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+    let provenance = CargoFactProvenance {
+        command: "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+            .to_string(),
+        cargo_version: Some("cargo 1.93.1".to_string()),
+        rustc_version: Some("rustc 1.93.1".to_string()),
+        captured_unix_millis: 123,
+    };
+    let metadata = serde_json::json!({
+        "packages": [{
+            "id": "path+file:///case#case@0.1.0",
+            "name": "case",
+            "manifest_path": "Cargo.toml",
+            "targets": [{
+                "name": "case",
+                "kind": ["lib"],
+                "src_path": "src/lib.rs"
+            }],
+            "features": {
+                "default": [],
+                "serde": []
+            }
+        }],
+        "workspace_members": ["path+file:///case#case@0.1.0"],
+        "workspace_root": ".",
+        "target_directory": "target"
+    })
+    .to_string();
+    let diagnostic_start = source.find("\"nope\"").unwrap() as u32;
+    let diagnostic_end = diagnostic_start + "\"nope\"".len() as u32;
+    let diagnostics = serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": "path+file:///case#case@0.1.0",
+        "target": {"name": "case"},
+        "message": {
+            "message": "mismatched types",
+            "level": "error",
+            "code": {"code": "E0308"},
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "byte_start": diagnostic_start,
+                "byte_end": diagnostic_end,
+                "line_start": 2,
+                "line_end": 2,
+                "column_start": 5,
+                "column_end": 11,
+                "is_primary": true,
+                "label": "expected i32"
+            }]
+        }
+    })
+    .to_string();
+
+    let report = graph
+        .refresh_cargo_facts_from_json(&metadata, Some(&diagnostics), provenance, &root)
+        .unwrap();
+
+    assert_eq!(report.summary.workspaces, 1);
+    assert_eq!(report.summary.packages, 1);
+    assert_eq!(report.summary.targets, 1);
+    assert_eq!(report.summary.features, 2);
+    assert_eq!(report.summary.diagnostics, 1);
+    assert_eq!(
+        report.summary.freshness.as_ref().unwrap().status,
+        Freshness::Fresh
+    );
+
+    let bad = graph.find_symbol_by_name("bad").pop().unwrap();
+    let hits = graph.cargo_diagnostics_for_symbol(&bad);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].diagnostic.code.as_deref(), Some("E0308"));
+    assert_eq!(hits[0].freshness.status, Freshness::Fresh);
+
+    graph
+        .files
+        .get_mut(&FileId::new("src/lib.rs"))
+        .unwrap()
+        .hash = ContentHash::new("changed");
+    let stale_hits = graph.cargo_diagnostics_for_symbol(&bad);
+    assert_eq!(stale_hits[0].freshness.status, Freshness::Stale);
+    assert!(!stale_hits[0].freshness.stale_reasons.is_empty());
+}
+
+#[test]
 fn persistent_graph_warm_start_skips_unchanged_parsing() {
     let root = temp_root("persistent-warm-start");
     fs::write(

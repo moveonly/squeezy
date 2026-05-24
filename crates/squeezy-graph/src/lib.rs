@@ -13,7 +13,7 @@ mod resolution;
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
-    Result, SourceSpan, SymbolId, SymbolKind,
+    Result, SourceSpan, SqueezyError, SymbolId, SymbolKind,
 };
 use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
@@ -110,6 +110,87 @@ pub struct GraphEdge {
     pub provenance: Provenance,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoFactProvenance {
+    pub command: String,
+    pub cargo_version: Option<String>,
+    pub rustc_version: Option<String>,
+    pub captured_unix_millis: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CargoFactNodeKind {
+    Workspace,
+    Package,
+    Target,
+    Feature,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoFactNode {
+    pub id: String,
+    pub kind: CargoFactNodeKind,
+    pub name: String,
+    pub package_id: Option<String>,
+    pub manifest_path: Option<String>,
+    pub source_path: Option<String>,
+    pub target_kinds: Vec<String>,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoDiagnostic {
+    pub level: String,
+    pub message: String,
+    pub code: Option<String>,
+    pub file_id: Option<FileId>,
+    pub span: Option<SourceSpan>,
+    pub label: Option<String>,
+    pub package_id: Option<String>,
+    pub target_name: Option<String>,
+    pub provenance: Provenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoFactFreshness {
+    pub status: Freshness,
+    pub input_fingerprint: ContentHash,
+    pub current_fingerprint: ContentHash,
+    pub stale_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoDiagnosticHit {
+    pub diagnostic: CargoDiagnostic,
+    pub freshness: CargoFactFreshness,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CargoFactsSummary {
+    pub workspaces: usize,
+    pub packages: usize,
+    pub targets: usize,
+    pub features: usize,
+    pub diagnostics: usize,
+    pub freshness: Option<CargoFactFreshness>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CargoFactRefreshReport {
+    pub summary: CargoFactsSummary,
+    pub diagnostics_loaded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CargoCompilerFacts {
+    pub workspace_root: Option<String>,
+    pub target_directory: Option<String>,
+    pub nodes: Vec<CargoFactNode>,
+    pub diagnostics: Vec<CargoDiagnostic>,
+    pub provenance: CargoFactProvenance,
+    pub input_fingerprint: ContentHash,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HierarchyNode {
     pub id: SymbolId,
@@ -188,6 +269,11 @@ pub struct GraphStats {
     pub body_hits: usize,
     pub references: usize,
     pub calls: usize,
+    pub cargo_workspaces: usize,
+    pub cargo_packages: usize,
+    pub cargo_targets: usize,
+    pub cargo_features: usize,
+    pub cargo_diagnostics: usize,
     pub body_hit_trigram_indexed: bool,
     pub body_hit_trigram_terms: usize,
     pub reference_index_terms: usize,
@@ -205,6 +291,7 @@ pub struct SemanticGraph {
     body_hits: Vec<BodyHit>,
     java_project_facts: Vec<JavaProjectFact>,
     dotnet_project_facts: Vec<DotnetProjectFact>,
+    cargo_facts: Option<CargoCompilerFacts>,
     java_project_facts_cache: HashMap<FileId, CachedJavaProjectFacts>,
     java_project_facts_cache_java_paths_signature: u64,
     symbols_by_name: HashMap<String, Vec<SymbolId>>,
@@ -262,6 +349,7 @@ impl SemanticGraph {
             body_hits: Vec::new(),
             java_project_facts: Vec::new(),
             dotnet_project_facts: Vec::new(),
+            cargo_facts: None,
             java_project_facts_cache: HashMap::new(),
             java_project_facts_cache_java_paths_signature: 0,
             symbols_by_name: HashMap::new(),
@@ -339,6 +427,7 @@ impl SemanticGraph {
     }
 
     pub fn stats(&self) -> GraphStats {
+        let cargo = self.cargo_facts_summary();
         GraphStats {
             files: self.files.len(),
             symbols: self.symbols.len(),
@@ -346,6 +435,11 @@ impl SemanticGraph {
             body_hits: self.body_hits.len(),
             references: self.references.len(),
             calls: self.calls.len(),
+            cargo_workspaces: cargo.workspaces,
+            cargo_packages: cargo.packages,
+            cargo_targets: cargo.targets,
+            cargo_features: cargo.features,
+            cargo_diagnostics: cargo.diagnostics,
             body_hit_trigram_indexed: self.body_hit_trigram_indexed,
             body_hit_trigram_terms: self.body_hit_trigram_index.len(),
             reference_index_terms: self.references_by_text.len(),
@@ -364,6 +458,93 @@ impl SemanticGraph {
         &self.dotnet_project_facts
     }
 
+    pub fn cargo_facts(&self) -> Option<&CargoCompilerFacts> {
+        self.cargo_facts.as_ref()
+    }
+
+    pub fn cargo_facts_summary(&self) -> CargoFactsSummary {
+        let Some(facts) = &self.cargo_facts else {
+            return CargoFactsSummary::default();
+        };
+        let mut summary = CargoFactsSummary {
+            diagnostics: facts.diagnostics.len(),
+            freshness: Some(self.cargo_fact_freshness_for(facts)),
+            ..CargoFactsSummary::default()
+        };
+        for node in &facts.nodes {
+            match node.kind {
+                CargoFactNodeKind::Workspace => summary.workspaces += 1,
+                CargoFactNodeKind::Package => summary.packages += 1,
+                CargoFactNodeKind::Target => summary.targets += 1,
+                CargoFactNodeKind::Feature => summary.features += 1,
+            }
+        }
+        summary
+    }
+
+    pub fn refresh_cargo_facts_from_json(
+        &mut self,
+        metadata_json: &str,
+        diagnostics_json: Option<&str>,
+        provenance: CargoFactProvenance,
+        root: &Path,
+    ) -> Result<CargoFactRefreshReport> {
+        let mut facts = parse_cargo_metadata(metadata_json, &provenance, root)?;
+        if let Some(diagnostics_json) = diagnostics_json {
+            facts.diagnostics.extend(parse_cargo_diagnostics(
+                diagnostics_json,
+                &provenance,
+                root,
+            )?);
+        }
+        facts.input_fingerprint = self.cargo_fact_input_fingerprint();
+        self.cargo_facts = Some(facts);
+        Ok(CargoFactRefreshReport {
+            summary: self.cargo_facts_summary(),
+            diagnostics_loaded: diagnostics_json.is_some(),
+        })
+    }
+
+    pub fn cargo_diagnostics_for_symbol(&self, symbol: &GraphSymbol) -> Vec<CargoDiagnosticHit> {
+        let Some(facts) = &self.cargo_facts else {
+            return Vec::new();
+        };
+        let freshness = self.cargo_fact_freshness_for(facts);
+        let symbol_span = symbol.body_span.unwrap_or(symbol.span);
+        let mut hits = facts
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                let Some(file_id) = &diagnostic.file_id else {
+                    return false;
+                };
+                if file_id != &symbol.file_id {
+                    return false;
+                }
+                if symbol.kind == SymbolKind::File {
+                    return true;
+                }
+                diagnostic
+                    .span
+                    .map(|span| spans_intersect(symbol_span, span))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .map(|diagnostic| CargoDiagnosticHit {
+                diagnostic,
+                freshness: freshness.clone(),
+            })
+            .collect::<Vec<_>>();
+        hits.sort_by(|left, right| {
+            left.diagnostic
+                .span
+                .map(|span| span.start_byte)
+                .cmp(&right.diagnostic.span.map(|span| span.start_byte))
+                .then(left.diagnostic.message.cmp(&right.diagnostic.message))
+        });
+        hits
+    }
+
     pub fn language_facts(&self) -> Vec<LanguageFact> {
         self.java_project_facts
             .iter()
@@ -376,6 +557,48 @@ impl SemanticGraph {
                     .map(LanguageFact::Dotnet),
             )
             .collect()
+    }
+
+    fn cargo_fact_freshness_for(&self, facts: &CargoCompilerFacts) -> CargoFactFreshness {
+        let current_fingerprint = self.cargo_fact_input_fingerprint();
+        let mut stale_reasons = Vec::new();
+        if current_fingerprint != facts.input_fingerprint {
+            stale_reasons.push(
+                "Cargo manifest, lockfile, config, or Rust source inputs changed".to_string(),
+            );
+        }
+        CargoFactFreshness {
+            status: if stale_reasons.is_empty() {
+                Freshness::Fresh
+            } else {
+                Freshness::Stale
+            },
+            input_fingerprint: facts.input_fingerprint.clone(),
+            current_fingerprint,
+            stale_reasons,
+        }
+    }
+
+    fn cargo_fact_input_fingerprint(&self) -> ContentHash {
+        let mut entries = self
+            .files
+            .values()
+            .filter(|file| {
+                file.language == LanguageKind::Rust || is_cargo_fact_input_path(&file.relative_path)
+            })
+            .map(|file| {
+                format!(
+                    "{}\t{}\t{}",
+                    file.relative_path,
+                    file.hash.0,
+                    file.language.display_name()
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        ContentHash::new(squeezy_workspace::stable_content_hash(
+            entries.join("\n").as_bytes(),
+        ))
     }
 
     pub fn hierarchy(&self, root: Option<&SymbolId>, max_depth: usize) -> Vec<HierarchyNode> {
@@ -1806,6 +2029,266 @@ fn language_report<'a>(records: impl IntoIterator<Item = &'a FileRecord>) -> Lan
 
 fn line_ranges_intersect(start: u32, end: u32, dirty: DirtyRange) -> bool {
     start <= dirty.end_line && dirty.start_line <= end
+}
+
+fn spans_intersect(left: SourceSpan, right: SourceSpan) -> bool {
+    left.start_byte <= right.end_byte && right.start_byte <= left.end_byte
+}
+
+fn is_cargo_fact_input_path(relative_path: &str) -> bool {
+    relative_path.ends_with("Cargo.toml")
+        || relative_path == "Cargo.lock"
+        || relative_path == ".cargo/config"
+        || relative_path == ".cargo/config.toml"
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataJson {
+    packages: Vec<CargoMetadataPackageJson>,
+    workspace_members: Vec<String>,
+    workspace_root: Option<String>,
+    target_directory: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataPackageJson {
+    id: String,
+    name: String,
+    manifest_path: Option<String>,
+    targets: Vec<CargoMetadataTargetJson>,
+    #[serde(default)]
+    features: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMetadataTargetJson {
+    name: String,
+    kind: Vec<String>,
+    src_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMessageJson {
+    reason: String,
+    package_id: Option<String>,
+    target: Option<CargoMessageTargetJson>,
+    message: Option<RustcMessageJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoMessageTargetJson {
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustcMessageJson {
+    message: String,
+    level: String,
+    code: Option<RustcCodeJson>,
+    #[serde(default)]
+    spans: Vec<RustcSpanJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustcCodeJson {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RustcSpanJson {
+    file_name: String,
+    byte_start: u32,
+    byte_end: u32,
+    line_start: u32,
+    line_end: u32,
+    column_start: u32,
+    column_end: u32,
+    is_primary: bool,
+    label: Option<String>,
+}
+
+fn parse_cargo_metadata(
+    metadata_json: &str,
+    provenance: &CargoFactProvenance,
+    root: &Path,
+) -> Result<CargoCompilerFacts> {
+    let metadata = serde_json::from_str::<CargoMetadataJson>(metadata_json).map_err(|err| {
+        SqueezyError::Graph(format!("failed to parse cargo metadata JSON: {err}"))
+    })?;
+    let mut nodes = Vec::new();
+    nodes.push(CargoFactNode {
+        id: "cargo:workspace".to_string(),
+        kind: CargoFactNodeKind::Workspace,
+        name: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref())
+            .unwrap_or_else(|| ".".to_string()),
+        package_id: None,
+        manifest_path: None,
+        source_path: None,
+        target_kinds: Vec::new(),
+        provenance: Provenance::new("cargo metadata", provenance.command.clone()),
+    });
+
+    let workspace_members = metadata
+        .workspace_members
+        .into_iter()
+        .collect::<HashSet<_>>();
+    for package in metadata.packages {
+        if !workspace_members.is_empty() && !workspace_members.contains(&package.id) {
+            continue;
+        }
+        let manifest_path = normalize_optional_cargo_path(root, package.manifest_path.as_deref());
+        nodes.push(CargoFactNode {
+            id: format!("cargo:package:{}", package.id),
+            kind: CargoFactNodeKind::Package,
+            name: package.name.clone(),
+            package_id: Some(package.id.clone()),
+            manifest_path: manifest_path.clone(),
+            source_path: None,
+            target_kinds: Vec::new(),
+            provenance: Provenance::new("cargo metadata", "workspace package"),
+        });
+        for target in package.targets {
+            nodes.push(CargoFactNode {
+                id: format!("cargo:target:{}:{}", package.id, target.name),
+                kind: CargoFactNodeKind::Target,
+                name: target.name,
+                package_id: Some(package.id.clone()),
+                manifest_path: manifest_path.clone(),
+                source_path: normalize_optional_cargo_path(root, target.src_path.as_deref()),
+                target_kinds: target.kind,
+                provenance: Provenance::new("cargo metadata", "package target"),
+            });
+        }
+        for feature in package.features.keys() {
+            nodes.push(CargoFactNode {
+                id: format!("cargo:feature:{}:{feature}", package.id),
+                kind: CargoFactNodeKind::Feature,
+                name: feature.clone(),
+                package_id: Some(package.id.clone()),
+                manifest_path: manifest_path.clone(),
+                source_path: None,
+                target_kinds: Vec::new(),
+                provenance: Provenance::new("cargo metadata", "package feature"),
+            });
+        }
+    }
+    nodes.sort_by(|left, right| left.id.cmp(&right.id));
+
+    Ok(CargoCompilerFacts {
+        workspace_root: normalize_optional_cargo_path(root, metadata.workspace_root.as_deref()),
+        target_directory: normalize_optional_cargo_path(root, metadata.target_directory.as_deref()),
+        nodes,
+        diagnostics: Vec::new(),
+        provenance: provenance.clone(),
+        input_fingerprint: ContentHash::new(""),
+    })
+}
+
+fn parse_cargo_diagnostics(
+    diagnostics_json: &str,
+    provenance: &CargoFactProvenance,
+    root: &Path,
+) -> Result<Vec<CargoDiagnostic>> {
+    let mut diagnostics = Vec::new();
+    for line in diagnostics_json.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(event) = serde_json::from_str::<CargoMessageJson>(line) else {
+            continue;
+        };
+        if event.reason != "compiler-message" {
+            continue;
+        }
+        let Some(message) = event.message else {
+            continue;
+        };
+        let spans = primary_or_first_spans(&message.spans);
+        if spans.is_empty() {
+            diagnostics.push(CargoDiagnostic {
+                level: message.level,
+                message: message.message,
+                code: message.code.map(|code| code.code),
+                file_id: None,
+                span: None,
+                label: None,
+                package_id: event.package_id,
+                target_name: event.target.and_then(|target| target.name),
+                provenance: Provenance::new("cargo check", provenance.command.clone()),
+            });
+            continue;
+        }
+        for span in spans {
+            diagnostics.push(CargoDiagnostic {
+                level: message.level.clone(),
+                message: message.message.clone(),
+                code: message.code.as_ref().map(|code| code.code.clone()),
+                file_id: normalize_cargo_file_id(root, &span.file_name).map(FileId::new),
+                span: Some(SourceSpan::new(
+                    span.byte_start,
+                    span.byte_end,
+                    squeezy_core::SourcePoint::new(span.line_start, span.column_start),
+                    squeezy_core::SourcePoint::new(span.line_end, span.column_end),
+                )),
+                label: span.label.clone(),
+                package_id: event.package_id.clone(),
+                target_name: event.target.as_ref().and_then(|target| target.name.clone()),
+                provenance: Provenance::new("cargo check", provenance.command.clone()),
+            });
+        }
+    }
+    diagnostics.sort_by(|left, right| {
+        left.file_id
+            .as_ref()
+            .map(|id| id.0.as_str())
+            .cmp(&right.file_id.as_ref().map(|id| id.0.as_str()))
+            .then(
+                left.span
+                    .map(|span| span.start_byte)
+                    .cmp(&right.span.map(|span| span.start_byte)),
+            )
+            .then(left.message.cmp(&right.message))
+    });
+    Ok(diagnostics)
+}
+
+fn primary_or_first_spans(spans: &[RustcSpanJson]) -> Vec<&RustcSpanJson> {
+    let primary = spans
+        .iter()
+        .filter(|span| span.is_primary)
+        .collect::<Vec<_>>();
+    if primary.is_empty() {
+        spans.first().into_iter().collect()
+    } else {
+        primary
+    }
+}
+
+fn normalize_optional_cargo_path(root: &Path, path: Option<&str>) -> Option<String> {
+    path.and_then(|path| normalize_cargo_file_id(root, path))
+}
+
+fn normalize_cargo_file_id(root: &Path, path: &str) -> Option<String> {
+    if path.starts_with('<') {
+        return None;
+    }
+    let path = Path::new(path);
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).ok()?.to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+    let normalized = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            std::path::Component::CurDir => None,
+            _ => Some(component.as_os_str().to_string_lossy().to_string()),
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 fn file_symbol(file: &FileRecord) -> GraphSymbol {
