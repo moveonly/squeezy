@@ -61,6 +61,663 @@ fn helper() {}
 }
 
 #[test]
+fn cargo_compiler_facts_attach_diagnostics_and_track_staleness() {
+    let source = "pub fn bad() -> i32 {\n    \"nope\"\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+    let provenance = CargoFactProvenance {
+        command: "cargo metadata --format-version=1 --no-deps; cargo check --message-format=json"
+            .to_string(),
+        cargo_version: Some("cargo 1.93.1".to_string()),
+        rustc_version: Some("rustc 1.93.1".to_string()),
+        captured_unix_millis: 123,
+    };
+    let metadata = serde_json::json!({
+        "packages": [{
+            "id": "path+file:///case#case@0.1.0",
+            "name": "case",
+            "manifest_path": "Cargo.toml",
+            "targets": [{
+                "name": "case",
+                "kind": ["lib"],
+                "src_path": "src/lib.rs"
+            }],
+            "features": {
+                "default": [],
+                "serde": []
+            }
+        }],
+        "workspace_members": ["path+file:///case#case@0.1.0"],
+        "workspace_root": ".",
+        "target_directory": "target"
+    })
+    .to_string();
+    let diagnostic_start = source.find("\"nope\"").unwrap() as u32;
+    let diagnostic_end = diagnostic_start + "\"nope\"".len() as u32;
+    let diagnostics = serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": "path+file:///case#case@0.1.0",
+        "target": {"name": "case"},
+        "message": {
+            "message": "mismatched types",
+            "level": "error",
+            "code": {"code": "E0308"},
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "byte_start": diagnostic_start,
+                "byte_end": diagnostic_end,
+                "line_start": 2,
+                "line_end": 2,
+                "column_start": 5,
+                "column_end": 11,
+                "is_primary": true,
+                "label": "expected i32"
+            }]
+        }
+    })
+    .to_string();
+
+    let report = graph
+        .refresh_cargo_facts_from_json(&metadata, Some(&diagnostics), provenance, &root)
+        .unwrap();
+
+    assert_eq!(report.summary.workspaces, 1);
+    assert_eq!(report.summary.packages, 1);
+    assert_eq!(report.summary.targets, 1);
+    assert_eq!(report.summary.features, 2);
+    assert_eq!(report.summary.diagnostics, 1);
+    assert_eq!(
+        report.summary.freshness.as_ref().unwrap().status,
+        Freshness::Fresh
+    );
+
+    let bad = graph.find_symbol_by_name("bad").pop().unwrap();
+    let hits = graph.cargo_diagnostics_for_symbol(&bad);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].diagnostic.code.as_deref(), Some("E0308"));
+    assert_eq!(hits[0].freshness.status, Freshness::Fresh);
+    // rustc reports 1-indexed line/column; the graph stores 0-indexed
+    // coordinates everywhere else, so diagnostic spans must match that
+    // convention. The owning `bad` symbol's start line is 0; the diagnostic's
+    // start line should be 1 (rustc 2 - 1) and start column 4 (rustc 5 - 1).
+    let diagnostic_span = hits[0].diagnostic.span.unwrap();
+    assert_eq!(diagnostic_span.start.line, 1);
+    assert_eq!(diagnostic_span.start.column, 4);
+    assert_eq!(diagnostic_span.end.line, 1);
+    assert_eq!(diagnostic_span.end.column, 10);
+    assert!(diagnostic_span.start.line >= bad.span.start.line);
+
+    graph
+        .files
+        .get_mut(&FileId::new("src/lib.rs"))
+        .unwrap()
+        .hash = ContentHash::new("changed");
+    let stale_hits = graph.cargo_diagnostics_for_symbol(&bad);
+    assert_eq!(stale_hits[0].freshness.status, Freshness::Stale);
+    assert!(!stale_hits[0].freshness.stale_reasons.is_empty());
+}
+
+fn cargo_provenance(command: &str) -> CargoFactProvenance {
+    CargoFactProvenance {
+        command: command.to_string(),
+        cargo_version: Some("cargo 1.93.1".to_string()),
+        rustc_version: Some("rustc 1.93.1".to_string()),
+        captured_unix_millis: 123,
+    }
+}
+
+fn cargo_metadata_fixture() -> String {
+    serde_json::json!({
+        "packages": [{
+            "id": "path+file:///case#case@0.1.0",
+            "name": "case",
+            "manifest_path": "Cargo.toml",
+            "targets": [{
+                "name": "case",
+                "kind": ["lib"],
+                "src_path": "src/lib.rs"
+            }],
+            "features": {}
+        }],
+        "workspace_members": ["path+file:///case#case@0.1.0"],
+        "workspace_root": ".",
+        "target_directory": "target"
+    })
+    .to_string()
+}
+
+#[test]
+fn cargo_compiler_facts_filter_non_compiler_messages_and_sort_diagnostics() {
+    let source_a = "pub fn a() {}\n";
+    let source_b = "pub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record_a = record("src/a.rs", source_a);
+    let record_b = record("src/b.rs", source_b);
+    let parsed_a = parser
+        .parse_source(&record_a, source_a.to_string())
+        .unwrap();
+    let parsed_b = parser
+        .parse_source(&record_b, source_b.to_string())
+        .unwrap();
+    let root = record_a
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed_a, parsed_b]);
+
+    let metadata = cargo_metadata_fixture();
+    // Stream contains two compiler-message events plus several events that
+    // should be silently filtered (compiler-artifact, build-script-executed,
+    // build-finished, and a malformed line).
+    let stream = [
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///case#case@0.1.0","target":{"name":"case"}}"#.to_string(),
+        r#"{"reason":"build-script-executed","package_id":"path+file:///case#case@0.1.0"}"#.to_string(),
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "unused variable",
+                "level": "warning",
+                "code": {"code": "unused_variables"},
+                "spans": [{
+                    "file_name": "src/b.rs",
+                    "byte_start": 4,
+                    "byte_end": 5,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 5,
+                    "column_end": 6,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+        "not a json line".to_string(),
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "lint",
+                "level": "warning",
+                "code": null,
+                "spans": [{
+                    "file_name": "src/a.rs",
+                    "byte_start": 0,
+                    "byte_end": 1,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 1,
+                    "column_end": 2,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+        r#"{"reason":"build-finished","success":true}"#.to_string(),
+    ]
+    .join("\n");
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo metadata; cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let diagnostics = graph
+        .cargo_facts()
+        .map(|facts| facts.diagnostics.clone())
+        .unwrap_or_default();
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+    assert_eq!(
+        diagnostics[0]
+            .file_id
+            .as_ref()
+            .map(|id| id.0.as_str())
+            .unwrap_or(""),
+        "src/a.rs"
+    );
+    assert_eq!(
+        diagnostics[1]
+            .file_id
+            .as_ref()
+            .map(|id| id.0.as_str())
+            .unwrap_or(""),
+        "src/b.rs"
+    );
+}
+
+#[test]
+fn cargo_compiler_facts_emit_diagnostic_without_span() {
+    let source = "pub fn a() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/a.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let metadata = cargo_metadata_fixture();
+    let stream = serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": "path+file:///case#case@0.1.0",
+        "target": {"name": "case"},
+        "message": {
+            "message": "command-level note",
+            "level": "note",
+            "code": null,
+            "spans": []
+        }
+    })
+    .to_string();
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let diagnostics = graph
+        .cargo_facts()
+        .map(|facts| facts.diagnostics.clone())
+        .unwrap_or_default();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(diagnostics[0].file_id.is_none());
+    assert!(diagnostics[0].span.is_none());
+}
+
+#[test]
+fn cargo_compiler_facts_emit_one_diagnostic_per_primary_span() {
+    let source = "pub fn a() {}\npub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let metadata = cargo_metadata_fixture();
+    let stream = serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": "path+file:///case#case@0.1.0",
+        "target": {"name": "case"},
+        "message": {
+            "message": "two-site warning",
+            "level": "warning",
+            "code": {"code": "W1234"},
+            "spans": [
+                {
+                    "file_name": "src/lib.rs",
+                    "byte_start": 0,
+                    "byte_end": 5,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 1,
+                    "column_end": 6,
+                    "is_primary": true,
+                    "label": "first"
+                },
+                {
+                    "file_name": "src/lib.rs",
+                    "byte_start": 14,
+                    "byte_end": 19,
+                    "line_start": 2,
+                    "line_end": 2,
+                    "column_start": 1,
+                    "column_end": 6,
+                    "is_primary": true,
+                    "label": "second"
+                }
+            ]
+        }
+    })
+    .to_string();
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let diagnostics = graph
+        .cargo_facts()
+        .map(|facts| facts.diagnostics.clone())
+        .unwrap_or_default();
+    assert_eq!(diagnostics.len(), 2);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code.as_deref() == Some("W1234")
+                && diagnostic.message == "two-site warning")
+    );
+    let labels = diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.label.clone().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"first".to_string()));
+    assert!(labels.contains(&"second".to_string()));
+}
+
+#[test]
+fn cargo_compiler_facts_normalize_absolute_paths() {
+    let source = "pub fn a() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let inside_path = root.join("src/lib.rs");
+    let inside_path_str = inside_path.to_string_lossy().into_owned();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let metadata = cargo_metadata_fixture();
+    let stream = [
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "inside warning",
+                "level": "warning",
+                "code": null,
+                "spans": [{
+                    "file_name": inside_path_str,
+                    "byte_start": 0,
+                    "byte_end": 1,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 1,
+                    "column_end": 2,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "outside warning",
+                "level": "warning",
+                "code": null,
+                "spans": [{
+                    "file_name": "/tmp/squeezy-cargo-outside.rs",
+                    "byte_start": 0,
+                    "byte_end": 1,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 1,
+                    "column_end": 2,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n");
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let diagnostics = graph
+        .cargo_facts()
+        .map(|facts| facts.diagnostics.clone())
+        .unwrap_or_default();
+    assert_eq!(diagnostics.len(), 2);
+    let inside = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == "inside warning")
+        .unwrap();
+    assert_eq!(
+        inside.file_id.as_ref().map(|id| id.0.as_str()),
+        Some("src/lib.rs")
+    );
+    let outside = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message == "outside warning")
+        .unwrap();
+    assert!(outside.file_id.is_none());
+}
+
+#[test]
+fn cargo_compiler_facts_flip_stale_on_cargo_toml_change() {
+    let source = "pub fn a() -> i32 {\n    \"nope\"\n}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let manifest = "[package]\nname='case'\nversion='0.1.0'\nedition='2024'\n";
+    fs::write(root.join("Cargo.toml"), manifest).unwrap();
+    let manifest_record = FileRecord {
+        id: FileId::new("Cargo.toml"),
+        path: root.join("Cargo.toml"),
+        relative_path: "Cargo.toml".to_string(),
+        hash: ContentHash::new(stable_content_hash(manifest.as_bytes())),
+        size_bytes: manifest.len() as u64,
+        modified_unix_millis: 0,
+        language: LanguageKind::Unsupported,
+        freshness: Freshness::Fresh,
+    };
+    graph
+        .files
+        .insert(manifest_record.id.clone(), manifest_record);
+
+    let diagnostic_start = source.find("\"nope\"").unwrap() as u32;
+    let diagnostic_end = diagnostic_start + "\"nope\"".len() as u32;
+    let metadata = cargo_metadata_fixture();
+    let stream = serde_json::json!({
+        "reason": "compiler-message",
+        "package_id": "path+file:///case#case@0.1.0",
+        "target": {"name": "case"},
+        "message": {
+            "message": "manifest-driven warning",
+            "level": "warning",
+            "code": null,
+            "spans": [{
+                "file_name": "src/lib.rs",
+                "byte_start": diagnostic_start,
+                "byte_end": diagnostic_end,
+                "line_start": 2,
+                "line_end": 2,
+                "column_start": 5,
+                "column_end": 11,
+                "is_primary": true,
+                "label": null
+            }]
+        }
+    })
+    .to_string();
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo metadata; cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let symbol_a = graph.find_symbol_by_name("a").pop().unwrap();
+    let fresh_hits = graph.cargo_diagnostics_for_symbol(&symbol_a);
+    assert_eq!(fresh_hits.len(), 1, "{fresh_hits:?}");
+    assert_eq!(fresh_hits[0].freshness.status, Freshness::Fresh);
+
+    graph
+        .files
+        .get_mut(&FileId::new("Cargo.toml"))
+        .unwrap()
+        .hash = ContentHash::new("changed");
+    let hits = graph.cargo_diagnostics_for_symbol(&symbol_a);
+    assert_eq!(hits[0].freshness.status, Freshness::Stale);
+    assert!(!hits[0].freshness.stale_reasons.is_empty());
+}
+
+#[test]
+fn cargo_compiler_facts_file_symbol_returns_all_diagnostics_in_file() {
+    let source = "pub fn a() {}\npub fn b() {}\n";
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/lib.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let root = record
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let metadata = cargo_metadata_fixture();
+    let stream = [
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "first",
+                "level": "warning",
+                "code": null,
+                "spans": [{
+                    "file_name": "src/lib.rs",
+                    "byte_start": 0,
+                    "byte_end": 1,
+                    "line_start": 1,
+                    "line_end": 1,
+                    "column_start": 1,
+                    "column_end": 2,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+        serde_json::json!({
+            "reason": "compiler-message",
+            "package_id": "path+file:///case#case@0.1.0",
+            "target": {"name": "case"},
+            "message": {
+                "message": "second",
+                "level": "warning",
+                "code": null,
+                "spans": [{
+                    "file_name": "src/lib.rs",
+                    "byte_start": 100,
+                    "byte_end": 101,
+                    "line_start": 5,
+                    "line_end": 5,
+                    "column_start": 1,
+                    "column_end": 2,
+                    "is_primary": true,
+                    "label": null
+                }]
+            }
+        })
+        .to_string(),
+    ]
+    .join("\n");
+
+    graph
+        .refresh_cargo_facts_from_json(
+            &metadata,
+            Some(&stream),
+            cargo_provenance("cargo check"),
+            &root,
+        )
+        .unwrap();
+
+    let file_symbol = graph
+        .symbols
+        .values()
+        .find(|symbol| {
+            symbol.kind == SymbolKind::File && symbol.file_id == FileId::new("src/lib.rs")
+        })
+        .cloned()
+        .expect("file symbol present");
+    let hits = graph.cargo_diagnostics_for_symbol(&file_symbol);
+    assert_eq!(hits.len(), 2);
+    let messages = hits
+        .iter()
+        .map(|hit| hit.diagnostic.message.clone())
+        .collect::<Vec<_>>();
+    assert!(messages.contains(&"first".to_string()));
+    assert!(messages.contains(&"second".to_string()));
+}
+
+#[test]
+fn cargo_fact_input_path_matches_basename_and_nested_paths() {
+    assert!(is_cargo_fact_input_path("Cargo.toml"));
+    assert!(is_cargo_fact_input_path("crates/foo/Cargo.toml"));
+    assert!(is_cargo_fact_input_path("Cargo.lock"));
+    assert!(is_cargo_fact_input_path("rust-toolchain"));
+    assert!(is_cargo_fact_input_path("rust-toolchain.toml"));
+    assert!(is_cargo_fact_input_path("build.rs"));
+    assert!(is_cargo_fact_input_path("crates/foo/build.rs"));
+    assert!(is_cargo_fact_input_path(".cargo/config"));
+    assert!(is_cargo_fact_input_path(".cargo/config.toml"));
+    assert!(is_cargo_fact_input_path("crates/foo/.cargo/config.toml"));
+
+    assert!(!is_cargo_fact_input_path("foo/NotCargo.toml"));
+    assert!(!is_cargo_fact_input_path("docs/build.rst"));
+    assert!(!is_cargo_fact_input_path("src/lib.rs"));
+}
+
+#[test]
 fn persistent_graph_warm_start_skips_unchanged_parsing() {
     let root = temp_root("persistent-warm-start");
     fs::write(

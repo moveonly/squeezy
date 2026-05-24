@@ -18,7 +18,7 @@ use squeezy_core::{
     PermissionAction, PermissionCapability, PermissionRequest, PermissionRule,
     PermissionRuleSource, PermissionScope, PermissionVerdict, Redactor, ResponseVerbosity,
     SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TaskStateSnapshot, TaskStateStatus,
-    TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
     escape_toml_basic_string,
 };
@@ -28,7 +28,7 @@ use squeezy_llm::{
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore, StoredToolReceipt,
+    SqueezyStore, StoredReadSnapshot, StoredToolReceipt,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -42,8 +42,13 @@ use squeezy_tools::{
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod exploration_compiler;
+
+use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+
 const MAX_TOOL_ROUNDS: usize = 8;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
+const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
@@ -501,6 +506,7 @@ pub struct Agent {
     /// a panicking writer, and never need a fallback enum value: every byte
     /// we observe was previously written via `SessionMode::to_u8`.
     session_mode: Arc<AtomicU8>,
+    loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     store: Option<Arc<SqueezyStore>>,
 }
 
@@ -625,6 +631,7 @@ impl Agent {
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
+            loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
         }
     }
@@ -1226,6 +1233,7 @@ impl Agent {
         let conversation_state = self.conversation_state.clone();
         let store = self.store.clone();
         let task_state = Arc::new(Mutex::new(None));
+        let loaded_tool_schemas = self.loaded_tool_schemas.clone();
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
@@ -1257,6 +1265,7 @@ impl Agent {
             }
             let mut all_tool_specs = vec![task_state_advertised_tool()];
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+            warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -1278,6 +1287,7 @@ impl Agent {
                 conversation_state,
                 store,
                 task_state: task_state.clone(),
+                loaded_tool_schemas,
             }
             .run(task_title.clone())
             .await;
@@ -1343,6 +1353,7 @@ struct TurnRuntime {
     conversation_state: Arc<Mutex<ConversationState>>,
     store: Option<Arc<SqueezyStore>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
 }
 
 fn request_response_verbosity(
@@ -1504,6 +1515,14 @@ impl TurnRuntime {
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::from_store(self.store.clone());
         let mut broker = CostBroker::new(&self.config);
+        let exploration_plan = self
+            .config
+            .exploration_compiler
+            .then(|| compile_exploration_plan(&input))
+            .flatten();
+        let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(
+            exploration_plan.as_ref(),
+        )));
         broker.metrics.redactions += std::mem::take(&mut self.seed_redactions);
         // Instructions are static across the turn's tool rounds; redact
         // them once so the cost is not paid (or double-counted) per round.
@@ -1529,17 +1548,117 @@ impl TurnRuntime {
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
 
+        if let Some(plan) = exploration_plan.clone()
+            && !plan.calls.is_empty()
+        {
+            broker.metrics.planner_turns += 1;
+            broker.metrics.planner_tool_calls += plan.calls.len() as u64;
+            self.log_event(
+                "exploration_plan",
+                Some(self.turn_id),
+                Some(format!("{} planner preflight", plan.intent.as_str())),
+                json!({
+                    "intent": plan.intent.as_str(),
+                    "query": plan.query,
+                    "calls": plan
+                        .calls
+                        .iter()
+                        .map(|call| call.name.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            let planned_calls = plan.calls;
+            let mut planner_items = planned_calls
+                .iter()
+                .cloned()
+                .map(|call| llm_function_call_item(call, &self.redactor))
+                .collect::<Vec<_>>();
+            let results = execute_tool_calls(
+                planned_calls,
+                ToolExecutionContext {
+                    turn_id: self.turn_id,
+                    provider: self.provider.clone(),
+                    tools: &self.tools,
+                    jobs: &self.jobs,
+                    config: &self.config,
+                    telemetry: self.telemetry.clone(),
+                    redactor: self.redactor.clone(),
+                    tx: self.tx.clone(),
+                    cancel: self.cancel.clone(),
+                    approval_ids: self.approval_ids.clone(),
+                    session_rules: self.session_rules.clone(),
+                    session_mode: self.session_mode.clone(),
+                    session_log: self.session_log.clone(),
+                    task_state: self.task_state.clone(),
+                    all_tool_specs: &self.all_tool_specs,
+                    loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+                    exploration_state: exploration_state.clone(),
+                },
+                &mut broker,
+            )
+            .await;
+            // The planner is advisory: once the preflight block has executed,
+            // the model has the planner outputs (success or not) in context, so
+            // we lift the raw-read guard to avoid locking the turn on misfires
+            // or non-`Success` graph results.
+            exploration_state.lock().await.mark_preflight_complete();
+            let results = seen_tool_outputs.prepare_results(results);
+            let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            for pending in &results {
+                broker.record_model_result(&pending.result);
+            }
+            seen_tool_outputs.remember_results(&results);
+
+            let outputs = results
+                .into_iter()
+                .map(|pending| {
+                    let output = pending.result.model_output();
+                    LlmInputItem::FunctionCallOutput {
+                        call_id: pending.result.call_id,
+                        output,
+                    }
+                })
+                .collect::<Vec<_>>();
+            planner_items.extend(outputs.clone());
+            conversation.extend(planner_items.clone());
+            for output in &outputs {
+                self.log_event(
+                    "tool_result",
+                    Some(self.turn_id),
+                    tool_output_summary(output),
+                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_compiler" }),
+                );
+            }
+            if self.config.store_responses {
+                next_input = vec![user_item.clone()];
+                next_input.extend(planner_items);
+            } else {
+                next_input = conversation.clone();
+            }
+        }
+
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
+            let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let request = LlmRequest {
                 model: self.config.model.clone(),
-                instructions: request_instructions.clone(),
+                instructions: instructions_with_tool_index(
+                    &request_instructions,
+                    &self.all_tool_specs,
+                    active_mode,
+                    &self.config.tools,
+                ),
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
-                tools: advertised_tool_specs(&self.all_tool_specs, active_mode),
+                tools: request_tool_specs(
+                    &self.all_tool_specs,
+                    active_mode,
+                    &self.config.tools,
+                    &loaded_tool_schemas,
+                ),
                 store: self.config.store_responses,
             };
             let request_model = request.model.clone();
@@ -1735,6 +1854,9 @@ impl TurnRuntime {
                     session_mode: self.session_mode.clone(),
                     session_log: self.session_log.clone(),
                     task_state: self.task_state.clone(),
+                    all_tool_specs: &self.all_tool_specs,
+                    loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+                    exploration_state: exploration_state.clone(),
                 },
                 &mut broker,
             )
@@ -1977,6 +2099,9 @@ struct ToolExecutionContext<'a> {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    all_tool_specs: &'a [AdvertisedTool],
+    loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
+    exploration_state: Arc<Mutex<ExplorationTurnState>>,
 }
 
 async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
@@ -2004,6 +2129,111 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
         ToolStatus::Success,
         json!({ "ok": true, "summary": snapshot.compact_summary() }),
     )
+}
+
+async fn handle_load_tool_schema_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> ToolResult {
+    let Some(name) = call
+        .arguments
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({ "ok": false, "error": "missing required string field: name" }),
+        );
+    };
+
+    let Some(tool) = context
+        .all_tool_specs
+        .iter()
+        .find(|tool| tool.spec.name == name)
+    else {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({ "ok": false, "name": name, "error": "unknown tool" }),
+        );
+    };
+
+    let active_mode = load_session_mode(&context.session_mode);
+    if mode_refuses_capability(active_mode, tool.capability) {
+        return control_tool_result(
+            call,
+            ToolStatus::Denied,
+            json!({
+                "ok": false,
+                "name": name,
+                "status": "refused",
+                "capability": tool.capability.as_str(),
+                "mode": active_mode.as_str(),
+                "error": "tool schema is not allowed in the current session mode"
+            }),
+        );
+    }
+
+    if tool_is_core_schema(tool, &context.config.tools) {
+        return control_tool_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "ok": true,
+                "name": name,
+                "status": "already_attached",
+                "position": "core"
+            }),
+        );
+    }
+
+    let mut loaded = context.loaded_tool_schemas.lock().await;
+    if let Some(position) = loaded.iter().position(|loaded_name| loaded_name == name) {
+        return control_tool_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "ok": true,
+                "name": name,
+                "status": "already_attached",
+                "position": position
+            }),
+        );
+    }
+    loaded.push(name.to_string());
+    let position = loaded.len() - 1;
+    control_tool_result(
+        call,
+        ToolStatus::Success,
+        json!({
+            "ok": true,
+            "name": name,
+            "status": "attached",
+            "position": position
+        }),
+    )
+}
+
+async fn exploration_read_denial_reason(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> Option<&'static str> {
+    context
+        .exploration_state
+        .lock()
+        .await
+        .read_denial_reason(call)
+}
+
+async fn record_exploration_tool_result(context: &ToolExecutionContext<'_>, result: &ToolResult) {
+    context
+        .exploration_state
+        .lock()
+        .await
+        .record_tool_result(&result.tool_name, result.status == ToolStatus::Success);
 }
 
 async fn publish_task_state_update(
@@ -2093,6 +2323,11 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
+        if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
+            results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
 
         let tool_sequence = match broker.reserve_call() {
             Ok(tool_sequence) => tool_sequence,
@@ -2119,6 +2354,30 @@ async fn execute_tool_calls(
                 continue;
             }
         };
+
+        if let Some(reason) = exploration_read_denial_reason(&context, call).await {
+            let result = ToolResult::denied(call, reason);
+            broker.metrics.planner_refusals += 1;
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            continue;
+        }
 
         match permission_decision(call, &context).await {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
@@ -2352,6 +2611,7 @@ async fn run_one_tool(
             context.turn_id.to_string(),
         )
         .await;
+    record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);
         let summary = tool_result_summary(&result);
@@ -3171,12 +3431,221 @@ fn task_state_advertised_tool() -> AdvertisedTool {
     }
 }
 
+/// Synthetic control tool that promotes a discoverable tool's full schema
+/// into the request `tools` array. It is intentionally **not** routed through
+/// the `permissions.rules` engine: lazy loading is a model-facing UX
+/// affordance, and the capability is `Read` so it stays available whenever
+/// lazy loading itself is enabled and the session mode does not refuse read
+/// capabilities.
+fn load_tool_schema_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
+            description: "Attach the full JSON schema for a discoverable tool before using it."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name of the discoverable tool whose schema should be attached."
+                    }
+                },
+                "required": ["name"]
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
     tools
         .iter()
         .filter(|tool| !mode_refuses_capability(mode, tool.capability))
         .map(|tool| tool.spec.clone())
         .collect()
+}
+
+fn request_tool_specs(
+    tools: &[AdvertisedTool],
+    mode: SessionMode,
+    schema_config: &ToolSchemaConfig,
+    loaded_tool_schemas: &[String],
+) -> Vec<LlmToolSpec> {
+    if !schema_config.lazy_schema_loading {
+        return advertised_tool_specs(tools, mode);
+    }
+
+    // Per-round `LlmToolSpec` clones are intentional and bounded by the size
+    // of the advertised tool set (~20 first-party tools today). If the spec
+    // set grows materially — for example once MCP brings in many external
+    // tools — switching `AdvertisedTool::spec` to `Arc<LlmToolSpec>` or
+    // emitting `Vec<Arc<LlmToolSpec>>` from this function would zero the
+    // per-round clone cost.
+    let mut specs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for name in [TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME]
+        .into_iter()
+        .chain(schema_config.core.iter().map(String::as_str))
+    {
+        push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
+    }
+    for name in loaded_tool_schemas {
+        push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
+    }
+    specs
+}
+
+fn push_tool_spec_by_name(
+    tools: &[AdvertisedTool],
+    name: &str,
+    mode: SessionMode,
+    specs: &mut Vec<LlmToolSpec>,
+    seen: &mut BTreeSet<String>,
+) {
+    if !seen.insert(name.to_string()) {
+        return;
+    }
+    if name == LOAD_TOOL_SCHEMA_TOOL_NAME {
+        let tool = load_tool_schema_advertised_tool();
+        if !mode_refuses_capability(mode, tool.capability) {
+            specs.push(tool.spec);
+        }
+        return;
+    }
+    let Some(tool) = tools.iter().find(|tool| tool.spec.name == name) else {
+        // Misconfigured `[tools].core` / `[tools].discoverable` entries (typos
+        // or names that no longer exist in the registry) are surfaced once at
+        // session start by `warn_unknown_tool_schema_names`. Silently skipping
+        // here keeps the hot path allocation-free.
+        return;
+    };
+    if !mode_refuses_capability(mode, tool.capability) {
+        specs.push(tool.spec.clone());
+    }
+}
+
+/// Emit `tracing::warn!` for any name in `[tools].core` or
+/// `[tools].discoverable` that does not refer to a known tool. This is run
+/// once at session start (when `all_tool_specs` is built) so a typo like
+/// `core = ["webfectch"]` surfaces as an actionable warning instead of
+/// disappearing silently in the hot path. The two synthetic tools
+/// (`update_task_state`, `load_tool_schema`) are always considered known.
+fn warn_unknown_tool_schema_names(
+    all_tool_specs: &[AdvertisedTool],
+    schema_config: &ToolSchemaConfig,
+) {
+    let mut known: BTreeSet<&str> = all_tool_specs
+        .iter()
+        .map(|tool| tool.spec.name.as_str())
+        .collect();
+    known.insert(TASK_STATE_TOOL_NAME);
+    known.insert(LOAD_TOOL_SCHEMA_TOOL_NAME);
+    for name in schema_config
+        .core
+        .iter()
+        .chain(schema_config.discoverable.iter())
+    {
+        if !known.contains(name.as_str()) {
+            tracing::warn!(
+                target: "squeezy::tools",
+                tool = %name,
+                "[tools] entry references unknown tool; entry will be ignored"
+            );
+        }
+    }
+}
+
+const TOOLS_INDEX_OPENER: &str = "<tools_index>\nDiscoverable tools are listed below with compact metadata. Use load_tool_schema before calling one of these tools.\n";
+const TOOLS_INDEX_CLOSER: &str = "\n</tools_index>";
+
+fn tool_schema_index(
+    tools: &[AdvertisedTool],
+    mode: SessionMode,
+    schema_config: &ToolSchemaConfig,
+) -> Option<String> {
+    if !schema_config.lazy_schema_loading {
+        return None;
+    }
+    let mut rows = tools
+        .iter()
+        .filter(|tool| {
+            !mode_refuses_capability(mode, tool.capability)
+                && !tool_is_core_schema(tool, schema_config)
+        })
+        .map(|tool| {
+            format!(
+                "- {} | capability={} | {}",
+                tool.spec.name,
+                tool.capability.as_str(),
+                first_line_of_description(&tool.spec.description)
+            )
+        })
+        .collect::<Vec<_>>();
+    // Alphabetic ordering (not first-load order like `request_tool_specs`)
+    // keeps the rendered `<tools_index>` byte-stable across rounds even if
+    // the registry's iteration order shifts, which matters for provider-side
+    // prompt-prefix caching.
+    rows.sort();
+    if rows.is_empty() {
+        return None;
+    }
+    let mut index = String::with_capacity(
+        TOOLS_INDEX_OPENER.len()
+            + TOOLS_INDEX_CLOSER.len()
+            + rows.iter().map(String::len).sum::<usize>()
+            + rows.len(),
+    );
+    index.push_str(TOOLS_INDEX_OPENER);
+    index.push_str(&rows.join("\n"));
+    index.push_str(TOOLS_INDEX_CLOSER);
+    Some(index)
+}
+
+fn instructions_with_tool_index(
+    base: &str,
+    tools: &[AdvertisedTool],
+    mode: SessionMode,
+    schema_config: &ToolSchemaConfig,
+) -> String {
+    match tool_schema_index(tools, mode, schema_config) {
+        Some(index) => format!("{base}\n\n{index}"),
+        None => base.to_string(),
+    }
+}
+
+fn first_line_of_description(description: &str) -> String {
+    description
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Returns `true` when `tool`'s full JSON schema must be sent on every
+/// request (no lazy `load_tool_schema` hop). Tools fall into one of three
+/// buckets:
+///   * synthetic control tools (`update_task_state`, `load_tool_schema`)
+///     and every tool when lazy loading is disabled — always-core,
+///   * names listed in `[tools].core` — explicit core,
+///   * everything else (including names listed in `[tools].discoverable`
+///     and any unknown name) — discoverable.
+///
+/// Returning `false` for the implicit-discoverable case is intentional: a
+/// tool that is neither configured-core nor configured-discoverable should
+/// default to discoverable so the cache prefix stays compact.
+fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) -> bool {
+    let name = tool.spec.name.as_str();
+    if name == TASK_STATE_TOOL_NAME || name == LOAD_TOOL_SCHEMA_TOOL_NAME {
+        return true;
+    }
+    if !schema_config.lazy_schema_loading {
+        return true;
+    }
+    schema_config.core_contains(name)
 }
 
 fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
@@ -4032,14 +4501,17 @@ impl SeenToolOutputs {
                     .or_insert(seen.clone());
                 if let Some(store) = self.store.as_deref() {
                     let _ = store.put_tool_receipt(&StoredToolReceipt {
-                        tool_name: seen.tool_name,
-                        stable_output_sha256: seen.stable_output_sha256,
-                        call_id: seen.call_id,
-                        content_sha256: seen.content_sha256,
+                        tool_name: seen.tool_name.clone(),
+                        stable_output_sha256: seen.stable_output_sha256.clone(),
+                        call_id: seen.call_id.clone(),
+                        content_sha256: seen.content_sha256.clone(),
                         model_output_bytes: seen.model_output_bytes,
                         created_unix_millis: unix_millis(),
-                        summary: seen.summary,
+                        summary: seen.summary.clone(),
                     });
+                    if let Some(snapshot) = read_snapshot_from_result(&result.result, &seen) {
+                        let _ = store.put_read_snapshot(&snapshot);
+                    }
                 }
             }
         }
@@ -4081,6 +4553,39 @@ fn stable_output_sha256(result: &ToolResult) -> String {
         .and_then(Value::as_str)
         .unwrap_or(&result.receipt.output_sha256)
         .to_string()
+}
+
+fn read_snapshot_from_result(
+    result: &ToolResult,
+    seen: &SeenToolOutput,
+) -> Option<StoredReadSnapshot> {
+    if !matches!(result.tool_name.as_str(), "read_file" | "read_slice") {
+        return None;
+    }
+    if result.content.get("read_mode").and_then(Value::as_str) == Some("diff") {
+        return None;
+    }
+    let path = result.content.get("path")?.as_str()?.to_string();
+    let content = result.content.get("content")?.as_str()?.to_string();
+    let start_byte = result
+        .content
+        .get("offset")
+        .and_then(Value::as_u64)
+        .or_else(|| result.content.get("start_byte").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let bytes_returned = result.content.get("bytes_returned")?.as_u64()?;
+    Some(StoredReadSnapshot {
+        path,
+        tool_name: seen.tool_name.clone(),
+        call_id: seen.call_id.clone(),
+        stable_output_sha256: seen.stable_output_sha256.clone(),
+        content_sha256: seen.content_sha256.clone(),
+        start_byte,
+        end_byte: start_byte.saturating_add(bytes_returned),
+        content,
+        model_output_bytes: seen.model_output_bytes,
+        created_unix_millis: unix_millis(),
+    })
 }
 
 fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult {

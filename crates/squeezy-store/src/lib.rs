@@ -7,7 +7,9 @@
 //!
 //! * `repo_profile` - generated per-repo facts (`~/.squeezy/repos.toml`).
 //! * `sessions` - per-session metadata and event logs.
-//! * `state.redb` - graph partitions, receipt metadata, and observations.
+//! * `state.redb` - graph partitions, receipt metadata, read snapshots
+//!   (keyed by `(path, start_byte, end_byte)` so distinct windows of the same
+//!   file do not overwrite each other), and observations.
 
 use std::{
     collections::BTreeSet,
@@ -34,6 +36,7 @@ pub const SCHEMA_VERSION: u64 = 1;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GRAPH_PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_partitions");
 const TOOL_RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tool_receipts");
+const READ_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("read_snapshots");
 const OBSERVATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("observations");
 const OBSERVATION_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("observation_index");
 
@@ -180,6 +183,74 @@ impl SqueezyStore {
             receipts.push(decode(value.value())?);
         }
         Ok(receipts)
+    }
+
+    pub fn put_read_snapshot(&self, snapshot: &StoredReadSnapshot) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write.open_table(READ_SNAPSHOTS).map_err(store_error)?;
+            insert_json(
+                &mut table,
+                &read_snapshot_key(&snapshot.path, snapshot.start_byte, snapshot.end_byte),
+                snapshot,
+            )?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    /// Return the most recently created snapshot for `path`, regardless of
+    /// window. Useful for diagnostics and call sites that only need to know
+    /// whether any snapshot exists.
+    pub fn read_snapshot(&self, path: &str) -> Result<Option<StoredReadSnapshot>> {
+        let snapshots = self.read_snapshots_for_path(path)?;
+        Ok(snapshots
+            .into_iter()
+            .max_by_key(|snapshot| snapshot.created_unix_millis))
+    }
+
+    /// Return every snapshot stored under `path` across all `(start_byte,
+    /// end_byte)` windows. Callers that need to match a specific request
+    /// window should filter the returned list themselves.
+    pub fn read_snapshots_for_path(&self, path: &str) -> Result<Vec<StoredReadSnapshot>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(READ_SNAPSHOTS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let prefix = read_snapshot_key_prefix(path);
+        let mut snapshots = Vec::new();
+        for entry in table.iter().map_err(store_error)? {
+            let (key, value) = entry.map_err(store_error)?;
+            if !key.value().starts_with(prefix.as_str()) {
+                continue;
+            }
+            let snapshot: StoredReadSnapshot = decode(value.value())?;
+            if snapshot.path == path {
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(snapshots)
+    }
+
+    /// Return the most recent snapshot for `path` whose stored window exactly
+    /// matches `[start_byte, end_byte)`. The caller is expected to compare
+    /// `content_sha256` against the current file before treating the snapshot
+    /// as a hit.
+    pub fn read_snapshot_for_window(
+        &self,
+        path: &str,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> Result<Option<StoredReadSnapshot>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(READ_SNAPSHOTS) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_table_json(
+            &table,
+            read_snapshot_key(path, start_byte, end_byte).as_str(),
+        )
     }
 
     pub fn put_observation(&self, mut observation: Observation) -> Result<Observation> {
@@ -362,6 +433,20 @@ pub struct StoredToolReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredReadSnapshot {
+    pub path: String,
+    pub tool_name: String,
+    pub call_id: String,
+    pub stable_output_sha256: String,
+    pub content_sha256: Option<String>,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub content: String,
+    pub model_output_bytes: usize,
+    pub created_unix_millis: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     pub id: String,
     pub kind: ObservationKind,
@@ -418,6 +503,7 @@ fn initialize_schema(database: &Database) -> Result<()> {
     }
     write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
     write.open_table(TOOL_RECEIPTS).map_err(store_error)?;
+    write.open_table(READ_SNAPSHOTS).map_err(store_error)?;
     write.open_table(OBSERVATIONS).map_err(store_error)?;
     write.open_table(OBSERVATION_INDEX).map_err(store_error)?;
     write.commit().map_err(store_error)
@@ -490,6 +576,20 @@ fn store_error(error: impl std::fmt::Display) -> SqueezyError {
 
 fn receipt_key(tool_name: &str, stable_output_sha256: &str) -> String {
     format!("{tool_name}\0{stable_output_sha256}")
+}
+
+/// Composite key for read snapshots. Keys are `<path>\0<start_byte>\0<end_byte>`
+/// with zero-padded byte offsets so the lexicographic ordering of redb keys
+/// matches the natural numeric ordering of `(start_byte, end_byte)` within a
+/// given path. This lets multiple windows of the same file coexist instead of
+/// the most recent read clobbering older ones.
+fn read_snapshot_key(path: &str, start_byte: u64, end_byte: u64) -> String {
+    format!("{path}\0{start_byte:020}\0{end_byte:020}")
+}
+
+/// Prefix used to scan every snapshot belonging to `path`.
+fn read_snapshot_key_prefix(path: &str) -> String {
+    format!("{path}\0")
 }
 
 fn observation_tokens(observation: &Observation) -> BTreeSet<String> {

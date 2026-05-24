@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -54,6 +54,41 @@ pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
+/// Tools whose full JSON schema is always sent up-front in every request,
+/// independent of `[tools].lazy_schema_loading`.
+///
+/// These are the cheap-and-likely-needed-every-turn tools: bounded file
+/// reads/writes, structured patching, search, shell, and graph-backed navigation. Heavyweight
+/// or rarely-used tools (e.g. `verify`, `webfetch`, `websearch`) are
+/// intentionally **not** in this list so they only cost prompt bytes once
+/// the model explicitly attaches them via `load_tool_schema`.
+///
+/// The two synthetic control tools (`update_task_state`, `load_tool_schema`)
+/// are not duplicated here on purpose: they are forced into the request
+/// `tools` array by name in `squeezy_agent::request_tool_specs`, and
+/// `squeezy_agent::tool_is_core_schema` treats them as always-core. Listing
+/// them in two places risks future skew if one site is updated without the
+/// other.
+pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
+    "glob",
+    "grep",
+    "read_file",
+    "read_tool_output",
+    "write_file",
+    "apply_patch",
+    "shell",
+    "decl_search",
+    "definition_search",
+    "diff_context",
+    "downstream_flow",
+    "hierarchy",
+    "plan_patch",
+    "read_slice",
+    "reference_search",
+    "repo_map",
+    "symbol_context",
+    "upstream_flow",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -70,6 +105,7 @@ pub struct AppConfig {
     pub session_logs: SessionLogConfig,
     pub context_compaction: ContextCompactionConfig,
     pub store_responses: bool,
+    pub exploration_compiler: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
     pub tool_preview_bytes: usize,
@@ -86,6 +122,7 @@ pub struct AppConfig {
     pub skills: SkillsConfig,
     pub graph: GraphConfig,
     pub cache: CacheConfig,
+    pub tools: ToolSchemaConfig,
     pub tui: TuiConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub config_sources: Vec<String>,
@@ -305,6 +342,20 @@ impl AppConfig {
                 provider,
                 ProviderConfig::OpenAi(_) | ProviderConfig::AzureOpenAi(_)
             );
+        let agent_settings = settings.agent.unwrap_or_default();
+        // The exploration compiler defaults to on, and the documented env-var
+        // override is `SQUEEZY_EXPLORATION_COMPILER=off|false|...`. Treating
+        // the variable as a disable-only override keeps the documented values
+        // working without silently flipping the default off on typos or empty
+        // strings, matching how `SQUEEZY_TELEMETRY` and `SQUEEZY_FEEDBACK`
+        // handle their own default-on flags.
+        let settings_exploration_compiler = agent_settings.exploration_compiler.unwrap_or(true);
+        let exploration_compiler_var = get_var("SQUEEZY_EXPLORATION_COMPILER");
+        let exploration_compiler = if parse_disabled_bool(exploration_compiler_var.as_deref()) {
+            false
+        } else {
+            settings_exploration_compiler
+        };
         let budgets = settings.budgets.unwrap_or_default();
         let max_parallel_tools = get_var("SQUEEZY_MAX_PARALLEL_TOOLS")
             .and_then(|value| value.parse::<usize>().ok())
@@ -388,6 +439,7 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
+        let tools = ToolSchemaConfig::from_settings(settings.tools.unwrap_or_default())?;
         let session_logs = SessionLogConfig::from_settings(&session_settings);
         let context_compaction = ContextCompactionConfig::from_settings_and_env(
             settings.context.unwrap_or_default(),
@@ -414,6 +466,7 @@ impl AppConfig {
             session_logs,
             context_compaction,
             store_responses,
+            exploration_compiler,
             max_parallel_tools,
             tool_spill_threshold_bytes,
             tool_preview_bytes,
@@ -430,6 +483,7 @@ impl AppConfig {
             skills,
             graph,
             cache,
+            tools,
             tui,
             mcp_servers,
             config_sources: sources,
@@ -498,6 +552,12 @@ impl AppConfig {
             self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
         ));
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
+
+        output.push_str("[agent]\n");
+        output.push_str(&format!(
+            "exploration_compiler = {}\n\n",
+            self.exploration_compiler
+        ));
 
         output.push_str("[session]\n");
         output.push_str(&format!(
@@ -751,6 +811,17 @@ impl AppConfig {
             ));
         }
         output.push('\n');
+
+        output.push_str("[tools]\n");
+        output.push_str(&format!(
+            "lazy_schema_loading = {}\n",
+            self.tools.lazy_schema_loading
+        ));
+        output.push_str(&format!("core = {}\n", toml_string_array(&self.tools.core)));
+        output.push_str(&format!(
+            "discoverable = {}\n\n",
+            toml_string_array(&self.tools.discoverable)
+        ));
 
         output.push_str("[tui]\n");
         output.push_str(&format!("tick_rate_ms = {}\n", self.tui.tick_rate_ms));
@@ -1023,6 +1094,7 @@ pub struct SettingsFile {
     pub model: Option<String>,
     pub model_settings: Option<ModelSettings>,
     pub providers: Option<BTreeMap<String, ProviderSettings>>,
+    pub agent: Option<AgentSettings>,
     pub session: Option<SessionSettings>,
     pub context: Option<ContextCompactionSettings>,
     pub budgets: Option<BudgetSettings>,
@@ -1034,6 +1106,7 @@ pub struct SettingsFile {
     pub skills: Option<SkillsSettings>,
     pub graph: Option<GraphSettings>,
     pub cache: Option<CacheSettings>,
+    pub tools: Option<ToolSchemaSettings>,
     pub tui: Option<TuiSettings>,
     pub mcp: Option<McpSettings>,
 }
@@ -1081,6 +1154,7 @@ impl SettingsFile {
                 "profile",
                 "model",
                 "providers",
+                "agent",
                 "session",
                 "context",
                 "budgets",
@@ -1092,6 +1166,7 @@ impl SettingsFile {
                 "skills",
                 "graph",
                 "cache",
+                "tools",
                 "tui",
                 "mcp",
             ],
@@ -1115,6 +1190,9 @@ impl SettingsFile {
             }
         }
         settings.providers = providers_settings(table, source)?;
+        settings.agent = optional_table(table, "agent", source)?
+            .map(|table| AgentSettings::from_table(table, source, "agent"))
+            .transpose()?;
         settings.session = optional_table(table, "session", source)?
             .map(|table| SessionSettings::from_table(table, source, "session"))
             .transpose()?;
@@ -1148,6 +1226,9 @@ impl SettingsFile {
         settings.cache = optional_table(table, "cache", source)?
             .map(|table| CacheSettings::from_table(table, source, "cache"))
             .transpose()?;
+        settings.tools = optional_table(table, "tools", source)?
+            .map(|table| ToolSchemaSettings::from_table(table, source, "tools"))
+            .transpose()?;
         settings.tui = optional_table(table, "tui", source)?
             .map(|table| TuiSettings::from_table(table, source, "tui"))
             .transpose()?;
@@ -1167,6 +1248,7 @@ impl SettingsFile {
             ModelSettings::merge,
         );
         merge_provider_maps(&mut self.providers, next.providers);
+        merge_option(&mut self.agent, next.agent, AgentSettings::merge);
         merge_option(&mut self.session, next.session, SessionSettings::merge);
         merge_option(
             &mut self.context,
@@ -1194,6 +1276,7 @@ impl SettingsFile {
         merge_option(&mut self.skills, next.skills, SkillsSettings::merge);
         merge_option(&mut self.graph, next.graph, GraphSettings::merge);
         merge_option(&mut self.cache, next.cache, CacheSettings::merge);
+        merge_option(&mut self.tools, next.tools, ToolSchemaSettings::merge);
         merge_option(&mut self.tui, next.tui, TuiSettings::merge);
         merge_option(&mut self.mcp, next.mcp, McpSettings::merge);
     }
@@ -1316,6 +1399,29 @@ impl ModelSettings {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentSettings {
+    pub exploration_compiler: Option<bool>,
+}
+
+impl AgentSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(table, &["exploration_compiler"], source, path)?;
+        Ok(Self {
+            exploration_compiler: bool_value(
+                table,
+                "exploration_compiler",
+                source,
+                &field(path, "exploration_compiler"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.exploration_compiler, next.exploration_compiler);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BudgetSettings {
     pub max_parallel_tools: Option<usize>,
     pub tool_spill_threshold_bytes: Option<usize>,
@@ -1424,6 +1530,115 @@ impl BudgetSettings {
             next.max_search_files_per_turn,
         );
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSchemaConfig {
+    pub lazy_schema_loading: bool,
+    pub core: Vec<String>,
+    pub discoverable: Vec<String>,
+}
+
+impl Default for ToolSchemaConfig {
+    fn default() -> Self {
+        Self {
+            lazy_schema_loading: true,
+            core: DEFAULT_CORE_TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+            discoverable: Vec::new(),
+        }
+    }
+}
+
+impl ToolSchemaConfig {
+    pub fn from_settings(settings: ToolSchemaSettings) -> Result<Self> {
+        let defaults = Self::default();
+        if let (Some(core), Some(discoverable)) = (&settings.core, &settings.discoverable) {
+            reject_tool_schema_overlap(core, discoverable)?;
+        }
+        let mut core = defaults.core;
+        if let Some(additional_core) = settings.core {
+            for tool in additional_core {
+                if !core.contains(&tool) {
+                    core.push(tool);
+                }
+            }
+        }
+        let discoverable = settings.discoverable.unwrap_or(defaults.discoverable);
+        core.retain(|tool| !discoverable.contains(tool));
+        Ok(Self {
+            lazy_schema_loading: settings
+                .lazy_schema_loading
+                .unwrap_or(defaults.lazy_schema_loading),
+            core,
+            discoverable,
+        })
+    }
+
+    pub fn core_contains(&self, name: &str) -> bool {
+        self.core.iter().any(|tool| tool == name)
+    }
+
+    pub fn discoverable_contains(&self, name: &str) -> bool {
+        self.discoverable.iter().any(|tool| tool == name)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ToolSchemaSettings {
+    pub lazy_schema_loading: Option<bool>,
+    pub core: Option<Vec<String>>,
+    pub discoverable: Option<Vec<String>>,
+}
+
+impl ToolSchemaSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &["lazy_schema_loading", "core", "discoverable"],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            lazy_schema_loading: bool_value(
+                table,
+                "lazy_schema_loading",
+                source,
+                &field(path, "lazy_schema_loading"),
+            )?,
+            core: string_array_value(table, "core", source, &field(path, "core"))?,
+            discoverable: string_array_value(
+                table,
+                "discoverable",
+                source,
+                &field(path, "discoverable"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
+        merge_string_lists(&mut self.core, next.core);
+        merge_string_lists(&mut self.discoverable, next.discoverable);
+    }
+}
+
+fn reject_tool_schema_overlap(core: &[String], discoverable: &[String]) -> Result<()> {
+    let core = core.iter().collect::<BTreeSet<_>>();
+    let overlap = discoverable
+        .iter()
+        .filter(|name| core.contains(name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if overlap.is_empty() {
+        return Ok(());
+    }
+    Err(SqueezyError::Config(format!(
+        "[tools] core and discoverable overlap: {}",
+        overlap.join(", ")
+    )))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3827,6 +4042,9 @@ pub fn user_settings_template() -> &'static str {
 # max_output_tokens = 128
 # store_responses = false      # only honored by openai/azure_openai
 
+[agent]
+# exploration_compiler = true  # graph-first planner for common navigation prompts
+
 [session]
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
@@ -3921,6 +4139,14 @@ pub fn user_settings_template() -> &'static str {
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
 
+# [tools]
+# lazy_schema_loading = true
+# `update_task_state` and `load_tool_schema` are always-core control tools
+# and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
+# `squeezy_core` for the authoritative default list.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "apply_patch", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "plan_patch", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# discoverable = []
+
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"   # compact | verbose
@@ -3950,6 +4176,9 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+
+[agent]
+# exploration_compiler = true  # graph-first planner for common navigation prompts
 
 [session]
 # mode = "build"              # build | plan
@@ -4005,6 +4234,14 @@ pub fn project_settings_template() -> &'static str {
 # Relative paths are resolved against the project root (the directory
 # containing this squeezy.toml).
 # tool_outputs = ".squeezy/tool_outputs"
+
+# [tools]
+# lazy_schema_loading = true
+# `update_task_state` and `load_tool_schema` are always-core control tools
+# and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
+# `squeezy_core` for the authoritative default list.
+# core = ["glob", "grep", "read_file", "read_tool_output", "write_file", "apply_patch", "shell", "decl_search", "definition_search", "diff_context", "downstream_flow", "hierarchy", "plan_patch", "read_slice", "reference_search", "repo_map", "symbol_context", "upstream_flow"]
+# discoverable = []
 
 [tui]
 # tick_rate_ms = 50
@@ -5283,6 +5520,9 @@ pub struct SessionMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub planner_turns: u64,
+    pub planner_tool_calls: u64,
+    pub planner_refusals: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
 }
@@ -5304,6 +5544,9 @@ impl SessionMetrics {
         self.spill_writes += turn.spill_writes;
         self.spill_reads += turn.spill_reads;
         self.budget_denials += turn.budget_denials;
+        self.planner_turns += turn.planner_turns;
+        self.planner_tool_calls += turn.planner_tool_calls;
+        self.planner_refusals += turn.planner_refusals;
         self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
     }
@@ -5325,6 +5568,9 @@ pub struct TurnMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub planner_turns: u64,
+    pub planner_tool_calls: u64,
+    pub planner_refusals: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
 }
@@ -5889,7 +6135,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use update_task_state at turn start, before and after meaningful step transitions, when blocked, before verification, after verification, and whenever new evidence changes the plan. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

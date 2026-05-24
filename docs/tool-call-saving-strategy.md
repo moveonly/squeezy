@@ -21,8 +21,21 @@ model-facing tool output compact enough to be useful.
   reading file contents.
 - **Search output modes.** `grep` supports `content`, `files_with_matches`, and
   `count` modes so broad exploration does not always return matching lines.
-- **Stable tool surface.** Tool schemas are sorted deterministically so
-  provider-side prompt/cache prefixes can remain stable.
+- **Stable tool surface.** Core tool schemas are sent in deterministic order
+  and discoverable schemas are appended in first-load order so provider-side
+  prompt/cache prefixes can remain stable.
+- **Lazy schema loading.** Long-tail and MCP tools are advertised in a compact
+  `tools_index` by default. The always-core `load_tool_schema` tool attaches a
+  discoverable tool's full schema when the model needs it, and later rounds in
+  the same session reuse the expanded schema set. The `tools_index` text is
+  intentionally byte-stable across rounds: a tool stays listed in the index
+  even after its schema has been attached, so the provider's prompt-cache
+  prefix does not invalidate every time the model loads a new tool. The
+  `tools_index` and `load_tool_schema` are an advisory hint, not an enforced
+  precondition: the registry still owns the actual executors, and the
+  permission engine remains the real safety boundary, so a tool call made
+  without a prior `load_tool_schema` is routed through the normal permission
+  path rather than refused on schema grounds.
 - **Parallel read/search calls.** Independent `glob`, `grep`, `read_file`, and
   `read_tool_output` calls can run concurrently while write and shell calls stay
   serialized. Graph-backed navigation tools use the same read-only execution
@@ -32,6 +45,16 @@ model-facing tool output compact enough to be useful.
   `downstream_flow`, `symbol_context`, `hierarchy`, and `read_slice` answer
   common code questions from persisted graph partitions and return compact
   evidence packets instead of raw file dumps.
+- **Exploration compiler.** Common navigation prompts are classified before the
+  first model request and routed through deterministic graph-first tool plans.
+  The resulting evidence packets are inserted into the model input as ordinary
+  tool results, and confident navigation turns refuse premature `read_file`
+  calls until the planner's preflight block has executed (the planner is
+  advisory; the guard is lifted after preflight even if individual graph
+  tools returned non-`Success` statuses). The test-pairing plan's filesystem
+  glob (`**/*test*.rs`) is currently Rust-specific, in line with Squeezy's
+  Rust-first navigation scope; on non-Rust workspaces it produces an empty
+  result and is otherwise inert.
 - **Output spill previews.** Large tool outputs are written to a local
   content-addressed store. The model receives a compact preview plus a handle
   for fetching exact ranges. Spill previews also carry the original output
@@ -104,6 +127,8 @@ model-facing tool output compact enough to be useful.
 - `SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN` controls the per-turn read-byte cap.
 - `SQUEEZY_MAX_SEARCH_FILES_PER_TURN` controls the per-turn search file-scan
   cap.
+- `SQUEEZY_EXPLORATION_COMPILER=off` disables the deterministic graph-first
+  planner for comparison runs or debugging. It is enabled by default.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
 - `SQUEEZY_SHELL_PERMISSION_CLASSIFIER` controls the narrow LLM fallback for
@@ -124,10 +149,23 @@ model-facing tool output compact enough to be useful.
 - **MCP tool spill routing.** External MCP tool execution should pass through
   the same spill, preview, and receipt-stub layer once MCP tool execution
   exists.
-- **Diff awareness.** The current branch diff and recently changed files should
-  be queryable as compact summaries.
-- **Deferred tool loading.** Long-tail tools, including MCP tools, should load
-  schemas only when the model actually needs them.
+- **Diff awareness.** The current branch diff and recently changed files are
+  queryable as compact summaries through `diff_context`. `read_slice` also
+  supports `read_mode="diff"` for source bytes changed against `worktree`
+  (staged, unstaged, and untracked changes vs `HEAD`), `branch_base` (the
+  default-branch merge base), `index` (staged changes), or `last_receipt`.
+  Ranges today are line/byte hunks derived from git, not symbol spans; a
+  graph-driven structural variant that returns enclosing symbol spans is a
+  follow-up.
+- **Last-receipt fallback semantics.** `last_receipt` compares the requested
+  window against the most recent model-visible read snapshot for that exact
+  `(path, start_byte, end_byte)` tuple, returns a receipt stub when the file
+  hash is unchanged, and otherwise falls back to `worktree` with a
+  `baseline_fallback` label (`last_receipt_store_unavailable`,
+  `last_receipt_snapshot_missing`, `last_receipt_window_mismatch`,
+  `last_receipt_current_file_unavailable`, or `last_receipt_store_error`) so
+  the model can tell apart "no snapshot" from "snapshot for a different
+  window" from "transient IO error".
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly
   request shaping should preserve stable prompt prefixes.
 - **Approval persistence.** TUI prompts can allow once, allow a user/project
