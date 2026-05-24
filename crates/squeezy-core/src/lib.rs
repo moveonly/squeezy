@@ -2109,7 +2109,11 @@ fn shell_root_sensitive_overlap(
     None
 }
 
-fn sensitive_pattern_base(pattern: &str) -> String {
+/// Returns the literal directory prefix of a sensitive-path glob pattern,
+/// stripping any trailing wildcards (`*`, `/**`) and the leading `/`. Empty
+/// output indicates that the pattern is purely a wildcard and should be
+/// treated as having no enforceable prefix.
+pub fn sensitive_pattern_base(pattern: &str) -> String {
     let trimmed = pattern
         .trim()
         .trim_end_matches('*')

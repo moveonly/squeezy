@@ -1370,13 +1370,14 @@ fn config_source_labels_strip_paths() {
         "defaults".to_string(),
         "user:/home/me/.squeezy/settings.toml".to_string(),
         "project:/repo/squeezy.toml".to_string(),
+        "repo:/home/me/.squeezy/projects/demo-0123456789abcdef/settings.toml".to_string(),
         "env".to_string(),
         "cli".to_string(),
     ];
 
     assert_eq!(
         config.config_source_labels(),
-        vec!["defaults", "user", "project", "env", "cli"],
+        vec!["defaults", "user", "project", "repo", "env", "cli"],
     );
 }
 

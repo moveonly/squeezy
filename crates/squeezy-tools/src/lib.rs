@@ -30,7 +30,7 @@ use squeezy_core::{
     GraphConfig, LanguageKind, McpServerConfig, PermissionCapability, PermissionMode,
     PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
     Provenance, Redactor, Result, ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy,
-    SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind,
+    SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind, sensitive_pattern_base,
 };
 use squeezy_graph::{
     CallEdgeHit, DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode,
@@ -7722,15 +7722,6 @@ fn sensitive_absolute_paths(root: &Path, config: &ShellSandboxConfig) -> Vec<Pat
         }
     }
     paths
-}
-
-fn sensitive_pattern_base(pattern: &str) -> String {
-    let trimmed = pattern
-        .trim()
-        .trim_end_matches('*')
-        .trim_end_matches('/')
-        .trim_end_matches("/**");
-    trimmed.trim_start_matches('/').to_string()
 }
 
 #[cfg(target_os = "macos")]
