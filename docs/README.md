@@ -1,45 +1,30 @@
 # Squeezy Docs
 
-This directory is for committed documentation about implemented behavior and completed project decisions.
+This directory separates user-facing product documentation from contributor and
+implementation documentation.
 
-Keep personal notes, motivation, research from reference agents, sketches, and ideas that are not meant to describe the current implementation outside this committed docs tree.
+## External Docs
 
-Current completed decisions:
+[`external/`](external/) is the public, user-help corpus. These docs explain how
+Squeezy behaves, which options users can set, how the agent approaches work, and
+how to diagnose common product issues. The built-in Squeezy help implementation
+embeds this directory so `/help <topic>` and natural-language Squeezy questions
+can answer from local docs before any model or network lookup.
 
-- Squeezy itself is implemented fully in Rust.
-- Initial supported platforms are macOS and Linux.
-- Initial UI is a TUI.
-- Initial semantic navigation source language is Rust.
-- Current semantic navigation source languages are Rust, Python, C, and C++.
-- Unsupported source languages fall back to ordinary bounded read/grep/list tools.
-- Navigation tools mean semantic graph/code-understanding operations on top of tree-sitter, not grep wrappers.
-- LSP and `rust-analyzer` are not part of navigation; use toolchain/compiler commands only for build, test, and explicit verification.
-- Runtime graph state starts in memory; persisted graph/cache will use `redb`; Tantivy is deferred for later full-text ranking.
+Start with [`external/README.md`](external/README.md).
 
-Foundation runtime behavior now exists: the workspace builds, the TUI starts, and the first LLM provider shapes are OpenAI Responses streaming and Anthropic Messages streaming. Graph-backed navigation is still future work.
+## Internal Docs
 
-Implemented graph behavior is documented in `docs/SEMANTIC_GRAPH.md`.
+[`internal/`](internal/) is for contributors and maintainers. These docs cover
+architecture, implementation choices, validation, benchmarks, test layout, and
+deployment details. Internal docs are not embedded into normal user help.
 
-Local tool checkpoints, undo, and revert behavior are documented in [`CHECKPOINTS.md`](CHECKPOINTS.md).
+Start with [`internal/README.md`](internal/README.md).
 
-Local session logs, discovery, and resume behavior are documented in [`SESSIONS.md`](SESSIONS.md).
+## Maintenance Rule
 
-Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
-
-Local skill discovery and activation are documented in [`SKILLS.md`](SKILLS.md).
-
-Anonymous product telemetry is documented in [`TELEMETRY.md`](TELEMETRY.md).
-
-Consented maintainer feedback and bug-report intake are documented in
-[`FEEDBACK.md`](FEEDBACK.md).
-
-Developer setup and verification commands live in the repository root `CONTRIBUTING.md`.
-
-Platform support details live in `docs/PLATFORMS.md`.
-
-Validation harness details live in `docs/VALIDATION_HARNESS.md`.
-
-Configuration is documented in [`CONFIGURATION.md`](CONFIGURATION.md), with
-provider-specific details in [`PROVIDERS.md`](PROVIDERS.md).
-
-Shell sandboxing is documented in [`SHELL_SANDBOXING.md`](SHELL_SANDBOXING.md).
+When product behavior changes, update the relevant external doc first if a user
+could ask Squeezy about that behavior. When contributor workflow, architecture,
+or validation behavior changes, update the relevant internal doc. If a moved or
+renamed external doc should remain answerable through in-product help, update
+`crates/squeezy-skills/src/help.rs` and its tests in the same change.

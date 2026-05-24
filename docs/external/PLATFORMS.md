@@ -33,6 +33,11 @@ CI smoke-tests both debug and release artifacts with:
 squeezy --health
 ```
 
+`squeezy --health` prints `squeezy: ok` followed by `key=value` lines. Today it
+emits `config_sources`, `config_source_labels`, and `help_hint`; consumers must
+tolerate new keys being appended at the end. The `help_hint` line points users
+at the TUI `/help <topic>` command for local Squeezy help.
+
 ## Linux
 
 Linux is built and tested in CI on GitHub-hosted Ubuntu runners. The distributable Linux artifact is built for:

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DOC_PATH = "docs/TEST_LAYOUT.md"
+DOC_PATH = "docs/internal/TEST_LAYOUT.md"
 TEST_SUFFIX = "_tests.rs"
 RS_SUFFIX = ".rs"
 FORBIDDEN_TESTS_FILENAME = "tests.rs"

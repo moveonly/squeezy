@@ -990,6 +990,82 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
+async fn squeezy_help_self_question_completes_without_provider_request() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "How do I configure Squeezy providers?".to_string(),
+        CancellationToken::new(),
+    );
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("Squeezy help"), "{completed}");
+    assert!(
+        completed.contains("docs/external/PROVIDERS.md"),
+        "{completed}"
+    );
+    assert!(completed.contains("[model]"), "{completed}");
+}
+
+#[tokio::test]
+async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "Does Squeezy support quantum billing?".to_string(),
+        CancellationToken::new(),
+    );
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("won't guess"), "{completed}");
+    assert!(
+        completed.contains("https://squeezyagent.com/docs/"),
+        "{completed}"
+    );
+    assert!(
+        completed.contains("https://github.com/esqueezy/squeezy"),
+        "{completed}"
+    );
+}
+
+#[tokio::test]
+async fn unrelated_questions_still_call_provider() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "How do I configure serde?".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    assert_eq!(provider.requests().len(), 1);
+}
+
+#[tokio::test]
 async fn explicit_skill_activation_injects_body_and_rewrites_task() {
     let root = temp_workspace("agent_skill_explicit");
     write_skill(

@@ -4,7 +4,7 @@ A coding agent that treats cost, speed, and code understanding as first-class ci
 
 Squeezy parses repositories and builds a persistent local semantic graph. The agent queries this graph through structured tools that return compact evidence packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early development. The foundation TUI scaffold is runnable, provider/model selection is registry-backed, OpenAI, Anthropic, Gemini, Azure OpenAI, and Ollama adapters are available, deterministic validation harness tasks run in CI, and graph-backed navigation tools expose compact evidence packets. Committed decisions live in [`docs/`](docs).
+> **Status:** early development. The foundation TUI scaffold is runnable, provider/model selection is registry-backed, OpenAI, Anthropic, Gemini, Azure OpenAI, and Ollama adapters are available, deterministic validation harness tasks run in CI, and graph-backed navigation tools expose compact evidence packets. User docs live in [`docs/external/`](docs/external) and contributor docs live in [`docs/internal/`](docs/internal).
 
 ## Cost
 
@@ -18,10 +18,13 @@ Every model token is a budgeted resource.
 - Current fallback tools use ignore-aware `grep`, path-only `glob`, compact
   search modes, spill handles, aggregate result budgets, and permission-gated
   `websearch`/`webfetch` for current external evidence.
-- The tool-call saving roadmap is documented in [`docs/tool-call-saving-strategy.md`](docs/tool-call-saving-strategy.md).
-- Anonymous product telemetry is documented in [`docs/TELEMETRY.md`](docs/TELEMETRY.md).
-- Consented feedback and bug-report intake are documented in [`docs/FEEDBACK.md`](docs/FEEDBACK.md).
-- Configuration is documented in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md), with provider details in [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
+- The agent approach, local-first help behavior, tool surfaces, and TUI slash
+  commands are documented in [`docs/external/AGENT_APPROACH.md`](docs/external/AGENT_APPROACH.md)
+  and [`docs/external/TOOLS.md`](docs/external/TOOLS.md).
+- The tool-call saving roadmap is documented in [`docs/external/tool-call-saving-strategy.md`](docs/external/tool-call-saving-strategy.md).
+- Anonymous product telemetry is documented in [`docs/external/TELEMETRY.md`](docs/external/TELEMETRY.md).
+- Consented feedback and bug-report intake are documented in [`docs/external/FEEDBACK.md`](docs/external/FEEDBACK.md).
+- Configuration is documented in [`docs/external/CONFIGURATION.md`](docs/external/CONFIGURATION.md), with provider details in [`docs/external/PROVIDERS.md`](docs/external/PROVIDERS.md).
 
 ## Speed
 
@@ -38,9 +41,10 @@ The semantic graph is the primary navigation surface; bounded grep is a labeled 
 
 - Every relationship carries a **confidence label** (`exact_syntax`, `import_resolved`, `candidate_set`, `external`, `unknown`).
 - Every claim carries **provenance**: spans, hashes, parser/query origin, freshness.
-- **Framework adapters** (planned) expose routes and system functions as graph nodes when a framework is detected.
+- **Framework-aware extensions** can expose routes and system functions as graph
+  nodes when a supported adapter exists.
 - The **current branch diff** is first-class context: "what did I just change and what does it affect" is one query, not a search.
-- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence. The current language coverage matrix lives in [`docs/LANGUAGES.md`](docs/LANGUAGES.md).
+- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence. The current language coverage matrix lives in [`docs/external/LANGUAGES.md`](docs/external/LANGUAGES.md).
 
 ## Scope
 

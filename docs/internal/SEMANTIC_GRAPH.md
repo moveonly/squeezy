@@ -12,7 +12,7 @@ navigation questions before the model reads raw files.
   build output, lockfile, binary, large, VCS metadata, hidden, and
   user-excluded paths.
 - Language-specific declaration coverage is tracked in
-  [`docs/LANGUAGES.md`](LANGUAGES.md). The supported `LanguageFamily` set is
+  [`../external/LANGUAGES.md`](../external/LANGUAGES.md). The supported `LanguageFamily` set is
   Rust, Python, Java, C#, Go, C/C++, and JavaScript/TypeScript.
 - Signatures: raw item header, visibility, attributes, docs, spans, and body
   spans where present.
@@ -76,8 +76,8 @@ decision instead of walking a likely non-code or dangerous directory.
 - Unknown cfg and feature combinations are not silently dropped; callers should
   treat affected results as lower-confidence until compiler facts land in the
   later compiler-as-fact epic.
-- Language-specific heuristics, limitations, and TODOs live in
-  [`docs/LANGUAGES.md`](LANGUAGES.md). This file only describes the shared graph
+- Language-specific heuristics, limitations, and follow-ups live in
+  [`../external/LANGUAGES.md`](../external/LANGUAGES.md). This file only describes the shared graph
   policy and query surface.
 
 Every result carries a confidence label such as `ExactSyntax`, `ImportResolved`,
@@ -310,7 +310,7 @@ Current external-oracle gaps and known losses:
   resolution, and external crate/stdlib references remain heuristic or
   lower-confidence
 
-Latest local benchmark snapshot is documented in `benchmarks/README.md`. On the
+Latest local benchmark snapshot is documented in [`BENCHMARKS.md`](BENCHMARKS.md). On the
 May 23, 2026 release run, comparable declaration symbols were 100% TP with 0 FP
 and 0 FN against `rust-analyzer symbols` on five external popular Rust repos:
 ripgrep, fd, bat, tokio, and serde. The LSP navigation oracle does show losses:

@@ -306,6 +306,7 @@ async fn main() -> squeezy_core::Result<()> {
             "config_source_labels={}",
             config.config_source_labels().join(",")
         );
+        println!("help_hint=use /help <topic> in the TUI for local Squeezy help");
         if let Some(summary) = onboarding.visible_summary {
             println!("{summary}");
         }

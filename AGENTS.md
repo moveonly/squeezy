@@ -14,30 +14,30 @@ Squeezy is a Rust-first coding agent optimized around low cost and high-signal s
 ## Current Scope
 
 - Implementation language: Rust only.
-- First semantic navigation source language: Rust.
-- First supported platforms: macOS and Linux.
+- Semantic navigation source languages: Rust, Python, Java, C#/.NET, Go, C/C++, and JavaScript/TypeScript.
+- Supported platforms: macOS and Linux.
 - UI: TUI.
 - Unsupported source languages fall back to ordinary bounded read/grep/list tools; do not fake graph confidence for them.
 - "Navigation tools" means tree-sitter-backed semantic graph operations such as declarations, references, hierarchy, call candidates, dependency paths, impact, and exact read slices.
 
 ## Expected Architecture
 
-The planned crate layout should separate:
+The crate layout separates:
 
 - CLI and session orchestration.
 - Workspace discovery, ignore handling, and file watching.
 - Tree-sitter parser runtime and language registry.
 - Semantic graph storage and incremental updates.
-- Future native task/context ledger for long-running resumable work.
+- Session logs, context compaction, checkpoints, and resumable local work.
 - Retrieval/ranking/query planning.
 - Tool protocol and permission policy.
 - LLM provider abstraction and prompt/cache accounting.
 
 ## Storage Direction
 
-- Start with in-memory graph state while the semantic model stabilizes.
-- Use `redb` for persisted graph/cache.
-- Load graph partitions into memory lazily when queries need them.
+- Keep an in-memory query surface backed by persisted graph/cache partitions.
+- Use `redb` for persisted graph/cache state.
+- Hydrate graph partitions lazily when queries need them.
 - Add `tantivy` later for full-text ranking; do not make it part of the first graph milestone.
 
 ## Rust Analysis Direction
@@ -55,7 +55,7 @@ Integration-test fixtures and reusable test artifacts belong under the owning cr
 
 ## Test Layout
 
-`docs/TEST_LAYOUT.md` is the source of truth. Quick decision rule:
+`docs/internal/TEST_LAYOUT.md` is the source of truth. Quick decision rule:
 
 - Unit tests that need crate-private items → `src/<module>_tests.rs` paired
   with a real `src/<module>.rs` source file. Declare via `#[cfg(test)]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check docs/LANGUAGES.md against the benchmark language/oracle registries."""
+"""Check docs/external/LANGUAGES.md against the benchmark language/oracle registries."""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def normalized_cell(cell: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bench", default="target/debug/squeezy-graph-bench")
-    parser.add_argument("--doc", default="docs/LANGUAGES.md")
+    parser.add_argument("--doc", default="docs/external/LANGUAGES.md")
     args = parser.parse_args()
 
     bench = Path(args.bench)
@@ -81,7 +81,7 @@ def main() -> int:
     for family, language in languages.items():
         row = rows.get(family)
         if row is None:
-            errors.append(f"missing docs/LANGUAGES.md row for {family}")
+            errors.append(f"missing docs/external/LANGUAGES.md row for {family}")
             continue
         kinds = language["kinds"]
         extensions = language["extensions"]
@@ -100,7 +100,7 @@ def main() -> int:
 
     extra_rows = set(rows) - set(languages)
     for family in sorted(extra_rows):
-        errors.append(f"docs/LANGUAGES.md row has no live language registry entry: {family}")
+        errors.append(f"docs/external/LANGUAGES.md row has no live language registry entry: {family}")
 
     if errors:
         for error in errors:

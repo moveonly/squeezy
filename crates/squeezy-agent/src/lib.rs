@@ -26,6 +26,7 @@ use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
     capabilities_for, estimate_cost, estimate_request_context, fetch_ollama_context_window,
 };
+use squeezy_skills::{HelpAnswer, SqueezyHelp, matches_squeezy_help_input};
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
@@ -1413,6 +1414,32 @@ impl Agent {
             {
                 return;
             }
+            // Cheap pre-check first so unrelated coding turns do not pay for a
+            // full `inspect_redacted()` rendering on every turn.
+            if matches_squeezy_help_input(&task_title)
+                && let Some(answer) =
+                    SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
+            {
+                complete_squeezy_help_turn(
+                    turn_id,
+                    task_title,
+                    answer,
+                    redacted_input.redactions,
+                    HelpTurnDeps {
+                        tx: tx.clone(),
+                        redactor: redactor.clone(),
+                        session_log: session_log.clone(),
+                        conversation_state: conversation_state.clone(),
+                        session_metrics: session_metrics.clone(),
+                        telemetry: telemetry.clone(),
+                        config: config.clone(),
+                        task_state: task_state.clone(),
+                        session_mode: session_mode.clone(),
+                    },
+                )
+                .await;
+                return;
+            }
             let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
             for error in mcp_errors {
                 log_session_event(
@@ -1489,6 +1516,158 @@ impl Agent {
 
         rx
     }
+}
+
+struct HelpTurnDeps {
+    tx: mpsc::Sender<AgentEvent>,
+    redactor: Arc<Redactor>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Arc<Mutex<ConversationState>>,
+    session_metrics: Arc<Mutex<SessionMetrics>>,
+    telemetry: TelemetryClient,
+    config: AppConfig,
+    task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    session_mode: Arc<AtomicU8>,
+}
+
+async fn complete_squeezy_help_turn(
+    turn_id: TurnId,
+    task_title: String,
+    answer: HelpAnswer,
+    seed_redactions: u64,
+    deps: HelpTurnDeps,
+) {
+    let HelpTurnDeps {
+        tx,
+        redactor,
+        session_log,
+        conversation_state,
+        session_metrics,
+        telemetry,
+        config,
+        task_state,
+        session_mode,
+    } = deps;
+    let user_item = LlmInputItem::UserText(task_title.clone());
+    let user_transcript = TranscriptItem::user(task_title.clone());
+    let rendered = redactor.redact(&answer.render_markdown());
+    let message = TranscriptItem::assistant(rendered.text);
+    let metrics = TurnMetrics {
+        redactions: seed_redactions + rendered.redactions,
+        ..TurnMetrics::default()
+    };
+    let cost = CostSnapshot::default();
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "user_message",
+        Some(turn_id),
+        user_item_summary(&user_item),
+        json!({}),
+    );
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::starting(task_title.clone()),
+    )
+    .await;
+    let _ = tx.send(AgentEvent::Started { turn_id }).await;
+    let _ = tx
+        .send(AgentEvent::AssistantDelta {
+            turn_id,
+            delta: message.content.clone(),
+        })
+        .await;
+    let latest_task_state = task_state.lock().await.clone();
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::terminal_from(
+            latest_task_state.as_ref(),
+            task_title.clone(),
+            TaskStateStatus::Completed,
+            Some(format!("Squeezy help: {}", answer.topic)),
+        ),
+    )
+    .await;
+
+    {
+        let mut state = conversation_state.lock().await;
+        state.conversation.push(user_item);
+        state
+            .conversation
+            .push(LlmInputItem::AssistantText(message.content.clone()));
+        // Help turns never call the provider, so any prior response-chain id
+        // (e.g. OpenAI Responses) stays valid for the next real turn. Leaving
+        // it untouched avoids forcing the following turn to resend full history.
+        state.transcript.push(user_transcript);
+        state.transcript.push(message.clone());
+        merge_cost(&mut state.cost, &cost);
+        state.metrics.merge_turn(&metrics);
+        state.redactions += metrics.redactions;
+        if let Some(session) = &session_log {
+            let _ = session.write_resume_state(&state.to_resume_state());
+            let _ = session.update_metadata(|metadata| {
+                metadata.cost = state.cost.clone();
+                metadata.metrics = state.metrics.clone();
+                metadata.redactions = state.redactions;
+                metadata.resume_available = true;
+                metadata.mode = load_session_mode(&session_mode);
+            });
+        }
+    }
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "squeezy_help",
+        Some(turn_id),
+        Some(answer.topic.clone()),
+        json!({
+            "topic": answer.topic,
+            "status": answer.status,
+            "citations": answer.citations,
+            "config_sections": answer.config_sections,
+        }),
+    );
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "assistant_completed",
+        Some(turn_id),
+        Some(format!(
+            "Squeezy help: {}",
+            message.content.lines().next().unwrap_or("help")
+        )),
+        json!({
+            "response_id": null,
+            "cost": cost,
+            "metrics": metrics,
+        }),
+    );
+
+    telemetry.spawn(TelemetryEvent::turn_completed(
+        &config,
+        turn_id.get(),
+        metrics.clone(),
+    ));
+    session_metrics.lock().await.merge_turn(&metrics);
+    let _ = tx
+        .send(AgentEvent::Completed {
+            turn_id,
+            message,
+            response_id: None,
+            cost,
+            metrics,
+        })
+        .await;
 }
 
 struct TurnRuntime {

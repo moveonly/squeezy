@@ -2,6 +2,11 @@
 
 Squeezy is implemented in Rust and targets macOS and Linux first. The foundation workspace uses Rust 2024.
 
+Contributor-facing architecture, validation, benchmark, and deployment notes
+live in [`docs/internal/`](docs/internal/). User-facing product docs live in
+[`docs/external/`](docs/external/) and are embedded into built-in Squeezy help,
+so update them whenever user-visible behavior changes.
+
 ## Setup
 
 Install Rust `1.93.1` or newer. The repository pins `1.93.1` in `rust-toolchain.toml` and each crate inherits `rust-version = "1.93.1"` from the workspace.
@@ -175,4 +180,4 @@ Do not run costly provider smoke checks from AI automation. Use the ignored `cos
 
 ## Unit Test Layout
 
-Keep unit tests in sibling files. See `docs/TEST_LAYOUT.md`.
+Keep unit tests in sibling files. See `docs/internal/TEST_LAYOUT.md`.

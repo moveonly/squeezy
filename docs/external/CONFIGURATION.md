@@ -22,7 +22,8 @@ runtime state and is ignored by git in this repository.
 
 Generated repo profiles are separate from project configuration. Squeezy stores
 detected, machine-local repo knowledge in `~/.squeezy/repos.toml` and uses its
-stable repo id for per-repo user settings; see `docs/REPO_PROFILE.md`.
+stable repo id for per-repo user settings; see
+[`REPO_PROFILE.md`](REPO_PROFILE.md).
 
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
@@ -368,7 +369,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   pruned even when an `include` glob would otherwise re-enable it; the
   exclusion is reported with its normal class reason, not `user_exclude`.
   Canonical supported-language families and recognized extensions are listed in
-  [`docs/LANGUAGES.md`](LANGUAGES.md).
+  [`LANGUAGES.md`](LANGUAGES.md).
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
   workspace root, not the process working directory. Graph warm-start state,
   cross-session receipt metadata, and internal observations are stored in

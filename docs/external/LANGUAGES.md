@@ -1,11 +1,9 @@
 # Language Coverage
 
-This document is the canonical source for Squeezy's language coverage. It is
-organized by `LanguageFamily`, which maps one or more `LanguageKind` values to a
-single parser backend, graph extension, benchmark oracle, and CI benchmark job.
-The reproducible benchmark corpus itself lives in `benchmarks/corpus.json`,
-which pins smoke/full cases, external repository commits, scenario limits, and
-report paths.
+This document is the user-facing source for Squeezy's language coverage. It is
+organized by `LanguageFamily`, which maps one or more source languages to a
+single parser backend and navigation behavior. The internal benchmark corpus
+uses the same family names so coverage claims stay checkable.
 
 ## Coverage Matrix
 
@@ -25,12 +23,11 @@ Indexed: modules, structs, enums, unions, traits, impls, functions, methods,
 consts, statics, type aliases, macros, tests, imports, references, calls, and
 body hits.
 
-Known limitations: cfg and feature evaluation is local and syntactic until the
-compiler-as-fact work lands; macro expansion is not attempted; external crates
-and standard-library roots are treated as external rather than resolved through
-Cargo metadata.
-
-TODO: compiler-as-fact integration is tracked by `squeezy-cfa.18`.
+Known limitations: cfg and feature evaluation is still conservative; macro
+expansion is not attempted; external crates and standard-library roots are
+treated as external navigation targets. Cargo metadata and optional `cargo
+check` diagnostics can be refreshed explicitly as compiler facts, but navigation
+tools do not run Cargo automatically.
 
 Oracle: rust-analyzer LSP/symbol probes, plus `cargo check` timing for validation.
 
@@ -43,8 +40,9 @@ Known limitations: dynamic attributes, metaclasses, runtime import side effects,
 monkey-patching, framework magic, and type-inferred receiver dispatch are
 heuristic or external. No mypy-style type solving is attempted.
 
-TODO: broaden framework-aware navigation after the core graph-backed navigation
-tools stabilize under `squeezy-cfa.5`.
+Known follow-ups: framework-aware navigation can improve route, ORM, and
+decorator-heavy projects, but the current graph remains tree-sitter and local
+heuristic based.
 
 Oracle: CPython `ast` parsing and declaration comparison.
 
@@ -58,7 +56,8 @@ Known limitations: overload resolution, runtime dispatch, reflection, annotation
 processors, generated sources, and external classpaths remain heuristic or
 external.
 
-TODO: Java follow-up work lives under `squeezy-cfa.25`.
+Known follow-ups: overload resolution, classpath completeness, annotation
+processing, and generated-source behavior are not compiler-equivalent.
 
 Oracle: `javac` compiler-tree scans for symbols and navigation query checks.
 
@@ -77,8 +76,8 @@ semantics are not compiler-equivalent. Razor, Blazor `.razor`, and `.cshtml`
 files are intentionally discovered as bounded fallback inputs for v0; embedded
 C# is not assigned graph confidence yet.
 
-TODO: broader C# graph behavior after v0 is tracked under `squeezy-cfa.38` and
-follow-up extraction/navigation tasks.
+Known follow-ups: broader .NET project-system fidelity, generated-source
+handling, and framework-specific navigation remain bounded local heuristics.
 
 Oracle: Roslyn project in `benchmarks/oracle/csharp` for declaration symbols and
 syntactic extends/implements edges.
@@ -93,7 +92,8 @@ Known limitations: interface satisfaction, full receiver type inference, embedde
 field promotion, build tags, generated code, and external modules are candidate,
 heuristic, or external facts.
 
-TODO: additional corpus coverage is tracked by `squeezy-cfa.38`.
+Known follow-ups: additional corpus coverage, interface satisfaction, and build
+tag handling can improve precision and recall.
 
 Oracle: Go parser/types script embedded in the benchmark binary.
 
@@ -108,8 +108,8 @@ dispatch, ADL, build-system flags, and cross-translation-unit semantics are
 heuristic. Preprocessor directives are evidence for fallback, not exact compiler
 state.
 
-TODO: additional cross-language benchmark corpus coverage is tracked by
-`squeezy-cfa.38`.
+Known follow-ups: additional C and C++ corpus coverage, compile database
+handling, and macro/template handling can improve precision and recall.
 
 Oracle: clang AST JSON, shared by C and C++.
 
@@ -126,7 +126,8 @@ without checked config, package export edge cases, runtime dispatch, and full
 TypeScript type evaluation are heuristic, external, or fallback results.
 `tsconfig.json` path handling is local and intentionally bounded.
 
-TODO: JS/TS follow-ups are tracked by `squeezy-cfa.27`.
+Known follow-ups: bundler alias handling, package export edge cases, and
+framework conventions can improve precision and recall.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
@@ -140,15 +141,5 @@ quality. Smoke fixtures for every supported family include generated and vendor
 source paths; their specs assert those paths are surfaced as generated/vendor
 fallback evidence rather than graph-confident answers.
 
-## Adding A New Language
-
-1. Add the `LanguageKind` variant and map it to a `LanguageFamily` in
-   `squeezy-core`.
-2. Add extensions to `LanguageFamily::file_extensions`.
-3. Register a `LanguageBackend` in `squeezy-parse`.
-4. Register a `LanguageGraphExt` in `squeezy-graph`.
-5. Register a `LanguageOracle` in `benchmarks/squeezy-graph-bench`.
-6. Add fixture and spec files under `benchmarks/fixtures/` and
-   `benchmarks/specs/`.
-7. Add the language family to `.github/workflows/benchmark.yml` and document the
-   oracle/limitations in this file.
+Contributor steps for adding or changing a language family live in
+[`../internal/ARCHITECTURE.md`](../internal/ARCHITECTURE.md).

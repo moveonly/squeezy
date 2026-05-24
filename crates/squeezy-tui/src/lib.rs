@@ -31,6 +31,7 @@ use squeezy_core::{
     TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
+use squeezy_skills::{HelpStatus, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
@@ -518,6 +519,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             app.push_transcript_item(TranscriptItem::system(format_context_command(&snapshot)));
             return true;
         }
+        "/help" => {
+            handle_help_command(app, rest);
+            return true;
+        }
         "/feedback" => {
             handle_feedback_command(app, agent, rest).await;
             return true;
@@ -879,6 +884,20 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     app.jobs.insert(job.id, job.clone());
     app.status = format!("started job {} {}", job.id, job.title);
     true
+}
+
+fn handle_help_command(app: &mut TuiApp, rest: &str) {
+    let help = SqueezyHelp::new(app.help_config_inspect.clone());
+    let answer = if rest.trim().is_empty() {
+        help.topic_index()
+    } else {
+        help.answer_topic(rest)
+    };
+    app.status = match answer.status {
+        HelpStatus::Answered => format!("help {}", answer.topic),
+        HelpStatus::Unsupported => "help topic not covered locally".to_string(),
+    };
+    app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
 }
 
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -1574,7 +1593,7 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
 /// Keys we surface in the approval prompt, in display order. The list
 /// matches the metadata emitted by `ToolRegistry::permission_request` so a
 /// future field becomes visible by adding it here AND in the tool
-/// registry; the doc in `docs/CONFIGURATION.md` references this contract.
+/// registry; the doc in `docs/external/CONFIGURATION.md` references this contract.
 pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
     "server",
     "tool",
@@ -2176,9 +2195,9 @@ fn format_status_tokens(app: &TuiApp) -> String {
     let hints = if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
     } else if app.cancel.is_some() {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /help /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /cost /context /attach /attachments /detach /compact /pin /pins /unpin /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /help /copy /cost /context /attach /attachments /detach /compact /pin /pins /unpin /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -2415,6 +2434,7 @@ struct TuiApp {
     tool_output_verbosity: ToolOutputVerbosity,
     transcript_default: TranscriptDefault,
     show_reasoning_usage: bool,
+    help_config_inspect: String,
     repo: RepoStatus,
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
@@ -2496,6 +2516,7 @@ impl TuiApp {
             tool_output_verbosity: config.tui.tool_output_verbosity,
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
+            help_config_inspect: config.inspect_redacted(),
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),

@@ -10,6 +10,10 @@ use serde_json::{Value, json};
 use squeezy_core::{Result, SkillsConfig, SqueezyError};
 use tracing::warn;
 
+pub mod help;
+
+pub use help::{HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input};
+
 const SKILL_FILE: &str = "SKILL.md";
 const PROJECT_SKILLS_DIR: &str = ".squeezy/skills";
 const COMPAT_PROJECT_SKILLS_DIR: &str = ".agents/skills";

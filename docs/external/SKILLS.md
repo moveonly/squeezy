@@ -75,3 +75,21 @@ Skills can activate in three ways:
 Loaded skill bodies are cached for the lifetime of the process so repeat activations within a session do not re-read the SKILL.md from disk.
 
 Loading a skill only injects instructions. It does not grant tools, bypass approvals, execute shell snippets, or change the session permission policy.
+
+## Built-In Squeezy Help
+
+Squeezy also ships a built-in help surface for questions about Squeezy itself.
+This is separate from user and project `SKILL.md` directories.
+
+- Use `/help` in the TUI to list covered Squeezy help topics.
+- Use `/help <topic>` for a local answer grounded in bundled
+  `docs/external/` files and the current run's redacted `config inspect`
+  output.
+- Natural-language questions that clearly ask about Squeezy itself can be
+  answered by the same local help path before model or MCP calls.
+- If the local corpus does not cover the topic, Squeezy refuses to guess and
+  points to the public website and repository, or to explicit external lookup
+  tools when those are available.
+
+Built-in Squeezy help does not fetch the network automatically. Current public
+docs lookup remains a separate, explicit web/docs task.
