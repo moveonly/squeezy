@@ -560,7 +560,7 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "      hello");
+    assert_eq!(text, "> hello");
 }
 
 #[test]
@@ -609,6 +609,65 @@ fn tool_output_verbosity_changes_preview_length() {
 
     assert!(compact.len() < verbose.len());
     assert!(compact.ends_with("..."), "{compact}");
+}
+
+#[test]
+fn failed_tool_rows_show_actionable_error_detail() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo build --workspace",
+        "exit_code": 101,
+        "stdout": "",
+        "stderr": "",
+        "error": null,
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 120, 12);
+
+    assert!(output.contains("✖ Failed shell · exit 101"), "{output}");
+    assert!(!output.contains("shell · error"), "{output}");
+}
+
+#[test]
+fn failed_tool_rows_fall_back_to_no_output_when_empty() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo build --workspace",
+        "exit_code": null,
+        "stdout": "",
+        "stderr": "",
+        "error": null,
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 120, 12);
+
+    assert!(output.contains("✖ Failed shell · no output"), "{output}");
+    assert!(!output.contains("shell · error"), "{output}");
+}
+
+#[test]
+fn denied_tool_rows_show_denial_reason() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Denied;
+    result.content = serde_json::json!({
+        "reason": "required shell sandbox unavailable",
+        "permission_denied": true,
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 120, 12);
+
+    assert!(
+        output.contains("⚠ Denied shell · required shell sandbox unavailable"),
+        "{output}"
+    );
 }
 
 #[test]
@@ -918,7 +977,7 @@ fn render_keeps_header_when_transcript_has_content() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("scripted:gpt-test"), "{output}");
-    assert!(output.contains("      hello"), "{output}");
+    assert!(output.contains("> hello"), "{output}");
     assert!(output.contains("● answer"), "{output}");
     assert!(!output.contains("Answered"), "{output}");
 }
@@ -1065,7 +1124,7 @@ fn running_prompt_keeps_working_line_below_submitted_prompt() {
 
     let output = render_to_string(&app, 120, 18);
 
-    assert!(output.contains("      why?"), "{output}");
+    assert!(output.contains("> why?"), "{output}");
     assert!(output.contains("• Working why?"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
 }
@@ -1147,10 +1206,10 @@ fn submitted_prompt_surface_extends_to_render_width() {
         40
     );
     assert_eq!(rendered.chars().count(), 40);
+    assert!(rendered.starts_with("> find getFoo"), "{rendered}");
     assert_eq!(lines[0].spans[0].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[3].style.bg, Some(PROMPT_BG));
     assert_eq!(lines[2].spans[1].style.bg, Some(PROMPT_BG));
     assert_eq!(lines.last().expect("separator").spans.len(), 0);
 }
@@ -1192,7 +1251,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     app.push_log("turn failed: provider stream failed".to_string());
 
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("      hi"), "{output}");
+    assert!(output.contains("> hi"), "{output}");
     assert!(
         output.contains("└ turn failed: provider stream failed"),
         "{output}"
@@ -1256,10 +1315,9 @@ fn failed_user_turn_marks_status_not_prompt_text() {
         message_outcome(&app.transcript, 0),
     );
     assert_eq!(user_lines[1].spans[0].style.bg, Some(PROMPT_BG));
+    assert_eq!(user_lines[1].spans[1].content.as_ref(), "hi");
+    assert_eq!(user_lines[1].spans[1].style.fg, Some(Color::White));
     assert_eq!(user_lines[1].spans[1].style.bg, Some(PROMPT_BG));
-    assert_eq!(user_lines[1].spans[2].content.as_ref(), "hi");
-    assert_eq!(user_lines[1].spans[2].style.fg, Some(Color::White));
-    assert_eq!(user_lines[1].spans[2].style.bg, Some(PROMPT_BG));
 
     let log_lines = format_transcript_entry(
         &app.transcript[1],
@@ -1282,10 +1340,10 @@ fn user_prompt_text_is_highlighted_in_transcript() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(lines[1].spans[2].content.as_ref(), "find getFoo");
+    assert_eq!(lines[1].spans[1].content.as_ref(), "find getFoo");
     assert_eq!(lines[1].spans[0].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[2].style.bg, Some(PROMPT_BG));
-    assert_eq!(lines[1].spans[2].style.fg, Some(Color::White));
+    assert_eq!(lines[1].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[1].spans[1].style.fg, Some(Color::White));
     assert!(!text.contains("◐"), "{text}");
 }
 

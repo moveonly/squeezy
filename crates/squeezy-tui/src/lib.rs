@@ -2663,7 +2663,7 @@ fn format_message_entry_with_width(
 
 fn format_user_prompt_entry(
     item: &TranscriptItem,
-    selected: bool,
+    _selected: bool,
     width: Option<u16>,
 ) -> Vec<Line<'static>> {
     let mut content = item.content.split('\n').collect::<Vec<_>>();
@@ -2673,7 +2673,7 @@ fn format_user_prompt_entry(
     let mut lines = Vec::with_capacity(content.len() + 3);
     lines.push(user_prompt_blank_line(width));
     lines.extend(content.into_iter().enumerate().map(|(index, line)| {
-        let marker = if selected && index == 0 { "> " } else { "  " };
+        let marker = if index == 0 { "> " } else { "  " };
         user_prompt_content_line(marker, line, width)
     }));
     lines.push(user_prompt_blank_line(width));
@@ -2691,14 +2691,12 @@ fn user_prompt_blank_line(width: Option<u16>) -> Line<'static> {
 }
 
 fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>) -> Line<'static> {
-    let prompt_prefix = "    ";
-    let text_width = prompt_prefix.chars().count() + line.chars().count();
+    let text_width = line.chars().count();
     let padding = user_prompt_surface_width(marker, width)
         .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
         .unwrap_or_default();
     Line::from(vec![
         user_prompt_marker_span(marker),
-        Span::styled(prompt_prefix, Style::default().bg(PROMPT_BG)),
         Span::styled(
             line.to_string(),
             Style::default().fg(Color::White).bg(PROMPT_BG),
@@ -3003,12 +3001,68 @@ fn tool_result_summary(result: &ToolResult) -> String {
                 summary.push_str(" · output shortened");
             }
         }
-        ToolStatus::Error => summary.push_str(" · error"),
-        ToolStatus::Denied => summary.push_str(" · denied"),
+        ToolStatus::Error => {
+            summary.push_str(" · ");
+            summary.push_str(&tool_result_error_detail(result));
+        }
+        ToolStatus::Denied => {
+            summary.push_str(" · ");
+            summary.push_str(&tool_result_denied_detail(result));
+        }
         ToolStatus::Stale => summary.push_str(" · stale"),
         ToolStatus::Cancelled => summary.push_str(" · cancelled"),
     }
     summary
+}
+
+fn tool_result_error_detail(result: &ToolResult) -> String {
+    if let Some(error) = result
+        .content
+        .get("error")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return compact_text(error, 140);
+    }
+    if let Some(code) = result
+        .content
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
+    {
+        return format!("exit {code}");
+    }
+    for key in ["stderr", "stdout"] {
+        if let Some(line) = result
+            .content
+            .get(key)
+            .and_then(|value| value.as_str())
+            .and_then(first_nonempty_line)
+        {
+            return compact_text(line, 140);
+        }
+    }
+    if result.cost_hint.truncated {
+        "output shortened".to_string()
+    } else {
+        "no output".to_string()
+    }
+}
+
+fn tool_result_denied_detail(result: &ToolResult) -> String {
+    result
+        .content
+        .get("reason")
+        .or_else(|| result.content.get("error"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| compact_text(value, 140))
+        .unwrap_or_else(|| "denied".to_string())
+}
+
+fn first_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
 fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> String {
