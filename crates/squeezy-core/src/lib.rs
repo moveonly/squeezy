@@ -34,6 +34,11 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
 pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
 pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
+pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 4;
+pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 1_200;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
@@ -104,6 +109,7 @@ pub struct AppConfig {
     pub session_mode: SessionMode,
     pub session_logs: SessionLogConfig,
     pub context_compaction: ContextCompactionConfig,
+    pub subagents: SubagentConfig,
     pub store_responses: bool,
     pub exploration_compiler: bool,
     pub max_parallel_tools: usize,
@@ -445,6 +451,10 @@ impl AppConfig {
             settings.context.unwrap_or_default(),
             &mut get_var,
         );
+        let subagents = SubagentConfig::from_settings_and_env(
+            settings.subagents.unwrap_or_default(),
+            &mut get_var,
+        );
         let tui = TuiConfig::from_settings(settings.tui.unwrap_or_default());
         if env_used {
             sources.push("env".to_string());
@@ -465,6 +475,7 @@ impl AppConfig {
             session_mode,
             session_logs,
             context_compaction,
+            subagents,
             store_responses,
             exploration_compiler,
             max_parallel_tools,
@@ -603,6 +614,36 @@ impl AppConfig {
         output.push_str(&format!(
             "compaction_max_summary_bytes = {}\n\n",
             self.context_compaction.max_summary_bytes
+        ));
+
+        output.push_str("[subagents]\n");
+        output.push_str(&format!("enabled = {}\n", self.subagents.enabled));
+        output.push_str(&format!(
+            "explore_enabled = {}\n",
+            self.subagents.explore_enabled
+        ));
+        if let Some(model) = &self.subagents.explore_model {
+            output.push_str(&format!("explore_model = {}\n", toml_string(model)));
+        }
+        output.push_str(&format!(
+            "max_tool_calls_per_call = {}\n",
+            self.subagents.max_tool_calls_per_call
+        ));
+        output.push_str(&format!(
+            "max_tool_bytes_read_per_call = {}\n",
+            self.subagents.max_tool_bytes_read_per_call
+        ));
+        output.push_str(&format!(
+            "max_search_files_per_call = {}\n",
+            self.subagents.max_search_files_per_call
+        ));
+        output.push_str(&format!(
+            "max_model_rounds = {}\n",
+            self.subagents.max_model_rounds
+        ));
+        output.push_str(&format!(
+            "max_summary_tokens = {}\n\n",
+            self.subagents.max_summary_tokens
         ));
 
         output.push_str("[budgets]\n");
@@ -1097,6 +1138,7 @@ pub struct SettingsFile {
     pub agent: Option<AgentSettings>,
     pub session: Option<SessionSettings>,
     pub context: Option<ContextCompactionSettings>,
+    pub subagents: Option<SubagentSettings>,
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
@@ -1153,6 +1195,7 @@ impl SettingsFile {
                 "agent",
                 "session",
                 "context",
+                "subagents",
                 "budgets",
                 "permissions",
                 "telemetry",
@@ -1194,6 +1237,9 @@ impl SettingsFile {
             .transpose()?;
         settings.context = optional_table(table, "context", source)?
             .map(|table| ContextCompactionSettings::from_table(table, source, "context"))
+            .transpose()?;
+        settings.subagents = optional_table(table, "subagents", source)?
+            .map(|table| SubagentSettings::from_table(table, source, "subagents"))
             .transpose()?;
         settings.budgets = optional_table(table, "budgets", source)?
             .map(|table| BudgetSettings::from_table(table, source, "budgets"))
@@ -1251,6 +1297,7 @@ impl SettingsFile {
             next.context,
             ContextCompactionSettings::merge,
         );
+        merge_option(&mut self.subagents, next.subagents, SubagentSettings::merge);
         merge_option(&mut self.budgets, next.budgets, BudgetSettings::merge);
         merge_option(
             &mut self.permissions,
@@ -1893,6 +1940,180 @@ impl ContextCompactionSettings {
             &mut self.compaction_max_summary_bytes,
             next.compaction_max_summary_bytes,
         );
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentSettings {
+    pub enabled: Option<bool>,
+    pub explore_enabled: Option<bool>,
+    pub explore_model: Option<String>,
+    pub max_tool_calls_per_call: Option<u64>,
+    pub max_tool_bytes_read_per_call: Option<u64>,
+    pub max_search_files_per_call: Option<u64>,
+    pub max_model_rounds: Option<usize>,
+    pub max_summary_tokens: Option<u32>,
+}
+
+impl SubagentSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "enabled",
+                "explore_enabled",
+                "explore_model",
+                "max_tool_calls_per_call",
+                "max_tool_bytes_read_per_call",
+                "max_search_files_per_call",
+                "max_model_rounds",
+                "max_summary_tokens",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?,
+            explore_enabled: bool_value(
+                table,
+                "explore_enabled",
+                source,
+                &field(path, "explore_enabled"),
+            )?,
+            explore_model: string_value(
+                table,
+                "explore_model",
+                source,
+                &field(path, "explore_model"),
+            )?,
+            max_tool_calls_per_call: u64_value(
+                table,
+                "max_tool_calls_per_call",
+                source,
+                &field(path, "max_tool_calls_per_call"),
+            )?,
+            max_tool_bytes_read_per_call: u64_value(
+                table,
+                "max_tool_bytes_read_per_call",
+                source,
+                &field(path, "max_tool_bytes_read_per_call"),
+            )?,
+            max_search_files_per_call: u64_value(
+                table,
+                "max_search_files_per_call",
+                source,
+                &field(path, "max_search_files_per_call"),
+            )?,
+            max_model_rounds: usize_value(
+                table,
+                "max_model_rounds",
+                source,
+                &field(path, "max_model_rounds"),
+            )?,
+            max_summary_tokens: u32_value(
+                table,
+                "max_summary_tokens",
+                source,
+                &field(path, "max_summary_tokens"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.enabled, next.enabled);
+        replace_if_some(&mut self.explore_enabled, next.explore_enabled);
+        replace_if_some(&mut self.explore_model, next.explore_model);
+        replace_if_some(
+            &mut self.max_tool_calls_per_call,
+            next.max_tool_calls_per_call,
+        );
+        replace_if_some(
+            &mut self.max_tool_bytes_read_per_call,
+            next.max_tool_bytes_read_per_call,
+        );
+        replace_if_some(
+            &mut self.max_search_files_per_call,
+            next.max_search_files_per_call,
+        );
+        replace_if_some(&mut self.max_model_rounds, next.max_model_rounds);
+        replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    pub enabled: bool,
+    pub explore_enabled: bool,
+    pub explore_model: Option<String>,
+    pub max_tool_calls_per_call: u64,
+    pub max_tool_bytes_read_per_call: u64,
+    pub max_search_files_per_call: u64,
+    pub max_model_rounds: usize,
+    pub max_summary_tokens: u32,
+}
+
+impl SubagentConfig {
+    fn from_settings_and_env(
+        settings: SubagentSettings,
+        get_var: &mut impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        Self {
+            enabled: get_var("SQUEEZY_SUBAGENTS_ENABLED")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.enabled.unwrap_or(true)),
+            explore_enabled: get_var("SQUEEZY_EXPLORE_SUBAGENT_ENABLED")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.explore_enabled.unwrap_or(true)),
+            explore_model: get_var("SQUEEZY_EXPLORE_MODEL")
+                .or(settings.explore_model)
+                .filter(|value| !value.trim().is_empty()),
+            max_tool_calls_per_call: parse_u64(
+                get_var("SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL"),
+                settings
+                    .max_tool_calls_per_call
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL),
+            ),
+            max_tool_bytes_read_per_call: parse_u64(
+                get_var("SQUEEZY_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL"),
+                settings
+                    .max_tool_bytes_read_per_call
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL),
+            ),
+            max_search_files_per_call: parse_u64(
+                get_var("SQUEEZY_SUBAGENT_MAX_SEARCH_FILES_PER_CALL"),
+                settings
+                    .max_search_files_per_call
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL),
+            ),
+            max_model_rounds: parse_usize(
+                get_var("SQUEEZY_SUBAGENT_MAX_MODEL_ROUNDS"),
+                settings
+                    .max_model_rounds
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS),
+            ),
+            max_summary_tokens: get_var("SQUEEZY_SUBAGENT_MAX_SUMMARY_TOKENS")
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .or(settings.max_summary_tokens)
+                .unwrap_or(DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS),
+        }
+    }
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            explore_enabled: true,
+            explore_model: None,
+            max_tool_calls_per_call: DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+            max_tool_bytes_read_per_call: DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
+            max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
+            max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+            max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+        }
     }
 }
 
@@ -4055,6 +4276,16 @@ pub fn user_settings_template() -> &'static str {
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
 
+[subagents]
+# enabled = true
+# explore_enabled = true
+# explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_tool_calls_per_call = 24
+# max_tool_bytes_read_per_call = 8388608
+# max_search_files_per_call = 2000
+# max_model_rounds = 4
+# max_summary_tokens = 1200
+
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
@@ -4189,6 +4420,16 @@ pub fn project_settings_template() -> &'static str {
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
+
+[subagents]
+# enabled = true
+# explore_enabled = true
+# explore_model = "gpt-5-nano" # optional cheap model override for the current provider
+# max_tool_calls_per_call = 24
+# max_tool_bytes_read_per_call = 8388608
+# max_search_files_per_call = 2000
+# max_model_rounds = 4
+# max_summary_tokens = 1200
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -5519,8 +5760,16 @@ pub struct SessionMetrics {
     pub planner_turns: u64,
     pub planner_tool_calls: u64,
     pub planner_refusals: u64,
+    pub subagent_calls: u64,
+    pub subagent_failures: u64,
+    pub subagent_tool_calls: u64,
+    pub subagent_budget_denials: u64,
+    pub subagent_files_scanned: u64,
+    pub subagent_bytes_read: u64,
+    pub subagent_model_output_bytes: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
+    pub subagent_provider: CostSnapshot,
 }
 
 impl SessionMetrics {
@@ -5543,8 +5792,16 @@ impl SessionMetrics {
         self.planner_turns += turn.planner_turns;
         self.planner_tool_calls += turn.planner_tool_calls;
         self.planner_refusals += turn.planner_refusals;
+        self.subagent_calls += turn.subagent_calls;
+        self.subagent_failures += turn.subagent_failures;
+        self.subagent_tool_calls += turn.subagent_tool_calls;
+        self.subagent_budget_denials += turn.subagent_budget_denials;
+        self.subagent_files_scanned += turn.subagent_files_scanned;
+        self.subagent_bytes_read += turn.subagent_bytes_read;
+        self.subagent_model_output_bytes += turn.subagent_model_output_bytes;
         self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
+        merge_cost_snapshot(&mut self.subagent_provider, &turn.subagent_provider);
     }
 }
 
@@ -5567,13 +5824,34 @@ pub struct TurnMetrics {
     pub planner_turns: u64,
     pub planner_tool_calls: u64,
     pub planner_refusals: u64,
+    pub subagent_calls: u64,
+    pub subagent_failures: u64,
+    pub subagent_tool_calls: u64,
+    pub subagent_budget_denials: u64,
+    pub subagent_files_scanned: u64,
+    pub subagent_bytes_read: u64,
+    pub subagent_model_output_bytes: u64,
     pub redactions: u64,
     pub provider: CostSnapshot,
+    pub subagent_provider: CostSnapshot,
 }
 
 impl TurnMetrics {
     pub fn record_provider(&mut self, cost: &CostSnapshot) {
         merge_cost_snapshot(&mut self.provider, cost);
+    }
+
+    pub fn record_subagent_provider(&mut self, cost: &CostSnapshot) {
+        merge_cost_snapshot(&mut self.subagent_provider, cost);
+    }
+
+    pub fn merge_subagent_tool_metrics(&mut self, metrics: &TurnMetrics) {
+        self.subagent_tool_calls += metrics.tool_calls;
+        self.subagent_budget_denials += metrics.budget_denials;
+        self.subagent_files_scanned += metrics.files_scanned;
+        self.subagent_bytes_read += metrics.bytes_read;
+        self.subagent_model_output_bytes += metrics.model_output_bytes;
+        merge_cost_snapshot(&mut self.subagent_provider, &metrics.provider);
     }
 }
 

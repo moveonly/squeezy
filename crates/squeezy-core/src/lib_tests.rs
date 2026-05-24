@@ -115,17 +115,19 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert!(config.tools.core.contains(&"grep".to_string()));
     assert!(config.tools.core.contains(&"plan_patch".to_string()));
     assert!(config.tools.core.contains(&"apply_patch".to_string()));
-    // `update_task_state` and `load_tool_schema` are always-core control
-    // tools and are intentionally absent from the configurable `core` list;
-    // `squeezy_agent::request_tool_specs` forces them into the request by
-    // name.
+    // Control tools are always-core and intentionally absent from the
+    // configurable `core` list; `squeezy_agent::request_tool_specs` forces
+    // them into the request by name.
     assert!(!config.tools.core.contains(&"load_tool_schema".to_string()));
     assert!(!config.tools.core.contains(&"update_task_state".to_string()));
+    assert!(!config.tools.core.contains(&"delegate".to_string()));
+    assert!(!config.tools.core.contains(&"explore".to_string()));
     assert!(config.tools.discoverable.is_empty());
     assert_eq!(
         config.context_compaction,
         ContextCompactionConfig::default()
     );
+    assert_eq!(config.subagents, SubagentConfig::default());
     assert_eq!(config.telemetry, TelemetryConfig::default());
     assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
     assert!(
@@ -169,6 +171,49 @@ compaction_max_summary_bytes = 4096
     assert_eq!(config.context_compaction.recent_items, 3);
     assert_eq!(config.context_compaction.max_summary_bytes, 4096);
     assert!(config.inspect_redacted().contains("[context]"));
+}
+
+#[test]
+fn subagent_config_reads_settings_and_env() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[subagents]
+enabled = true
+explore_enabled = false
+explore_model = "cheap-from-settings"
+max_tool_calls_per_call = 9
+max_tool_bytes_read_per_call = 1000
+max_search_files_per_call = 11
+max_model_rounds = 2
+max_summary_tokens = 333
+"#,
+        "test",
+    )
+    .expect("settings");
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_EXPLORE_SUBAGENT_ENABLED" => Some("true".to_string()),
+        "SQUEEZY_EXPLORE_MODEL" => Some("cheap-from-env".to_string()),
+        "SQUEEZY_SUBAGENT_MAX_TOOL_CALLS_PER_CALL" => Some("12".to_string()),
+        _ => None,
+    });
+
+    assert!(config.subagents.enabled);
+    assert!(config.subagents.explore_enabled);
+    assert_eq!(
+        config.subagents.explore_model.as_deref(),
+        Some("cheap-from-env")
+    );
+    assert_eq!(config.subagents.max_tool_calls_per_call, 12);
+    assert_eq!(config.subagents.max_tool_bytes_read_per_call, 1000);
+    assert_eq!(config.subagents.max_search_files_per_call, 11);
+    assert_eq!(config.subagents.max_model_rounds, 2);
+    assert_eq!(config.subagents.max_summary_tokens, 333);
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("[subagents]"));
+    let round_tripped =
+        SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(round_tripped_config.subagents, config.subagents);
 }
 
 #[test]
@@ -1007,6 +1052,16 @@ max_tool_calls_per_turn = 4
 max_tool_bytes_read_per_turn = 5000
 max_search_files_per_turn = 6
 
+[subagents]
+enabled = true
+explore_enabled = true
+explore_model = "gpt-cheap"
+max_tool_calls_per_call = 7
+max_tool_bytes_read_per_call = 8000
+max_search_files_per_call = 9
+max_model_rounds = 2
+max_summary_tokens = 444
+
 [session]
 mode = "plan"
 
@@ -1082,6 +1137,12 @@ reason = "docs lookups are safe"
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);
+    assert_eq!(config.subagents.explore_model.as_deref(), Some("gpt-cheap"));
+    assert_eq!(config.subagents.max_tool_calls_per_call, 7);
+    assert_eq!(config.subagents.max_tool_bytes_read_per_call, 8000);
+    assert_eq!(config.subagents.max_search_files_per_call, 9);
+    assert_eq!(config.subagents.max_model_rounds, 2);
+    assert_eq!(config.subagents.max_summary_tokens, 444);
     assert_eq!(config.permissions.edit, PermissionMode::Deny);
     assert!(!config.telemetry.enabled);
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");

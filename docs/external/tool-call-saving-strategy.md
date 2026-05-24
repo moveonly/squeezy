@@ -111,6 +111,9 @@ model-facing tool output compact enough to be useful.
 - **Per-turn broker metrics.** Tool-call, read-byte, search-file, receipt-hit,
   spill, denial, provider-token, cache, and estimated-cost counters are tracked
   per turn and surfaced to the TUI/harness.
+- **Subagent isolation.** `delegate` and `explore` run bounded child model/tool
+  loops with their own context and budgets. The parent receives a structured
+  summary plus receipt hashes, not the child's intermediate tool outputs.
 - **Anonymous telemetry hooks.** Tool completions and turn aggregates emit
   typed telemetry with sequence numbers, timings, statuses, and numeric cost
   counters. Tool arguments, prompts, paths, commands, URLs, and content are not

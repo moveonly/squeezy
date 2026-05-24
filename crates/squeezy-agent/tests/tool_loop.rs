@@ -138,6 +138,8 @@ async fn plan_mode_advertises_only_read_only_tools() {
         tool_names,
         vec![
             "update_task_state",
+            "delegate",
+            "explore",
             "load_tool_schema",
             "glob",
             "grep",
@@ -352,6 +354,244 @@ async fn discoverable_tool_schema_load_appends_full_schema_for_later_rounds() {
 }
 
 #[tokio::test]
+async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs() {
+    let root = temp_workspace("explore_subagent_isolated");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "explore_call".to_string(),
+                name: "explore".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Find the needle entrypoint",
+                    "scope": "src.rs",
+                    "thoroughness": "quick"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "sub_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("sub_tools".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(11),
+                    output_tokens: Some(3),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Brief: src.rs defines fn needle(). Read src.rs before editing.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("sub_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(7),
+                    output_tokens: Some(5),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ready".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.model = "expensive-main".to_string();
+    config.subagents.explore_model = Some("cheap-explore".to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("research first".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].model, "expensive-main");
+    assert_eq!(requests[1].model, "cheap-explore");
+    assert_eq!(requests[2].model, "cheap-explore");
+    assert_eq!(requests[3].model, "expensive-main");
+    let subagent_tools = tool_names(&requests[1]);
+    assert!(subagent_tools.contains(&"read_file"));
+    assert!(subagent_tools.contains(&"repo_map"));
+    for forbidden in [
+        "delegate",
+        "explore",
+        "apply_patch",
+        "write_file",
+        "shell",
+        "verify",
+    ] {
+        assert!(
+            !subagent_tools.contains(&forbidden),
+            "explore subagent should not advertise {forbidden}: {subagent_tools:?}"
+        );
+    }
+
+    let parent_outputs = function_outputs(&requests[3]);
+    assert_eq!(parent_outputs.len(), 1);
+    assert_eq!(parent_outputs[0].0, "explore_call");
+    let explore_content = &parent_outputs[0].1["content"];
+    assert_eq!(explore_content["ok"], true);
+    assert_eq!(explore_content["agent"], "explore");
+    assert!(
+        explore_content["summary"]
+            .as_str()
+            .expect("summary")
+            .contains("needle")
+    );
+    assert!(
+        !requests[3].input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::FunctionCall { call_id, .. }
+                | LlmInputItem::FunctionCallOutput { call_id, .. } if call_id == "sub_read"
+        )),
+        "subagent intermediate tool calls must not reach the parent request"
+    );
+
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(snapshot.metrics.subagent_calls, 1);
+    assert_eq!(snapshot.metrics.subagent_failures, 0);
+    assert_eq!(snapshot.metrics.subagent_tool_calls, 1);
+    assert!(snapshot.metrics.subagent_bytes_read > 0);
+    assert_eq!(snapshot.metrics.subagent_provider.input_tokens, Some(18));
+    assert_eq!(snapshot.metrics.subagent_provider.output_tokens, Some(8));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn disabled_explore_subagent_returns_structured_failure_without_child_requests() {
+    let root = temp_workspace("explore_subagent_disabled");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "explore_call".to_string(),
+                name: "explore".to_string(),
+                arguments: serde_json::json!({"prompt": "scan"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("saw failure".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.subagents.explore_enabled = false;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("scan".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 1);
+    let content = &outputs[0].1["content"];
+    assert_eq!(content["ok"], false);
+    assert_eq!(content["status"], "disabled");
+    assert!(
+        content["error"]
+            .as_str()
+            .expect("error")
+            .contains("disabled")
+    );
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(snapshot.metrics.subagent_calls, 1);
+    assert_eq!(snapshot.metrics.subagent_failures, 1);
+    assert_eq!(snapshot.metrics.subagent_tool_calls, 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn delegate_subagent_uses_parent_model_for_natural_research() {
+    let root = temp_workspace("delegate_subagent_parent_model");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "delegate_call".to_string(),
+                name: "delegate".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Summarize architecture",
+                    "scope": "Rust crates"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("Architecture summary".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("delegate_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(4),
+                    output_tokens: Some(6),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.model = "main-model".to_string();
+    config.subagents.explore_model = Some("cheap-explore".to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("delegate this".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].model, "main-model");
+    let outputs = function_outputs(&requests[2]);
+    assert_eq!(outputs.len(), 1);
+    let content = &outputs[0].1["content"];
+    assert_eq!(content["ok"], true);
+    assert_eq!(content["agent"], "delegate");
+    assert_eq!(content["model"], "main-model");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn loaded_tool_schemas_persist_across_turns() {
     let root = temp_workspace("lazy_schema_across_turns");
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -436,6 +676,8 @@ async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index(
     let names = tool_names(&requests[0]);
     for expected in [
         "update_task_state",
+        "delegate",
+        "explore",
         "grep",
         "webfetch",
         "websearch",

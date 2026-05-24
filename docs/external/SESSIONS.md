@@ -38,13 +38,13 @@ The TUI also supports `/sessions`, `/session <session_id>`, `/resume
 Use `/cost` for cumulative session cost and tool accounting. It reports the
 provider token counters Squeezy has received so far, cache counters when the
 provider exposes them, estimated USD from local pricing metadata, tool-call
-counts, receipt hits, spill reads/writes, redactions, and budget denials.
+counts, subagent spend, receipt hits, spill reads/writes, redactions, and budget denials.
 Provider token fields are only as complete as the provider events Squeezy has
 seen; estimated USD is not a billing authority.
 
 Use `/context` for local context accounting. It reports provider/model,
 response-state mode, completed-turn counters, transcript and model-history
-shape, attached-context shape, tool/result volume, and request-size estimates
+shape, attached-context shape, tool/result and subagent volume, and request-size estimates
 for both the next transmitted request and the local full-history view. Squeezy
 shows context-window percentages and remaining input budget only when it has
 both model limit metadata and a deterministic local token estimate. For custom

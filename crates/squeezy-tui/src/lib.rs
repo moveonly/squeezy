@@ -192,6 +192,38 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         report.record.after.estimated_tokens
                     ));
                 }
+                AgentEvent::SubagentStarted { agent, prompt, .. } => {
+                    app.status = format!("{agent} subagent running");
+                    app.push_log(format!("{agent} subagent started: {prompt}"));
+                }
+                AgentEvent::SubagentCompleted {
+                    agent,
+                    summary,
+                    metrics,
+                    ..
+                } => {
+                    app.status = format!("{agent} subagent completed");
+                    app.push_log(format!(
+                        "{agent} subagent completed tools={} bytes={} summary={}",
+                        metrics.subagent_tool_calls.max(metrics.tool_calls),
+                        metrics.subagent_bytes_read.max(metrics.bytes_read),
+                        compact_text(&summary, 180)
+                    ));
+                }
+                AgentEvent::SubagentFailed {
+                    agent,
+                    error,
+                    metrics,
+                    ..
+                } => {
+                    app.status = format!("{agent} subagent failed");
+                    app.push_log(format!(
+                        "{agent} subagent failed tools={} bytes={} error={}",
+                        metrics.subagent_tool_calls.max(metrics.tool_calls),
+                        metrics.subagent_bytes_read.max(metrics.bytes_read),
+                        compact_text(&error, 180)
+                    ));
+                }
                 AgentEvent::ApprovalRequested {
                     request,
                     decision_tx,
@@ -1086,9 +1118,10 @@ provider={} model={} mode={}\n\
 estimated_usd={} (estimated from provider-reported usage and local pricing metadata)\n\
 provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
 tools calls={} successes={} errors={} denials={} cancellations={} budget_denials={}\n\
+subagents calls={} failures={} estimated_usd={} input={} output={} tool_calls={} budget_denials={}\n\
 receipts stub_hits={} negative_stub_hits={} total_hits={}\n\
 spills writes={} reads={}\n\
-io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={}\n\
+io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={} subagent_bytes_read={} subagent_files_scanned={} subagent_model_output_bytes={}\n\
 redactions={}\n\
 accuracy=provider token counters are provider-reported when available; USD is an estimate, not a billing authority.",
         snapshot.session_id.as_deref().unwrap_or("-"),
@@ -1107,6 +1140,13 @@ accuracy=provider token counters are provider-reported when available; USD is an
         metrics.tool_denials,
         metrics.tool_cancellations,
         metrics.budget_denials,
+        metrics.subagent_calls,
+        metrics.subagent_failures,
+        format_cost(&metrics.subagent_provider),
+        format_optional_u64(metrics.subagent_provider.input_tokens),
+        format_optional_u64(metrics.subagent_provider.output_tokens),
+        metrics.subagent_tool_calls,
+        metrics.subagent_budget_denials,
         metrics.receipt_stub_hits,
         metrics.negative_receipt_hits,
         metrics.receipt_stub_hits + metrics.negative_receipt_hits,
@@ -1116,6 +1156,9 @@ accuracy=provider token counters are provider-reported when available; USD is an
         metrics.files_scanned,
         metrics.matches_returned,
         metrics.model_output_bytes,
+        metrics.subagent_bytes_read,
+        metrics.subagent_files_scanned,
+        metrics.subagent_model_output_bytes,
         snapshot.redactions,
     )
 }
@@ -1146,6 +1189,7 @@ transcript items={} user={} assistant={} system={} bytes={}\n\
 local_history items={} user_text={} assistant_text={} function_calls={} function_outputs={} text_bytes={} tool_output_bytes={}\n\
 attached_context total={} active={} removed={} unsupported={} stored_bytes={} redactions={}\n\
 tool_volume calls={} results={} receipt_hits={} spill_writes={} spill_reads={} budget_denials={}\n\
+subagent_volume calls={} failures={} tool_calls={} bytes_read={} files_scanned={} model_output_bytes={} budget_denials={}\n\
 {}\n\
 {}\n\
 accuracy=context tokens are deterministic local estimates of assembled request content; percentages and remaining input budget are shown only when a model context limit is known.",
@@ -1188,6 +1232,13 @@ accuracy=context tokens are deterministic local estimates of assembled request c
         snapshot.metrics.spill_writes,
         snapshot.metrics.spill_reads,
         snapshot.metrics.budget_denials,
+        snapshot.metrics.subagent_calls,
+        snapshot.metrics.subagent_failures,
+        snapshot.metrics.subagent_tool_calls,
+        snapshot.metrics.subagent_bytes_read,
+        snapshot.metrics.subagent_files_scanned,
+        snapshot.metrics.subagent_model_output_bytes,
+        snapshot.metrics.subagent_budget_denials,
         format_request_estimate("transmitted_request", &snapshot.transmitted_request),
         format_request_estimate("local_full_history", &snapshot.full_history_request),
     )

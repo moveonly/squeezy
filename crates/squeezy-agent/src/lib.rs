@@ -14,13 +14,15 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
-    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, PROJECT_SETTINGS_FILE,
-    PermissionAction, PermissionCapability, PermissionRequest, PermissionRule,
-    PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig, Redactor,
-    ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
-    TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics,
-    context_attachment_preview, context_attachment_storage_text, default_settings_path,
-    detect_context_attachment_kind, escape_toml_basic_string,
+    ContextPin, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
+    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
+    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, PROJECT_SETTINGS_FILE, PermissionAction,
+    PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
+    PermissionVerdict, ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics,
+    SessionMode, SqueezyError, StreamRedactor, TaskStateSnapshot, TaskStateStatus,
+    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
+    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    escape_toml_basic_string,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
@@ -51,9 +53,12 @@ use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 const MAX_TOOL_ROUNDS: usize = 8;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
+const DELEGATE_TOOL_NAME: &str = "delegate";
+const EXPLORE_TOOL_NAME: &str = "explore";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
+const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
 // Compaction summary truncation budgets. These are character (not byte)
 // caps because they pass through `compact_text` → `truncate_chars`. They
 // stay collocated so a future audit can read the total summary growth
@@ -902,7 +907,7 @@ impl Agent {
             native_text_verbosity,
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = vec![task_state_advertised_tool()];
+        let mut all_tool_specs = core_control_tools();
         all_tool_specs.extend(self.tools.specs().into_iter().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
@@ -1451,7 +1456,7 @@ impl Agent {
                     json!({ "error": error }),
                 );
             }
-            let mut all_tool_specs = vec![task_state_advertised_tool()];
+            let mut all_tool_specs = core_control_tools();
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
             warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
 
@@ -2403,6 +2408,21 @@ struct TurnPersistInput<'a> {
     context_compaction: ContextCompactionState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentKind {
+    Delegate,
+    Explore,
+}
+
+impl SubagentKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Delegate => "delegate",
+            Self::Explore => "explore",
+        }
+    }
+}
+
 /// Re-applies any pins added concurrently while the turn was running.
 ///
 /// The turn runner builds its own `ContextCompactionState` clone at turn
@@ -2557,6 +2577,606 @@ async fn handle_load_tool_schema_call(
     )
 }
 
+#[derive(Debug, Clone)]
+struct SubagentRequest {
+    prompt: String,
+    scope: Option<String>,
+    thoroughness: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SubagentExecution {
+    status: ToolStatus,
+    summary: String,
+    status_label: &'static str,
+    error: Option<String>,
+    metrics: TurnMetrics,
+    supporting_receipts: Vec<Value>,
+    model: String,
+}
+
+async fn handle_subagent_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+    kind: SubagentKind,
+    broker: &mut CostBroker,
+) -> ToolResult {
+    broker.metrics.subagent_calls += 1;
+    if !context.config.subagents.enabled
+        || (kind == SubagentKind::Explore && !context.config.subagents.explore_enabled)
+    {
+        broker.metrics.subagent_failures += 1;
+        return subagent_control_result(
+            call,
+            kind,
+            SubagentExecution {
+                status: ToolStatus::Denied,
+                summary: String::new(),
+                status_label: "disabled",
+                error: Some("subagent is disabled by configuration".to_string()),
+                metrics: TurnMetrics::default(),
+                supporting_receipts: Vec::new(),
+                model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+            },
+        );
+    }
+    let request = match parse_subagent_request(call, kind) {
+        Ok(request) => request,
+        Err(error) => {
+            broker.metrics.subagent_failures += 1;
+            return subagent_control_result(
+                call,
+                kind,
+                SubagentExecution {
+                    status: ToolStatus::Error,
+                    summary: String::new(),
+                    status_label: "invalid_request",
+                    error: Some(error),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                },
+            );
+        }
+    };
+    let started_prompt = context
+        .redactor
+        .redact(&compact_text(&request.prompt, 240))
+        .text;
+    log_session_event(
+        context.session_log.as_ref(),
+        &context.redactor,
+        "subagent_started",
+        Some(context.turn_id),
+        Some(format!("{}: {started_prompt}", kind.as_str())),
+        json!({
+            "agent": kind.as_str(),
+            "scope": request.scope,
+            "thoroughness": request.thoroughness,
+        }),
+    );
+    let _ = context
+        .tx
+        .send(AgentEvent::SubagentStarted {
+            turn_id: context.turn_id,
+            agent: kind.as_str().to_string(),
+            prompt: started_prompt,
+        })
+        .await;
+
+    let execution = run_subagent(context, kind, request).await;
+    broker
+        .metrics
+        .merge_subagent_tool_metrics(&execution.metrics);
+    if execution.status != ToolStatus::Success {
+        broker.metrics.subagent_failures += 1;
+    }
+    let event_payload = json!({
+        "agent": kind.as_str(),
+        "status": execution.status_label,
+        "model": execution.model,
+        "metrics": execution.metrics.clone(),
+        "supporting_receipts": execution.supporting_receipts.clone(),
+    });
+    match execution.status {
+        ToolStatus::Success => {
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "subagent_completed",
+                Some(context.turn_id),
+                Some(format!(
+                    "{} completed: {}",
+                    kind.as_str(),
+                    compact_text(&execution.summary, 240)
+                )),
+                event_payload,
+            );
+            let _ = context
+                .tx
+                .send(AgentEvent::SubagentCompleted {
+                    turn_id: context.turn_id,
+                    agent: kind.as_str().to_string(),
+                    summary: compact_text(&execution.summary, 320),
+                    metrics: execution.metrics.clone(),
+                })
+                .await;
+        }
+        _ => {
+            let error = execution
+                .error
+                .clone()
+                .unwrap_or_else(|| execution.status_label.to_string());
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "subagent_failed",
+                Some(context.turn_id),
+                Some(format!(
+                    "{} failed: {}",
+                    kind.as_str(),
+                    compact_text(&error, 240)
+                )),
+                event_payload,
+            );
+            let _ = context
+                .tx
+                .send(AgentEvent::SubagentFailed {
+                    turn_id: context.turn_id,
+                    agent: kind.as_str().to_string(),
+                    error: compact_text(&error, 320),
+                    metrics: execution.metrics.clone(),
+                })
+                .await;
+        }
+    }
+
+    subagent_control_result(call, kind, execution)
+}
+
+fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<SubagentRequest, String> {
+    let prompt = call
+        .arguments
+        .get("prompt")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "missing required string field: prompt".to_string())?
+        .to_string();
+    let scope = match call.arguments.get("scope") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(value)) if value.trim().is_empty() => None,
+        Some(Value::String(value)) => Some(value.trim().to_string()),
+        Some(_) => return Err("scope must be a string or null".to_string()),
+    };
+    let thoroughness = match call.arguments.get("thoroughness") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(value)) => {
+            let value = value.trim().to_ascii_lowercase();
+            if value.is_empty() {
+                None
+            } else if matches!(value.as_str(), "quick" | "medium" | "thorough") {
+                Some(value)
+            } else {
+                return Err("thoroughness must be quick, medium, or thorough".to_string());
+            }
+        }
+        Some(_) => return Err("thoroughness must be a string".to_string()),
+    };
+    if kind == SubagentKind::Delegate && thoroughness.is_some() {
+        return Err("delegate does not accept thoroughness".to_string());
+    }
+    Ok(SubagentRequest {
+        prompt,
+        scope,
+        thoroughness,
+    })
+}
+
+async fn run_subagent(
+    parent: &ToolExecutionContext<'_>,
+    kind: SubagentKind,
+    request: SubagentRequest,
+) -> SubagentExecution {
+    let mut config = parent.config.clone();
+    config.session_mode = SessionMode::Plan;
+    config.store_responses = false;
+    config.max_output_tokens = Some(config.subagents.max_summary_tokens);
+    config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
+    config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
+    config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
+    config.max_tool_result_bytes_per_round = config.max_tool_result_bytes_per_round.min(24_000);
+    let model = subagent_model_for_kind(parent.provider.name(), &config, kind);
+    config.model = model.clone();
+
+    let allowed_tools = subagent_allowed_tools(parent.all_tool_specs, kind);
+    if allowed_tools.is_empty() {
+        return SubagentExecution {
+            status: ToolStatus::Error,
+            summary: String::new(),
+            status_label: "failed",
+            error: Some("no read-only tools are available to the subagent".to_string()),
+            metrics: TurnMetrics::default(),
+            supporting_receipts: Vec::new(),
+            model,
+        };
+    }
+    let allowed_tool_names = allowed_tools
+        .iter()
+        .map(|tool| tool.spec.name.clone())
+        .collect::<BTreeSet<_>>();
+    let tool_specs = advertised_tool_specs(&allowed_tools, SessionMode::Plan);
+    let instructions = subagent_instructions(kind, &request);
+    let redacted_instructions = parent.redactor.redact(&instructions);
+    let mut broker = CostBroker::new(&config);
+    broker.metrics.redactions += redacted_instructions.redactions;
+    let mut assistant_stream = StreamRedactor::new(parent.redactor.clone());
+    let mut assistant_message = String::new();
+    let mut conversation = vec![LlmInputItem::UserText(subagent_user_prompt(&request))];
+    let mut supporting_receipts = Vec::new();
+    let (hidden_tx, _hidden_rx) = mpsc::channel(8);
+    let local_jobs = JobRegistry::new();
+    let local_task_state = Arc::new(Mutex::new(None));
+    let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
+    let local_mode = Arc::new(AtomicU8::new(SessionMode::Plan.to_u8()));
+    let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
+
+    for _round in 0..config.subagents.max_model_rounds {
+        let llm_input = redact_llm_input_items(&conversation, &parent.redactor);
+        let request_model = config.model.clone();
+        let llm_request = LlmRequest {
+            model: request_model.clone(),
+            instructions: redacted_instructions.text.clone(),
+            input: llm_input,
+            max_output_tokens: config.max_output_tokens,
+            response_verbosity: request_response_verbosity(&config, parent.provider.name()),
+            reasoning_effort: request_reasoning_effort(&config, parent.provider.name()),
+            previous_response_id: None,
+            tools: tool_specs.clone(),
+            store: false,
+        };
+        let mut stream = parent
+            .provider
+            .stream_response(llm_request, parent.cancel.child_token());
+        let mut tool_calls = Vec::new();
+        let mut completed = false;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(LlmEvent::Started) => {}
+                Ok(LlmEvent::TextDelta(delta)) => {
+                    let chunk = assistant_stream.push(&delta);
+                    if !chunk.text.is_empty() {
+                        assistant_message.push_str(&chunk.text);
+                    }
+                }
+                Ok(LlmEvent::ToolCall(tool_call)) => {
+                    tool_calls.push(ToolCall {
+                        call_id: tool_call.call_id,
+                        name: tool_call.name,
+                        arguments: tool_call.arguments,
+                    });
+                }
+                Ok(LlmEvent::Completed { mut cost, .. }) => {
+                    if cost.estimated_usd_micros.is_none() {
+                        cost.estimated_usd_micros =
+                            estimate_cost(parent.provider.name(), &request_model, &cost);
+                    }
+                    broker.metrics.record_provider(&cost);
+                    completed = true;
+                    break;
+                }
+                Ok(LlmEvent::Cancelled) => {
+                    return SubagentExecution {
+                        status: ToolStatus::Cancelled,
+                        summary: String::new(),
+                        status_label: "cancelled",
+                        error: Some("subagent cancelled".to_string()),
+                        metrics: broker.metrics,
+                        supporting_receipts,
+                        model,
+                    };
+                }
+                Err(error) => {
+                    return SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "failed",
+                        error: Some(error.to_string()),
+                        metrics: broker.metrics,
+                        supporting_receipts,
+                        model,
+                    };
+                }
+            }
+        }
+
+        if !completed {
+            let chunk = assistant_stream.finish();
+            if !chunk.text.is_empty() {
+                assistant_message.push_str(&chunk.text);
+            }
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            return successful_subagent_execution(
+                assistant_message,
+                broker.metrics,
+                supporting_receipts,
+                model,
+                &config,
+            );
+        }
+
+        if tool_calls.is_empty() {
+            let chunk = assistant_stream.finish();
+            if !chunk.text.is_empty() {
+                assistant_message.push_str(&chunk.text);
+            }
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            return successful_subagent_execution(
+                assistant_message,
+                broker.metrics,
+                supporting_receipts,
+                model,
+                &config,
+            );
+        }
+
+        let rejected = tool_calls
+            .iter()
+            .filter(|call| !allowed_tool_names.contains(&call.name))
+            .map(|call| ToolResult::denied(call, "tool is not available to this subagent"))
+            .collect::<Vec<_>>();
+        let approved = tool_calls
+            .iter()
+            .filter(|call| allowed_tool_names.contains(&call.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut results = rejected;
+        if !approved.is_empty() {
+            results.extend(
+                execute_tool_calls(
+                    approved,
+                    ToolExecutionContext {
+                        turn_id: parent.turn_id,
+                        provider: parent.provider.clone(),
+                        tools: parent.tools,
+                        jobs: &local_jobs,
+                        config: &config,
+                        telemetry: parent.telemetry.clone(),
+                        redactor: parent.redactor.clone(),
+                        tx: hidden_tx.clone(),
+                        cancel: parent.cancel.child_token(),
+                        approval_ids: parent.approval_ids.clone(),
+                        session_rules: parent.session_rules.clone(),
+                        session_mode: local_mode.clone(),
+                        session_log: None,
+                        task_state: local_task_state.clone(),
+                        all_tool_specs: &allowed_tools,
+                        loaded_tool_schemas: local_loaded_schemas.clone(),
+                        exploration_state: local_exploration.clone(),
+                    },
+                    &mut broker,
+                )
+                .await,
+            );
+        }
+        let results = SeenToolOutputs::default().prepare_results(results);
+        let results = pack_tool_results(results, config.max_tool_result_bytes_per_round);
+        for pending in &results {
+            broker.record_model_result(&pending.result);
+            if supporting_receipts.len() < 12 {
+                supporting_receipts.push(subagent_supporting_receipt(&pending.result));
+            }
+        }
+        conversation.extend(
+            tool_calls
+                .iter()
+                .cloned()
+                .map(|call| llm_function_call_item(call, &parent.redactor)),
+        );
+        conversation.extend(results.into_iter().map(|pending| {
+            let output = pending.result.model_output();
+            LlmInputItem::FunctionCallOutput {
+                call_id: pending.result.call_id,
+                output,
+            }
+        }));
+    }
+
+    SubagentExecution {
+        status: ToolStatus::Error,
+        summary: String::new(),
+        status_label: "max_rounds_exceeded",
+        error: Some(format!(
+            "subagent stopped after {} model rounds",
+            config.subagents.max_model_rounds
+        )),
+        metrics: broker.metrics,
+        supporting_receipts,
+        model,
+    }
+}
+
+fn successful_subagent_execution(
+    summary: String,
+    metrics: TurnMetrics,
+    supporting_receipts: Vec<Value>,
+    model: String,
+    config: &AppConfig,
+) -> SubagentExecution {
+    let max_chars = (config.subagents.max_summary_tokens as usize)
+        .saturating_mul(SUBAGENT_SUMMARY_CHARS_PER_TOKEN)
+        .max(256);
+    SubagentExecution {
+        status: ToolStatus::Success,
+        summary: compact_text(&summary, max_chars),
+        status_label: "completed",
+        error: None,
+        metrics,
+        supporting_receipts,
+        model,
+    }
+}
+
+fn subagent_control_result(
+    call: &ToolCall,
+    kind: SubagentKind,
+    execution: SubagentExecution,
+) -> ToolResult {
+    let mut content = json!({
+        "ok": execution.status == ToolStatus::Success,
+        "agent": kind.as_str(),
+        "status": execution.status_label,
+        "summary": execution.summary,
+        "model": execution.model,
+        "supporting_receipts": execution.supporting_receipts,
+        "cost": execution.metrics.provider,
+        "metrics": {
+            "tool_calls": execution.metrics.tool_calls,
+            "tool_successes": execution.metrics.tool_successes,
+            "tool_errors": execution.metrics.tool_errors,
+            "tool_denials": execution.metrics.tool_denials,
+            "tool_cancellations": execution.metrics.tool_cancellations,
+            "files_scanned": execution.metrics.files_scanned,
+            "bytes_read": execution.metrics.bytes_read,
+            "model_output_bytes": execution.metrics.model_output_bytes,
+            "budget_denials": execution.metrics.budget_denials,
+            "redactions": execution.metrics.redactions,
+        }
+    });
+    if let Some(error) = execution.error {
+        content["error"] = json!(error);
+    }
+    control_tool_result(call, execution.status, content)
+}
+
+fn subagent_supporting_receipt(result: &ToolResult) -> Value {
+    json!({
+        "tool": result.tool_name,
+        "status": tool_status_label(result.status),
+        "output_sha256": result.receipt.output_sha256,
+        "content_sha256": result.receipt.content_sha256,
+        "output_bytes": result.cost_hint.output_bytes,
+        "truncated": result.cost_hint.truncated,
+    })
+}
+
+fn subagent_user_prompt(request: &SubagentRequest) -> String {
+    let mut prompt = format!("Task:\n{}", request.prompt);
+    if let Some(scope) = &request.scope {
+        prompt.push_str(&format!("\n\nScope:\n{scope}"));
+    }
+    if let Some(thoroughness) = &request.thoroughness {
+        prompt.push_str(&format!("\n\nThoroughness: {thoroughness}"));
+    }
+    prompt
+}
+
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
+fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> String {
+    match kind {
+        SubagentKind::Delegate => {
+            "You are an isolated Squeezy research subagent. Investigate the requested question with read/search/navigation tools only. Return a concise summary for the parent agent with relevant files, symbols, risks, and next actions. Do not modify files, run commands, ask the user, or include raw tool dumps.".to_string()
+        }
+        SubagentKind::Explore => {
+            let thoroughness = request.thoroughness.as_deref().unwrap_or("medium");
+            format!(
+                "You are Squeezy's cheap read-only code exploration subagent. Use semantic graph tools first: repo_map, decl_search, definition_search, reference_search, symbol_context, hierarchy, upstream_flow, downstream_flow, and read_slice. Use glob, grep, and read_file only as bounded fallback. Thoroughness: {thoroughness}. Return a compact briefing with relevant files/symbols, architecture notes, implementation hazards, and the minimum next reads/actions the parent needs before planning or editing. Do not modify files, run shell/compiler/network/MCP tools, ask the user, or include raw tool dumps."
+            )
+        }
+    }
+}
+
+fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKind) -> String {
+    match kind {
+        SubagentKind::Delegate => config.model.clone(),
+        SubagentKind::Explore => config.subagents.explore_model.clone().unwrap_or_else(|| {
+            default_cheap_model_for_provider(provider)
+                .unwrap_or(&config.model)
+                .to_string()
+        }),
+    }
+}
+
+fn default_cheap_model_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "openai" => Some(DEFAULT_OPENAI_MODEL),
+        "anthropic" => Some(DEFAULT_ANTHROPIC_MODEL),
+        "google" => Some(DEFAULT_GOOGLE_MODEL),
+        "azure_openai" => Some(DEFAULT_AZURE_OPENAI_MODEL),
+        "bedrock" => Some(DEFAULT_BEDROCK_MODEL),
+        "ollama" => Some(DEFAULT_OLLAMA_MODEL),
+        _ => None,
+    }
+}
+
+const DELEGATE_SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "glob",
+    "grep",
+    "read_file",
+    "read_tool_output",
+    "decl_search",
+    "definition_search",
+    "diff_context",
+    "downstream_flow",
+    "hierarchy",
+    "list_skills",
+    "load_skill",
+    "plan_patch",
+    "read_slice",
+    "reference_search",
+    "repo_map",
+    "symbol_context",
+    "upstream_flow",
+];
+
+const EXPLORE_SUBAGENT_TOOL_NAMES: &[&str] = &[
+    "repo_map",
+    "decl_search",
+    "definition_search",
+    "reference_search",
+    "symbol_context",
+    "hierarchy",
+    "upstream_flow",
+    "downstream_flow",
+    "read_slice",
+    "glob",
+    "grep",
+    "read_file",
+];
+
+fn subagent_allowed_tools(
+    all_tool_specs: &[AdvertisedTool],
+    kind: SubagentKind,
+) -> Vec<AdvertisedTool> {
+    let names = match kind {
+        SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES,
+        SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES,
+    }
+    .iter()
+    .copied()
+    .collect::<BTreeSet<_>>();
+    all_tool_specs
+        .iter()
+        .filter(|tool| names.contains(tool.spec.name.as_str()))
+        .filter(|tool| {
+            matches!(
+                tool.capability,
+                PermissionCapability::Read | PermissionCapability::Search
+            )
+        })
+        .cloned()
+        .collect()
+}
+
 async fn exploration_read_denial_reason(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
@@ -2665,6 +3285,32 @@ async fn execute_tool_calls(
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == DELEGATE_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Delegate,
+                    broker,
+                ))
+                .await,
+            );
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == EXPLORE_TOOL_NAME {
+            results[index] = Some(
+                Box::pin(handle_subagent_call(
+                    &context,
+                    call,
+                    SubagentKind::Explore,
+                    broker,
+                ))
+                .await,
+            );
             recorded[index] = true;
             continue;
         }
@@ -3771,6 +4417,14 @@ fn task_state_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn core_control_tools() -> Vec<AdvertisedTool> {
+    vec![
+        task_state_advertised_tool(),
+        delegate_advertised_tool(),
+        explore_advertised_tool(),
+    ]
+}
+
 /// Synthetic control tool that promotes a discoverable tool's full schema
 /// into the request `tools` array. It is intentionally **not** routed through
 /// the `permissions.rules` engine: lazy loading is a model-facing UX
@@ -3800,12 +4454,79 @@ fn load_tool_schema_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn delegate_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: DELEGATE_TOOL_NAME.to_string(),
+            description: "Delegate broad research to an isolated subagent. The parent receives only a structured summary, supporting receipts, and separate spend metrics.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Natural language research task for the subagent."
+                    },
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional bounded scope such as paths, modules, symbols, or exclusions."
+                    }
+                },
+                "required": ["prompt"]
+            }),
+            strict: false,
+        },
+    }
+}
+
+fn explore_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: EXPLORE_TOOL_NAME.to_string(),
+            description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools and return a compact briefing before planning or executing.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Codebase question or task context to investigate."
+                    },
+                    "scope": {
+                        "type": ["string", "null"],
+                        "description": "Optional paths, crates, modules, symbols, or file patterns to focus on."
+                    },
+                    "thoroughness": {
+                        "type": "string",
+                        "enum": ["quick", "medium", "thorough"],
+                        "description": "How broadly to scan. Default is medium."
+                    }
+                },
+                "required": ["prompt"]
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
     tools
         .iter()
         .filter(|tool| !mode_refuses_capability(mode, tool.capability))
         .map(|tool| tool.spec.clone())
         .collect()
+}
+
+fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
+    match name {
+        TASK_STATE_TOOL_NAME => Some(task_state_advertised_tool()),
+        DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
+        EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
+        LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
+        _ => None,
+    }
 }
 
 fn transcript_shape(transcript: &[TranscriptItem]) -> TranscriptShape {
@@ -3887,9 +4608,14 @@ fn request_tool_specs(
     // per-round clone cost.
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
-    for name in [TASK_STATE_TOOL_NAME, LOAD_TOOL_SCHEMA_TOOL_NAME]
-        .into_iter()
-        .chain(schema_config.core.iter().map(String::as_str))
+    for name in [
+        TASK_STATE_TOOL_NAME,
+        DELEGATE_TOOL_NAME,
+        EXPLORE_TOOL_NAME,
+        LOAD_TOOL_SCHEMA_TOOL_NAME,
+    ]
+    .into_iter()
+    .chain(schema_config.core.iter().map(String::as_str))
     {
         push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
     }
@@ -3909,8 +4635,7 @@ fn push_tool_spec_by_name(
     if !seen.insert(name.to_string()) {
         return;
     }
-    if name == LOAD_TOOL_SCHEMA_TOOL_NAME {
-        let tool = load_tool_schema_advertised_tool();
+    if let Some(tool) = synthetic_tool_by_name(name) {
         if !mode_refuses_capability(mode, tool.capability) {
             specs.push(tool.spec);
         }
@@ -3932,8 +4657,8 @@ fn push_tool_spec_by_name(
 /// `[tools].discoverable` that does not refer to a known tool. This is run
 /// once at session start (when `all_tool_specs` is built) so a typo like
 /// `core = ["webfectch"]` surfaces as an actionable warning instead of
-/// disappearing silently in the hot path. The two synthetic tools
-/// (`update_task_state`, `load_tool_schema`) are always considered known.
+/// disappearing silently in the hot path. Synthetic tools are always
+/// considered known.
 fn warn_unknown_tool_schema_names(
     all_tool_specs: &[AdvertisedTool],
     schema_config: &ToolSchemaConfig,
@@ -3943,6 +4668,8 @@ fn warn_unknown_tool_schema_names(
         .map(|tool| tool.spec.name.as_str())
         .collect();
     known.insert(TASK_STATE_TOOL_NAME);
+    known.insert(DELEGATE_TOOL_NAME);
+    known.insert(EXPLORE_TOOL_NAME);
     known.insert(LOAD_TOOL_SCHEMA_TOOL_NAME);
     for name in schema_config
         .core
@@ -4029,7 +4756,8 @@ fn first_line_of_description(description: &str) -> String {
 /// Returns `true` when `tool`'s full JSON schema must be sent on every
 /// request (no lazy `load_tool_schema` hop). Tools fall into one of three
 /// buckets:
-///   * synthetic control tools (`update_task_state`, `load_tool_schema`)
+///   * synthetic control tools (`update_task_state`, `delegate`, `explore`,
+///     `load_tool_schema`)
 ///     and every tool when lazy loading is disabled — always-core,
 ///   * names listed in `[tools].core` — explicit core,
 ///   * everything else (including names listed in `[tools].discoverable`
@@ -4040,7 +4768,10 @@ fn first_line_of_description(description: &str) -> String {
 /// default to discoverable so the cache prefix stays compact.
 fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) -> bool {
     let name = tool.spec.name.as_str();
-    if name == TASK_STATE_TOOL_NAME || name == LOAD_TOOL_SCHEMA_TOOL_NAME {
+    if matches!(
+        name,
+        TASK_STATE_TOOL_NAME | DELEGATE_TOOL_NAME | EXPLORE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME
+    ) {
         return true;
     }
     if !schema_config.lazy_schema_loading {
@@ -5212,6 +5943,23 @@ pub enum AgentEvent {
     ContextCompacted {
         turn_id: TurnId,
         report: ContextCompactionReport,
+    },
+    SubagentStarted {
+        turn_id: TurnId,
+        agent: String,
+        prompt: String,
+    },
+    SubagentCompleted {
+        turn_id: TurnId,
+        agent: String,
+        summary: String,
+        metrics: TurnMetrics,
+    },
+    SubagentFailed {
+        turn_id: TurnId,
+        agent: String,
+        error: String,
+        metrics: TurnMetrics,
     },
     ApprovalRequested {
         turn_id: TurnId,
