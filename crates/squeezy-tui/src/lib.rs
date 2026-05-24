@@ -3478,7 +3478,7 @@ fn format_status_hints(app: &TuiApp) -> &'static str {
     } else if app.exit_armed {
         "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
     } else {
-        "Enter send · Up/Down history/menu · Ctrl+J newline · Shift+Up/Down select · Ctrl-E expand/collapse · /help · Esc quit"
+        "Enter send · Up/Down history/menu · Ctrl+J newline · PgUp/PgDn scroll · Shift+Up/Down select · Ctrl-E expand/collapse · /help · Esc quit"
     }
 }
 

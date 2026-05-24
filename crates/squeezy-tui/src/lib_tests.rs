@@ -75,6 +75,10 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         status.contains("Up/Down history/menu"),
         "missing collapse hint: {status}"
     );
+    assert!(
+        status.contains("PgUp/PgDn scroll"),
+        "missing scroll hint: {status}"
+    );
 }
 
 #[test]
