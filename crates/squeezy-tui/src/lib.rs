@@ -8,11 +8,15 @@ use std::{
 };
 
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Frame, Terminal,
@@ -48,9 +52,11 @@ const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 const AMBER: Color = Color::Rgb(245, 158, 11);
 const GOLD: Color = Color::Rgb(251, 191, 36);
-const ORANGE: Color = Color::Rgb(249, 115, 22);
+const MODE_PURPLE: Color = Color::Rgb(168, 85, 247);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
+const PROMPT_MIN_HEIGHT: u16 = 2;
+const PROMPT_MAX_HEIGHT: u16 = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
@@ -368,6 +374,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 }
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
+    if key.code != KeyCode::Esc {
+        app.exit_armed = false;
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if cancel_active_turn(app) {
             return Ok(false);
@@ -394,6 +404,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 "task panel expanded".to_string()
             };
         }
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
+    {
+        app.input.push('\n');
         return Ok(false);
     }
 
@@ -431,14 +448,16 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         KeyCode::Esc => {
             if cancel_active_turn(app) {
                 Ok(false)
-            } else {
+            } else if app.exit_armed {
                 Ok(true)
+            } else {
+                app.exit_armed = true;
+                Ok(false)
             }
         }
-        // Scroll keys intentionally leave `app.status` alone so that
-        // useful messages (tool results, errors, approval prompts) stay
-        // visible while the user navigates history. The status footer
-        // already surfaces a "scrolled" marker when off the bottom.
+        // Scroll keys intentionally leave `app.status` alone so command
+        // handlers can keep their latest state even though the footer stays
+        // context-only.
         KeyCode::PageUp => {
             app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(8);
             Ok(false)
@@ -466,6 +485,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         KeyCode::Enter => {
             if app.turn_rx.is_some() {
                 app.status = "turn already running; press Ctrl-C to cancel".to_string();
+                return Ok(false);
+            }
+            if app.input.ends_with('\\') {
+                app.input.pop();
+                app.input.push('\n');
                 return Ok(false);
             }
             let input = app.input.trim().to_string();
@@ -1700,6 +1724,7 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
     let header_height = if area.height >= 12 { 6 } else { 0 };
+    let input_height = input_panel_height(app, area.width);
     let attachment_height = attachment_panel_height(app);
     let approval_prompt = app.pending_approval.as_ref().map(|pending| {
         // When an approval is pending, reserve a dedicated panel large
@@ -1734,7 +1759,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
     }
-    constraints.push(Constraint::Length(1));
+    constraints.push(Constraint::Length(input_height));
     constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2259,12 +2284,12 @@ enum TurnVisualState {
 impl TurnVisualState {
     fn color(self, tick: u64) -> Color {
         match self {
-            Self::Idle => ORANGE,
+            Self::Idle => AMBER,
             Self::Running => {
                 if tick % 8 < 4 {
                     GOLD
                 } else {
-                    ORANGE
+                    AMBER
                 }
             }
             Self::Succeeded => Color::Green,
@@ -2313,19 +2338,111 @@ fn short_hash(hash: &str) -> &str {
     hash.get(..12).unwrap_or(hash)
 }
 
+fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
+    prompt_visual_line_count(&app.input, width)
+        .clamp(PROMPT_MIN_HEIGHT as usize, PROMPT_MAX_HEIGHT as usize) as u16
+}
+
+fn prompt_visual_line_count(input: &str, width: u16) -> usize {
+    let content_width = width.saturating_sub(4).max(1) as usize;
+    if input.is_empty() {
+        return 1;
+    }
+    input
+        .split('\n')
+        .map(|line| {
+            let chars = line.chars().count().max(1);
+            chars.div_ceil(content_width)
+        })
+        .sum()
+}
+
+fn prompt_input_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    if app.input.is_empty() {
+        return vec![Line::from(vec![
+            Span::styled(" ", Style::default().bg(PROMPT_BG)),
+            turn_dot_span(app),
+            Span::styled("  ", Style::default().bg(PROMPT_BG)),
+        ])];
+    }
+    app.input
+        .split('\n')
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = if index == 0 {
+                vec![
+                    Span::styled(" ", Style::default().bg(PROMPT_BG)),
+                    turn_dot_span(app),
+                    Span::styled("  ", Style::default().bg(PROMPT_BG)),
+                ]
+            } else {
+                vec![Span::styled(
+                    "    ",
+                    Style::default().fg(QUIET).bg(PROMPT_BG),
+                )]
+            };
+            let mut spans = prefix;
+            spans.push(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::White).bg(PROMPT_BG),
+            ));
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(Line::from(vec![
-        Span::styled(" ", Style::default().bg(PROMPT_BG)),
-        turn_dot_span(app),
-        Span::styled("  ", Style::default().bg(PROMPT_BG)),
-        Span::styled(app.input.as_str(), Style::default().bg(PROMPT_BG)),
-    ]))
-    .style(Style::default().fg(Color::White).bg(PROMPT_BG));
+    let lines = prompt_input_lines(app);
+    let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    let paragraph = Paragraph::new(lines)
+        .style(Style::default().fg(Color::White).bg(PROMPT_BG))
+        .scroll((scroll, 0))
+        .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
+fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
+    let right = mode_status_text(app);
+    let right_width = right.chars().count();
+    let available_left = (width as usize).saturating_sub(right_width + 1);
+    let left = fit_chars(&status_left_text(app), available_left);
+    let left_width = left.chars().count();
+    let padding = " ".repeat((width as usize).saturating_sub(left_width + right_width));
+    Line::from(vec![
+        Span::styled(left, Style::default().fg(Color::Gray)),
+        Span::raw(padding),
+        Span::styled(
+            right,
+            Style::default()
+                .fg(MODE_PURPLE)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn status_left_text(app: &TuiApp) -> String {
+    let branch = if app.repo.available {
+        app.repo.branch.as_deref().unwrap_or("detached")
+    } else {
+        "no repo"
+    };
+    format!("dir {} · git {}", app.directory, branch)
+}
+
+fn mode_status_text(app: &TuiApp) -> String {
+    format!("{} mode (Shift+Tab to cycle)", title_case_mode(app.mode))
+}
+
+fn title_case_mode(mode: SessionMode) -> &'static str {
+    match mode {
+        SessionMode::Plan => "Plan",
+        SessionMode::Build => "Build",
+    }
+}
+
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(format_status_lines(app)).style(Style::default().fg(QUIET));
+    let paragraph =
+        Paragraph::new(format_status_lines(app, area.width)).style(Style::default().fg(QUIET));
     frame.render_widget(paragraph, area);
 }
 
@@ -2341,18 +2458,9 @@ fn format_status_tokens(app: &TuiApp) -> String {
     lines.join("\n")
 }
 
-fn format_status_lines(app: &TuiApp) -> Vec<Line<'static>> {
+fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(vec![
-            turn_dot_span(app),
-            Span::styled("  ", Style::default().fg(QUIET)),
-            Span::styled(app.repo.branch_display(), Style::default().fg(AMBER)),
-            Span::styled("  ", Style::default().fg(QUIET)),
-            Span::styled(app.mode.as_str().to_string(), Style::default().fg(AMBER)),
-            Span::styled("  ", Style::default().fg(QUIET)),
-            Span::styled(app.status.clone(), Style::default().fg(Color::White)),
-            Span::styled(format_status_activity(app), Style::default().fg(QUIET)),
-        ]),
+        format_status_overview_line(app, width),
         Line::from(Span::styled(
             format_status_hints(app),
             Style::default().fg(QUIET),
@@ -2373,49 +2481,14 @@ fn format_status_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 fn format_status_context(app: &TuiApp) -> String {
-    format!(
-        "{}  {}  {}{}",
-        app.repo.branch_display(),
-        app.mode.as_str(),
-        app.status,
-        format_status_activity(app),
-    )
-}
-
-fn format_status_activity(app: &TuiApp) -> String {
-    let scroll_marker = if app.transcript_scroll_from_bottom > 0 {
-        "  history"
-    } else {
-        ""
-    };
-    let active_jobs = app
-        .jobs
-        .values()
-        .filter(|job| job.status.is_active())
-        .count();
-    let latest_notification = app
-        .notifications
-        .back()
-        .map(|notification| {
-            format!(
-                "  job{} {}",
-                notification.job_id,
-                notification.status.as_str()
-            )
-        })
-        .unwrap_or_default();
-    let jobs = if app.jobs.is_empty() {
-        String::new()
-    } else {
-        format!("  jobs {active_jobs}/{}", app.jobs.len())
-    };
-    format!("{jobs}{latest_notification}{scroll_marker}")
+    format!("{}  {}", status_left_text(app), mode_status_text(app))
 }
 
 fn format_status_details(app: &TuiApp) -> String {
     format!(
-        "{}  sandbox {}  telemetry {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
+        "{}  repo {}  sandbox {}  telemetry {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
         app.permissions.compact(),
+        app.repo.detail(),
         app.permissions.sandbox,
         app.telemetry.as_str(),
         format_cost(&app.cost),
@@ -2444,9 +2517,11 @@ fn format_status_hints(app: &TuiApp) -> &'static str {
     if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
     } else if app.cancel.is_some() {
-        "Enter send · Shift-Tab mode · Ctrl-P task · Ctrl-Y copy · /help · Ctrl-C cancel"
+        "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-Y copy · /help"
+    } else if app.exit_armed {
+        "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E fold · /help"
     } else {
-        "Enter send · Shift-Tab mode · Ctrl-P task · Ctrl-E fold · /help · Esc quit"
+        "Enter send · Ctrl+J newline · \\+Enter newline · Ctrl-P task · Ctrl-E fold · /help · Esc quit"
     }
 }
 
@@ -2594,22 +2669,12 @@ impl RepoStatus {
 
     #[cfg(test)]
     fn compact(&self) -> String {
-        if !self.available {
-            return "repo=none".to_string();
-        }
-        let mut value = format!("repo={}", self.branch.as_deref().unwrap_or("detached"));
-        if self.changed_files > 0 {
-            value.push_str(&format!("*{}", self.changed_files));
-        }
-        if let Some(operation) = &self.operation {
-            value.push_str(&format!(":{operation}"));
-        }
-        value
+        format!("repo={}", self.detail())
     }
 
-    fn branch_display(&self) -> String {
+    fn detail(&self) -> String {
         if !self.available {
-            return "no repo".to_string();
+            return "none".to_string();
         }
         let mut value = self.branch.as_deref().unwrap_or("detached").to_string();
         if self.changed_files > 0 {
@@ -2730,6 +2795,7 @@ struct TuiApp {
     status: String,
     turn_visual: TurnVisualState,
     animation_tick: u64,
+    exit_armed: bool,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
@@ -2786,25 +2852,8 @@ impl TuiApp {
         startup: StartupProfile,
         clipboard: Box<dyn Clipboard>,
     ) -> Self {
-        let mut transcript = Vec::new();
-        let status = if let Some(summary) = startup.onboarding_summary {
-            // The onboarding summary is generated by Squeezy itself, not the
-            // model, so it belongs to the System role. Using Assistant would
-            // both mislabel provenance and mix the same color with later
-            // assistant turns, making the seam ambiguous in the transcript.
-            let entry = TranscriptEntry::message(
-                0,
-                TranscriptItem {
-                    role: Role::System,
-                    content: summary,
-                },
-                config.tui.transcript_default,
-            );
-            transcript.push(entry);
-            "repo profile ready".to_string()
-        } else {
-            "ready".to_string()
-        };
+        let transcript = Vec::new();
+        let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
         Self {
             provider_name,
@@ -2841,6 +2890,7 @@ impl TuiApp {
             status,
             turn_visual: TurnVisualState::Idle,
             animation_tick: 0,
+            exit_armed: false,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
@@ -3048,8 +3098,14 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            Clear(ClearType::Purge),
+            MoveTo(0, 0),
+            EnableBracketedPaste
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         Ok(Self { terminal })

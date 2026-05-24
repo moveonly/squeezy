@@ -4,7 +4,9 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{AzureOpenAiConfig, CostSnapshot, OpenAiConfig, Result, SqueezyError};
+use squeezy_core::{
+    AzureOpenAiConfig, CostSnapshot, OpenAiConfig, ResponseVerbosity, Result, SqueezyError,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
@@ -77,7 +79,7 @@ impl OpenAiProvider {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
         if let Some(response_verbosity) = request.response_verbosity {
-            body["text"] = json!({ "verbosity": response_verbosity.as_str() });
+            body["text"] = json!({ "verbosity": openai_text_verbosity(response_verbosity) });
         }
         if let Some(reasoning_effort) = request.reasoning_effort {
             body["reasoning"] = json!({ "effort": reasoning_effort.as_str() });
@@ -100,6 +102,14 @@ impl OpenAiProvider {
             );
         }
         body
+    }
+}
+
+fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
+    match verbosity {
+        ResponseVerbosity::Concise => "low",
+        ResponseVerbosity::Normal => "medium",
+        ResponseVerbosity::Verbose => "high",
     }
 }
 

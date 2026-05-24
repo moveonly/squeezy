@@ -173,8 +173,33 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
 
     let body = OpenAiProvider::request_body(&request);
 
-    assert_eq!(body["text"]["verbosity"], "verbose");
+    assert_eq!(body["text"]["verbosity"], "high");
     assert_eq!(body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_body_maps_squeezy_verbosity_to_openai_values() {
+    for (squeezy, openai) in [
+        (squeezy_core::ResponseVerbosity::Concise, "low"),
+        (squeezy_core::ResponseVerbosity::Normal, "medium"),
+        (squeezy_core::ResponseVerbosity::Verbose, "high"),
+    ] {
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            instructions: "be brief".to_string(),
+            input: vec![LlmInputItem::UserText("hello".to_string())],
+            max_output_tokens: None,
+            response_verbosity: Some(squeezy),
+            reasoning_effort: None,
+            previous_response_id: None,
+            tools: Vec::new(),
+            store: false,
+        };
+
+        let body = OpenAiProvider::request_body(&request);
+
+        assert_eq!(body["text"]["verbosity"], openai);
+    }
 }
 
 #[test]

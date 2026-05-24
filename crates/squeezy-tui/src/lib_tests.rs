@@ -8,7 +8,7 @@ use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionScope, Role, SessionMode, StatusVerbosity,
+    PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
     TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
     ToolOutputVerbosity, TuiConfig, TurnId, TurnMetrics,
 };
@@ -36,7 +36,7 @@ fn app_starts_ready_with_empty_transcript() {
 }
 
 #[test]
-fn app_surfaces_onboarding_summary_once() {
+fn app_does_not_seed_onboarding_summary_into_fresh_transcript() {
     let config = test_config(SessionMode::Build);
     let app = TuiApp::new_with_clipboard(
         "openai",
@@ -46,16 +46,8 @@ fn app_surfaces_onboarding_summary_once() {
         Box::new(NoopClipboard),
     );
 
-    assert_eq!(app.status, "repo profile ready");
-    assert_eq!(app.transcript.len(), 1);
-    let TranscriptEntryKind::Message(item) = &app.transcript[0].kind else {
-        panic!("onboarding entry should be a message");
-    };
-    assert_eq!(item.content, "repo profile created: /tmp/project");
-    // The seeded onboarding summary is Squeezy-authored metadata, not an
-    // assistant turn; surfacing it under Role::System keeps provenance
-    // honest and avoids visual collision with later assistant deltas.
-    assert_eq!(item.role, Role::System);
+    assert_eq!(app.status, "ready");
+    assert!(app.transcript.is_empty());
 }
 
 #[test]
@@ -71,9 +63,12 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
     app.status = "ready".to_string();
 
     let status = format_status_tokens(&app);
-    assert!(status.contains(" plan "), "missing mode: {status}");
     assert!(
-        status.contains("Shift-Tab mode"),
+        status.contains("Plan mode (Shift+Tab to cycle)"),
+        "missing mode: {status}"
+    );
+    assert!(
+        status.contains("Ctrl+J newline"),
         "missing toggle hint: {status}",
     );
     assert!(
@@ -593,9 +588,14 @@ fn compact_status_surfaces_context_without_dense_counters() {
     app.status = "running search".to_string();
 
     let status = format_status_tokens(&app);
-    assert!(status.contains(" build "), "{status}");
-    assert!(status.contains("feature*2"), "{status}");
-    assert!(status.contains("running search"), "{status}");
+    assert!(
+        status.contains("Build mode (Shift+Tab to cycle)"),
+        "{status}"
+    );
+    assert!(status.contains("dir "), "{status}");
+    assert!(status.contains("feature"), "{status}");
+    assert!(!status.contains("feature*2"), "{status}");
+    assert!(!status.contains("running search"), "{status}");
     assert!(!status.contains("openai:gpt-test"), "{status}");
     assert!(!status.contains("perm="), "{status}");
     assert!(!status.contains("sandbox"), "{status}");
@@ -608,7 +608,7 @@ fn compact_status_surfaces_context_without_dense_counters() {
 }
 
 #[test]
-fn status_line_surfaces_job_counts_and_latest_notification() {
+fn status_line_omits_job_counts_and_latest_notification() {
     let mut app = test_app(SessionMode::Build);
     app.jobs.insert(1, test_job(1, JobStatus::Running));
     app.jobs.insert(2, test_job(2, JobStatus::Completed));
@@ -622,8 +622,12 @@ fn status_line_surfaces_job_counts_and_latest_notification() {
     });
 
     let status = format_status_tokens(&app);
-    assert!(status.contains("jobs 1/2"), "{status}");
-    assert!(status.contains("job2 completed"), "{status}");
+    assert!(!status.contains("jobs 1/2"), "{status}");
+    assert!(!status.contains("job2 completed"), "{status}");
+    assert!(
+        status.contains("Build mode (Shift+Tab to cycle)"),
+        "{status}"
+    );
 }
 
 #[test]
@@ -658,7 +662,10 @@ fn verbose_status_surfaces_budget_and_cache_details() {
     };
 
     let status = format_status_tokens(&app);
-    assert!(status.contains(" plan "), "{status}");
+    assert!(
+        status.contains("Plan mode (Shift+Tab to cycle)"),
+        "{status}"
+    );
     assert!(status.contains("cost $0.000042"), "{status}");
     assert!(status.contains("tok 10/5"), "{status}");
     assert!(status.contains("tools 2"), "{status}");
@@ -691,7 +698,13 @@ fn render_uses_two_line_status_footer() {
     let output = render_to_string(&app, 140, 14);
     assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("openai:gpt-test"), "{output}");
+    assert!(output.contains("dir "), "{output}");
     assert!(output.contains("feature"), "{output}");
+    assert!(
+        output.contains("Build mode (Shift+Tab to cycle)"),
+        "{output}"
+    );
+    assert!(!output.contains("ready"), "{output}");
     assert!(output.contains("Ctrl-E fold"), "{output}");
 }
 
@@ -716,6 +729,21 @@ fn render_prompt_uses_turn_state_dot() {
 
     let output = render_to_string(&app, 100, 12);
     assert!(output.contains("•  ship it"), "{output}");
+}
+
+#[test]
+fn prompt_height_grows_for_multiline_input() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(input_panel_height(&app, 100), 2);
+
+    app.input = "one\ntwo\nthree".to_string();
+    assert_eq!(input_panel_height(&app, 100), 3);
+
+    app.input = (0..20)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(input_panel_height(&app, 100), PROMPT_MAX_HEIGHT);
 }
 
 #[test]
@@ -766,7 +794,7 @@ async fn ctrl_p_collapses_and_expands_task_panel() {
 }
 
 #[tokio::test]
-async fn esc_cancels_active_turn_but_quits_when_idle() {
+async fn esc_cancels_active_turn_and_requires_double_press_to_quit_when_idle() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);
@@ -794,7 +822,44 @@ async fn esc_cancels_active_turn_but_quits_when_idle() {
     )
     .await
     .expect("idle esc");
+    assert!(!quit);
+    assert!(app.exit_armed);
+    assert!(format_status_tokens(&app).contains("Esc again to exit"));
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("second idle esc");
     assert!(quit);
+}
+
+#[tokio::test]
+async fn ctrl_j_and_backslash_enter_insert_prompt_newlines() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    app.input = "first".to_string();
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-j newline");
+    assert_eq!(app.input, "first\n");
+
+    app.input.push_str("second\\");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("backslash enter newline");
+    assert_eq!(app.input, "first\nsecond\n");
 }
 
 #[tokio::test]
@@ -1220,7 +1285,7 @@ async fn scroll_keys_preserve_status_text() {
 }
 
 #[test]
-fn status_marker_surfaces_history_scroll_state() {
+fn status_footer_stays_context_only_when_scrolled() {
     let config = test_config(SessionMode::Build);
     let mut app = TuiApp::new_with_clipboard(
         "openai",
@@ -1232,16 +1297,17 @@ fn status_marker_surfaces_history_scroll_state() {
 
     let live = format_status_tokens(&app);
     assert!(
-        !live.contains("scroll=history"),
-        "no marker while at bottom: {live}",
+        !live.contains("history"),
+        "no marker while at bottom: {live}"
     );
 
     app.transcript_scroll_from_bottom = 4;
     let scrolled = format_status_tokens(&app);
     assert!(
-        scrolled.contains("history"),
-        "missing scroll marker: {scrolled}",
+        !scrolled.contains("history"),
+        "footer stays calm: {scrolled}"
     );
+    assert!(scrolled.contains("Build mode"), "{scrolled}");
 }
 
 #[test]
