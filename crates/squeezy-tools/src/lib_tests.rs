@@ -2855,6 +2855,48 @@ fn web_helpers_extract_hosts_and_classify_text_content() {
     assert!(is_textual_content_type("application/problem+json"));
     assert!(is_textual_content_type("image/svg+xml"));
     assert!(!is_textual_content_type("application/octet-stream"));
+    assert_eq!(
+        extract_http_urls("See https://example.com/docs, then https://docs.rs/squeezy."),
+        vec![
+            "https://docs.rs/squeezy".to_string(),
+            "https://example.com/docs".to_string()
+        ]
+    );
+}
+
+#[test]
+fn web_cache_receipt_status_marks_stale_entries() {
+    let retrieved_at = 1_000_u128;
+    let stale_after = web_cache_stale_after_unix_ms(retrieved_at);
+
+    assert_eq!(web_cache_receipt_status(retrieved_at, stale_after), "fresh");
+    assert_eq!(
+        web_cache_receipt_status(retrieved_at, stale_after + 1),
+        "stale"
+    );
+}
+
+#[test]
+fn web_stable_output_sha256_is_deterministic_and_kind_scoped() {
+    let request = "request-hash";
+    let content = "content-hash";
+    let quote = "quote-hash";
+
+    let webfetch = web_stable_output_sha256("webfetch", request, content, quote);
+    let websearch = web_stable_output_sha256("websearch", request, content, quote);
+    let webfetch_again = web_stable_output_sha256("webfetch", request, content, quote);
+
+    assert_eq!(webfetch, webfetch_again);
+    assert_ne!(webfetch, websearch);
+    assert_eq!(webfetch.len(), 64);
+    assert_eq!(
+        web_stable_output_sha256("webfetch", request, "different-content", quote),
+        web_stable_output_sha256("webfetch", request, "different-content", quote)
+    );
+    assert_ne!(
+        webfetch,
+        web_stable_output_sha256("webfetch", request, "different-content", quote)
+    );
 }
 
 #[test]
@@ -2938,6 +2980,60 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
         "rust async"
     );
     assert_eq!(requests[0].body["params"]["arguments"]["numResults"], 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_returns_citations_cache_receipt_and_redacted_quote() {
+    let root = temp_workspace("websearch_citations");
+    let text = "Rust docs at https://doc.rust-lang.org/book/. API_TOKEN=super-secret-value";
+    let body = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":{}}}]}}}}"#,
+        serde_json::to_string(text).expect("quote")
+    );
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response("application/json", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust book", "output_byte_cap": 90}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["evidence"]["kind"], "remote_search");
+    assert_eq!(
+        result.content["source_urls"][0],
+        "https://doc.rust-lang.org/book/"
+    );
+    assert_eq!(
+        result.content["citations"][0]["url"],
+        "https://doc.rust-lang.org/book/"
+    );
+    assert_eq!(result.content["cache_receipt"]["kind"], "websearch");
+    assert_eq!(result.content["cache_receipt"]["status"], "fresh");
+    assert!(
+        result.content["cache_receipt"]["stable_output_sha256"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    let quote = result.content["result"].as_str().expect("quote");
+    assert!(quote.contains("<redacted:"));
+    assert!(!quote.contains("super-secret-value"));
+    assert!(result.cost_hint.redactions > 0);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3200,8 +3296,78 @@ async fn webfetch_strips_html_scripts_and_styles() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["format"], "text");
     assert_eq!(result.content["content"], "Hello world & docs");
+    assert_eq!(result.content["source_url"], "https://example.com/docs");
+    assert_eq!(result.content["evidence"]["kind"], "remote_document");
+    assert_eq!(
+        result.content["citations"][0]["url"],
+        "https://example.com/docs"
+    );
+    assert_eq!(result.content["cache_receipt"]["kind"], "webfetch");
+    assert_eq!(result.content["cache_receipt"]["status"], "fresh");
     let requests = http.get_requests.lock().expect("get requests");
     assert_eq!(*requests, vec!["https://example.com/docs".to_string()]);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn webfetch_quote_limit_is_enforced_after_redaction() {
+    let root = temp_workspace("webfetch_redacted_quote_limit");
+    let body = format!("API_TOKEN=super-secret-value {}", "a".repeat(200));
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({
+                    "url": "https://example.com/docs",
+                    "output_byte_cap": 64,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = result.content["content"].as_str().expect("content");
+    assert!(
+        content.len() <= 64,
+        "len={} content={content}",
+        content.len()
+    );
+    assert!(!content.contains("super-secret-value"));
+    assert_eq!(result.content["quote_limit_bytes"], 64);
+    assert!(result.content["quote_truncated"].as_bool().unwrap_or(false));
+    assert!(result.cost_hint.redactions > 0);
+    assert!(
+        result.cost_hint.truncated,
+        "cost_hint.truncated must mirror quote_truncated"
+    );
+
+    let cache_receipt = result.content["cache_receipt"]
+        .as_object()
+        .expect("cache_receipt");
+    let request_sha = cache_receipt["request_sha256"]
+        .as_str()
+        .expect("request_sha256");
+    let content_sha = cache_receipt["content_sha256"]
+        .as_str()
+        .expect("content_sha256");
+    let quote_sha = cache_receipt["quote_sha256"]
+        .as_str()
+        .expect("quote_sha256");
+    let expected_stable = web_stable_output_sha256("webfetch", request_sha, content_sha, quote_sha);
+    assert_eq!(cache_receipt["stable_output_sha256"], expected_stable);
+
     let _ = fs::remove_dir_all(root);
 }
 

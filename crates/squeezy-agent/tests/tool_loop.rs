@@ -12,8 +12,8 @@ use futures_util::stream;
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionMode, PermissionPolicy,
-    PermissionScope, Result, SessionMode,
+    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionAction, PermissionMode,
+    PermissionPolicy, PermissionRule, PermissionRuleSource, PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
@@ -21,13 +21,19 @@ use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
 struct ScriptedProvider {
+    name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
     requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self::named("scripted", responses)
+    }
+
+    fn named(name: &'static str, responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
         Self {
+            name,
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -40,7 +46,7 @@ impl ScriptedProvider {
 
 impl LlmProvider for ScriptedProvider {
     fn name(&self) -> &'static str {
-        "scripted"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
@@ -191,6 +197,37 @@ async fn exploration_compiler_prefetches_graph_context_before_model_request() {
         outputs
             .iter()
             .any(|(_, output)| output["tool_name"] == "definition_search")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cited_final_answer_is_preserved() {
+    let root = temp_workspace("cited_final_answer");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "Use the current docs at https://example.com/docs.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+
+    let mut rx = agent.start_turn("answer with citation".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert_eq!(
+        completed.as_deref(),
+        Some("Use the current docs at https://example.com/docs.")
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1455,6 +1492,95 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
 }
 
 #[tokio::test]
+async fn disabled_web_permission_returns_denied_tool_result() {
+    let root = temp_workspace("disabled_web_permission");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("blocked".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Deny;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch denied url".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert_eq!(outputs[0].1["content"]["permission_denied"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn blocked_web_domain_rule_returns_denied_tool_result() {
+    let root = temp_workspace("blocked_web_domain_rule");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("blocked".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    config.permissions.rules.push(PermissionRule::new(
+        "network",
+        "domain:example.com",
+        PermissionAction::Deny,
+        PermissionRuleSource::Project,
+        Some("blocked test domain".to_string()),
+    ));
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+        .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    let reason = outputs[0].1["content"]["reason"].as_str().expect("reason");
+    assert_eq!(reason, "blocked test domain");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn approved_webfetch_validation_error_returns_to_model_and_web_tools_are_indexed() {
     let root = temp_workspace("approved_webfetch_validation");
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -1624,6 +1750,31 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
 }
 
 #[tokio::test]
+async fn empty_session_accounting_snapshot_reports_zero_completed_state() {
+    let root = temp_workspace("empty_accounting");
+    let provider = Arc::new(ScriptedProvider::named("openai", Vec::new()));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    let agent = Agent::new(config, provider);
+
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert_eq!(snapshot.provider, "openai");
+    assert_eq!(snapshot.metrics.turns, 0);
+    assert_eq!(snapshot.cost.input_tokens, None);
+    assert_eq!(snapshot.transcript.items, 0);
+    assert_eq!(snapshot.conversation.items, 0);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(snapshot.transmitted_request.input_tokens > 0);
+    assert!(!snapshot.provider_stored_context_active());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn automatic_context_compaction_replaces_old_raw_history() {
     let root = temp_workspace("auto_context_compaction");
     let provider = Arc::new(ScriptedProvider::new(vec![
@@ -1691,6 +1842,54 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
 }
 
 #[tokio::test]
+async fn store_responses_accounting_marks_provider_stored_context_gap() {
+    let root = temp_workspace("store_response_accounting");
+    let provider = Arc::new(ScriptedProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("stored answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_stored".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(100),
+                    output_tokens: Some(25),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ]],
+    ));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    config.store_responses = true;
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert!(snapshot.provider_stored_context_active());
+    assert_eq!(
+        snapshot.previous_response_id.as_deref(),
+        Some("resp_stored")
+    );
+    assert_eq!(snapshot.metrics.turns, 1);
+    assert_eq!(snapshot.cost.input_tokens, Some(100));
+    assert!(snapshot.full_history_request.input_tokens > snapshot.transmitted_request.input_tokens);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(
+        snapshot
+            .transmitted_request
+            .used_input_percent_x100
+            .is_some()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn manual_context_compaction_preserves_pins_in_resume_state() {
     let root = temp_workspace("manual_context_compaction");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
@@ -1748,10 +1947,6 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
     let root = temp_workspace("auto_compaction_pair");
     fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
     let provider = Arc::new(ScriptedProvider::new(vec![
-        // First turn: a single tool round (read_file) + a heavy assistant
-        // reply so the next turn crosses the compaction threshold. The
-        // resulting persisted conversation pattern is:
-        //   [UserText, FunctionCall(read_call), FunctionCallOutput(read_call), AssistantText]
         vec![
             Ok(LlmEvent::Started),
             Ok(LlmEvent::ToolCall(LlmToolCall {
@@ -1775,9 +1970,6 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
                 cost: CostSnapshot::default(),
             }),
         ],
-        // Second turn: a small text completion. The pre-turn compaction
-        // must not split between the FunctionCall and its
-        // FunctionCallOutput.
         vec![
             Ok(LlmEvent::Started),
             Ok(LlmEvent::TextDelta("second answer".to_string())),
@@ -1851,8 +2043,6 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
         ],
     ]));
     let mut config = config_for(root.clone());
-    // Set thresholds high enough that compaction never auto-fires; the
-    // pin must still reach the model.
     config.context_compaction = ContextCompactionConfig {
         enabled: true,
         estimated_tokens: 1_000_000,

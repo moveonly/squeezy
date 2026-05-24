@@ -35,6 +35,25 @@ squeezy sessions cleanup
 The TUI also supports `/sessions`, `/session <session_id>`, `/resume
 <session_id>`, `/session-export <session_id>`, `/report [session_id]`, and
 `/session-cleanup`.
+Use `/cost` for cumulative session cost and tool accounting. It reports the
+provider token counters Squeezy has received so far, cache counters when the
+provider exposes them, estimated USD from local pricing metadata, tool-call
+counts, receipt hits, spill reads/writes, redactions, and budget denials.
+Provider token fields are only as complete as the provider events Squeezy has
+seen; estimated USD is not a billing authority.
+
+Use `/context` for local context accounting. It reports provider/model,
+response-state mode, completed-turn counters, transcript and model-history
+shape, attached-context shape, tool/result volume, and request-size estimates
+for both the next transmitted request and the local full-history view. Squeezy
+shows context-window percentages and remaining input budget only when it has
+both model limit metadata and a deterministic local token estimate. For custom
+models, unknown Ollama metadata, or other missing limits, those fields stay
+`unknown`. When `store_responses=true` and a previous response id is active,
+the transmitted request can be much smaller than the full local history because
+the provider stores prior response state; exact provider-side current-window
+usage is unknown, so `/context` labels that gap explicitly.
+
 Attached context is managed with `/attach <path>`, `/attachments`, and
 `/detach <attachment_id>`. Multi-line or large bracketed paste input is stored
 as attached context; small single-line paste input stays in the prompt editor.

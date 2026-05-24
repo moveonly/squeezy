@@ -13,14 +13,14 @@ use thiserror::Error;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash-lite";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
-pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-3-5-haiku-20241022-v1:0";
+pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
@@ -1137,16 +1137,12 @@ impl SettingsFile {
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
-        let value = text
-            .parse::<toml::Value>()
+        let table = toml::from_str::<toml::value::Table>(text)
             .map_err(|err| SqueezyError::Config(format!("{source}: {err}")))?;
-        Self::from_toml_value(value, source)
+        Self::from_toml_table(&table, source)
     }
 
-    fn from_toml_value(value: toml::Value, source: &str) -> Result<Self> {
-        let table = value.as_table().ok_or_else(|| {
-            SqueezyError::Config(format!("{source}: settings root must be a TOML table"))
-        })?;
+    fn from_toml_table(table: &toml::value::Table, source: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
             &[
@@ -4067,7 +4063,7 @@ pub fn user_settings_template() -> &'static str {
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
-# default_model = "claude-3-5-haiku-20241022"
+# default_model = "claude-haiku-4-5-20251001"
 
 [permissions]
 # read = "allow"
@@ -6135,7 +6131,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

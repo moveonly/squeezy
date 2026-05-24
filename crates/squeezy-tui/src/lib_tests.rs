@@ -152,6 +152,73 @@ async fn slash_plan_and_build_force_modes() {
 }
 
 #[tokio::test]
+async fn slash_cost_reports_empty_session_without_model_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/cost").await);
+
+    let output = last_message_content(&app).expect("cost output");
+    assert_eq!(app.status, "cost snapshot");
+    assert!(output.contains("Cost accounting"), "{output}");
+    assert!(
+        output.contains("provider=scripted model=gpt-5-nano"),
+        "{output}"
+    );
+    assert!(
+        output.contains("provider_tokens input=- output=-"),
+        "{output}"
+    );
+    assert!(output.contains("tools calls=0"), "{output}");
+    assert!(app.jobs.is_empty());
+}
+
+#[tokio::test]
+async fn slash_context_reports_known_model_budget_percentages() {
+    let mut config = test_config(SessionMode::Build);
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    let mut agent = Agent::new(
+        config.clone(),
+        Arc::new(UnavailableProvider::new("openai", "test provider")),
+    );
+    let mut app = TuiApp::new_with_clipboard(
+        "openai",
+        &config,
+        SessionMode::Build,
+        None,
+        Box::new(NoopClipboard),
+    );
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
+
+    let output = last_message_content(&app).expect("context output");
+    assert_eq!(app.status, "context snapshot");
+    assert!(output.contains("Context accounting"), "{output}");
+    assert!(output.contains("context_window=400000"), "{output}");
+    assert!(output.contains("remaining_input_budget="), "{output}");
+    assert!(output.contains("used="), "{output}");
+    assert!(output.contains('%'), "{output}");
+    assert!(app.jobs.is_empty());
+}
+
+#[tokio::test]
+async fn slash_context_keeps_percentages_unknown_without_model_limits() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
+
+    let output = last_message_content(&app).expect("context output");
+    assert!(output.contains("context_window=unknown"), "{output}");
+    assert!(
+        output.contains("remaining_input_budget=unknown"),
+        "{output}"
+    );
+    assert!(output.contains("used=unknown"), "{output}");
+    assert!(!output.contains('%'), "{output}");
+}
+
+#[tokio::test]
 async fn multiline_paste_becomes_attached_context() {
     let root = temp_workspace("tui_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());

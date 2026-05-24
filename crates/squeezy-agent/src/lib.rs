@@ -16,14 +16,15 @@ use squeezy_core::{
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
     ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, PROJECT_SETTINGS_FILE,
     PermissionAction, PermissionCapability, PermissionRequest, PermissionRule,
-    PermissionRuleSource, PermissionScope, PermissionVerdict, Redactor, ResponseVerbosity,
-    SessionMetrics, SessionMode, SqueezyError, StreamRedactor, TaskStateSnapshot, TaskStateStatus,
-    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
-    escape_toml_basic_string,
+    PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig, Redactor,
+    ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics,
+    context_attachment_preview, context_attachment_storage_text, default_settings_path,
+    detect_context_attachment_kind, escape_toml_basic_string,
 };
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, capabilities_for, estimate_cost,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, RequestTokenEstimate,
+    capabilities_for, estimate_cost, estimate_request_context, fetch_ollama_context_window,
 };
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
@@ -121,6 +122,60 @@ pub struct ContextAttachmentUpdate {
     pub attachment: ContextAttachment,
     pub duplicate: bool,
     pub active: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TranscriptShape {
+    pub items: usize,
+    pub user: usize,
+    pub assistant: usize,
+    pub system: usize,
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationShape {
+    pub items: usize,
+    pub user_text: usize,
+    pub assistant_text: usize,
+    pub function_calls: usize,
+    pub function_outputs: usize,
+    pub text_bytes: usize,
+    pub tool_output_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AttachmentShape {
+    pub total: usize,
+    pub active: usize,
+    pub removed: usize,
+    pub unsupported: usize,
+    pub stored_bytes: usize,
+    pub redactions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAccountingSnapshot {
+    pub session_id: Option<String>,
+    pub provider: &'static str,
+    pub model: String,
+    pub mode: SessionMode,
+    pub store_responses: bool,
+    pub previous_response_id: Option<String>,
+    pub cost: CostSnapshot,
+    pub metrics: SessionMetrics,
+    pub redactions: u64,
+    pub transcript: TranscriptShape,
+    pub conversation: ConversationShape,
+    pub attachments: AttachmentShape,
+    pub transmitted_request: RequestTokenEstimate,
+    pub full_history_request: RequestTokenEstimate,
+}
+
+impl SessionAccountingSnapshot {
+    pub fn provider_stored_context_active(&self) -> bool {
+        self.store_responses && self.previous_response_id.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -767,6 +822,112 @@ impl Agent {
         self.session_log
             .as_ref()
             .map(|handle| handle.session_id().to_string())
+    }
+
+    pub async fn session_accounting_snapshot(&self) -> SessionAccountingSnapshot {
+        let state = self.conversation_state.lock().await.clone();
+        let mode = load_session_mode(&self.session_mode);
+        let context_window_override = match &self.config.provider {
+            ProviderConfig::Ollama(ollama) => {
+                fetch_ollama_context_window(&ollama.base_url, &self.config.model).await
+            }
+            _ => None,
+        };
+        let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
+        let full_history_request = self.accounting_request(
+            state.conversation.clone(),
+            None,
+            false,
+            mode,
+            self.config.store_responses,
+            &loaded_tool_schemas,
+        );
+        let transmitted_input =
+            if self.config.store_responses && state.previous_response_id.is_some() {
+                Vec::new()
+            } else {
+                state.conversation.clone()
+            };
+        let transmitted_request = self.accounting_request(
+            transmitted_input,
+            state.previous_response_id.clone(),
+            self.config.store_responses,
+            mode,
+            self.config.store_responses,
+            &loaded_tool_schemas,
+        );
+        SessionAccountingSnapshot {
+            session_id: self.session_id(),
+            provider: self.provider.name(),
+            model: self.config.model.clone(),
+            mode,
+            store_responses: self.config.store_responses,
+            previous_response_id: state.previous_response_id.clone(),
+            cost: state.cost,
+            metrics: state.metrics,
+            redactions: state.redactions,
+            transcript: transcript_shape(&state.transcript),
+            conversation: conversation_shape(&state.conversation),
+            attachments: attachment_shape(&state.context_attachments),
+            transmitted_request: estimate_request_context(
+                self.provider.name(),
+                &self.config.model,
+                &transmitted_request,
+                context_window_override,
+            ),
+            full_history_request: estimate_request_context(
+                self.provider.name(),
+                &self.config.model,
+                &full_history_request,
+                context_window_override,
+            ),
+        }
+    }
+
+    fn accounting_request(
+        &self,
+        input: Vec<LlmInputItem>,
+        previous_response_id: Option<String>,
+        store: bool,
+        mode: SessionMode,
+        include_response_state: bool,
+        loaded_tool_schemas: &[String],
+    ) -> LlmRequest {
+        let native_text_verbosity = capabilities_for(self.provider.name(), &self.config.model)
+            .is_some_and(|capabilities| capabilities.text_verbosity);
+        let raw_instructions = instructions_with_response_verbosity(
+            &self.config.instructions,
+            self.config.tui.response_verbosity,
+            native_text_verbosity,
+        );
+        let request_instructions = self.redactor.redact(&raw_instructions).text;
+        let mut all_tool_specs = vec![task_state_advertised_tool()];
+        all_tool_specs.extend(self.tools.specs().into_iter().map(advertised_tool));
+        LlmRequest {
+            model: self.config.model.clone(),
+            instructions: instructions_with_tool_index(
+                &request_instructions,
+                &all_tool_specs,
+                mode,
+                &self.config.tools,
+            ),
+            input: redact_llm_input_items(&input, &self.redactor),
+            max_output_tokens: self.config.max_output_tokens,
+            response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
+            reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
+            previous_response_id: if include_response_state {
+                previous_response_id
+            } else {
+                None
+            },
+            tools: request_tool_specs(
+                &all_tool_specs,
+                mode,
+                &self.config.tools,
+                loaded_tool_schemas,
+            ),
+            store,
+        }
     }
 
     pub fn list_sessions(
@@ -3468,6 +3629,67 @@ fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Llm
         .collect()
 }
 
+fn transcript_shape(transcript: &[TranscriptItem]) -> TranscriptShape {
+    let mut shape = TranscriptShape {
+        items: transcript.len(),
+        ..TranscriptShape::default()
+    };
+    for item in transcript {
+        shape.bytes += item.content.len();
+        match item.role {
+            Role::User => shape.user += 1,
+            Role::Assistant => shape.assistant += 1,
+            Role::System => shape.system += 1,
+        }
+    }
+    shape
+}
+
+fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
+    let mut shape = ConversationShape {
+        items: conversation.len(),
+        ..ConversationShape::default()
+    };
+    for item in conversation {
+        match item {
+            LlmInputItem::UserText(text) => {
+                shape.user_text += 1;
+                shape.text_bytes += text.len();
+            }
+            LlmInputItem::AssistantText(text) => {
+                shape.assistant_text += 1;
+                shape.text_bytes += text.len();
+            }
+            LlmInputItem::FunctionCall { arguments, .. } => {
+                shape.function_calls += 1;
+                shape.text_bytes += arguments.to_string().len();
+            }
+            LlmInputItem::FunctionCallOutput { output, .. } => {
+                shape.function_outputs += 1;
+                shape.tool_output_bytes += output.len();
+            }
+        }
+    }
+    shape
+}
+
+fn attachment_shape(attachments: &[ContextAttachment]) -> AttachmentShape {
+    let mut shape = AttachmentShape {
+        total: attachments.len(),
+        ..AttachmentShape::default()
+    };
+    for attachment in attachments {
+        shape.stored_bytes += attachment.stored_bytes;
+        shape.redactions += attachment.redactions;
+        match attachment.status {
+            ContextAttachmentStatus::Attached => shape.active += 1,
+            ContextAttachmentStatus::Removed => shape.removed += 1,
+            ContextAttachmentStatus::Unsupported => shape.unsupported += 1,
+        }
+    }
+    shape
+}
+
 fn request_tool_specs(
     tools: &[AdvertisedTool],
     mode: SessionMode,
@@ -4549,8 +4771,15 @@ fn is_receipt_stub_candidate(result: &ToolResult) -> bool {
 fn stable_output_sha256(result: &ToolResult) -> String {
     result
         .content
-        .get("original_output_sha256")
+        .get("cache_receipt")
+        .and_then(|value| value.get("stable_output_sha256"))
         .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .content
+                .get("original_output_sha256")
+                .and_then(Value::as_str)
+        })
         .unwrap_or(&result.receipt.output_sha256)
         .to_string()
 }

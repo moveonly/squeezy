@@ -268,8 +268,16 @@ async fn main() -> squeezy_core::Result<()> {
             .filter(|candidate| provider.is_none_or(|provider| provider == *candidate))
             .flat_map(models_for_provider)
         {
+            let context_window = model
+                .limits
+                .map(|limits| limits.context_window_tokens.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let max_output = model
+                .limits
+                .map(|limits| limits.max_output_tokens.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
             println!(
-                "{}\t{}\t{:?}\tstreaming={} tools={} json={} vision={} state={} reasoning_tokens={} reasoning_effort={} verbosity={}",
+                "{}\t{}\t{:?}\tstreaming={} tools={} json={} vision={} state={} reasoning_tokens={} reasoning_effort={} verbosity={} context_window={} max_output={} tokenizer={} lifecycle={}",
                 model.provider,
                 model.id,
                 model.profile,
@@ -280,7 +288,11 @@ async fn main() -> squeezy_core::Result<()> {
                 model.capabilities.response_state,
                 model.capabilities.reasoning_tokens,
                 model.capabilities.reasoning_effort,
-                model.capabilities.text_verbosity
+                model.capabilities.text_verbosity,
+                context_window,
+                max_output,
+                model.tokenizer.as_str(),
+                model.lifecycle.as_str(),
             );
         }
         return Ok(());

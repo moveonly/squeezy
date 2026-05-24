@@ -15,11 +15,13 @@ mod registry;
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use google::GoogleProvider;
-pub use ollama::OllamaProvider;
+pub use ollama::{OllamaProvider, fetch_ollama_context_window};
 pub use openai::OpenAiProvider;
 pub use registry::{
-    MODEL_REGISTRY, ModelCapabilities, ModelInfo, PROVIDERS, TokenPricing, capabilities_for,
-    estimate_cost, models_for_provider, provider_from_config, provider_name,
+    MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
+    RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for, estimate_cost,
+    estimate_request_context, model_info_for, models_for_provider, provider_from_config,
+    provider_name,
 };
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
