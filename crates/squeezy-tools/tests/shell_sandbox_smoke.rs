@@ -49,6 +49,27 @@ fn temp_workspace(name: &str) -> PathBuf {
     root
 }
 
+fn home_workspace(name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    let counter = WORKSPACE_NONCE.fetch_add(1, Ordering::SeqCst);
+    let root = home.join(format!(
+        "squeezy_shell_sandbox_smoke_{name}_{pid}_{base}_{counter}",
+        pid = std::process::id()
+    ));
+    if let Err(error) = fs::create_dir_all(&root) {
+        eprintln!(
+            "SKIP: cannot create home-backed outside root {}: {error}",
+            root.display()
+        );
+        return None;
+    }
+    Some(root)
+}
+
 fn smoke_registry(root: &Path, shell_sandbox: ShellSandboxConfig) -> ToolRegistry {
     ToolRegistry::new_with_configs_and_skills(
         root,
@@ -261,7 +282,10 @@ async fn shell_sandbox_blocks_unconfigured_outside_write() {
     }
 
     let root = temp_workspace("blocked_outside_workspace");
-    let outside = temp_workspace("blocked_outside_root");
+    let Some(outside) = home_workspace("blocked_outside_root") else {
+        let _ = fs::remove_dir_all(root);
+        return;
+    };
     let registry = smoke_registry(&root, required_deny_config());
     let target = outside.join("blocked.txt");
     let result = run_shell(
