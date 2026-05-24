@@ -12,6 +12,7 @@ use crossterm::{
     cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEvent, MouseEventKind,
     },
     execute,
     style::Print,
@@ -100,6 +101,50 @@ impl Command for DisableAlternateScroll {
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::other(
             "alternate scroll is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableMouseScroll;
+
+impl Command for EnableMouseScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // SGR + normal mouse tracking is the smallest common xterm mode set
+        // that reports wheel events without subscribing to mouse motion.
+        f.write_str("\x1b[?1006h\x1b[?1000h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "mouse scroll reporting is only supported through ANSI escape sequences",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableMouseScroll;
+
+impl Command for DisableMouseScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[?1000l\x1b[?1006l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::other(
+            "mouse scroll reporting is only supported through ANSI escape sequences",
         ))
     }
 
@@ -569,6 +614,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse);
+            Ok(false)
+        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
@@ -685,8 +734,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_previous_transcript_entry(app);
-            } else if should_route_plain_arrow_to_transcript_scroll(app, key) {
-                scroll_transcript_up(app, 4);
             } else {
                 recall_prompt_history(app, HistoryDirection::Previous);
             }
@@ -698,8 +745,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 select_next_transcript_entry(app);
-            } else if should_route_plain_arrow_to_transcript_scroll(app, key) {
-                scroll_transcript_down(app, 4);
             } else {
                 recall_prompt_history(app, HistoryDirection::Next);
             }
@@ -767,8 +812,12 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 }
 
-fn should_route_plain_arrow_to_transcript_scroll(app: &TuiApp, key: KeyEvent) -> bool {
-    app.alternate_scroll_enabled && app.input.is_empty() && key.modifiers.is_empty()
+fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => scroll_transcript_up(app, 4),
+        MouseEventKind::ScrollDown => scroll_transcript_down(app, 4),
+        _ => {}
+    }
 }
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
@@ -845,7 +894,11 @@ fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
     let last = app.input_history.len() - 1;
     let next = match (app.input_history_index, direction) {
         (None, HistoryDirection::Previous) => {
-            app.input_history_draft = app.input.clone();
+            app.input_history_draft = if app.input.trim().is_empty() {
+                String::new()
+            } else {
+                app.input.clone()
+            };
             Some(last)
         }
         (None, HistoryDirection::Next) => return,
@@ -5495,10 +5548,11 @@ impl TerminalGuard {
                 execute!(
                     stdout,
                     EnterAlternateScreen,
+                    Print(DISABLE_MOUSE_MODES),
                     EnableAlternateScroll,
+                    EnableMouseScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
-                    Print(DISABLE_MOUSE_MODES),
                     EnableBracketedPaste
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
@@ -5580,6 +5634,7 @@ impl Drop for TerminalGuard {
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
                     DisableAlternateScroll,
+                    DisableMouseScroll,
                     Print(DISABLE_MOUSE_MODES)
                 );
                 let _ = self.terminal.clear();
@@ -5589,6 +5644,7 @@ impl Drop for TerminalGuard {
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
                     DisableAlternateScroll,
+                    DisableMouseScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Clear(ClearType::All),
                     MoveTo(0, 0),

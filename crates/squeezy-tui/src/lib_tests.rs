@@ -217,10 +217,12 @@ async fn prompt_history_uses_plain_up_down_when_prompt_is_empty() {
 }
 
 #[tokio::test]
-async fn alternate_scroll_arrows_scroll_transcript_without_prompt_history() {
+async fn alternate_screen_arrows_recall_prompt_history_when_trimmed_empty() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    push_input_history(&mut app, "previous prompt".to_string());
+    app.input = " \n ".to_string();
+    push_input_history(&mut app, "first prompt".to_string());
+    push_input_history(&mut app, "second prompt".to_string());
 
     handle_key(
         &mut app,
@@ -228,10 +230,10 @@ async fn alternate_scroll_arrows_scroll_transcript_without_prompt_history() {
         KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
     )
     .await
-    .expect("scroll up");
+    .expect("history up");
 
-    assert_eq!(app.transcript_scroll_from_bottom, 4);
-    assert!(app.input.is_empty());
+    assert_eq!(app.input, "second prompt");
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
 
     handle_key(
         &mut app,
@@ -239,7 +241,39 @@ async fn alternate_scroll_arrows_scroll_transcript_without_prompt_history() {
         KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
     )
     .await
-    .expect("scroll down");
+    .expect("history down");
+
+    assert!(app.input.is_empty());
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[test]
+fn mouse_wheel_scrolls_transcript_without_prompt_history() {
+    let mut app = test_app(SessionMode::Build);
+    push_input_history(&mut app, "previous prompt".to_string());
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 200,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(app.transcript_scroll_from_bottom, 4);
+    assert!(app.input.is_empty());
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 200,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
 
     assert_eq!(app.transcript_scroll_from_bottom, 0);
     assert!(app.input.is_empty());
@@ -1345,6 +1379,21 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
         .write_ansi(&mut disable)
         .expect("disable alternate scroll");
     assert_eq!(disable, "\x1b[?1007l");
+}
+
+#[test]
+fn mouse_scroll_commands_use_minimal_xterm_tracking_modes() {
+    let mut enable = String::new();
+    EnableMouseScroll
+        .write_ansi(&mut enable)
+        .expect("enable mouse scroll");
+    assert_eq!(enable, "\x1b[?1006h\x1b[?1000h");
+
+    let mut disable = String::new();
+    DisableMouseScroll
+        .write_ansi(&mut disable)
+        .expect("disable mouse scroll");
+    assert_eq!(disable, "\x1b[?1000l\x1b[?1006l");
 }
 
 #[test]
