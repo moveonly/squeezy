@@ -6,6 +6,7 @@ use std::{
 pub mod backend;
 mod languages;
 
+use serde::{Deserialize, Serialize};
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageKind, Provenance, Result,
     SourcePoint, SourceSpan, SqueezyError, SymbolId, SymbolKind,
@@ -25,7 +26,7 @@ pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedFile {
     pub file: FileRecord,
     pub package: Option<String>,
@@ -59,7 +60,7 @@ impl ParsedFile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedSymbol {
     pub id: SymbolId,
     pub file_id: FileId,
@@ -78,7 +79,7 @@ pub struct ParsedSymbol {
     pub freshness: Freshness,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedImport {
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
@@ -91,7 +92,7 @@ pub struct ParsedImport {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedCall {
     pub file_id: FileId,
     pub caller_id: Option<SymbolId>,
@@ -105,14 +106,14 @@ pub struct ParsedCall {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParsedCallKind {
     Direct,
     Method,
     Macro,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParsedReference {
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
@@ -122,7 +123,7 @@ pub struct ParsedReference {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReferenceKind {
     Identifier,
     Type,
@@ -131,7 +132,7 @@ pub enum ReferenceKind {
     Attribute,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BodyHit {
     pub file_id: FileId,
     pub owner_id: Option<SymbolId>,
@@ -140,7 +141,7 @@ pub struct BodyHit {
     pub span: SourceSpan,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BodyHitKind {
     Identifier,
     Type,
@@ -151,13 +152,13 @@ pub enum BodyHitKind {
     Attribute,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsupportedParse {
     pub reason: String,
     pub suggested_fallback: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParseDiagnostic {
     pub message: String,
     pub span: Option<SourceSpan>,

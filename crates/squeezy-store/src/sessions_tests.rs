@@ -1,7 +1,10 @@
 use std::{fs, path::PathBuf};
 
+use redb::{Database, TableDefinition};
 use serde_json::json;
-use squeezy_core::{AppConfig, CostSnapshot, SessionLogConfig, SessionMetrics};
+use squeezy_core::{AppConfig, CostSnapshot, FileId, SessionLogConfig, SessionMetrics};
+
+use crate::{GraphStoreMetadata, Observation, ObservationKind, SqueezyStore, StoredToolReceipt};
 
 use super::*;
 
@@ -244,6 +247,133 @@ fn cleanup_excluding_skips_protected_session() {
         store.root().join(protected.session_id()).exists(),
         "protected session must remain on disk"
     );
+}
+
+#[test]
+fn state_store_round_trips_graph_receipts_and_observations() {
+    let root = temp_root("state-round-trip");
+    let store = SqueezyStore::open(&root, None).expect("open store");
+
+    let metadata = GraphStoreMetadata {
+        workspace_root: root.display().to_string(),
+        crawl_options_hash: "crawl".to_string(),
+        language_registry_version: "langs".to_string(),
+        graph_format_version: 1,
+    };
+    store.set_graph_metadata(&metadata).expect("set metadata");
+    assert_eq!(store.graph_metadata().expect("metadata"), Some(metadata));
+
+    let file_id = FileId::new("src/lib.rs");
+    store
+        .put_graph_partition(&file_id, &serde_json::json!({"hash": "abc"}))
+        .expect("put partition");
+    let partition: serde_json::Value = store
+        .graph_partition(&file_id)
+        .expect("partition")
+        .expect("partition exists");
+    assert_eq!(partition["hash"], "abc");
+
+    store
+        .put_tool_receipt(&StoredToolReceipt {
+            tool_name: "read_file".to_string(),
+            stable_output_sha256: "out".to_string(),
+            call_id: "call_1".to_string(),
+            content_sha256: Some("content".to_string()),
+            model_output_bytes: 42,
+            created_unix_millis: 1,
+        })
+        .expect("put receipt");
+    assert_eq!(store.tool_receipts().expect("receipts").len(), 1);
+
+    let mut observation = Observation::new(
+        ObservationKind::Decision,
+        "Use redb for graph persistence",
+        "test",
+    );
+    observation.tags.push("graph".to_string());
+    let observation = store.put_observation(observation).expect("put observation");
+    assert_eq!(
+        store
+            .get_observation(&observation.id)
+            .expect("get observation")
+            .expect("observation")
+            .text,
+        "Use redb for graph persistence"
+    );
+    assert_eq!(
+        store
+            .search_observations("redb graph", 10)
+            .expect("search observations")
+            .len(),
+        1
+    );
+    store
+        .delete_observation(&observation.id)
+        .expect("delete observation");
+    assert!(
+        store
+            .search_observations("redb graph", 10)
+            .expect("search observations")
+            .is_empty()
+    );
+}
+
+#[test]
+fn state_store_schema_mismatch_backs_up_old_database_without_data_loss() {
+    let root = temp_root("state-schema-mismatch");
+    let state = root.join(".squeezy").join("cache").join("state.redb");
+    fs::create_dir_all(state.parent().unwrap()).expect("create cache dir");
+    write_schema_version(&state, 0);
+
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    assert_eq!(
+        store
+            .graph_metadata()
+            .expect("metadata")
+            .map(|metadata| metadata.graph_format_version),
+        None
+    );
+    assert!(
+        fs::read_dir(state.parent().unwrap())
+            .expect("read cache")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| entry.file_name().to_string_lossy().contains("schema-0")),
+        "old schema database should be backed up"
+    );
+}
+
+#[test]
+fn state_store_open_rejects_a_second_handle_on_the_same_file() {
+    // redb enforces single-process exclusivity by failing the second
+    // `Database::create` with a lock error. Squeezy relies on this contract
+    // to keep agent and tool-registry layers sharing a single
+    // `Arc<SqueezyStore>` instead of accidentally racing two independent
+    // handles against the same file: regressions there silently disable
+    // graph persistence because the second open returns an error that
+    // callers downgrade to `None`. This test pins the redb behavior so we
+    // notice if it ever changes.
+    let root = temp_root("state-dual-open");
+    let first = SqueezyStore::open(&root, None).expect("first open");
+    let second = SqueezyStore::open(&root, None);
+    assert!(
+        second.is_err(),
+        "redb must reject a second open on the same database file"
+    );
+    let _ = first;
+}
+
+fn write_schema_version(path: &std::path::Path, version: u64) {
+    const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+    let database = Database::create(path).expect("create old database");
+    let write = database.begin_write().expect("begin write");
+    {
+        let mut table = write.open_table(META).expect("open meta");
+        let value = serde_json::to_vec(&version).expect("encode version");
+        table
+            .insert("schema_version", value.as_slice())
+            .expect("insert version");
+    }
+    write.commit().expect("commit");
 }
 
 fn temp_root(name: &str) -> PathBuf {

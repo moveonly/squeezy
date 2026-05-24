@@ -6,7 +6,7 @@ use std::{
         Arc, RwLock,
         atomic::{AtomicU8, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::StreamExt;
@@ -20,15 +20,16 @@ use squeezy_core::{
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolSpec, estimate_cost};
 use squeezy_store::{
     CleanupReport, ResumeItem, SessionEvent, SessionHandle, SessionMetadata, SessionQuery,
-    SessionRecord, SessionResumeState, SessionStatus, SessionStore,
+    SessionRecord, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
+    StoredToolReceipt,
 };
 use squeezy_telemetry::{
     ErrorKind, TelemetryClient, TelemetryEvent, ToolCostProperties,
     ToolStatusKind as TelemetryToolStatusKind, ToolTelemetryReport,
 };
 use squeezy_tools::{
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolResult, ToolSpec,
-    ToolStatus, WebToolConfig, sha256_hex,
+    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ToolResult, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -98,6 +99,7 @@ pub struct Agent {
     /// a panicking writer, and never need a fallback enum value: every byte
     /// we observe was previously written via `SessionMode::to_u8`.
     session_mode: Arc<AtomicU8>,
+    store: Option<Arc<SqueezyStore>>,
 }
 
 impl Agent {
@@ -162,6 +164,16 @@ impl Agent {
                 .redactor()
                 .expect("validated redaction config must compile"),
         );
+        // Open the persistent state store exactly once and share the handle
+        // with the tool registry. redb only allows a single live `Database`
+        // per file (see `state_store_open_rejects_a_second_handle_on_the_same_file`),
+        // so the registry's graph manager must reuse this handle instead of
+        // opening its own — otherwise the second open would fail silently
+        // and graph partitions would never be persisted.
+        let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
+            .ok()
+            .map(Arc::new);
+        let runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
         let tools = ToolRegistry::new_with_configs_and_skills(
             config.workspace_root.clone(),
             output_config.clone(),
@@ -169,7 +181,7 @@ impl Agent {
             config.skills.clone(),
             &config.graph,
             config.permissions.shell_sandbox.clone(),
-            redactor.clone(),
+            runtime.clone(),
         )
         .unwrap_or_else(|_| {
             // Workspace root unavailable; fall back to the current
@@ -183,7 +195,7 @@ impl Agent {
                 config.skills.clone(),
                 &config.graph,
                 config.permissions.shell_sandbox.clone(),
-                redactor.clone(),
+                runtime,
             )
             .expect("current directory must be a valid tool root")
         });
@@ -202,6 +214,7 @@ impl Agent {
             next_approval_id: Arc::new(AtomicU64::new(1)),
             session_rules: Arc::new(RwLock::new(Vec::new())),
             session_mode: Arc::new(AtomicU8::new(initial_session_mode.to_u8())),
+            store,
         }
     }
 
@@ -347,6 +360,7 @@ impl Agent {
         let session_mode = self.session_mode.clone();
         let session_log = self.session_log.clone();
         let conversation_state = self.conversation_state.clone();
+        let store = self.store.clone();
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
@@ -379,6 +393,7 @@ impl Agent {
                 session_mode,
                 session_log,
                 conversation_state,
+                store,
             }
             .run(redacted_input.text)
             .await;
@@ -426,6 +441,7 @@ struct TurnRuntime {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
+    store: Option<Arc<SqueezyStore>>,
 }
 
 impl TurnRuntime {
@@ -451,7 +467,7 @@ impl TurnRuntime {
             conversation.clone()
         };
         let mut total_cost = CostSnapshot::default();
-        let mut seen_tool_outputs = SeenToolOutputs::default();
+        let mut seen_tool_outputs = SeenToolOutputs::from_store(self.store.clone());
         let mut broker = CostBroker::new(&self.config);
         broker.metrics.redactions += std::mem::take(&mut self.seed_redactions);
         // Instructions are static across the turn's tool rounds; redact
@@ -2081,9 +2097,35 @@ struct PendingToolResult {
 #[derive(Debug, Default)]
 struct SeenToolOutputs {
     by_tool_output: BTreeMap<(String, String), SeenToolOutput>,
+    store: Option<Arc<SqueezyStore>>,
 }
 
 impl SeenToolOutputs {
+    fn from_store(store: Option<Arc<SqueezyStore>>) -> Self {
+        let mut outputs = Self {
+            by_tool_output: BTreeMap::new(),
+            store,
+        };
+        if let Some(store) = outputs.store.as_deref()
+            && let Ok(receipts) = store.tool_receipts()
+        {
+            for receipt in receipts {
+                let seen = SeenToolOutput {
+                    call_id: receipt.call_id,
+                    tool_name: receipt.tool_name,
+                    stable_output_sha256: receipt.stable_output_sha256,
+                    content_sha256: receipt.content_sha256,
+                    model_output_bytes: receipt.model_output_bytes,
+                };
+                outputs
+                    .by_tool_output
+                    .entry((seen.tool_name.clone(), seen.stable_output_sha256.clone()))
+                    .or_insert(seen);
+            }
+        }
+        outputs
+    }
+
     fn prepare_results(&self, results: Vec<ToolResult>) -> Vec<PendingToolResult> {
         let mut prepared = Vec::with_capacity(results.len());
         let mut seen = self
@@ -2147,7 +2189,17 @@ impl SeenToolOutputs {
             if let Some(seen) = result.remember.clone() {
                 self.by_tool_output
                     .entry((seen.tool_name.clone(), seen.stable_output_sha256.clone()))
-                    .or_insert(seen);
+                    .or_insert(seen.clone());
+                if let Some(store) = self.store.as_deref() {
+                    let _ = store.put_tool_receipt(&StoredToolReceipt {
+                        tool_name: seen.tool_name,
+                        stable_output_sha256: seen.stable_output_sha256,
+                        call_id: seen.call_id,
+                        content_sha256: seen.content_sha256,
+                        model_output_bytes: seen.model_output_bytes,
+                        created_unix_millis: unix_millis(),
+                    });
+                }
             }
         }
     }
@@ -2298,6 +2350,13 @@ fn receipt_stub_reference_omitted(result: ToolResult) -> ToolResult {
         },
         spill_model_output: None,
     }
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {

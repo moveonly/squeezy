@@ -37,6 +37,7 @@ ignore = "0.4"
 libc = "0.2"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
+redb = "4.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

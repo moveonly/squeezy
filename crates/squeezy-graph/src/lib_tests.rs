@@ -61,6 +61,88 @@ fn helper() {}
 }
 
 #[test]
+fn persistent_graph_warm_start_skips_unchanged_parsing() {
+    let root = temp_root("persistent-warm-start");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn hello() {}\n").unwrap();
+
+    let first = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert!(first.build_report().parsed_files > 0);
+    assert_eq!(first.build_report().persisted_files_loaded, 0);
+    drop(first);
+
+    let second = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(second.build_report().parsed_files, 0);
+    assert!(second.build_report().persisted_files_loaded > 0);
+    assert!(
+        second
+            .graph()
+            .find_symbol_by_name("hello")
+            .iter()
+            .any(|symbol| symbol.name == "hello")
+    );
+}
+
+#[test]
+fn persistent_graph_refresh_updates_changed_partitions() {
+    let root = temp_root("persistent-refresh");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname='demo'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src")).unwrap();
+    let source = root.join("src/lib.rs");
+    fs::write(&source, "pub fn old_name() {}\n").unwrap();
+
+    let mut manager = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig {
+            debounce: Duration::from_millis(0),
+            idle_refresh_interval: Duration::from_secs(60),
+            per_tool_refresh_budget: Duration::from_secs(5),
+        },
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    fs::write(&source, "pub fn new_name() {}\n").unwrap();
+    manager.record_changed_path(&source);
+    let refresh = manager.refresh_now().unwrap();
+    assert_eq!(refresh.reparsed_files, 1);
+    assert!(manager.graph().find_symbol_by_name("new_name").len() == 1);
+    drop(manager);
+
+    let reopened = GraphManager::open_persistent_with_crawl_options(
+        &root,
+        RefreshConfig::default(),
+        CrawlOptions::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(reopened.build_report().parsed_files, 0);
+    assert!(reopened.graph().find_symbol_by_name("new_name").len() == 1);
+    assert!(reopened.graph().find_symbol_by_name("old_name").is_empty());
+}
+
+#[test]
 fn graph_answers_python_navigation_queries() {
     let source = r#"
 class Greeter:

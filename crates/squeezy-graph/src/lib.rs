@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 pub mod backend;
 mod languages;
 
+use serde::{Deserialize, Serialize};
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
     Result, SourceSpan, SymbolId, SymbolKind,
@@ -15,6 +17,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
+use squeezy_store::{GraphStoreMetadata, GraphWriteBatch, SqueezyStore};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 use crate::languages::{
@@ -32,12 +35,13 @@ use crate::languages::{
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
+const GRAPH_FORMAT_VERSION: u64 = 1;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSymbol {
     pub id: SymbolId,
     pub file_id: FileId,
@@ -80,19 +84,19 @@ impl From<ParsedSymbol> for GraphSymbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyAnnotation {
     pub status: String,
     pub ranges: Vec<DirtyRange>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyRange {
     pub start_line: u32,
     pub end_line: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEdge {
     pub from: SymbolId,
     pub to: Option<SymbolId>,
@@ -150,7 +154,7 @@ pub struct CallEdgeHit {
     pub edge: GraphEdge,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaProjectFact {
     pub provider: String,
     pub kind: String,
@@ -159,7 +163,7 @@ pub struct JavaProjectFact {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DotnetProjectFact {
     pub provider: String,
     pub kind: String,
@@ -2755,6 +2759,9 @@ pub struct GraphBuildReport {
     pub files_seen: usize,
     pub parsed_files: usize,
     pub unsupported_files: usize,
+    pub persisted_files_loaded: usize,
+    pub persisted_files_missed: usize,
+    pub persistence_rebuilt: bool,
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
@@ -2811,6 +2818,8 @@ pub struct GraphManager {
     parser: LanguageParser,
     graph: SemanticGraph,
     config: RefreshConfig,
+    store: Option<Arc<SqueezyStore>>,
+    store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
     pending_changed_paths: HashSet<PathBuf>,
@@ -2830,20 +2839,86 @@ impl GraphManager {
         config: RefreshConfig,
         crawl_options: CrawlOptions,
     ) -> Result<Self> {
+        Self::open_with_optional_store(root, config, crawl_options, None)
+    }
+
+    /// Open a `GraphManager` that uses its own private [`SqueezyStore`] under
+    /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
+    /// Production callers that already hold a shared `Arc<SqueezyStore>`
+    /// should use [`open_with_store`] instead: redb forbids two `Database`
+    /// handles on the same file, so opening another one here against an
+    /// agent-owned store would fail silently and disable graph persistence.
+    pub fn open_persistent_with_crawl_options(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        cache_root: Option<PathBuf>,
+    ) -> Result<Self> {
+        let root_path = root.as_ref().to_path_buf();
+        let store = SqueezyStore::open(&root_path, cache_root.as_deref())
+            .ok()
+            .map(Arc::new);
+        Self::open_with_optional_store(root_path, config, crawl_options, store)
+    }
+
+    /// Open a `GraphManager` against an already-open [`SqueezyStore`]. Pass
+    /// `None` to disable persistence. Sharing one handle keeps the agent and
+    /// the tool registry from racing to acquire redb's exclusive file lock.
+    pub fn open_with_store(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Result<Self> {
+        Self::open_with_optional_store(root, config, crawl_options, store)
+    }
+
+    fn open_with_optional_store(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
+        let store_metadata = store
+            .as_ref()
+            .map(|_| graph_store_metadata(&root, &crawl_options));
         let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
-        let (parsed, parse_summary) = parser.parse_records(&snapshot.files)?;
-        let graph = SemanticGraph::from_parsed(parsed);
+        let loaded =
+            load_persisted_partitions(store.as_deref(), store_metadata.as_ref(), &snapshot.files)?;
+        let (parsed_missed, parse_summary) = parser.parse_records(&loaded.missed_records)?;
+        if let (Some(store), Some(metadata)) = (store.as_deref(), store_metadata.as_ref()) {
+            // Coalesce the cold-build writes into one redb transaction so the
+            // first crawl pays a single fsync rather than one per parsed file.
+            let mut batch = GraphWriteBatch::new();
+            batch.set_metadata(metadata.clone());
+            for parsed in &parsed_missed {
+                batch.upsert_partition(&parsed.file.id, parsed)?;
+            }
+            store.apply_graph_batch(&batch)?;
+        }
+        let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+            &snapshot.files,
+            loaded.parsed,
+            parsed_missed,
+        ));
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
             parsed_files: parse_summary.parsed_files,
-            unsupported_files: parse_summary.unsupported_files,
+            unsupported_files: graph
+                .files
+                .values()
+                .filter(|file| file.language == LanguageKind::Unsupported)
+                .count(),
+            persisted_files_loaded: loaded.loaded_files,
+            persisted_files_missed: loaded.missed_records.len(),
+            persistence_rebuilt: loaded.rebuilt,
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
@@ -2858,6 +2933,8 @@ impl GraphManager {
             parser,
             graph,
             config,
+            store,
+            store_metadata,
             last_refresh: Instant::now(),
             build_report,
             pending_changed_paths: HashSet::new(),
@@ -3064,11 +3141,18 @@ impl GraphManager {
         let unchanged_event_paths = pending_changed_paths
             .len()
             .saturating_sub(event_changed_or_removed);
+        // Accumulate persistence side effects across the refresh and flush in
+        // a single redb transaction at the end. Refreshes can touch dozens of
+        // files (large saves, branch switches) and a per-file commit pays one
+        // fsync each, which dominates wall-clock cost.
+        let mut graph_batch = GraphWriteBatch::new();
         for file_id in &removed_files {
             self.graph.remove_file(file_id);
+            graph_batch.remove_partition(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
+            graph_batch.remove_partition(file_id);
         }
         for record in unsupported_changed_records {
             self.graph.files.insert(record.id.clone(), record.clone());
@@ -3086,12 +3170,31 @@ impl GraphManager {
             reparsed_files += 1;
         }
         if !parsed_files.is_empty() {
+            if self.store.is_some() {
+                if let Some(metadata) = &self.store_metadata {
+                    graph_batch.set_metadata(metadata.clone());
+                }
+                for parsed in &parsed_files {
+                    if let Err(err) = graph_batch.upsert_partition(&parsed.file.id, parsed) {
+                        // Encoding failure cannot poison the in-memory graph
+                        // update; skip persistence for the offending file and
+                        // keep going. The warm-start path will re-parse it
+                        // next time.
+                        let _ = err;
+                    }
+                }
+            }
             self.graph.replace_files(parsed_files);
         } else if metadata_refresh_needed {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
+        }
+        if let Some(store) = self.store.as_deref()
+            && !graph_batch.is_empty()
+        {
+            let _ = store.apply_graph_batch(&graph_batch);
         }
 
         self.pending_changed_paths.clear();
@@ -3117,6 +3220,117 @@ impl GraphManager {
             skipped_due_to_interval: false,
             budget_exhausted,
         })
+    }
+}
+
+struct LoadedPartitions {
+    parsed: Vec<ParsedFile>,
+    missed_records: Vec<FileRecord>,
+    loaded_files: usize,
+    rebuilt: bool,
+}
+
+fn load_persisted_partitions(
+    store: Option<&SqueezyStore>,
+    expected_metadata: Option<&GraphStoreMetadata>,
+    records: &[FileRecord],
+) -> Result<LoadedPartitions> {
+    let Some(store) = store else {
+        return Ok(LoadedPartitions {
+            parsed: Vec::new(),
+            missed_records: records.to_vec(),
+            loaded_files: 0,
+            rebuilt: false,
+        });
+    };
+    let metadata_matches = match (store.graph_metadata()?, expected_metadata) {
+        (Some(existing), Some(expected)) => existing == *expected,
+        (None, _) => false,
+        (_, None) => false,
+    };
+    if !metadata_matches {
+        store.clear_graph_partitions()?;
+        return Ok(LoadedPartitions {
+            parsed: Vec::new(),
+            missed_records: records.to_vec(),
+            loaded_files: 0,
+            rebuilt: true,
+        });
+    }
+
+    let mut parsed = Vec::new();
+    let mut missed_records = Vec::new();
+    for record in records {
+        match store.graph_partition::<ParsedFile>(&record.id)? {
+            Some(mut persisted) if persisted_partition_matches(&persisted, record) => {
+                persisted.file = record.clone();
+                parsed.push(persisted);
+            }
+            _ => missed_records.push(record.clone()),
+        }
+    }
+    let loaded_files = parsed.len();
+    Ok(LoadedPartitions {
+        parsed,
+        missed_records,
+        loaded_files,
+        rebuilt: false,
+    })
+}
+
+fn persisted_partition_matches(parsed: &ParsedFile, record: &FileRecord) -> bool {
+    parsed.file.id == record.id
+        && parsed.file.relative_path == record.relative_path
+        && parsed.file.hash == record.hash
+        && parsed.file.language == record.language
+}
+
+fn merge_parsed_by_snapshot_order(
+    records: &[FileRecord],
+    loaded: Vec<ParsedFile>,
+    parsed_missed: Vec<ParsedFile>,
+) -> Vec<ParsedFile> {
+    let mut by_id = loaded
+        .into_iter()
+        .chain(parsed_missed)
+        .map(|parsed| (parsed.file.id.clone(), parsed))
+        .collect::<HashMap<_, _>>();
+    records
+        .iter()
+        .filter_map(|record| by_id.remove(&record.id))
+        .collect()
+}
+
+fn graph_store_metadata(root: &Path, crawl_options: &CrawlOptions) -> GraphStoreMetadata {
+    let crawl_options_json = serde_json::json!({
+        "include_hidden": crawl_options.include_hidden,
+        "max_file_bytes": crawl_options.max_file_bytes,
+        "require_indexing_signal": crawl_options.require_indexing_signal,
+        "include": crawl_options.policy.include,
+        "exclude": crawl_options.policy.exclude,
+        "include_classes": crawl_options.policy.include_classes,
+        "exclude_classes": crawl_options.policy.exclude_classes,
+    });
+    let language_registry_version = LanguageFamily::all()
+        .iter()
+        .map(|family| {
+            let kinds = family
+                .kinds()
+                .iter()
+                .map(|kind| kind.display_name())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}:{kinds}", family.id())
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    GraphStoreMetadata {
+        workspace_root: root.display().to_string(),
+        crawl_options_hash: squeezy_workspace::stable_content_hash(
+            crawl_options_json.to_string().as_bytes(),
+        ),
+        language_registry_version,
+        graph_format_version: GRAPH_FORMAT_VERSION,
     }
 }
 

@@ -35,6 +35,7 @@ use squeezy_graph::{
     DirtyAnnotation, DirtyRange, GraphManager, GraphSymbol, ReferenceHit, SignatureQuery,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
+use squeezy_store::SqueezyStore;
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
@@ -71,6 +72,35 @@ const DEFAULT_WEB_FETCH_OUTPUT_BYTE_CAP: usize = 32_000;
 const MAX_WEB_REDIRECTS: usize = 5;
 const DIFF_SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 const POLICY_PREFIX_BYTES: usize = 4096;
+
+/// Per-process runtime bits the registry needs alongside its tool-specific
+/// configs. Grouping them keeps the public constructor signature under
+/// `clippy::too_many_arguments` while leaving each tool config struct as the
+/// place to look for that tool's settings.
+///
+/// `state_store` carries an already-open [`SqueezyStore`] when the caller wants
+/// the registry's graph manager to share persistence with the surrounding
+/// agent. redb enforces single-handle access per database file (verified by
+/// `state_store_open_rejects_a_second_handle_on_the_same_file`), so callers
+/// that also need the store outside the registry must open it once and pass
+/// the same `Arc` in here rather than open a parallel handle.
+#[derive(Debug, Clone, Default)]
+pub struct ToolRegistryRuntime {
+    /// Shared persistent state store. `None` disables graph persistence in
+    /// the registry's `GraphManager` (matches the pre-persistence default).
+    pub state_store: Option<Arc<SqueezyStore>>,
+    /// Shared redactor used by tools that surface user-visible text.
+    pub redactor: Arc<Redactor>,
+}
+
+impl ToolRegistryRuntime {
+    pub fn new(state_store: Option<Arc<SqueezyStore>>, redactor: Arc<Redactor>) -> Self {
+        Self {
+            state_store,
+            redactor,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -559,7 +589,7 @@ impl ToolRegistry {
             ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             CrawlOptions::default(),
-            Arc::new(Redactor::default()),
+            ToolRegistryRuntime::default(),
         )
     }
 
@@ -576,7 +606,7 @@ impl ToolRegistry {
             ShellSandboxConfig::default(),
             SkillCatalog::empty(),
             crawl_options_from_graph_config(graph_config),
-            Arc::new(Redactor::default()),
+            ToolRegistryRuntime::default(),
         )
     }
 
@@ -587,7 +617,7 @@ impl ToolRegistry {
         skills_config: SkillsConfig,
         graph_config: &GraphConfig,
         shell_sandbox: ShellSandboxConfig,
-        redactor: Arc<Redactor>,
+        runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
@@ -601,7 +631,7 @@ impl ToolRegistry {
             shell_sandbox,
             skills,
             crawl_options_from_graph_config(graph_config),
-            redactor,
+            runtime,
         )
     }
 
@@ -612,7 +642,7 @@ impl ToolRegistry {
         shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
-        redactor: Arc<Redactor>,
+        runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
         let root = root.into();
         let root = root
@@ -625,7 +655,7 @@ impl ToolRegistry {
             shell_sandbox,
             skills,
             crawl_options,
-            redactor,
+            runtime,
         )
     }
 
@@ -636,17 +666,25 @@ impl ToolRegistry {
         shell_sandbox: ShellSandboxConfig,
         skills: SkillCatalog,
         crawl_options: CrawlOptions,
-        redactor: Arc<Redactor>,
+        runtime: ToolRegistryRuntime,
     ) -> Result<Self> {
+        let ToolRegistryRuntime {
+            state_store,
+            redactor,
+        } = runtime;
         let output_store = ToolOutputStore::new(&root, output_config)?;
         let http = Arc::new(ReqwestWebHttpClient::new()?);
         // Compile the policy once up front. Invalid user globs surface as a
         // `SqueezyError::Config` here instead of silently disabling the
         // policy on every hot-path call.
         let compiled_policy = Arc::new(crawl_options.policy.compile()?);
-        let graph =
-            GraphManager::open_with_crawl_options(&root, Default::default(), crawl_options.clone())
-                .ok();
+        let graph = GraphManager::open_with_store(
+            &root,
+            Default::default(),
+            crawl_options.clone(),
+            state_store,
+        )
+        .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
         let checkpoints = CheckpointStore::open(&root)?;

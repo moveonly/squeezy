@@ -15,6 +15,7 @@ use squeezy_core::{
     AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use squeezy_store::SqueezyStore;
 use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
@@ -631,6 +632,117 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
         outputs[0].1["receipt"]["output_sha256"]
     );
     assert!(outputs[1].1["content"]["content"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn repeated_read_result_returns_receipt_stub_across_sessions() {
+    let root = temp_workspace("receipt_stub_cross_session");
+    fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");
+    let first_provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "first_session_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let first_agent = Agent::new(config_for(root.clone()), first_provider);
+    drain_turn(first_agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+    drop(first_agent);
+
+    let second_provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "second_session_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("deduped".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let second_agent = Agent::new(config_for(root.clone()), second_provider.clone());
+    drain_turn(second_agent.start_turn("read again".to_string(), CancellationToken::new())).await;
+
+    let requests = second_provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].0, "second_session_read");
+    assert_eq!(outputs[0].1["content"]["receipt_stub"], true);
+    assert_eq!(
+        outputs[0].1["content"]["same_as_call_id"],
+        "first_session_read"
+    );
+    assert!(outputs[0].1["content"]["content"].is_null());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn agent_shares_state_store_with_tool_registry_for_graph_persistence() {
+    // Regression for an earlier draft of the persistence change in which the
+    // agent and the tool registry each opened their own `SqueezyStore` on
+    // the workspace. redb forbids a second `Database` handle on the same
+    // file, so the registry's open quietly failed and graph persistence
+    // never ran. Asserting that the shared state store contains a graph
+    // partition entry after one agent turn pins the contract that both
+    // layers reuse the agent's `Arc<SqueezyStore>`.
+    let root = temp_workspace("agent_shared_state_store");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'shared-state-demo'\nversion = '0.1.0'\nedition = '2024'\n",
+    )
+    .expect("write cargo");
+    fs::write(root.join("src/lib.rs"), "pub fn shared_state_demo() {}\n").expect("write lib");
+
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_only".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+    drain_turn(agent.start_turn("warm graph".to_string(), CancellationToken::new())).await;
+    drop(agent);
+
+    let store = SqueezyStore::open(&root, None).expect("reopen state store");
+    let partition: Option<serde_json::Value> = store
+        .graph_partition(&squeezy_core::FileId::new("src/lib.rs"))
+        .expect("graph_partition");
+    assert!(
+        partition.is_some(),
+        "agent must persist graph partitions through the shared state store",
+    );
 
     let _ = fs::remove_dir_all(root);
 }

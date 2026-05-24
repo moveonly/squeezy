@@ -8,6 +8,7 @@ use std::{
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
+use serde::{Deserialize, Serialize};
 use squeezy_core::{ContentHash, FileId, Freshness, LanguageKind, Result, SqueezyError};
 
 pub const CRATE_NAME: &str = "squeezy-workspace";
@@ -176,7 +177,7 @@ fn literal_prefix(pattern: &str) -> &str {
     &pattern[..cutoff]
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRecord {
     pub id: FileId,
     pub path: PathBuf,
@@ -1080,8 +1081,8 @@ fn default_path_reason(relative_path: &str, is_dir: bool) -> Option<ExclusionRea
             | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".tox" | ".nox" | ".gradle" => {
                 return Some(ExclusionReason::DependencyCache);
             }
-            "target" | "dist" | "build" | "out" | "bin" | "obj" | ".next" | ".turbo"
-            | ".output" | ".cache" | "coverage" | ".nyc_output" => {
+            "target" | ".squeezy" | "dist" | "build" | "out" | "bin" | "obj" | ".next"
+            | ".turbo" | ".output" | ".cache" | "coverage" | ".nyc_output" => {
                 return Some(ExclusionReason::BuildOutput);
             }
             _ => {}

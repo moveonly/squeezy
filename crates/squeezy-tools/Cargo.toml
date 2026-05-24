@@ -20,6 +20,7 @@ sha2.workspace = true
 squeezy-core.workspace = true
 squeezy-graph.workspace = true
 squeezy-skills.workspace = true
+squeezy-store.workspace = true
 squeezy-vcs.workspace = true
 squeezy-workspace.workspace = true
 tokio.workspace = true

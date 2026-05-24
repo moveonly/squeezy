@@ -1249,6 +1249,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "redb"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1623,9 +1632,11 @@ dependencies = [
 name = "squeezy-graph"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "squeezy-core",
  "squeezy-parse",
+ "squeezy-store",
  "squeezy-workspace",
 ]
 
@@ -1665,6 +1676,7 @@ dependencies = [
 name = "squeezy-parse"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "squeezy-core",
  "squeezy-workspace",
  "tree-sitter",
@@ -1700,6 +1712,7 @@ dependencies = [
 name = "squeezy-store"
 version = "0.1.0"
 dependencies = [
+ "redb",
  "serde",
  "serde_json",
  "sha2",
@@ -1736,6 +1749,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-graph",
  "squeezy-skills",
+ "squeezy-store",
  "squeezy-vcs",
  "squeezy-workspace",
  "tokio",
@@ -1777,6 +1791,7 @@ version = "0.1.0"
 dependencies = [
  "globset",
  "ignore",
+ "serde",
  "squeezy-core",
 ]
 

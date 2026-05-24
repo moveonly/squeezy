@@ -10,4 +10,5 @@ publish.workspace = true
 [dependencies]
 globset.workspace = true
 ignore.workspace = true
+serde.workspace = true
 squeezy-core.workspace = true

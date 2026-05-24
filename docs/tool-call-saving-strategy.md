@@ -38,10 +38,11 @@ model-facing tool output compact enough to be useful.
   warning, failure, and status lines plus a tail window of context. Spill
   handles continue to store the unshaped raw result for exact follow-up
   reads.
-- **Receipt-backed output stubs.** During one turn, repeated successful
-  read-style tool outputs with the same receipt are replaced with a compact
-  stub that points back to the first model-visible result. Outputs omitted by
-  the aggregate result budget are not remembered as seen.
+- **Receipt-backed output stubs.** Repeated successful read-style tool outputs
+  with the same receipt are replaced with a compact stub that points back to
+  the first model-visible result. The compact receipt ledger is persisted under
+  the cache root, so identical outputs can be stubbed in later sessions too.
+  Outputs omitted by the aggregate result budget are not remembered as seen.
 - **Aggregate result budgets.** A round with many parallel tools enforces a
   combined model-facing output cap, not only per-tool caps.
 - **Unified permission engine.** Every tool call is converted into a structured
