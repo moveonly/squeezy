@@ -12,8 +12,8 @@ use futures_util::stream;
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionMode, PermissionPolicy,
-    PermissionScope, Result, SessionMode,
+    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionAction, PermissionMode,
+    PermissionPolicy, PermissionRule, PermissionRuleSource, PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
@@ -197,6 +197,37 @@ async fn exploration_compiler_prefetches_graph_context_before_model_request() {
         outputs
             .iter()
             .any(|(_, output)| output["tool_name"] == "definition_search")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cited_final_answer_is_preserved() {
+    let root = temp_workspace("cited_final_answer");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "Use the current docs at https://example.com/docs.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+
+    let mut rx = agent.start_turn("answer with citation".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert_eq!(
+        completed.as_deref(),
+        Some("Use the current docs at https://example.com/docs.")
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1456,6 +1487,95 @@ async fn denied_webfetch_is_reported_and_does_not_open_network_connection() {
     let outputs = function_outputs(&requests[1]);
     assert_eq!(outputs[0].0, "web_call");
     assert_eq!(outputs[0].1["status"], "Denied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn disabled_web_permission_returns_denied_tool_result() {
+    let root = temp_workspace("disabled_web_permission");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("blocked".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Deny;
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch denied url".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    assert_eq!(outputs[0].1["content"]["permission_denied"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn blocked_web_domain_rule_returns_denied_tool_result() {
+    let root = temp_workspace("blocked_web_domain_rule");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "web_call".to_string(),
+                name: "webfetch".to_string(),
+                arguments: serde_json::json!({"url": "https://example.com/docs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("blocked".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.permissions.web = PermissionMode::Allow;
+    config.permissions.rules.push(PermissionRule::new(
+        "network",
+        "domain:example.com",
+        PermissionAction::Deny,
+        PermissionRuleSource::Project,
+        Some("blocked test domain".to_string()),
+    ));
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("fetch blocked domain".to_string(), CancellationToken::new()))
+        .await;
+
+    let requests = provider.requests();
+    let outputs = function_outputs(&requests[1]);
+    assert_eq!(outputs[0].0, "web_call");
+    assert_eq!(outputs[0].1["status"], "Denied");
+    let reason = outputs[0].1["content"]["reason"].as_str().expect("reason");
+    assert_eq!(reason, "blocked test domain");
 
     let _ = fs::remove_dir_all(root);
 }

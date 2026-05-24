@@ -100,6 +100,11 @@ model-facing tool output compact enough to be useful.
   discovery through a configurable Exa MCP endpoint, and `webfetch` retrieves
   specific HTTP(S) URLs with bounded response sizes, text/HTML shaping, content
   receipts, host-visible approval summaries, and cross-host redirect stops.
+  Successful web results are marked as remote evidence and include source URL
+  fields, retrieval time, citation metadata, redacted quote hashes, and
+  cache-receipt metadata. Quote byte caps are enforced after redaction so
+  secret-looking remote text is scrubbed before it is truncated, spilled,
+  logged, or sent back to the model.
 - **Provider tool calls.** The OpenAI Responses and Anthropic Messages providers
   expose documented function tools and feed tool outputs back into the model
   loop.
@@ -131,6 +136,9 @@ model-facing tool output compact enough to be useful.
   planner for comparison runs or debugging. It is enabled by default.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
+- `webfetch.output_byte_cap` and `websearch.output_byte_cap` are per-call tool
+  arguments that bound the redacted quote text returned to the model. They do
+  not change the HTTP response byte caps used to protect the local process.
 - `SQUEEZY_SHELL_PERMISSION_CLASSIFIER` controls the narrow LLM fallback for
   ambiguous shell commands. Disabled by default to keep the per-turn token
   budget predictable: every ambiguous shell call would otherwise cost one
