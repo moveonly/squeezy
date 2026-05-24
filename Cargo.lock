@@ -2080,6 +2080,7 @@ dependencies = [
 name = "squeezy-mcp"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rmcp",
  "serde",
  "serde_json",

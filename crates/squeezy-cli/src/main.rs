@@ -382,6 +382,13 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
             } else if config.mcp_servers.is_empty() {
                 println!("No MCP servers configured.");
             } else {
+                let mut rows: Vec<[String; 4]> = Vec::with_capacity(config.mcp_servers.len() + 1);
+                rows.push([
+                    "NAME".to_string(),
+                    "STATE".to_string(),
+                    "TRANSPORT".to_string(),
+                    "ENDPOINT".to_string(),
+                ]);
                 for (name, server) in &config.mcp_servers {
                     let state = if server.enabled {
                         "enabled"
@@ -393,7 +400,27 @@ fn handle_mcp_command(command: &McpCommand, cli: &Cli) -> squeezy_core::Result<(
                         .as_deref()
                         .or(server.url.as_deref())
                         .unwrap_or("-");
-                    println!("{name}\t{state}\t{}\t{endpoint}", server.transport.as_str());
+                    rows.push([
+                        name.clone(),
+                        state.to_string(),
+                        server.transport.as_str().to_string(),
+                        endpoint.to_string(),
+                    ]);
+                }
+                let widths = (0..4)
+                    .map(|col| rows.iter().map(|row| row[col].len()).max().unwrap_or(0))
+                    .collect::<Vec<_>>();
+                for row in rows {
+                    println!(
+                        "{:<w0$}  {:<w1$}  {:<w2$}  {}",
+                        row[0],
+                        row[1],
+                        row[2],
+                        row[3],
+                        w0 = widths[0],
+                        w1 = widths[1],
+                        w2 = widths[2],
+                    );
                 }
             }
             Ok(())
@@ -569,8 +596,8 @@ fn validate_mcp_name(name: &str) -> squeezy_core::Result<()> {
 
 fn parse_mcp_transport(value: &str) -> squeezy_core::Result<McpTransport> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "stdio" | "local" => Ok(McpTransport::Stdio),
-        "http" | "remote" => Ok(McpTransport::Http),
+        "stdio" => Ok(McpTransport::Stdio),
+        "http" => Ok(McpTransport::Http),
         "sse" => Ok(McpTransport::Sse),
         _ => Err(SqueezyError::Config(format!(
             "invalid MCP transport {value:?}; expected stdio, http, or sse"

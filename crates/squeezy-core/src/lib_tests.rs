@@ -893,6 +893,57 @@ reason = "docs lookups are safe"
 }
 
 #[test]
+fn explicit_user_mcp_rules_outrank_per_server_defaults() {
+    // A user-declared `[[permissions.rules]]` deny must remain the last
+    // word over a per-server `default = "allow"`. We assert this by
+    // resolving the rule list in order and verifying that the final
+    // matching rule for `docs/risky` is the user's Deny.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "mcp"
+target = "docs/risky"
+action = "deny"
+source = "user"
+reason = "operator-pinned deny"
+
+[mcp.servers.docs]
+enabled = true
+transport = "stdio"
+command = "docs-mcp"
+
+[mcp.servers.docs.permissions]
+default = "allow"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    let rules: Vec<_> = config
+        .permissions
+        .rules
+        .iter()
+        .filter(|rule| rule.capability == "mcp")
+        .collect();
+    // The MCP-derived `docs/*` allow rule must be inserted *before* the
+    // user's explicit `docs/risky` deny so last-write-wins matching
+    // ultimately returns Deny.
+    let server_default_idx = rules
+        .iter()
+        .position(|rule| rule.target == "docs/*")
+        .expect("server-default rule present");
+    let user_deny_idx = rules
+        .iter()
+        .position(|rule| rule.target == "docs/risky" && rule.action == PermissionMode::Deny)
+        .expect("user deny present");
+    assert!(
+        server_default_idx < user_deny_idx,
+        "user `[[permissions.rules]]` must come after MCP-derived rules so explicit policy wins"
+    );
+}
+
+#[test]
 fn project_settings_override_user_settings_with_deep_provider_merge() {
     let mut user = SettingsFile::from_toml_str(
         r#"

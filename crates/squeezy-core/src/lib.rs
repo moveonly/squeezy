@@ -343,9 +343,14 @@ impl AppConfig {
         let redaction = RedactionConfig::from_settings(settings.redaction.unwrap_or_default())?;
         let mcp_servers = settings.mcp.map(|mcp| mcp.servers).unwrap_or_default();
         let mut permission_settings = settings.permissions.unwrap_or_default();
-        permission_settings
-            .rules
-            .extend(mcp_permission_rules(&mcp_servers));
+        // Insert MCP-derived rules *before* the user's explicit
+        // `[[permissions.rules]]`. Permission matching is "last rule wins",
+        // so this keeps any deliberate user deny/allow as the final word
+        // and prevents an MCP server's own permission block from silently
+        // overriding admin policy.
+        let mut combined_rules = mcp_permission_rules(&mcp_servers);
+        combined_rules.append(&mut permission_settings.rules);
+        permission_settings.rules = combined_rules;
         let permissions = PermissionPolicy::from_settings_and_env(
             permission_settings,
             &sources.join(","),
@@ -526,6 +531,10 @@ impl AppConfig {
         output.push_str(&format!(
             "web = {}\n",
             toml_string(self.permissions.web.as_str())
+        ));
+        output.push_str(&format!(
+            "mcp = {}\n",
+            toml_string(self.permissions.mcp.as_str())
         ));
         output.push_str(&format!(
             "shell_classifier = {}\n\n",
@@ -1586,6 +1595,7 @@ pub struct PermissionSettings {
     pub shell: Option<PermissionMode>,
     pub ignored_search: Option<PermissionMode>,
     pub web: Option<PermissionMode>,
+    pub mcp: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
     pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
@@ -1601,6 +1611,7 @@ impl PermissionSettings {
                 "shell",
                 "ignored_search",
                 "web",
+                "mcp",
                 "shell_classifier",
                 "shell_sandbox",
                 "rules",
@@ -1619,6 +1630,7 @@ impl PermissionSettings {
                 &field(path, "ignored_search"),
             )?,
             web: permission_value(table, "web", source, &field(path, "web"))?,
+            mcp: permission_value(table, "mcp", source, &field(path, "mcp"))?,
             shell_classifier: bool_value(
                 table,
                 "shell_classifier",
@@ -1640,6 +1652,7 @@ impl PermissionSettings {
         replace_if_some(&mut self.shell, next.shell);
         replace_if_some(&mut self.ignored_search, next.ignored_search);
         replace_if_some(&mut self.web, next.web);
+        replace_if_some(&mut self.mcp, next.mcp);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
         merge_option(
             &mut self.shell_sandbox,
@@ -1986,6 +1999,10 @@ pub enum PermissionScope {
     Shell,
     IgnoredSearch,
     Web,
+    /// External MCP tools. Treated as its own scope so the shell sandbox
+    /// gating (network policy, plan-mode shell denial) does not accidentally
+    /// extend to MCP calls without explicit opt-in.
+    Mcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1995,6 +2012,7 @@ pub struct PermissionPolicy {
     pub shell: PermissionMode,
     pub ignored_search: PermissionMode,
     pub web: PermissionMode,
+    pub mcp: PermissionMode,
     pub shell_classifier: bool,
     pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
@@ -2032,6 +2050,10 @@ impl PermissionPolicy {
                 var("SQUEEZY_WEB_PERMISSION"),
                 settings.web.unwrap_or(PermissionMode::Ask),
             ),
+            mcp: parse_permission(
+                var("SQUEEZY_MCP_PERMISSION"),
+                settings.mcp.unwrap_or(PermissionMode::Ask),
+            ),
             shell_classifier: parse_bool(
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
@@ -2048,6 +2070,7 @@ impl PermissionPolicy {
             PermissionScope::Shell => self.shell,
             PermissionScope::IgnoredSearch => self.ignored_search,
             PermissionScope::Web => self.web,
+            PermissionScope::Mcp => self.mcp,
         }
     }
 
@@ -2155,6 +2178,7 @@ impl Default for PermissionPolicy {
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
+            mcp: PermissionMode::Ask,
             shell_classifier: false,
             shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
@@ -2195,7 +2219,7 @@ fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionSc
         PermissionCapability::Edit => PermissionScope::Edit,
         PermissionCapability::Shell => PermissionScope::Shell,
         PermissionCapability::Network => PermissionScope::Web,
-        PermissionCapability::Mcp => PermissionScope::Shell,
+        PermissionCapability::Mcp => PermissionScope::Mcp,
         PermissionCapability::Git => PermissionScope::Shell,
         PermissionCapability::Compiler => PermissionScope::Shell,
         PermissionCapability::Destructive => PermissionScope::Shell,
@@ -3083,6 +3107,7 @@ pub fn user_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
@@ -3177,6 +3202,7 @@ pub fn project_settings_template() -> &'static str {
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
+# mcp = "ask"
 #
 # [[permissions.rules]]
 # capability = "compiler"
@@ -3762,13 +3788,17 @@ fn mcp_permission_rules_value(
     rules
         .iter()
         .enumerate()
-        .map(|value| {
-            let rule_path = format!("{path}[{}]", value.0);
+        .map(|(index, value)| {
+            let rule_path = format!("{path}[{index}]");
             let table = value
-                .1
                 .as_table()
                 .ok_or_else(|| type_error(source, &rule_path, "table"))?;
-            reject_unknown_keys(table, &["target", "action", "source", "reason"], source, &rule_path)?;
+            reject_unknown_keys(
+                table,
+                &["target", "action", "source", "reason"],
+                source,
+                &rule_path,
+            )?;
             let target =
                 required_string_value(table, "target", source, &field(&rule_path, "target"))?;
             let target = if target.starts_with(&format!("{server_name}/")) {

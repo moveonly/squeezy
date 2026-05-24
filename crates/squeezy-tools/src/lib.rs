@@ -915,7 +915,7 @@ impl ToolRegistry {
 
     pub fn permission_scope(&self, call: &ToolCall) -> PermissionScope {
         if self.mcp_tool(&call.name).is_some() {
-            return PermissionScope::Shell;
+            return PermissionScope::Mcp;
         }
         match call.name.as_str() {
             "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,

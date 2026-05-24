@@ -248,17 +248,26 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   stream handling). `stdio` servers use `command`, optional `args`, and
   optional `env`; remote servers use `url`. `enabled = false` keeps the
   server configured without discovering or advertising its tools. MCP tools
-  are discovered before each agent turn and advertised as
+  are discovered once per agent turn — concurrently across servers and
+  reusing a long-lived session per server — and advertised as
   `mcp__<server>__<tool>`; calls are routed back to the raw server/tool name.
-  Tool results are always treated as untrusted external bytes and flow through
+  A transient discovery failure preserves the prior turn's cached entries
+  for that server so a flaky server does not vanish mid-session. Tool
+  results are always treated as untrusted external bytes and flow through
   ordinary redaction, spill previews, receipts, and result budgets.
 - `[mcp.servers.<name>.permissions]`: per-server MCP permission defaults.
   `default = "allow" | "ask" | "deny"` expands to an ordinary `mcp` rule with
   target `<name>/*`. `[[mcp.servers.<name>.permissions.rules]]` accepts
   `target`, `action`, optional `source`, and optional `reason`; targets are
   server-qualified automatically, so `target = "query:*"` matches
-  `<name>/query:*`. Session rules created from the TUI approval prompt still
-  layer on top of file rules.
+  `<name>/query:*`. MCP-derived rules are layered *before* any explicit
+  `[[permissions.rules]]` in the resolved rule list, so a user-pinned
+  `[[permissions.rules]]` deny remains the last word over a server's own
+  default. Session rules created from the TUI approval prompt still layer
+  on top of file rules.
+- The `mcp` permission scope has its own default (`mcp = "ask"`) in
+  `[permissions]` so MCP tool execution does not inherit the shell-sandbox
+  policy. Override via TOML or `SQUEEZY_MCP_PERMISSION`.
 - `[telemetry]`: `enabled` and `endpoint`.
 - `[redaction]`: `custom_patterns`, an optional list of Rust regex patterns
   that extend Squeezy's built-in secret redaction.

@@ -355,6 +355,20 @@ impl Agent {
 
         tokio::spawn(async move {
             let redacted_input = redactor.redact(&input);
+            let failure_session_log = session_log.clone();
+            // Echo the user message into the TUI before kicking MCP
+            // discovery so a slow/flaky external server never delays the
+            // prompt the user just submitted.
+            if tx
+                .send(AgentEvent::UserMessage {
+                    turn_id,
+                    message: TranscriptItem::user(redacted_input.text.clone()),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
             for error in mcp_errors {
                 log_session_event(
@@ -367,17 +381,6 @@ impl Agent {
                 );
             }
             let all_tool_specs = tools.specs().into_iter().map(advertised_tool).collect();
-            let failure_session_log = session_log.clone();
-            if tx
-                .send(AgentEvent::UserMessage {
-                    turn_id,
-                    message: TranscriptItem::user(redacted_input.text.clone()),
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -1650,8 +1653,8 @@ fn legacy_scope_for_capability(capability: PermissionCapability) -> PermissionSc
         PermissionCapability::Read | PermissionCapability::Search => PermissionScope::Read,
         PermissionCapability::Edit => PermissionScope::Edit,
         PermissionCapability::Network => PermissionScope::Web,
+        PermissionCapability::Mcp => PermissionScope::Mcp,
         PermissionCapability::Shell
-        | PermissionCapability::Mcp
         | PermissionCapability::Git
         | PermissionCapability::Compiler
         | PermissionCapability::Destructive => PermissionScope::Shell,

@@ -1,9 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, JsonObject, Tool as RmcpTool},
@@ -12,11 +13,14 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{McpServerConfig, McpTransport};
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 
 pub type McpResult<T> = Result<T, McpError>;
+
+type McpService = rmcp::service::RunningService<rmcp::service::RoleClient, ()>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -62,6 +66,11 @@ pub struct ExternalMcpToolResult {
 pub struct McpClientRegistry {
     servers: Arc<BTreeMap<String, McpServerConfig>>,
     cache: Arc<Mutex<BTreeMap<String, ExternalMcpTool>>>,
+    // Long-lived service handles keyed by server name. We reuse them across
+    // discovery and tool calls so we don't pay process-spawn (stdio) or
+    // session-handshake (HTTP) cost on every invocation. Entries are removed
+    // on transport error so the next call transparently reconnects.
+    sessions: Arc<TokioMutex<BTreeMap<String, Arc<McpService>>>>,
 }
 
 impl McpClientRegistry {
@@ -69,10 +78,11 @@ impl McpClientRegistry {
         Self {
             servers: Arc::new(servers),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub fn has_no_enabled_servers(&self) -> bool {
         self.servers.iter().all(|(_, server)| !server.enabled)
     }
 
@@ -90,22 +100,47 @@ impl McpClientRegistry {
             .and_then(|cache| cache.get(model_name).cloned())
     }
 
+    /// Refresh the cached tool list by listing tools on every enabled server
+    /// in parallel. On success, the cache is updated with the fresh listing.
+    /// On per-server failure, previously cached entries for the failing
+    /// server are preserved so that a single transient timeout does not
+    /// blow up tools that the model has already learned about this session.
     pub async fn refresh_tools(&self, cancel: CancellationToken) -> Vec<McpError> {
-        if self.is_empty() {
+        let prior_cache = self
+            .cache
+            .lock()
+            .map(|cache| cache.clone())
+            .unwrap_or_default();
+
+        if self.has_no_enabled_servers() {
             if let Ok(mut cache) = self.cache.lock() {
                 cache.clear();
             }
             return Vec::new();
         }
 
-        let mut next = BTreeMap::new();
-        let mut errors = Vec::new();
+        let mut futures = FuturesUnordered::new();
         for (server_name, server) in self.servers.iter() {
             if !server.enabled {
                 continue;
             }
-            match discover_server_tools(server_name, server, cancel.clone()).await {
+            let cancel = cancel.clone();
+            let registry = self.clone();
+            let name = server_name.clone();
+            let server = server.clone();
+            futures.push(async move {
+                let result = registry.discover_one(&name, &server, cancel).await;
+                (name, result)
+            });
+        }
+
+        let mut next: BTreeMap<String, ExternalMcpTool> = BTreeMap::new();
+        let mut succeeded: BTreeSet<String> = BTreeSet::new();
+        let mut errors = Vec::new();
+        while let Some((name, result)) = futures.next().await {
+            match result {
                 Ok(tools) => {
+                    succeeded.insert(name.clone());
                     for tool in tools {
                         let model_name = unique_model_name(&next, &tool.model_name);
                         next.insert(model_name.clone(), ExternalMcpTool { model_name, ..tool });
@@ -114,7 +149,7 @@ impl McpClientRegistry {
                 Err(error) => {
                     tracing::warn!(
                         target: "squeezy::mcp",
-                        server = %server_name,
+                        server = %name,
                         error = %error,
                         "failed to discover MCP tools"
                     );
@@ -122,6 +157,23 @@ impl McpClientRegistry {
                 }
             }
         }
+
+        // Preserve prior tools for enabled servers whose refresh failed this
+        // turn so a flaky server does not vanish mid-session.
+        for (model_name, tool) in &prior_cache {
+            let server_still_enabled = self
+                .servers
+                .get(&tool.server)
+                .map(|server| server.enabled)
+                .unwrap_or(false);
+            if server_still_enabled
+                && !succeeded.contains(&tool.server)
+                && !next.contains_key(model_name)
+            {
+                next.insert(model_name.clone(), tool.clone());
+            }
+        }
+
         if let Ok(mut cache) = self.cache.lock() {
             *cache = next;
         }
@@ -142,9 +194,12 @@ impl McpClientRegistry {
             .get(&tool.server)
             .ok_or_else(|| McpError::UnknownTool {
                 tool: model_name.to_string(),
-            })?;
+            })?
+            .clone();
         let args = arguments_object(&tool.model_name, arguments)?;
-        let result = call_server_tool(&tool.server, server, &tool.raw_name, args, cancel).await?;
+        let result = self
+            .call_one(&tool.server, &server, &tool.raw_name, args, cancel)
+            .await?;
         Ok(ExternalMcpToolResult {
             server: tool.server,
             raw_name: tool.raw_name,
@@ -157,122 +212,135 @@ impl McpClientRegistry {
             content: result,
         })
     }
-}
 
-async fn discover_server_tools(
-    server_name: &str,
-    server: &McpServerConfig,
-    cancel: CancellationToken,
-) -> McpResult<Vec<ExternalMcpTool>> {
-    let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
-    with_timeout(server_name, timeout_ms, cancel, async {
-        match server.transport {
-            McpTransport::Stdio => discover_stdio_tools(server_name, server).await,
-            McpTransport::Http | McpTransport::Sse => {
-                discover_http_tools(server_name, server).await
+    async fn discover_one(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        cancel: CancellationToken,
+    ) -> McpResult<Vec<ExternalMcpTool>> {
+        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let registry = self.clone();
+        let server_for_call = server.clone();
+        let server_name_owned = server_name.to_string();
+        let result = with_timeout(server_name, timeout_ms, cancel, async move {
+            let service = registry
+                .session_for(&server_name_owned, &server_for_call)
+                .await?;
+            let tools = service
+                .list_all_tools()
+                .await
+                .map_err(|err| McpError::Transport {
+                    server: server_name_owned.clone(),
+                    message: err.to_string(),
+                })?;
+            Ok((server_name_owned, tools))
+        })
+        .await;
+        match result {
+            Ok((_, tools)) => Ok(convert_tools(server_name, server.transport, tools)),
+            Err(error) => {
+                self.invalidate_session(server_name).await;
+                Err(error)
             }
         }
-    })
-    .await
-}
+    }
 
-async fn call_server_tool(
-    server_name: &str,
-    server: &McpServerConfig,
-    tool_name: &str,
-    arguments: JsonObject,
-    cancel: CancellationToken,
-) -> McpResult<Value> {
-    let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
-    with_timeout(server_name, timeout_ms, cancel, async {
-        match server.transport {
-            McpTransport::Stdio => call_stdio_tool(server_name, server, tool_name, arguments).await,
-            McpTransport::Http | McpTransport::Sse => {
-                call_http_tool(server_name, server, tool_name, arguments).await
+    async fn call_one(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        tool_name: &str,
+        arguments: JsonObject,
+        cancel: CancellationToken,
+    ) -> McpResult<Value> {
+        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let registry = self.clone();
+        let server_for_call = server.clone();
+        let server_name_owned = server_name.to_string();
+        let tool_name_owned = tool_name.to_string();
+        let result = with_timeout(server_name, timeout_ms, cancel, async move {
+            let service = registry
+                .session_for(&server_name_owned, &server_for_call)
+                .await?;
+            let response = service
+                .call_tool(
+                    CallToolRequestParams::new(tool_name_owned.clone()).with_arguments(arguments),
+                )
+                .await
+                .map_err(|err| McpError::Transport {
+                    server: server_name_owned.clone(),
+                    message: err.to_string(),
+                })?;
+            serde_json::to_value(response).map_err(|err| McpError::Transport {
+                server: server_name_owned.clone(),
+                message: err.to_string(),
+            })
+        })
+        .await;
+        if result.is_err() {
+            self.invalidate_session(server_name).await;
+        }
+        result
+    }
+
+    async fn session_for(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+    ) -> McpResult<Arc<McpService>> {
+        // Fast path: a previously started session is already cached.
+        {
+            let sessions = self.sessions.lock().await;
+            if let Some(svc) = sessions.get(server_name) {
+                return Ok(svc.clone());
             }
         }
-    })
-    .await
+
+        // Slow path: open a new session outside the lock so concurrent
+        // discovery on other servers is not serialized behind this start.
+        let svc = match server.transport {
+            McpTransport::Stdio => start_stdio_service(server_name, server).await?,
+            McpTransport::Http | McpTransport::Sse => {
+                start_http_service(server_name, server).await?
+            }
+        };
+        let arc = Arc::new(svc);
+        let mut sessions = self.sessions.lock().await;
+        if let Some(existing) = sessions.get(server_name) {
+            // Lost the race against a concurrent caller. Use the existing
+            // session and drop the duplicate; the unused service is reaped
+            // by rmcp on Drop.
+            return Ok(existing.clone());
+        }
+        sessions.insert(server_name.to_string(), arc.clone());
+        Ok(arc)
+    }
+
+    async fn invalidate_session(&self, server_name: &str) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.remove(server_name);
+    }
+
+    /// Tear down every cached session. Useful at shutdown so child processes
+    /// reap promptly instead of waiting for the registry Arc to drop.
+    pub async fn shutdown(&self) {
+        let mut sessions = self.sessions.lock().await;
+        sessions.clear();
+    }
+
+    /// Seed the in-memory tool cache directly. Intended for tests that need
+    /// to pre-populate cached entries to verify refresh/preservation logic
+    /// without spawning real MCP servers.
+    #[doc(hidden)]
+    pub fn insert_cached_tool_for_test(&self, tool: ExternalMcpTool) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(tool.model_name.clone(), tool);
+        }
+    }
 }
 
-async fn discover_stdio_tools(
-    server_name: &str,
-    server: &McpServerConfig,
-) -> McpResult<Vec<ExternalMcpTool>> {
-    let service = start_stdio_service(server_name, server).await?;
-    let tools = service
-        .list_all_tools()
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
-    let _ = service.cancel().await;
-    Ok(convert_tools(server_name, server.transport, tools))
-}
-
-async fn call_stdio_tool(
-    server_name: &str,
-    server: &McpServerConfig,
-    tool_name: &str,
-    arguments: JsonObject,
-) -> McpResult<Value> {
-    let service = start_stdio_service(server_name, server).await?;
-    let result = service
-        .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
-    let _ = service.cancel().await;
-    serde_json::to_value(result).map_err(|err| McpError::Transport {
-        server: server_name.to_string(),
-        message: err.to_string(),
-    })
-}
-
-async fn discover_http_tools(
-    server_name: &str,
-    server: &McpServerConfig,
-) -> McpResult<Vec<ExternalMcpTool>> {
-    let service = start_http_service(server_name, server).await?;
-    let tools = service
-        .list_all_tools()
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
-    let _ = service.cancel().await;
-    Ok(convert_tools(server_name, server.transport, tools))
-}
-
-async fn call_http_tool(
-    server_name: &str,
-    server: &McpServerConfig,
-    tool_name: &str,
-    arguments: JsonObject,
-) -> McpResult<Value> {
-    let service = start_http_service(server_name, server).await?;
-    let result = service
-        .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments))
-        .await
-        .map_err(|err| McpError::Transport {
-            server: server_name.to_string(),
-            message: err.to_string(),
-        })?;
-    let _ = service.cancel().await;
-    serde_json::to_value(result).map_err(|err| McpError::Transport {
-        server: server_name.to_string(),
-        message: err.to_string(),
-    })
-}
-
-async fn start_stdio_service(
-    server_name: &str,
-    server: &McpServerConfig,
-) -> McpResult<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
+async fn start_stdio_service(server_name: &str, server: &McpServerConfig) -> McpResult<McpService> {
     let command = server
         .command
         .as_ref()
@@ -294,10 +362,7 @@ async fn start_stdio_service(
         })
 }
 
-async fn start_http_service(
-    server_name: &str,
-    server: &McpServerConfig,
-) -> McpResult<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
+async fn start_http_service(server_name: &str, server: &McpServerConfig) -> McpResult<McpService> {
     let url = server.url.as_ref().ok_or_else(|| McpError::MissingUrl {
         server: server_name.to_string(),
         transport: match server.transport {
