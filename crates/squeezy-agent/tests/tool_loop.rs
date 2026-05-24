@@ -655,6 +655,53 @@ async fn repeated_read_result_returns_receipt_stub_to_model() {
 }
 
 #[tokio::test]
+async fn successful_read_result_persists_model_visible_snapshot() {
+    let root = temp_workspace("read_snapshot");
+    fs::write(root.join("sample.txt"), "visible content\n").expect("write sample");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_once".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "sample.txt"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider);
+
+    drain_turn(agent.start_turn("read once".to_string(), CancellationToken::new())).await;
+    drop(agent);
+
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    let snapshot = store
+        .read_snapshot("sample.txt")
+        .expect("read snapshot")
+        .expect("snapshot exists");
+    assert_eq!(snapshot.call_id, "read_once");
+    assert_eq!(snapshot.content, "visible content\n");
+    let expected_hash = sha256_hex("visible content\n".as_bytes());
+    assert_eq!(
+        snapshot.content_sha256.as_deref(),
+        Some(expected_hash.as_str())
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn repeated_read_result_returns_receipt_stub_across_sessions() {
     let root = temp_workspace("receipt_stub_cross_session");
     fs::write(root.join("sample.txt"), "durable content\n").expect("write sample");

@@ -124,8 +124,23 @@ model-facing tool output compact enough to be useful.
 - **MCP tool spill routing.** External MCP tool execution should pass through
   the same spill, preview, and receipt-stub layer once MCP tool execution
   exists.
-- **Diff awareness.** The current branch diff and recently changed files should
-  be queryable as compact summaries.
+- **Diff awareness.** The current branch diff and recently changed files are
+  queryable as compact summaries through `diff_context`. `read_slice` also
+  supports `read_mode="diff"` for source bytes changed against `worktree`
+  (staged, unstaged, and untracked changes vs `HEAD`), `branch_base` (the
+  default-branch merge base), `index` (staged changes), or `last_receipt`.
+  Ranges today are line/byte hunks derived from git, not symbol spans; a
+  graph-driven structural variant that returns enclosing symbol spans is a
+  follow-up.
+- **Last-receipt fallback semantics.** `last_receipt` compares the requested
+  window against the most recent model-visible read snapshot for that exact
+  `(path, start_byte, end_byte)` tuple, returns a receipt stub when the file
+  hash is unchanged, and otherwise falls back to `worktree` with a
+  `baseline_fallback` label (`last_receipt_store_unavailable`,
+  `last_receipt_snapshot_missing`, `last_receipt_window_mismatch`,
+  `last_receipt_current_file_unavailable`, or `last_receipt_store_error`) so
+  the model can tell apart "no snapshot" from "snapshot for a different
+  window" from "transient IO error".
 - **Deferred tool loading.** Long-tail tools, including MCP tools, should load
   schemas only when the model actually needs them.
 - **Provider cache controls.** Provider-specific cache keys and cache-friendly

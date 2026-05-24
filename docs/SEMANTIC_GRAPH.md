@@ -151,7 +151,12 @@ The agent-facing graph tool surface is:
   bounded call-chain context
 - `symbol_context` and `hierarchy` for focused symbol/module exploration
 - `read_slice` for exact bounded source slices from graph spans or explicit
-  byte/line ranges
+  byte/line ranges, plus `read_mode="diff"` for changed ranges against
+  `worktree`, `branch_base`, `index`, or `last_receipt` baselines. The
+  changed-range schema is line/byte hunks derived from git today; a
+  graph-driven variant that expands each changed range to the smallest
+  enclosing symbol span (function, method, impl, test) is a follow-up rather
+  than something this surface already implements.
 
 Graph navigation tools return uniform evidence packets with `claim`, `spans`,
 `confidence`, `freshness`, `provenance`, `cost_hint`, and `next_action`.

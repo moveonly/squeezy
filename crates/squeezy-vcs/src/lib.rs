@@ -60,6 +60,14 @@ pub enum DiffMode {
     #[default]
     Worktree,
     Branch,
+    /// Alias for [`DiffMode::Branch`] kept so the read-side baseline names
+    /// (`worktree`/`branch_base`/`index`/`last_receipt`) line up one-to-one
+    /// with `read_slice` arguments. Every dispatch in this crate treats it
+    /// identically to `Branch`; if a real distinction is ever needed (for
+    /// example diffing the merge base against the branch tip with a different
+    /// `refish`), update both call sites in `snapshot` at the same time.
+    BranchBase,
+    Index,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -257,18 +265,22 @@ impl GitVcs {
         let vcs = self.vcs_info(&git_root, mode, &mut errors);
         let refish = match mode {
             DiffMode::Worktree => vcs.head.as_deref(),
-            DiffMode::Branch => vcs.merge_base.as_deref(),
+            DiffMode::Branch | DiffMode::BranchBase => vcs.merge_base.as_deref(),
+            DiffMode::Index => vcs.head.as_deref(),
         };
 
         let mut by_path = BTreeMap::<String, DiffFile>::new();
-        for item in self.status_files(&git_root, &mut errors) {
-            by_path.insert(item.path.clone(), item);
+        if mode != DiffMode::Index {
+            for item in self.status_files(&git_root, &mut errors) {
+                by_path.insert(item.path.clone(), item);
+            }
         }
         if let Some(refish) = refish {
-            for item in self.name_status_files(&git_root, refish, &mut errors) {
+            let cached = mode == DiffMode::Index;
+            for item in self.name_status_files(&git_root, refish, cached, &mut errors) {
                 by_path.entry(item.path.clone()).or_insert(item);
             }
-            for (path, stat) in self.numstat(&git_root, refish, &mut errors) {
+            for (path, stat) in self.numstat(&git_root, refish, cached, &mut errors) {
                 let entry = by_path.entry(path.clone()).or_insert_with(|| DiffFile {
                     path,
                     status: DiffFileStatus::Modified,
@@ -303,6 +315,7 @@ impl GitVcs {
                 self.patch_file(
                     &git_root,
                     refish.unwrap_or("HEAD"),
+                    mode == DiffMode::Index,
                     &file.path,
                     options.max_patch_bytes,
                 )
@@ -365,7 +378,7 @@ impl GitVcs {
         let branch = git_text(git_root, ["symbolic-ref", "--quiet", "--short", "HEAD"]).ok();
         let head = git_text(git_root, ["rev-parse", "--verify", "HEAD"]).ok();
         let default_branch = default_branch(git_root);
-        let merge_base = if mode == DiffMode::Branch {
+        let merge_base = if matches!(mode, DiffMode::Branch | DiffMode::BranchBase) {
             default_branch
                 .as_deref()
                 .and_then(|base| git_text(git_root, ["merge-base", base, "HEAD"]).ok())
@@ -375,7 +388,7 @@ impl GitVcs {
         let operation_state = git_dir
             .as_deref()
             .and_then(|path| transient_operation_state(Path::new(path)));
-        if mode == DiffMode::Branch && default_branch.is_none() {
+        if matches!(mode, DiffMode::Branch | DiffMode::BranchBase) && default_branch.is_none() {
             errors.push("default branch could not be determined for branch diff".to_string());
         }
         VcsInfo {
@@ -447,22 +460,26 @@ impl GitVcs {
         &self,
         git_root: &Path,
         refish: &str,
+        cached: bool,
         errors: &mut Vec<String>,
     ) -> Vec<DiffFile> {
-        let output = match git_output(
-            git_root,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-renames",
-                "--name-status",
-                "-z",
-                refish,
-                "--",
-                ".",
-                ":(exclude).squeezy",
-            ],
-        ) {
+        let mut args = vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--name-status".to_string(),
+            "-z".to_string(),
+        ];
+        if cached {
+            args.push("--cached".to_string());
+        }
+        args.extend([
+            refish.to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ]);
+        let output = match git_output_vec_allow_status(git_root, args, &[0]) {
             Ok(output) => output,
             Err(err) => {
                 errors.push(err);
@@ -495,22 +512,26 @@ impl GitVcs {
         &self,
         git_root: &Path,
         refish: &str,
+        cached: bool,
         errors: &mut Vec<String>,
     ) -> BTreeMap<String, FileStat> {
-        let output = match git_output(
-            git_root,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-renames",
-                "--numstat",
-                "-z",
-                refish,
-                "--",
-                ".",
-                ":(exclude).squeezy",
-            ],
-        ) {
+        let mut args = vec![
+            "diff".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--numstat".to_string(),
+            "-z".to_string(),
+        ];
+        if cached {
+            args.push("--cached".to_string());
+        }
+        args.extend([
+            refish.to_string(),
+            "--".to_string(),
+            ".".to_string(),
+            ":(exclude).squeezy".to_string(),
+        ]);
+        let output = match git_output_vec_allow_status(git_root, args, &[0]) {
             Ok(output) => output,
             Err(err) => {
                 errors.push(err);
@@ -534,24 +555,22 @@ impl GitVcs {
         &self,
         git_root: &Path,
         refish: &str,
+        cached: bool,
         file: &str,
         max_bytes: usize,
     ) -> Option<Patch> {
-        let output = git_output_allow_status(
-            git_root,
-            [
-                "diff",
-                "--patch",
-                "--no-ext-diff",
-                "--no-renames",
-                "--unified=3",
-                refish,
-                "--",
-                file,
-            ],
-            &[0],
-        )
-        .ok()?;
+        let mut args = vec![
+            "diff".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--unified=3".to_string(),
+        ];
+        if cached {
+            args.push("--cached".to_string());
+        }
+        args.extend([refish.to_string(), "--".to_string(), file.to_string()]);
+        let output = git_output_vec_allow_status(git_root, args, &[0]).ok()?;
         Some(capped_patch(output.stdout, max_bytes))
     }
 

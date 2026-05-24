@@ -40,7 +40,7 @@ use squeezy_mcp::{ExternalMcpTool, McpClientRegistry};
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog};
 use squeezy_store::SqueezyStore;
 use squeezy_vcs::{
-    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
+    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
 };
 use squeezy_workspace::{
@@ -450,6 +450,16 @@ pub struct ToolRegistry {
     http: Arc<dyn WebHttpClient>,
     graph: Arc<StdMutex<Option<GraphManager>>>,
     vcs: Arc<GitVcs>,
+    /// Shared persistent state store. When `None`, `read_mode=diff` with
+    /// `diff_baseline=last_receipt` cannot reach any stored read snapshots and
+    /// silently falls back to the `worktree` baseline (with a
+    /// `baseline_fallback.reason = "last_receipt_store_unavailable"` label on
+    /// the result). Several test-only registry constructors leave this as
+    /// `None` on purpose — integration tests that need the receipt-stub path
+    /// should build the registry through `new_with_configs_and_skills`
+    /// (or `new_with_configs_skills_and_mcp`) with a populated
+    /// [`ToolRegistryRuntime`].
+    state_store: Option<Arc<SqueezyStore>>,
     checkpoints: Arc<CheckpointStore>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
@@ -777,7 +787,7 @@ impl ToolRegistry {
             &root,
             Default::default(),
             crawl_options.clone(),
-            state_store,
+            state_store.clone(),
         )
         .ok();
         let vcs = GitVcs::open(&root)?;
@@ -790,6 +800,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
@@ -829,6 +840,7 @@ impl ToolRegistry {
             http,
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
+            state_store: None,
             checkpoints: Arc::new(checkpoints),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
@@ -2613,12 +2625,20 @@ impl ToolRegistry {
                 Ok(target) => target,
                 Err(err) => return tool_error(call, err),
             };
-        let path = match self.resolve_existing(&path_arg) {
-            Ok(path) => path,
-            Err(err) => return tool_error(call, err),
+        let diff_mode = args.read_mode.unwrap_or_default() == ReadSliceReadMode::Diff;
+        let path = if diff_mode {
+            match self.join_workspace(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
+        } else {
+            match self.resolve_existing(&path_arg) {
+                Ok(path) => path,
+                Err(err) => return tool_error(call, err),
+            }
         };
         let rel = self.relative(&path);
-        if args.diff_only.unwrap_or(false) {
+        if !diff_mode && args.diff_only.unwrap_or(false) {
             let diff_paths =
                 diff_path_set(&self.diff_snapshot(DiffMode::Worktree, DiffOptions::default()));
             if !diff_paths.contains(rel.to_string_lossy().as_ref()) {
@@ -2640,6 +2660,30 @@ impl ToolRegistry {
                 None,
             );
         }
+        if diff_mode {
+            let rel_str = rel.to_string_lossy().to_string();
+            let ctx = ReadSliceDiffCtx {
+                call,
+                args: &args,
+                path: &path,
+                rel: rel_str.as_str(),
+                graph_available: graph.is_some(),
+                graph_status,
+                confidence,
+                provenance,
+                span,
+            };
+            return self.execute_read_slice_diff_blocking(&ctx);
+        }
+        let path = match path.canonicalize() {
+            Ok(path) => path,
+            Err(err) => {
+                return tool_error(
+                    call,
+                    format!("path does not exist or is inaccessible: {err}"),
+                );
+            }
+        };
 
         let total_bytes = match file_len(&path) {
             Ok(len) => len,
@@ -2706,7 +2750,7 @@ impl ToolRegistry {
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("bytes_returned".to_string(), json!(bytes.len()));
         payload.insert("total_bytes".to_string(), json!(total_bytes));
-        payload.insert("sha256".to_string(), json!(content_sha256));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
         payload.insert("truncated".to_string(), json!(truncated));
         if let Some(reason) = ignored_reason {
             payload.insert("ignored".to_string(), json!(true));
@@ -2721,6 +2765,484 @@ impl ToolRegistry {
             cost,
             Some(content_sha256),
         )
+    }
+
+    fn execute_read_slice_diff_blocking(&self, ctx: &ReadSliceDiffCtx<'_>) -> ToolResult {
+        let baseline_requested = ctx.args.diff_baseline.unwrap_or_default();
+        if baseline_requested == DiffReadBaseline::LastReceipt {
+            match self.read_slice_last_receipt_diff(ctx) {
+                LastReceiptDiffOutcome::Result(result) => return result,
+                LastReceiptDiffOutcome::Fallback(reason) => {
+                    return self.read_slice_git_diff(
+                        ctx,
+                        DiffReadBaseline::Worktree,
+                        Some(json!({
+                            "requested": diff_read_baseline_str(baseline_requested),
+                            "used": diff_read_baseline_str(DiffReadBaseline::Worktree),
+                            "reason": reason,
+                        })),
+                    );
+                }
+            }
+        }
+        self.read_slice_git_diff(ctx, baseline_requested, None)
+    }
+
+    fn read_slice_git_diff(
+        &self,
+        ctx: &ReadSliceDiffCtx<'_>,
+        baseline: DiffReadBaseline,
+        baseline_fallback: Option<Value>,
+    ) -> ToolResult {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            ..
+        } = ctx;
+        let rel = *rel;
+        let snapshot_mode = match baseline {
+            DiffReadBaseline::Worktree | DiffReadBaseline::LastReceipt => DiffMode::Worktree,
+            DiffReadBaseline::BranchBase => DiffMode::BranchBase,
+            DiffReadBaseline::Index => DiffMode::Index,
+        };
+        let max_ranges = args.max_ranges.unwrap_or(20).clamp(1, 100);
+        // Cap diff reads at the same per-file budget the crawler uses to skip
+        // oversized files. A multi-hundred-MB modified file would otherwise be
+        // fully slurped before any per-range cap applies; the slice mode
+        // already pages through `read_slice_byte_window`, but the diff path
+        // needs the whole current file to attribute hunks to byte ranges.
+        if let Ok(size) = file_len(path) {
+            let limit = self.crawl_options.max_file_bytes;
+            if limit > 0 && size > limit {
+                let mut payload = serde_json::Map::new();
+                payload.insert("tool".to_string(), json!("read_slice"));
+                payload.insert("read_mode".to_string(), json!("diff"));
+                payload.insert("status".to_string(), json!("file_too_large"));
+                payload.insert("graph_available".to_string(), json!(*graph_available));
+                payload.insert("graph_status".to_string(), json!(*graph_status));
+                payload.insert(
+                    "baseline_requested".to_string(),
+                    json!(diff_read_baseline_str(
+                        args.diff_baseline.unwrap_or_default()
+                    )),
+                );
+                payload.insert(
+                    "baseline_used".to_string(),
+                    json!(diff_read_baseline_str(baseline)),
+                );
+                if let Some(fallback) = baseline_fallback {
+                    payload.insert("baseline_fallback".to_string(), fallback);
+                }
+                payload.insert("path".to_string(), json!(rel));
+                payload.insert("total_bytes".to_string(), json!(size));
+                payload.insert("max_file_bytes".to_string(), json!(limit));
+                payload.insert("ranges".to_string(), json!([]));
+                payload.insert("packets".to_string(), json!([]));
+                payload.insert("truncated".to_string(), json!(true));
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    Value::Object(payload),
+                    ToolCostHint {
+                        truncated: true,
+                        ..ToolCostHint::default()
+                    },
+                    None,
+                );
+            }
+        }
+        let snapshot = self.diff_snapshot(
+            snapshot_mode,
+            DiffOptions {
+                include_patch: true,
+                max_patch_bytes: 5_000_000,
+            },
+        );
+        let file = snapshot.files.iter().find(|file| file.path == rel);
+        let content_sha256 = path.exists().then(|| sha256_file(path).ok()).flatten();
+        let current_text = path
+            .exists()
+            .then(|| fs::read(path).ok())
+            .flatten()
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+        let mut cost = ToolCostHint::default();
+        let mut truncated = snapshot.truncated;
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+
+        if let Some(file) = file {
+            if file.binary {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a changed binary file; source bytes were omitted",
+                    *confidence,
+                    provenance,
+                    ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
+                ));
+                ranges.push(json!({
+                    "status": diff_status_str(file.status),
+                    "binary": true,
+                    "content_omitted": "binary_file",
+                }));
+            } else if file.status == DiffFileStatus::Deleted {
+                packets.push(read_diff_packet(
+                    rel,
+                    None,
+                    "read_slice diff found a deleted file; current source bytes are unavailable",
+                    *confidence,
+                    provenance,
+                    ToolCostHint::default(),
+                    DiffNextActionKind::ReadSlice,
+                ));
+                ranges.push(json!({
+                    "status": "deleted",
+                    "content_omitted": "deleted_file",
+                }));
+            } else if let Some(text) = current_text.as_deref() {
+                let changed_ranges = file
+                    .patch
+                    .as_deref()
+                    .map(|patch| changed_byte_ranges_from_patch(patch, text))
+                    .filter(|ranges| !ranges.is_empty())
+                    .unwrap_or_else(|| {
+                        if file.status == DiffFileStatus::Added {
+                            vec![ChangedByteRange::new(
+                                0,
+                                text.len(),
+                                1,
+                                text.lines().count().max(1) as u32,
+                                "added",
+                            )]
+                        } else {
+                            diff_hunks_to_byte_ranges(&file.hunks, text)
+                        }
+                    });
+                for range in changed_ranges.into_iter().take(max_ranges) {
+                    let bytes = text.as_bytes();
+                    let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+                    let content =
+                        String::from_utf8_lossy(&bytes[range.start..capped_end]).to_string();
+                    let range_truncated = capped_end < range.end;
+                    truncated |= range_truncated;
+                    let range_cost = ToolCostHint {
+                        bytes_read: content.len() as u64,
+                        output_bytes: content.len() as u64,
+                        truncated: range_truncated,
+                        ..ToolCostHint::default()
+                    };
+                    cost.bytes_read += range_cost.bytes_read;
+                    cost.truncated |= range_truncated;
+                    let span = SourceSpan::new(
+                        range.start.min(u32::MAX as usize) as u32,
+                        range.end.min(u32::MAX as usize) as u32,
+                        squeezy_core::SourcePoint::new(range.start_line.saturating_sub(1), 0),
+                        squeezy_core::SourcePoint::new(range.end_line.saturating_sub(1), 0),
+                    );
+                    packets.push(read_diff_packet(
+                        rel,
+                        Some(span),
+                        "read_slice diff returned changed source bytes",
+                        *confidence,
+                        provenance,
+                        range_cost,
+                        // Range carries `content` inline, so steer the model to
+                        // graph-backed context for the enclosing symbol rather
+                        // than re-fetching the same bytes via slice mode.
+                        DiffNextActionKind::SymbolContextOrSlice {
+                            rust_graph: *graph_available && *graph_status == "rust",
+                        },
+                    ));
+                    ranges.push(json!({
+                        "status": range.status,
+                        "start_byte": range.start,
+                        "end_byte": range.end,
+                        "start_line": range.start_line,
+                        "end_line": range.end_line,
+                        "bytes_returned": content.len(),
+                        "truncated": range_truncated,
+                        "content": content,
+                    }));
+                }
+                truncated |= file.patch_truncated
+                    || (ranges.len() >= max_ranges && file.hunks.len() > max_ranges);
+            }
+        }
+
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changed source ranges for this path",
+                *confidence,
+                provenance,
+                ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
+            ));
+        }
+
+        cost.matches_returned = ranges.len() as u64;
+        cost.truncated |= truncated;
+        let mut payload = serde_json::Map::new();
+        payload.insert("tool".to_string(), json!("read_slice"));
+        payload.insert("read_mode".to_string(), json!("diff"));
+        payload.insert("graph_available".to_string(), json!(*graph_available));
+        payload.insert("graph_status".to_string(), json!(*graph_status));
+        payload.insert(
+            "baseline_requested".to_string(),
+            json!(diff_read_baseline_str(
+                args.diff_baseline.unwrap_or_default()
+            )),
+        );
+        payload.insert(
+            "baseline_used".to_string(),
+            json!(diff_read_baseline_str(baseline)),
+        );
+        if let Some(fallback) = baseline_fallback {
+            payload.insert("baseline_fallback".to_string(), fallback);
+        }
+        payload.insert("path".to_string(), json!(rel));
+        payload.insert("sha256".to_string(), json!(&content_sha256));
+        // `path_in_diff` is the literal "git reports a diff for this path"
+        // signal: it stays true even when no source ranges survive (e.g.
+        // binary/deleted files) so callers can distinguish "clean file" from
+        // "changed file with no readable content".
+        let path_in_diff = file.is_some();
+        payload.insert("path_in_diff".to_string(), json!(path_in_diff));
+        // Back-compat alias: pre-fix consumers read `unchanged` to mean "git
+        // reports no diff for this path". Keep the same wire shape but only
+        // claim "unchanged" when both git is clean *and* we produced no
+        // packets, so binary/deleted entries no longer masquerade as clean.
+        payload.insert(
+            "unchanged".to_string(),
+            json!(!path_in_diff && ranges.is_empty()),
+        );
+        payload.insert("ranges".to_string(), json!(ranges));
+        payload.insert("packets".to_string(), json!(packets));
+        payload.insert("truncated".to_string(), json!(cost.truncated));
+        payload.insert("vcs".to_string(), json!(snapshot.vcs));
+        payload.insert("errors".to_string(), json!(snapshot.errors));
+        make_result(
+            call,
+            ToolStatus::Success,
+            Value::Object(payload),
+            cost,
+            content_sha256,
+        )
+    }
+
+    fn read_slice_last_receipt_diff(&self, ctx: &ReadSliceDiffCtx<'_>) -> LastReceiptDiffOutcome {
+        let ReadSliceDiffCtx {
+            call,
+            args,
+            path,
+            rel,
+            graph_available,
+            graph_status,
+            confidence,
+            provenance,
+            span,
+        } = ctx;
+        let rel = *rel;
+        let Some(store) = self.state_store.as_deref() else {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_store_unavailable");
+        };
+        let snapshots = match store.read_snapshots_for_path(rel) {
+            Ok(snapshots) => snapshots,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_store_error"),
+        };
+        if snapshots.is_empty() {
+            return LastReceiptDiffOutcome::Fallback("last_receipt_snapshot_missing");
+        }
+        let content_sha256 = match sha256_file(path) {
+            Ok(hash) => hash,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let total_bytes = match file_len(path) {
+            Ok(len) => len,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let (offset, limit, _) = match read_slice_byte_window(path, total_bytes, args, *span) {
+            Ok(window) => window,
+            Err(_) => return LastReceiptDiffOutcome::Fallback("last_receipt_window_unavailable"),
+        };
+        let end = offset.saturating_add(limit).min(total_bytes as usize);
+        // Pick the most recent snapshot whose stored window exactly matches the
+        // requested `[offset, end)`. Storage is keyed by
+        // `(path, start_byte, end_byte)`, so distinct windows of the same file
+        // do not overwrite each other and the requested window is found even
+        // if a subsequent unrelated read landed for the same path.
+        let snapshot = snapshots
+            .iter()
+            .filter(|snapshot| {
+                snapshot.start_byte == offset as u64 && snapshot.end_byte == end as u64
+            })
+            .max_by_key(|snapshot| snapshot.created_unix_millis);
+        let snapshot = match snapshot {
+            Some(snapshot) => snapshot.clone(),
+            None => return LastReceiptDiffOutcome::Fallback("last_receipt_window_mismatch"),
+        };
+        if snapshot.content_sha256.as_deref() == Some(content_sha256.as_str()) {
+            // `cost_hint.truncated` semantically means "we omitted bytes the
+            // caller would have got". The unchanged stub omits bytes by design
+            // because they were unchanged, so report it as a dedup save rather
+            // than a truncation — the latter biases the budget broker against
+            // the receipt-stub path.
+            let cost = ToolCostHint::default();
+            let packet = read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes since the last receipt",
+                *confidence,
+                provenance,
+                cost.clone(),
+                DiffNextActionKind::ReadSlice,
+            );
+            return LastReceiptDiffOutcome::Result(make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "tool": "read_slice",
+                    "read_mode": "diff",
+                    "graph_available": *graph_available,
+                    "graph_status": *graph_status,
+                    "baseline_requested": "last_receipt",
+                    "baseline_used": "last_receipt",
+                    "path": rel,
+                    "sha256": &content_sha256,
+                    "unchanged": true,
+                    "receipt_stub": true,
+                    "dedup": true,
+                    "same_as_call_id": snapshot.call_id,
+                    "same_as_tool_name": snapshot.tool_name,
+                    "original_output_sha256": snapshot.stable_output_sha256,
+                    "original_content_sha256": snapshot.content_sha256,
+                    "original_model_output_bytes": snapshot.model_output_bytes,
+                    "ranges": [],
+                    "packets": [packet],
+                    "truncated": false,
+                }),
+                cost,
+                Some(content_sha256.clone()),
+            ));
+        }
+
+        let bytes = match read_range(path, offset as u64, limit) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let current = String::from_utf8_lossy(&bytes).to_string();
+        // Line numbers must be reported against the full file, not against the
+        // window. `current` covers `[offset, offset+limit)` only, so count the
+        // newlines that precede `offset` once and apply that offset to each
+        // window-local line number.
+        let line_offset_before_window = match window_line_offset(path, offset) {
+            Ok(value) => value,
+            Err(_) => {
+                return LastReceiptDiffOutcome::Fallback("last_receipt_current_file_unavailable");
+            }
+        };
+        let local_ranges = byte_diff_ranges(snapshot.content.as_bytes(), current.as_bytes());
+        let mut cost = ToolCostHint::default();
+        let mut ranges = Vec::new();
+        let mut packets = Vec::new();
+        for range in local_ranges
+            .into_iter()
+            .take(args.max_ranges.unwrap_or(20).clamp(1, 100))
+        {
+            let start = offset.saturating_add(range.start);
+            let end_bytes = offset.saturating_add(range.end);
+            let capped_end = range.end.min(range.start.saturating_add(MAX_READ_LIMIT));
+            let content =
+                String::from_utf8_lossy(&current.as_bytes()[range.start..capped_end]).to_string();
+            let range_truncated = capped_end < range.end;
+            let start_line = line_number_for_byte(&current, range.start)
+                .saturating_add(line_offset_before_window);
+            let end_line =
+                line_number_for_byte(&current, range.end.saturating_sub(1).max(range.start))
+                    .saturating_add(line_offset_before_window);
+            let span = SourceSpan::new(
+                start.min(u32::MAX as usize) as u32,
+                end_bytes.min(u32::MAX as usize) as u32,
+                squeezy_core::SourcePoint::new(start_line.saturating_sub(1), 0),
+                squeezy_core::SourcePoint::new(end_line.saturating_sub(1), 0),
+            );
+            let range_cost = ToolCostHint {
+                bytes_read: content.len() as u64,
+                output_bytes: content.len() as u64,
+                truncated: range_truncated,
+                ..ToolCostHint::default()
+            };
+            cost.bytes_read += range_cost.bytes_read;
+            cost.truncated |= range_truncated;
+            packets.push(read_diff_packet(
+                rel,
+                Some(span),
+                "read_slice diff returned source bytes changed since the last receipt",
+                *confidence,
+                provenance,
+                range_cost,
+                DiffNextActionKind::SymbolContextOrSlice {
+                    rust_graph: *graph_available && *graph_status == "rust",
+                },
+            ));
+            ranges.push(json!({
+                "status": "modified",
+                "start_byte": start,
+                "end_byte": end_bytes,
+                "start_line": start_line,
+                "end_line": end_line,
+                "bytes_returned": content.len(),
+                "truncated": range_truncated,
+                "content": content,
+            }));
+        }
+        if ranges.is_empty() {
+            packets.push(read_diff_packet(
+                rel,
+                None,
+                "read_slice diff found no changes in the last receipt window",
+                *confidence,
+                provenance,
+                ToolCostHint::default(),
+                DiffNextActionKind::ReadSlice,
+            ));
+        }
+        cost.matches_returned = ranges.len() as u64;
+        let result = make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "tool": "read_slice",
+                "read_mode": "diff",
+                "graph_available": *graph_available,
+                "graph_status": *graph_status,
+                "baseline_requested": "last_receipt",
+                "baseline_used": "last_receipt",
+                "path": rel,
+                "sha256": &content_sha256,
+                "unchanged": false,
+                "ranges": ranges,
+                "packets": packets,
+                "truncated": cost.truncated,
+            }),
+            cost,
+            Some(content_sha256.clone()),
+        );
+        LastReceiptDiffOutcome::Result(result)
     }
 
     fn graph_context_for_snapshot(
@@ -6337,6 +6859,9 @@ struct ReadSliceArgs {
     path: Option<String>,
     symbol_id: Option<String>,
     span_kind: Option<ReadSliceSpanKind>,
+    read_mode: Option<ReadSliceReadMode>,
+    diff_baseline: Option<DiffReadBaseline>,
+    max_ranges: Option<usize>,
     start_byte: Option<usize>,
     end_byte: Option<usize>,
     start_line: Option<u32>,
@@ -6345,6 +6870,25 @@ struct ReadSliceArgs {
     offset: Option<usize>,
     limit: Option<usize>,
     diff_only: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReadSliceReadMode {
+    #[default]
+    Slice,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DiffReadBaseline {
+    #[default]
+    Worktree,
+    #[serde(alias = "branch")]
+    BranchBase,
+    Index,
+    LastReceipt,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -6591,6 +7135,8 @@ fn diff_mode_str(mode: DiffMode) -> &'static str {
     match mode {
         DiffMode::Worktree => "worktree",
         DiffMode::Branch => "branch",
+        DiffMode::BranchBase => "branch_base",
+        DiffMode::Index => "index",
     }
 }
 
@@ -6630,6 +7176,322 @@ fn diff_status_str(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Deleted => "deleted",
         DiffFileStatus::Modified => "modified",
     }
+}
+
+fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
+    match baseline {
+        DiffReadBaseline::Worktree => "worktree",
+        DiffReadBaseline::BranchBase => "branch_base",
+        DiffReadBaseline::Index => "index",
+        DiffReadBaseline::LastReceipt => "last_receipt",
+    }
+}
+
+enum LastReceiptDiffOutcome {
+    Result(ToolResult),
+    Fallback(&'static str),
+}
+
+/// Bundle of arguments shared by the three `read_mode=diff` helpers. Grouping
+/// them keeps each helper under `clippy::too_many_arguments` and removes the
+/// duplicated argument forwarding between `execute_read_slice_diff_blocking`
+/// → `read_slice_git_diff` / `read_slice_last_receipt_diff` plus the
+/// `LastReceipt` → `Worktree` fallback re-call.
+struct ReadSliceDiffCtx<'a> {
+    call: &'a ToolCall,
+    args: &'a ReadSliceArgs,
+    path: &'a Path,
+    rel: &'a str,
+    graph_available: bool,
+    graph_status: &'static str,
+    confidence: Confidence,
+    provenance: Vec<Provenance>,
+    span: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedByteRange {
+    start: usize,
+    end: usize,
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+impl ChangedByteRange {
+    fn new(start: usize, end: usize, start_line: u32, end_line: u32, status: &'static str) -> Self {
+        Self {
+            start,
+            end,
+            start_line,
+            end_line,
+            status,
+        }
+    }
+}
+
+/// Next-action recommendation for a diff packet. Diff ranges that already
+/// carry the changed bytes inline should not steer the model back to
+/// `read_slice` in slice mode for the same path — that just re-fetches the
+/// same content. Prefer `symbol_context` (Rust graph available) so the model
+/// can pull the enclosing symbol's callers/callees instead.
+#[derive(Debug, Clone, Copy)]
+enum DiffNextActionKind {
+    /// Recommend the slice mode of `read_slice` for cases that did not
+    /// already include source bytes (binary files, deleted files, empty
+    /// range lists). Surrounding context still needs a real fetch.
+    ReadSlice,
+    /// Recommend either `symbol_context` (when the Rust semantic graph is
+    /// available for this path) or the slice mode of `read_slice` (as a
+    /// language-agnostic fallback). Used when the diff range already includes
+    /// `content` inline.
+    SymbolContextOrSlice { rust_graph: bool },
+}
+
+fn read_diff_next_action(path: &str, kind: DiffNextActionKind) -> Value {
+    match kind {
+        DiffNextActionKind::ReadSlice => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read the exact current source slice if surrounding context is needed"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: true } => json!({
+            "tool": "symbol_context",
+            "arguments": {
+                "path": path
+            },
+            "reason": "look up the enclosing symbol's callers and callees instead of refetching the same diff bytes"
+        }),
+        DiffNextActionKind::SymbolContextOrSlice { rust_graph: false } => json!({
+            "tool": "read_slice",
+            "arguments": {
+                "path": path,
+                "read_mode": "slice"
+            },
+            "reason": "read additional surrounding source if context beyond the diff bytes is needed"
+        }),
+    }
+}
+
+fn read_diff_packet(
+    path: &str,
+    span: Option<SourceSpan>,
+    claim: &'static str,
+    confidence: Confidence,
+    provenance: &[Provenance],
+    cost_hint: ToolCostHint,
+    next_action_kind: DiffNextActionKind,
+) -> Value {
+    evidence_packet(
+        claim,
+        vec![span_for_path_json(path, span)],
+        confidence,
+        Freshness::Fresh,
+        provenance.to_vec(),
+        cost_hint,
+        read_diff_next_action(path, next_action_kind),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangedLineRange {
+    start_line: u32,
+    end_line: u32,
+    status: &'static str,
+}
+
+fn changed_byte_ranges_from_patch(patch: &str, text: &str) -> Vec<ChangedByteRange> {
+    let mut line_ranges = Vec::<ChangedLineRange>::new();
+    let mut new_line = 0u32;
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line).unwrap_or(1);
+            continue;
+        }
+        if new_line == 0 || line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            push_changed_line(&mut line_ranges, new_line, "modified");
+            new_line = new_line.saturating_add(1);
+        } else if line.starts_with('-') {
+            push_changed_line(&mut line_ranges, new_line.max(1), "deleted");
+        } else if line.starts_with(' ') {
+            new_line = new_line.saturating_add(1);
+        }
+    }
+    let modified_ranges = line_ranges
+        .iter()
+        .filter(|range| range.status == "modified")
+        .cloned()
+        .collect::<Vec<_>>();
+    line_ranges
+        .into_iter()
+        .filter(|range| {
+            range.status != "deleted"
+                || !modified_ranges.iter().any(|modified| {
+                    range.start_line <= modified.end_line && range.end_line >= modified.start_line
+                })
+        })
+        .map(|range| line_range_to_byte_range(text, range))
+        .collect()
+}
+
+fn push_changed_line(ranges: &mut Vec<ChangedLineRange>, line: u32, status: &'static str) {
+    if let Some(last) = ranges.last_mut()
+        && last.status == status
+        && line <= last.end_line.saturating_add(1)
+    {
+        last.end_line = last.end_line.max(line);
+        return;
+    }
+    ranges.push(ChangedLineRange {
+        start_line: line,
+        end_line: line,
+        status,
+    });
+}
+
+fn parse_hunk_new_start(line: &str) -> Option<u32> {
+    let plus = line.find('+')?;
+    let rest = line.get(plus + 1..)?;
+    let end = rest
+        .find(|ch: char| ch == ',' || ch.is_ascii_whitespace())
+        .unwrap_or(rest.len());
+    rest.get(..end)?.parse().ok()
+}
+
+fn diff_hunks_to_byte_ranges(hunks: &[DiffHunk], text: &str) -> Vec<ChangedByteRange> {
+    hunks
+        .iter()
+        .map(|hunk| {
+            let start_line = hunk.start_line.saturating_add(1).max(1);
+            let end_line = hunk.end_line.saturating_add(1).max(start_line);
+            line_range_to_byte_range(
+                text,
+                ChangedLineRange {
+                    start_line,
+                    end_line,
+                    status: "modified",
+                },
+            )
+        })
+        .collect()
+}
+
+fn line_range_to_byte_range(text: &str, range: ChangedLineRange) -> ChangedByteRange {
+    let offsets = line_start_offsets(text);
+    let start = byte_for_line(&offsets, text.len(), range.start_line);
+    let end = if range.status == "deleted" {
+        start
+    } else {
+        byte_after_line(&offsets, text.len(), range.end_line)
+    };
+    ChangedByteRange::new(
+        start,
+        end.max(start),
+        range.start_line,
+        range.end_line,
+        range.status,
+    )
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0usize];
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' && index + 1 < text.len() {
+            offsets.push(index + 1);
+        }
+    }
+    offsets
+}
+
+fn byte_for_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets
+        .get(line.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(text_len)
+}
+
+fn byte_after_line(offsets: &[usize], text_len: usize, line: u32) -> usize {
+    offsets.get(line as usize).copied().unwrap_or(text_len)
+}
+
+fn byte_diff_ranges(old: &[u8], new: &[u8]) -> Vec<ChangedByteRange> {
+    if old == new {
+        return Vec::new();
+    }
+    let mut prefix = 0usize;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut old_suffix = old.len();
+    let mut new_suffix = new.len();
+    while old_suffix > prefix && new_suffix > prefix && old[old_suffix - 1] == new[new_suffix - 1] {
+        old_suffix -= 1;
+        new_suffix -= 1;
+    }
+    let mut start = prefix;
+    while start > 0 && new[start - 1] != b'\n' {
+        start -= 1;
+    }
+    let mut end = new_suffix.max(start);
+    while end < new.len() && new[end.saturating_sub(1)] != b'\n' {
+        end += 1;
+    }
+    // Compute line numbers honestly so the resulting range stands on its own
+    // (callers can still overwrite, but the type no longer lies about being
+    // line-aware). `new` here is the window-local current bytes; the caller
+    // is responsible for offsetting to file-absolute lines if needed.
+    let start_line = line_number_for_byte_bytes(new, start);
+    let end_line =
+        line_number_for_byte_bytes(new, end.saturating_sub(1).max(start)).max(start_line);
+    vec![ChangedByteRange::new(
+        start, end, start_line, end_line, "modified",
+    )]
+}
+
+fn line_number_for_byte(text: &str, byte: usize) -> u32 {
+    line_number_for_byte_bytes(text.as_bytes(), byte)
+}
+
+fn line_number_for_byte_bytes(bytes: &[u8], byte: usize) -> u32 {
+    let clamped = byte.min(bytes.len());
+    bytes[..clamped]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        .saturating_add(1) as u32
+}
+
+/// Count the number of newlines strictly before `offset` in `path`. Used to
+/// promote window-local line numbers to file-absolute ones in
+/// `read_slice_last_receipt_diff` without slurping the full file into memory
+/// twice. Returns the count of `\n` bytes in `[0, offset)`.
+fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, std::io::Error> {
+    if offset == 0 {
+        return Ok(0);
+    }
+    use std::io::{BufReader, Read};
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut remaining = offset;
+    let mut buf = [0u8; 8192];
+    let mut newlines: u32 = 0;
+    while remaining > 0 {
+        let to_read = remaining.min(buf.len());
+        let read = reader.read(&mut buf[..to_read])?;
+        if read == 0 {
+            break;
+        }
+        newlines = newlines
+            .saturating_add(buf[..read].iter().filter(|byte| **byte == b'\n').count() as u32);
+        remaining -= read;
+    }
+    Ok(newlines)
 }
 
 #[derive(Debug)]
@@ -9425,7 +10287,7 @@ fn diff_context_spec() -> ToolSpec {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "mode": {"type": "string", "enum": ["worktree", "branch"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch compares the current branch to the default-branch merge base. Default worktree."},
+                "mode": {"type": "string", "enum": ["worktree", "branch", "branch_base", "index"], "description": "worktree compares current staged/unstaged/untracked changes to HEAD; branch and branch_base compare the current branch to the default-branch merge base; index compares staged changes to HEAD. Default worktree."},
                 "include_patch": {"type": "boolean", "description": "Include unified patch text. Default false to keep output compact."},
                 "max_files": {"type": "integer", "minimum": 1, "maximum": 500},
                 "max_symbols_per_file": {"type": "integer", "minimum": 1, "maximum": 100},
@@ -9666,7 +10528,7 @@ fn hierarchy_spec() -> ToolSpec {
 fn read_slice_spec() -> ToolSpec {
     ToolSpec {
         name: "read_slice".to_string(),
-        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Prefer spans returned by graph evidence packets.".to_string(),
+        description: "Read an exact bounded source slice by symbol_id, byte range, line range, or path/offset. Set read_mode=diff to return only changed ranges against a baseline. Prefer spans returned by graph evidence packets.".to_string(),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
@@ -9675,6 +10537,9 @@ fn read_slice_spec() -> ToolSpec {
                 "path": {"type": "string"},
                 "symbol_id": {"type": "string"},
                 "span_kind": {"type": "string", "enum": ["signature", "body"]},
+                "read_mode": {"type": "string", "enum": ["slice", "diff"], "description": "slice returns the requested exact range; diff returns only changed ranges for the same path or symbol. Default slice."},
+                "diff_baseline": {"type": "string", "enum": ["worktree", "branch_base", "index", "last_receipt"], "description": "Baseline for read_mode=diff. worktree compares against HEAD including staged, unstaged, and untracked changes; branch_base compares against the default-branch merge base; index compares staged changes; last_receipt compares against the most recent model-visible read snapshot for this path and falls back to worktree if unavailable."},
+                "max_ranges": {"type": "integer", "minimum": 1, "maximum": 100},
                 "start_byte": {"type": "integer", "minimum": 0},
                 "end_byte": {"type": "integer", "minimum": 0},
                 "start_line": {"type": "integer", "minimum": 1},

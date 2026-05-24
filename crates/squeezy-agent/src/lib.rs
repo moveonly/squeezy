@@ -28,7 +28,7 @@ use squeezy_llm::{
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore, StoredToolReceipt,
+    SqueezyStore, StoredReadSnapshot, StoredToolReceipt,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -4032,14 +4032,17 @@ impl SeenToolOutputs {
                     .or_insert(seen.clone());
                 if let Some(store) = self.store.as_deref() {
                     let _ = store.put_tool_receipt(&StoredToolReceipt {
-                        tool_name: seen.tool_name,
-                        stable_output_sha256: seen.stable_output_sha256,
-                        call_id: seen.call_id,
-                        content_sha256: seen.content_sha256,
+                        tool_name: seen.tool_name.clone(),
+                        stable_output_sha256: seen.stable_output_sha256.clone(),
+                        call_id: seen.call_id.clone(),
+                        content_sha256: seen.content_sha256.clone(),
                         model_output_bytes: seen.model_output_bytes,
                         created_unix_millis: unix_millis(),
                         summary: seen.summary,
                     });
+                    if let Some(snapshot) = read_snapshot_from_result(&result.result, &seen) {
+                        let _ = store.put_read_snapshot(&snapshot);
+                    }
                 }
             }
         }
@@ -4081,6 +4084,39 @@ fn stable_output_sha256(result: &ToolResult) -> String {
         .and_then(Value::as_str)
         .unwrap_or(&result.receipt.output_sha256)
         .to_string()
+}
+
+fn read_snapshot_from_result(
+    result: &ToolResult,
+    seen: &SeenToolOutput,
+) -> Option<StoredReadSnapshot> {
+    if !matches!(result.tool_name.as_str(), "read_file" | "read_slice") {
+        return None;
+    }
+    if result.content.get("read_mode").and_then(Value::as_str) == Some("diff") {
+        return None;
+    }
+    let path = result.content.get("path")?.as_str()?.to_string();
+    let content = result.content.get("content")?.as_str()?.to_string();
+    let start_byte = result
+        .content
+        .get("offset")
+        .and_then(Value::as_u64)
+        .or_else(|| result.content.get("start_byte").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let bytes_returned = result.content.get("bytes_returned")?.as_u64()?;
+    Some(StoredReadSnapshot {
+        path,
+        tool_name: seen.tool_name.clone(),
+        call_id: seen.call_id.clone(),
+        stable_output_sha256: seen.stable_output_sha256.clone(),
+        content_sha256: seen.content_sha256.clone(),
+        start_byte,
+        end_byte: start_byte.saturating_add(bytes_returned),
+        content,
+        model_output_bytes: seen.model_output_bytes,
+        created_unix_millis: unix_millis(),
+    })
 }
 
 fn receipt_stub_result(result: ToolResult, seen: &SeenToolOutput) -> ToolResult {
