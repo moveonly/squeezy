@@ -32,9 +32,15 @@ sha256_for() {
   checksum_file="$(find "$assets_dir" -type f -name "${archive}.sha256" -print -quit)"
   if [[ -z "$checksum_file" ]]; then
     echo "missing checksum for archive: $archive" >&2
-    exit 1
+    return 1
   fi
-  awk '{print $1}' "$checksum_file"
+  local checksum
+  checksum="$(awk '{print $1}' "$checksum_file")"
+  if [[ ! "$checksum" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    echo "checksum for $archive is not a 64-char hex sha256: '$checksum'" >&2
+    return 1
+  fi
+  printf '%s' "$checksum"
 }
 
 url_for() {
@@ -46,6 +52,17 @@ version="${release_tag#v}"
 x86_macos="squeezy-x86_64-apple-darwin.tar.gz"
 arm_macos="squeezy-aarch64-apple-darwin.tar.gz"
 x86_linux="squeezy-x86_64-unknown-linux-musl.tar.gz"
+
+# Resolve every URL and checksum up-front so a missing or malformed checksum
+# fails the script under `set -e` instead of silently expanding to "" inside
+# the heredoc below (command-substitution failures in heredocs do not
+# propagate to the parent shell on their own).
+arm_macos_url="$(url_for "$arm_macos")"
+arm_macos_sha="$(sha256_for "$arm_macos")"
+x86_macos_url="$(url_for "$x86_macos")"
+x86_macos_sha="$(sha256_for "$x86_macos")"
+x86_linux_url="$(url_for "$x86_linux")"
+x86_linux_sha="$(sha256_for "$x86_linux")"
 
 formula_dir="$tap_dir/Formula"
 formula_file="$formula_dir/squeezy.rb"
@@ -60,18 +77,18 @@ class Squeezy < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "$(url_for "$arm_macos")"
-      sha256 "$(sha256_for "$arm_macos")"
+      url "${arm_macos_url}"
+      sha256 "${arm_macos_sha}"
     else
-      url "$(url_for "$x86_macos")"
-      sha256 "$(sha256_for "$x86_macos")"
+      url "${x86_macos_url}"
+      sha256 "${x86_macos_sha}"
     end
   end
 
   on_linux do
     if Hardware::CPU.intel?
-      url "$(url_for "$x86_linux")"
-      sha256 "$(sha256_for "$x86_linux")"
+      url "${x86_linux_url}"
+      sha256 "${x86_linux_sha}"
     else
       odie "Squeezy only publishes x86_64 Linux Homebrew archives for now"
     end
