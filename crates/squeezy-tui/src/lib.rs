@@ -10,7 +10,8 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
@@ -50,12 +51,13 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
-const AMBER: Color = Color::Rgb(234, 179, 8);
-const GOLD: Color = Color::Rgb(250, 204, 21);
-const MODE_PURPLE: Color = Color::Rgb(168, 85, 247);
+const AMBER: Color = Color::Rgb(252, 211, 77);
+const GOLD: Color = Color::Rgb(254, 240, 138);
+const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
+const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-const PROMPT_MIN_HEIGHT: u16 = 2;
+const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -365,11 +367,27 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
+        Event::Mouse(mouse) => {
+            handle_mouse(app, mouse);
+            Ok(false)
+        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
         }
         _ => Ok(false),
+    }
+}
+
+fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(3);
+        }
+        _ => {}
     }
 }
 
@@ -1835,10 +1853,7 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
 
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(
-            "◆ ",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("◆ ", Style::default().fg(AMBER)),
         Span::styled(
             task_title(snapshot).to_string(),
             Style::default()
@@ -1921,6 +1936,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
             item,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
+            message_outcome(&app.transcript, index),
         ));
     }
     if !app.pending_assistant.is_empty() {
@@ -2002,10 +2018,7 @@ fn startup_card_row(
     }
     Line::from(vec![
         Span::styled("│ ", Style::default().fg(GOLD)),
-        Span::styled(
-            format!("{label}:"),
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{label}:"), Style::default().fg(AMBER)),
         Span::raw(" ".repeat(label_width.saturating_sub(label.len() + 1))),
         Span::styled(value, value_style),
         Span::raw(padding),
@@ -2049,9 +2062,12 @@ fn format_transcript_entry(
     entry: &TranscriptEntry,
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
-        TranscriptEntryKind::Message(item) => format_message_entry(item, entry.collapsed, selected),
+        TranscriptEntryKind::Message(item) => {
+            format_message_entry(item, entry.collapsed, selected, outcome)
+        }
         TranscriptEntryKind::ToolCall(call) => {
             format_tool_call_entry(call, entry.collapsed, selected)
         }
@@ -2062,19 +2078,58 @@ fn format_transcript_entry(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageOutcome {
+    Normal,
+    Failed,
+}
+
+fn message_outcome(entries: &[TranscriptEntry], index: usize) -> MessageOutcome {
+    let Some(TranscriptEntry {
+        kind: TranscriptEntryKind::Message(item),
+        ..
+    }) = entries.get(index)
+    else {
+        return MessageOutcome::Normal;
+    };
+    if item.role != Role::User {
+        return MessageOutcome::Normal;
+    }
+
+    for entry in entries.iter().skip(index + 1) {
+        match &entry.kind {
+            TranscriptEntryKind::Log(message) if is_failure_log(message) => {
+                return MessageOutcome::Failed;
+            }
+            TranscriptEntryKind::Message(_) => return MessageOutcome::Normal,
+            _ => {}
+        }
+    }
+    MessageOutcome::Normal
+}
+
+fn is_failure_log(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("failed") || lower.contains("error") || lower.contains("cancelled")
+}
+
 fn format_message_entry(
     item: &TranscriptItem,
     collapsed: bool,
     selected: bool,
+    outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
     let (action, color) = role_action(&item.role);
+    let failed = outcome == MessageOutcome::Failed;
+    let label_color = if failed { ERROR_RED } else { GOLD };
+    let action_color = if failed { ERROR_RED } else { color };
     if collapsed {
         return vec![action_line(
             selected,
             "• ",
-            GOLD,
+            label_color,
             action,
-            color,
+            action_color,
             format!(
                 "… {} chars  {}",
                 item.content.chars().count(),
@@ -2082,7 +2137,14 @@ fn format_message_entry(
             ),
         )];
     }
-    action_text_lines(selected, "• ", GOLD, action, color, &item.content)
+    action_text_lines(
+        selected,
+        "• ",
+        label_color,
+        action,
+        action_color,
+        &item.content,
+    )
 }
 
 fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -2169,9 +2231,8 @@ fn role_action(role: &Role) -> (&'static str, Color) {
 }
 
 fn log_color(message: &str) -> Color {
-    let lower = message.to_ascii_lowercase();
-    if lower.contains("failed") || lower.contains("error") {
-        Color::Red
+    if is_failure_log(message) {
+        ERROR_RED
     } else {
         GOLD
     }
@@ -2215,7 +2276,7 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
             "└ ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(content.into(), Style::default().fg(color)),
+        Span::styled(content.into(), Style::default().fg(QUIET)),
     ])
 }
 
@@ -2310,7 +2371,7 @@ fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> S
 fn status_color(status: ToolStatus) -> Color {
     match status {
         ToolStatus::Success => Color::Green,
-        ToolStatus::Error | ToolStatus::Stale => Color::Red,
+        ToolStatus::Error | ToolStatus::Stale => ERROR_RED,
         ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
     }
 }
@@ -2354,7 +2415,7 @@ impl TurnVisualState {
                 }
             }
             Self::Succeeded => Color::Green,
-            Self::Failed => Color::Red,
+            Self::Failed => ERROR_RED,
         }
     }
 }
@@ -2369,27 +2430,26 @@ fn turn_dot_span(app: &TuiApp) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
-    const FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
-    let frame = FRAMES[(app.animation_tick as usize / 2) % FRAMES.len()];
-    let color = if app.animation_tick % 8 < 4 {
+    const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
+    let tick_ms = app.animation_tick_rate.as_millis().max(1) as u64;
+    let elapsed_ms = app.animation_tick.saturating_mul(tick_ms);
+    let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
+    let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
+    let frame = if direction_reversed {
+        FRAMES[FRAMES.len() - 1 - frame_index]
+    } else {
+        FRAMES[frame_index]
+    };
+    let color = if (elapsed_ms / 800).is_multiple_of(2) {
         GOLD
     } else {
         AMBER
     };
-    Span::styled(
-        frame,
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )
+    Span::styled(frame, Style::default().fg(color))
 }
 
 fn prompt_cursor_span() -> Span<'static> {
-    Span::styled(
-        "|",
-        Style::default()
-            .fg(GOLD)
-            .bg(PROMPT_BG)
-            .add_modifier(Modifier::BOLD),
-    )
+    Span::styled("┃", Style::default().fg(GOLD).bg(PROMPT_BG))
 }
 
 fn compact_text(text: &str, limit: usize) -> String {
@@ -2425,6 +2485,7 @@ fn short_hash(hash: &str) -> &str {
 
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
     prompt_visual_line_count(&app.input, width)
+        .saturating_add(2)
         .clamp(PROMPT_MIN_HEIGHT as usize, PROMPT_MAX_HEIGHT as usize) as u16
 }
 
@@ -2442,7 +2503,7 @@ fn prompt_visual_line_count(input: &str, width: u16) -> usize {
         .sum()
 }
 
-fn prompt_input_lines(app: &TuiApp) -> Vec<Line<'static>> {
+fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     if app.input.is_empty() {
         return vec![Line::from(vec![
             Span::styled(" ", Style::default().bg(PROMPT_BG)),
@@ -2482,8 +2543,24 @@ fn prompt_input_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .collect()
 }
 
+fn prompt_blank_line() -> Line<'static> {
+    Line::from(Span::styled(" ", Style::default().bg(PROMPT_BG)))
+}
+
+fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
+    let content = prompt_input_content_lines(app);
+    let spare = (height as usize).saturating_sub(content.len());
+    let top_padding = spare / 2;
+    let bottom_padding = spare.saturating_sub(top_padding);
+    let mut lines = Vec::with_capacity(top_padding + content.len() + bottom_padding);
+    lines.extend((0..top_padding).map(|_| prompt_blank_line()));
+    lines.extend(content);
+    lines.extend((0..bottom_padding).map(|_| prompt_blank_line()));
+    lines
+}
+
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = prompt_input_lines(app);
+    let lines = prompt_input_lines(app, area.height);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(Color::White).bg(PROMPT_BG))
@@ -2502,12 +2579,7 @@ fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
     Line::from(vec![
         Span::styled(left, Style::default().fg(Color::Gray)),
         Span::raw(padding),
-        Span::styled(
-            right,
-            Style::default()
-                .fg(MODE_PURPLE)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(right, Style::default().fg(MODE_PURPLE)),
     ])
 }
 
@@ -2886,6 +2958,7 @@ struct TuiApp {
     status: String,
     turn_visual: TurnVisualState,
     animation_tick: u64,
+    animation_tick_rate: Duration,
     exit_armed: bool,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
@@ -2981,6 +3054,7 @@ impl TuiApp {
             status,
             turn_visual: TurnVisualState::Idle,
             animation_tick: 0,
+            animation_tick_rate: config.tick_rate,
             exit_armed: false,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
@@ -3194,7 +3268,8 @@ impl TerminalGuard {
             EnterAlternateScreen,
             Clear(ClearType::Purge),
             MoveTo(0, 0),
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            EnableMouseCapture
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
@@ -3219,6 +3294,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();

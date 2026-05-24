@@ -728,7 +728,7 @@ fn render_prompt_uses_rotating_coin_and_cursor() {
     app.turn_visual = TurnVisualState::Running;
 
     let output = render_to_string(&app, 100, 12);
-    assert!(output.contains("◐  ship it|"), "{output}");
+    assert!(output.contains("●  ship it┃"), "{output}");
 }
 
 #[test]
@@ -747,18 +747,71 @@ fn failure_log_renders_as_detail_under_user_turn() {
 }
 
 #[test]
+fn failed_user_turn_marks_status_not_prompt_text() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi"));
+    app.push_log("turn failed: provider stream failed".to_string());
+
+    let user_lines = format_transcript_entry(
+        &app.transcript[0],
+        false,
+        app.tool_output_verbosity,
+        message_outcome(&app.transcript, 0),
+    );
+    assert_eq!(user_lines[0].spans[1].style.fg, Some(ERROR_RED));
+    assert_eq!(user_lines[0].spans[2].style.fg, Some(ERROR_RED));
+    assert_eq!(user_lines[0].spans[4].content.as_ref(), "hi");
+    assert_eq!(user_lines[0].spans[4].style.fg, None);
+
+    let log_lines = format_transcript_entry(
+        &app.transcript[1],
+        false,
+        app.tool_output_verbosity,
+        message_outcome(&app.transcript, 1),
+    );
+    assert_eq!(log_lines[0].spans[1].style.fg, Some(ERROR_RED));
+    assert_eq!(log_lines[0].spans[2].style.fg, Some(QUIET));
+}
+
+#[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
-    assert_eq!(input_panel_height(&app, 100), 2);
+    assert_eq!(input_panel_height(&app, 100), 3);
 
     app.input = "one\ntwo\nthree".to_string();
-    assert_eq!(input_panel_height(&app, 100), 3);
+    assert_eq!(input_panel_height(&app, 100), 5);
 
     app.input = (0..20)
         .map(|index| format!("line {index}"))
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(input_panel_height(&app, 100), PROMPT_MAX_HEIGHT);
+}
+
+#[test]
+fn mouse_wheel_scrolls_transcript_inside_app() {
+    let mut app = test_app(SessionMode::Build);
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
 }
 
 #[test]
