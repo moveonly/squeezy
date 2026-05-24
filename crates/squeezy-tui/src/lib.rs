@@ -20,7 +20,7 @@ use ratatui::{
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
 use squeezy_core::{
     AppConfig, PermissionPolicy, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TelemetryConfig, TranscriptItem,
+    TaskStateSnapshot, TelemetryConfig, TranscriptItem,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::SessionQuery;
@@ -134,6 +134,10 @@ async fn drain_agent_events(app: &mut TuiApp) {
                             .push_str(&format!(" redacted={}", result.cost_hint.redactions));
                     }
                 }
+                AgentEvent::TaskStateUpdated { snapshot, .. } => {
+                    app.task_state = Some(snapshot);
+                    app.status = "task state updated".to_string();
+                }
                 AgentEvent::ApprovalRequested {
                     request,
                     decision_tx,
@@ -197,9 +201,7 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if let Some(cancel) = &app.cancel {
-            cancel.cancel();
-            app.status = "cancelling".to_string();
+        if cancel_active_turn(app) {
             return Ok(false);
         }
         return Ok(true);
@@ -207,6 +209,18 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
         copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+        return Ok(false);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        if app.task_state.is_some() {
+            app.task_panel_collapsed = !app.task_panel_collapsed;
+            app.status = if app.task_panel_collapsed {
+                "task panel collapsed".to_string()
+            } else {
+                "task panel expanded".to_string()
+            };
+        }
         return Ok(false);
     }
 
@@ -231,12 +245,23 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if key.code == KeyCode::Esc && app.cancel.is_some() {
+        cancel_active_turn(app);
+        return Ok(false);
+    }
+
     if handle_approval_key(app, key) {
         return Ok(false);
     }
 
     match key.code {
-        KeyCode::Esc => Ok(true),
+        KeyCode::Esc => {
+            if cancel_active_turn(app) {
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        }
         // Scroll keys intentionally leave `app.status` alone so that
         // useful messages (tool results, errors, approval prompts) stay
         // visible while the user navigates history. The status footer
@@ -272,6 +297,8 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
                 return Ok(false);
             }
             let cancel = CancellationToken::new();
+            app.task_state = None;
+            app.task_panel_collapsed = false;
             app.turn_rx = Some(agent.start_turn(input, cancel.clone()));
             app.cancel = Some(cancel);
             app.status = "starting turn".to_string();
@@ -289,6 +316,18 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         }
         _ => Ok(false),
     }
+}
+
+fn cancel_active_turn(app: &mut TuiApp) -> bool {
+    let Some(cancel) = &app.cancel else {
+        return false;
+    };
+    cancel.cancel();
+    if let Some(pending) = app.pending_approval.take() {
+        let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
+    }
+    app.status = "cancelling".to_string();
+    true
 }
 
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
@@ -361,6 +400,8 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 Ok(transcript) => {
                     app.transcript = transcript;
                     app.pending_assistant.clear();
+                    app.task_state = None;
+                    app.task_panel_collapsed = false;
                     app.turn_rx = None;
                     app.cancel = None;
                     app.status = format!("resumed session {session_id}");
@@ -704,17 +745,50 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         let prompt = format_approval_prompt(&pending.request);
         let line_count = prompt.matches('\n').count() as u16 + 1;
         let approval_height = line_count.saturating_add(2).clamp(6, 18);
+        if should_show_task_panel(app) {
+            let task_height = task_panel_height(app).min(5);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(task_height),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_task_state(frame, chunks[1], app);
+            render_approval(frame, chunks[2], &prompt);
+            render_input(frame, chunks[3], app);
+            render_status(frame, chunks[4], app);
+        } else {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(3),
+                    Constraint::Length(approval_height),
+                    Constraint::Length(3),
+                    Constraint::Length(2),
+                ])
+                .split(area);
+            render_transcript(frame, chunks[0], app);
+            render_approval(frame, chunks[1], &prompt);
+            render_input(frame, chunks[2], app);
+            render_status(frame, chunks[3], app);
+        }
+    } else if should_show_task_panel(app) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),
-                Constraint::Length(approval_height),
+                Constraint::Min(5),
+                Constraint::Length(task_panel_height(app)),
                 Constraint::Length(3),
                 Constraint::Length(2),
             ])
             .split(area);
         render_transcript(frame, chunks[0], app);
-        render_approval(frame, chunks[1], &prompt);
+        render_task_state(frame, chunks[1], app);
         render_input(frame, chunks[2], app);
         render_status(frame, chunks[3], app);
     } else {
@@ -729,6 +803,106 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_transcript(frame, chunks[0], app);
         render_input(frame, chunks[1], app);
         render_status(frame, chunks[2], app);
+    }
+}
+
+fn should_show_task_panel(app: &TuiApp) -> bool {
+    app.task_state.is_some()
+}
+
+fn task_panel_height(app: &TuiApp) -> u16 {
+    if app.task_panel_collapsed {
+        return 3;
+    }
+    let line_count = app
+        .task_state
+        .as_ref()
+        .map(|snapshot| format_task_state_lines(snapshot, false).len() as u16)
+        .unwrap_or(1);
+    line_count.saturating_add(2).clamp(4, 12)
+}
+
+fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(snapshot) = app.task_state.as_ref() else {
+        return;
+    };
+    let lines = format_task_state_lines(snapshot, app.task_panel_collapsed);
+    let title = if app.task_panel_collapsed {
+        "Task (collapsed)"
+    } else {
+        "Task"
+    };
+    let paragraph = Paragraph::new(lines)
+        .block(Block::default().title(title).borders(Borders::ALL))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec<Line<'static>> {
+    if collapsed {
+        return vec![Line::from(format!(
+            "Task: {} | active={} | blocker={} | next={} | verification={}",
+            task_title(snapshot),
+            snapshot.active_step_title().unwrap_or("-"),
+            snapshot.blocker.as_deref().unwrap_or("-"),
+            snapshot.next_action.as_deref().unwrap_or("-"),
+            snapshot.verification.as_str(),
+        ))];
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(format!(
+        "Task: {}  status={}",
+        task_title(snapshot),
+        snapshot.status.as_str()
+    )));
+    if let Some(summary) = &snapshot.summary {
+        lines.push(Line::from(format!("Summary: {summary}")));
+    }
+    if snapshot.steps.is_empty() {
+        lines.push(Line::from("Steps: -"));
+    } else {
+        for step in &snapshot.steps {
+            let detail = step
+                .detail
+                .as_ref()
+                .map(|detail| format!(" - {detail}"))
+                .unwrap_or_default();
+            lines.push(Line::from(format!(
+                "[{}] {}{}",
+                step.status.as_str(),
+                step.title,
+                detail
+            )));
+        }
+    }
+    if let Some(blocker) = &snapshot.blocker {
+        lines.push(Line::from(format!("Blocker: {blocker}")));
+    }
+    if !snapshot.recent_changes.is_empty() {
+        lines.push(Line::from(format!(
+            "Recent: {}",
+            snapshot.recent_changes.join("; ")
+        )));
+    }
+    if let Some(next_action) = &snapshot.next_action {
+        lines.push(Line::from(format!("Next: {next_action}")));
+    }
+    lines.push(Line::from(format!(
+        "Verification: {}",
+        snapshot.verification.as_str()
+    )));
+    if let Some(reason) = &snapshot.replan_reason {
+        lines.push(Line::from(format!("Replan: {reason}")));
+    }
+    lines
+}
+
+fn task_title(snapshot: &TaskStateSnapshot) -> &str {
+    if snapshot.task.is_empty() {
+        "current turn"
+    } else {
+        snapshot.task.as_str()
     }
 }
 
@@ -838,9 +1012,11 @@ fn format_status_tokens(app: &TuiApp) -> String {
         },
     );
     let hints = if app.pending_approval.is_some() {
-        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C cancel"
+        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
+    } else if app.cancel.is_some() {
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy | /sessions /resume | Ctrl-C cancel | Esc quit"
+        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -1069,6 +1245,8 @@ struct TuiApp {
     transcript: Vec<TranscriptItem>,
     transcript_scroll_from_bottom: u16,
     pending_assistant: String,
+    task_state: Option<TaskStateSnapshot>,
+    task_panel_collapsed: bool,
     status: String,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
@@ -1128,6 +1306,8 @@ impl TuiApp {
             transcript,
             transcript_scroll_from_bottom: 0,
             pending_assistant: String::new(),
+            task_state: None,
+            task_panel_collapsed: false,
             status,
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),

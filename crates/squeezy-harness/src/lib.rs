@@ -540,7 +540,9 @@ async fn run_agent_with_config(
             }
             AgentEvent::UserMessage { .. } => {}
             AgentEvent::ToolCallQueued { .. } | AgentEvent::ToolCallCompleted { .. } => {}
-            AgentEvent::ToolCallStarted { .. } | AgentEvent::ApprovalRequested { .. } => {}
+            AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::ApprovalRequested { .. }
+            | AgentEvent::TaskStateUpdated { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

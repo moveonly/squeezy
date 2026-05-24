@@ -51,6 +51,45 @@ fn session_store_lists_filters_and_exports_sessions() {
 }
 
 #[test]
+fn session_export_preserves_task_state_events() {
+    let root = temp_root("task-state-export");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "task_state",
+            Some("1".to_string()),
+            Some("Implement task UX | status=blocked".to_string()),
+            json!({
+                "snapshot": {
+                    "task": "Implement task UX",
+                    "status": "blocked",
+                    "blocker": "waiting for approval",
+                    "next_action": "cancel or approve",
+                    "verification": "not_started",
+                    "replan_reason": "new evidence changed the next step"
+                }
+            }),
+        ))
+        .expect("append task state");
+
+    let exported = store.export(handle.session_id()).expect("export");
+    let events = exported["events"].as_array().expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["kind"], "task_state");
+    assert_eq!(
+        events[0]["payload"]["snapshot"]["replan_reason"],
+        "new evidence changed the next step"
+    );
+}
+
+#[test]
 fn malformed_event_lines_are_counted_as_warnings() {
     let root = temp_root("malformed");
     let config = AppConfig {
