@@ -4447,7 +4447,222 @@ pub enum SqueezyError {
 
 pub type Result<T> = std::result::Result<T, SqueezyError>;
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStateStatus {
+    #[default]
+    Running,
+    Blocked,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TaskStateStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStepStatus {
+    #[default]
+    Pending,
+    Active,
+    Completed,
+    Blocked,
+    Skipped,
+}
+
+impl TaskStepStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Completed => "completed",
+            Self::Blocked => "blocked",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskVerificationState {
+    #[default]
+    NotStarted,
+    Running,
+    Passed,
+    Failed,
+    Skipped,
+}
+
+impl TaskVerificationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Running => "running",
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStateStep {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: TaskStepStatus,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStateSnapshot {
+    #[serde(default)]
+    pub task: String,
+    #[serde(default)]
+    pub status: TaskStateStatus,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub steps: Vec<TaskStateStep>,
+    #[serde(default)]
+    pub blocker: Option<String>,
+    #[serde(default)]
+    pub next_action: Option<String>,
+    #[serde(default)]
+    pub verification: TaskVerificationState,
+    #[serde(default)]
+    pub recent_changes: Vec<String>,
+    #[serde(default)]
+    pub replan_reason: Option<String>,
+}
+
+impl TaskStateSnapshot {
+    pub fn starting(task: impl Into<String>) -> Self {
+        Self {
+            task: task.into(),
+            status: TaskStateStatus::Running,
+            steps: vec![TaskStateStep {
+                title: "Start turn".to_string(),
+                status: TaskStepStatus::Active,
+                detail: Some("Preparing the first model request".to_string()),
+            }],
+            next_action: Some("wait for agent task-state update".to_string()),
+            ..Self::default()
+        }
+        .normalized()
+    }
+
+    pub fn terminal_from(
+        latest: Option<&Self>,
+        fallback_task: impl Into<String>,
+        status: TaskStateStatus,
+        summary: Option<String>,
+    ) -> Self {
+        let mut snapshot = latest
+            .cloned()
+            .unwrap_or_else(|| Self::starting(fallback_task));
+        snapshot.status = status;
+        snapshot.summary = summary.or(snapshot.summary);
+        if matches!(
+            status,
+            TaskStateStatus::Completed | TaskStateStatus::Cancelled | TaskStateStatus::Failed
+        ) {
+            snapshot.next_action = None;
+        }
+        snapshot.normalized()
+    }
+
+    pub fn active_step_title(&self) -> Option<&str> {
+        self.steps
+            .iter()
+            .find(|step| {
+                matches!(
+                    step.status,
+                    TaskStepStatus::Active | TaskStepStatus::Blocked
+                )
+            })
+            .map(|step| step.title.as_str())
+    }
+
+    pub fn compact_summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.task.is_empty() {
+            parts.push(self.task.clone());
+        }
+        parts.push(format!("status={}", self.status.as_str()));
+        if let Some(step) = self.active_step_title()
+            && !step.is_empty()
+        {
+            parts.push(format!("active={step}"));
+        }
+        if let Some(blocker) = &self.blocker {
+            parts.push(format!("blocker={blocker}"));
+        }
+        if let Some(next_action) = &self.next_action {
+            parts.push(format!("next={next_action}"));
+        }
+        parts.push(format!("verification={}", self.verification.as_str()));
+        parts.join(" | ")
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.task = normalize_task_text(self.task, 500);
+        self.summary = normalize_optional_task_text(self.summary, 500);
+        self.blocker = normalize_optional_task_text(self.blocker, 500);
+        self.next_action = normalize_optional_task_text(self.next_action, 500);
+        self.replan_reason = normalize_optional_task_text(self.replan_reason, 500);
+        self.steps = self
+            .steps
+            .into_iter()
+            .take(20)
+            .map(|mut step| {
+                step.title = normalize_task_text(step.title, 200);
+                step.detail = normalize_optional_task_text(step.detail, 300);
+                step
+            })
+            .collect();
+        self.recent_changes = self
+            .recent_changes
+            .into_iter()
+            .filter_map(|change| normalize_optional_task_text(Some(change), 300))
+            .take(20)
+            .collect();
+        if self.blocker.is_some() && self.status == TaskStateStatus::Running {
+            self.status = TaskStateStatus::Blocked;
+        }
+        self
+    }
+}
+
+fn normalize_optional_task_text(value: Option<String>, limit: usize) -> Option<String> {
+    value.and_then(|text| {
+        let text = normalize_task_text(text, limit);
+        (!text.is_empty()).then_some(text)
+    })
+}
+
+fn normalize_task_text(text: String, limit: usize) -> String {
+    let mut output = text.trim().replace('\n', " ");
+    if output.chars().count() > limit {
+        output = output.chars().take(limit.saturating_sub(3)).collect();
+        output.push_str("...");
+    }
+    output
+}
+
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in local evidence. Use update_task_state at turn start, before and after meaningful step transitions, when blocked, before verification, after verification, and whenever new evidence changes the plan. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Do not invent URLs. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
