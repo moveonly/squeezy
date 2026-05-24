@@ -565,12 +565,14 @@ impl Agent {
     }
 
     fn persist_context_attachments(&self, state: &ConversationState) -> squeezy_core::Result<()> {
+        // Only persist resume state here. `metadata.resume_available` is set
+        // to `true` at session start and `metadata.redactions` is re-synced
+        // by `persist_turn_state` on the next completed turn, so we avoid
+        // the redundant read-modify-write of `metadata.json` (which also
+        // keeps the session_id-bearing metadata out of the attachment flow
+        // for static analyzers).
         if let Some(session) = &self.session_log {
             session.write_resume_state(&state.to_resume_state())?;
-            session.update_metadata(|metadata| {
-                metadata.redactions = state.redactions;
-                metadata.resume_available = true;
-            })?;
         }
         Ok(())
     }
