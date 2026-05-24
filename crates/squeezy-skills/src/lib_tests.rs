@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -258,6 +259,98 @@ fn prompt_block_escapes_metadata_and_breakouts() {
     assert!(!block.contains("uses </skill>"));
     assert!(block.contains("<\\/content>"));
     assert!(block.contains("<\\/skill>"));
+}
+
+#[test]
+fn squeezy_help_config_answer_cites_docs_and_config_sections() {
+    let help = SqueezyHelp::new(
+        r#"[model]
+provider = "openai"
+model = "gpt-test"
+
+[providers.openai]
+api_key_env = "<redacted>"
+base_url = "https://api.openai.com/v1"
+
+[skills]
+user_dir = "/tmp/skills"
+compat_user_dir = "/tmp/agent-skills"
+"#,
+    );
+
+    let answer = help.answer_topic("providers");
+
+    assert_eq!(answer.status, HelpStatus::Answered);
+    assert!(answer.config_sections.contains(&"model".to_string()));
+    assert!(
+        answer
+            .config_sections
+            .contains(&"providers.openai".to_string())
+    );
+    assert!(
+        answer
+            .citations
+            .contains(&HelpCitation::DocsPath("docs/PROVIDERS.md".to_string()))
+    );
+    assert!(
+        answer
+            .citations
+            .contains(&HelpCitation::ConfigInspectSection("model".to_string()))
+    );
+    let rendered = answer.render_markdown();
+    assert!(rendered.contains("[providers.openai]"), "{rendered}");
+    assert!(!rendered.contains("--api-key"), "{rendered}");
+    assert!(!rendered.contains("[providers.fake]"), "{rendered}");
+}
+
+#[test]
+fn squeezy_help_refuses_unsupported_self_questions_with_public_pointers() {
+    let help = SqueezyHelp::new("");
+    let answer = help
+        .answer_for_input("Does Squeezy support quantum billing?")
+        .expect("squeezy self question should be handled");
+
+    assert_eq!(answer.status, HelpStatus::Unsupported);
+    let rendered = answer.render_markdown();
+    assert!(rendered.contains("won't guess"), "{rendered}");
+    assert!(
+        rendered.contains("https://squeezyagent.com/docs/"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("https://github.com/esqueezy/squeezy"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn squeezy_help_ignores_unrelated_questions() {
+    let help = SqueezyHelp::new("");
+
+    assert!(
+        help.answer_for_input("How do I configure serde?").is_none(),
+        "unrelated coding questions should stay on the model path"
+    );
+    assert!(
+        help.answer_for_input("help me implement Squeezy features")
+            .is_none(),
+        "implementation requests should not be captured by product help"
+    );
+}
+
+#[test]
+fn squeezy_help_doc_citations_are_bundled_paths() {
+    let bundled = help::bundled_doc_paths()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let help = SqueezyHelp::new("");
+    let answer = help.answer_topic("permissions");
+
+    for citation in answer.citations {
+        if let HelpCitation::DocsPath(path) = citation {
+            assert!(bundled.contains(path.as_str()), "missing {path}");
+        }
+    }
 }
 
 fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {

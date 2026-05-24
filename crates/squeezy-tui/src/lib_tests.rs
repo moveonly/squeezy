@@ -307,6 +307,53 @@ async fn slash_attach_surfaces_unsupported_images() {
 }
 
 #[tokio::test]
+async fn slash_help_lists_topics() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/help").await);
+
+    assert_eq!(app.status, "help index");
+    let content = last_message_content(&app).expect("help transcript");
+    assert!(content.contains("Supported topics"), "{content}");
+    assert!(content.contains("`providers`"), "{content}");
+}
+
+#[tokio::test]
+async fn slash_help_config_renders_citations_and_config() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/help providers").await);
+
+    assert_eq!(app.status, "help providers");
+    let content = last_message_content(&app).expect("help transcript");
+    assert!(content.contains("docs/PROVIDERS.md"), "{content}");
+    assert!(content.contains("[model]"), "{content}");
+    assert!(!content.contains("--api-key"), "{content}");
+}
+
+#[tokio::test]
+async fn slash_help_unsupported_points_to_public_resources() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/help quantum billing").await);
+
+    assert_eq!(app.status, "help topic not covered locally");
+    let content = last_message_content(&app).expect("help transcript");
+    assert!(content.contains("won't guess"), "{content}");
+    assert!(
+        content.contains("https://squeezyagent.com/docs/"),
+        "{content}"
+    );
+    assert!(
+        content.contains("https://github.com/esqueezy/squeezy"),
+        "{content}"
+    );
+}
+
+#[tokio::test]
 async fn mode_switch_is_refused_during_active_turn() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

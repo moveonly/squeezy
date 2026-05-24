@@ -27,6 +27,8 @@ Local session logs, discovery, and resume behavior are documented in [`SESSIONS.
 Tool-call cost strategy is documented in [`tool-call-saving-strategy.md`](tool-call-saving-strategy.md).
 
 Local skill discovery and activation are documented in [`SKILLS.md`](SKILLS.md).
+The same page documents built-in `/help <topic>` for local Squeezy self-help
+answers grounded in this docs corpus and redacted config inspection.
 
 Anonymous product telemetry is documented in [`TELEMETRY.md`](TELEMETRY.md).
 
