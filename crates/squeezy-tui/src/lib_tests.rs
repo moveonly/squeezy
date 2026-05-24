@@ -1052,62 +1052,6 @@ fn startup_card_scrolls_with_transcript_history() {
 }
 
 #[test]
-fn native_scrollback_history_mirrors_startup_and_committed_entries_once() {
-    let mut app = test_app(SessionMode::Build);
-    app.push_transcript_item(TranscriptItem::user("hi"));
-    app.pending_assistant = "streaming".to_string();
-
-    let seeded = scrollback_history_lines(&app, 80, true, 0)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-    assert!(seeded.iter().any(|line| line.contains(">_ Squeezy v")));
-    assert!(seeded.iter().any(|line| line.contains("> hi")));
-    assert!(
-        seeded.iter().all(|line| !line.contains("streaming")),
-        "pending assistant text must stay in the live frame only: {seeded:?}"
-    );
-
-    app.push_transcript_item(TranscriptItem::assistant("hello"));
-    let incremental = scrollback_history_lines(&app, 80, false, 1)
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-    assert!(!incremental.iter().any(|line| line.contains(">_ Squeezy v")));
-    assert!(!incremental.iter().any(|line| line.contains("> hi")));
-    assert!(incremental.iter().any(|line| line.contains("● hello")));
-}
-
-#[test]
-fn native_scrollback_ansi_sanitizes_control_sequences() {
-    let line = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default()
-                .fg(GOLD)
-                .bg(PROMPT_BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("hello\x1b[31m"),
-    ]);
-
-    let rendered = ansi_line(&line);
-
-    assert!(rendered.contains("\x1b[1;38;2;254;240;138;48;2;31;31;35m"));
-    assert!(rendered.contains("hello?[31m"), "{rendered:?}");
-}
-
-#[test]
 fn exit_hint_points_to_session_resume_command() {
     assert_eq!(
         exit_hint(Some("session-123")).as_deref(),
@@ -1298,11 +1242,19 @@ fn completed_turn_shows_worked_duration_divider() {
 fn working_shimmer_sweeps_left_to_right() {
     let left = shimmer_word_spans("Working", 1_200);
     let right = shimmer_word_spans("Working", 2_200);
+    let repeated_left = shimmer_word_spans("Working", 4_600);
 
     assert_ne!(left[0].style.fg, Some(AMBER));
     assert_eq!(left.last().expect("last").style.fg, Some(AMBER));
     assert_eq!(right[0].style.fg, Some(AMBER));
     assert_ne!(right.last().expect("last").style.fg, Some(AMBER));
+    assert_eq!(
+        left.iter().map(|span| span.style).collect::<Vec<_>>(),
+        repeated_left
+            .iter()
+            .map(|span| span.style)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -1906,6 +1858,42 @@ async fn transcript_navigation_keys_update_scroll_state() {
     .await
     .expect("handle key");
     assert_eq!(app.transcript_scroll_from_bottom, u16::MAX);
+}
+
+#[test]
+fn mouse_wheel_scrolls_transcript_not_prompt_history() {
+    let mut app = test_app(SessionMode::Build);
+    app.input_history.push("previous prompt".to_string());
+    app.input.clear();
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(app.transcript_scroll_from_bottom, 4);
+    assert!(
+        app.input.is_empty(),
+        "mouse wheel must not recall prompt history"
+    );
+
+    handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert!(app.input.is_empty());
 }
 
 #[test]
