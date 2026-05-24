@@ -82,6 +82,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
+    assert!(config.exploration_compiler);
     assert_eq!(config.max_parallel_tools, 8);
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key_env, DEFAULT_EXA_API_KEY_ENV);
@@ -920,6 +921,9 @@ reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
 
+[agent]
+exploration_compiler = false
+
 [budgets]
 max_parallel_tools = 3
 tool_spill_threshold_bytes = 1000
@@ -996,6 +1000,7 @@ reason = "docs lookups are safe"
     assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(config.max_output_tokens, Some(512));
     assert!(config.store_responses);
+    assert!(!config.exploration_compiler);
     assert_eq!(config.session_mode, SessionMode::Plan);
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.tool_spill_threshold_bytes, 1000);

@@ -156,6 +156,48 @@ async fn plan_mode_advertises_only_read_only_tools() {
 }
 
 #[tokio::test]
+async fn exploration_compiler_prefetches_graph_context_before_model_request() {
+    let root = temp_workspace("exploration_preflight");
+    write_rust_crate(&root, "pub fn make_widget() {}\n");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "src/lib.rs defines make_widget.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_final".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    drain_turn(agent.start_turn(
+        "Which file defines make_widget?".to_string(),
+        CancellationToken::new(),
+    ))
+    .await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let outputs = function_outputs(&requests[0]);
+    let call_ids = outputs
+        .iter()
+        .map(|(call_id, _)| *call_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        call_ids,
+        vec!["planner_definition_search", "planner_symbol_context"]
+    );
+    assert!(
+        outputs
+            .iter()
+            .any(|(_, output)| output["tool_name"] == "definition_search")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn build_mode_advertises_full_tool_set() {
     let root = temp_workspace("build_tools");
     let provider = Arc::new(ScriptedProvider::new(vec![vec![
@@ -1356,4 +1398,14 @@ fn temp_workspace(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("squeezy_agent_{name}_{nonce}"));
     fs::create_dir_all(&root).expect("create temp workspace");
     root
+}
+
+fn write_rust_crate(root: &std::path::Path, source: &str) {
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    fs::write(root.join("src/lib.rs"), source).expect("write source");
 }

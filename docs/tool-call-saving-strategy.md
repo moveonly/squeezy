@@ -27,6 +27,11 @@ model-facing tool output compact enough to be useful.
   `downstream_flow`, `symbol_context`, `hierarchy`, and `read_slice` answer
   common code questions from persisted graph partitions and return compact
   evidence packets instead of raw file dumps.
+- **Exploration compiler.** Common navigation prompts are classified before the
+  first model request and routed through deterministic graph-first tool plans.
+  The resulting evidence packets are inserted into the model input as ordinary
+  tool results, and confident navigation turns refuse premature `read_file`
+  calls until graph context has been gathered.
 - **Output spill previews.** Large tool outputs are written to a local
   content-addressed store. The model receives a compact preview plus a handle
   for fetching exact ranges. Spill previews also carry the original output
@@ -99,6 +104,8 @@ model-facing tool output compact enough to be useful.
 - `SQUEEZY_MAX_TOOL_BYTES_READ_PER_TURN` controls the per-turn read-byte cap.
 - `SQUEEZY_MAX_SEARCH_FILES_PER_TURN` controls the per-turn search file-scan
   cap.
+- `SQUEEZY_EXPLORATION_COMPILER=off` disables the deterministic graph-first
+  planner for comparison runs or debugging. It is enabled by default.
 - `SQUEEZY_WEB_PERMISSION` controls the allow/ask/deny policy for `websearch`
   and `webfetch`. The default is `ask`.
 - `SQUEEZY_SHELL_PERMISSION_CLASSIFIER` controls the narrow LLM fallback for

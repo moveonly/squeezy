@@ -199,6 +199,49 @@ async fn agent_runner_scopes_tools_to_materialized_workspace_and_counts_tool_cos
     assert_eq!(output.metrics.matches_returned, 1);
 }
 
+#[tokio::test]
+async fn planner_probe_compares_enabled_and_disabled_runs() {
+    let task = TaskSpec {
+        id: "planner-probe".to_string(),
+        title: "Planner probe".to_string(),
+        prompt: "Which file defines make_widget?".to_string(),
+        workspace: WorkspaceSpec {
+            files: vec![
+                WorkspaceFile {
+                    path: "Cargo.toml".to_string(),
+                    content:
+                        "[package]\nname = \"case\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+                            .to_string(),
+                },
+                WorkspaceFile {
+                    path: "src/lib.rs".to_string(),
+                    content: "pub fn make_widget() {}\n".to_string(),
+                },
+            ],
+        },
+        expect: ExpectSpec {
+            contains: vec!["src/lib.rs".to_string()],
+        },
+        mock: None,
+        baseline: Some(BaselineSpec {
+            pattern: "make_widget".to_string(),
+            include: vec!["*.rs".to_string()],
+            mode: BaselineMode::Paths,
+            read_path: None,
+        }),
+    };
+
+    let enabled = run_task(&task, RunnerKind::PlannerProbe, None).await;
+    let disabled = run_task(&task, RunnerKind::PlannerProbeNoPlanner, None).await;
+
+    assert_eq!(enabled.status, TaskStatus::Passed);
+    assert_eq!(disabled.status, TaskStatus::Passed);
+    assert_eq!(enabled.metrics.planner_turns, 1);
+    assert!(enabled.metrics.planner_tool_calls > 0);
+    assert_eq!(disabled.metrics.planner_turns, 0);
+    assert!(enabled.metrics.bytes_read < disabled.metrics.bytes_read);
+}
+
 #[derive(Debug)]
 struct ToolUsingProvider {
     marker: String,

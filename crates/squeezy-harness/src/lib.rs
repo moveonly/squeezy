@@ -21,7 +21,8 @@ use squeezy_core::{
     DEFAULT_OPENAI_MODEL, Result, SqueezyError,
 };
 use squeezy_llm::{
-    LlmEvent, LlmProvider, LlmRequest, LlmStream, provider_from_config as llm_provider_from_config,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    provider_from_config as llm_provider_from_config,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +35,8 @@ pub enum RunnerKind {
     MockOpenai,
     MockAnthropic,
     GrepBaseline,
+    PlannerProbe,
+    PlannerProbeNoPlanner,
     CostlyOpenai,
     CostlyAnthropic,
     CostlyGoogle,
@@ -56,7 +59,13 @@ impl RunnerKind {
     }
 
     pub const fn is_mock(self) -> bool {
-        matches!(self, Self::MockOpenai | Self::MockAnthropic)
+        matches!(
+            self,
+            Self::MockOpenai
+                | Self::MockAnthropic
+                | Self::PlannerProbe
+                | Self::PlannerProbeNoPlanner
+        )
     }
 
     pub const fn name(self) -> &'static str {
@@ -64,6 +73,8 @@ impl RunnerKind {
             Self::MockOpenai => "mock-openai",
             Self::MockAnthropic => "mock-anthropic",
             Self::GrepBaseline => "grep-baseline",
+            Self::PlannerProbe => "planner-probe",
+            Self::PlannerProbeNoPlanner => "planner-probe-no-planner",
             Self::CostlyOpenai => "costly-openai",
             Self::CostlyAnthropic => "costly-anthropic",
             Self::CostlyGoogle => "costly-google",
@@ -88,6 +99,8 @@ pub fn default_runners() -> Vec<RunnerKind> {
     vec![
         RunnerKind::MockOpenai,
         RunnerKind::MockAnthropic,
+        RunnerKind::PlannerProbe,
+        RunnerKind::PlannerProbeNoPlanner,
         RunnerKind::GrepBaseline,
     ]
 }
@@ -195,6 +208,9 @@ pub struct HarnessMetrics {
     pub spill_writes: u64,
     pub spill_reads: u64,
     pub budget_denials: u64,
+    pub planner_turns: u64,
+    pub planner_tool_calls: u64,
+    pub planner_refusals: u64,
     pub redactions: u64,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -292,6 +308,8 @@ pub async fn run_task(task: &TaskSpec, runner: RunnerKind, trace_dir: Option<&Pa
         RunnerKind::MockOpenai => run_mock(task, runner, mock_events(task, "openai")).await,
         RunnerKind::MockAnthropic => run_mock(task, runner, mock_events(task, "anthropic")).await,
         RunnerKind::GrepBaseline => run_baseline(task),
+        RunnerKind::PlannerProbe => run_planner_probe(task, runner, true).await,
+        RunnerKind::PlannerProbeNoPlanner => run_planner_probe(task, runner, false).await,
         RunnerKind::CostlyOpenai => run_costly(task, runner, "openai", trace_dir).await,
         RunnerKind::CostlyAnthropic => run_costly(task, runner, "anthropic", trace_dir).await,
         RunnerKind::CostlyGoogle => run_costly(task, runner, "google", trace_dir).await,
@@ -357,6 +375,22 @@ async fn run_mock(
     let events = events?;
     let provider = Arc::new(ScriptedProvider::new(runner.name(), events));
     run_agent(task, runner, provider).await
+}
+
+async fn run_planner_probe(
+    task: &TaskSpec,
+    runner: RunnerKind,
+    exploration_compiler: bool,
+) -> Result<RunnerOutput> {
+    let baseline = task.baseline.as_ref().ok_or_else(|| {
+        SqueezyError::Agent(format!("task {} has no planner-probe baseline", task.id))
+    })?;
+    let provider = Arc::new(PlannerProbeProvider::new(task, baseline));
+    let mut config = AppConfig::from_env();
+    config.model = runner.name().to_string();
+    config.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+    config.exploration_compiler = exploration_compiler;
+    run_agent_with_config(task, runner, provider, config).await
 }
 
 async fn run_costly(
@@ -522,6 +556,9 @@ async fn run_agent_with_config(
                 metrics.spill_writes = turn_metrics.spill_writes;
                 metrics.spill_reads = turn_metrics.spill_reads;
                 metrics.budget_denials = turn_metrics.budget_denials;
+                metrics.planner_turns = turn_metrics.planner_turns;
+                metrics.planner_tool_calls = turn_metrics.planner_tool_calls;
+                metrics.planner_refusals = turn_metrics.planner_refusals;
                 metrics.redactions = turn_metrics.redactions;
                 metrics.input_tokens = cost.input_tokens;
                 metrics.output_tokens = cost.output_tokens;
@@ -604,6 +641,116 @@ impl LlmProvider for ScriptedProvider {
             Box::pin(stream::iter(events));
         stream
     }
+}
+
+#[derive(Debug)]
+struct PlannerProbeProvider {
+    answer: String,
+    pattern: String,
+    include: Vec<String>,
+    read_path: Option<String>,
+    phase: Mutex<u8>,
+}
+
+impl PlannerProbeProvider {
+    fn new(task: &TaskSpec, baseline: &BaselineSpec) -> Self {
+        Self {
+            answer: task.expect.contains.join(" "),
+            pattern: baseline.pattern.clone(),
+            include: baseline.include.clone(),
+            read_path: baseline
+                .read_path
+                .clone()
+                .or_else(|| first_expected_source_path(task)),
+            phase: Mutex::new(0),
+        }
+    }
+}
+
+impl LlmProvider for PlannerProbeProvider {
+    fn name(&self) -> &'static str {
+        "planner-probe"
+    }
+
+    fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let has_planner_context = request.input.iter().any(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. }
+            | LlmInputItem::FunctionCallOutput { call_id, .. } => call_id.starts_with("planner_"),
+            _ => false,
+        });
+        let has_read_output = request.input.iter().any(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => call_id == "probe_read",
+            _ => false,
+        });
+        let has_grep_output = request.input.iter().any(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => call_id == "probe_grep",
+            _ => false,
+        });
+
+        let mut phase = self.phase.lock().expect("planner probe phase");
+        let events = if has_planner_context
+            || has_read_output
+            || (has_grep_output && self.read_path.is_none())
+        {
+            vec![
+                Ok(LlmEvent::TextDelta(self.answer.clone())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("planner_probe_final".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ]
+        } else if *phase == 0 {
+            *phase = 1;
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "probe_grep".to_string(),
+                    name: "grep".to_string(),
+                    arguments: json!({
+                        "pattern": self.pattern.clone(),
+                        "include": self.include.clone(),
+                        "output_mode": "content",
+                    }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("planner_probe_grep".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ]
+        } else {
+            *phase = 2;
+            let path = self.read_path.clone().unwrap_or_else(|| ".".to_string());
+            vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "probe_read".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": path }),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("planner_probe_read".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ]
+        };
+        Box::pin(stream::iter(events))
+    }
+}
+
+fn first_expected_source_path(task: &TaskSpec) -> Option<String> {
+    task.expect.contains.iter().find_map(|expected| {
+        let value = expected.trim();
+        if value.ends_with(".rs")
+            || value.contains(".rs:")
+            || value.contains(".py")
+            || value.contains(".js")
+            || value.contains(".ts")
+        {
+            Some(value.trim_end_matches(':').to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
@@ -892,10 +1039,35 @@ pub fn summarize(results: &[TaskResult]) -> serde_json::Value {
         .iter()
         .filter(|result| result.status == TaskStatus::Passed)
         .count();
+    let tool_calls = results
+        .iter()
+        .map(|result| result.metrics.tool_calls)
+        .sum::<u64>();
+    let bytes_read = results
+        .iter()
+        .map(|result| result.metrics.bytes_read)
+        .sum::<u64>();
+    let planner_turns = results
+        .iter()
+        .map(|result| result.metrics.planner_turns)
+        .sum::<u64>();
+    let planner_tool_calls = results
+        .iter()
+        .map(|result| result.metrics.planner_tool_calls)
+        .sum::<u64>();
+    let planner_refusals = results
+        .iter()
+        .map(|result| result.metrics.planner_refusals)
+        .sum::<u64>();
     json!({
         "total": results.len(),
         "passed": passed,
         "failed": results.len().saturating_sub(passed),
+        "tool_calls": tool_calls,
+        "bytes_read": bytes_read,
+        "planner_turns": planner_turns,
+        "planner_tool_calls": planner_tool_calls,
+        "planner_refusals": planner_refusals,
     })
 }
 

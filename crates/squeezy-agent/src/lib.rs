@@ -40,6 +40,10 @@ use squeezy_tools::{
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod exploration_compiler;
+
+use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+
 const MAX_TOOL_ROUNDS: usize = 8;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
@@ -1290,6 +1294,14 @@ impl TurnRuntime {
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::from_store(self.store.clone());
         let mut broker = CostBroker::new(&self.config);
+        let exploration_plan = self
+            .config
+            .exploration_compiler
+            .then(|| compile_exploration_plan(&input))
+            .flatten();
+        let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(
+            exploration_plan.as_ref(),
+        )));
         broker.metrics.redactions += std::mem::take(&mut self.seed_redactions);
         // Instructions are static across the turn's tool rounds; redact
         // them once so the cost is not paid (or double-counted) per round.
@@ -1314,6 +1326,88 @@ impl TurnRuntime {
         );
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
+
+        if let Some(plan) = exploration_plan.clone()
+            && !plan.calls.is_empty()
+        {
+            broker.metrics.planner_turns = 1;
+            broker.metrics.planner_tool_calls += plan.calls.len() as u64;
+            self.log_event(
+                "exploration_plan",
+                Some(self.turn_id),
+                Some(format!("{} planner preflight", plan.intent.as_str())),
+                json!({
+                    "intent": plan.intent.as_str(),
+                    "query": plan.query,
+                    "calls": plan
+                        .calls
+                        .iter()
+                        .map(|call| call.name.clone())
+                        .collect::<Vec<_>>(),
+                }),
+            );
+            let planned_calls = plan.calls;
+            let results = execute_tool_calls(
+                planned_calls.clone(),
+                ToolExecutionContext {
+                    turn_id: self.turn_id,
+                    provider: self.provider.clone(),
+                    tools: &self.tools,
+                    jobs: &self.jobs,
+                    config: &self.config,
+                    telemetry: self.telemetry.clone(),
+                    redactor: self.redactor.clone(),
+                    tx: self.tx.clone(),
+                    cancel: self.cancel.clone(),
+                    approval_ids: self.approval_ids.clone(),
+                    session_rules: self.session_rules.clone(),
+                    session_mode: self.session_mode.clone(),
+                    session_log: self.session_log.clone(),
+                    task_state: self.task_state.clone(),
+                    exploration_state: exploration_state.clone(),
+                },
+                &mut broker,
+            )
+            .await;
+            let results = seen_tool_outputs.prepare_results(results);
+            let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
+            for pending in &results {
+                broker.record_model_result(&pending.result);
+            }
+            seen_tool_outputs.remember_results(&results);
+
+            let outputs = results
+                .into_iter()
+                .map(|pending| {
+                    let output = pending.result.model_output();
+                    LlmInputItem::FunctionCallOutput {
+                        call_id: pending.result.call_id,
+                        output,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut planner_items = planned_calls
+                .iter()
+                .cloned()
+                .map(|call| llm_function_call_item(call, &self.redactor))
+                .collect::<Vec<_>>();
+            planner_items.extend(outputs.clone());
+            conversation.extend(planner_items.clone());
+            for output in &outputs {
+                self.log_event(
+                    "tool_result",
+                    Some(self.turn_id),
+                    tool_output_summary(output),
+                    json!({ "output": resume_item_for_json(output.clone()), "source": "exploration_compiler" }),
+                );
+            }
+            if self.config.store_responses {
+                next_input = vec![user_item.clone()];
+                next_input.extend(planner_items);
+            } else {
+                next_input = conversation.clone();
+            }
+        }
 
         for _round in 0..MAX_TOOL_ROUNDS {
             let active_mode = load_session_mode(&self.session_mode);
@@ -1519,6 +1613,7 @@ impl TurnRuntime {
                     session_mode: self.session_mode.clone(),
                     session_log: self.session_log.clone(),
                     task_state: self.task_state.clone(),
+                    exploration_state: exploration_state.clone(),
                 },
                 &mut broker,
             )
@@ -1723,6 +1818,7 @@ struct ToolExecutionContext<'a> {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    exploration_state: Arc<Mutex<ExplorationTurnState>>,
 }
 
 async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
@@ -1750,6 +1846,25 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
         ToolStatus::Success,
         json!({ "ok": true, "summary": snapshot.compact_summary() }),
     )
+}
+
+async fn exploration_read_denial_reason(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> Option<String> {
+    context
+        .exploration_state
+        .lock()
+        .await
+        .read_denial_reason(call)
+}
+
+async fn record_exploration_tool_result(context: &ToolExecutionContext<'_>, result: &ToolResult) {
+    context
+        .exploration_state
+        .lock()
+        .await
+        .record_tool_result(&result.tool_name, result.status == ToolStatus::Success);
 }
 
 async fn publish_task_state_update(
@@ -1865,6 +1980,30 @@ async fn execute_tool_calls(
                 continue;
             }
         };
+
+        if let Some(reason) = exploration_read_denial_reason(&context, call).await {
+            let result = ToolResult::denied(call, reason);
+            broker.metrics.planner_refusals += 1;
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            continue;
+        }
 
         match permission_decision(call, &context).await {
             ApprovalDecision::Approved => approved.push((index, call.clone(), tool_sequence)),
@@ -2098,6 +2237,7 @@ async fn run_one_tool(
             context.turn_id.to_string(),
         )
         .await;
+    record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);
         let summary = tool_result_summary(&result);
