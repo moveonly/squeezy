@@ -14,7 +14,10 @@ use crossterm::{
     },
     execute,
     style::Print,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Frame, Terminal,
@@ -287,6 +290,7 @@ async fn run_inner(
     if let Some(session_id) = agent.session_id() {
         app.status = format!("session {session_id}");
     }
+    terminal.set_exit_hint(exit_hint(agent.session_id().as_deref()));
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
@@ -2265,22 +2269,77 @@ fn working_line(app: &TuiApp) -> Line<'static> {
 }
 
 fn working_word_spans(app: &TuiApp) -> Vec<Span<'static>> {
-    let highlight_index = ((prompt_elapsed_ms(app) / 650) as usize) % "Working".chars().count();
-    "Working"
-        .chars()
+    shimmer_word_spans("Working", prompt_elapsed_ms(app))
+}
+
+fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>> {
+    let chars = text.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let padding = 4usize;
+    let band_half_width = 2.25f32;
+    let period = chars.len() + padding * 2;
+    let sweep_ms = 3_400u64;
+    let position =
+        ((elapsed_ms % sweep_ms) as f32 / sweep_ms as f32) * period.saturating_sub(1) as f32;
+    chars
+        .into_iter()
         .enumerate()
         .map(|(index, ch)| {
-            let color = if index == highlight_index {
-                GOLD
+            let char_position = (index + padding) as f32;
+            let distance = (char_position - position).abs();
+            let intensity = if distance <= band_half_width {
+                let x = std::f32::consts::PI * (distance / band_half_width);
+                0.5 * (1.0 + x.cos())
             } else {
-                AMBER
+                0.0
             };
+            let color = blend_color(AMBER, GOLD, intensity * 0.9);
             Span::styled(
                 ch.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )
         })
         .collect()
+}
+
+fn blend_color(base: Color, highlight: Color, intensity: f32) -> Color {
+    let (base_r, base_g, base_b) = rgb_components(base);
+    let (hi_r, hi_g, hi_b) = rgb_components(highlight);
+    let t = intensity.clamp(0.0, 1.0);
+    Color::Rgb(
+        blend_channel(base_r, hi_r, t),
+        blend_channel(base_g, hi_g, t),
+        blend_channel(base_b, hi_b, t),
+    )
+}
+
+fn blend_channel(base: u8, highlight: u8, intensity: f32) -> u8 {
+    (base as f32 + (highlight as f32 - base as f32) * intensity).round() as u8
+}
+
+fn rgb_components(color: Color) -> (u8, u8, u8) {
+    match color {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (255, 0, 0),
+        Color::Green => (0, 128, 0),
+        Color::Yellow => (255, 255, 0),
+        Color::Blue => (0, 0, 255),
+        Color::Magenta => (255, 0, 255),
+        Color::Cyan => (0, 255, 255),
+        Color::Gray => (128, 128, 128),
+        Color::DarkGray => (80, 80, 80),
+        Color::LightRed => (255, 128, 128),
+        Color::LightGreen => (128, 255, 128),
+        Color::LightYellow => (255, 255, 128),
+        Color::LightBlue => (128, 128, 255),
+        Color::LightMagenta => (255, 128, 255),
+        Color::LightCyan => (128, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Indexed(_) | Color::Reset => (255, 255, 255),
+    }
 }
 
 fn current_turn_duration(app: &TuiApp) -> Duration {
@@ -4030,6 +4089,12 @@ struct PendingApproval {
     decision_tx: oneshot::Sender<ToolApprovalDecision>,
 }
 
+fn exit_hint(session_id: Option<&str>) -> Option<String> {
+    session_id.map(|session_id| {
+        format!("Squeezy session saved. Resume with: squeezy sessions resume {session_id}")
+    })
+}
+
 fn scrollback_history_lines(
     app: &TuiApp,
     width: u16,
@@ -4132,6 +4197,7 @@ struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     scrollback_seeded: bool,
     scrollback_entries: usize,
+    exit_hint: Option<String>,
 }
 
 impl TerminalGuard {
@@ -4140,6 +4206,7 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         execute!(
             stdout,
+            EnterAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0),
             EnableBracketedPaste,
@@ -4152,7 +4219,12 @@ impl TerminalGuard {
             terminal,
             scrollback_seeded: false,
             scrollback_entries: 0,
+            exit_hint: None,
         })
+    }
+
+    fn set_exit_hint(&mut self, exit_hint: Option<String>) {
+        self.exit_hint = exit_hint;
     }
 
     fn sync_scrollback_history(&mut self, app: &TuiApp) -> Result<()> {
@@ -4201,9 +4273,13 @@ impl Drop for TerminalGuard {
             Print(DISABLE_ALTERNATE_SCROLL),
             Print(DISABLE_MOUSE_MODES),
             Clear(ClearType::All),
-            MoveTo(0, 0)
+            MoveTo(0, 0),
+            LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
+        if let Some(hint) = &self.exit_hint {
+            let _ = writeln!(self.terminal.backend_mut(), "{hint}");
+        }
     }
 }
 

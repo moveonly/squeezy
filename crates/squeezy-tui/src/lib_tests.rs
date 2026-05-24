@@ -1108,6 +1108,15 @@ fn native_scrollback_ansi_sanitizes_control_sequences() {
 }
 
 #[test]
+fn exit_hint_points_to_session_resume_command() {
+    assert_eq!(
+        exit_hint(Some("session-123")).as_deref(),
+        Some("Squeezy session saved. Resume with: squeezy sessions resume session-123")
+    );
+    assert!(exit_hint(None).is_none());
+}
+
+#[test]
 fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.input = "ship it".to_string();
@@ -1283,6 +1292,17 @@ fn completed_turn_shows_worked_duration_divider() {
     assert!(output.contains("─ Worked for 13m 23s"), "{output}");
     assert!(!output.contains("• Working"), "{output}");
     assert!(!output.contains("• Done"), "{output}");
+}
+
+#[test]
+fn working_shimmer_sweeps_left_to_right() {
+    let left = shimmer_word_spans("Working", 1_200);
+    let right = shimmer_word_spans("Working", 2_200);
+
+    assert_ne!(left[0].style.fg, Some(AMBER));
+    assert_eq!(left.last().expect("last").style.fg, Some(AMBER));
+    assert_eq!(right[0].style.fg, Some(AMBER));
+    assert_ne!(right.last().expect("last").style.fg, Some(AMBER));
 }
 
 #[test]
