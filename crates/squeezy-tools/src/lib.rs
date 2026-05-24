@@ -4474,12 +4474,28 @@ impl ToolRegistry {
             );
         }
 
-        let command = verify_command(&self.root, scope, level, &changed_paths);
+        let Some(plan) = verify_command_plan(&self.root, scope, level, &changed_paths) else {
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "scope": verify_scope_str(scope),
+                    "level": verify_level_str(level),
+                    "changed_files": changed_paths,
+                    "command": null,
+                    "no_op": true,
+                    "not_run": true,
+                    "reason": "no Cargo.toml found for Rust verification",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
         let shell_call = ToolCall {
             call_id: call.call_id.clone(),
             name: "shell".to_string(),
             arguments: json!({
-                "command": command,
+                "command": plan.command,
                 "description": "run verification scoped by current diff",
                 "timeout_ms": VERIFY_SHELL_TIMEOUT_MS,
                 "output_byte_cap": DEFAULT_SHELL_OUTPUT_BYTE_CAP,
@@ -8541,7 +8557,87 @@ fn is_rust_verification_path(path: &str) -> bool {
     path.ends_with(".rs") || path.ends_with("Cargo.toml") || path.ends_with("Cargo.lock")
 }
 
+#[cfg(test)]
 fn verify_command(
+    root: &Path,
+    scope: VerifyScope,
+    level: VerifyLevel,
+    changed_paths: &[String],
+) -> String {
+    verify_command_plan(root, scope, level, changed_paths)
+        .map(|plan| plan.command)
+        .unwrap_or_else(|| match level {
+            VerifyLevel::Quick => "cargo test --workspace --message-format=json".to_string(),
+            VerifyLevel::Full => "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && cargo test --workspace --message-format=json".to_string(),
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifyCommandPlan {
+    command: String,
+}
+
+fn verify_command_plan(
+    root: &Path,
+    scope: VerifyScope,
+    level: VerifyLevel,
+    changed_paths: &[String],
+) -> Option<VerifyCommandPlan> {
+    if root.join("Cargo.toml").is_file() {
+        return Some(VerifyCommandPlan {
+            command: workspace_verify_command(root, scope, level, changed_paths),
+        });
+    }
+
+    let manifest_paths = match scope {
+        VerifyScope::Workspace => nested_manifest_paths(root),
+        VerifyScope::Diff => diff_manifest_paths(root, changed_paths),
+    };
+    if manifest_paths.is_empty() {
+        return None;
+    }
+    let test_commands = manifest_paths
+        .iter()
+        .map(|manifest| {
+            format!(
+                "cargo test --manifest-path {} --message-format=json",
+                shell_quote(&manifest.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>();
+    let command = match level {
+        VerifyLevel::Quick => test_commands.join(" && "),
+        VerifyLevel::Full => {
+            let fmt_commands = manifest_paths
+                .iter()
+                .map(|manifest| {
+                    format!(
+                        "cargo fmt --check --manifest-path {}",
+                        shell_quote(&manifest.to_string_lossy())
+                    )
+                })
+                .collect::<Vec<_>>();
+            let clippy_commands = manifest_paths
+                .iter()
+                .map(|manifest| {
+                    format!(
+                        "cargo clippy --manifest-path {} --all-targets --message-format=json -- -D warnings",
+                        shell_quote(&manifest.to_string_lossy())
+                    )
+                })
+                .collect::<Vec<_>>();
+            fmt_commands
+                .into_iter()
+                .chain(clippy_commands)
+                .chain(test_commands)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        }
+    };
+    Some(VerifyCommandPlan { command })
+}
+
+fn workspace_verify_command(
     root: &Path,
     scope: VerifyScope,
     level: VerifyLevel,
@@ -8572,6 +8668,64 @@ fn verify_command(
         VerifyLevel::Full => format!(
             "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && {test_command}"
         ),
+    }
+}
+
+fn diff_manifest_paths(root: &Path, changed_paths: &[String]) -> Vec<PathBuf> {
+    changed_paths
+        .iter()
+        .filter(|path| is_rust_verification_path(path))
+        .filter_map(|path| nearest_manifest_for_path(root, path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn nearest_manifest_for_path(root: &Path, path: &str) -> Option<PathBuf> {
+    let mut cursor = root.join(path);
+    if cursor.extension().is_some() {
+        cursor.pop();
+    }
+    loop {
+        let manifest = cursor.join("Cargo.toml");
+        if manifest.is_file() {
+            return manifest.strip_prefix(root).ok().map(Path::to_path_buf);
+        }
+        if cursor == root || !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+fn nested_manifest_paths(root: &Path) -> Vec<PathBuf> {
+    let mut manifests = BTreeSet::new();
+    collect_nested_manifest_paths(root, root, &mut manifests);
+    manifests.into_iter().collect()
+}
+
+fn collect_nested_manifest_paths(root: &Path, dir: &Path, manifests: &mut BTreeSet<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if matches!(
+            name.to_string_lossy().as_ref(),
+            ".git" | "target" | "node_modules"
+        ) {
+            continue;
+        }
+        let manifest = path.join("Cargo.toml");
+        if manifest.is_file()
+            && let Ok(relative) = manifest.strip_prefix(root)
+        {
+            manifests.insert(relative.to_path_buf());
+        }
+        collect_nested_manifest_paths(root, &path, manifests);
     }
 }
 

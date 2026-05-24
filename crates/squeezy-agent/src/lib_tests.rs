@@ -284,10 +284,10 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
         .flat_map(|request| request.tools.into_iter().map(|tool| tool.name))
         .collect::<Vec<_>>();
     assert!(
-        request_names
+        !request_names
             .iter()
             .any(|name| name == TASK_STATE_TOOL_NAME),
-        "task-state tool was not advertised: {request_names:?}",
+        "task-state progress must be runtime-derived, not advertised: {request_names:?}",
     );
 
     let session_id = agent.session_id().expect("session id");
@@ -1192,13 +1192,17 @@ async fn run_ls_phrase_uses_local_tool_path_without_provider_request() {
         CancellationToken::new(),
     );
     let mut completed = None;
+    let mut queued_tools = Vec::new();
     while let Some(event) = rx.recv().await {
-        if let AgentEvent::Completed { message, .. } = event {
-            completed = Some(message.content);
+        match event {
+            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call.name),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            _ => {}
         }
     }
 
     assert!(provider.requests().is_empty());
+    assert_eq!(queued_tools, vec!["shell".to_string()]);
     let completed = completed.expect("local run turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
 
@@ -1701,17 +1705,11 @@ fn control_tools_are_advertised_in_build_and_plan_modes() {
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(
-        build_names,
-        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
-    );
+    assert_eq!(build_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(
-        plan_names,
-        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
-    );
+    assert_eq!(plan_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
 }
 
 #[test]
@@ -1724,7 +1722,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(names, vec![TASK_STATE_TOOL_NAME.to_string()]);
+    assert!(names.is_empty());
 
     let explore_only_off = SubagentConfig {
         explore_enabled: false,
@@ -1734,13 +1732,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(
-        names,
-        vec![
-            TASK_STATE_TOOL_NAME.to_string(),
-            DELEGATE_TOOL_NAME.to_string(),
-        ]
-    );
+    assert_eq!(names, vec![DELEGATE_TOOL_NAME.to_string()]);
 }
 
 #[test]
@@ -1753,7 +1745,6 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         .finish();
 
     let tools = [
-        task_state_advertised_tool(),
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
     ];
@@ -1811,7 +1802,6 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
     assert_eq!(
         initial_names,
         vec![
-            TASK_STATE_TOOL_NAME,
             DELEGATE_TOOL_NAME,
             EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -1833,7 +1823,6 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
     assert_eq!(
         loaded_names,
         vec![
-            TASK_STATE_TOOL_NAME,
             DELEGATE_TOOL_NAME,
             EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -1864,7 +1853,6 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         !names.contains(&EXPLORE_TOOL_NAME),
         "explore must not be advertised when subagents.enabled=false: {names:?}"
     );
-    assert!(names.contains(&TASK_STATE_TOOL_NAME));
     assert!(names.contains(&"grep"));
 
     let explore_only = SubagentConfig {
@@ -1885,7 +1873,6 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
 #[test]
 fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
     let tools = [
-        task_state_advertised_tool(),
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
         test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),

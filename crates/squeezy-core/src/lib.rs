@@ -69,12 +69,13 @@ pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// intentionally **not** in this list so they only cost prompt bytes once
 /// the model explicitly attaches them via `load_tool_schema`.
 ///
-/// The two synthetic control tools (`update_task_state`, `load_tool_schema`)
-/// are not duplicated here on purpose: they are forced into the request
-/// `tools` array by name in `squeezy_agent::request_tool_specs`, and
-/// `squeezy_agent::tool_is_core_schema` treats them as always-core. Listing
-/// them in two places risks future skew if one site is updated without the
-/// other.
+/// `load_tool_schema` is not duplicated here on purpose: it is forced into the
+/// request `tools` array by name in `squeezy_agent::request_tool_specs`, and
+/// `squeezy_agent::tool_is_core_schema` treats it as always-core. Listing it
+/// in two places risks future skew if one site is updated without the other.
+///
+/// `update_task_state` is intentionally omitted from model-visible schemas.
+/// The runtime derives visible progress from turn/tool lifecycle events.
 pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",

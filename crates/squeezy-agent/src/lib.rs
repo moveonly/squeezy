@@ -5509,51 +5509,15 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
     }
 }
 
-fn task_state_advertised_tool() -> AdvertisedTool {
-    AdvertisedTool {
-        capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
-            name: TASK_STATE_TOOL_NAME.to_string(),
-            description: "Update the visible task/plan/progress state for the current turn. Use this for task title, step statuses, blockers, recent changes, next action, verification state, and replan reasons.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "task": {"type": "string", "description": "Short task title."},
-                    "status": {"type": "string", "enum": ["running", "blocked", "completed", "cancelled", "failed"], "description": "Overall task state. Default running."},
-                    "summary": {"type": ["string", "null"], "description": "Short state summary."},
-                    "steps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "title": {"type": "string"},
-                                "status": {"type": "string", "enum": ["pending", "active", "completed", "blocked", "skipped"]},
-                                "detail": {"type": ["string", "null"]}
-                            }
-                        },
-                        "description": "Ordered plan/progress steps."
-                    },
-                    "blocker": {"type": ["string", "null"], "description": "Current blocker, if any."},
-                    "next_action": {"type": ["string", "null"], "description": "What the agent intends to do next."},
-                    "verification": {"type": "string", "enum": ["not_started", "running", "passed", "failed", "skipped"], "description": "Verification state. Default not_started."},
-                    "recent_changes": {"type": "array", "items": {"type": "string"}, "description": "Short bullets for user-visible changes already made."},
-                    "replan_reason": {"type": ["string", "null"], "description": "Why the plan changed, if it changed."}
-                }
-            }),
-            strict: false,
-        },
-    }
-}
-
 /// Synthetic control tools that are advertised to the model on every
-/// request. `task_state` is always present. `delegate` and `explore` are
-/// gated on [`SubagentConfig::enabled`] / `explore_enabled` so we don't
-/// spend prompt tokens advertising tools the agent would refuse on every
-/// call.
+/// request. Progress/task state is intentionally not model-visible: the
+/// runtime derives visible working state from turn and tool lifecycle events,
+/// so simple prompts cannot burn full model rounds on bookkeeping-only calls.
+/// `delegate` and `explore` are gated on [`SubagentConfig::enabled`] /
+/// `explore_enabled` so we don't spend prompt tokens advertising tools the
+/// agent would refuse on every call.
 fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
-    let mut tools = vec![task_state_advertised_tool()];
+    let mut tools = Vec::new();
     if subagents.enabled {
         tools.push(delegate_advertised_tool());
         if subagents.explore_enabled {
@@ -5659,7 +5623,6 @@ fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Llm
 
 fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
     match name {
-        TASK_STATE_TOOL_NAME => Some(task_state_advertised_tool()),
         DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
@@ -5749,7 +5712,6 @@ fn request_tool_specs(
     let advertised_names: BTreeSet<&str> =
         tools.iter().map(|tool| tool.spec.name.as_str()).collect();
     let synthetic_order = [
-        TASK_STATE_TOOL_NAME,
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -5814,7 +5776,6 @@ fn warn_unknown_tool_schema_names(
         .iter()
         .map(|tool| tool.spec.name.as_str())
         .collect();
-    known.insert(TASK_STATE_TOOL_NAME);
     known.insert(DELEGATE_TOOL_NAME);
     known.insert(EXPLORE_TOOL_NAME);
     known.insert(LOAD_TOOL_SCHEMA_TOOL_NAME);
@@ -5903,8 +5864,7 @@ fn first_line_of_description(description: &str) -> String {
 /// Returns `true` when `tool`'s full JSON schema must be sent on every
 /// request (no lazy `load_tool_schema` hop). Tools fall into one of three
 /// buckets:
-///   * synthetic control tools (`update_task_state`, `delegate`, `explore`,
-///     `load_tool_schema`)
+///   * synthetic control tools (`delegate`, `explore`, `load_tool_schema`)
 ///     and every tool when lazy loading is disabled — always-core,
 ///   * names listed in `[tools].core` — explicit core,
 ///   * everything else (including names listed in `[tools].discoverable`
@@ -5917,7 +5877,7 @@ fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) 
     let name = tool.spec.name.as_str();
     if matches!(
         name,
-        TASK_STATE_TOOL_NAME | DELEGATE_TOOL_NAME | EXPLORE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME
+        DELEGATE_TOOL_NAME | EXPLORE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME
     ) {
         return true;
     }

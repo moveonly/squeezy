@@ -1082,6 +1082,11 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
     let root = temp_workspace("verify_command");
     fs::create_dir_all(root.join("crates/example")).expect("create crate");
     fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/example\"]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(
         root.join("crates/example/Cargo.toml"),
         "[package]\nname = \"squeezy-example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
@@ -1097,6 +1102,71 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
     assert_eq!(
         command,
         "cargo test -p squeezy-example --message-format=json"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
+    let root = temp_workspace("verify_nested_manifest");
+    fs::create_dir_all(root.join("tools/sonar-arch-graph/src")).expect("create crate");
+    fs::write(
+        root.join("tools/sonar-arch-graph/Cargo.toml"),
+        "[package]\nname = \"sonar-arch-graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+
+    let plan = verify_command_plan(
+        &root,
+        VerifyScope::Diff,
+        VerifyLevel::Quick,
+        &["tools/sonar-arch-graph/src/main.rs".to_string()],
+    )
+    .expect("verification plan");
+
+    assert_eq!(
+        plan.command,
+        "cargo test --manifest-path 'tools/sonar-arch-graph/Cargo.toml' --message-format=json"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn verify_reports_not_run_when_no_cargo_manifest_exists() {
+    let root = temp_workspace("verify_no_manifest");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").expect("write rust");
+    git_init_commit(&root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn changed() -> bool { true }\n",
+    )
+    .expect("modify rust");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "verify".to_string(),
+                name: "verify".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["no_op"], true);
+    assert_eq!(result.content["not_run"], true);
+    assert!(
+        result.content["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("no Cargo.toml"),
+        "{}",
+        result.content
     );
 
     let _ = fs::remove_dir_all(root);

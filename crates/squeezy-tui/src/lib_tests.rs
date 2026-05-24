@@ -626,6 +626,23 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(!expanded.contains("receipt output="), "{expanded}");
 }
 
+#[test]
+fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+
+    assert!(app.selected_entry.is_none());
+    assert!(app.transcript[0].collapsed);
+
+    toggle_selected_transcript_entry(&mut app);
+    assert!(!app.transcript[0].collapsed);
+    assert_eq!(app.status, "expanded transcript entry 1");
+
+    toggle_selected_transcript_entry(&mut app);
+    assert!(app.transcript[0].collapsed);
+    assert_eq!(app.status, "collapsed transcript entry 1");
+}
+
 #[tokio::test]
 async fn slash_collapse_and_expand_apply_to_tool_entries() {
     let mut agent = test_agent(SessionMode::Build);
@@ -670,6 +687,28 @@ fn failed_tool_rows_show_actionable_error_detail() {
         "{output}"
     );
     assert!(!output.contains("shell · error"), "{output}");
+}
+
+#[test]
+fn missing_cargo_manifest_shell_failure_renders_as_not_run_warning() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("shell", "");
+    result.status = ToolStatus::Error;
+    result.content = serde_json::json!({
+        "command": "cargo check -p sonar-arch-graph",
+        "exit_code": 101,
+        "stdout": "",
+        "stderr": "error: could not find `Cargo.toml` in `/Users/abbassabra/semsitter` or any parent directory",
+    });
+    app.push_tool_result(result);
+
+    let output = render_to_string(&app, 140, 12);
+
+    assert!(
+        output.contains("⚠ Not run cargo check -p sonar-arch-graph · no Cargo.toml found"),
+        "{output}"
+    );
+    assert!(!output.contains("✖ Failed cargo check"), "{output}");
 }
 
 #[test]
@@ -795,24 +834,6 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         }),
     );
 
-    let mut plan = sample_tool_result("plan_patch", "");
-    plan.call_id = "plan-1".to_string();
-    plan.content = serde_json::json!({
-        "objective": "modify one file",
-        "plan_id": "patch-1",
-        "symbols": [{"name": "foo"}],
-        "impact": {"neighborhood_paths": ["src/lib.rs", "src/main.rs"]},
-        "graph_available": true,
-    });
-    app.push_tool_result_with_call(
-        plan,
-        Some(ToolCall {
-            call_id: "plan-1".to_string(),
-            name: "plan_patch".to_string(),
-            arguments: serde_json::json!({"objective": "modify one file"}),
-        }),
-    );
-
     let output = render_to_string(&app, 180, 18);
 
     assert!(
@@ -827,10 +848,7 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         output.contains("✔ Explored read src/lib.rs · 128B · more available"),
         "{output}"
     );
-    assert!(
-        output.contains("✔ Planned plan patch for modify one file · 1 symbols · 2 paths"),
-        "{output}"
-    );
+    assert!(!output.contains("plan patch"), "{output}");
     assert!(!output.contains("output shortened"), "{output}");
     assert!(!output.contains("\"paths\""), "{output}");
 }
@@ -869,6 +887,58 @@ fn edit_tool_row_summarizes_checkpoint_diff_and_expands_patch() {
     assert!(output.contains("-old"), "{output}");
     assert!(output.contains("+new"), "{output}");
     assert!(!output.contains("\"checkpoint\""), "{output}");
+}
+
+#[test]
+fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("apply_patch", "");
+    result.call_id = "patch-1".to_string();
+    let patch = (0..40)
+        .map(|index| format!("+line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    result.content = serde_json::json!({
+        "checkpoint": {
+            "files": [{
+                "path": "src/lib.rs",
+                "additions": 40,
+                "deletions": 0,
+                "patch": patch,
+                "patch_truncated": false
+            }]
+        }
+    });
+    app.push_tool_result_with_call(
+        result,
+        Some(ToolCall {
+            call_id: "patch-1".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: serde_json::json!({}),
+        }),
+    );
+    toggle_selected_transcript_entry(&mut app);
+
+    let lines = format_transcript_entry_with_width(
+        &app.transcript[0],
+        false,
+        ToolOutputVerbosity::Normal,
+        MessageOutcome::Normal,
+        Some(120),
+    );
+    let output = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(output.contains("+line 20"), "{output}");
+    assert!(!output.contains("Ctrl-E to expand"), "{output}");
 }
 
 #[test]

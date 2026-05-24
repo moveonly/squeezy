@@ -396,21 +396,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     }
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
-                    app.status = format!(
-                        "{} {:?} {}B{}",
-                        result.tool_name,
-                        result.status,
-                        result.cost_hint.output_bytes,
-                        if result.cost_hint.truncated {
-                            " truncated"
-                        } else {
-                            ""
-                        }
-                    );
-                    if result.cost_hint.redactions > 0 {
-                        app.status
-                            .push_str(&format!(" redacted={}", result.cost_hint.redactions));
-                    }
+                    app.status = tool_result_status_text(&result);
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
                     app.push_tool_result_with_call(result, call);
@@ -2009,8 +1995,11 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
 }
 
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
-    let Some(index) = app.selected_entry else {
-        app.status = "select a transcript entry first".to_string();
+    let Some(index) = app
+        .selected_entry
+        .or_else(|| latest_toggleable_transcript_entry(app))
+    else {
+        app.status = "transcript is empty".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -2028,6 +2017,15 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         },
         entry.id + 1
     );
+}
+
+fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
+    app.transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.is_toggleable())
+        .map(|(index, _)| index)
 }
 
 fn switch_mode(
@@ -3064,25 +3062,25 @@ fn format_tool_result_entry(
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
-    let result = &tool.result;
     let (marker, action) = tool_result_action(tool);
+    let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
     if collapsed {
         return vec![action_line_spans(
             selected,
             marker,
-            status_color(result.status),
+            color,
             action,
-            status_color(result.status),
+            color,
             summary_spans,
         )];
     }
     let mut lines = vec![action_line_spans(
         selected,
         marker,
-        status_color(result.status),
+        color,
         action,
-        status_color(result.status),
+        color,
         summary_spans,
     )];
     lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
@@ -3347,6 +3345,20 @@ fn tool_result_summary_spans(tool: &ToolTranscript) -> Vec<Span<'static>> {
             Style::default().fg(Color::White),
         )],
     };
+    if tool_result_not_run(tool) {
+        spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            tool_result_error_detail(result),
+            Style::default().fg(QUIET),
+        ));
+        if tool.repeat_count > 1 {
+            spans.push(Span::styled(
+                format!(" ({}x)", tool.repeat_count),
+                Style::default().fg(QUIET),
+            ));
+        }
+        return spans;
+    }
     match result.status {
         ToolStatus::Error | ToolStatus::Stale => {
             spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
@@ -4156,16 +4168,12 @@ fn expanded_generic_tool_detail_lines(
 fn output_block_lines(
     label: &'static str,
     content: &str,
-    verbosity: ToolOutputVerbosity,
+    _verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
     if content.trim().is_empty() {
         return Vec::new();
     }
-    let limit = match verbosity {
-        ToolOutputVerbosity::Compact => 8,
-        ToolOutputVerbosity::Normal => 18,
-        ToolOutputVerbosity::Verbose => 60,
-    };
+    let limit = usize::MAX;
     let lines = head_tail_lines(content, limit);
     let mut rendered = vec![detail_line(false, QUIET, label)];
     rendered.extend(lines.into_iter().map(|line| {
@@ -4519,7 +4527,35 @@ fn is_invalid_argument_result(result: &ToolResult) -> bool {
             .is_some_and(|error| error.contains("invalid tool arguments"))
 }
 
+fn cargo_manifest_missing_result(result: &ToolResult) -> bool {
+    matches!(result.tool_name.as_str(), "shell" | "verify")
+        && ["error", "stderr", "stdout"].iter().any(|key| {
+            result
+                .content
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .is_some_and(|text| text.contains("could not find `Cargo.toml`"))
+        })
+}
+
 fn tool_result_error_detail(result: &ToolResult) -> String {
+    if cargo_manifest_missing_result(result) {
+        return "no Cargo.toml found".to_string();
+    }
+    if let Some(reason) = result
+        .content
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && result
+            .content
+            .get("not_run")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    {
+        return compact_text(reason, 140);
+    }
     if let Some(error) = result
         .content
         .get("error")
@@ -4563,6 +4599,31 @@ fn tool_result_error_detail(result: &ToolResult) -> String {
     }
 }
 
+fn tool_result_status_text(result: &ToolResult) -> String {
+    if cargo_manifest_missing_result(result) {
+        return format!("{} not run: no Cargo.toml found", result.tool_name);
+    }
+    let status = match result.status {
+        ToolStatus::Success => "completed",
+        ToolStatus::Error | ToolStatus::Stale => "failed",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Cancelled => "cancelled",
+    };
+    let mut text = format!("{} {status}", result.tool_name);
+    if result.cost_hint.truncated {
+        text.push_str(" · output shortened");
+    } else if result.cost_hint.output_bytes > 0 {
+        text.push_str(&format!(
+            " · {}",
+            format_bytes(result.cost_hint.output_bytes)
+        ));
+    }
+    if result.cost_hint.redactions > 0 {
+        text.push_str(&format!(" · redacted {}", result.cost_hint.redactions));
+    }
+    text
+}
+
 fn tool_result_denied_detail(result: &ToolResult) -> String {
     result
         .content
@@ -4598,7 +4659,18 @@ fn status_color(status: ToolStatus) -> Color {
     }
 }
 
+fn tool_result_display_color(tool: &ToolTranscript) -> Color {
+    if tool_result_not_run(tool) {
+        GOLD
+    } else {
+        status_color(tool.result.status)
+    }
+}
+
 fn tool_result_action(tool: &ToolTranscript) -> (&'static str, &'static str) {
+    if tool_result_not_run(tool) {
+        return ("⚠ ", "Not run");
+    }
     match tool.result.status {
         ToolStatus::Success if tool.result.tool_name == "plan_patch" => ("✔ ", "Planned"),
         ToolStatus::Success
@@ -4615,6 +4687,15 @@ fn tool_result_action(tool: &ToolTranscript) -> (&'static str, &'static str) {
         ToolStatus::Denied => ("⚠ ", "Denied"),
         ToolStatus::Cancelled => ("⚠ ", "Cancelled"),
     }
+}
+
+fn tool_result_not_run(tool: &ToolTranscript) -> bool {
+    tool.result
+        .content
+        .get("not_run")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+        || cargo_manifest_missing_result(&tool.result)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5419,6 +5500,9 @@ impl TuiApp {
     }
 
     fn push_tool_result_with_call(&mut self, result: ToolResult, call: Option<ToolCall>) {
+        if tool_result_hidden_by_default(&result) {
+            return;
+        }
         let id = self.next_id();
         let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
         if let Some(last) = self.transcript.last_mut()
@@ -5559,6 +5643,10 @@ impl TranscriptEntry {
         }
     }
 
+    fn is_toggleable(&self) -> bool {
+        true
+    }
+
     fn pin_payload(&self) -> (String, String, String) {
         match &self.kind {
             TranscriptEntryKind::Message(item) => (
@@ -5611,6 +5699,10 @@ fn coalesce_tool_transcript_entry(existing: &mut TranscriptEntry, next: &Transcr
     } else {
         false
     }
+}
+
+fn tool_result_hidden_by_default(result: &ToolResult) -> bool {
+    result.tool_name == "plan_patch" && result.status == ToolStatus::Success
 }
 
 fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
