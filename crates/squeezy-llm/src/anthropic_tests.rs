@@ -8,6 +8,8 @@ fn request_body_uses_messages_streaming_shape() {
         instructions: "be brief".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         tools: vec![LlmToolSpec {
             name: "read_file".to_string(),
@@ -58,6 +60,8 @@ fn request_body_maps_tool_roundtrip_messages() {
             },
         ],
         max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
@@ -178,6 +182,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             cost: CostSnapshot {
                 input_tokens: Some(10),
                 output_tokens: Some(4),
+                reasoning_output_tokens: None,
                 cached_input_tokens: Some(3),
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,

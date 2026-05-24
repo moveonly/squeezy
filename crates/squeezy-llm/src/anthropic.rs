@@ -233,6 +233,7 @@ impl AnthropicStreamState {
         CostSnapshot {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            reasoning_output_tokens: None,
             cached_input_tokens: self.cache_read_input_tokens,
             cache_write_input_tokens: self.cache_creation_input_tokens,
             estimated_usd_micros: None,

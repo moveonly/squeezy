@@ -10,6 +10,8 @@ fn request_body_uses_chat_stream_shape() {
         instructions: "be brief".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(16),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: vec![LlmToolSpec {
             name: "grep".to_string(),
@@ -53,6 +55,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
             cost: CostSnapshot {
                 input_tokens: Some(10),
                 output_tokens: Some(2),
+                reasoning_output_tokens: None,
                 cached_input_tokens: None,
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),

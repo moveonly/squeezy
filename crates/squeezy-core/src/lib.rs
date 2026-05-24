@@ -50,6 +50,7 @@ pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
     pub profile: ModelProfile,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
     pub max_output_tokens: Option<u32>,
     pub tick_rate: Duration,
@@ -269,6 +270,7 @@ impl AppConfig {
             .or(settings.model)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(default_model);
+        let reasoning_effort = model_settings.reasoning_effort;
         let max_output_tokens = get_var("SQUEEZY_MAX_OUTPUT_TOKENS")
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
@@ -380,6 +382,7 @@ impl AppConfig {
             provider,
             model,
             profile,
+            reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens: Some(max_output_tokens),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
@@ -460,6 +463,12 @@ impl AppConfig {
             "profile = {}\n",
             toml_string(self.profile.as_str())
         ));
+        if let Some(reasoning_effort) = self.reasoning_effort {
+            output.push_str(&format!(
+                "reasoning_effort = {}\n",
+                toml_string(reasoning_effort.as_str())
+            ));
+        }
         output.push_str(&format!(
             "max_output_tokens = {}\n",
             self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
@@ -673,8 +682,24 @@ impl AppConfig {
         output.push_str("[tui]\n");
         output.push_str(&format!("tick_rate_ms = {}\n", self.tui.tick_rate_ms));
         output.push_str(&format!(
-            "status_verbosity = {}\n\n",
+            "status_verbosity = {}\n",
             toml_string(self.tui.status_verbosity.as_str())
+        ));
+        output.push_str(&format!(
+            "response_verbosity = {}\n",
+            toml_string(self.tui.response_verbosity.as_str())
+        ));
+        output.push_str(&format!(
+            "tool_output_verbosity = {}\n",
+            toml_string(self.tui.tool_output_verbosity.as_str())
+        ));
+        output.push_str(&format!(
+            "transcript_default = {}\n",
+            toml_string(self.tui.transcript_default.as_str())
+        ));
+        output.push_str(&format!(
+            "show_reasoning_usage = {}\n\n",
+            self.tui.show_reasoning_usage
         ));
 
         for (name, server) in &self.mcp_servers {
@@ -879,6 +904,33 @@ impl ModelProfile {
             Self::Cheap => "cheap",
             Self::Balanced => "balanced",
             Self::Strong => "strong",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
         }
     }
 }
@@ -1101,6 +1153,7 @@ pub struct ModelSettings {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub profile: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
     pub store_responses: Option<bool>,
 }
@@ -1113,6 +1166,7 @@ impl ModelSettings {
                 "provider",
                 "model",
                 "profile",
+                "reasoning_effort",
                 "max_output_tokens",
                 "store_responses",
             ],
@@ -1128,10 +1182,17 @@ impl ModelSettings {
                 field(path, "profile")
             )));
         }
+        let reasoning_effort = reasoning_effort_value(
+            table,
+            "reasoning_effort",
+            source,
+            &field(path, "reasoning_effort"),
+        )?;
         Ok(Self {
             provider: string_value(table, "provider", source, &field(path, "provider"))?,
             model: string_value(table, "model", source, &field(path, "model"))?,
             profile,
+            reasoning_effort,
             max_output_tokens: u32_value(
                 table,
                 "max_output_tokens",
@@ -1151,6 +1212,7 @@ impl ModelSettings {
         replace_if_some(&mut self.provider, next.provider);
         replace_if_some(&mut self.model, next.model);
         replace_if_some(&mut self.profile, next.profile);
+        replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
         replace_if_some(&mut self.store_responses, next.store_responses);
     }
@@ -2956,9 +3018,65 @@ impl StatusVerbosity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseVerbosity {
+    Concise,
+    Normal,
+    Verbose,
+}
+
+impl ResponseVerbosity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Concise => "concise",
+            Self::Normal => "normal",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutputVerbosity {
+    Compact,
+    Normal,
+    Verbose,
+}
+
+impl ToolOutputVerbosity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Normal => "normal",
+            Self::Verbose => "verbose",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptDefault {
+    Compact,
+    Expanded,
+}
+
+impl TranscriptDefault {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Expanded => "expanded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
     pub status_verbosity: StatusVerbosity,
+    pub response_verbosity: ResponseVerbosity,
+    pub tool_output_verbosity: ToolOutputVerbosity,
+    pub transcript_default: TranscriptDefault,
+    pub show_reasoning_usage: bool,
 }
 
 impl TuiConfig {
@@ -2968,6 +3086,16 @@ impl TuiConfig {
             status_verbosity: settings
                 .status_verbosity
                 .unwrap_or(StatusVerbosity::Compact),
+            response_verbosity: settings
+                .response_verbosity
+                .unwrap_or(ResponseVerbosity::Normal),
+            tool_output_verbosity: settings
+                .tool_output_verbosity
+                .unwrap_or(ToolOutputVerbosity::Compact),
+            transcript_default: settings
+                .transcript_default
+                .unwrap_or(TranscriptDefault::Compact),
+            show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
         }
     }
 }
@@ -2982,11 +3110,27 @@ impl Default for TuiConfig {
 pub struct TuiSettings {
     pub tick_rate_ms: Option<u64>,
     pub status_verbosity: Option<StatusVerbosity>,
+    pub response_verbosity: Option<ResponseVerbosity>,
+    pub tool_output_verbosity: Option<ToolOutputVerbosity>,
+    pub transcript_default: Option<TranscriptDefault>,
+    pub show_reasoning_usage: Option<bool>,
 }
 
 impl TuiSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["tick_rate_ms", "status_verbosity"], source, path)?;
+        reject_unknown_keys(
+            table,
+            &[
+                "tick_rate_ms",
+                "status_verbosity",
+                "response_verbosity",
+                "tool_output_verbosity",
+                "transcript_default",
+                "show_reasoning_usage",
+            ],
+            source,
+            path,
+        )?;
         Ok(Self {
             tick_rate_ms: u64_value(table, "tick_rate_ms", source, &field(path, "tick_rate_ms"))?,
             status_verbosity: status_verbosity_value(
@@ -2995,12 +3139,40 @@ impl TuiSettings {
                 source,
                 &field(path, "status_verbosity"),
             )?,
+            response_verbosity: response_verbosity_value(
+                table,
+                "response_verbosity",
+                source,
+                &field(path, "response_verbosity"),
+            )?,
+            tool_output_verbosity: tool_output_verbosity_value(
+                table,
+                "tool_output_verbosity",
+                source,
+                &field(path, "tool_output_verbosity"),
+            )?,
+            transcript_default: transcript_default_value(
+                table,
+                "transcript_default",
+                source,
+                &field(path, "transcript_default"),
+            )?,
+            show_reasoning_usage: bool_value(
+                table,
+                "show_reasoning_usage",
+                source,
+                &field(path, "show_reasoning_usage"),
+            )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.tick_rate_ms, next.tick_rate_ms);
         replace_if_some(&mut self.status_verbosity, next.status_verbosity);
+        replace_if_some(&mut self.response_verbosity, next.response_verbosity);
+        replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
+        replace_if_some(&mut self.transcript_default, next.transcript_default);
+        replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
     }
 }
 
@@ -3082,6 +3254,7 @@ pub fn user_settings_template() -> &'static str {
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
 # profile = "balanced"         # cheap | balanced | strong
 # model = "gpt-5-nano"         # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "low"     # low | medium | high; only sent to capable providers
 # max_output_tokens = 128
 # store_responses = false      # only honored by openai/azure_openai
 
@@ -3163,6 +3336,14 @@ pub fn user_settings_template() -> &'static str {
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
 
+[tui]
+# tick_rate_ms = 50
+# status_verbosity = "compact"   # compact | verbose
+# response_verbosity = "normal"  # concise | normal | verbose
+# tool_output_verbosity = "compact" # compact | normal | verbose
+# transcript_default = "compact" # compact | expanded
+# show_reasoning_usage = true
+
 # [mcp.servers.docs]
 # enabled = true
 # transport = "stdio"       # stdio | http | sse
@@ -3232,6 +3413,10 @@ pub fn project_settings_template() -> &'static str {
 [tui]
 # tick_rate_ms = 50
 # status_verbosity = "compact"   # compact | verbose
+# response_verbosity = "normal"  # concise | normal | verbose
+# tool_output_verbosity = "compact" # compact | normal | verbose
+# transcript_default = "compact" # compact | expanded
+# show_reasoning_usage = true
 
 # [mcp.servers.docs]
 # enabled = true
@@ -3913,6 +4098,78 @@ fn status_verbosity_value(
     }
 }
 
+fn response_verbosity_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<ResponseVerbosity>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "concise" => Ok(Some(ResponseVerbosity::Concise)),
+        "normal" => Ok(Some(ResponseVerbosity::Normal)),
+        "verbose" => Ok(Some(ResponseVerbosity::Verbose)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid response verbosity {value:?}; expected concise, normal, or verbose"
+        ))),
+    }
+}
+
+fn tool_output_verbosity_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<ToolOutputVerbosity>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compact" => Ok(Some(ToolOutputVerbosity::Compact)),
+        "normal" => Ok(Some(ToolOutputVerbosity::Normal)),
+        "verbose" => Ok(Some(ToolOutputVerbosity::Verbose)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid tool output verbosity {value:?}; expected compact, normal, or verbose"
+        ))),
+    }
+}
+
+fn transcript_default_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TranscriptDefault>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "compact" => Ok(Some(TranscriptDefault::Compact)),
+        "expanded" => Ok(Some(TranscriptDefault::Expanded)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid transcript default {value:?}; expected compact or expanded"
+        ))),
+    }
+}
+
+fn reasoning_effort_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<ReasoningEffort>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    ReasoningEffort::parse(&value).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, or high"
+        ))
+    }).map(Some)
+}
+
 fn mcp_transport_value(
     table: &toml::value::Table,
     key: &str,
@@ -4315,6 +4572,8 @@ fn looks_like_config(label: Option<&str>, text: &str) -> bool {
 pub struct CostSnapshot {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    #[serde(default)]
+    pub reasoning_output_tokens: Option<u64>,
     pub cached_input_tokens: Option<u64>,
     pub cache_write_input_tokens: Option<u64>,
     pub estimated_usd_micros: Option<u64>,

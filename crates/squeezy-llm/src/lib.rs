@@ -2,7 +2,7 @@ use std::{pin::Pin, sync::Arc};
 
 use futures_core::Stream;
 use serde_json::Value;
-use squeezy_core::{CostSnapshot, Result, SqueezyError};
+use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
 mod anthropic;
@@ -18,8 +18,8 @@ pub use google::GoogleProvider;
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use registry::{
-    MODEL_REGISTRY, ModelCapabilities, ModelInfo, PROVIDERS, TokenPricing, estimate_cost,
-    models_for_provider, provider_from_config, provider_name,
+    MODEL_REGISTRY, ModelCapabilities, ModelInfo, PROVIDERS, TokenPricing, capabilities_for,
+    estimate_cost, models_for_provider, provider_from_config, provider_name,
 };
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
@@ -30,6 +30,8 @@ pub struct LlmRequest {
     pub instructions: String,
     pub input: Vec<LlmInputItem>,
     pub max_output_tokens: Option<u32>,
+    pub response_verbosity: Option<ResponseVerbosity>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub previous_response_id: Option<String>,
     pub tools: Vec<LlmToolSpec>,
     pub store: bool,
@@ -47,6 +49,8 @@ impl LlmRequest {
             instructions,
             input: vec![LlmInputItem::UserText(input)],
             max_output_tokens,
+            response_verbosity: None,
+            reasoning_effort: None,
             previous_response_id: None,
             tools: Vec::new(),
             store: false,

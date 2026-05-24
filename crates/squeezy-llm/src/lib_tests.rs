@@ -11,6 +11,8 @@ async fn unavailable_provider_reports_configuration_error() {
         instructions: "test".to_string(),
         input: vec![LlmInputItem::UserText("hello".to_string())],
         max_output_tokens: Some(16),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
@@ -28,6 +30,7 @@ fn registry_estimates_known_model_costs() {
     let cost = CostSnapshot {
         input_tokens: Some(1_000_000),
         output_tokens: Some(1_000_000),
+        reasoning_output_tokens: None,
         cached_input_tokens: Some(1_000_000),
         cache_write_input_tokens: None,
         estimated_usd_micros: None,
@@ -46,6 +49,7 @@ fn registry_does_not_double_subtract_anthropic_cached_input() {
     let cached = CostSnapshot {
         input_tokens: Some(200),
         output_tokens: Some(50),
+        reasoning_output_tokens: None,
         cached_input_tokens: Some(5_000),
         cache_write_input_tokens: Some(0),
         estimated_usd_micros: None,
@@ -53,6 +57,7 @@ fn registry_does_not_double_subtract_anthropic_cached_input() {
     let uncached = CostSnapshot {
         input_tokens: Some(200),
         output_tokens: Some(50),
+        reasoning_output_tokens: None,
         cached_input_tokens: Some(0),
         cache_write_input_tokens: Some(0),
         estimated_usd_micros: None,

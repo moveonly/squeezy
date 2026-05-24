@@ -76,6 +76,12 @@ impl OpenAiProvider {
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
+        if let Some(response_verbosity) = request.response_verbosity {
+            body["text"] = json!({ "verbosity": response_verbosity.as_str() });
+        }
+        if let Some(reasoning_effort) = request.reasoning_effort {
+            body["reasoning"] = json!({ "effort": reasoning_effort.as_str() });
+        }
         if !request.tools.is_empty() {
             let mut tools = request.tools.iter().collect::<Vec<_>>();
             tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -395,6 +401,10 @@ fn parse_cost(response: Option<&Value>) -> CostSnapshot {
     CostSnapshot {
         input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
         output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+        reasoning_output_tokens: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(Value::as_u64),
         cached_input_tokens: usage
             .get("input_tokens_details")
             .and_then(|details| details.get("cached_tokens"))

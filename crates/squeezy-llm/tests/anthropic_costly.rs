@@ -34,6 +34,8 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
             "Reply with exactly: squeezy-ok".to_string(),
         )],
         max_output_tokens: Some(costly_max_output_tokens()?),
+        response_verbosity: None,
+        reasoning_effort: None,
         previous_response_id: None,
         tools: Vec::new(),
         store: false,
