@@ -20,7 +20,13 @@ model-facing tool output compact enough to be useful.
   provider-side prompt/cache prefixes can remain stable.
 - **Parallel read/search calls.** Independent `glob`, `grep`, `read_file`, and
   `read_tool_output` calls can run concurrently while write and shell calls stay
-  serialized.
+  serialized. Graph-backed navigation tools use the same read-only execution
+  path.
+- **Graph-backed navigation.** `repo_map`, `decl_search`,
+  `definition_search`, `reference_search`, `upstream_flow`,
+  `downstream_flow`, `symbol_context`, `hierarchy`, and `read_slice` answer
+  common code questions from persisted graph partitions and return compact
+  evidence packets instead of raw file dumps.
 - **Output spill previews.** Large tool outputs are written to a local
   content-addressed store. The model receives a compact preview plus a handle
   for fetching exact ranges. Spill previews also carry the original output
@@ -113,9 +119,6 @@ model-facing tool output compact enough to be useful.
 - **MCP tool spill routing.** External MCP tool execution should pass through
   the same spill, preview, and receipt-stub layer once MCP tool execution
   exists.
-- **Graph-backed navigation.** Symbol lookup, references, call candidates,
-  test-of relationships, and span reads should answer common code questions
-  without shell/search/read loops.
 - **Diff awareness.** The current branch diff and recently changed files should
   be queryable as compact summaries.
 - **Deferred tool loading.** Long-tail tools, including MCP tools, should load

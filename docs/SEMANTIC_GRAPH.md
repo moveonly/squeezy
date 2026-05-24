@@ -140,8 +140,24 @@ The in-memory graph supports:
 - reference search by text/path segment
 - callers, callees, and bounded call chains
 
-The graph returns compact symbol and edge records with spans, freshness,
-confidence, and provenance. Raw file reads should be targeted by these spans.
+The agent-facing graph tool surface is:
+
+- `repo_map` for compact architecture maps, language counts, coverage, and
+  unsupported-file samples
+- `decl_search` and `definition_search` for declaration lookup and
+  disambiguation
+- `reference_search` for symbol-bound or broad heuristic references
+- `upstream_flow` and `downstream_flow` for callers, callees, references, and
+  bounded call-chain context
+- `symbol_context` and `hierarchy` for focused symbol/module exploration
+- `read_slice` for exact bounded source slices from graph spans or explicit
+  byte/line ranges
+
+Graph navigation tools return uniform evidence packets with `claim`, `spans`,
+`confidence`, `freshness`, `provenance`, `cost_hint`, and `next_action`.
+Unsupported or unknown-language paths return structured fallback suggestions for
+bounded grep/read navigation rather than graph confidence. Raw file reads should
+be targeted by graph spans or `read_slice` ranges.
 
 ## Benchmarks
 

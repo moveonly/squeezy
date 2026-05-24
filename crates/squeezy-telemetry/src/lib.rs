@@ -584,7 +584,8 @@ impl FirstPartyToolName {
             "webfetch" => Self::Webfetch,
             "websearch" => Self::Websearch,
             "repo_map" | "decl_search" | "definition_search" | "reference_search"
-            | "symbol_context" | "hierarchy" => Self::Graph,
+            | "upstream_flow" | "downstream_flow" | "symbol_context" | "hierarchy"
+            | "read_slice" => Self::Graph,
             "ast_build" | "graph_refresh" => Self::Ast,
             _ => Self::Other,
         }
@@ -613,7 +614,8 @@ impl ToolFamily {
             "shell" => Self::Shell,
             "webfetch" | "websearch" => Self::Web,
             "repo_map" | "decl_search" | "definition_search" | "reference_search"
-            | "symbol_context" | "hierarchy" => Self::Graph,
+            | "upstream_flow" | "downstream_flow" | "symbol_context" | "hierarchy"
+            | "read_slice" => Self::Graph,
             "ast_build" | "graph_refresh" => Self::Ast,
             _ => Self::Other,
         }

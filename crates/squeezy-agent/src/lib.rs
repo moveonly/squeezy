@@ -2235,7 +2235,21 @@ fn is_receipt_stub_candidate(result: &ToolResult) -> bool {
     result.status == ToolStatus::Success
         && matches!(
             result.tool_name.as_str(),
-            "glob" | "grep" | "read_file" | "read_tool_output" | "webfetch" | "websearch"
+            "decl_search"
+                | "definition_search"
+                | "downstream_flow"
+                | "glob"
+                | "grep"
+                | "hierarchy"
+                | "read_file"
+                | "read_slice"
+                | "read_tool_output"
+                | "reference_search"
+                | "repo_map"
+                | "symbol_context"
+                | "upstream_flow"
+                | "webfetch"
+                | "websearch"
         )
 }
 

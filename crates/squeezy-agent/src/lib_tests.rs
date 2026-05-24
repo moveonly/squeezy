@@ -880,15 +880,23 @@ fn agent_session_mode_transition_logs_structured_fields() {
 #[test]
 fn advertised_tool_specs_are_mode_aware() {
     let tools = [
+        ("decl_search", PermissionCapability::Search),
+        ("definition_search", PermissionCapability::Search),
         ("diff_context", PermissionCapability::Read),
+        ("downstream_flow", PermissionCapability::Read),
         ("glob", PermissionCapability::Search),
         ("grep", PermissionCapability::Search),
+        ("hierarchy", PermissionCapability::Read),
         ("list_skills", PermissionCapability::Read),
         ("load_skill", PermissionCapability::Read),
         ("read_file", PermissionCapability::Read),
+        ("read_slice", PermissionCapability::Read),
         ("read_tool_output", PermissionCapability::Read),
+        ("reference_search", PermissionCapability::Search),
+        ("repo_map", PermissionCapability::Read),
         ("shell", PermissionCapability::Shell),
         ("symbol_context", PermissionCapability::Read),
+        ("upstream_flow", PermissionCapability::Read),
         ("verify", PermissionCapability::Compiler),
         ("webfetch", PermissionCapability::Network),
         ("websearch", PermissionCapability::Network),
@@ -911,14 +919,22 @@ fn advertised_tool_specs_are_mode_aware() {
     assert_eq!(
         plan_names,
         vec![
+            "decl_search",
+            "definition_search",
             "diff_context",
+            "downstream_flow",
             "glob",
             "grep",
+            "hierarchy",
             "list_skills",
             "load_skill",
             "read_file",
+            "read_slice",
             "read_tool_output",
+            "reference_search",
+            "repo_map",
             "symbol_context",
+            "upstream_flow",
         ]
     );
 }
