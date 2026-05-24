@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    env,
     io::{self, Write},
     path::PathBuf,
     sync::Arc,
@@ -28,7 +29,8 @@ use squeezy_agent::{
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
+    TaskStateSnapshot, TaskStepStatus, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault,
+    TranscriptItem,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_skills::{HelpStatus, SqueezyHelp};
@@ -44,9 +46,19 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
+const AMBER: Color = Color::Rgb(245, 158, 11);
+const AMBER_DIM: Color = Color::Rgb(180, 83, 9);
+const GOLD: Color = Color::Rgb(251, 191, 36);
+const QUIET: Color = Color::DarkGray;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupProfile {
+    pub onboarding_summary: Option<String>,
+    pub languages: String,
+}
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
-    run_inner(config, provider, None, None).await
+    run_inner(config, provider, None, StartupProfile::default()).await
 }
 
 pub async fn run_with_onboarding(
@@ -54,7 +66,24 @@ pub async fn run_with_onboarding(
     provider: Arc<dyn LlmProvider>,
     onboarding_summary: Option<String>,
 ) -> Result<()> {
-    run_inner(config, provider, None, onboarding_summary).await
+    run_inner(
+        config,
+        provider,
+        None,
+        StartupProfile {
+            onboarding_summary,
+            languages: String::new(),
+        },
+    )
+    .await
+}
+
+pub async fn run_with_startup_profile(
+    config: AppConfig,
+    provider: Arc<dyn LlmProvider>,
+    startup: StartupProfile,
+) -> Result<()> {
+    run_inner(config, provider, None, startup).await
 }
 
 pub async fn resume(
@@ -64,14 +93,20 @@ pub async fn resume(
 ) -> Result<()> {
     // Resume reuses the transcript already on disk, so it intentionally
     // doesn't seed a fresh onboarding summary on top.
-    run_inner(config, provider, Some(session_id), None).await
+    run_inner(
+        config,
+        provider,
+        Some(session_id),
+        StartupProfile::default(),
+    )
+    .await
 }
 
 async fn run_inner(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     resume_session_id: Option<String>,
-    onboarding_summary: Option<String>,
+    startup: StartupProfile,
 ) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
     let (mut agent, initial_transcript) = if let Some(session_id) = resume_session_id {
@@ -83,7 +118,7 @@ async fn run_inner(
         agent.provider_name(),
         &config,
         agent.session_mode(),
-        onboarding_summary,
+        startup,
     );
     for item in initial_transcript {
         app.push_transcript_item(item);
@@ -1687,7 +1722,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
     }
-    constraints.push(Constraint::Length(3));
+    constraints.push(Constraint::Length(1));
     constraints.push(Constraint::Length(2));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1719,14 +1754,14 @@ fn should_show_task_panel(app: &TuiApp) -> bool {
 
 fn task_panel_height(app: &TuiApp) -> u16 {
     if app.task_panel_collapsed {
-        return 3;
+        return 1;
     }
     let line_count = app
         .task_state
         .as_ref()
         .map(|snapshot| format_task_state_lines(snapshot, false).len() as u16)
         .unwrap_or(1);
-    line_count.saturating_add(2).clamp(4, 12)
+    line_count.clamp(2, 7)
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -1734,13 +1769,8 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         return;
     };
     let lines = format_task_state_lines(snapshot, app.task_panel_collapsed);
-    let title = if app.task_panel_collapsed {
-        "Task (collapsed)"
-    } else {
-        "Task"
-    };
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
@@ -1748,7 +1778,7 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec<Line<'static>> {
     if collapsed {
         return vec![Line::from(format!(
-            "Task: {} | active={} | blocker={} | next={} | verification={}",
+            "◆ {} · active {} · blocker {} · next {} · verify {}",
             task_title(snapshot),
             snapshot.active_step_title().unwrap_or("-"),
             snapshot.blocker.as_deref().unwrap_or("-"),
@@ -1758,25 +1788,41 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
     }
 
     let mut lines = Vec::new();
-    lines.push(Line::from(format!(
-        "Task: {}  status={}",
-        task_title(snapshot),
-        snapshot.status.as_str()
-    )));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "◆ ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            task_title(snapshot).to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {}", snapshot.status.as_str()),
+            Style::default().fg(QUIET),
+        ),
+    ]));
     if let Some(summary) = &snapshot.summary {
-        lines.push(Line::from(format!("Summary: {summary}")));
+        lines.push(Line::from(format!("  {summary}")));
     }
     if snapshot.steps.is_empty() {
-        lines.push(Line::from("Steps: -"));
+        lines.push(Line::from("  -"));
     } else {
-        for step in &snapshot.steps {
+        for step in snapshot
+            .steps
+            .iter()
+            .filter(|step| step.status == TaskStepStatus::Active)
+            .take(1)
+        {
             let detail = step
                 .detail
                 .as_ref()
                 .map(|detail| format!(" - {detail}"))
                 .unwrap_or_default();
             lines.push(Line::from(format!(
-                "[{}] {}{}",
+                "  {} {}{}",
                 step.status.as_str(),
                 step.title,
                 detail
@@ -1784,23 +1830,21 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
         }
     }
     if let Some(blocker) = &snapshot.blocker {
-        lines.push(Line::from(format!("Blocker: {blocker}")));
+        lines.push(Line::from(format!("  blocker {blocker}")));
     }
     if !snapshot.recent_changes.is_empty() {
         lines.push(Line::from(format!(
-            "Recent: {}",
+            "  recent {}",
             snapshot.recent_changes.join("; ")
         )));
     }
-    if let Some(next_action) = &snapshot.next_action {
-        lines.push(Line::from(format!("Next: {next_action}")));
-    }
+    let next = snapshot.next_action.as_deref().unwrap_or("-");
     lines.push(Line::from(format!(
-        "Verification: {}",
+        "  next {next} · verify {}",
         snapshot.verification.as_str()
     )));
     if let Some(reason) = &snapshot.replan_reason {
-        lines.push(Line::from(format!("Replan: {reason}")));
+        lines.push(Line::from(format!("  replan {reason}")));
     }
     lines
 }
@@ -1835,35 +1879,96 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     }
     if !app.pending_assistant.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled(
-                "assistant ",
-                Style::default()
-                    .fg(Color::Green)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled("◐ ", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
             Span::raw(&app.pending_assistant),
         ]));
     }
     if lines.is_empty() {
-        lines.push(Line::from(
-            "Squeezy is ready. Type a prompt and press Enter.",
-        ));
+        lines.extend(startup_card_lines(app, area.width));
     }
 
     let scroll =
         transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Squeezy").borders(Borders::ALL))
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let card_width = width.clamp(36, 64) as usize;
+    let inner = card_width.saturating_sub(2);
+    let border = "─".repeat(inner);
+    vec![
+        Line::from(Span::styled(
+            format!("╭{border}╮"),
+            Style::default().fg(AMBER_DIM),
+        )),
+        startup_card_row(
+            inner,
+            "",
+            format!(">_ Squeezy v{}", app.version),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        startup_card_row(inner, "model", app.model.clone(), Style::default().fg(GOLD)),
+        startup_card_row(
+            inner,
+            "directory",
+            app.directory.clone(),
+            Style::default().fg(Color::White),
+        ),
+        startup_card_row(
+            inner,
+            "languages",
+            app.language_summary.clone(),
+            Style::default().fg(Color::White),
+        ),
+        Line::from(Span::styled(
+            format!("╰{border}╯"),
+            Style::default().fg(AMBER_DIM),
+        )),
+    ]
+}
+
+fn startup_card_row(
+    inner_width: usize,
+    label: &'static str,
+    value: String,
+    value_style: Style,
+) -> Line<'static> {
+    let label_width = if label.is_empty() { 0 } else { 11 };
+    let value_width = inner_width.saturating_sub(label_width + 2);
+    let value = fit_chars(&value, value_width);
+    let used = 1 + label_width + value.chars().count();
+    let padding = " ".repeat(inner_width.saturating_sub(used));
+    if label.is_empty() {
+        return Line::from(vec![
+            Span::styled("│ ", Style::default().fg(AMBER_DIM)),
+            Span::styled(value, value_style),
+            Span::raw(padding),
+            Span::styled("│", Style::default().fg(AMBER_DIM)),
+        ]);
+    }
+    Line::from(vec![
+        Span::styled("│ ", Style::default().fg(AMBER_DIM)),
+        Span::styled(
+            format!("{label}:"),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(label_width.saturating_sub(label.len() + 1))),
+        Span::styled(value, value_style),
+        Span::raw(padding),
+        Span::styled("│", Style::default().fg(AMBER_DIM)),
+    ])
 }
 
 fn attachment_panel_height(app: &TuiApp) -> u16 {
     if app.attachments.is_empty() {
         0
     } else {
-        (app.attachments.len() as u16).saturating_add(2).clamp(3, 6)
+        (app.attachments.len() as u16).clamp(1, 4)
     }
 }
 
@@ -1874,17 +1979,13 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .map(|attachment| Line::from(format_attachment_line(attachment)))
         .collect::<Vec<_>>();
     let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("Attached context")
-                .borders(Borders::ALL),
-        )
+        .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
 fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u16) -> u16 {
-    let visible_lines = area_height.saturating_sub(2) as usize;
+    let visible_lines = area_height as usize;
     let max_scroll = line_count.saturating_sub(visible_lines);
     max_scroll.saturating_sub(from_bottom as usize) as u16
 }
@@ -1892,9 +1993,9 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
 #[cfg(test)]
 fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
     let (label, color) = match &item.role {
-        Role::User => ("user ", Color::Cyan),
-        Role::Assistant => ("assistant ", Color::Green),
-        Role::System => ("system ", Color::Yellow),
+        Role::User => ("> ", AMBER),
+        Role::Assistant => ("● ", Color::Green),
+        Role::System => ("• ", GOLD),
     };
     Line::from(vec![
         Span::styled(
@@ -1934,7 +2035,7 @@ fn format_message_entry(
             label,
             color,
             format!(
-                "[collapsed {} chars] {}",
+                "… {} chars  {}",
                 item.content.chars().count(),
                 compact_text(&item.content, 140)
             ),
@@ -1950,17 +2051,12 @@ fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> V
         compact_text(&call.arguments.to_string(), 140)
     );
     if collapsed {
-        return vec![line_with_label(
-            selected,
-            "tool call ",
-            Color::Magenta,
-            summary,
-        )];
+        return vec![line_with_label(selected, "◌ ", AMBER, summary)];
     }
     let mut lines = vec![line_with_label(
         selected,
-        "tool call ",
-        Color::Magenta,
+        "◌ ",
+        AMBER,
         format!("{} queued", call.name),
     )];
     lines.extend(indented_text_lines(
@@ -1981,14 +2077,14 @@ fn format_tool_result_entry(
     if collapsed {
         return vec![line_with_label(
             selected,
-            "tool result ",
+            "● ",
             status_color(result.status),
             summary,
         )];
     }
     let mut lines = vec![line_with_label(
         selected,
-        "tool result ",
+        "● ",
         status_color(result.status),
         summary,
     )];
@@ -2012,19 +2108,19 @@ fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<
         let preview = compact_text(message, 140);
         return vec![line_with_label(
             selected,
-            "log ",
-            Color::Yellow,
-            format!("[collapsed {} chars] {}", message.chars().count(), preview),
+            "! ",
+            GOLD,
+            format!("… {} chars  {}", message.chars().count(), preview),
         )];
     }
-    text_lines(selected, "log ", Color::Yellow, message)
+    text_lines(selected, "! ", GOLD, message)
 }
 
 fn role_style(role: &Role) -> (&'static str, Color) {
     match role {
-        Role::User => ("user ", Color::Cyan),
-        Role::Assistant => ("assistant ", Color::Green),
-        Role::System => ("system ", Color::Yellow),
+        Role::User => ("> ", AMBER),
+        Role::Assistant => ("● ", Color::Green),
+        Role::System => ("• ", GOLD),
     }
 }
 
@@ -2076,9 +2172,9 @@ fn indented_text_lines(content: &str) -> Vec<Line<'static>> {
 
 fn tool_result_summary(result: &ToolResult) -> String {
     format!(
-        "{} {:?} {}B{} receipt={}",
+        "{} {} {}B{} receipt={}",
         result.tool_name,
-        result.status,
+        tool_status_label(result.status),
         result.cost_hint.output_bytes,
         if result.cost_hint.truncated {
             " truncated"
@@ -2104,12 +2200,34 @@ fn status_color(status: ToolStatus) -> Color {
     match status {
         ToolStatus::Success => Color::Green,
         ToolStatus::Error | ToolStatus::Stale => Color::Red,
-        ToolStatus::Denied | ToolStatus::Cancelled => Color::Yellow,
+        ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
+    }
+}
+
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
     }
 }
 
 fn compact_text(text: &str, limit: usize) -> String {
     truncate_bytes(&text.replace('\n', " "), limit)
+}
+
+fn fit_chars(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut output = text.chars().take(width - 3).collect::<String>();
+    output.push_str("...");
+    output
 }
 
 fn truncate_bytes(text: &str, limit: usize) -> String {
@@ -2128,20 +2246,82 @@ fn short_hash(hash: &str) -> &str {
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph = Paragraph::new(app.input.as_str())
-        .block(Block::default().title("Prompt").borders(Borders::ALL));
+    let paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(
+            "◆ ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(app.input.as_str()),
+    ]));
     frame.render_widget(paragraph, area);
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph =
-        Paragraph::new(format_status_tokens(app)).style(Style::default().fg(Color::DarkGray));
+    let paragraph = Paragraph::new(format_status_lines(app)).style(Style::default().fg(QUIET));
     frame.render_widget(paragraph, area);
 }
 
+#[cfg(test)]
 fn format_status_tokens(app: &TuiApp) -> String {
+    let mut lines = vec![
+        format_status_context(app),
+        format_status_hints(app).to_string(),
+    ];
+    if app.status_verbosity == StatusVerbosity::Verbose {
+        lines.push(format_status_details(app));
+    }
+    lines.join("\n")
+}
+
+fn format_status_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(app.repo.branch_display(), Style::default().fg(AMBER)),
+            Span::styled("  ", Style::default().fg(QUIET)),
+            Span::styled(
+                format!("{}:{}", app.provider_name, app.model),
+                Style::default().fg(GOLD),
+            ),
+            Span::styled("  ", Style::default().fg(QUIET)),
+            Span::styled(app.mode.as_str().to_string(), Style::default().fg(AMBER)),
+            Span::styled("  ", Style::default().fg(QUIET)),
+            Span::styled(app.status.clone(), Style::default().fg(Color::White)),
+            Span::styled(format_status_activity(app), Style::default().fg(QUIET)),
+        ]),
+        Line::from(Span::styled(
+            format_status_hints(app),
+            Style::default().fg(QUIET),
+        )),
+    ];
+    if app.status_verbosity == StatusVerbosity::Verbose {
+        lines[1] = Line::from(Span::styled(
+            format!(
+                "{} · {}",
+                format_status_details(app),
+                format_status_hints(app)
+            ),
+            Style::default().fg(QUIET),
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+fn format_status_context(app: &TuiApp) -> String {
+    format!(
+        "{}  {}:{}  {}  {}{}",
+        app.repo.branch_display(),
+        app.provider_name,
+        app.model,
+        app.mode.as_str(),
+        app.status,
+        format_status_activity(app),
+    )
+}
+
+fn format_status_activity(app: &TuiApp) -> String {
     let scroll_marker = if app.transcript_scroll_from_bottom > 0 {
-        "  scroll=history"
+        "  history"
     } else {
         ""
     };
@@ -2155,29 +2335,26 @@ fn format_status_tokens(app: &TuiApp) -> String {
         .back()
         .map(|notification| {
             format!(
-                "  note=job{}:{}",
+                "  job{} {}",
                 notification.job_id,
                 notification.status.as_str()
             )
         })
         .unwrap_or_default();
-    let context = format!(
-        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  jobs={}/{}  status={}{}{}",
-        app.provider_name,
-        app.model,
-        app.mode.as_str(),
-        app.repo.compact(),
+    let jobs = if app.jobs.is_empty() {
+        String::new()
+    } else {
+        format!("  jobs {active_jobs}/{}", app.jobs.len())
+    };
+    format!("{jobs}{latest_notification}{scroll_marker}")
+}
+
+fn format_status_details(app: &TuiApp) -> String {
+    format!(
+        "{}  sandbox {}  telemetry {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
         app.permissions.compact(),
         app.permissions.sandbox,
         app.telemetry.as_str(),
-        active_jobs,
-        app.jobs.len(),
-        app.status,
-        latest_notification,
-        scroll_marker,
-    );
-    let spend = format!(
-        "cost={} tok={}/{}{} ctx={} pins={} compact={} tools={} budget={}",
         format_cost(&app.cost),
         format_optional_u64(app.cost.input_tokens),
         format_optional_u64(app.cost.output_tokens),
@@ -2191,26 +2368,22 @@ fn format_status_tokens(app: &TuiApp) -> String {
         } else {
             format!("denied:{}", app.metrics.budget_denials)
         },
-    );
-    let hints = if app.pending_approval.is_some() {
+        app.config_sources,
+        app.metrics.bytes_read,
+        app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
+        app.metrics.redactions,
+        format_optional_u64(app.cost.cached_input_tokens),
+        format_optional_u64(app.cost.cache_write_input_tokens),
+    )
+}
+
+fn format_status_hints(app: &TuiApp) -> &'static str {
+    if app.pending_approval.is_some() {
         "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
     } else if app.cancel.is_some() {
-        "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /help /copy | /sessions /resume | Ctrl-C/Esc cancel"
+        "Enter send · Shift-Tab mode · Ctrl-P task · Ctrl-Y copy · /help · Ctrl-C cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /help /copy /cost /context /attach /attachments /detach /compact /pin /pins /unpin /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
-    };
-    match app.status_verbosity {
-        StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
-        StatusVerbosity::Verbose => format!(
-            "{context}  {spend}\ncfg={} read={}B receipts={} redactions={} cached={} cache_write={}{} | {hints}",
-            app.config_sources,
-            app.metrics.bytes_read,
-            app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
-            app.metrics.redactions,
-            format_optional_u64(app.cost.cached_input_tokens),
-            format_optional_u64(app.cost.cache_write_input_tokens),
-            reasoning_status_fragment(app),
-        ),
+        "Enter send · Shift-Tab mode · Ctrl-P task · Ctrl-E fold · /help · Esc quit"
     }
 }
 
@@ -2356,6 +2529,7 @@ impl RepoStatus {
         }
     }
 
+    #[cfg(test)]
     fn compact(&self) -> String {
         if !self.available {
             return "repo=none".to_string();
@@ -2369,10 +2543,48 @@ impl RepoStatus {
         }
         value
     }
+
+    fn branch_display(&self) -> String {
+        if !self.available {
+            return "no repo".to_string();
+        }
+        let mut value = self.branch.as_deref().unwrap_or("detached").to_string();
+        if self.changed_files > 0 {
+            value.push_str(&format!("*{}", self.changed_files));
+        }
+        if let Some(operation) = &self.operation {
+            value.push_str(&format!(":{operation}"));
+        }
+        value
+    }
 }
 
 fn short_commit(head: &str) -> String {
     head.chars().take(7).collect()
+}
+
+fn compact_path(path: &std::path::Path) -> String {
+    let display = path.display().to_string();
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return display;
+    };
+    if let Ok(stripped) = path.strip_prefix(&home) {
+        if stripped.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", stripped.display())
+        }
+    } else {
+        display
+    }
+}
+
+fn configured_language_summary(config: &AppConfig) -> String {
+    if config.graph.languages.is_empty() {
+        "none".to_string()
+    } else {
+        config.graph.languages.join(", ")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2426,7 +2638,10 @@ impl TelemetryStatus {
 
 struct TuiApp {
     provider_name: &'static str,
+    version: &'static str,
     model: String,
+    directory: String,
+    language_summary: String,
     mode: SessionMode,
     config_sources: String,
     status_verbosity: StatusVerbosity,
@@ -2468,17 +2683,18 @@ impl TuiApp {
         provider_name: &'static str,
         config: &AppConfig,
         mode: SessionMode,
-        onboarding_summary: Option<String>,
+        startup: StartupProfile,
     ) -> Self {
-        Self::new_with_clipboard(
+        Self::new_with_startup(
             provider_name,
             config,
             mode,
-            onboarding_summary,
+            startup,
             Box::new(Osc52Clipboard),
         )
     }
 
+    #[cfg(test)]
     fn new_with_clipboard(
         provider_name: &'static str,
         config: &AppConfig,
@@ -2486,8 +2702,27 @@ impl TuiApp {
         onboarding_summary: Option<String>,
         clipboard: Box<dyn Clipboard>,
     ) -> Self {
+        Self::new_with_startup(
+            provider_name,
+            config,
+            mode,
+            StartupProfile {
+                onboarding_summary,
+                languages: String::new(),
+            },
+            clipboard,
+        )
+    }
+
+    fn new_with_startup(
+        provider_name: &'static str,
+        config: &AppConfig,
+        mode: SessionMode,
+        startup: StartupProfile,
+        clipboard: Box<dyn Clipboard>,
+    ) -> Self {
         let mut transcript = Vec::new();
-        let status = if let Some(summary) = onboarding_summary {
+        let status = if let Some(summary) = startup.onboarding_summary {
             // The onboarding summary is generated by Squeezy itself, not the
             // model, so it belongs to the System role. Using Assistant would
             // both mislabel provenance and mix the same color with later
@@ -2508,7 +2743,14 @@ impl TuiApp {
         let next_entry_id = transcript.len() as u64;
         Self {
             provider_name,
+            version: env!("CARGO_PKG_VERSION"),
             model: config.model.clone(),
+            directory: compact_path(&config.workspace_root),
+            language_summary: if startup.languages.trim().is_empty() {
+                configured_language_summary(config)
+            } else {
+                startup.languages
+            },
             mode,
             config_sources: config.config_source_labels().join(","),
             status_verbosity: config.tui.status_verbosity,

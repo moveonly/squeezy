@@ -71,13 +71,13 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
     app.status = "ready".to_string();
 
     let status = format_status_tokens(&app);
-    assert!(status.contains("mode=plan"), "missing mode: {status}");
+    assert!(status.contains(" plan "), "missing mode: {status}");
     assert!(
         status.contains("Shift-Tab mode"),
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Ctrl-E collapse"),
+        status.contains("Ctrl-E fold"),
         "missing collapse hint: {status}"
     );
 }
@@ -383,7 +383,7 @@ fn transcript_item_formats_role_label() {
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert_eq!(text, "user hello");
+    assert_eq!(text, "> hello");
 }
 
 #[test]
@@ -393,8 +393,8 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
 
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 12);
-    assert!(collapsed.contains("tool result"), "{collapsed}");
-    assert!(collapsed.contains("grep Success"), "{collapsed}");
+    assert!(collapsed.contains("●"), "{collapsed}");
+    assert!(collapsed.contains("grep success"), "{collapsed}");
     assert!(
         !collapsed.contains("needle found"),
         "collapsed view should hide payload: {collapsed}"
@@ -441,6 +441,13 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
         ..CostSnapshot::default()
     };
 
+    let visible = format_status_tokens(&app);
+    assert!(
+        !visible.contains("reasoning=3"),
+        "compact status hides accounting details: {visible}"
+    );
+
+    app.status_verbosity = StatusVerbosity::Verbose;
     let visible = format_status_tokens(&app);
     assert!(visible.contains("reasoning=3"), "{visible}");
 
@@ -587,22 +594,13 @@ fn compact_status_surfaces_context_without_dense_counters() {
 
     let status = format_status_tokens(&app);
     assert!(status.contains("openai:gpt-test"), "{status}");
-    assert!(status.contains("mode=build"), "{status}");
-    assert!(status.contains("repo=feature*2"), "{status}");
-    assert!(
-        status.contains("perm=r:allow e:ask sh:ask web:ask"),
-        "{status}"
-    );
-    assert!(
-        status.contains("sandbox=required/net=deny_by_default"),
-        "{status}"
-    );
-    assert!(status.contains("telemetry=on"), "{status}");
-    assert!(status.contains("status=running search"), "{status}");
-    assert!(
-        status.contains("cost=- tok=-/- ctx=0 pins=0 compact=0 tools=0 budget=ok"),
-        "{status}"
-    );
+    assert!(status.contains(" build "), "{status}");
+    assert!(status.contains("feature*2"), "{status}");
+    assert!(status.contains("running search"), "{status}");
+    assert!(!status.contains("perm="), "{status}");
+    assert!(!status.contains("sandbox"), "{status}");
+    assert!(!status.contains("telemetry"), "{status}");
+    assert!(!status.contains("cost"), "{status}");
     assert!(
         !status.contains("cfg="),
         "compact status should stay calm: {status}"
@@ -624,9 +622,8 @@ fn status_line_surfaces_job_counts_and_latest_notification() {
     });
 
     let status = format_status_tokens(&app);
-    assert!(status.contains("jobs=1/2"), "{status}");
-    assert!(status.contains("note=job2:completed"), "{status}");
-    assert!(status.contains("/jobs"), "{status}");
+    assert!(status.contains("jobs 1/2"), "{status}");
+    assert!(status.contains("job2 completed"), "{status}");
 }
 
 #[test]
@@ -661,17 +658,17 @@ fn verbose_status_surfaces_budget_and_cache_details() {
     };
 
     let status = format_status_tokens(&app);
-    assert!(status.contains("mode=plan"), "{status}");
-    assert!(
-        status.contains("cost=$0.000042 tok=10/5 ctx=0 pins=0 compact=0 tools=2 budget=denied:1"),
-        "{status}"
-    );
-    assert!(status.contains("cfg="), "{status}");
-    assert!(status.contains("read=1024B"), "{status}");
-    assert!(status.contains("receipts=1"), "{status}");
-    assert!(status.contains("redactions=4"), "{status}");
-    assert!(status.contains("cached=7"), "{status}");
-    assert!(status.contains("cache_write=3"), "{status}");
+    assert!(status.contains(" plan "), "{status}");
+    assert!(status.contains("cost $0.000042"), "{status}");
+    assert!(status.contains("tok 10/5"), "{status}");
+    assert!(status.contains("tools 2"), "{status}");
+    assert!(status.contains("budget denied:1"), "{status}");
+    assert!(status.contains("cfg defaults"), "{status}");
+    assert!(status.contains("read 1024B"), "{status}");
+    assert!(status.contains("receipts 1"), "{status}");
+    assert!(status.contains("redactions 4"), "{status}");
+    assert!(status.contains("cached 7"), "{status}");
+    assert!(status.contains("cache_write 3"), "{status}");
 }
 
 #[test]
@@ -692,9 +689,10 @@ fn render_uses_two_line_status_footer() {
     };
 
     let output = render_to_string(&app, 140, 14);
+    assert!(output.contains(">_ Squeezy v"), "{output}");
     assert!(output.contains("openai:gpt-test"), "{output}");
-    assert!(output.contains("repo=feature"), "{output}");
-    assert!(output.contains("Ctrl-E collapse"), "{output}");
+    assert!(output.contains("feature"), "{output}");
+    assert!(output.contains("Ctrl-E fold"), "{output}");
 }
 
 #[test]
@@ -703,15 +701,15 @@ fn task_panel_renders_progress_blocker_next_action_and_verification() {
     app.task_state = Some(sample_task_state());
 
     let output = render_to_string(&app, 120, 24);
-    assert!(output.contains("Task"), "{output}");
+    assert!(output.contains("◆"), "{output}");
     assert!(output.contains("Implement task UX"), "{output}");
-    assert!(output.contains("[completed] Inspect TUI"), "{output}");
-    assert!(output.contains("[active] Wire task panel"), "{output}");
-    assert!(output.contains("Blocker: approval pending"), "{output}");
-    assert!(output.contains("Next: run focused tests"), "{output}");
-    assert!(output.contains("Verification: running"), "{output}");
+    assert!(!output.contains("completed Inspect TUI"), "{output}");
+    assert!(output.contains("active Wire task panel"), "{output}");
+    assert!(output.contains("blocker approval pending"), "{output}");
+    assert!(output.contains("next run focused tests"), "{output}");
+    assert!(output.contains("verify running"), "{output}");
     assert!(
-        output.contains("Replan: status footer is too compact"),
+        output.contains("replan status footer is too compact"),
         "{output}"
     );
 }
@@ -731,8 +729,8 @@ async fn ctrl_p_collapses_and_expands_task_panel() {
     .expect("collapse task panel");
     assert!(app.task_panel_collapsed);
     let collapsed = render_to_string(&app, 120, 16);
-    assert!(collapsed.contains("Task (collapsed)"), "{collapsed}");
-    assert!(collapsed.contains("active=Wire task panel"), "{collapsed}");
+    assert!(collapsed.contains("◆ Implement task UX"), "{collapsed}");
+    assert!(collapsed.contains("active Wire task panel"), "{collapsed}");
 
     handle_key(
         &mut app,
@@ -1035,8 +1033,8 @@ async fn transcript_navigation_keys_update_scroll_state() {
 
 #[test]
 fn transcript_scroll_offset_defaults_to_bottom() {
-    assert_eq!(transcript_scroll_offset(20, 10, 0), 12);
-    assert_eq!(transcript_scroll_offset(20, 10, 8), 4);
+    assert_eq!(transcript_scroll_offset(20, 10, 0), 10);
+    assert_eq!(transcript_scroll_offset(20, 10, 8), 2);
     assert_eq!(transcript_scroll_offset(20, 10, u16::MAX), 0);
 }
 
@@ -1218,7 +1216,7 @@ fn status_marker_surfaces_history_scroll_state() {
     app.transcript_scroll_from_bottom = 4;
     let scrolled = format_status_tokens(&app);
     assert!(
-        scrolled.contains("scroll=history"),
+        scrolled.contains("history"),
         "missing scroll marker: {scrolled}",
     );
 }

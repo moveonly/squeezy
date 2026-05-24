@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, fs,
     io::{self, Write},
     path::PathBuf,
@@ -17,9 +17,9 @@ use squeezy_llm::{
     models_for_provider, provider_from_config,
 };
 use squeezy_store::{
-    BugReportOptions, RepoProfileLoad, ResumeItem, SessionEvent, SessionMetadata, SessionQuery,
-    SessionResumeState, SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
-    parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
+    SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
+    ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
@@ -333,8 +333,15 @@ async fn main() -> squeezy_core::Result<()> {
         return result;
     }
 
-    let result =
-        squeezy_tui::run_with_onboarding(config, provider, onboarding.visible_summary).await;
+    let result = squeezy_tui::run_with_startup_profile(
+        config,
+        provider,
+        squeezy_tui::StartupProfile {
+            onboarding_summary: onboarding.visible_summary,
+            languages: onboarding.language_summary,
+        },
+    )
+    .await;
     let _ = telemetry.flush().await;
     result
 }
@@ -913,16 +920,59 @@ fn parse_excluded_sections(values: &[String]) -> squeezy_core::Result<BTreeSet<S
 
 struct PreparedRepoProfile {
     visible_summary: Option<String>,
+    language_summary: String,
 }
 
 fn prepare_repo_profile(config: &mut AppConfig) -> squeezy_core::Result<PreparedRepoProfile> {
     let loaded = ensure_repo_profile(&config.workspace_root, &config.graph)?;
     append_repo_profile_instructions(config, &loaded);
+    let language_summary = startup_language_summary(&loaded);
     let visible_summary = loaded
         .status
         .should_show_onboarding()
         .then(|| loaded.profile.compact_summary(loaded.status));
-    Ok(PreparedRepoProfile { visible_summary })
+    Ok(PreparedRepoProfile {
+        visible_summary,
+        language_summary,
+    })
+}
+
+fn startup_language_summary(loaded: &RepoProfileLoad) -> String {
+    let mut families = BTreeMap::<String, (String, usize)>::new();
+    for language in &loaded.profile.languages {
+        if language.files == 0 || language.semantic_support != SemanticSupport::Supported {
+            continue;
+        }
+        let family = language
+            .family
+            .as_deref()
+            .unwrap_or(language.name.as_str())
+            .to_string();
+        let display = language_family_display(&family, &language.name).to_string();
+        let entry = families.entry(family).or_insert((display, 0));
+        entry.1 += language.files;
+    }
+    if families.is_empty() {
+        return "none".to_string();
+    }
+    families
+        .into_values()
+        .map(|(name, files)| format!("{name} {files}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn language_family_display<'a>(family: &str, fallback: &'a str) -> &'a str {
+    match family {
+        "rust" => "Rust",
+        "python" => "Python",
+        "java" => "Java",
+        "csharp" => "C#",
+        "go" => "Go",
+        "c-family" => "C/C++",
+        "js-ts" => "JS/TS",
+        _ => fallback,
+    }
 }
 
 fn append_repo_profile_instructions(config: &mut AppConfig, loaded: &RepoProfileLoad) {
