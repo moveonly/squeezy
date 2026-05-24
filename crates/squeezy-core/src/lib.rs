@@ -5841,16 +5841,18 @@ impl TurnMetrics {
         merge_cost_snapshot(&mut self.provider, cost);
     }
 
-    pub fn record_subagent_provider(&mut self, cost: &CostSnapshot) {
-        merge_cost_snapshot(&mut self.subagent_provider, cost);
-    }
-
+    /// Roll up the subagent's own [`TurnMetrics`] into the parent turn. The
+    /// subagent's tool / I/O / provider counters are attributed to
+    /// `subagent_*` so the parent's tool / I/O / provider numbers stay scoped
+    /// to the parent agent's own work, while `redactions` is a session-wide
+    /// safety counter and is merged into the parent total instead of dropped.
     pub fn merge_subagent_tool_metrics(&mut self, metrics: &TurnMetrics) {
         self.subagent_tool_calls += metrics.tool_calls;
         self.subagent_budget_denials += metrics.budget_denials;
         self.subagent_files_scanned += metrics.files_scanned;
         self.subagent_bytes_read += metrics.bytes_read;
         self.subagent_model_output_bytes += metrics.model_output_bytes;
+        self.redactions += metrics.redactions;
         merge_cost_snapshot(&mut self.subagent_provider, &metrics.provider);
     }
 }

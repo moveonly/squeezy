@@ -19,7 +19,7 @@ use squeezy_core::{
     DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, PROJECT_SETTINGS_FILE, PermissionAction,
     PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
     PermissionVerdict, ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics,
-    SessionMode, SqueezyError, StreamRedactor, TaskStateSnapshot, TaskStateStatus,
+    SessionMode, SqueezyError, StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus,
     ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
     escape_toml_basic_string,
@@ -907,7 +907,7 @@ impl Agent {
             native_text_verbosity,
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = core_control_tools();
+        let mut all_tool_specs = core_control_tools(&self.config.subagents);
         all_tool_specs.extend(self.tools.specs().into_iter().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
@@ -1456,7 +1456,7 @@ impl Agent {
                     json!({ "error": error }),
                 );
             }
-            let mut all_tool_specs = core_control_tools();
+            let mut all_tool_specs = core_control_tools(&config.subagents);
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
             warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
 
@@ -2814,25 +2814,83 @@ async fn run_subagent(
     let mut assistant_message = String::new();
     let mut conversation = vec![LlmInputItem::UserText(subagent_user_prompt(&request))];
     let mut supporting_receipts = Vec::new();
-    let (hidden_tx, _hidden_rx) = mpsc::channel(8);
+    // Subagent tool execution emits ToolCallStarted/ToolCallCompleted/JobUpdated
+    // events on the per-call `tx` channel. The parent never surfaces these
+    // intermediate events, so we drain them in a background task. Without an
+    // active drain a high-fanout round (>~4 parallel tool calls) would fill
+    // the channel buffer and the `send().await` inside the tool dispatcher
+    // would block forever.
+    let (hidden_tx, mut hidden_rx) = mpsc::channel::<AgentEvent>(64);
+    let drain_handle = tokio::spawn(async move { while hidden_rx.recv().await.is_some() {} });
     let local_jobs = JobRegistry::new();
     let local_task_state = Arc::new(Mutex::new(None));
     let local_loaded_schemas = Arc::new(Mutex::new(Vec::new()));
     let local_mode = Arc::new(AtomicU8::new(SessionMode::Plan.to_u8()));
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
+    let mut seen_outputs = SeenToolOutputs::default();
 
+    let execution = run_subagent_loop(
+        parent,
+        &config,
+        &tool_specs,
+        &allowed_tools,
+        &allowed_tool_names,
+        &redacted_instructions.text,
+        &hidden_tx,
+        &local_jobs,
+        &local_task_state,
+        &local_loaded_schemas,
+        &local_mode,
+        &local_exploration,
+        &mut seen_outputs,
+        &mut broker,
+        &mut assistant_stream,
+        &mut assistant_message,
+        &mut conversation,
+        &mut supporting_receipts,
+        model,
+    )
+    .await;
+
+    drop(hidden_tx);
+    let _ = drain_handle.await;
+    execution
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_loop(
+    parent: &ToolExecutionContext<'_>,
+    config: &AppConfig,
+    tool_specs: &[LlmToolSpec],
+    allowed_tools: &[AdvertisedTool],
+    allowed_tool_names: &BTreeSet<String>,
+    instructions: &str,
+    hidden_tx: &mpsc::Sender<AgentEvent>,
+    local_jobs: &JobRegistry,
+    local_task_state: &Arc<Mutex<Option<TaskStateSnapshot>>>,
+    local_loaded_schemas: &Arc<Mutex<Vec<String>>>,
+    local_mode: &Arc<AtomicU8>,
+    local_exploration: &Arc<Mutex<ExplorationTurnState>>,
+    seen_outputs: &mut SeenToolOutputs,
+    broker: &mut CostBroker,
+    assistant_stream: &mut StreamRedactor,
+    assistant_message: &mut String,
+    conversation: &mut Vec<LlmInputItem>,
+    supporting_receipts: &mut Vec<Value>,
+    model: String,
+) -> SubagentExecution {
     for _round in 0..config.subagents.max_model_rounds {
-        let llm_input = redact_llm_input_items(&conversation, &parent.redactor);
+        let llm_input = redact_llm_input_items(conversation, &parent.redactor);
         let request_model = config.model.clone();
         let llm_request = LlmRequest {
             model: request_model.clone(),
-            instructions: redacted_instructions.text.clone(),
+            instructions: instructions.to_string(),
             input: llm_input,
             max_output_tokens: config.max_output_tokens,
-            response_verbosity: request_response_verbosity(&config, parent.provider.name()),
-            reasoning_effort: request_reasoning_effort(&config, parent.provider.name()),
+            response_verbosity: request_response_verbosity(config, parent.provider.name()),
+            reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
-            tools: tool_specs.clone(),
+            tools: tool_specs.to_vec(),
             store: false,
         };
         let mut stream = parent
@@ -2866,24 +2924,26 @@ async fn run_subagent(
                     break;
                 }
                 Ok(LlmEvent::Cancelled) => {
+                    broker.metrics.redactions += assistant_stream.total_redactions();
                     return SubagentExecution {
                         status: ToolStatus::Cancelled,
                         summary: String::new(),
                         status_label: "cancelled",
                         error: Some("subagent cancelled".to_string()),
-                        metrics: broker.metrics,
-                        supporting_receipts,
+                        metrics: broker.metrics.clone(),
+                        supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                     };
                 }
                 Err(error) => {
+                    broker.metrics.redactions += assistant_stream.total_redactions();
                     return SubagentExecution {
                         status: ToolStatus::Error,
                         summary: String::new(),
                         status_label: "failed",
                         error: Some(error.to_string()),
-                        metrics: broker.metrics,
-                        supporting_receipts,
+                        metrics: broker.metrics.clone(),
+                        supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                     };
                 }
@@ -2897,11 +2957,11 @@ async fn run_subagent(
             }
             broker.metrics.redactions += assistant_stream.total_redactions();
             return successful_subagent_execution(
-                assistant_message,
-                broker.metrics,
-                supporting_receipts,
+                std::mem::take(assistant_message),
+                broker.metrics.clone(),
+                std::mem::take(supporting_receipts),
                 model,
-                &config,
+                config,
             );
         }
 
@@ -2912,11 +2972,11 @@ async fn run_subagent(
             }
             broker.metrics.redactions += assistant_stream.total_redactions();
             return successful_subagent_execution(
-                assistant_message,
-                broker.metrics,
-                supporting_receipts,
+                std::mem::take(assistant_message),
+                broker.metrics.clone(),
+                std::mem::take(supporting_receipts),
                 model,
-                &config,
+                config,
             );
         }
 
@@ -2939,8 +2999,8 @@ async fn run_subagent(
                         turn_id: parent.turn_id,
                         provider: parent.provider.clone(),
                         tools: parent.tools,
-                        jobs: &local_jobs,
-                        config: &config,
+                        jobs: local_jobs,
+                        config,
                         telemetry: parent.telemetry.clone(),
                         redactor: parent.redactor.clone(),
                         tx: hidden_tx.clone(),
@@ -2950,16 +3010,16 @@ async fn run_subagent(
                         session_mode: local_mode.clone(),
                         session_log: None,
                         task_state: local_task_state.clone(),
-                        all_tool_specs: &allowed_tools,
+                        all_tool_specs: allowed_tools,
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                     },
-                    &mut broker,
+                    broker,
                 )
                 .await,
             );
         }
-        let results = SeenToolOutputs::default().prepare_results(results);
+        let results = seen_outputs.prepare_results(results);
         let results = pack_tool_results(results, config.max_tool_result_bytes_per_round);
         for pending in &results {
             broker.record_model_result(&pending.result);
@@ -2982,6 +3042,7 @@ async fn run_subagent(
         }));
     }
 
+    broker.metrics.redactions += assistant_stream.total_redactions();
     SubagentExecution {
         status: ToolStatus::Error,
         summary: String::new(),
@@ -2990,8 +3051,8 @@ async fn run_subagent(
             "subagent stopped after {} model rounds",
             config.subagents.max_model_rounds
         )),
-        metrics: broker.metrics,
-        supporting_receipts,
+        metrics: broker.metrics.clone(),
+        supporting_receipts: std::mem::take(supporting_receipts),
         model,
     }
 }
@@ -4417,12 +4478,20 @@ fn task_state_advertised_tool() -> AdvertisedTool {
     }
 }
 
-fn core_control_tools() -> Vec<AdvertisedTool> {
-    vec![
-        task_state_advertised_tool(),
-        delegate_advertised_tool(),
-        explore_advertised_tool(),
-    ]
+/// Synthetic control tools that are advertised to the model on every
+/// request. `task_state` is always present. `delegate` and `explore` are
+/// gated on [`SubagentConfig::enabled`] / `explore_enabled` so we don't
+/// spend prompt tokens advertising tools the agent would refuse on every
+/// call.
+fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
+    let mut tools = vec![task_state_advertised_tool()];
+    if subagents.enabled {
+        tools.push(delegate_advertised_tool());
+        if subagents.explore_enabled {
+            tools.push(explore_advertised_tool());
+        }
+    }
+    tools
 }
 
 /// Synthetic control tool that promotes a discoverable tool's full schema
@@ -4608,14 +4677,23 @@ fn request_tool_specs(
     // per-round clone cost.
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
-    for name in [
+    let advertised_names: BTreeSet<&str> =
+        tools.iter().map(|tool| tool.spec.name.as_str()).collect();
+    let synthetic_order = [
         TASK_STATE_TOOL_NAME,
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
-    ]
-    .into_iter()
-    .chain(schema_config.core.iter().map(String::as_str))
+    ];
+    for name in synthetic_order
+        .into_iter()
+        .filter(|name| {
+            // Synthetic control tools may have been filtered out of
+            // `core_control_tools` (e.g. subagents disabled). In that case
+            // don't push them back into the request via name lookup.
+            *name == LOAD_TOOL_SCHEMA_TOOL_NAME || advertised_names.contains(name)
+        })
+        .chain(schema_config.core.iter().map(String::as_str))
     {
         push_tool_spec_by_name(tools, name, mode, &mut specs, &mut seen);
     }

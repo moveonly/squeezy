@@ -591,6 +591,78 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
     let _ = fs::remove_dir_all(root);
 }
 
+// Regression test: previously the subagent's internal event channel had a
+// buffer of 8 with no receiver, and every parallel tool call pushed two
+// `AgentEvent` messages (`ToolCallStarted` and `ToolCallCompleted`). A
+// subagent that emitted 5+ parallel tool calls in a single round would fill
+// the buffer and block forever on `send().await`. The drained-channel fix
+// must keep this case progressing.
+#[tokio::test]
+async fn explore_subagent_with_many_parallel_tool_calls_does_not_deadlock() {
+    let root = temp_workspace("explore_subagent_high_fanout");
+    for index in 0..12 {
+        fs::write(root.join(format!("file{index}.rs")), b"// content\n").expect("write source");
+    }
+    let mut sub_round = vec![Ok(LlmEvent::Started)];
+    for index in 0..12 {
+        sub_round.push(Ok(LlmEvent::ToolCall(LlmToolCall {
+            call_id: format!("sub_read_{index}"),
+            name: "read_file".to_string(),
+            arguments: serde_json::json!({"path": format!("file{index}.rs")}),
+        })));
+    }
+    sub_round.push(Ok(LlmEvent::Completed {
+        response_id: Some("sub_tools".to_string()),
+        cost: CostSnapshot::default(),
+    }));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "explore_call".to_string(),
+                name: "explore".to_string(),
+                arguments: serde_json::json!({"prompt": "Inspect all files"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        sub_round,
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("brief".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("sub_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    let drain = drain_turn(agent.start_turn("research".to_string(), CancellationToken::new()));
+    // Give the subagent a generous wall-clock budget; before the fix the
+    // send().await inside the tool dispatcher blocked indefinitely.
+    tokio::time::timeout(std::time::Duration::from_secs(30), drain)
+        .await
+        .expect("subagent must not deadlock under high fan-out");
+
+    let snapshot = agent.session_accounting_snapshot().await;
+    assert_eq!(snapshot.metrics.subagent_calls, 1);
+    assert_eq!(snapshot.metrics.subagent_failures, 0);
+    assert_eq!(snapshot.metrics.subagent_tool_calls, 12);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn loaded_tool_schemas_persist_across_turns() {
     let root = temp_workspace("lazy_schema_across_turns");
