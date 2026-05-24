@@ -23,14 +23,14 @@ use ratatui::{
 };
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, ToolApprovalDecision, ToolApprovalRequest,
+    MAX_JOBS_RETAINED, SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
     TranscriptDefault, TranscriptItem,
 };
-use squeezy_llm::LlmProvider;
+use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
@@ -488,6 +488,18 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         .map(str::trim)
         .unwrap_or_default();
     match command {
+        "/cost" => {
+            let snapshot = agent.session_accounting_snapshot().await;
+            app.status = "cost snapshot".to_string();
+            app.push_transcript_item(TranscriptItem::system(format_cost_command(&snapshot)));
+            return true;
+        }
+        "/context" => {
+            let snapshot = agent.session_accounting_snapshot().await;
+            app.status = "context snapshot".to_string();
+            app.push_transcript_item(TranscriptItem::system(format_context_command(&snapshot)));
+            return true;
+        }
         "/feedback" => {
             handle_feedback_command(app, agent, rest).await;
             return true;
@@ -956,6 +968,167 @@ fn format_attachment_line(attachment: &ContextAttachment) -> String {
         attachment.original_bytes,
         preview
     )
+}
+
+fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> String {
+    let cost = &snapshot.cost;
+    let metrics = &snapshot.metrics;
+    format!(
+        "Cost accounting\n\
+session={}\n\
+provider={} model={} mode={}\n\
+estimated_usd={} (estimated from provider-reported usage and local pricing metadata)\n\
+provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
+tools calls={} successes={} errors={} denials={} cancellations={} budget_denials={}\n\
+receipts stub_hits={} negative_stub_hits={} total_hits={}\n\
+spills writes={} reads={}\n\
+io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={}\n\
+redactions={}\n\
+accuracy=provider token counters are provider-reported when available; USD is an estimate, not a billing authority.",
+        snapshot.session_id.as_deref().unwrap_or("-"),
+        snapshot.provider,
+        snapshot.model,
+        snapshot.mode.as_str(),
+        format_cost(cost),
+        format_optional_u64(cost.input_tokens),
+        format_optional_u64(cost.output_tokens),
+        format_optional_u64(cost.reasoning_output_tokens),
+        format_optional_u64(cost.cached_input_tokens),
+        format_optional_u64(cost.cache_write_input_tokens),
+        metrics.tool_calls,
+        metrics.tool_successes,
+        metrics.tool_errors,
+        metrics.tool_denials,
+        metrics.tool_cancellations,
+        metrics.budget_denials,
+        metrics.receipt_stub_hits,
+        metrics.negative_receipt_hits,
+        metrics.receipt_stub_hits + metrics.negative_receipt_hits,
+        metrics.spill_writes,
+        metrics.spill_reads,
+        metrics.bytes_read,
+        metrics.files_scanned,
+        metrics.matches_returned,
+        metrics.model_output_bytes,
+        snapshot.redactions,
+    )
+}
+
+fn format_context_command(snapshot: &SessionAccountingSnapshot) -> String {
+    let response_state = if snapshot.store_responses {
+        if snapshot.previous_response_id.is_some() {
+            "store_responses=true previous_response_id=present"
+        } else {
+            "store_responses=true previous_response_id=absent"
+        }
+    } else {
+        "store_responses=false"
+    };
+    let provider_gap = if snapshot.provider_stored_context_active() {
+        "provider_stored_context=active; exact provider-side current-window use is unknown, so compare transmitted request with the local full-history estimate"
+    } else {
+        "provider_stored_context=inactive"
+    };
+    format!(
+        "Context accounting\n\
+session={}\n\
+provider={} model={} mode={}\n\
+response_state={}\n\
+{}\n\
+completed_turns={} provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
+transcript items={} user={} assistant={} system={} bytes={}\n\
+local_history items={} user_text={} assistant_text={} function_calls={} function_outputs={} text_bytes={} tool_output_bytes={}\n\
+attached_context total={} active={} removed={} unsupported={} stored_bytes={} redactions={}\n\
+tool_volume calls={} results={} receipt_hits={} spill_writes={} spill_reads={} budget_denials={}\n\
+{}\n\
+{}\n\
+accuracy=context tokens are deterministic local estimates of assembled request content; percentages and remaining input budget are shown only when a model context limit is known.",
+        snapshot.session_id.as_deref().unwrap_or("-"),
+        snapshot.provider,
+        snapshot.model,
+        snapshot.mode.as_str(),
+        response_state,
+        provider_gap,
+        snapshot.metrics.turns,
+        format_optional_u64(snapshot.cost.input_tokens),
+        format_optional_u64(snapshot.cost.output_tokens),
+        format_optional_u64(snapshot.cost.reasoning_output_tokens),
+        format_optional_u64(snapshot.cost.cached_input_tokens),
+        format_optional_u64(snapshot.cost.cache_write_input_tokens),
+        snapshot.transcript.items,
+        snapshot.transcript.user,
+        snapshot.transcript.assistant,
+        snapshot.transcript.system,
+        snapshot.transcript.bytes,
+        snapshot.conversation.items,
+        snapshot.conversation.user_text,
+        snapshot.conversation.assistant_text,
+        snapshot.conversation.function_calls,
+        snapshot.conversation.function_outputs,
+        snapshot.conversation.text_bytes,
+        snapshot.conversation.tool_output_bytes,
+        snapshot.attachments.total,
+        snapshot.attachments.active,
+        snapshot.attachments.removed,
+        snapshot.attachments.unsupported,
+        snapshot.attachments.stored_bytes,
+        snapshot.attachments.redactions,
+        snapshot.metrics.tool_calls,
+        snapshot.metrics.tool_successes
+            + snapshot.metrics.tool_errors
+            + snapshot.metrics.tool_denials
+            + snapshot.metrics.tool_cancellations,
+        snapshot.metrics.receipt_stub_hits + snapshot.metrics.negative_receipt_hits,
+        snapshot.metrics.spill_writes,
+        snapshot.metrics.spill_reads,
+        snapshot.metrics.budget_denials,
+        format_request_estimate("transmitted_request", &snapshot.transmitted_request),
+        format_request_estimate("local_full_history", &snapshot.full_history_request),
+    )
+}
+
+fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> String {
+    let mut output = format!(
+        "{} input_tokens={} tokenizer={} accuracy={}",
+        label,
+        estimate.input_tokens,
+        estimate.tokenizer.as_str(),
+        if estimate.estimated {
+            "estimated"
+        } else {
+            "exact"
+        }
+    );
+    if let Some(context_window) = estimate.context_window_tokens {
+        output.push_str(&format!(" context_window={context_window}"));
+    } else {
+        output.push_str(" context_window=unknown");
+    }
+    if let Some(max_output) = estimate.max_output_tokens {
+        output.push_str(&format!(" max_output_reserve={max_output}"));
+    } else {
+        output.push_str(" max_output_reserve=unknown");
+    }
+    if let Some(input_budget) = estimate.input_budget_tokens {
+        output.push_str(&format!(" input_budget={input_budget}"));
+    } else {
+        output.push_str(" input_budget=unknown");
+    }
+    if let Some(remaining) = estimate.remaining_input_tokens {
+        output.push_str(&format!(" remaining_input_budget={remaining}"));
+    } else {
+        output.push_str(" remaining_input_budget=unknown");
+    }
+    if let Some(percent) = estimate.used_input_percent_x100 {
+        output.push_str(&format!(" used={}", format_percent_x100(percent)));
+    } else {
+        output.push_str(" used=unknown");
+    }
+    output
+}
+
+fn format_percent_x100(value: u32) -> String {
+    format!("{}.{:02}%", value / 100, value % 100)
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
@@ -1865,7 +2038,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     } else if app.cancel.is_some() {
         "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /attach /attachments /detach /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /cost /context /attach /attachments /detach /sessions /resume /feedback /report /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),

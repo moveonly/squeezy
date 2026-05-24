@@ -63,3 +63,24 @@ fn parser_extracts_text_tool_calls_and_usage() {
         }
     );
 }
+
+#[test]
+fn show_metadata_extracts_context_window_from_model_info() {
+    let value = json!({
+        "model_info": {
+            "qwen3.context_length": 32768,
+            "qwen3.embedding_length": 4096
+        }
+    });
+
+    assert_eq!(ollama_context_window_from_show(&value), Some(32_768));
+}
+
+#[test]
+fn show_metadata_extracts_context_window_from_parameters_fallback() {
+    let value = json!({
+        "parameters": "temperature 0.7\nnum_ctx 8192\n"
+    });
+
+    assert_eq!(ollama_context_window_from_show(&value), Some(8_192));
+}

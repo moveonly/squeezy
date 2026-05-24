@@ -13,14 +13,14 @@ use thiserror::Error;
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-3-5-haiku-20241022";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash-lite";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
-pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-3-5-haiku-20241022-v1:0";
+pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
@@ -3666,7 +3666,7 @@ pub fn user_settings_template() -> &'static str {
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
-# default_model = "claude-3-5-haiku-20241022"
+# default_model = "claude-haiku-4-5-20251001"
 
 [permissions]
 # read = "allow"

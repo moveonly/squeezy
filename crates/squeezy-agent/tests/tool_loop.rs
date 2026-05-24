@@ -20,13 +20,19 @@ use squeezy_tools::sha256_hex;
 use tokio_util::sync::CancellationToken;
 
 struct ScriptedProvider {
+    name: &'static str,
     responses: Mutex<VecDeque<Vec<Result<LlmEvent>>>>,
     requests: Mutex<Vec<LlmRequest>>,
 }
 
 impl ScriptedProvider {
     fn new(responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
+        Self::named("scripted", responses)
+    }
+
+    fn named(name: &'static str, responses: Vec<Vec<Result<LlmEvent>>>) -> Self {
         Self {
+            name,
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
         }
@@ -39,7 +45,7 @@ impl ScriptedProvider {
 
 impl LlmProvider for ScriptedProvider {
     fn name(&self) -> &'static str {
-        "scripted"
+        self.name
     }
 
     fn stream_response(&self, request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
@@ -1286,6 +1292,79 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
     );
     assert_eq!(resumed_metadata.cost.output_tokens, Some(70));
     assert_eq!(resumed_metadata.metrics.turns, first_turns + 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn empty_session_accounting_snapshot_reports_zero_completed_state() {
+    let root = temp_workspace("empty_accounting");
+    let provider = Arc::new(ScriptedProvider::named("openai", Vec::new()));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    let agent = Agent::new(config, provider);
+
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert_eq!(snapshot.provider, "openai");
+    assert_eq!(snapshot.metrics.turns, 0);
+    assert_eq!(snapshot.cost.input_tokens, None);
+    assert_eq!(snapshot.transcript.items, 0);
+    assert_eq!(snapshot.conversation.items, 0);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(snapshot.transmitted_request.input_tokens > 0);
+    assert!(!snapshot.provider_stored_context_active());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn store_responses_accounting_marks_provider_stored_context_gap() {
+    let root = temp_workspace("store_response_accounting");
+    let provider = Arc::new(ScriptedProvider::named(
+        "openai",
+        vec![vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("stored answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_stored".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(100),
+                    output_tokens: Some(25),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ]],
+    ));
+    let mut config = config_for(root.clone());
+    config.model = squeezy_core::DEFAULT_OPENAI_MODEL.to_string();
+    config.store_responses = true;
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let snapshot = agent.session_accounting_snapshot().await;
+
+    assert!(snapshot.provider_stored_context_active());
+    assert_eq!(
+        snapshot.previous_response_id.as_deref(),
+        Some("resp_stored")
+    );
+    assert_eq!(snapshot.metrics.turns, 1);
+    assert_eq!(snapshot.cost.input_tokens, Some(100));
+    assert!(snapshot.full_history_request.input_tokens > snapshot.transmitted_request.input_tokens);
+    assert_eq!(
+        snapshot.transmitted_request.context_window_tokens,
+        Some(400_000)
+    );
+    assert!(
+        snapshot
+            .transmitted_request
+            .used_input_percent_x100
+            .is_some()
+    );
 
     let _ = fs::remove_dir_all(root);
 }

@@ -2,6 +2,7 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{CostSnapshot, OllamaConfig, Result, SqueezyError};
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
@@ -48,6 +49,55 @@ impl OllamaProvider {
         }
         body
     }
+}
+
+pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<u64> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .ok()?;
+    let url = format!("{}/show", base_url.trim_end_matches('/'));
+    let value: Value = client
+        .post(url)
+        .json(&json!({ "model": model }))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    ollama_context_window_from_show(&value)
+}
+
+pub(crate) fn ollama_context_window_from_show(value: &Value) -> Option<u64> {
+    value
+        .get("model_info")
+        .and_then(Value::as_object)
+        .and_then(|info| {
+            info.iter().find_map(|(key, value)| {
+                if key.ends_with(".context_length") {
+                    value.as_u64()
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            value
+                .get("parameters")
+                .and_then(Value::as_str)
+                .and_then(parse_num_ctx)
+        })
+}
+
+fn parse_num_ctx(parameters: &str) -> Option<u64> {
+    parameters.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("num_ctx"), Some(value)) => value.parse().ok(),
+            _ => None,
+        }
+    })
 }
 
 impl LlmProvider for OllamaProvider {
