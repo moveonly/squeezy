@@ -1,4 +1,29 @@
-pub(crate) fn collect_accuracy(root: &Path, graph: &SemanticGraph, ra_lsp_probes: usize) -> AccuracyReport {
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    time::Instant,
+};
+
+use squeezy_core::{EdgeKind, Result, SymbolKind};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    mixed::select_scenarios,
+    oracles::{
+        collect_rust_analyzer_symbol_scan, collect_squeezy_symbol_scan,
+        rust_analyzer::{
+            RustAnalyzerLsp, byte_to_lsp_position, line_char_to_byte, path_to_file_uri,
+        },
+    },
+    report::*,
+};
+
+pub(crate) fn collect_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+    ra_lsp_probes: usize,
+) -> AccuracyReport {
     let squeezy_symbols = collect_squeezy_symbol_scan(graph);
     let started = Instant::now();
     let (rust_analyzer_symbols, status) = collect_rust_analyzer_symbol_scan(graph);
@@ -40,15 +65,10 @@ pub(crate) fn empty_accuracy(status: &str) -> AccuracyReport {
     }
 }
 
-include!("oracles/clang.rs");
-include!("oracles/cpython_ast.rs");
-include!("oracles/tsc.rs");
-include!("oracles/go_types.rs");
-include!("oracles/common_scan.rs");
-include!("oracles/roslyn.rs");
-include!("oracles/javac.rs");
-include!("oracles/rust_analyzer.rs");
-pub(crate) fn compare_symbol_sets(squeezy: &SymbolScan, rust_analyzer: &SymbolScan) -> AccuracySetReport {
+pub(crate) fn compare_symbol_sets(
+    squeezy: &SymbolScan,
+    rust_analyzer: &SymbolScan,
+) -> AccuracySetReport {
     let true_positive = squeezy
         .counts
         .iter()
@@ -469,7 +489,12 @@ pub(crate) fn location_key_for_reference_hit(
     })
 }
 
-pub(crate) fn probe_byte_for_edge(source: &str, start: usize, end: usize, target_text: &str) -> usize {
+pub(crate) fn probe_byte_for_edge(
+    source: &str,
+    start: usize,
+    end: usize,
+    target_text: &str,
+) -> usize {
     let end = end.min(source.len());
     let start = start.min(end);
     let slice = source.get(start..end).unwrap_or_default();
@@ -593,258 +618,3 @@ pub(crate) fn ratio(numerator: usize, denominator: usize) -> f64 {
         ((numerator as f64 / denominator as f64) * 10_000.0).round() / 10_000.0
     }
 }
-
-#[derive(Debug, Clone)]
-pub(crate) enum MixedScenario {
-    HierarchyAll {
-        depth: usize,
-    },
-    HierarchyRoot {
-        root: SymbolId,
-        depth: usize,
-    },
-    SymbolLookup {
-        name: String,
-    },
-    SignatureSearch {
-        text: String,
-        kind: Option<SymbolKind>,
-    },
-    BodySearch {
-        text: String,
-        hit_kind: Option<BodyHitKind>,
-    },
-    ReferenceSearch {
-        text: String,
-    },
-    ReferencesToSymbol {
-        symbol: SymbolId,
-    },
-    Callees {
-        symbol: SymbolId,
-    },
-    Callers {
-        symbol: SymbolId,
-    },
-    CallChain {
-        from: SymbolId,
-        to: SymbolId,
-    },
-}
-
-impl MixedScenario {
-    pub(crate) fn tool(&self) -> &'static str {
-        match self {
-            MixedScenario::HierarchyAll { .. } | MixedScenario::HierarchyRoot { .. } => "hierarchy",
-            MixedScenario::SymbolLookup { .. } => "symbol_lookup",
-            MixedScenario::SignatureSearch { .. } => "signature_search",
-            MixedScenario::BodySearch { .. } => "body_search",
-            MixedScenario::ReferenceSearch { .. } => "reference_search",
-            MixedScenario::ReferencesToSymbol { .. } => "references_to_symbol",
-            MixedScenario::Callees { .. } => "callees",
-            MixedScenario::Callers { .. } => "callers",
-            MixedScenario::CallChain { .. } => "call_chain",
-        }
-    }
-}
-
-pub(crate) fn build_mixed_scenarios(graph: &SemanticGraph) -> Vec<MixedScenario> {
-    let mut symbols = graph
-        .symbols
-        .values()
-        .filter(|symbol| !symbol.name.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    symbols.sort_by(|left, right| {
-        format!("{:?}", left.kind)
-            .cmp(&format!("{:?}", right.kind))
-            .then(left.name.cmp(&right.name))
-            .then(left.file_id.0.cmp(&right.file_id.0))
-            .then(left.span.start_byte.cmp(&right.span.start_byte))
-    });
-
-    let names = symbols
-        .iter()
-        .filter(|symbol| symbol.kind != SymbolKind::File)
-        .map(|symbol| symbol.name.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    let mut scenarios = Vec::new();
-    for depth in [1, 2, 4, 8, 16] {
-        scenarios.push(MixedScenario::HierarchyAll { depth });
-    }
-
-    for symbol in &symbols {
-        if symbol.kind == SymbolKind::File {
-            scenarios.push(MixedScenario::HierarchyRoot {
-                root: symbol.id.clone(),
-                depth: 4,
-            });
-            continue;
-        }
-
-        scenarios.push(MixedScenario::SymbolLookup {
-            name: symbol.name.clone(),
-        });
-        scenarios.push(MixedScenario::SignatureSearch {
-            text: symbol.name.clone(),
-            kind: None,
-        });
-        scenarios.push(MixedScenario::SignatureSearch {
-            text: symbol.name.clone(),
-            kind: Some(symbol.kind),
-        });
-        scenarios.push(MixedScenario::Callees {
-            symbol: symbol.id.clone(),
-        });
-        scenarios.push(MixedScenario::Callers {
-            symbol: symbol.id.clone(),
-        });
-        scenarios.push(MixedScenario::ReferencesToSymbol {
-            symbol: symbol.id.clone(),
-        });
-    }
-
-    for name in &names {
-        scenarios.push(MixedScenario::ReferenceSearch { text: name.clone() });
-        scenarios.push(MixedScenario::BodySearch {
-            text: name.clone(),
-            hit_kind: None,
-        });
-        for hit_kind in [
-            BodyHitKind::Identifier,
-            BodyHitKind::Type,
-            BodyHitKind::Path,
-            BodyHitKind::Call,
-            BodyHitKind::Macro,
-        ] {
-            scenarios.push(MixedScenario::BodySearch {
-                text: name.clone(),
-                hit_kind: Some(hit_kind),
-            });
-        }
-    }
-
-    for edge in graph.edges() {
-        if matches!(edge.kind, EdgeKind::Calls | EdgeKind::InvokesMacro)
-            && let Some(to) = &edge.to
-        {
-            scenarios.push(MixedScenario::CallChain {
-                from: edge.from.clone(),
-                to: to.clone(),
-            });
-        }
-    }
-
-    scenarios
-}
-
-pub(crate) fn select_scenarios(available: usize, requested: usize) -> Vec<usize> {
-    if requested == 0 || requested >= available {
-        return (0..available).collect();
-    }
-
-    let mut rng = DeterministicRng::new(0x5eed_5eed_51ee_ee55_u64);
-    let mut selected = BTreeSet::new();
-    while selected.len() < requested {
-        selected.insert(rng.next_usize(available));
-    }
-    selected.into_iter().collect()
-}
-
-pub(crate) fn run_mixed_scenario(graph: &SemanticGraph, scenario: &MixedScenario) -> usize {
-    match scenario {
-        MixedScenario::HierarchyAll { depth } => graph.hierarchy(None, *depth).len(),
-        MixedScenario::HierarchyRoot { root, depth } => graph.hierarchy(Some(root), *depth).len(),
-        MixedScenario::SymbolLookup { name } => graph.find_symbol_by_name(name).len(),
-        MixedScenario::SignatureSearch { text, kind } => graph
-            .signature_search(&SignatureQuery {
-                text: text.clone(),
-                kind: *kind,
-                visibility: None,
-                attribute: None,
-            })
-            .len(),
-        MixedScenario::BodySearch { text, hit_kind } => graph
-            .body_search(&BodySearchQuery {
-                text: text.clone(),
-                owner_kind: None,
-                hit_kind: *hit_kind,
-            })
-            .len(),
-        MixedScenario::ReferenceSearch { text } => graph.reference_search(text).len(),
-        MixedScenario::ReferencesToSymbol { symbol } => graph.references_to_symbol(symbol).len(),
-        MixedScenario::Callees { symbol } => graph.callees(symbol).len(),
-        MixedScenario::Callers { symbol } => graph.callers(symbol).len(),
-        MixedScenario::CallChain { from, to } => graph
-            .call_chain(from, to, 8)
-            .map(|chain| chain.len())
-            .unwrap_or_default(),
-    }
-}
-
-pub(crate) fn run_refresh_probe(repo: &Path, language: BenchmarkLanguage) -> Result<RefreshProbeReport> {
-    let source_snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(repo)?;
-    let temp_root = temp_dir("squeezy-refresh-probe")?;
-    let mut copied = Vec::new();
-    for record in source_snapshot
-        .files
-        .iter()
-        .filter(|record| record.language == language.language_kind())
-        .take(250)
-    {
-        let dest = temp_root.join(&record.relative_path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::copy(&record.path, &dest)?;
-        copied.push(dest);
-    }
-
-    // The probe creates a synthetic tree of just-source files, so the
-    // workspace indexing-signal check can fail (no Cargo.toml/pom.xml/etc.
-    // gets copied alongside the source files). Disable the signal
-    // requirement for the probe so refresh always walks the temp tree.
-    let crawl_options = CrawlOptions {
-        require_indexing_signal: false,
-        ..CrawlOptions::default()
-    };
-    let mut manager = GraphManager::open_with_crawl_options(
-        &temp_root,
-        RefreshConfig {
-            debounce: std::time::Duration::from_millis(0),
-            idle_refresh_interval: std::time::Duration::from_millis(0),
-            per_tool_refresh_budget: std::time::Duration::from_secs(10),
-        },
-        crawl_options,
-    )?;
-
-    let edits = copied.iter().take(2).cloned().collect::<Vec<_>>();
-    for path in &edits {
-        let mut text = fs::read_to_string(path)?;
-        text.push_str(language.comment_text());
-        fs::write(path, text)?;
-        manager.record_changed_path(path.clone());
-    }
-
-    let refresh_started = Instant::now();
-    let report = manager.refresh_before_query()?;
-    let refresh_ms = refresh_started.elapsed().as_millis();
-    fs::remove_dir_all(&temp_root)?;
-
-    Ok(RefreshProbeReport {
-        language: language.as_str().to_string(),
-        copied_source_files: copied.len(),
-        edited_files: edits.len(),
-        refresh_ms,
-        reparsed_files: report.reparsed_files,
-        changed_files: report.changed_files.len(),
-        changed_paths_from_events: report.changed_paths_from_events,
-        changed_paths_from_polling: report.changed_paths_from_polling,
-        unchanged_event_paths: report.unchanged_event_paths,
-        budget_exhausted: report.budget_exhausted,
-    })
-}
-

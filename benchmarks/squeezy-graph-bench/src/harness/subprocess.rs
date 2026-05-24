@@ -16,7 +16,9 @@ where
 {
     let started = Instant::now();
     let output = Command::new(program).args(args).output().map_err(|err| {
-        SqueezyError::Graph(format!("failed to run benchmark subprocess {program}: {err}"))
+        SqueezyError::Graph(format!(
+            "failed to run benchmark subprocess {program}: {err}"
+        ))
     })?;
     Ok(TimedOutput {
         elapsed_ms: started.elapsed().as_millis(),

@@ -2,6 +2,24 @@ use squeezy_core::LanguageFamily;
 
 use crate::cli::BenchmarkLanguage;
 
+pub(crate) mod clang;
+pub(crate) mod common_scan;
+pub(crate) mod cpython_ast;
+pub(crate) mod go_types;
+pub(crate) mod javac;
+pub(crate) mod roslyn;
+pub(crate) mod rust_analyzer;
+pub(crate) mod tsc;
+
+pub(crate) use clang::*;
+pub(crate) use common_scan::*;
+pub(crate) use cpython_ast::*;
+pub(crate) use go_types::*;
+pub(crate) use javac::*;
+pub(crate) use roslyn::*;
+pub(crate) use rust_analyzer::*;
+pub(crate) use tsc::*;
+
 pub trait LanguageOracle: Sync {
     fn id(&self) -> &'static str;
     fn family(&self) -> LanguageFamily;
@@ -11,89 +29,61 @@ pub trait LanguageOracle: Sync {
     }
 }
 
-macro_rules! oracle {
-    ($module:ident, $type_name:ident, $id:literal, $family:expr, $language:expr) => {
-        pub mod $module {
-            use squeezy_core::LanguageFamily;
-
-            use crate::{cli::BenchmarkLanguage, oracles::LanguageOracle};
-
-            pub struct $type_name;
-
-            impl LanguageOracle for $type_name {
-                fn id(&self) -> &'static str {
-                    $id
-                }
-
-                fn family(&self) -> LanguageFamily {
-                    $family
-                }
-
-                fn benchmark_language(&self) -> BenchmarkLanguage {
-                    $language
-                }
-            }
-        }
-    };
+struct OracleDescriptor {
+    id: &'static str,
+    family: LanguageFamily,
+    language: BenchmarkLanguage,
 }
 
-oracle!(
-    rust_analyzer,
-    RustAnalyzerOracle,
-    "rust_analyzer",
-    LanguageFamily::Rust,
-    BenchmarkLanguage::Rust
-);
-oracle!(
-    cpython_ast,
-    CpythonAstOracle,
-    "cpython_ast",
-    LanguageFamily::Python,
-    BenchmarkLanguage::Python
-);
-oracle!(
-    javac,
-    JavacOracle,
-    "javac",
-    LanguageFamily::Java,
-    BenchmarkLanguage::Java
-);
-oracle!(
-    roslyn,
-    RoslynOracle,
-    "roslyn",
-    LanguageFamily::CSharp,
-    BenchmarkLanguage::CSharp
-);
-oracle!(
-    go_types,
-    GoTypesOracle,
-    "go_types",
-    LanguageFamily::Go,
-    BenchmarkLanguage::Go
-);
-oracle!(
-    clang,
-    ClangOracle,
-    "clang",
-    LanguageFamily::CFamily,
-    BenchmarkLanguage::C
-);
-oracle!(
-    tsc,
-    TscOracle,
-    "tsc",
-    LanguageFamily::JsTs,
-    BenchmarkLanguage::TypeScript
-);
+impl LanguageOracle for OracleDescriptor {
+    fn id(&self) -> &'static str {
+        self.id
+    }
 
-static RUST_ANALYZER: rust_analyzer::RustAnalyzerOracle = rust_analyzer::RustAnalyzerOracle;
-static CPYTHON_AST: cpython_ast::CpythonAstOracle = cpython_ast::CpythonAstOracle;
-static JAVAC: javac::JavacOracle = javac::JavacOracle;
-static ROSLYN: roslyn::RoslynOracle = roslyn::RoslynOracle;
-static GO_TYPES: go_types::GoTypesOracle = go_types::GoTypesOracle;
-static CLANG: clang::ClangOracle = clang::ClangOracle;
-static TSC: tsc::TscOracle = tsc::TscOracle;
+    fn family(&self) -> LanguageFamily {
+        self.family
+    }
+
+    fn benchmark_language(&self) -> BenchmarkLanguage {
+        self.language
+    }
+}
+
+static RUST_ANALYZER: OracleDescriptor = OracleDescriptor {
+    id: "rust_analyzer",
+    family: LanguageFamily::Rust,
+    language: BenchmarkLanguage::Rust,
+};
+static CPYTHON_AST: OracleDescriptor = OracleDescriptor {
+    id: "cpython_ast",
+    family: LanguageFamily::Python,
+    language: BenchmarkLanguage::Python,
+};
+static JAVAC: OracleDescriptor = OracleDescriptor {
+    id: "javac",
+    family: LanguageFamily::Java,
+    language: BenchmarkLanguage::Java,
+};
+static ROSLYN: OracleDescriptor = OracleDescriptor {
+    id: "roslyn",
+    family: LanguageFamily::CSharp,
+    language: BenchmarkLanguage::CSharp,
+};
+static GO_TYPES: OracleDescriptor = OracleDescriptor {
+    id: "go_types",
+    family: LanguageFamily::Go,
+    language: BenchmarkLanguage::Go,
+};
+static CLANG: OracleDescriptor = OracleDescriptor {
+    id: "clang",
+    family: LanguageFamily::CFamily,
+    language: BenchmarkLanguage::C,
+};
+static TSC: OracleDescriptor = OracleDescriptor {
+    id: "tsc",
+    family: LanguageFamily::JsTs,
+    language: BenchmarkLanguage::TypeScript,
+};
 
 static ORACLES: [&'static dyn LanguageOracle; 7] = [
     &RUST_ANALYZER,

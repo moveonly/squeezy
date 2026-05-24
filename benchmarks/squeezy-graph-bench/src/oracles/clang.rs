@@ -1,3 +1,28 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
+
+use serde_json::Value;
+use squeezy_core::{LanguageKind, Result, SqueezyError};
+use squeezy_graph::SemanticGraph;
+use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
+
+use crate::{
+    accuracy::{compare_symbol_sets, increment_unique_symbol, merge_symbol_scan},
+    cli::BenchmarkLanguage,
+    mixed::select_scenarios,
+    oracles::common_scan::{CFamilyClangSymbolScan, collect_c_family_squeezy_symbol_scan},
+    report::{
+        AccuracyReport, DefinitionAccuracyReport, NavigationAccuracyReport,
+        ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+    util::{increment, truncate},
+};
+
 pub(crate) fn collect_c_family_accuracy(
     root: &Path,
     graph: &SemanticGraph,
@@ -352,7 +377,10 @@ pub(crate) fn clang_x_language(
     }
 }
 
-pub(crate) fn clang_include_dirs(root: &Path, files: &[squeezy_workspace::FileRecord]) -> Vec<PathBuf> {
+pub(crate) fn clang_include_dirs(
+    root: &Path,
+    files: &[squeezy_workspace::FileRecord],
+) -> Vec<PathBuf> {
     let mut dirs = BTreeSet::new();
     dirs.insert(root.to_path_buf());
     for name in ["include", "src", "lib", "deps"] {
@@ -405,3 +433,7 @@ pub(crate) fn clang_symbol_name_is_comparable(name: &str) -> bool {
         && !name.starts_with("operator")
         && !name.contains("(anonymous")
 }
+
+#[cfg(test)]
+#[path = "clang_tests.rs"]
+mod tests;

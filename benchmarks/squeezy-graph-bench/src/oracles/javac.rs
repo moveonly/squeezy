@@ -1,3 +1,17 @@
+use std::{fs, path::Path, process::Command, time::Instant};
+
+use serde::Deserialize;
+use squeezy_core::{Result, SqueezyError};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{compare_symbol_sets, increment_symbol, ratio, symbol_count},
+    oracles::common_scan::collect_squeezy_symbol_scan,
+    oracles::rust_analyzer::normalize_symbol_name,
+    report::{JavaOracleReport, QueryOracleReport, QueryReport, SymbolKey, SymbolScan},
+    util::{command_exists, temp_dir},
+};
+
 pub(crate) fn time_java_oracle_optional(root: &Path) -> (u128, String) {
     if !command_exists("java") {
         return (0, "skipped: java not found".to_string());
