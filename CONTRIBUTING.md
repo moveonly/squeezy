@@ -9,11 +9,11 @@ Install Rust `1.93.1` or newer. The repository pins `1.93.1` in `rust-toolchain.
 Install pre-commit hooks:
 
 ```sh
-brew install pre-commit gitleaks actionlint cargo-deny
+brew install pre-commit gitleaks actionlint cargo-deny typos-cli
 pre-commit install
 ```
 
-If you do not use Homebrew, install `pre-commit`, `gitleaks`, `actionlint`, and `cargo-deny` with your platform's package manager.
+If you do not use Homebrew, install `pre-commit`, `gitleaks`, `actionlint`, `cargo-deny`, and `typos` with your platform's package manager.
 
 On Debian/Ubuntu Linux, install the packages needed for the static musl release build:
 
@@ -109,6 +109,7 @@ cargo clippy --workspace --all-targets --target x86_64-unknown-linux-musl -- -D 
 pre-commit run --all-files
 gitleaks detect --source . --redact --no-banner --no-color --verbose
 actionlint
+typos README.md CONTRIBUTING.md docs .github
 cargo deny check
 ```
 
@@ -127,7 +128,9 @@ For an HTML report:
 cargo llvm-cov --workspace --all-targets --html
 ```
 
-CI runs secret scanning, workflow linting, dependency policy checks, formatting, test-layout, clippy, tests, coverage checks, and release binary builds on every pull request and every push to `main`. The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, coverage, and release packaging against `x86_64-unknown-linux-musl`. macOS and Linux jobs upload release-mode `squeezy` binaries as workflow artifacts. The Linux artifact is statically checked so it does not depend on glibc, then smoke-tested with `--health`, `--version`, and `--help`. The coverage step writes its text summary to the GitHub job summary.
+CI runs secret scanning, workflow linting, dependency policy checks, docs text linting, formatting, test-layout checks, clippy, tests, deterministic validation harness runners, coverage checks, and debug artifact builds on every pull request and every push to `main`. The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, harness validation, coverage, and artifact packaging against `x86_64-unknown-linux-musl`. The coverage step writes its text summary to the GitHub job summary.
+
+Pushing a `v*` tag runs the release workflow. It builds and smoke-tests downloadable archives for `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-unknown-linux-musl`, uploads checksum files, and publishes a GitHub Release with generated notes. Dependabot tracks Cargo workspace dependencies, benchmark harness dependencies, and GitHub Actions updates weekly.
 
 ## Run
 

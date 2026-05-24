@@ -1,0 +1,56 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: deps(cargo)
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /benchmarks/squeezy-graph-bench
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:20"
+      timezone: Etc/UTC
+    labels:
+      - dependencies
+      - rust
+      - benchmark
+    commit-message:
+      prefix: deps(bench)
+    groups:
+      benchmark-cargo-dependencies:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:40"
+      timezone: Etc/UTC
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: deps(actions)
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    open-pull-requests-limit: 3

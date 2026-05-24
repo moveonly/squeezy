@@ -29,3 +29,10 @@ repos:
         entry: actionlint
         language: system
         files: ^\.github/workflows/.*\.ya?ml$
+
+      - id: typos-docs
+        name: Docs text lint
+        entry: typos README.md CONTRIBUTING.md docs .github
+        language: system
+        pass_filenames: false
+        files: ^(README\.md|CONTRIBUTING\.md|docs/|\.github/)
