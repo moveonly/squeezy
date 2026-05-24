@@ -165,6 +165,7 @@ impl AppConfig {
         cli_provider: Option<&str>,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
+        let workspace_root = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut env_used = false;
         let mut get_var = |name: &str| {
             let value = var(name);
@@ -368,6 +369,7 @@ impl AppConfig {
         let permissions = PermissionPolicy::from_settings_and_env(
             permission_settings,
             &sources.join(","),
+            &workspace_root,
             &mut get_var,
         )?;
         let session_settings = settings.session.unwrap_or_default();
@@ -397,7 +399,7 @@ impl AppConfig {
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens: Some(max_output_tokens),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
-            workspace_root: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            workspace_root,
             permissions,
             session_mode,
             session_logs,
@@ -437,7 +439,7 @@ impl AppConfig {
     }
 
     /// Returns `config_sources` with file paths reduced to short labels
-    /// (`"user"`, `"project"`) for display in narrow status lines. Full
+    /// (`"user"`, `"project"`, `"repo"`) for display in narrow status lines. Full
     /// paths remain available on `config_sources` and via `config inspect`.
     pub fn config_source_labels(&self) -> Vec<&str> {
         self.config_sources
@@ -582,6 +584,14 @@ impl AppConfig {
         output.push_str(&format!(
             "env_allowlist = {}\n",
             toml_string_array(&self.permissions.shell_sandbox.env_allowlist)
+        ));
+        output.push_str(&format!(
+            "read_roots = {}\n",
+            toml_path_array(&self.permissions.shell_sandbox.read_roots)
+        ));
+        output.push_str(&format!(
+            "write_roots = {}\n",
+            toml_path_array(&self.permissions.shell_sandbox.write_roots)
         ));
         output.push_str(&format!(
             "sensitive_path_patterns = {}\n",
@@ -845,6 +855,14 @@ fn toml_string_array<S: AsRef<str>>(values: &[S]) -> String {
     }
     out.push(']');
     out
+}
+
+fn toml_path_array(values: &[PathBuf]) -> String {
+    let values = values
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    toml_string_array(&values)
 }
 
 fn toml_bare_or_quoted_key(key: &str) -> String {
@@ -1770,6 +1788,8 @@ pub struct ShellSandboxSettings {
     pub audit: Option<bool>,
     pub kill_grace_ms: Option<u64>,
     pub env_allowlist: Option<Vec<String>>,
+    pub read_roots: Option<Vec<String>>,
+    pub write_roots: Option<Vec<String>>,
     pub sensitive_path_patterns: Option<Vec<String>>,
     /// When `true`, the user-provided `sensitive_path_patterns` REPLACE the
     /// built-in floor. The default behavior (`false` / unset) extends the
@@ -1788,6 +1808,8 @@ impl ShellSandboxSettings {
                 "audit",
                 "kill_grace_ms",
                 "env_allowlist",
+                "read_roots",
+                "write_roots",
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
             ],
@@ -1810,6 +1832,18 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "env_allowlist"),
             )?,
+            read_roots: string_array_value(
+                table,
+                "read_roots",
+                source,
+                &field(path, "read_roots"),
+            )?,
+            write_roots: string_array_value(
+                table,
+                "write_roots",
+                source,
+                &field(path, "write_roots"),
+            )?,
             sensitive_path_patterns: string_array_value(
                 table,
                 "sensitive_path_patterns",
@@ -1831,6 +1865,8 @@ impl ShellSandboxSettings {
         replace_if_some(&mut self.audit, next.audit);
         replace_if_some(&mut self.kill_grace_ms, next.kill_grace_ms);
         replace_if_some(&mut self.env_allowlist, next.env_allowlist);
+        merge_string_lists(&mut self.read_roots, next.read_roots);
+        merge_string_lists(&mut self.write_roots, next.write_roots);
         replace_if_some(
             &mut self.sensitive_path_patterns,
             next.sensitive_path_patterns,
@@ -1898,6 +1934,8 @@ pub struct ShellSandboxConfig {
     pub audit: bool,
     pub kill_grace_ms: u64,
     pub env_allowlist: Vec<String>,
+    pub read_roots: Vec<PathBuf>,
+    pub write_roots: Vec<PathBuf>,
     pub sensitive_path_patterns: Vec<String>,
 }
 
@@ -1909,6 +1947,8 @@ impl Default for ShellSandboxConfig {
             audit: true,
             kill_grace_ms: 250,
             env_allowlist: default_shell_env_allowlist(),
+            read_roots: Vec::new(),
+            write_roots: Vec::new(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
         }
     }
@@ -1918,7 +1958,11 @@ const SHELL_SANDBOX_KILL_GRACE_MIN_MS: u64 = 10;
 const SHELL_SANDBOX_KILL_GRACE_MAX_MS: u64 = 60_000;
 
 impl ShellSandboxConfig {
-    fn from_settings(settings: Option<ShellSandboxSettings>, source: &str) -> Result<Self> {
+    fn from_settings(
+        settings: Option<ShellSandboxSettings>,
+        source: &str,
+        workspace_root: &Path,
+    ) -> Result<Self> {
         let mut config = Self::default();
         let Some(settings) = settings else {
             return Ok(config);
@@ -1994,6 +2038,25 @@ impl ShellSandboxConfig {
                 config.sensitive_path_patterns = merged;
             }
         }
+        if let Some(read_roots) = settings.read_roots {
+            config.read_roots = validate_shell_sandbox_roots(
+                read_roots,
+                "read_roots",
+                source,
+                workspace_root,
+                &config.sensitive_path_patterns,
+            )?;
+        }
+        if let Some(write_roots) = settings.write_roots {
+            config.write_roots = validate_shell_sandbox_roots(
+                write_roots,
+                "write_roots",
+                source,
+                workspace_root,
+                &config.sensitive_path_patterns,
+            )?;
+        }
+        reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)
     }
 }
@@ -2045,6 +2108,118 @@ fn validate_sensitive_path_pattern(pattern: &str, source: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_shell_sandbox_roots(
+    roots: Vec<String>,
+    key: &str,
+    source: &str,
+    workspace_root: &Path,
+    sensitive_patterns: &[String],
+) -> Result<Vec<PathBuf>> {
+    let mut validated = Vec::new();
+    for raw in roots {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} contains empty path"
+            )));
+        }
+        let path = expand_home_path(PathBuf::from(trimmed));
+        if !path.is_absolute() {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} path {trimmed:?} must be absolute"
+            )));
+        }
+        let canonical = fs::canonicalize(&path).map_err(|err| {
+            SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} path {} is not accessible: {err}",
+                path.display()
+            ))
+        })?;
+        if !canonical.is_dir() {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} path {} is not a directory",
+                canonical.display()
+            )));
+        }
+        if let Some(sensitive) =
+            shell_root_sensitive_overlap(&canonical, workspace_root, sensitive_patterns)
+        {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} path {} is inside sensitive path {}",
+                canonical.display(),
+                sensitive.display()
+            )));
+        }
+        if validated.contains(&canonical) {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.{key} path {} duplicates another configured root",
+                canonical.display()
+            )));
+        }
+        validated.push(canonical);
+    }
+    validated.sort();
+    Ok(validated)
+}
+
+fn reject_duplicate_shell_roots(
+    source: &str,
+    read_roots: &[PathBuf],
+    write_roots: &[PathBuf],
+) -> Result<()> {
+    for read_root in read_roots {
+        if write_roots.contains(read_root) {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox root {} appears in both read_roots and write_roots; write_roots already imply read access",
+                read_root.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn shell_root_sensitive_overlap(
+    root: &Path,
+    workspace_root: &Path,
+    sensitive_patterns: &[String],
+) -> Option<PathBuf> {
+    let workspace_root =
+        fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| fs::canonicalize(&home).ok().or(Some(home)));
+    for pattern in sensitive_patterns {
+        let base = sensitive_pattern_base(pattern);
+        if base.is_empty() {
+            continue;
+        }
+        let workspace_sensitive = workspace_root.join(&base);
+        if root.starts_with(&workspace_sensitive) {
+            return Some(workspace_sensitive);
+        }
+        if let Some(home) = &home {
+            let home_sensitive = home.join(&base);
+            if root.starts_with(&home_sensitive) {
+                return Some(home_sensitive);
+            }
+        }
+    }
+    None
+}
+
+/// Returns the literal directory prefix of a sensitive-path glob pattern,
+/// stripping any trailing wildcards (`*`, `/**`) and the leading `/`. Empty
+/// output indicates that the pattern is purely a wildcard and should be
+/// treated as having no enforceable prefix.
+pub fn sensitive_pattern_base(pattern: &str) -> String {
+    let trimmed = pattern
+        .trim()
+        .trim_end_matches('*')
+        .trim_end_matches('/')
+        .trim_end_matches("/**");
+    trimmed.trim_start_matches('/').to_string()
 }
 
 fn default_shell_env_allowlist() -> Vec<String> {
@@ -2120,13 +2295,19 @@ pub struct PermissionPolicy {
 
 impl PermissionPolicy {
     pub fn from_env_vars(mut var: impl FnMut(&str) -> Option<String>) -> Self {
-        Self::from_settings_and_env(PermissionSettings::default(), "defaults", &mut var)
-            .expect("built-in permission defaults are valid")
+        Self::from_settings_and_env(
+            PermissionSettings::default(),
+            "defaults",
+            &env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            &mut var,
+        )
+        .expect("built-in permission defaults are valid")
     }
 
     fn from_settings_and_env(
         settings: PermissionSettings,
         source: &str,
+        workspace_root: &Path,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self> {
         Ok(Self {
@@ -2158,7 +2339,11 @@ impl PermissionPolicy {
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
             ),
-            shell_sandbox: ShellSandboxConfig::from_settings(settings.shell_sandbox, source)?,
+            shell_sandbox: ShellSandboxConfig::from_settings(
+                settings.shell_sandbox,
+                source,
+                workspace_root,
+            )?,
             rules: settings.rules,
         })
     }
@@ -3342,6 +3527,59 @@ pub fn default_settings_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".squeezy/settings.toml"))
 }
 
+pub fn default_projects_dir() -> PathBuf {
+    env::var_os("SQUEEZY_PROJECTS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".squeezy/projects"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".squeezy/projects"))
+}
+
+pub fn repo_settings_id(root: impl AsRef<Path>) -> String {
+    let root = root.as_ref();
+    let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let display = canonical.display().to_string();
+    let name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_repo_settings_name)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    format!("{name}-{:016x}", fnv1a64(display.as_bytes()))
+}
+
+pub fn per_repo_settings_path(root: impl AsRef<Path>) -> PathBuf {
+    default_projects_dir()
+        .join(repo_settings_id(root))
+        .join("settings.toml")
+}
+
+fn sanitize_repo_settings_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 pub fn default_squeezy_skills_dir() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -3475,6 +3713,8 @@ pub fn user_settings_template() -> &'static str {
 # audit = true
 # kill_grace_ms = 250
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
+# read_roots = []                  # extra absolute directories shell may read
+# write_roots = []                 # extra absolute directories shell may read/write
 # sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 
 [telemetry]
@@ -3553,6 +3793,10 @@ pub fn project_settings_template() -> &'static str {
 # target = "cargo test:*"
 # action = "allow"
 # source = "project"
+#
+# [permissions.shell_sandbox]
+# read_roots = []                  # shared absolute read-only shell roots
+# write_roots = []                 # shared absolute read/write shell roots
 
 # `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
 # external MCP tools that are discovered before each agent turn.
@@ -3594,13 +3838,24 @@ pub fn project_settings_template() -> &'static str {
 fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>)> {
     let user_path = default_settings_path();
     let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let project_path = find_project_settings_path(cwd);
-    load_settings_from_paths(Some(user_path.as_path()), project_path.as_deref())
+    let project_path = find_project_settings_path(&cwd);
+    let repo_root = project_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or(cwd);
+    let repo_path = per_repo_settings_path(repo_root);
+    load_settings_from_paths(
+        Some(user_path.as_path()),
+        project_path.as_deref(),
+        Some(repo_path.as_path()),
+    )
 }
 
 fn load_settings_from_paths(
     user_path: Option<&Path>,
     project_path: Option<&Path>,
+    repo_path: Option<&Path>,
 ) -> Result<(SettingsFile, Vec<String>)> {
     let mut settings = SettingsFile::default();
     let mut sources = vec!["defaults".to_string()];
@@ -3623,6 +3878,16 @@ fn load_settings_from_paths(
         )?;
         settings.merge(project);
         sources.push(format!("project:{}", project_path.display()));
+    }
+    if let Some(repo_path) = repo_path
+        && repo_path.is_file()
+    {
+        let repo = SettingsFile::from_toml_str(
+            &fs::read_to_string(repo_path)?,
+            &format!("repo:{}", repo_path.display()),
+        )?;
+        settings.merge(repo);
+        sources.push(format!("repo:{}", repo_path.display()));
     }
     Ok((settings, sources))
 }
@@ -4366,6 +4631,22 @@ fn field(prefix: &str, key: &str) -> String {
 fn replace_if_some<T>(target: &mut Option<T>, next: Option<T>) {
     if next.is_some() {
         *target = next;
+    }
+}
+
+fn merge_string_lists(target: &mut Option<Vec<String>>, next: Option<Vec<String>>) {
+    let Some(next) = next else {
+        return;
+    };
+    match target {
+        Some(existing) => {
+            for value in next {
+                if !existing.contains(&value) {
+                    existing.push(value);
+                }
+            }
+        }
+        None => *target = Some(next),
     }
 }
 

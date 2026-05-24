@@ -129,17 +129,34 @@ fn config_without_env_uses_openai_provider_defaults() {
 
 #[test]
 fn shell_sandbox_settings_parse_and_round_trip() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy_shell_roots_{}_{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    let read_root = root.join("read");
+    let write_root = root.join("write");
+    std::fs::create_dir_all(&read_root).expect("read root");
+    std::fs::create_dir_all(&write_root).expect("write root");
+    let read_root = std::fs::canonicalize(&read_root).expect("canonical read root");
+    let write_root = std::fs::canonicalize(&write_root).expect("canonical write root");
     let settings = SettingsFile::from_toml_str(
-        r#"
+        &format!(
+            r#"
 [permissions.shell_sandbox]
 mode = "best_effort"
 network = "allow_when_approved"
 audit = false
 kill_grace_ms = 500
 env_allowlist = ["PATH", "LC_*"]
+read_roots = [{}]
+write_roots = [{}]
 sensitive_path_patterns = [".ssh/**", ".env*"]
 replace_sensitive_path_patterns = true
 "#,
+            toml_string(&read_root.display().to_string()),
+            toml_string(&write_root.display().to_string()),
+        ),
         "test",
     )
     .expect("settings parse");
@@ -160,6 +177,14 @@ replace_sensitive_path_patterns = true
         ["PATH", "LC_*"]
     );
     assert_eq!(
+        config.permissions.shell_sandbox.read_roots,
+        vec![read_root.clone()]
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.write_roots,
+        vec![write_root.clone()]
+    );
+    assert_eq!(
         config.permissions.shell_sandbox.sensitive_path_patterns,
         [".ssh/**", ".env*"]
     );
@@ -174,6 +199,7 @@ replace_sensitive_path_patterns = true
         round_tripped_config.permissions.shell_sandbox, config.permissions.shell_sandbox,
         "inspect output must round-trip to the same effective sandbox config",
     );
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -672,6 +698,63 @@ sensitive_path_patterns = ["**"]
     )
     .expect_err("sensitive_path_patterns ** must be rejected");
     assert!(format!("{err}").contains("sensitive_path_patterns"));
+}
+
+#[test]
+fn shell_sandbox_config_validates_extra_roots() {
+    let root = std::env::temp_dir().join(format!(
+        "squeezy_shell_root_validation_{}_{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    let read_root = root.join("read");
+    let file_root = root.join("file");
+    let ssh_root = root.join(".ssh");
+    std::fs::create_dir_all(&read_root).expect("read root");
+    std::fs::create_dir_all(&ssh_root).expect("ssh root");
+    std::fs::write(&file_root, "not a dir").expect("file root");
+
+    let relative = try_app_config(
+        r#"
+[permissions.shell_sandbox]
+read_roots = ["relative"]
+"#,
+    )
+    .expect_err("relative roots must be rejected");
+    assert!(format!("{relative}").contains("read_roots"));
+
+    let missing = try_app_config(&format!(
+        r#"
+[permissions.shell_sandbox]
+read_roots = [{}]
+"#,
+        toml_string(&root.join("missing").display().to_string())
+    ))
+    .expect_err("missing roots must be rejected");
+    assert!(format!("{missing}").contains("not accessible"));
+
+    let file = try_app_config(&format!(
+        r#"
+[permissions.shell_sandbox]
+read_roots = [{}]
+"#,
+        toml_string(&file_root.display().to_string())
+    ))
+    .expect_err("file roots must be rejected");
+    assert!(format!("{file}").contains("not a directory"));
+
+    let duplicate = try_app_config(&format!(
+        r#"
+[permissions.shell_sandbox]
+read_roots = [{root}]
+write_roots = [{root}]
+"#,
+        root = toml_string(&read_root.display().to_string())
+    ))
+    .expect_err("duplicate read/write roots must be rejected");
+    assert!(format!("{duplicate}").contains("both read_roots and write_roots"));
+
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -1413,13 +1496,14 @@ fn config_source_labels_strip_paths() {
         "defaults".to_string(),
         "user:/home/me/.squeezy/settings.toml".to_string(),
         "project:/repo/squeezy.toml".to_string(),
+        "repo:/home/me/.squeezy/projects/demo-0123456789abcdef/settings.toml".to_string(),
         "env".to_string(),
         "cli".to_string(),
     ];
 
     assert_eq!(
         config.config_source_labels(),
-        vec!["defaults", "user", "project", "env", "cli"],
+        vec!["defaults", "user", "project", "repo", "env", "cli"],
     );
 }
 
@@ -1510,9 +1594,12 @@ default_model = "project-default"
     )
     .expect("write project file");
 
-    let (settings, sources) =
-        load_settings_from_paths(Some(user_path.as_path()), Some(project_path.as_path()))
-            .expect("merge sources");
+    let (settings, sources) = load_settings_from_paths(
+        Some(user_path.as_path()),
+        Some(project_path.as_path()),
+        None,
+    )
+    .expect("merge sources");
 
     assert_eq!(sources[0], "defaults");
     assert!(sources[1].starts_with("user:"));
@@ -1534,6 +1621,53 @@ default_model = "project-default"
 }
 
 #[test]
+fn load_settings_from_paths_merges_repo_after_project() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy_config_repo_{}_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let project_path = dir.join("squeezy.toml");
+    let repo_path = dir.join("repo-settings.toml");
+    std::fs::write(
+        &project_path,
+        r#"
+[model]
+model = "project-model"
+"#,
+    )
+    .expect("write project file");
+    std::fs::write(
+        &repo_path,
+        r#"
+[model]
+model = "repo-model"
+"#,
+    )
+    .expect("write repo file");
+
+    let (settings, sources) = load_settings_from_paths(
+        None,
+        Some(project_path.as_path()),
+        Some(repo_path.as_path()),
+    )
+    .expect("merge sources");
+
+    assert_eq!(sources[0], "defaults");
+    assert!(sources[1].starts_with("project:"));
+    assert!(sources[2].starts_with("repo:"));
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.model, "repo-model");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn load_settings_from_paths_skips_missing_files() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy_config_missing_{}_{}_{}",
@@ -1548,9 +1682,12 @@ fn load_settings_from_paths_skips_missing_files() {
     let user_path = dir.join("does_not_exist.toml");
     let project_path = dir.join("also_missing.toml");
 
-    let (settings, sources) =
-        load_settings_from_paths(Some(user_path.as_path()), Some(project_path.as_path()))
-            .expect("merge sources");
+    let (settings, sources) = load_settings_from_paths(
+        Some(user_path.as_path()),
+        Some(project_path.as_path()),
+        Some(dir.join("repo_missing.toml").as_path()),
+    )
+    .expect("merge sources");
 
     assert_eq!(sources, vec!["defaults".to_string()]);
     assert!(settings.providers.is_none());

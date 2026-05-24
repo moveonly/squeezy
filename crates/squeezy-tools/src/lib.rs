@@ -30,7 +30,7 @@ use squeezy_core::{
     GraphConfig, LanguageKind, McpServerConfig, PermissionCapability, PermissionMode,
     PermissionRequest, PermissionRisk, PermissionRule, PermissionRuleSource, PermissionScope,
     Provenance, Redactor, Result, ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy,
-    SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind,
+    SkillsConfig, SourceSpan, SqueezyError, SymbolId, SymbolKind, sensitive_pattern_base,
 };
 use squeezy_graph::{
     CallEdgeHit, DirtyAnnotation, DirtyRange, GraphEdge, GraphManager, GraphSymbol, HierarchyNode,
@@ -557,18 +557,30 @@ struct ShellSandboxPlan {
     backend: &'static str,
     mode: &'static str,
     network: &'static str,
+    filesystem: &'static str,
     required: bool,
+    configured_read_roots: Vec<PathBuf>,
+    configured_write_roots: Vec<PathBuf>,
+    #[allow(dead_code)]
+    filesystem_read_roots: Vec<PathBuf>,
+    #[allow(dead_code)]
+    filesystem_write_roots: Vec<PathBuf>,
 }
 
 impl ShellSandboxPlan {
-    fn direct(command: &str, mode: ShellSandboxMode) -> Self {
+    fn direct(command: &str, mode: ShellSandboxMode, config: &ShellSandboxConfig) -> Self {
         Self {
             program: "sh".to_string(),
             args: vec!["-lc".to_string(), command.to_string()],
             backend: "none",
             mode: mode.as_str(),
             network: "not_enforced",
+            filesystem: "not_enforced",
             required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
         }
     }
 
@@ -577,9 +589,46 @@ impl ShellSandboxPlan {
             "backend": self.backend,
             "mode": self.mode,
             "network": self.network,
+            "filesystem": self.filesystem,
             "required": self.required,
+            "read_roots": path_list_json(&self.configured_read_roots),
+            "write_roots": path_list_json(&self.configured_write_roots),
         })
     }
+}
+
+fn path_list_json(paths: &[PathBuf]) -> Value {
+    Value::Array(
+        paths
+            .iter()
+            .map(|path| Value::String(path.display().to_string()))
+            .collect(),
+    )
+}
+
+fn path_list_metadata(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        "none".to_string()
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn shell_sandbox_status_metadata(config: &ShellSandboxConfig, status: &str) -> Value {
+    json!({
+        "backend": "none",
+        "mode": config.mode.as_str(),
+        "network": "not_enforced",
+        "filesystem": "not_enforced",
+        "required": false,
+        "status": status,
+        "read_roots": path_list_json(&config.read_roots),
+        "write_roots": path_list_json(&config.write_roots),
+    })
 }
 
 impl ToolRegistry {
@@ -825,7 +874,11 @@ impl ToolRegistry {
         analysis: &ShellPermissionAnalysis,
     ) -> std::result::Result<ShellSandboxPlan, String> {
         match self.shell_sandbox.mode {
-            ShellSandboxMode::Off => Ok(ShellSandboxPlan::direct(command, ShellSandboxMode::Off)),
+            ShellSandboxMode::Off => Ok(ShellSandboxPlan::direct(
+                command,
+                ShellSandboxMode::Off,
+                &self.shell_sandbox,
+            )),
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
                 prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)
             }
@@ -1100,6 +1153,14 @@ impl ToolRegistry {
                 metadata.insert(
                     "sandbox_network".to_string(),
                     self.shell_sandbox.network.as_str().to_string(),
+                );
+                metadata.insert(
+                    "sandbox_read_roots".to_string(),
+                    path_list_metadata(&self.shell_sandbox.read_roots),
+                );
+                metadata.insert(
+                    "sandbox_write_roots".to_string(),
+                    path_list_metadata(&self.shell_sandbox.write_roots),
                 );
                 if let Some(timeout_ms) = args.as_ref().and_then(|args| args.timeout_ms) {
                     metadata.insert("timeout_ms".to_string(), timeout_ms.to_string());
@@ -3125,7 +3186,7 @@ impl ToolRegistry {
                 "shell output_byte_cap must be at least 1",
             );
         }
-        let workdir = match self.resolve_existing(args.workdir.as_deref().unwrap_or(".")) {
+        let workdir = match self.resolve_shell_workdir(args.workdir.as_deref().unwrap_or(".")) {
             Ok(path) => path,
             Err(err) => {
                 return shell_policy_denied(
@@ -3159,7 +3220,7 @@ impl ToolRegistry {
                 &args,
                 &workdir,
                 &analysis,
-                json!({"backend": "none", "mode": self.shell_sandbox.mode.as_str(), "status": "denied"}),
+                shell_sandbox_status_metadata(&self.shell_sandbox, "denied"),
                 timeout_ms,
                 output_cap,
                 "denied",
@@ -3179,7 +3240,7 @@ impl ToolRegistry {
                     &args,
                     &workdir,
                     &analysis,
-                    json!({"backend": "none", "mode": self.shell_sandbox.mode.as_str(), "status": "unavailable"}),
+                    shell_sandbox_status_metadata(&self.shell_sandbox, "unavailable"),
                     timeout_ms,
                     output_cap,
                     "denied",
@@ -3661,6 +3722,28 @@ impl ToolRegistry {
         self.ensure_inside(canonical)
     }
 
+    fn resolve_shell_workdir(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        let candidate = self.join_shell_path(raw)?;
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|err| format!("path does not exist or is inaccessible: {err}"))?;
+        if !canonical.is_dir() {
+            return Err("path is not a directory".to_string());
+        }
+        if canonical.starts_with(self.root.as_ref())
+            || self
+                .shell_sandbox
+                .read_roots
+                .iter()
+                .chain(self.shell_sandbox.write_roots.iter())
+                .any(|root| canonical.starts_with(root))
+        {
+            Ok(canonical)
+        } else {
+            Err("path is outside the workspace and configured shell sandbox roots".to_string())
+        }
+    }
+
     fn resolve_for_write(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         let candidate = self.join_workspace(raw)?;
         if candidate.exists() {
@@ -3677,6 +3760,14 @@ impl ToolRegistry {
     }
 
     fn join_workspace(&self, raw: &str) -> std::result::Result<PathBuf, String> {
+        let path = self.join_shell_path(raw)?;
+        if !path.starts_with(self.root.as_ref()) {
+            return Err("path must stay inside the workspace".to_string());
+        }
+        Ok(path)
+    }
+
+    fn join_shell_path(&self, raw: &str) -> std::result::Result<PathBuf, String> {
         if raw.trim().is_empty() {
             return Err("path must not be empty".to_string());
         }
@@ -7317,6 +7408,7 @@ fn prepare_shell_sandbox_plan(
         config,
         Path::new("/usr/bin/sandbox-exec").exists(),
         linux_unshare_supported(),
+        linux_landlock_supported(),
     )
 }
 
@@ -7328,16 +7420,16 @@ fn prepare_shell_sandbox_plan_with_probe(
     config: &ShellSandboxConfig,
     macos_sandbox_exec_available: bool,
     linux_unshare_available: bool,
+    linux_landlock_available: bool,
 ) -> std::result::Result<ShellSandboxPlan, String> {
     if config.mode == ShellSandboxMode::Off {
-        return Ok(ShellSandboxPlan::direct(command, ShellSandboxMode::Off));
+        return Ok(ShellSandboxPlan::direct(
+            command,
+            ShellSandboxMode::Off,
+            config,
+        ));
     }
 
-    // `root` is only consumed when synthesising the macOS sandbox-exec
-    // profile; on Linux and other targets the plan is otherwise the same.
-    // Touch the binding so non-macOS clippy doesn't flag it as unused.
-    #[cfg(not(target_os = "macos"))]
-    let _ = root;
     let required = config.mode == ShellSandboxMode::Required;
     // The sandbox-level network posture has THREE distinct states:
     //   - "allowed_approved": classified network + user opted into
@@ -7369,7 +7461,12 @@ fn prepare_shell_sandbox_plan_with_probe(
                 backend: "macos-sandbox-exec",
                 mode: config.mode.as_str(),
                 network,
+                filesystem: "enforced",
                 required,
+                configured_read_roots: config.read_roots.clone(),
+                configured_write_roots: config.write_roots.clone(),
+                filesystem_read_roots: Vec::new(),
+                filesystem_write_roots: Vec::new(),
             });
         }
         if required {
@@ -7399,13 +7496,33 @@ fn prepare_shell_sandbox_plan_with_probe(
             }
             // best_effort: fall through to a direct ShellSandboxPlan below.
         } else {
+            let filesystem = if linux_landlock_available {
+                "enforced"
+            } else if required {
+                return Err("required shell sandbox unavailable: linux Landlock filesystem enforcement unavailable".to_string());
+            } else {
+                "best_effort_unavailable"
+            };
             return Ok(ShellSandboxPlan {
                 program: "sh".to_string(),
                 args: vec!["-lc".to_string(), command.to_string()],
                 backend: "linux-direct-syscalls",
                 mode: config.mode.as_str(),
                 network,
+                filesystem,
                 required,
+                configured_read_roots: config.read_roots.clone(),
+                configured_write_roots: config.write_roots.clone(),
+                filesystem_read_roots: if linux_landlock_available {
+                    linux_shell_read_roots(root, config)
+                } else {
+                    Vec::new()
+                },
+                filesystem_write_roots: if linux_landlock_available {
+                    shell_writable_roots(root, config)
+                } else {
+                    Vec::new()
+                },
             });
         }
     }
@@ -7420,7 +7537,7 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    Ok(ShellSandboxPlan::direct(command, config.mode))
+    Ok(ShellSandboxPlan::direct(command, config.mode, config))
 }
 
 #[cfg(target_os = "macos")]
@@ -7443,6 +7560,8 @@ fn macos_shell_sandbox_profile(
     // Reads from system / toolchain prefixes: required so compilers,
     // shells, dynamic linker, and certificate stores can do their job.
     let mut read_roots = macos_read_roots();
+    read_roots.extend(config.read_roots.iter().cloned());
+    read_roots.extend(config.write_roots.iter().cloned());
     read_roots.sort();
     read_roots.dedup();
     for path in read_roots {
@@ -7452,7 +7571,7 @@ fn macos_shell_sandbox_profile(
         ));
     }
     // Read+write inside the workspace, tmp dirs, and toolchain caches.
-    let mut write_roots = shell_writable_roots(root);
+    let mut write_roots = shell_writable_roots(root, config);
     write_roots.sort();
     write_roots.dedup();
     for path in write_roots {
@@ -7523,8 +7642,7 @@ fn macos_read_roots() -> Vec<PathBuf> {
     roots
 }
 
-#[cfg(target_os = "macos")]
-fn shell_writable_roots(root: &Path) -> Vec<PathBuf> {
+fn shell_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
     let mut roots = vec![
         root.to_path_buf(),
         PathBuf::from("/tmp"),
@@ -7543,6 +7661,41 @@ fn shell_writable_roots(root: &Path) -> Vec<PathBuf> {
         roots.push(home.join(".cargo"));
         roots.push(home.join(".rustup"));
     }
+    roots.extend(config.write_roots.iter().cloned());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/nix/store",
+        "/dev",
+        "/proc",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
+    }
+    roots.push(root.to_path_buf());
+    roots.extend(config.read_roots.iter().cloned());
+    roots.extend(config.write_roots.iter().cloned());
     roots.sort();
     roots.dedup();
     roots
@@ -7564,17 +7717,11 @@ fn sensitive_absolute_paths(root: &Path, config: &ShellSandboxConfig) -> Vec<Pat
         if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
             paths.push(home.join(&base));
         }
+        for allowed_root in config.read_roots.iter().chain(config.write_roots.iter()) {
+            paths.push(allowed_root.join(&base));
+        }
     }
     paths
-}
-
-fn sensitive_pattern_base(pattern: &str) -> String {
-    let trimmed = pattern
-        .trim()
-        .trim_end_matches('*')
-        .trim_end_matches('/')
-        .trim_end_matches("/**");
-    trimmed.trim_start_matches('/').to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -7763,6 +7910,9 @@ fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellSandboxPlan)
     #[cfg(target_os = "linux")]
     if plan.backend == "linux-direct-syscalls" {
         let deny_network = plan.network == "denied";
+        let enforce_filesystem = plan.filesystem == "enforced";
+        let read_roots = plan.filesystem_read_roots.clone();
+        let write_roots = plan.filesystem_write_roots.clone();
         // `Command::process_group(0)` already arranges a `setpgid(0, 0)` in
         // the child's pre_exec, so we don't duplicate it here. We focus on
         // the namespace unshare, which is the additional isolation step.
@@ -7771,7 +7921,13 @@ fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellSandboxPlan)
         // single-step unshare if user-namespace setup is forbidden so that
         // best-effort mode does not hard-fail on every call.
         unsafe {
-            command.pre_exec(move || linux_unshare_pre_exec(deny_network));
+            command.pre_exec(move || {
+                linux_unshare_pre_exec(deny_network)?;
+                if enforce_filesystem {
+                    linux_landlock_restrict(&read_roots, &write_roots)?;
+                }
+                Ok(())
+            });
         }
     }
 
@@ -7819,6 +7975,216 @@ fn linux_unshare_pre_exec(deny_network: bool) -> std::io::Result<()> {
 fn linux_write_proc(path: &str, contents: &[u8]) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).open(path)?;
     file.write_all(contents)
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_supported() -> bool {
+    linux_landlock_abi_version() > 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_landlock_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_abi_version() -> i32 {
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if version <= 0 { 0 } else { version as i32 }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_restrict(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::Result<()> {
+    let abi = linux_landlock_abi_version();
+    if abi <= 0 {
+        return Err(std::io::Error::other("Landlock is unavailable"));
+    }
+    let handled_access_fs = linux_landlock_handled_access(abi);
+    let ruleset_attr = LandlockRulesetAttr { handled_access_fs };
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &ruleset_attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ruleset_fd = ruleset_fd as libc::c_int;
+    let add_result = (|| {
+        let read_access = linux_landlock_read_access(handled_access_fs);
+        let write_access = linux_landlock_write_access(handled_access_fs);
+        for root in read_roots {
+            linux_landlock_add_path_rule(ruleset_fd, root, read_access)?;
+        }
+        for root in write_roots {
+            linux_landlock_add_path_rule(ruleset_fd, root, write_access)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = add_result {
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        return Err(err);
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        return Err(err);
+    }
+    let restrict_result =
+        unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
+    let close_result = unsafe { libc::close(ruleset_fd) };
+    if restrict_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_add_path_rule(
+    ruleset_fd: libc::c_int,
+    path: &Path,
+    allowed_access: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("sandbox root contains NUL byte"))?;
+    let parent_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if parent_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let path_beneath = LandlockPathBeneathAttr {
+        allowed_access,
+        parent_fd,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &path_beneath as *const LandlockPathBeneathAttr,
+            0u32,
+        )
+    };
+    let close_result = unsafe { libc::close(parent_fd) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_handled_access(abi: i32) -> u64 {
+    let mut access = LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_READ_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
+    if abi >= 2 {
+        access |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi >= 3 {
+        access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    if abi >= 5 {
+        access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+    access
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_read_access(handled_access_fs: u64) -> u64 {
+    handled_access_fs
+        & (LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_READ_DIR
+            | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_write_access(handled_access_fs: u64) -> u64 {
+    handled_access_fs
 }
 
 /// Probe whether the kernel currently permits unprivileged user-namespace

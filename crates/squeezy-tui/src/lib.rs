@@ -1281,6 +1281,8 @@ pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
     "output_byte_cap",
     "sandbox",
     "sandbox_network",
+    "sandbox_read_roots",
+    "sandbox_write_roots",
     "parser_backed",
     "dynamic",
 ];

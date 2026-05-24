@@ -1469,6 +1469,86 @@ async fn shell_returns_bounded_output_and_exit_code() {
 }
 
 #[tokio::test]
+async fn shell_workdir_accepts_configured_extra_root() {
+    let root = temp_workspace("shell_extra_workdir");
+    let extra = temp_workspace("shell_extra_root");
+    let extra = fs::canonicalize(&extra).expect("canonical extra root");
+    let shell_sandbox = squeezy_core::ShellSandboxConfig {
+        mode: squeezy_core::ShellSandboxMode::Off,
+        write_roots: vec![extra.clone()],
+        ..squeezy_core::ShellSandboxConfig::default()
+    };
+    let registry = ToolRegistry::new_inner(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        shell_sandbox,
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_extra_workdir".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok",
+                    "workdir": extra.display().to_string(),
+                    "description": "run in configured extra root"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(
+        result.content["sandbox"]["write_roots"][0],
+        extra.display().to_string()
+    );
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(extra);
+}
+
+#[tokio::test]
+async fn shell_workdir_rejects_unconfigured_outside_root() {
+    let root = temp_workspace("shell_outside_workdir");
+    let outside = temp_workspace("shell_outside_root");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_outside_workdir".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf no",
+                    "workdir": outside.display().to_string(),
+                    "description": "run outside workspace"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .unwrap()
+            .contains("configured shell sandbox roots")
+    );
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(outside);
+}
+
+#[tokio::test]
 async fn shell_sensitive_path_reference_is_denied_before_spawn() {
     let root = temp_workspace("shell_sensitive");
     let registry = ToolRegistry::new(&root).expect("registry");
@@ -3603,7 +3683,12 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         backend,
         mode: if required { "required" } else { "best_effort" },
         network: "denied",
+        filesystem: "enforced",
         required,
+        configured_read_roots: Vec::new(),
+        configured_write_roots: Vec::new(),
+        filesystem_read_roots: Vec::new(),
+        filesystem_write_roots: Vec::new(),
     }
 }
 
@@ -3621,6 +3706,7 @@ fn prepare_sandbox_plan_with_probes(
         config,
         macos_available,
         linux_available,
+        true,
     )
 }
 
