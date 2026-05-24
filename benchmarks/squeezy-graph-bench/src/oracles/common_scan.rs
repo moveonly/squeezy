@@ -3,6 +3,7 @@ use std::{collections::BTreeSet, path::Path, process::Command};
 use serde::{Deserialize, Deserializer};
 use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolKind};
 use squeezy_graph::SemanticGraph;
+use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
 
 use crate::{
     accuracy::{increment_symbol, increment_unique_symbol},
@@ -18,6 +19,41 @@ use crate::{
 
 pub(crate) fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     collect_squeezy_symbol_scan_excluding_files(graph, &BTreeSet::new())
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OracleExclusions {
+    files: BTreeSet<String>,
+    dirs: Vec<String>,
+}
+
+impl OracleExclusions {
+    pub(crate) fn excludes(&self, relative_path: &str) -> bool {
+        self.files.contains(relative_path)
+            || self.dirs.iter().any(|dir| {
+                relative_path == dir.trim_end_matches('/')
+                    || relative_path.starts_with(dir.as_str())
+            })
+    }
+}
+
+pub(crate) fn default_oracle_exclusions(root: &Path) -> Result<OracleExclusions> {
+    let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
+    let mut files = BTreeSet::new();
+    let mut dirs = Vec::new();
+    for excluded in snapshot.excluded {
+        if excluded.is_dir {
+            let mut prefix = excluded.relative_path;
+            if !prefix.ends_with('/') {
+                prefix.push('/');
+            }
+            dirs.push(prefix);
+        } else {
+            files.insert(excluded.relative_path);
+        }
+    }
+    dirs.sort();
+    Ok(OracleExclusions { files, dirs })
 }
 
 pub(crate) fn collect_squeezy_symbol_scan_excluding_files(
@@ -255,6 +291,7 @@ where
 }
 
 pub(crate) fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSymbolScan> {
+    let exclusions = default_oracle_exclusions(root)?;
     let output = Command::new("python3")
         .arg("-c")
         .arg(PYTHON_AST_ORACLE)
@@ -272,6 +309,10 @@ pub(crate) fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSym
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
+        if exclusions.excludes(&file) {
+            increment(&mut scan.excluded_by_kind, "ExcludedPath");
+            continue;
+        }
         increment_symbol(
             &mut scan.counts,
             SymbolKey {
@@ -281,9 +322,14 @@ pub(crate) fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSym
             },
         );
     }
+    let unparseable_files = output
+        .unparseable_files
+        .into_iter()
+        .filter(|file| !exclusions.excludes(file))
+        .collect();
     Ok(PythonAstSymbolScan {
         symbols: scan,
-        unparseable_files: output.unparseable_files,
+        unparseable_files,
     })
 }
 

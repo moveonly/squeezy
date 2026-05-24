@@ -22,6 +22,8 @@ pub(crate) struct QuerySpec {
     pub(crate) expected_contains: Vec<String>,
     #[serde(default)]
     pub(crate) documented_misses: Vec<DocumentedMiss>,
+    #[serde(default)]
+    pub(crate) baseline: Option<GrepBaselineSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -30,8 +32,36 @@ pub(crate) struct DocumentedMiss {
     pub(crate) reason: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct GrepBaselineSpec {
+    #[serde(default)]
+    pub(crate) pattern: Option<String>,
+    #[serde(default)]
+    pub(crate) include: Vec<String>,
+    #[serde(default)]
+    pub(crate) mode: GrepBaselineMode,
+    #[serde(default)]
+    pub(crate) unsupported_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GrepBaselineMode {
+    Paths,
+    Count,
+    FirstLine,
+    Unsupported,
+}
+
+impl Default for GrepBaselineMode {
+    fn default() -> Self {
+        Self::Paths
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct BenchmarkReport {
+    pub(crate) corpus_case: Option<CorpusCaseReport>,
     pub(crate) language: String,
     pub(crate) fixture: String,
     pub(crate) spec: String,
@@ -42,6 +72,9 @@ pub(crate) struct BenchmarkReport {
     pub(crate) squeezy_total_ms: u128,
     pub(crate) build_phases: BuildPhaseReport,
     pub(crate) faster_than_validation: bool,
+    pub(crate) tool_metrics: ToolMetricsReport,
+    pub(crate) answer_quality: AnswerQualityReport,
+    pub(crate) fallback_quality: FallbackQualityReport,
     pub(crate) graph: GraphReport,
     pub(crate) accuracy: AccuracyReport,
     pub(crate) python_oracle: Option<PythonOracleReport>,
@@ -53,6 +86,61 @@ pub(crate) struct BenchmarkReport {
     pub(crate) heuristic_iterations: Vec<HeuristicIterationReport>,
     pub(crate) queries: Vec<QueryReport>,
     pub(crate) mixed_workload: Option<MixedWorkloadReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CorpusCaseReport {
+    pub(crate) name: String,
+    pub(crate) family: String,
+    pub(crate) tier: String,
+    pub(crate) source_url: Option<String>,
+    pub(crate) source_ref: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ToolMetricsReport {
+    pub(crate) graph_queries: usize,
+    pub(crate) grep_baseline_queries: usize,
+    pub(crate) mixed_scenarios: usize,
+    pub(crate) deterministic_tool_calls: usize,
+    pub(crate) wall_ms: u128,
+    pub(crate) estimated_usd_micros: u64,
+    pub(crate) cost_basis: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct AnswerQualityReport {
+    pub(crate) query_count: usize,
+    pub(crate) expected_checks: usize,
+    pub(crate) satisfied_checks: usize,
+    pub(crate) missing_checks: usize,
+    pub(crate) extra_results: usize,
+    pub(crate) documented_misses: usize,
+    pub(crate) passed: bool,
+    pub(crate) oracle_status: String,
+    pub(crate) oracle_precision: Option<f64>,
+    pub(crate) oracle_recall: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FallbackQualityReport {
+    pub(crate) unsupported_files: usize,
+    pub(crate) unsupported_file_samples: Vec<String>,
+    pub(crate) excluded_files: usize,
+    pub(crate) excluded_dirs: usize,
+    pub(crate) excluded_bytes: u64,
+    pub(crate) coverage_reasons: BTreeMap<String, FallbackReasonReport>,
+    pub(crate) edge_confidence: BTreeMap<String, usize>,
+    pub(crate) low_confidence_edges: usize,
+    pub(crate) fallback_rate: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FallbackReasonReport {
+    pub(crate) files: usize,
+    pub(crate) dirs: usize,
+    pub(crate) bytes: u64,
+    pub(crate) samples: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -86,6 +174,28 @@ pub(crate) struct QueryReport {
     pub(crate) missing: Vec<String>,
     pub(crate) extras: Vec<String>,
     pub(crate) documented_misses: Vec<DocumentedMiss>,
+    pub(crate) baseline: QueryBaselineReport,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueryBaselineReport {
+    pub(crate) status: QueryBaselineStatus,
+    pub(crate) status_detail: String,
+    pub(crate) pattern: Option<String>,
+    pub(crate) include: Vec<String>,
+    pub(crate) files_scanned: usize,
+    pub(crate) bytes_read: u64,
+    pub(crate) matches_returned: usize,
+    pub(crate) actual: Vec<String>,
+    pub(crate) semantic_relation_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueryBaselineStatus {
+    Ran,
+    Skipped,
+    Unsupported,
 }
 
 #[derive(Debug, Serialize)]

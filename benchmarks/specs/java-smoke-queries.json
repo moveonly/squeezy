@@ -70,6 +70,14 @@
         "maven:test_root:test:src/test/java",
         "maven:dependency:test:org.junit.jupiter:junit-jupiter:5.10.0"
       ]
+    },
+    {
+      "id": "java-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
     }
   ]
 }

@@ -1,5 +1,6 @@
 mod accuracy;
 mod cli;
+mod corpus;
 mod execution;
 mod gates;
 mod harness;

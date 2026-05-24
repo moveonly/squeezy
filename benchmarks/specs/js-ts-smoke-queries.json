@@ -47,6 +47,14 @@
       "kind": "references_to_symbol",
       "to": "RunnerProps",
       "expected_contains": ["RunnerProps"]
+    },
+    {
+      "id": "js-ts-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
     }
   ]
 }

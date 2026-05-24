@@ -44,6 +44,14 @@
       "from": "Greet",
       "to": "Format",
       "expected_contains": ["Greet -> Format"]
+    },
+    {
+      "id": "go-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
     }
   ]
 }

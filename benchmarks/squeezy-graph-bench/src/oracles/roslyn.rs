@@ -13,12 +13,13 @@ use crate::{
     accuracy::{compare_symbol_sets, increment_symbol},
     oracles::common_scan::{
         collect_csharp_squeezy_edge_scan_excluding_files,
-        collect_csharp_squeezy_symbol_scan_excluding_files,
+        collect_csharp_squeezy_symbol_scan_excluding_files, default_oracle_exclusions,
     },
     report::{
         AccuracyReport, CsharpOracleReport, DefinitionAccuracyReport, NavigationAccuracyReport,
         ReferenceAccuracyReport, SymbolKey, SymbolScan,
     },
+    util::increment,
 };
 
 pub(crate) fn collect_csharp_oracle_accuracy(
@@ -125,6 +126,7 @@ pub(crate) struct CsharpOracleSymbolScan {
 
 pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOracleSymbolScan> {
     let (dll, build_ms) = ensure_csharp_oracle_built()?;
+    let exclusions = default_oracle_exclusions(root)?;
     let output = Command::new("dotnet")
         .arg(&dll)
         .arg(root)
@@ -141,17 +143,30 @@ pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOra
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
+        if exclusions.excludes(&file) {
+            increment(&mut scan.excluded_by_kind, "ExcludedPath");
+            continue;
+        }
         increment_symbol(&mut scan.counts, SymbolKey { file, kind, name });
     }
     let mut edges = SymbolScan::default();
     for [file, kind, name] in output.edges {
         edges.raw_total += 1;
+        if exclusions.excludes(&file) {
+            increment(&mut edges.excluded_by_kind, "ExcludedPath");
+            continue;
+        }
         increment_symbol(&mut edges.counts, SymbolKey { file, kind, name });
     }
+    let unparseable_files = output
+        .unparseable_files
+        .into_iter()
+        .filter(|file| !exclusions.excludes(file))
+        .collect();
     Ok(CsharpOracleSymbolScan {
         symbols: scan,
         edges,
-        unparseable_files: output.unparseable_files,
+        unparseable_files,
         build_ms,
     })
 }

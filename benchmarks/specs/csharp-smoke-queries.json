@@ -71,6 +71,14 @@
         "directory-build-props:metadata_file:Directory.Build.props",
         "global-json:sdk:8.0.100"
       ]
+    },
+    {
+      "id": "csharp-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
     }
   ]
 }

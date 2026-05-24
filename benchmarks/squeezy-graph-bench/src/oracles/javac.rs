@@ -6,10 +6,10 @@ use squeezy_graph::SemanticGraph;
 
 use crate::{
     accuracy::{compare_symbol_sets, increment_symbol, ratio, symbol_count},
-    oracles::common_scan::collect_squeezy_symbol_scan,
+    oracles::common_scan::{collect_squeezy_symbol_scan, default_oracle_exclusions},
     oracles::rust_analyzer::normalize_symbol_name,
     report::{JavaOracleReport, QueryOracleReport, QueryReport, SymbolKey, SymbolScan},
-    util::{command_exists, temp_dir},
+    util::{command_exists, increment, temp_dir},
 };
 
 pub(crate) fn time_java_oracle_optional(root: &Path) -> (u128, String) {
@@ -122,6 +122,7 @@ pub(crate) struct JavaOracleOutput {
 }
 
 pub(crate) fn collect_java_compiler_tree_symbol_scan(root: &Path) -> Result<(SymbolScan, String)> {
+    let exclusions = default_oracle_exclusions(root)?;
     let temp = temp_dir("squeezy-java-oracle")?;
     let oracle_path = temp.join("JavaOracle.java");
     fs::write(&oracle_path, JAVA_COMPILER_TREE_ORACLE)?;
@@ -144,6 +145,10 @@ pub(crate) fn collect_java_compiler_tree_symbol_scan(root: &Path) -> Result<(Sym
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
+        if exclusions.excludes(&file) {
+            increment(&mut scan.excluded_by_kind, "ExcludedPath");
+            continue;
+        }
         increment_symbol(
             &mut scan.counts,
             SymbolKey {

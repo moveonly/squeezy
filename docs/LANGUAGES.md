@@ -3,6 +3,9 @@
 This document is the canonical source for Squeezy's language coverage. It is
 organized by `LanguageFamily`, which maps one or more `LanguageKind` values to a
 single parser backend, graph extension, benchmark oracle, and CI benchmark job.
+The reproducible benchmark corpus itself lives in `benchmarks/corpus.json`,
+which pins smoke/full cases, external repository commits, scenario limits, and
+report paths.
 
 ## Coverage Matrix
 
@@ -127,6 +130,15 @@ TODO: JS/TS follow-ups are tracked by `squeezy-cfa.27`.
 
 Oracle: TypeScript compiler API. CI installs the pinned `typescript` package and
 sets `SQUEEZY_TYPESCRIPT_PATH`.
+
+## Benchmark Corpus Reporting
+
+The benchmark report is intentionally claim-ready for v0 validation. Each case
+reports deterministic tool/cost metrics, grep-baseline query counts, wall time,
+answer-quality counts, oracle precision/recall where available, and fallback
+quality. Smoke fixtures for every supported family include generated and vendor
+source paths; their specs assert those paths are surfaced as generated/vendor
+fallback evidence rather than graph-confident answers.
 
 ## Adding A New Language
 

@@ -25,6 +25,10 @@ def metric_or_status(obj: dict[str, Any], ms_key: str, status_key: str) -> Any:
     return obj.get(status_key)
 
 
+def display_metric(value: Any) -> Any:
+    return "n/a" if value is None else value
+
+
 def write_query_table(out: list[str], report: dict[str, Any]) -> None:
     queries = report.get("queries") or []
     if not queries:
@@ -54,6 +58,46 @@ def write_graph_summary(out: list[str], report: dict[str, Any]) -> None:
                 edges=graph.get("edges"),
                 references=graph.get("references"),
                 calls=graph.get("calls"),
+            )
+        )
+
+
+def write_quality_summary(out: list[str], report: dict[str, Any]) -> None:
+    tool = report.get("tool_metrics") or {}
+    quality = report.get("answer_quality") or {}
+    fallback = report.get("fallback_quality") or {}
+    if tool:
+        out.append(
+            "- Tool/cost: graph_queries={graph_queries} grep_baseline_queries={grep} "
+            "mixed_scenarios={mixed} deterministic_tool_calls={calls} wall={wall}ms "
+            "estimated_usd_micros={cost}".format(
+                graph_queries=tool.get("graph_queries"),
+                grep=tool.get("grep_baseline_queries"),
+                mixed=tool.get("mixed_scenarios"),
+                calls=tool.get("deterministic_tool_calls"),
+                wall=tool.get("wall_ms"),
+                cost=tool.get("estimated_usd_micros"),
+            )
+        )
+    if quality:
+        out.append(
+            "- Answer quality: expected={expected} missing={missing} extras={extras} "
+            "oracle_precision={precision} oracle_recall={recall}".format(
+                expected=quality.get("expected_checks"),
+                missing=quality.get("missing_checks"),
+                extras=quality.get("extra_results"),
+                precision=display_metric(quality.get("oracle_precision")),
+                recall=display_metric(quality.get("oracle_recall")),
+            )
+        )
+    if fallback:
+        out.append(
+            "- Fallback/low-confidence: unsupported={unsupported} excluded_files={excluded} "
+            "excluded_dirs={dirs} low_confidence_edges={low}".format(
+                unsupported=fallback.get("unsupported_files"),
+                excluded=fallback.get("excluded_files"),
+                dirs=fallback.get("excluded_dirs"),
+                low=fallback.get("low_confidence_edges"),
             )
         )
 
@@ -102,6 +146,7 @@ def rust_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy graph build: {report['squeezy_build_ms']} ms")
         out.append(f"- Squeezy graph queries: {report['squeezy_query_ms']} ms")
+        write_quality_summary(out, report)
         acc = report["accuracy"]["symbols"]
         out.append(
             "- Fixture symbol accuracy: TP={true_positive} FP={false_positive} "
@@ -152,6 +197,7 @@ def c_family_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Fixture: {report['fixture']}")
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         write_graph_summary(out, report)
         out.append(f"- Accuracy oracle: {report['accuracy']['rust_analyzer_symbol_status']}")
         acc = report["accuracy"]["symbols"]
@@ -175,6 +221,7 @@ def csharp_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.extend(["", f"### {path}"])
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         write_graph_summary(out, report)
         out.append(f"- Accuracy oracle: {report['accuracy']['rust_analyzer_symbol_status']}")
         oracle = report.get("csharp_oracle")
@@ -225,6 +272,7 @@ def python_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Fixture: {report['fixture']}")
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         out.append(
             "- Python oracle symbols: TP={true_positive} FP={false_positive} "
             "FN={false_negative} precision={precision} recall={recall}".format(**acc)
@@ -245,6 +293,7 @@ def java_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Fixture: {report['fixture']}")
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         out.append(
             "- Java oracle symbols: TP={true_positive} FP={false_positive} "
             "FN={false_negative} precision={precision} recall={recall}".format(**acc)
@@ -266,6 +315,7 @@ def go_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Fixture: {report['fixture']}")
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         out.append(f"- Faster than validation: {report['faster_than_validation']}")
         phases = report.get("build_phases") or {}
         if phases:
@@ -327,6 +377,7 @@ def js_ts_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
         out.append(f"- Fixture: {report['fixture']}")
         out.append(f"- Validation: {report['validation_status']} in {report['validation_ms']} ms")
         out.append(f"- Squeezy total: {report['squeezy_total_ms']} ms")
+        write_quality_summary(out, report)
         if oracle:
             out.append(f"- Oracle status: {oracle.get('status', 'n/a')}")
             out.append(
@@ -408,7 +459,41 @@ def js_ts_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def all_summary(reports: list[tuple[str, dict[str, Any]]]) -> str:
+    out = ["## Cross-Language Semantic Graph Benchmark", ""]
+    out.append(
+        "| Case | Family | Tier | Wall ms | Graph queries | Grep baseline | Mixed scenarios | Missing | Extras | Fallback rate | Low-conf edges | Oracle status | Oracle precision | Oracle recall |"
+    )
+    out.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|")
+    for path, report in reports:
+        case = report.get("corpus_case") or {}
+        tool = report.get("tool_metrics") or {}
+        quality = report.get("answer_quality") or {}
+        fallback = report.get("fallback_quality") or {}
+        out.append(
+            "| {case} | {family} | {tier} | {wall} | {graph_queries} | {grep} | {mixed} | "
+            "{missing} | {extras} | {fallback_rate} | {low} | {status} | {precision} | {recall} |".format(
+                case=case.get("name") or path,
+                family=case.get("family") or report.get("language"),
+                tier=case.get("tier") or "single",
+                wall=tool.get("wall_ms", report.get("squeezy_total_ms")),
+                graph_queries=tool.get("graph_queries", len(report.get("queries") or [])),
+                grep=tool.get("grep_baseline_queries", 0),
+                mixed=tool.get("mixed_scenarios", 0),
+                missing=quality.get("missing_checks", 0),
+                extras=quality.get("extra_results", 0),
+                fallback_rate=fallback.get("fallback_rate", 0),
+                low=fallback.get("low_confidence_edges", 0),
+                status=quality.get("oracle_status"),
+                precision=display_metric(quality.get("oracle_precision")),
+                recall=display_metric(quality.get("oracle_recall")),
+            )
+        )
+    return "\n".join(out) + "\n"
+
+
 SUMMARIZERS = {
+    "all": all_summary,
     "rust": rust_summary,
     "c-family": c_family_summary,
     "c": c_family_summary,

@@ -1,0 +1,702 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "rust-smoke",
+      "family": "rust",
+      "language": "rust",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/rust-smoke.json",
+      "mixed_repo": "target/benchmark-repos/ripgrep-smoke",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "repo": {
+        "url": "https://github.com/BurntSushi/ripgrep",
+        "rev": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
+        "checkout": "target/benchmark-repos/ripgrep-smoke"
+      }
+    },
+    {
+      "name": "python-smoke",
+      "family": "python",
+      "language": "python",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/python/semantic-cases",
+      "spec": "benchmarks/specs/python-smoke-queries.json",
+      "report": "python/python-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "java-smoke",
+      "family": "java",
+      "language": "java",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/java/semantic-cases",
+      "spec": "benchmarks/specs/java-smoke-queries.json",
+      "report": "java/java-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "go-smoke",
+      "family": "go",
+      "language": "go",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/go/semantic-cases",
+      "spec": "benchmarks/specs/go-smoke-queries.json",
+      "report": "go/go-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "c-smoke",
+      "family": "c-family",
+      "language": "c",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/c/semantic-cases",
+      "spec": "benchmarks/specs/c-smoke-queries.json",
+      "report": "c-family/c-smoke.json",
+      "ra_lsp_probes": 0,
+      "oracle_files": 0
+    },
+    {
+      "name": "cpp-smoke",
+      "family": "c-family",
+      "language": "cpp",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/cpp/semantic-cases",
+      "spec": "benchmarks/specs/cpp-smoke-queries.json",
+      "report": "c-family/cpp-smoke.json",
+      "ra_lsp_probes": 0,
+      "oracle_files": 0
+    },
+    {
+      "name": "csharp-smoke",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/csharp-smoke.json",
+      "ra_lsp_probes": 0
+    },
+    {
+      "name": "js-ts-smoke",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "smoke",
+      "fixture": "benchmarks/fixtures/js-ts/semantic-cases",
+      "spec": "benchmarks/specs/js-ts-smoke-queries.json",
+      "report": "js-ts/js-ts-smoke.json",
+      "mixed_repo": "target/benchmark-repos/redux-smoke/src",
+      "mixed_iterations": 500,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/reduxjs/redux",
+        "rev": "1ea3a6bbeefd6b2bd6a71196742c4db40f4822b1",
+        "checkout": "target/benchmark-repos/redux-smoke"
+      }
+    },
+    {
+      "name": "ripgrep",
+      "family": "rust",
+      "language": "rust",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/ripgrep.json",
+      "mixed_repo": "target/benchmark-repos/ripgrep",
+      "mixed_iterations": 5000,
+      "ra_lsp_probes": 50,
+      "repo": {
+        "url": "https://github.com/BurntSushi/ripgrep",
+        "rev": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
+        "checkout": "target/benchmark-repos/ripgrep"
+      }
+    },
+    {
+      "name": "fd",
+      "family": "rust",
+      "language": "rust",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/fd.json",
+      "mixed_repo": "target/benchmark-repos/fd",
+      "mixed_iterations": 5000,
+      "ra_lsp_probes": 50,
+      "repo": {
+        "url": "https://github.com/sharkdp/fd",
+        "rev": "42b2ab8a84ddedf80eeed9079128c60161f64658",
+        "checkout": "target/benchmark-repos/fd"
+      }
+    },
+    {
+      "name": "bat",
+      "family": "rust",
+      "language": "rust",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/bat.json",
+      "mixed_repo": "target/benchmark-repos/bat",
+      "mixed_iterations": 5000,
+      "ra_lsp_probes": 50,
+      "repo": {
+        "url": "https://github.com/sharkdp/bat",
+        "rev": "f3d077346824eae07fbac4b56466d27049b9616e",
+        "checkout": "target/benchmark-repos/bat"
+      }
+    },
+    {
+      "name": "tokio",
+      "family": "rust",
+      "language": "rust",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/tokio.json",
+      "mixed_repo": "target/benchmark-repos/tokio",
+      "mixed_iterations": 5000,
+      "ra_lsp_probes": 50,
+      "repo": {
+        "url": "https://github.com/tokio-rs/tokio",
+        "rev": "82fe082ef14c2e2b2c1c29ed9873c2ca6e6109ee",
+        "checkout": "target/benchmark-repos/tokio"
+      }
+    },
+    {
+      "name": "serde",
+      "family": "rust",
+      "language": "rust",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/rust/semantic-cases",
+      "spec": "benchmarks/specs/smoke-queries.json",
+      "report": "rust/serde.json",
+      "mixed_repo": "target/benchmark-repos/serde",
+      "mixed_iterations": 5000,
+      "ra_lsp_probes": 50,
+      "repo": {
+        "url": "https://github.com/serde-rs/serde",
+        "rev": "fa7da4a93567ed347ad0735c28e439fca688ef26",
+        "checkout": "target/benchmark-repos/serde"
+      }
+    },
+    {
+      "name": "requests",
+      "family": "python",
+      "language": "python",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/requests/src/requests",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "python/requests.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/psf/requests",
+        "rev": "cd90742ed94d901759e26766197d0ce7c7bd9c8e",
+        "checkout": "target/benchmark-repos/requests"
+      }
+    },
+    {
+      "name": "flask",
+      "family": "python",
+      "language": "python",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/flask/src/flask",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "python/flask.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/pallets/flask",
+        "rev": "954f5684e4841aad84a8eec7ace7b81a0d3f6831",
+        "checkout": "target/benchmark-repos/flask"
+      }
+    },
+    {
+      "name": "click",
+      "family": "python",
+      "language": "python",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/click/src/click",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "python/click.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/pallets/click",
+        "rev": "3a40e43e8f61761cb7bd4f3e27ae3060690a84eb",
+        "checkout": "target/benchmark-repos/click"
+      }
+    },
+    {
+      "name": "black",
+      "family": "python",
+      "language": "python",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/black/src/black",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "python/black.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/psf/black",
+        "rev": "650983f7b32b15feeb0fa30c0ed1a8b6e2a9b28f",
+        "checkout": "target/benchmark-repos/black"
+      }
+    },
+    {
+      "name": "fastapi",
+      "family": "python",
+      "language": "python",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/fastapi/fastapi",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "python/fastapi.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/fastapi/fastapi",
+        "rev": "82064857539e6286522c347b4b11331b48dd2378",
+        "checkout": "target/benchmark-repos/fastapi"
+      }
+    },
+    {
+      "name": "junit5",
+      "family": "java",
+      "language": "java",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/junit5",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "java/junit5.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/junit-team/junit5",
+        "rev": "39297ab5d5f134e931d692b9f449e8955b5bcab3",
+        "checkout": "target/benchmark-repos/junit5"
+      }
+    },
+    {
+      "name": "mockito",
+      "family": "java",
+      "language": "java",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/mockito",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "java/mockito.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/mockito/mockito",
+        "rev": "3b5ba472cc1dd3d85e916875c9332b282d30fff4",
+        "checkout": "target/benchmark-repos/mockito"
+      }
+    },
+    {
+      "name": "guava",
+      "family": "java",
+      "language": "java",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/guava",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "java/guava.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/google/guava",
+        "rev": "cdd921520648e17a5bc8ced876690f0ab110c48c",
+        "checkout": "target/benchmark-repos/guava"
+      }
+    },
+    {
+      "name": "retrofit",
+      "family": "java",
+      "language": "java",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/retrofit",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "java/retrofit.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/square/retrofit",
+        "rev": "8e83a242eac1afc22a13c52098eddb27421353ff",
+        "checkout": "target/benchmark-repos/retrofit"
+      }
+    },
+    {
+      "name": "picocli",
+      "family": "java",
+      "language": "java",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/picocli",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "java/picocli.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/remkop/picocli",
+        "rev": "a89996315c3fe26b457e89443e3034e3e5967c49",
+        "checkout": "target/benchmark-repos/picocli"
+      }
+    },
+    {
+      "name": "gin",
+      "family": "go",
+      "language": "go",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/gin",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "go/gin.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/gin-gonic/gin",
+        "rev": "5f4f9643258dc2a65e684b63f12c8d543c936c67",
+        "checkout": "target/benchmark-repos/gin"
+      }
+    },
+    {
+      "name": "cobra",
+      "family": "go",
+      "language": "go",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/cobra",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "go/cobra.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/spf13/cobra",
+        "rev": "ad460ea8f249db69c943a365fb84f3a59042d54e",
+        "checkout": "target/benchmark-repos/cobra"
+      }
+    },
+    {
+      "name": "prometheus",
+      "family": "go",
+      "language": "go",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/prometheus",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "go/prometheus.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/prometheus/prometheus",
+        "rev": "1a7ad07bb9fbf0df9f1360b1bf0114c0e968c960",
+        "checkout": "target/benchmark-repos/prometheus"
+      }
+    },
+    {
+      "name": "etcd",
+      "family": "go",
+      "language": "go",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/etcd",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "go/etcd.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/etcd-io/etcd",
+        "rev": "dde11c0d4cd3ca9019f5c76aa1d986041374aeec",
+        "checkout": "target/benchmark-repos/etcd"
+      }
+    },
+    {
+      "name": "zap",
+      "family": "go",
+      "language": "go",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/zap",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "go/zap.json",
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/uber-go/zap",
+        "rev": "5b81b37b81b8e2ed447a6f57991e372ee4fa5c8f",
+        "checkout": "target/benchmark-repos/zap"
+      }
+    },
+    {
+      "name": "redis",
+      "family": "c-family",
+      "language": "c",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/c/semantic-cases",
+      "spec": "benchmarks/specs/c-smoke-queries.json",
+      "report": "c-family/redis.json",
+      "mixed_repo": "target/benchmark-repos/redis",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 0,
+      "oracle_files": 10,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/redis/redis",
+        "rev": "ba1a4b2c8f37beec5a9be040c37c755207f0cc8d",
+        "checkout": "target/benchmark-repos/redis"
+      }
+    },
+    {
+      "name": "curl",
+      "family": "c-family",
+      "language": "c",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/c/semantic-cases",
+      "spec": "benchmarks/specs/c-smoke-queries.json",
+      "report": "c-family/curl.json",
+      "mixed_repo": "target/benchmark-repos/curl",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 0,
+      "oracle_files": 10,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/curl/curl",
+        "rev": "fc90bdbaf9c9336912671715af0a778529b8f6c1",
+        "checkout": "target/benchmark-repos/curl"
+      }
+    },
+    {
+      "name": "sqlite",
+      "family": "c-family",
+      "language": "c",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/c/semantic-cases",
+      "spec": "benchmarks/specs/c-smoke-queries.json",
+      "report": "c-family/sqlite.json",
+      "mixed_repo": "target/benchmark-repos/sqlite",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 0,
+      "oracle_files": 10,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/sqlite/sqlite",
+        "rev": "3020203708aef0b579ce7692dd539642cafec6e1",
+        "checkout": "target/benchmark-repos/sqlite"
+      }
+    },
+    {
+      "name": "protobuf",
+      "family": "c-family",
+      "language": "cpp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/cpp/semantic-cases",
+      "spec": "benchmarks/specs/cpp-smoke-queries.json",
+      "report": "c-family/protobuf.json",
+      "mixed_repo": "target/benchmark-repos/protobuf",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 0,
+      "oracle_files": 10,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/protocolbuffers/protobuf",
+        "rev": "128dee159334faa78f345ee8473583141db8f80d",
+        "checkout": "target/benchmark-repos/protobuf"
+      }
+    },
+    {
+      "name": "nlohmann_json",
+      "family": "c-family",
+      "language": "cpp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/cpp/semantic-cases",
+      "spec": "benchmarks/specs/cpp-smoke-queries.json",
+      "report": "c-family/nlohmann_json.json",
+      "mixed_repo": "target/benchmark-repos/nlohmann_json",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 0,
+      "oracle_files": 10,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/nlohmann/json",
+        "rev": "484483acad6d562306efc9b3c6d413404f1b1f8a",
+        "checkout": "target/benchmark-repos/nlohmann_json"
+      }
+    },
+    {
+      "name": "newtonsoft_json",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/newtonsoft_json.json",
+      "mixed_repo": "target/benchmark-repos/newtonsoft_json",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/JamesNK/Newtonsoft.Json",
+        "rev": "4f73e74372445108d2c1bda37b36e6f5e43402e0",
+        "checkout": "target/benchmark-repos/newtonsoft_json"
+      }
+    },
+    {
+      "name": "dapper",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/dapper.json",
+      "mixed_repo": "target/benchmark-repos/dapper",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/DapperLib/Dapper",
+        "rev": "72a54c475f75e18cb93cba0809d00a5e6e49efd9",
+        "checkout": "target/benchmark-repos/dapper"
+      }
+    },
+    {
+      "name": "automapper",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/automapper.json",
+      "mixed_repo": "target/benchmark-repos/automapper",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/AutoMapper/AutoMapper",
+        "rev": "b57c206dc7291821e42bdf816a5637a5c1d8cb54",
+        "checkout": "target/benchmark-repos/automapper"
+      }
+    },
+    {
+      "name": "polly",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/polly.json",
+      "mixed_repo": "target/benchmark-repos/polly",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/App-vNext/Polly",
+        "rev": "d36bdd5c931784ebf5c99ff63601cace46a1d5e8",
+        "checkout": "target/benchmark-repos/polly"
+      }
+    },
+    {
+      "name": "serilog",
+      "family": "csharp",
+      "language": "csharp",
+      "tier": "full",
+      "fixture": "benchmarks/fixtures/csharp/semantic-cases",
+      "spec": "benchmarks/specs/csharp-smoke-queries.json",
+      "report": "csharp/serilog.json",
+      "mixed_repo": "target/benchmark-repos/serilog",
+      "mixed_iterations": 1500,
+      "ra_lsp_probes": 0,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/serilog/serilog",
+        "rev": "2ef63645cf0d0edd4b187510b238754249c4348f",
+        "checkout": "target/benchmark-repos/serilog"
+      }
+    },
+    {
+      "name": "vite",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/vite/packages/vite/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "js-ts/vite.json",
+      "mixed_repo": "target/benchmark-repos/vite/packages/vite/src",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/vitejs/vite",
+        "rev": "c917f1ef9d9c6ef131af96d89089d8ec680b18f2",
+        "checkout": "target/benchmark-repos/vite"
+      }
+    },
+    {
+      "name": "redux",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/redux/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "js-ts/redux.json",
+      "mixed_repo": "target/benchmark-repos/redux/src",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/reduxjs/redux",
+        "rev": "1ea3a6bbeefd6b2bd6a71196742c4db40f4822b1",
+        "checkout": "target/benchmark-repos/redux"
+      }
+    },
+    {
+      "name": "axios",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/axios/lib",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "js-ts/axios.json",
+      "mixed_repo": "target/benchmark-repos/axios/lib",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/axios/axios",
+        "rev": "278041d8cce5d96911bb1333f77dca3567fc90e2",
+        "checkout": "target/benchmark-repos/axios"
+      }
+    },
+    {
+      "name": "express",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/express/lib",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "js-ts/express.json",
+      "mixed_repo": "target/benchmark-repos/express/lib",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/expressjs/express",
+        "rev": "dae209ae6559c29cfca2a1f4414c51d89ea643d5",
+        "checkout": "target/benchmark-repos/express"
+      }
+    },
+    {
+      "name": "prettier",
+      "family": "js-ts",
+      "language": "typescript",
+      "tier": "full",
+      "fixture": "target/benchmark-repos/prettier/src",
+      "spec": "benchmarks/specs/empty-queries.json",
+      "report": "js-ts/prettier.json",
+      "mixed_repo": "target/benchmark-repos/prettier/src",
+      "mixed_iterations": 1000,
+      "ra_lsp_probes": 25,
+      "no_speed_gate": true,
+      "repo": {
+        "url": "https://github.com/prettier/prettier",
+        "rev": "6ae5fecd46f1a787c9cac9531420c510ec8d2c0d",
+        "checkout": "target/benchmark-repos/prettier"
+      }
+    }
+  ]
+}

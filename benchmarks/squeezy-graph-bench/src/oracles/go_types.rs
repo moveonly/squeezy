@@ -8,13 +8,14 @@ use crate::{
     cli::BenchmarkLanguage,
     oracles::common_scan::{
         GoAstOracleOutput, GoAstSymbolScan, collect_squeezy_symbol_scan_excluding_files,
+        default_oracle_exclusions,
     },
     oracles::rust_analyzer::normalize_symbol_name,
     report::{
         AccuracyReport, DefinitionAccuracyReport, GoOracleReport, HeuristicIterationReport,
         NavigationAccuracyReport, ReferenceAccuracyReport, SymbolKey, SymbolScan,
     },
-    util::temp_dir,
+    util::{increment, temp_dir},
 };
 
 pub(crate) fn collect_go_oracle_accuracy(
@@ -160,6 +161,7 @@ pub(crate) fn time_go_ast_oracle(fixture: &Path) -> Result<u128> {
 
 pub(crate) fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAstSymbolScan> {
     fs::write(script_path, GO_AST_ORACLE)?;
+    let exclusions = default_oracle_exclusions(root)?;
     let output = Command::new("go")
         .arg("run")
         .arg(script_path)
@@ -177,6 +179,10 @@ pub(crate) fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAst
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
+        if exclusions.excludes(&file) {
+            increment(&mut scan.excluded_by_kind, "ExcludedPath");
+            continue;
+        }
         increment_symbol(
             &mut scan.counts,
             SymbolKey {
@@ -186,9 +192,14 @@ pub(crate) fn run_go_ast_oracle(script_path: &Path, root: &Path) -> Result<GoAst
             },
         );
     }
+    let unparseable_files = output
+        .unparseable_files
+        .into_iter()
+        .filter(|file| !exclusions.excludes(file))
+        .collect();
     Ok(GoAstSymbolScan {
         symbols: scan,
-        unparseable_files: output.unparseable_files,
+        unparseable_files,
     })
 }
 

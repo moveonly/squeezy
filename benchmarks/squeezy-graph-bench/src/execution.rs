@@ -1,21 +1,45 @@
-use std::{collections::BTreeSet, path::Path, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+    time::Instant,
+};
 
-use squeezy_core::{Result, SqueezyError, SymbolKind};
+use squeezy_core::{Confidence, Result, SqueezyError, SymbolKind};
 use squeezy_graph::{BodySearchQuery, SemanticGraph, SignatureQuery};
 use squeezy_parse::{BodyHitKind, LanguageParser, ParsedFile};
-use squeezy_workspace::{CrawlOptions, WorkspaceCrawler};
+use squeezy_workspace::{CrawlOptions, IndexCoverage, WorkspaceCrawler, WorkspaceSnapshot};
 
-use crate::report::{BuildPhaseReport, QueryReport, QuerySpec};
+use crate::{
+    accuracy::ratio,
+    report::{
+        BuildPhaseReport, FallbackQualityReport, FallbackReasonReport, GrepBaselineMode,
+        GrepBaselineSpec, QueryBaselineReport, QueryBaselineStatus, QueryReport, QuerySpec,
+    },
+};
 
 pub(crate) struct GraphBuildOutput {
     pub(crate) graph: SemanticGraph,
     pub(crate) phases: BuildPhaseReport,
+    pub(crate) coverage: IndexCoverage,
+    pub(crate) unsupported_files: usize,
+    pub(crate) unsupported_file_samples: Vec<String>,
+    pub(crate) snapshot: WorkspaceSnapshot,
 }
 
 pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
     let total_started = Instant::now();
     let crawl_started = Instant::now();
     let snapshot = WorkspaceCrawler::new(CrawlOptions::default()).crawl(root)?;
+    let coverage = snapshot.coverage.clone();
+    let unsupported_files = snapshot.unsupported.len();
+    let unsupported_file_samples = snapshot
+        .unsupported
+        .iter()
+        .take(10)
+        .map(|file| file.relative_path.clone())
+        .collect();
+    let snapshot_for_grep = snapshot.clone();
     let crawl_ms = crawl_started.elapsed().as_millis();
 
     let parse_started = Instant::now();
@@ -41,7 +65,67 @@ pub(crate) fn build_graph(root: &Path) -> Result<GraphBuildOutput> {
             full_graph_ms,
             total_ms: total_started.elapsed().as_millis(),
         },
+        coverage,
+        unsupported_files,
+        unsupported_file_samples,
+        snapshot: snapshot_for_grep,
     })
+}
+
+pub(crate) fn fallback_quality_report(
+    coverage: &IndexCoverage,
+    unsupported_files: usize,
+    unsupported_file_samples: Vec<String>,
+    graph: &SemanticGraph,
+) -> FallbackQualityReport {
+    let coverage_reasons = coverage
+        .reasons
+        .iter()
+        .map(|(reason, item)| {
+            (
+                reason.clone(),
+                FallbackReasonReport {
+                    files: item.files,
+                    dirs: item.dirs,
+                    bytes: item.bytes,
+                    samples: item.samples.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut edge_confidence = BTreeMap::new();
+    for edge in graph.edges() {
+        *edge_confidence
+            .entry(format!("{:?}", edge.confidence))
+            .or_insert(0) += 1;
+    }
+    let low_confidence_edges = graph
+        .edges()
+        .iter()
+        .filter(|edge| {
+            !matches!(
+                edge.confidence,
+                Confidence::ExactSyntax | Confidence::ImportResolved
+            )
+        })
+        .count();
+    let total_edges = graph.edges().len();
+
+    FallbackQualityReport {
+        unsupported_files,
+        unsupported_file_samples,
+        excluded_files: coverage.skipped_files,
+        excluded_dirs: coverage.skipped_dirs,
+        excluded_bytes: coverage.skipped_bytes,
+        coverage_reasons,
+        edge_confidence,
+        low_confidence_edges,
+        fallback_rate: ratio(
+            unsupported_files + coverage.skipped_files + low_confidence_edges,
+            unsupported_files + coverage.skipped_files + total_edges,
+        ),
+    }
 }
 
 pub(crate) fn declaration_only_parsed(parsed: &[ParsedFile]) -> Vec<ParsedFile> {
@@ -58,8 +142,14 @@ pub(crate) fn declaration_only_parsed(parsed: &[ParsedFile]) -> Vec<ParsedFile> 
         .collect()
 }
 
-pub(crate) fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<QueryReport> {
+pub(crate) fn run_query(
+    snapshot: &WorkspaceSnapshot,
+    graph: &SemanticGraph,
+    query: &QuerySpec,
+    fallback_quality: &FallbackQualityReport,
+) -> Result<QueryReport> {
     let actual = match query.kind.as_str() {
+        "fallback_quality" => fallback_quality_lines(fallback_quality),
         "hierarchy_contains" => flatten_hierarchy(graph),
         "signature_search" => graph
             .signature_search(&SignatureQuery {
@@ -182,6 +272,7 @@ pub(crate) fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<Quer
         .collect::<BTreeSet<_>>();
     let missing = expected.difference(&actual).cloned().collect::<Vec<_>>();
     let extras = actual.difference(&expected).cloned().collect::<Vec<_>>();
+    let baseline = run_grep_baseline(snapshot, query)?;
 
     Ok(QueryReport {
         id: query.id.clone(),
@@ -191,7 +282,172 @@ pub(crate) fn run_query(graph: &SemanticGraph, query: &QuerySpec) -> Result<Quer
         missing,
         extras,
         documented_misses: query.documented_misses.clone(),
+        baseline,
     })
+}
+
+fn fallback_quality_lines(fallback: &FallbackQualityReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (reason, coverage) in &fallback.coverage_reasons {
+        lines.push(reason.clone());
+        lines.push(format!("{reason}:files={}", coverage.files));
+        lines.push(format!("{reason}:dirs={}", coverage.dirs));
+    }
+    for (confidence, count) in &fallback.edge_confidence {
+        lines.push(format!("edge_confidence:{confidence}={count}"));
+    }
+    if fallback.unsupported_files > 0 {
+        lines.push("unsupported".to_string());
+        lines.push(format!("unsupported:files={}", fallback.unsupported_files));
+    }
+    lines
+}
+
+fn run_grep_baseline(
+    snapshot: &WorkspaceSnapshot,
+    query: &QuerySpec,
+) -> Result<QueryBaselineReport> {
+    let (baseline, semantic_relation_supported) = grep_baseline_for_query(query);
+    if matches!(baseline.mode, GrepBaselineMode::Unsupported) {
+        return Ok(QueryBaselineReport {
+            status: QueryBaselineStatus::Unsupported,
+            status_detail: baseline
+                .unsupported_reason
+                .unwrap_or_else(|| "grep baseline cannot model this semantic query".to_string()),
+            pattern: baseline.pattern,
+            include: baseline.include,
+            files_scanned: 0,
+            bytes_read: 0,
+            matches_returned: 0,
+            actual: Vec::new(),
+            semantic_relation_supported,
+        });
+    }
+
+    let Some(pattern) = baseline
+        .pattern
+        .clone()
+        .filter(|pattern| !pattern.is_empty())
+    else {
+        return Ok(QueryBaselineReport {
+            status: QueryBaselineStatus::Skipped,
+            status_detail: "skipped: no grep pattern available".to_string(),
+            pattern: baseline.pattern,
+            include: baseline.include,
+            files_scanned: 0,
+            bytes_read: 0,
+            matches_returned: 0,
+            actual: Vec::new(),
+            semantic_relation_supported,
+        });
+    };
+
+    let mut files_scanned = 0usize;
+    let mut bytes_read = 0u64;
+    let mut matches = Vec::new();
+    let mut matched_paths = BTreeSet::new();
+    for file in &snapshot.files {
+        if !baseline.include.is_empty()
+            && !baseline
+                .include
+                .iter()
+                .any(|pattern| baseline_path_matches(pattern, &file.relative_path))
+        {
+            continue;
+        }
+        files_scanned += 1;
+        let content = match fs::read_to_string(&file.path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        bytes_read += content.len() as u64;
+        for (line_index, line) in content.lines().enumerate() {
+            if line.contains(&pattern) {
+                matched_paths.insert(file.relative_path.clone());
+                matches.push(format!(
+                    "{}:{}:{}",
+                    file.relative_path,
+                    line_index + 1,
+                    line
+                ));
+            }
+        }
+    }
+
+    let raw_match_count = matches.len();
+    let actual = match baseline.mode {
+        GrepBaselineMode::Paths => matched_paths.into_iter().collect(),
+        GrepBaselineMode::Count => vec![matches.len().to_string()],
+        GrepBaselineMode::FirstLine => matches.into_iter().take(1).collect(),
+        GrepBaselineMode::Unsupported => Vec::new(),
+    };
+
+    Ok(QueryBaselineReport {
+        status: QueryBaselineStatus::Ran,
+        status_detail: if semantic_relation_supported {
+            "grep baseline ran".to_string()
+        } else {
+            "grep baseline ran; semantic relation not modeled".to_string()
+        },
+        pattern: Some(pattern),
+        include: baseline.include,
+        files_scanned,
+        bytes_read,
+        matches_returned: raw_match_count,
+        actual,
+        semantic_relation_supported,
+    })
+}
+
+fn grep_baseline_for_query(query: &QuerySpec) -> (GrepBaselineSpec, bool) {
+    if let Some(baseline) = &query.baseline {
+        let semantic = !matches!(baseline.mode, GrepBaselineMode::Unsupported);
+        return (baseline.clone(), semantic);
+    }
+    let semantic_relation_supported = matches!(
+        query.kind.as_str(),
+        "signature_search" | "body_search" | "reference_search" | "hierarchy_contains"
+    );
+    let pattern = if !query.text.is_empty() {
+        Some(query.text.clone())
+    } else {
+        query
+            .to
+            .clone()
+            .or_else(|| query.from.clone())
+            .or_else(|| query.expected_contains.first().cloned())
+    };
+    (
+        GrepBaselineSpec {
+            pattern,
+            include: Vec::new(),
+            mode: GrepBaselineMode::Paths,
+            unsupported_reason: None,
+        },
+        semantic_relation_supported,
+    )
+}
+
+fn baseline_path_matches(pattern: &str, path: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        return path.ends_with(&format!(".{suffix}"));
+    }
+    let normalized = pattern.trim_start_matches('/');
+    if normalized.is_empty() {
+        return true;
+    }
+    if path == normalized || path == normalized.trim_end_matches('/') {
+        return true;
+    }
+    let dir_prefix = if normalized.ends_with('/') {
+        normalized.to_string()
+    } else {
+        format!("{normalized}/")
+    };
+    path.starts_with(&dir_prefix)
 }
 
 pub(crate) fn benchmark_symbol_by_name(
@@ -252,3 +508,7 @@ fn required<'a>(value: &'a Option<String>, name: &str) -> Result<&'a str> {
         .as_deref()
         .ok_or_else(|| SqueezyError::Graph(format!("query missing required {name}")))
 }
+
+#[cfg(test)]
+#[path = "execution_tests.rs"]
+mod tests;

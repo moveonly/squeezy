@@ -65,6 +65,14 @@
       "expected_contains": [
         "Runner"
       ]
+    },
+    {
+      "id": "python-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ]
     }
   ]
 }

@@ -68,6 +68,15 @@
           "reason": "macro expansion is intentionally outside the production graph"
         }
       ]
+    },
+    {
+      "id": "rust-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ],
+      "documented_misses": []
     }
   ]
 }

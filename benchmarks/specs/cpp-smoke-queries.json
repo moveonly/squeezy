@@ -57,6 +57,15 @@
         "Base"
       ],
       "documented_misses": []
+    },
+    {
+      "id": "cpp-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ],
+      "documented_misses": []
     }
   ]
 }

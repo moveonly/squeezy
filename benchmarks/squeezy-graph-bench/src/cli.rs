@@ -116,7 +116,19 @@ pub struct Args {
     pub(crate) no_speed_gate: bool,
 }
 
-impl Args {
+pub enum BenchmarkCommand {
+    Single(Args),
+    Corpus(CorpusArgs),
+}
+
+pub struct CorpusArgs {
+    pub(crate) corpus: PathBuf,
+    pub(crate) family: String,
+    pub(crate) tier: String,
+    pub(crate) report_dir: PathBuf,
+}
+
+impl BenchmarkCommand {
     pub fn parse() -> Result<Self> {
         let mut fixture = None;
         let mut language = BenchmarkLanguage::Rust;
@@ -127,6 +139,10 @@ impl Args {
         let mut ra_lsp_probes = 25;
         let mut oracle_files = 250;
         let mut no_speed_gate = false;
+        let mut corpus = None;
+        let mut family = "all".to_string();
+        let mut tier = "smoke".to_string();
+        let mut report_dir = PathBuf::from("target/semantic-graph-benchmark");
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -160,6 +176,22 @@ impl Args {
                     })?;
                     language = BenchmarkLanguage::parse(&raw)?;
                 }
+                "--corpus" => corpus = args.next().map(PathBuf::from),
+                "--family" => {
+                    family = args
+                        .next()
+                        .ok_or_else(|| SqueezyError::Graph("missing --family value".to_string()))?;
+                }
+                "--tier" => {
+                    tier = args
+                        .next()
+                        .ok_or_else(|| SqueezyError::Graph("missing --tier value".to_string()))?;
+                }
+                "--report-dir" => {
+                    report_dir = args.next().map(PathBuf::from).ok_or_else(|| {
+                        SqueezyError::Graph("missing --report-dir value".to_string())
+                    })?;
+                }
                 "--fixture" => fixture = args.next().map(PathBuf::from),
                 "--spec" => spec = args.next().map(PathBuf::from),
                 "--report" => report = args.next().map(PathBuf::from),
@@ -191,7 +223,7 @@ impl Args {
                 }
                 "--help" | "-h" => {
                     println!(
-                        "usage: squeezy-graph-bench [--list-languages|--list-oracles] [--language rust|python|java|c|cpp|csharp|go|javascript|typescript|js-ts] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
+                        "usage: squeezy-graph-bench [--list-languages|--list-oracles]\n       squeezy-graph-bench --corpus <path> [--family all|rust|python|java|go|c-family|csharp|js-ts] [--tier smoke|full] [--report-dir <path>]\n       squeezy-graph-bench [--language rust|python|java|c|cpp|csharp|go|javascript|typescript|js-ts] --fixture <path> --spec <path> --report <path> [--mixed-repo <path>] [--mixed-iterations <n, 0=all>] [--ra-lsp-probes <n, default=25, 0=off>] [--oracle-files <n, default=250, 0=all>] [--no-speed-gate]"
                     );
                     std::process::exit(0);
                 }
@@ -201,7 +233,38 @@ impl Args {
             }
         }
 
-        Ok(Self {
+        if let Some(corpus) = corpus {
+            if !matches!(
+                family.as_str(),
+                "all"
+                    | "rust"
+                    | "python"
+                    | "java"
+                    | "go"
+                    | "c-family"
+                    | "c"
+                    | "cpp"
+                    | "csharp"
+                    | "js-ts"
+                    | "javascript"
+                    | "typescript"
+            ) {
+                return Err(SqueezyError::Graph(format!(
+                    "unknown corpus family {family}"
+                )));
+            }
+            if !matches!(tier.as_str(), "smoke" | "full") {
+                return Err(SqueezyError::Graph(format!("unknown corpus tier {tier}")));
+            }
+            return Ok(Self::Corpus(CorpusArgs {
+                corpus,
+                family,
+                tier,
+                report_dir,
+            }));
+        }
+
+        Ok(Self::Single(Args {
             language,
             fixture: fixture.ok_or_else(|| SqueezyError::Graph("missing --fixture".to_string()))?,
             spec: spec.ok_or_else(|| SqueezyError::Graph("missing --spec".to_string()))?,
@@ -211,6 +274,6 @@ impl Args {
             ra_lsp_probes,
             oracle_files,
             no_speed_gate,
-        })
+        }))
     }
 }

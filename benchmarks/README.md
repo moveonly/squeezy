@@ -23,6 +23,7 @@ benchmarks/
   fixtures/go/semantic-cases/       # small Go module used by smoke CI
   fixtures/c/semantic-cases/        # small C project used by smoke CI
   fixtures/cpp/semantic-cases/      # small C++ project used by smoke CI
+  corpus.json                       # pinned smoke/full corpus manifest
   specs/smoke-queries.json          # expected query results and miss policy
   specs/python-smoke-queries.json   # Python expected query results
   specs/js-ts-smoke-queries.json    # JS/TS expected query results
@@ -40,6 +41,17 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
 cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- --list-oracles
 
 cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
+  --corpus benchmarks/corpus.json \
+  --family all \
+  --tier smoke \
+  --report-dir target/semantic-graph-benchmark
+
+python3 benchmarks/scripts/summarize.py \
+  --language all \
+  --report-glob "target/semantic-graph-benchmark/**/*.json" \
+  --output target/semantic-graph-benchmark/summary.md
+
+cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml -- \
   --language rust \
   --fixture benchmarks/fixtures/rust/semantic-cases \
   --spec benchmarks/specs/smoke-queries.json \
@@ -50,6 +62,12 @@ cargo run --release --manifest-path benchmarks/squeezy-graph-bench/Cargo.toml --
 Use `--language python|java|go|c|cpp|csharp|javascript|typescript|js-ts` with
 the matching fixture/spec from `docs/LANGUAGES.md`. Families with mixed workload
 support also accept `--mixed-repo <path>` and `--mixed-iterations <n>`.
+
+`benchmarks/corpus.json` is the reproducible v0 corpus entry point. It records
+the smoke fixtures, full-tier external repos, pinned source commits, scenario
+limits, oracle probe limits, and report paths. `--tier full` runs smoke plus
+full cases for the selected family so CI and local release checks include the
+small deterministic fixture before external corpus variance.
 
 ## CI Workflow
 
@@ -71,6 +89,13 @@ family.
 The run fails if required expected results are missing, the fixture graph build
 plus query time is not faster than compiler validation, or the incremental
 refresh probe reparses more files than it edited.
+
+Every smoke spec includes a `fallback_quality` query. The checked-in fixtures
+carry generated and vendor-path source files, and the benchmark asserts those
+paths are reported as fallback/exclusion evidence instead of being treated as
+high-confidence graph answers. Reports also include deterministic tool/cost
+metrics (`estimated_usd_micros = 0`), grep-baseline query counts, answer-quality
+counts, and fallback/low-confidence rates.
 
 The mixed workload is deterministic and exhaustive by default. It builds a
 Squeezy graph for the supplied repo, generates scenarios from every indexed
@@ -286,10 +311,16 @@ for touched graph/parser/workspace/benchmark paths. Manual `workflow_dispatch`
 adds a `language` selector (`rust`, `python`, `java`, `go`, `c-family`,
 `csharp`, `js-ts`, or `all`) plus `tier=smoke|full`.
 
-For Rust, the full tier clones ripgrep, fd, bat, tokio, and serde, runs 5,000
-deterministic mixed-workload scenarios per repo, and writes timing, symbol
-accuracy, and rust-analyzer LSP navigation accuracy summaries to the GitHub
-Actions step summary.
+Full-tier external repos are sourced from `benchmarks/corpus.json`, not from
+duplicated workflow shell lists. The manifest pins each repo to a specific
+commit and the reusable workflow checks out those commits before running the
+case. This keeps demo/website citations tied to auditable inputs instead of
+whatever each upstream repository's default branch contains on a later day.
+
+For Rust, the full tier clones ripgrep, fd, bat, tokio, and serde from the
+manifest, runs 5,000 deterministic mixed-workload scenarios per repo, and writes
+timing, symbol accuracy, and rust-analyzer LSP navigation accuracy summaries to
+the GitHub Actions step summary.
 
 For C/C++, the full tier clones redis, curl, sqlite, protobuf, and
 nlohmann/json, then runs 1,000 deterministic mixed workload scenarios, refresh
@@ -310,7 +341,10 @@ the five-repo external corpus for C#; the PR/smoke tier remains the small
 
 The workflow uploads the raw JSON reports and rendered summaries as
 `semantic-graph-benchmark-*` artifacts so benchmark runs can be audited after
-the job completes.
+the job completes. `benchmarks/scripts/summarize.py --language all` renders the
+cross-language matrix used for v0 demo and website claims: wall time, graph
+queries, grep-baseline queries, mixed scenarios, missing checks, fallback rate,
+low-confidence edges, and oracle precision/recall by case.
 
 `.github/workflows/python-semantic-graph-benchmark.yml` runs the Python smoke
 benchmark on PRs and pushes that touch graph, parser, workspace, benchmark, or

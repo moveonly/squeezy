@@ -77,6 +77,15 @@
           "reason": "preprocessor expansion is intentionally opaque in the production graph"
         }
       ]
+    },
+    {
+      "id": "c-fallback-quality",
+      "kind": "fallback_quality",
+      "expected_contains": [
+        "generated",
+        "vendor"
+      ],
+      "documented_misses": []
     }
   ]
 }
