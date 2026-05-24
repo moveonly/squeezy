@@ -107,19 +107,28 @@ cross-file indexes. JS/TS config edits such as `tsconfig.json` path changes or
 `package.json` export changes rebuild the local resolver and dependent import
 edges without reparsing unchanged source files.
 
+Parsed graph partitions are persisted in a `redb` database under the configured
+cache root (`.squeezy/cache/state.redb` by default). On a later session,
+unchanged files are hydrated from persisted partitions and skip tree-sitter
+parsing; changed or missing partitions are reparsed and written back. The store
+records a schema version plus workspace, crawl-policy, language-registry, and
+graph-format metadata. A schema mismatch backs up the old database and rebuilds
+fresh state instead of mutating unknown data in place.
+
 Tree-sitter parse work is parallelized for batches of at least eight files. Each
 worker owns its own parser instance, and the final graph merge plus index rebuild
 remain serial so output ordering and graph IDs stay deterministic. Small
 refreshes, including the common one- or two-file edit case, stay serial to avoid
 thread setup overhead.
 
-Graph build and refresh reports include duration, file counts, reparsed byte
-counts, symbol/edge counts, and Rust/Python/JS/TS/supported/unsupported/unknown
-language distribution. Refresh reports also separate changed paths observed from
-events, changed paths discovered by polling, and unchanged event paths so
-file-watcher FP/FN behavior can be benchmarked without sending paths or source
-text. Telemetry callers use these reports for one-shot graph build events and
-repeated graph refresh events without sending paths or source text.
+Graph build and refresh reports include duration, file counts, persisted
+partition hit/miss counts, reparsed byte counts, symbol/edge counts, and
+Rust/Python/JS/TS/supported/unsupported/unknown language distribution. Refresh
+reports also separate changed paths observed from events, changed paths
+discovered by polling, and unchanged event paths so file-watcher FP/FN behavior
+can be benchmarked without sending paths or source text. Telemetry callers use
+these reports for one-shot graph build events and repeated graph refresh events
+without sending paths or source text.
 
 ## Traversal Surface
 

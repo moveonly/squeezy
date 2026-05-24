@@ -1,12 +1,16 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 pub mod backend;
 mod languages;
+mod references;
+mod resolution;
 
+use serde::{Deserialize, Serialize};
 use squeezy_core::{
     Confidence, ContentHash, EdgeKind, FileId, Freshness, LanguageFamily, LanguageKind, Provenance,
     Result, SourceSpan, SymbolId, SymbolKind,
@@ -15,6 +19,7 @@ use squeezy_parse::{
     BodyHit, BodyHitKind, LanguageParser, ParsedCall, ParsedCallKind, ParsedFile, ParsedImport,
     ParsedReference, ParsedSymbol, ReferenceKind, edge_kind_for_call,
 };
+use squeezy_store::{GraphStoreMetadata, GraphWriteBatch, SqueezyStore};
 use squeezy_workspace::{CrawlOptions, FileRecord, IndexCoverage, WorkspaceCrawler};
 
 use crate::languages::{
@@ -32,12 +37,13 @@ use crate::languages::{
 
 pub const CRATE_NAME: &str = "squeezy-graph";
 const BODY_HIT_TRIGRAM_INDEX_MAX_HITS: usize = 100_000;
+const GRAPH_FORMAT_VERSION: u64 = 1;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphSymbol {
     pub id: SymbolId,
     pub file_id: FileId,
@@ -80,19 +86,19 @@ impl From<ParsedSymbol> for GraphSymbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyAnnotation {
     pub status: String,
     pub ranges: Vec<DirtyRange>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirtyRange {
     pub start_line: u32,
     pub end_line: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEdge {
     pub from: SymbolId,
     pub to: Option<SymbolId>,
@@ -150,7 +156,7 @@ pub struct CallEdgeHit {
     pub edge: GraphEdge,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JavaProjectFact {
     pub provider: String,
     pub kind: String,
@@ -159,7 +165,7 @@ pub struct JavaProjectFact {
     pub provenance: Provenance,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DotnetProjectFact {
     pub provider: String,
     pub kind: String,
@@ -866,1592 +872,6 @@ impl SemanticGraph {
         });
     }
 
-    fn rebuild_semantic_edges(&mut self) {
-        self.edges.retain(|edge| {
-            edge.kind == EdgeKind::Contains
-                && self.symbols.contains_key(&edge.from)
-                && edge
-                    .to
-                    .as_ref()
-                    .map(|to| self.symbols.contains_key(to))
-                    .unwrap_or(true)
-        });
-        self.rebuild_resolution_indexes();
-        self.js_ts_resolver = JsTsResolver::from_files(&self.files);
-        self.add_csharp_type_edges();
-
-        // Move-out, mutate, move-back. Each builder iterates a single
-        // field's data while writing edges, and the borrow checker won't
-        // let us hold an immutable iterator over `self.X` while passing
-        // `&mut self` to push edges. The original code cloned all three
-        // collections up-front; we use `mem::take` so the clone-equivalent
-        // cost is paid only on the data each builder actually iterates.
-        //
-        // IMPORTANT: `add_call_edges` and `add_reference_edges` use the
-        // resolver, which reads `self.imports` (Python alias lookups,
-        // C/C++ include-aware lookups, Java import resolution, Rust
-        // glob/use resolution). We must restore `self.imports` between
-        // phases so the resolver sees it.
-        let imports = std::mem::take(&mut self.imports);
-        self.add_import_edges(&imports);
-        self.imports = imports;
-
-        let calls = std::mem::take(&mut self.calls);
-        self.add_call_edges(&calls);
-        self.calls = calls;
-
-        let references = std::mem::take(&mut self.references);
-        self.add_reference_edges(&references);
-        self.references = references;
-    }
-
-    fn add_import_edges(&mut self, imports: &[ParsedImport]) {
-        for import in imports {
-            if import.alias.as_deref() == Some("__java_package__") {
-                continue;
-            }
-            let file_symbol_id = file_symbol_id(&import.file_id);
-            let from = import
-                .owner_id
-                .clone()
-                .unwrap_or_else(|| file_symbol_id.clone());
-            let target_name = import
-                .alias
-                .clone()
-                .unwrap_or_else(|| last_path_segment(&import.path));
-            let mut candidates = self.symbols_by_name_or_scan(&target_name);
-            // For Java imports we know the exact package + class chain, so we
-            // can prune candidates that do not match. This both improves
-            // precision and lets nested-class/static imports resolve when the
-            // raw last-segment name collides with unrelated symbols elsewhere.
-            if self
-                .files
-                .get(&import.file_id)
-                .map(|file| file.language == squeezy_core::LanguageKind::Java)
-                .unwrap_or(false)
-            {
-                candidates.retain(|id| {
-                    self.symbols
-                        .get(id)
-                        .map(|symbol| self.java_import_matches_symbol(import, symbol))
-                        .unwrap_or(false)
-                });
-            }
-            if self
-                .files
-                .get(&import.file_id)
-                .map(|file| file.language == squeezy_core::LanguageKind::CSharp)
-                .unwrap_or(false)
-            {
-                candidates.retain(|id| {
-                    self.symbols
-                        .get(id)
-                        .map(|symbol| csharp_import_matches_symbol(import, symbol))
-                        .unwrap_or(false)
-                });
-            }
-            let (to, confidence) = match candidates.as_slice() {
-                [only] if !import.is_glob => (Some(only.clone()), Confidence::ImportResolved),
-                [] if import.is_glob => (None, Confidence::CandidateSet),
-                [] => (None, Confidence::External),
-                _ => (None, Confidence::CandidateSet),
-            };
-            self.edges.push(GraphEdge {
-                from,
-                to,
-                target_text: import.path.clone(),
-                kind: if import.is_reexport {
-                    EdgeKind::Reexports
-                } else {
-                    EdgeKind::Imports
-                },
-                span: Some(import.span),
-                confidence,
-                freshness: Freshness::Fresh,
-                provenance: import.provenance.clone(),
-            });
-        }
-    }
-
-    fn add_call_edges(&mut self, calls: &[ParsedCall]) {
-        for call in calls {
-            let file_symbol_id = file_symbol_id(&call.file_id);
-            let from = call
-                .caller_id
-                .clone()
-                .unwrap_or_else(|| file_symbol_id.clone());
-            let (to, confidence, rank_reason) = self.resolve_call(call, &from);
-            self.edges.push(GraphEdge {
-                from,
-                to,
-                target_text: call.target_text.clone(),
-                kind: edge_kind_for_call(call.kind),
-                span: Some(call.span),
-                confidence,
-                freshness: Freshness::Fresh,
-                provenance: Provenance::new(
-                    call.provenance.source.clone(),
-                    format!("{}; rank={rank_reason}", call.provenance.reason),
-                ),
-            });
-        }
-    }
-
-    fn add_reference_edges(&mut self, references: &[ParsedReference]) {
-        for reference in references {
-            if self.should_skip_reference_edge(reference) {
-                continue;
-            }
-            let file_symbol_id = file_symbol_id(&reference.file_id);
-            let from = reference
-                .owner_id
-                .clone()
-                .unwrap_or_else(|| file_symbol_id.clone());
-            let candidates = self.symbols_by_name_or_scan(&last_path_segment(&reference.text));
-            let (to, confidence) = match candidates.as_slice() {
-                [only] => (Some(only.clone()), Confidence::Heuristic),
-                _ => continue,
-            };
-            if to.is_none() {
-                continue;
-            }
-            self.edges.push(GraphEdge {
-                from,
-                to,
-                target_text: reference.text.clone(),
-                kind: EdgeKind::References,
-                span: Some(reference.span),
-                confidence,
-                freshness: Freshness::Fresh,
-                provenance: reference.provenance.clone(),
-            });
-        }
-    }
-
-    fn should_skip_reference_edge(&self, reference: &ParsedReference) -> bool {
-        self.files
-            .get(&reference.file_id)
-            .map(|file| {
-                file.language == LanguageKind::Java
-                    && matches!(
-                        reference.kind,
-                        ReferenceKind::Identifier | ReferenceKind::Field
-                    )
-            })
-            .unwrap_or(false)
-    }
-
-    fn resolve_call(
-        &self,
-        call: &ParsedCall,
-        caller_id: &SymbolId,
-    ) -> (Option<SymbolId>, Confidence, &'static str) {
-        if call.kind == ParsedCallKind::Macro {
-            let candidates = self
-                .symbols_by_name_or_scan(&call.name)
-                .into_iter()
-                .filter(|id| {
-                    self.symbols
-                        .get(id)
-                        .map(|symbol| symbol.kind == SymbolKind::Macro)
-                        .unwrap_or(false)
-                })
-                .collect::<Vec<_>>();
-            return match candidates.as_slice() {
-                [only] => (Some(only.clone()), Confidence::ExactSyntax, "macro exact"),
-                [] => (None, Confidence::MacroOpaque, "macro opaque"),
-                _ => (None, Confidence::CandidateSet, "macro candidate set"),
-            };
-        }
-
-        if call.kind == ParsedCallKind::Direct
-            && let Some(callee) = self.import_alias_direct_call(caller_id, call)
-        {
-            return (Some(callee), Confidence::ImportResolved, "import alias");
-        }
-
-        let is_base_call =
-            call.kind == ParsedCallKind::Method && call.receiver.as_deref() == Some("base");
-
-        if call.kind == ParsedCallKind::Method
-            && !is_base_call
-            && let Some(callee) = self.same_impl_method(caller_id, &call.name)
-        {
-            return (Some(callee), Confidence::ExactSyntax, "same class or impl");
-        }
-
-        // C/C++ sibling method calls without `this->` parse as Direct
-        // (no receiver). They must still resolve to the local method on the
-        // caller's enclosing class/struct/union before we look elsewhere.
-        if call.kind == ParsedCallKind::Direct
-            && call.receiver.is_none()
-            && !call.target_text.contains("::")
-            && let Some(callee) = self.same_class_direct_call(caller_id, &call.name)
-        {
-            return (Some(callee), Confidence::ExactSyntax, "same class");
-        }
-
-        if call.kind == ParsedCallKind::Method
-            && let Some(callee) = self.inherited_python_method(caller_id, call)
-        {
-            return (Some(callee), Confidence::Heuristic, "inherited class");
-        }
-
-        let candidates = self
-            .symbols_by_name_or_scan(&call.name)
-            .into_iter()
-            .filter(|id| {
-                self.symbols
-                    .get(id)
-                    .map(|symbol| {
-                        matches!(
-                            symbol.kind,
-                            SymbolKind::Class
-                                | SymbolKind::Function
-                                | SymbolKind::Method
-                                | SymbolKind::Test
-                        )
-                    })
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-
-        if let Some(id) = self.qualified_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::Heuristic, "qualified syntax");
-        }
-
-        if call.kind == ParsedCallKind::Method {
-            if let Some(id) = self.java_static_imported_method(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "java static import");
-            }
-            if let Some(id) = self.java_receiver_field_method(caller_id, call) {
-                return (Some(id), Confidence::Heuristic, "java field receiver");
-            }
-            if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
-                return (Some(id), Confidence::Heuristic, "constructor alias");
-            }
-            if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "imported module");
-            }
-            if let Some(id) = self.go_package_qualified_call(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "go package import");
-            }
-            return match candidates.as_slice() {
-                [] => (None, Confidence::External, "method external"),
-                _ => (None, Confidence::CandidateSet, "method candidate set"),
-            };
-        }
-
-        if call.receiver.is_some() {
-            return match candidates.as_slice() {
-                [] => (None, Confidence::External, "receiver external"),
-                _ => (None, Confidence::CandidateSet, "receiver candidate set"),
-            };
-        }
-
-        if let Some(id) = self.same_file_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ExactSyntax, "same file");
-        }
-        if let Some(id) = self.imported_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ImportResolved, "explicit import");
-        }
-        if self.unresolved_js_ts_imported_direct_call(caller_id, call) {
-            return match candidates.as_slice() {
-                [] => (None, Confidence::External, "unresolved imported symbol"),
-                _ => (
-                    None,
-                    Confidence::CandidateSet,
-                    "unresolved imported symbol candidate set",
-                ),
-            };
-        }
-        if let Some(id) = self.c_family_include_direct_call(&candidates, caller_id) {
-            return (Some(id), Confidence::ImportResolved, "include directive");
-        }
-        if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
-            return (Some(id), Confidence::Heuristic, "package local");
-        }
-        match candidates.as_slice() {
-            [] => (None, Confidence::External, "external"),
-            _ => (None, Confidence::CandidateSet, "candidate set"),
-        }
-    }
-
-    fn qualified_direct_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        if call.kind != ParsedCallKind::Direct || !call.target_text.contains("::") {
-            return None;
-        }
-        self.same_impl_qualified_call(candidates, caller_id, call)
-            .or_else(|| self.associated_function_call(candidates, call))
-            .or_else(|| self.module_qualified_call(candidates, caller_id, call))
-    }
-
-    fn same_impl_qualified_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        if call.receiver.as_deref() != Some("Self") {
-            return None;
-        }
-        let caller = self.symbols.get(caller_id)?;
-        let impl_id = if caller.kind == SymbolKind::Impl {
-            caller.id.clone()
-        } else {
-            caller.parent_id.clone()?
-        };
-        self.symbols
-            .get(&impl_id)
-            .filter(|symbol| symbol.kind == SymbolKind::Impl)?;
-        single_symbol(
-            candidates
-                .iter()
-                .filter_map(|id| self.symbols.get(id))
-                .filter(|symbol| symbol.parent_id.as_ref() == Some(&impl_id))
-                .map(|symbol| symbol.id.clone()),
-        )
-    }
-
-    fn associated_function_call(
-        &self,
-        candidates: &[SymbolId],
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
-            return None;
-        }
-        let type_name = last_path_segment(receiver);
-        if !type_name
-            .chars()
-            .next()
-            .map(|ch| ch.is_ascii_uppercase())
-            .unwrap_or(false)
-        {
-            return None;
-        }
-
-        single_symbol(
-            candidates
-                .iter()
-                .filter_map(|id| self.symbols.get(id))
-                .filter(|symbol| {
-                    matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
-                        && symbol
-                            .parent_id
-                            .as_ref()
-                            .and_then(|parent_id| self.symbols.get(parent_id))
-                            .map(|parent| {
-                                parent.kind == SymbolKind::Impl
-                                    && impl_header_matches_type(&parent.name, &type_name)
-                            })
-                            .unwrap_or(false)
-                })
-                .map(|symbol| symbol.id.clone()),
-        )
-    }
-
-    fn module_qualified_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        let receiver = call.receiver.as_deref()?;
-        if path_starts_with_external_root(receiver, LanguageKind::Rust) {
-            return None;
-        }
-        let caller = self.symbols.get(caller_id)?;
-        let receiver_paths = self.receiver_module_paths(caller, receiver);
-        if receiver_paths.is_empty() {
-            return None;
-        }
-
-        single_symbol(
-            candidates
-                .iter()
-                .filter_map(|id| self.symbols.get(id))
-                .filter(|symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Test))
-                .filter(|symbol| is_free_function_like(symbol))
-                .filter(|symbol| {
-                    let module_path = self.module_path_for_symbol(symbol);
-                    receiver_paths.iter().any(|path| path == &module_path)
-                })
-                .map(|symbol| symbol.id.clone()),
-        )
-    }
-
-    fn receiver_module_paths(&self, caller: &GraphSymbol, receiver: &str) -> Vec<Vec<String>> {
-        let receiver_segments = path_segments(receiver);
-        if receiver_segments.is_empty() {
-            return Vec::new();
-        }
-        let mut paths = BTreeSet::new();
-        if receiver_segments.first().map(String::as_str) == Some("crate") {
-            paths.insert(receiver_segments.clone());
-        }
-        if let Some(caller_file) = self.files.get(&caller.file_id) {
-            let caller_module = module_path_for_file(&caller_file.relative_path);
-            let mut child = caller_module.clone();
-            child.extend(receiver_segments.clone());
-            if child.first().map(String::as_str) == Some("crate") {
-                paths.insert(child);
-            }
-            let mut relative = caller_module;
-            relative.pop();
-            relative.extend(receiver_segments.clone());
-            if relative.first().map(String::as_str) == Some("crate") {
-                paths.insert(relative);
-            }
-        }
-        for import in self
-            .imports_for_file(&caller.file_id)
-            .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
-        {
-            let alias_or_name = import
-                .alias
-                .clone()
-                .unwrap_or_else(|| last_path_segment(&import.path));
-            if alias_or_name == receiver_segments[0] {
-                let mut import_segments = path_segments(&import.path);
-                import_segments.extend(receiver_segments.iter().skip(1).cloned());
-                if import_segments.first().map(String::as_str) == Some("crate") {
-                    paths.insert(import_segments);
-                }
-            }
-        }
-        paths.into_iter().collect()
-    }
-
-    fn module_path_for_symbol(&self, symbol: &GraphSymbol) -> Vec<String> {
-        let mut path = self
-            .files
-            .get(&symbol.file_id)
-            .map(|file| {
-                if file.language == LanguageKind::Java {
-                    self.java_package_for_file(&symbol.file_id)
-                        .unwrap_or_else(|| module_path_for_file(&file.relative_path))
-                } else {
-                    module_path_for_file(&file.relative_path)
-                }
-            })
-            .unwrap_or_else(|| vec!["crate".to_string()]);
-        let mut modules = Vec::new();
-        let mut parent_id = symbol.parent_id.as_ref();
-        while let Some(id) = parent_id {
-            let Some(parent) = self.symbols.get(id) else {
-                break;
-            };
-            if parent.kind == SymbolKind::Module {
-                modules.push(parent.name.clone());
-            }
-            parent_id = parent.parent_id.as_ref();
-        }
-        modules.reverse();
-        path.extend(modules);
-        path
-    }
-
-    fn same_file_direct_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        if call.target_text.contains("::") {
-            return None;
-        }
-        let caller = self.symbols.get(caller_id)?;
-        let mut same_file = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| {
-                symbol.file_id == caller.file_id
-                    && matches!(
-                        symbol.kind,
-                        SymbolKind::Class | SymbolKind::Function | SymbolKind::Test
-                    )
-            })
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        same_file.sort_by(|left, right| left.0.cmp(&right.0));
-        same_file.dedup();
-        match same_file.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
-    }
-
-    fn imported_direct_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        if call.receiver.is_some() {
-            return None;
-        }
-        let caller = self.symbols.get(caller_id)?;
-        let mut imported_candidates = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|symbol| self.symbol_is_imported_as(caller, symbol, &call.name))
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        imported_candidates.sort_by(|left, right| left.0.cmp(&right.0));
-        imported_candidates.dedup();
-        match imported_candidates.as_slice() {
-            [only] => Some(only.clone()),
-            _ => None,
-        }
-    }
-
-    fn import_alias_direct_call(
-        &self,
-        caller_id: &SymbolId,
-        call: &ParsedCall,
-    ) -> Option<SymbolId> {
-        if call.kind != ParsedCallKind::Direct || call.receiver.is_some() {
-            return None;
-        }
-        let caller = self.symbols.get(caller_id)?;
-        let candidates = self
-            .imports_for_file(&caller.file_id)
-            .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.span.start_byte <= call.span.start_byte)
-            .filter(|import| import.alias.as_deref() == Some(call.name.as_str()))
-            .flat_map(|import| {
-                let target_name = last_path_segment(&import.path);
-                self.symbols_by_name_or_scan(&target_name)
-                    .into_iter()
-                    .filter_map(|id| self.symbols.get(&id))
-                    .filter(|symbol| {
-                        matches!(
-                            symbol.kind,
-                            SymbolKind::Class
-                                | SymbolKind::Function
-                                | SymbolKind::Method
-                                | SymbolKind::Test
-                        ) && self.import_matches_symbol(import, symbol)
-                    })
-                    .map(|symbol| symbol.id.clone())
-                    .collect::<Vec<_>>()
-            });
-        single_symbol(candidates)
-    }
-
-    fn package_local_direct_call(
-        &self,
-        candidates: &[SymbolId],
-        caller_id: &SymbolId,
-    ) -> Option<SymbolId> {
-        let caller = self.symbols.get(caller_id)?;
-        let caller_file = self.files.get(&caller.file_id)?;
-        single_symbol(
-            candidates
-                .iter()
-                .filter_map(|id| self.symbols.get(id))
-                .filter(|symbol| {
-                    if caller_file.language == LanguageKind::Java {
-                        return self.java_package_for_file(&symbol.file_id)
-                            == self.java_package_for_file(&caller.file_id);
-                    }
-                    self.files
-                        .get(&symbol.file_id)
-                        .map(|file| {
-                            package_key(&file.relative_path)
-                                == package_key(&caller_file.relative_path)
-                        })
-                        .unwrap_or(false)
-                })
-                .filter(|symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Class
-                            | SymbolKind::Function
-                            | SymbolKind::Method
-                            | SymbolKind::Test
-                    )
-                })
-                .map(|symbol| symbol.id.clone()),
-        )
-    }
-
-    fn symbol_is_imported_as(
-        &self,
-        caller: &GraphSymbol,
-        symbol: &GraphSymbol,
-        name: &str,
-    ) -> bool {
-        self.imports_for_file(&caller.file_id)
-            .filter(|import| self.import_visible_from_symbol(import, caller))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
-            .filter(|import| {
-                import
-                    .alias
-                    .as_deref()
-                    .map(|alias| alias == name)
-                    .unwrap_or_else(|| last_path_segment(&import.path) == name)
-            })
-            .any(|import| self.import_matches_symbol(import, symbol))
-    }
-
-    /// Fast path used by Python-specific resolution branches. Most large JS/TS
-    /// or Rust workspaces never have a Python caller, but the resolver paths
-    /// were still walking class-base/alias state per call before this guard.
-    fn import_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
-        if import.alias.as_deref() == Some("__java_package__") {
-            return false;
-        }
-        let Some(file) = self.files.get(&symbol.file_id) else {
-            if last_path_segment(&import.path) != symbol.name {
-                return false;
-            }
-            return true;
-        };
-        if file.language == squeezy_core::LanguageKind::Java {
-            return self.java_import_matches_symbol(import, symbol);
-        }
-        if is_js_ts_language(file.language) {
-            return self.js_ts_import_matches_symbol(import, symbol);
-        }
-        if last_path_segment(&import.path) != symbol.name {
-            return false;
-        }
-        if file.language != squeezy_core::LanguageKind::Python
-            && file.language != squeezy_core::LanguageKind::Go
-        {
-            return true;
-        }
-        if file.language == squeezy_core::LanguageKind::Go {
-            return self.go_import_matches_symbol(import, symbol);
-        }
-        let import_segments = python_path_segments(&import.path);
-        if import_segments.len() <= 1 {
-            return true;
-        }
-        let import_module = &import_segments[..import_segments.len() - 1];
-        let symbol_module = python_module_path_for_file(&file.relative_path);
-        path_segments_suffix_match(import_module, &symbol_module)
-    }
-
-    fn import_visible_from_symbol(&self, import: &ParsedImport, caller: &GraphSymbol) -> bool {
-        if import.file_id != caller.file_id {
-            return false;
-        }
-        let Some(owner_id) = &import.owner_id else {
-            return true;
-        };
-        owner_id == &caller.id || self.symbol_is_descendant_of(&caller.id, owner_id)
-    }
-
-    fn import_visible_from_reference(
-        &self,
-        import: &ParsedImport,
-        reference: &ParsedReference,
-    ) -> bool {
-        if import.file_id != reference.file_id {
-            return false;
-        }
-        let Some(owner_id) = &import.owner_id else {
-            return true;
-        };
-        reference
-            .owner_id
-            .as_ref()
-            .map(|reference_owner| {
-                reference_owner == owner_id
-                    || self.symbol_is_descendant_of(reference_owner, owner_id)
-            })
-            .unwrap_or(false)
-    }
-
-    fn symbol_is_descendant_of(&self, child_id: &SymbolId, ancestor_id: &SymbolId) -> bool {
-        let mut current = Some(child_id.clone());
-        while let Some(id) = current {
-            if &id == ancestor_id {
-                return true;
-            }
-            current = self
-                .symbols
-                .get(&id)
-                .and_then(|symbol| symbol.parent_id.clone());
-        }
-        false
-    }
-
-    fn same_class_direct_call(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
-        let caller = self.symbols.get(caller_id)?;
-        if !matches!(caller.kind, SymbolKind::Method | SymbolKind::Function) {
-            return None;
-        }
-        let parent_id = caller.parent_id.as_ref()?;
-        let parent = self.symbols.get(parent_id)?;
-        if !matches!(
-            parent.kind,
-            SymbolKind::Class | SymbolKind::Struct | SymbolKind::Union
-        ) {
-            return None;
-        }
-        self.method_on_class_or_partials(parent, method_name, Some(&caller.id))
-    }
-
-    fn same_impl_method(&self, caller_id: &SymbolId, method_name: &str) -> Option<SymbolId> {
-        let caller = self.symbols.get(caller_id)?;
-        let impl_id = if caller.kind == SymbolKind::Impl {
-            caller.id.clone()
-        } else {
-            caller.parent_id.clone()?
-        };
-        let parent = self.symbols.get(&impl_id)?;
-        if !matches!(
-            parent.kind,
-            // Containers that declare instance methods reachable via
-            // `this`/`self`/`Self`: Rust's impl/trait blocks and Class
-            // for Python-style classes, plus C# class/record/struct and
-            // C#/Go interfaces. `Struct` covers C# records and C# structs
-            // whose siblings need to be reachable for `this.Foo()`
-            // resolution; `Interface` covers C# interface methods and Go
-            // interface declarations.
-            SymbolKind::Class
-                | SymbolKind::Impl
-                | SymbolKind::Interface
-                | SymbolKind::Struct
-                | SymbolKind::Trait
-        ) {
-            return None;
-        }
-        self.method_on_class_or_partials(parent, method_name, Some(&caller.id))
-    }
-
-    fn method_on_class_or_partials(
-        &self,
-        parent: &GraphSymbol,
-        method_name: &str,
-        exclude: Option<&SymbolId>,
-    ) -> Option<SymbolId> {
-        let parent_ids = self
-            .symbols
-            .values()
-            .filter(|symbol| {
-                symbol.id == parent.id
-                    || (symbol.language_identity.is_some()
-                        && symbol.language_identity == parent.language_identity
-                        && is_class_like_kind(symbol.kind))
-            })
-            .map(|symbol| symbol.id.clone())
-            .collect::<Vec<_>>();
-        single_symbol(parent_ids.iter().flat_map(|parent_id| {
-            self.children_by_parent
-                .get(parent_id)
-                .into_iter()
-                .flatten()
-                .filter_map(|child_id| self.symbols.get(child_id))
-                .filter(move |symbol| {
-                    matches!(
-                        symbol.kind,
-                        SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
-                    ) && symbol.name == method_name
-                        && exclude.map(|id| id != &symbol.id).unwrap_or(true)
-                })
-                .map(|symbol| symbol.id.clone())
-        }))
-    }
-
-    fn edge_hit(&self, edge_index: usize) -> Option<CallEdgeHit> {
-        let edge = self.edges.get(edge_index)?.clone();
-        Some(CallEdgeHit {
-            caller: self.symbols.get(&edge.from).cloned(),
-            callee: edge
-                .to
-                .as_ref()
-                .and_then(|id| self.symbols.get(id))
-                .cloned(),
-            edge,
-        })
-    }
-
-    fn reference_hit(&self, reference: &ParsedReference, confidence: Confidence) -> ReferenceHit {
-        ReferenceHit {
-            owner: reference
-                .owner_id
-                .as_ref()
-                .and_then(|id| self.symbols.get(id))
-                .cloned(),
-            reference: reference.clone(),
-            confidence,
-        }
-    }
-
-    fn reference_candidate_indexes(&self, text: &str) -> Vec<usize> {
-        let mut indexes = BTreeSet::new();
-        if let Some(exact) = self.references_by_text.get(text) {
-            indexes.extend(exact.iter().copied());
-        }
-        let colon_suffix = format!("::{text}");
-        if let Some(segment) = self.references_by_text.get(&colon_suffix) {
-            indexes.extend(segment.iter().copied());
-        }
-        let dot_suffix = format!(".{text}");
-        if let Some(segment) = self.references_by_text.get(&dot_suffix) {
-            indexes.extend(segment.iter().copied());
-        }
-        let arrow_suffix = format!("->{text}");
-        if let Some(segment) = self.references_by_text.get(&arrow_suffix) {
-            indexes.extend(segment.iter().copied());
-        }
-        indexes.into_iter().collect()
-    }
-
-    fn reference_candidate_indexes_for_symbol(&self, symbol: &GraphSymbol) -> Vec<usize> {
-        let mut indexes = BTreeSet::new();
-        indexes.extend(self.reference_candidate_indexes(&symbol.name));
-        for alias in self
-            .imports
-            .iter()
-            .filter(|import| self.import_matches_symbol(import, symbol))
-            .filter_map(|import| import.alias.as_deref())
-        {
-            indexes.extend(self.reference_candidate_indexes(alias));
-        }
-        indexes.into_iter().collect()
-    }
-
-    fn reference_binding_confidence(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> Option<Confidence> {
-        if !reference_text_matches_symbol(reference, symbol)
-            && !self.reference_alias_matches_symbol(symbol, reference)
-            && !self.reference_qualifier_matches_symbol(symbol, reference)
-        {
-            return None;
-        }
-        if path_starts_with_external_root(&reference.text, self.reference_language(reference))
-            || self.reference_has_external_scope_prefix(reference)
-        {
-            return None;
-        }
-        if constructor_reference_can_bind_symbol(reference, symbol)
-            && self.reference_has_uppercase_scope_prefix(reference)
-        {
-            return None;
-        }
-        if self.reference_is_symbol_declaration(symbol, reference) {
-            return None;
-        }
-        if !self.reference_is_in_symbol_package(symbol, reference) {
-            return None;
-        }
-        if self.python_property_reference_matches(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        if self.reference_alias_matches_symbol(symbol, reference)
-            && reference_kind_can_bind_symbol(reference, symbol)
-        {
-            return Some(Confidence::ImportResolved);
-        }
-        if self.reference_is_impl_method_declaration_for_trait(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        if self.associated_type_reference_matches_symbol(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        if let Some(edge) = self.call_edge_for_reference(reference) {
-            return self.edge_binding_confidence(symbol, edge);
-        }
-        if self.imported_reference_matches_symbol(symbol, reference) {
-            return Some(Confidence::ImportResolved);
-        }
-        if let Some(edge) = self.semantic_edge_for_reference(reference) {
-            if edge.kind == EdgeKind::References
-                && !reference_kind_can_bind_symbol(reference, symbol)
-            {
-                return None;
-            }
-            if let Some(confidence) = self.edge_binding_confidence(symbol, edge) {
-                return Some(confidence);
-            }
-            if !matches!(edge.kind, EdgeKind::Imports | EdgeKind::Reexports) {
-                return None;
-            }
-        }
-        if self.scoped_type_qualifier_matches_symbol(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        if self.qualified_reference_matches_symbol(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        if self.can_bind_loose_reference(symbol, reference) {
-            return Some(Confidence::Heuristic);
-        }
-        None
-    }
-
-    fn reference_alias_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        self.imports_for_file(&reference.file_id)
-            .filter(|import| self.import_visible_from_reference(import, reference))
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
-            .filter(|import| import.alias.as_deref() == Some(reference.text.as_str()))
-            .any(|import| self.import_matches_symbol(import, symbol))
-    }
-
-    fn edge_binding_confidence(
-        &self,
-        symbol: &GraphSymbol,
-        edge: &GraphEdge,
-    ) -> Option<Confidence> {
-        let to = edge.to.as_ref()?;
-        if to == &symbol.id || self.impl_method_implements_trait_method(to, symbol) {
-            Some(edge.confidence)
-        } else {
-            None
-        }
-    }
-
-    fn reference_language(&self, reference: &ParsedReference) -> LanguageKind {
-        self.files
-            .get(&reference.file_id)
-            .map(|file| file.language)
-            .unwrap_or(LanguageKind::Unknown)
-    }
-
-    fn reference_is_in_symbol_package(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        let Some(symbol_file) = self.files.get(&symbol.file_id) else {
-            return false;
-        };
-        let Some(reference_file) = self.files.get(&reference.file_id) else {
-            return false;
-        };
-        if matches!(
-            (symbol_file.language, reference_file.language),
-            (LanguageKind::Python, LanguageKind::Python)
-        ) {
-            return true;
-        }
-        if matches!(
-            (symbol_file.language, reference_file.language),
-            (LanguageKind::Java, LanguageKind::Java)
-        ) {
-            return self.java_package_for_file(&symbol.file_id)
-                == self.java_package_for_file(&reference.file_id)
-                || self.imported_reference_matches_symbol(symbol, reference);
-        }
-        if matches!(
-            (symbol_file.language, reference_file.language),
-            (LanguageKind::Go, LanguageKind::Go)
-        ) {
-            return self.packages.get(&symbol.file_id) == self.packages.get(&reference.file_id)
-                && package_key(&symbol_file.relative_path)
-                    == package_key(&reference_file.relative_path);
-        }
-        package_key(&symbol_file.relative_path) == package_key(&reference_file.relative_path)
-    }
-
-    fn imported_reference_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        let reference_name = last_path_segment(&reference.text);
-        if self
-            .imports_for_file(&reference.file_id)
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
-            .any(|import| {
-                if import.is_glob
-                    || !import.span.contains_byte(reference.span.start_byte)
-                    || !import.span.contains_byte(reference.span.end_byte)
-                {
-                    return false;
-                }
-                let alias_or_name = import
-                    .alias
-                    .as_deref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| last_path_segment(&import.path));
-                // `extract_import` records the whole `use_declaration` span on
-                // every flattened import, so multi-item brace groups whose last
-                // segments collide (e.g. `use crate::{a::Foo, b::Foo}`) would
-                // otherwise let an inner-segment identifier bind to every
-                // colliding import. Require an alias-text match, a full-path
-                // match on the reference text, or no last-segment collisions
-                // within the same import span before allowing the inside-span
-                // shortcut.
-                let collisions = self
-                    .imports_for_file(&import.file_id)
-                    .filter(|other| {
-                        other.span == import.span && last_path_segment(&other.path) == symbol.name
-                    })
-                    .count();
-                let alias_match = import.alias.as_deref() == Some(reference.text.as_str());
-                let full_path_match = reference.text == import.path;
-                (alias_match || full_path_match || collisions <= 1)
-                    && (reference_name == symbol.name || reference_name == alias_or_name)
-                    && last_path_segment(&import.path) == symbol.name
-                    && self.import_module_matches_symbol(import, symbol)
-            })
-        {
-            return true;
-        }
-        if !reference_kind_can_bind_symbol(reference, symbol) {
-            return false;
-        }
-        self.imports_for_file(&reference.file_id).any(|import| {
-            if import.alias.as_deref() == Some("__java_package__") {
-                return false;
-            }
-            if path_starts_with_external_root(&import.path, self.reference_language(reference)) {
-                return false;
-            }
-            let alias_or_name = import
-                .alias
-                .as_deref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| last_path_segment(&import.path));
-            if import.is_glob {
-                return reference_name == symbol.name
-                    && self.import_module_matches_symbol(import, symbol);
-            }
-            alias_or_name == reference_name
-                && last_path_segment(&import.path) == symbol.name
-                && self.import_module_matches_symbol(import, symbol)
-        })
-    }
-
-    fn reference_qualifier_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if !matches!(reference.kind, ReferenceKind::Path) || !is_type_like_symbol(symbol.kind) {
-            return false;
-        }
-        path_segments(&reference.text)
-            .first()
-            .map(|segment| segment == &symbol.name)
-            .unwrap_or(false)
-    }
-
-    fn scoped_type_qualifier_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if !self.reference_qualifier_matches_symbol(symbol, reference) {
-            return false;
-        }
-        if path_starts_with_external_root(&reference.text, self.reference_language(reference)) {
-            return false;
-        }
-        self.symbol_is_in_reference_scope(symbol, reference)
-    }
-
-    fn symbol_is_in_reference_scope(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if symbol.file_id == reference.file_id {
-            return true;
-        }
-        self.imports_for_file(&reference.file_id)
-            .filter(|import| import.alias.as_deref() != Some("__java_package__"))
-            .any(|import| {
-                let alias_or_name = import
-                    .alias
-                    .as_deref()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|| last_path_segment(&import.path));
-                alias_or_name == symbol.name
-                    && last_path_segment(&import.path) == symbol.name
-                    && self.import_module_matches_symbol(import, symbol)
-            })
-    }
-
-    fn import_module_matches_symbol(&self, import: &ParsedImport, symbol: &GraphSymbol) -> bool {
-        let symbol_language = self.files.get(&symbol.file_id).map(|file| file.language);
-        if symbol_language == Some(squeezy_core::LanguageKind::Java) {
-            return self.java_import_matches_symbol(import, symbol);
-        }
-        if symbol_language.map(is_js_ts_language).unwrap_or(false) {
-            return self.js_ts_import_matches_symbol(import, symbol);
-        }
-        let mut import_path = path_segments(&import.path);
-        if import.is_glob {
-            if import_path.last().map(String::as_str) == Some("*") {
-                import_path.pop();
-            }
-        } else {
-            import_path.pop();
-        }
-        if import_path.is_empty() {
-            return false;
-        }
-        import_path == self.module_path_for_symbol(symbol)
-    }
-
-    fn qualified_reference_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if !reference.text.contains("::") || !reference_kind_can_bind_symbol(reference, symbol) {
-            return false;
-        }
-        let mut reference_path = path_segments(&reference.text);
-        if reference_path.pop().as_deref() != Some(symbol.name.as_str()) {
-            return false;
-        }
-        if reference_path.is_empty()
-            || path_starts_with_external_root(&reference.text, self.reference_language(reference))
-        {
-            return false;
-        }
-        if reference_path.first().map(String::as_str) == Some("crate") {
-            return reference_path == self.module_path_for_symbol(symbol);
-        }
-        let Some(owner) = reference
-            .owner_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-        else {
-            return false;
-        };
-        self.receiver_module_paths(owner, &reference_path.join("::"))
-            .into_iter()
-            .any(|path| path == self.module_path_for_symbol(symbol))
-    }
-
-    fn impl_method_implements_trait_method(
-        &self,
-        impl_method_id: &SymbolId,
-        trait_method: &GraphSymbol,
-    ) -> bool {
-        if !matches!(trait_method.kind, SymbolKind::Function | SymbolKind::Method) {
-            return false;
-        }
-        let Some(trait_symbol) = trait_method
-            .parent_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-            .filter(|symbol| symbol.kind == SymbolKind::Trait)
-        else {
-            return false;
-        };
-        let Some(impl_method) = self.symbols.get(impl_method_id) else {
-            return false;
-        };
-        if impl_method.name != trait_method.name
-            || !matches!(impl_method.kind, SymbolKind::Function | SymbolKind::Method)
-        {
-            return false;
-        }
-        let Some(impl_parent) = impl_method
-            .parent_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-            .filter(|parent| parent.kind == SymbolKind::Impl)
-        else {
-            return false;
-        };
-        // Name match alone is ambiguous when two traits in different modules
-        // share a name. Require that the impl header's trait path resolves
-        // back to the trait we're testing against.
-        impl_header_implements_trait(&impl_parent.name, &trait_symbol.name)
-            && self.impl_header_trait_resolves_to(&impl_parent.name, trait_symbol, impl_parent)
-    }
-
-    fn impl_header_trait_resolves_to(
-        &self,
-        header: &str,
-        trait_symbol: &GraphSymbol,
-        impl_anchor: &GraphSymbol,
-    ) -> bool {
-        let Some((trait_part, _)) = header.split_once(" for ") else {
-            return false;
-        };
-        let trait_part = trait_part
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != ':');
-        let segments = path_segments(trait_part);
-        if segments.last().map(String::as_str) != Some(trait_symbol.name.as_str()) {
-            return false;
-        }
-        if segments.len() == 1 {
-            if trait_symbol.file_id == impl_anchor.file_id {
-                return true;
-            }
-            return self
-                .imports
-                .iter()
-                .filter(|import| import.file_id == impl_anchor.file_id)
-                .any(|import| {
-                    let alias_or_name = import
-                        .alias
-                        .as_deref()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| last_path_segment(&import.path));
-                    alias_or_name == trait_symbol.name
-                        && self.import_module_matches_symbol(import, trait_symbol)
-                });
-        }
-        if segments.first().map(String::as_str) == Some("crate") {
-            let mut expected = self.module_path_for_symbol(trait_symbol);
-            expected.push(trait_symbol.name.clone());
-            return segments == expected;
-        }
-        let receiver = segments[..segments.len() - 1].join("::");
-        self.receiver_module_paths(impl_anchor, &receiver)
-            .into_iter()
-            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
-    }
-
-    fn reference_is_impl_method_declaration_for_trait(
-        &self,
-        trait_method: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        let Some(owner) = reference
-            .owner_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-        else {
-            return false;
-        };
-        if !self.impl_method_implements_trait_method(&owner.id, trait_method)
-            || !self.reference_is_symbol_declaration(owner, reference)
-        {
-            return false;
-        }
-        !self.symbol_or_ancestors_have_cfg_attribute(owner)
-    }
-
-    fn associated_type_reference_matches_symbol(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if symbol.kind != SymbolKind::TypeAlias || last_path_segment(&reference.text) != symbol.name
-        {
-            return false;
-        }
-        let Some(symbol_owner) = symbol
-            .parent_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-        else {
-            return false;
-        };
-        if symbol_owner.kind != SymbolKind::Trait {
-            return false;
-        }
-
-        let segments = path_segments(&reference.text);
-        if segments.len() < 2 || segments.last() != Some(&symbol.name) {
-            return false;
-        }
-        let qualifier = &segments[..segments.len() - 1];
-        if qualifier.len() == 1 && qualifier[0] == "Self" {
-            return self
-                .reference_owner_trait(reference)
-                .map(|owner| owner.id == symbol_owner.id)
-                .unwrap_or(false);
-        }
-        self.trait_path_matches_symbol(qualifier, symbol_owner, reference)
-    }
-
-    fn reference_owner_trait(&self, reference: &ParsedReference) -> Option<&GraphSymbol> {
-        let mut current = reference
-            .owner_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id));
-        while let Some(symbol) = current {
-            match symbol.kind {
-                SymbolKind::Trait => return Some(symbol),
-                SymbolKind::Impl => return None,
-                _ => {
-                    current = symbol
-                        .parent_id
-                        .as_ref()
-                        .and_then(|id| self.symbols.get(id));
-                }
-            }
-        }
-        None
-    }
-
-    fn trait_path_matches_symbol(
-        &self,
-        path: &[String],
-        trait_symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if path.last().map(String::as_str) != Some(trait_symbol.name.as_str()) {
-            return false;
-        }
-        if path.len() == 1 {
-            return self.symbol_is_in_reference_scope(trait_symbol, reference);
-        }
-        if path.first().map(String::as_str) == Some("crate") {
-            let mut expected = self.module_path_for_symbol(trait_symbol);
-            expected.push(trait_symbol.name.clone());
-            return path == expected;
-        }
-        let Some(owner) = reference
-            .owner_id
-            .as_ref()
-            .and_then(|id| self.symbols.get(id))
-        else {
-            return false;
-        };
-        let receiver = path[..path.len() - 1].join("::");
-        self.receiver_module_paths(owner, &receiver)
-            .into_iter()
-            .any(|receiver_path| receiver_path == self.module_path_for_symbol(trait_symbol))
-    }
-
-    fn symbol_or_ancestors_have_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
-        if has_cfg_attribute(symbol) || self.symbol_has_leading_cfg_attribute(symbol) {
-            return true;
-        }
-        let mut parent_id = symbol.parent_id.as_ref();
-        while let Some(id) = parent_id {
-            let Some(parent) = self.symbols.get(id) else {
-                break;
-            };
-            if has_cfg_attribute(parent) || self.symbol_has_leading_cfg_attribute(parent) {
-                return true;
-            }
-            parent_id = parent.parent_id.as_ref();
-        }
-        false
-    }
-
-    fn symbol_has_leading_cfg_attribute(&self, symbol: &GraphSymbol) -> bool {
-        let Some(file) = self.files.get(&symbol.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            return false;
-        };
-        let Some(prefix) = source.get(..symbol.span.start_byte as usize) else {
-            return false;
-        };
-        // Walk lines backward, tolerating doc/line comments and multi-line
-        // attributes that close with `)]` or `]` on a continuation line.
-        let mut in_multiline_attribute = false;
-        for line in prefix.lines().rev() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if trimmed.starts_with("/*") && trimmed.ends_with("*/") {
-                continue;
-            }
-            if in_multiline_attribute {
-                if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
-                    in_multiline_attribute = false;
-                    if attribute_text_is_cfg(trimmed) {
-                        return true;
-                    }
-                }
-                continue;
-            }
-            if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
-                if attribute_text_is_cfg(trimmed) {
-                    return true;
-                }
-                continue;
-            }
-            if trimmed.ends_with(']') {
-                in_multiline_attribute = true;
-                continue;
-            }
-            break;
-        }
-        false
-    }
-
-    fn reference_is_symbol_declaration(
-        &self,
-        symbol: &GraphSymbol,
-        reference: &ParsedReference,
-    ) -> bool {
-        if symbol.file_id != reference.file_id {
-            return false;
-        }
-        let signature_end = symbol
-            .body_span
-            .map(|span| span.start_byte)
-            .unwrap_or(symbol.span.end_byte);
-        if !(symbol.span.start_byte <= reference.span.start_byte
-            && reference.span.end_byte <= signature_end)
-        {
-            return false;
-        }
-        let Some(file) = self.files.get(&symbol.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            return false;
-        };
-        let Some(signature) = source.get(symbol.span.start_byte as usize..signature_end as usize)
-        else {
-            return false;
-        };
-        find_identifier(signature, &symbol.name)
-            .map(|offset| reference.span.start_byte == symbol.span.start_byte + offset as u32)
-            .unwrap_or(false)
-    }
-
-    fn reference_has_external_scope_prefix(&self, reference: &ParsedReference) -> bool {
-        if reference.text.contains("::") {
-            return false;
-        }
-        let Some(file) = self.files.get(&reference.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            return false;
-        };
-        let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
-            return false;
-        };
-        let scope = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        let scope = scope.trim_end_matches("::");
-        !scope.is_empty()
-            && path_starts_with_external_root(scope, self.reference_language(reference))
-    }
-
-    fn reference_has_uppercase_scope_prefix(&self, reference: &ParsedReference) -> bool {
-        if reference.text.contains("::") {
-            return false;
-        }
-        let Some(file) = self.files.get(&reference.file_id) else {
-            return false;
-        };
-        let Ok(source) = std::fs::read_to_string(&file.path) else {
-            return false;
-        };
-        let Some(prefix) = source.get(..reference.span.start_byte as usize) else {
-            return false;
-        };
-        let scope = prefix
-            .chars()
-            .rev()
-            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == ':')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect::<String>();
-        let scope = scope.trim_end_matches("::");
-        !scope.is_empty()
-            && scope
-                .rsplit("::")
-                .next()
-                .unwrap_or_default()
-                .chars()
-                .next()
-                .map(|ch| ch.is_ascii_uppercase())
-                .unwrap_or(false)
-    }
-
-    fn semantic_edge_for_reference(&self, reference: &ParsedReference) -> Option<&GraphEdge> {
-        let from = reference
-            .owner_id
-            .clone()
-            .unwrap_or_else(|| file_symbol_id(&reference.file_id));
-        self.edges_by_from
-            .get(&from)?
-            .iter()
-            .filter_map(|index| self.edges.get(*index))
-            .filter(|edge| {
-                matches!(
-                    edge.kind,
-                    EdgeKind::References | EdgeKind::Imports | EdgeKind::Reexports
-                ) && edge
-                    .span
-                    .map(|span| span.contains_byte(reference.span.start_byte))
-                    .unwrap_or(false)
-            })
-            .min_by_key(|edge| {
-                edge.span
-                    .map(|span| span.end_byte.saturating_sub(span.start_byte))
-                    .unwrap_or(u32::MAX)
-            })
-    }
-
-    fn call_edge_for_reference(&self, reference: &ParsedReference) -> Option<&GraphEdge> {
-        let from = reference
-            .owner_id
-            .clone()
-            .unwrap_or_else(|| file_symbol_id(&reference.file_id));
-        self.edges_by_from
-            .get(&from)?
-            .iter()
-            .filter_map(|index| self.edges.get(*index))
-            .filter(|edge| {
-                matches!(edge.kind, EdgeKind::Calls | EdgeKind::InvokesMacro)
-                    && edge
-                        .span
-                        .map(|span| {
-                            span.contains_byte(reference.span.start_byte)
-                                && span.contains_byte(reference.span.end_byte)
-                        })
-                        .unwrap_or(false)
-                    && last_path_segment(&edge.target_text) == last_path_segment(&reference.text)
-            })
-            .min_by_key(|edge| {
-                edge.span
-                    .map(|span| span.end_byte.saturating_sub(span.start_byte))
-                    .unwrap_or(u32::MAX)
-            })
-    }
-
-    fn can_bind_loose_reference(&self, symbol: &GraphSymbol, reference: &ParsedReference) -> bool {
-        if !reference_kind_can_bind_symbol(reference, symbol) {
-            return false;
-        }
-        let candidates = self.symbols_by_name_or_scan(&symbol.name);
-        let same_file_candidates = candidates
-            .iter()
-            .filter_map(|id| self.symbols.get(id))
-            .filter(|candidate| {
-                candidate.file_id == reference.file_id
-                    && reference_kind_can_bind_symbol(reference, candidate)
-            })
-            .collect::<Vec<_>>();
-        same_file_candidates.len() == 1 && same_file_candidates[0].id == symbol.id
-    }
-
     fn hierarchy_node(&self, id: &SymbolId, max_depth: usize) -> Option<HierarchyNode> {
         let symbol = self.symbols.get(id)?;
         let children = if max_depth == 0 {
@@ -2755,6 +1175,9 @@ pub struct GraphBuildReport {
     pub files_seen: usize,
     pub parsed_files: usize,
     pub unsupported_files: usize,
+    pub persisted_files_loaded: usize,
+    pub persisted_files_missed: usize,
+    pub persistence_rebuilt: bool,
     pub excluded_files: usize,
     pub excluded_dirs: usize,
     pub excluded_bytes: u64,
@@ -2811,6 +1234,8 @@ pub struct GraphManager {
     parser: LanguageParser,
     graph: SemanticGraph,
     config: RefreshConfig,
+    store: Option<Arc<SqueezyStore>>,
+    store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
     pending_changed_paths: HashSet<PathBuf>,
@@ -2830,20 +1255,86 @@ impl GraphManager {
         config: RefreshConfig,
         crawl_options: CrawlOptions,
     ) -> Result<Self> {
+        Self::open_with_optional_store(root, config, crawl_options, None)
+    }
+
+    /// Open a `GraphManager` that uses its own private [`SqueezyStore`] under
+    /// `<workspace_root>/.squeezy/cache` (or `cache_root` when overridden).
+    /// Production callers that already hold a shared `Arc<SqueezyStore>`
+    /// should use [`open_with_store`] instead: redb forbids two `Database`
+    /// handles on the same file, so opening another one here against an
+    /// agent-owned store would fail silently and disable graph persistence.
+    pub fn open_persistent_with_crawl_options(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        cache_root: Option<PathBuf>,
+    ) -> Result<Self> {
+        let root_path = root.as_ref().to_path_buf();
+        let store = SqueezyStore::open(&root_path, cache_root.as_deref())
+            .ok()
+            .map(Arc::new);
+        Self::open_with_optional_store(root_path, config, crawl_options, store)
+    }
+
+    /// Open a `GraphManager` against an already-open [`SqueezyStore`]. Pass
+    /// `None` to disable persistence. Sharing one handle keeps the agent and
+    /// the tool registry from racing to acquire redb's exclusive file lock.
+    pub fn open_with_store(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Result<Self> {
+        Self::open_with_optional_store(root, config, crawl_options, store)
+    }
+
+    fn open_with_optional_store(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Result<Self> {
         let started = Instant::now();
         let root = root.as_ref().to_path_buf();
+        let store_metadata = store
+            .as_ref()
+            .map(|_| graph_store_metadata(&root, &crawl_options));
         let crawler = WorkspaceCrawler::new(crawl_options);
         let snapshot = crawler.crawl(&root)?;
         let mut parser = LanguageParser::new()?;
         let bytes_seen = snapshot.files.iter().map(|file| file.size_bytes).sum();
         let language = language_report(&snapshot.files);
-        let (parsed, parse_summary) = parser.parse_records(&snapshot.files)?;
-        let graph = SemanticGraph::from_parsed(parsed);
+        let loaded =
+            load_persisted_partitions(store.as_deref(), store_metadata.as_ref(), &snapshot.files)?;
+        let (parsed_missed, parse_summary) = parser.parse_records(&loaded.missed_records)?;
+        if let (Some(store), Some(metadata)) = (store.as_deref(), store_metadata.as_ref()) {
+            // Coalesce the cold-build writes into one redb transaction so the
+            // first crawl pays a single fsync rather than one per parsed file.
+            let mut batch = GraphWriteBatch::new();
+            batch.set_metadata(metadata.clone());
+            for parsed in &parsed_missed {
+                batch.upsert_partition(&parsed.file.id, parsed)?;
+            }
+            store.apply_graph_batch(&batch)?;
+        }
+        let graph = SemanticGraph::from_parsed(merge_parsed_by_snapshot_order(
+            &snapshot.files,
+            loaded.parsed,
+            parsed_missed,
+        ));
         let build_report = GraphBuildReport {
             duration_ms: started.elapsed().as_millis(),
             files_seen: snapshot.files.len(),
             parsed_files: parse_summary.parsed_files,
-            unsupported_files: parse_summary.unsupported_files,
+            unsupported_files: graph
+                .files
+                .values()
+                .filter(|file| file.language == LanguageKind::Unsupported)
+                .count(),
+            persisted_files_loaded: loaded.loaded_files,
+            persisted_files_missed: loaded.missed_records.len(),
+            persistence_rebuilt: loaded.rebuilt,
             excluded_files: snapshot.coverage.skipped_files,
             excluded_dirs: snapshot.coverage.skipped_dirs,
             excluded_bytes: snapshot.coverage.skipped_bytes,
@@ -2858,6 +1349,8 @@ impl GraphManager {
             parser,
             graph,
             config,
+            store,
+            store_metadata,
             last_refresh: Instant::now(),
             build_report,
             pending_changed_paths: HashSet::new(),
@@ -3064,11 +1557,18 @@ impl GraphManager {
         let unchanged_event_paths = pending_changed_paths
             .len()
             .saturating_sub(event_changed_or_removed);
+        // Accumulate persistence side effects across the refresh and flush in
+        // a single redb transaction at the end. Refreshes can touch dozens of
+        // files (large saves, branch switches) and a per-file commit pays one
+        // fsync each, which dominates wall-clock cost.
+        let mut graph_batch = GraphWriteBatch::new();
         for file_id in &removed_files {
             self.graph.remove_file(file_id);
+            graph_batch.remove_partition(file_id);
         }
         for file_id in &unsupported_removed_files {
             self.graph.files.remove(file_id);
+            graph_batch.remove_partition(file_id);
         }
         for record in unsupported_changed_records {
             self.graph.files.insert(record.id.clone(), record.clone());
@@ -3086,12 +1586,31 @@ impl GraphManager {
             reparsed_files += 1;
         }
         if !parsed_files.is_empty() {
+            if self.store.is_some() {
+                if let Some(metadata) = &self.store_metadata {
+                    graph_batch.set_metadata(metadata.clone());
+                }
+                for parsed in &parsed_files {
+                    if let Err(err) = graph_batch.upsert_partition(&parsed.file.id, parsed) {
+                        // Encoding failure cannot poison the in-memory graph
+                        // update; skip persistence for the offending file and
+                        // keep going. The warm-start path will re-parse it
+                        // next time.
+                        let _ = err;
+                    }
+                }
+            }
             self.graph.replace_files(parsed_files);
         } else if metadata_refresh_needed {
             self.graph.rebuild_java_project_facts();
             self.graph.rebuild_dotnet_project_facts();
             self.graph.rebuild_semantic_edges();
             self.graph.rebuild_indexes();
+        }
+        if let Some(store) = self.store.as_deref()
+            && !graph_batch.is_empty()
+        {
+            let _ = store.apply_graph_batch(&graph_batch);
         }
 
         self.pending_changed_paths.clear();
@@ -3117,6 +1636,117 @@ impl GraphManager {
             skipped_due_to_interval: false,
             budget_exhausted,
         })
+    }
+}
+
+struct LoadedPartitions {
+    parsed: Vec<ParsedFile>,
+    missed_records: Vec<FileRecord>,
+    loaded_files: usize,
+    rebuilt: bool,
+}
+
+fn load_persisted_partitions(
+    store: Option<&SqueezyStore>,
+    expected_metadata: Option<&GraphStoreMetadata>,
+    records: &[FileRecord],
+) -> Result<LoadedPartitions> {
+    let Some(store) = store else {
+        return Ok(LoadedPartitions {
+            parsed: Vec::new(),
+            missed_records: records.to_vec(),
+            loaded_files: 0,
+            rebuilt: false,
+        });
+    };
+    let metadata_matches = match (store.graph_metadata()?, expected_metadata) {
+        (Some(existing), Some(expected)) => existing == *expected,
+        (None, _) => false,
+        (_, None) => false,
+    };
+    if !metadata_matches {
+        store.clear_graph_partitions()?;
+        return Ok(LoadedPartitions {
+            parsed: Vec::new(),
+            missed_records: records.to_vec(),
+            loaded_files: 0,
+            rebuilt: true,
+        });
+    }
+
+    let mut parsed = Vec::new();
+    let mut missed_records = Vec::new();
+    for record in records {
+        match store.graph_partition::<ParsedFile>(&record.id)? {
+            Some(mut persisted) if persisted_partition_matches(&persisted, record) => {
+                persisted.file = record.clone();
+                parsed.push(persisted);
+            }
+            _ => missed_records.push(record.clone()),
+        }
+    }
+    let loaded_files = parsed.len();
+    Ok(LoadedPartitions {
+        parsed,
+        missed_records,
+        loaded_files,
+        rebuilt: false,
+    })
+}
+
+fn persisted_partition_matches(parsed: &ParsedFile, record: &FileRecord) -> bool {
+    parsed.file.id == record.id
+        && parsed.file.relative_path == record.relative_path
+        && parsed.file.hash == record.hash
+        && parsed.file.language == record.language
+}
+
+fn merge_parsed_by_snapshot_order(
+    records: &[FileRecord],
+    loaded: Vec<ParsedFile>,
+    parsed_missed: Vec<ParsedFile>,
+) -> Vec<ParsedFile> {
+    let mut by_id = loaded
+        .into_iter()
+        .chain(parsed_missed)
+        .map(|parsed| (parsed.file.id.clone(), parsed))
+        .collect::<HashMap<_, _>>();
+    records
+        .iter()
+        .filter_map(|record| by_id.remove(&record.id))
+        .collect()
+}
+
+fn graph_store_metadata(root: &Path, crawl_options: &CrawlOptions) -> GraphStoreMetadata {
+    let crawl_options_json = serde_json::json!({
+        "include_hidden": crawl_options.include_hidden,
+        "max_file_bytes": crawl_options.max_file_bytes,
+        "require_indexing_signal": crawl_options.require_indexing_signal,
+        "include": crawl_options.policy.include,
+        "exclude": crawl_options.policy.exclude,
+        "include_classes": crawl_options.policy.include_classes,
+        "exclude_classes": crawl_options.policy.exclude_classes,
+    });
+    let language_registry_version = LanguageFamily::all()
+        .iter()
+        .map(|family| {
+            let kinds = family
+                .kinds()
+                .iter()
+                .map(|kind| kind.display_name())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}:{kinds}", family.id())
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    GraphStoreMetadata {
+        workspace_root: root.display().to_string(),
+        crawl_options_hash: squeezy_workspace::stable_content_hash(
+            crawl_options_json.to_string().as_bytes(),
+        ),
+        language_registry_version,
+        graph_format_version: GRAPH_FORMAT_VERSION,
     }
 }
 

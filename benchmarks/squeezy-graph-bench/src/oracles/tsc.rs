@@ -1,3 +1,34 @@
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write,
+    path::Path,
+    process::{Command, Stdio},
+    time::Instant,
+};
+
+use serde::Deserialize;
+use serde_json::{Value, json};
+use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolId, SymbolKind};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{
+        compare_symbol_sets, increment_symbol, location_key_for_reference_hit,
+        location_matches_symbol, probe_byte_for_edge, probe_byte_for_symbol, push_example, ratio,
+        render_locations,
+    },
+    mixed::select_scenarios,
+    oracles::{
+        common_scan::collect_squeezy_symbol_scan,
+        rust_analyzer::{byte_to_lsp_position, normalize_symbol_name},
+    },
+    report::{
+        AccuracyReport, DefinitionAccuracyReport, JsTsOracleReport, LocationKey,
+        NavigationAccuracyReport, ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+};
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct JsTsOracleSymbol {
     file: String,
@@ -5,7 +36,10 @@ pub(crate) struct JsTsOracleSymbol {
     name: String,
 }
 
-pub(crate) fn collect_js_ts_oracle_accuracy(root: &Path, graph: &SemanticGraph) -> JsTsOracleReport {
+pub(crate) fn collect_js_ts_oracle_accuracy(
+    root: &Path,
+    graph: &SemanticGraph,
+) -> JsTsOracleReport {
     let started = Instant::now();
     match collect_js_ts_symbol_scan(root) {
         Ok(oracle) => JsTsOracleReport {
@@ -830,7 +864,11 @@ pub(crate) fn collect_js_ts_navigation_accuracy(
     }
 }
 
-pub(crate) fn nav_report_error(msg: &str, limit: usize, limitations: Vec<String>) -> NavigationAccuracyReport {
+pub(crate) fn nav_report_error(
+    msg: &str,
+    limit: usize,
+    limitations: Vec<String>,
+) -> NavigationAccuracyReport {
     NavigationAccuracyReport {
         rust_analyzer_lsp_ms: None,
         rust_analyzer_lsp_status: msg.to_string(),

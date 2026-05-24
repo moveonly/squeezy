@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use squeezy_core::{GraphConfig, Redactor, SkillsConfig};
+use squeezy_core::{GraphConfig, SkillsConfig};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -37,7 +37,7 @@ fn registry_with_shell_sandbox_off_and_output_config(
         shell_sandbox,
         SkillCatalog::empty(),
         CrawlOptions::default(),
-        Arc::new(Redactor::default()),
+        ToolRegistryRuntime::default(),
     )
     .expect("registry")
 }
@@ -2725,7 +2725,7 @@ async fn skill_tools_list_metadata_and_load_body() {
         },
         &GraphConfig::default(),
         squeezy_core::ShellSandboxConfig::default(),
-        Arc::new(Redactor::default()),
+        ToolRegistryRuntime::default(),
     )
     .expect("registry");
 

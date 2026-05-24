@@ -1,3 +1,26 @@
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    process::Command,
+    time::Instant,
+};
+
+use serde::Deserialize;
+use squeezy_core::{Result, SqueezyError};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{compare_symbol_sets, increment_symbol},
+    oracles::common_scan::{
+        collect_csharp_squeezy_edge_scan_excluding_files,
+        collect_csharp_squeezy_symbol_scan_excluding_files,
+    },
+    report::{
+        AccuracyReport, CsharpOracleReport, DefinitionAccuracyReport, NavigationAccuracyReport,
+        ReferenceAccuracyReport, SymbolKey, SymbolScan,
+    },
+};
+
 pub(crate) fn collect_csharp_oracle_accuracy(
     root: &Path,
     graph: &SemanticGraph,
@@ -86,18 +109,18 @@ fn csharp_compared_symbol_kinds() -> Vec<String> {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct CsharpOracleOutput {
-    rows: Vec<[String; 3]>,
+    pub(crate) rows: Vec<[String; 3]>,
     #[serde(default)]
-    edges: Vec<[String; 3]>,
-    unparseable_files: Vec<String>,
+    pub(crate) edges: Vec<[String; 3]>,
+    pub(crate) unparseable_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CsharpOracleSymbolScan {
-    symbols: SymbolScan,
-    edges: SymbolScan,
-    unparseable_files: Vec<String>,
-    build_ms: Option<u128>,
+    pub(crate) symbols: SymbolScan,
+    pub(crate) edges: SymbolScan,
+    pub(crate) unparseable_files: Vec<String>,
+    pub(crate) build_ms: Option<u128>,
 }
 
 pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOracleSymbolScan> {
@@ -118,14 +141,7 @@ pub(crate) fn collect_csharp_oracle_symbol_scan(root: &Path) -> Result<CsharpOra
     let mut scan = SymbolScan::default();
     for [file, kind, name] in output.rows {
         scan.raw_total += 1;
-        increment_symbol(
-            &mut scan.counts,
-            SymbolKey {
-                file,
-                kind,
-                name,
-            },
-        );
+        increment_symbol(&mut scan.counts, SymbolKey { file, kind, name });
     }
     let mut edges = SymbolScan::default();
     for [file, kind, name] in output.edges {
@@ -223,44 +239,6 @@ pub(crate) fn csharp_oracle_project_dir() -> Result<PathBuf> {
     ))
 }
 
-const PYTHON_AST_ORACLE: &str = r#"
-import ast
-import json
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1]).resolve()
-rows = []
-unparseable_files = []
-
-class Visitor(ast.NodeVisitor):
-    def __init__(self, rel):
-        self.rel = rel
-        self.parents = []
-
-    def visit_ClassDef(self, node):
-        rows.append([self.rel, "Class", node.name])
-        self.parents.append("Class")
-        self.generic_visit(node)
-        self.parents.pop()
-
-    def visit_FunctionDef(self, node):
-        kind = "Method" if self.parents and self.parents[-1] == "Class" else "Function"
-        rows.append([self.rel, kind, node.name])
-        self.parents.append(kind)
-        self.generic_visit(node)
-        self.parents.pop()
-
-    visit_AsyncFunctionDef = visit_FunctionDef
-
-for path in sorted(root.rglob("*.py")):
-    rel = path.relative_to(root).as_posix()
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (SyntaxError, UnicodeDecodeError):
-        unparseable_files.append(rel)
-        continue
-    Visitor(rel).visit(tree)
-
-print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
-"#;
+#[cfg(test)]
+#[path = "roslyn_tests.rs"]
+mod tests;

@@ -19,20 +19,17 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
 use squeezy_core::{
-    GraphConfig, Redactor, ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy,
-    SkillsConfig,
+    GraphConfig, ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy, SkillsConfig,
 };
 use squeezy_tools::{
-    ToolCall, ToolOutputConfig, ToolRegistry, ToolResult, ToolStatus, WebToolConfig,
+    ToolCall, ToolOutputConfig, ToolRegistry, ToolRegistryRuntime, ToolResult, ToolStatus,
+    WebToolConfig,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -60,7 +57,7 @@ fn smoke_registry(root: &Path, shell_sandbox: ShellSandboxConfig) -> ToolRegistr
         SkillsConfig::default(),
         &GraphConfig::default(),
         shell_sandbox,
-        Arc::new(Redactor::default()),
+        ToolRegistryRuntime::default(),
     )
     .expect("registry")
 }

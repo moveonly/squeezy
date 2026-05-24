@@ -8,6 +8,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+serde.workspace = true
 squeezy-core.workspace = true
 squeezy-workspace.workspace = true
 tree-sitter.workspace = true

@@ -1,3 +1,21 @@
+use std::{collections::BTreeSet, path::Path, process::Command};
+
+use serde::{Deserialize, Deserializer};
+use squeezy_core::{EdgeKind, LanguageKind, Result, SqueezyError, SymbolKind};
+use squeezy_graph::SemanticGraph;
+
+use crate::{
+    accuracy::{increment_symbol, increment_unique_symbol},
+    oracles::{
+        clang::clang_symbol_name_is_comparable,
+        rust_analyzer::{
+            normalize_c_family_squeezy_kind, normalize_squeezy_kind, normalize_symbol_name,
+        },
+    },
+    report::{SymbolKey, SymbolScan},
+    util::increment,
+};
+
 pub(crate) fn collect_squeezy_symbol_scan(graph: &SemanticGraph) -> SymbolScan {
     collect_squeezy_symbol_scan_excluding_files(graph, &BTreeSet::new())
 }
@@ -194,38 +212,38 @@ pub(crate) fn collect_csharp_squeezy_edge_scan_excluding_files(
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PythonAstOracleOutput {
-    rows: Vec<[String; 3]>,
-    unparseable_files: Vec<String>,
+    pub(crate) rows: Vec<[String; 3]>,
+    pub(crate) unparseable_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct PythonAstSymbolScan {
-    symbols: SymbolScan,
-    unparseable_files: Vec<String>,
+    pub(crate) symbols: SymbolScan,
+    pub(crate) unparseable_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct CFamilyClangSymbolScan {
-    symbols: SymbolScan,
-    parsed_files: usize,
-    candidate_files: usize,
-    selected_files: usize,
-    unparseable_files: Vec<String>,
-    excluded_files: Vec<String>,
+    pub(crate) symbols: SymbolScan,
+    pub(crate) parsed_files: usize,
+    pub(crate) candidate_files: usize,
+    pub(crate) selected_files: usize,
+    pub(crate) unparseable_files: Vec<String>,
+    pub(crate) excluded_files: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct GoAstOracleOutput {
     #[serde(default, deserialize_with = "null_default")]
-    rows: Vec<[String; 3]>,
+    pub(crate) rows: Vec<[String; 3]>,
     #[serde(default, deserialize_with = "null_default")]
-    unparseable_files: Vec<String>,
+    pub(crate) unparseable_files: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) struct GoAstSymbolScan {
-    symbols: SymbolScan,
-    unparseable_files: Vec<String>,
+    pub(crate) symbols: SymbolScan,
+    pub(crate) unparseable_files: Vec<String>,
 }
 
 pub(crate) fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
@@ -268,3 +286,49 @@ pub(crate) fn collect_python_ast_symbol_scan(root: &Path) -> Result<PythonAstSym
         unparseable_files: output.unparseable_files,
     })
 }
+
+const PYTHON_AST_ORACLE: &str = r#"
+import ast
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1]).resolve()
+rows = []
+unparseable_files = []
+
+class Visitor(ast.NodeVisitor):
+    def __init__(self, rel):
+        self.rel = rel
+        self.parents = []
+
+    def visit_ClassDef(self, node):
+        rows.append([self.rel, "Class", node.name])
+        self.parents.append("Class")
+        self.generic_visit(node)
+        self.parents.pop()
+
+    def visit_FunctionDef(self, node):
+        kind = "Method" if self.parents and self.parents[-1] == "Class" else "Function"
+        rows.append([self.rel, kind, node.name])
+        self.parents.append(kind)
+        self.generic_visit(node)
+        self.parents.pop()
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+for path in sorted(root.rglob("*.py")):
+    rel = path.relative_to(root).as_posix()
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (SyntaxError, UnicodeDecodeError):
+        unparseable_files.append(rel)
+        continue
+    Visitor(rel).visit(tree)
+
+print(json.dumps({"rows": rows, "unparseable_files": unparseable_files}))
+"#;
+
+#[cfg(test)]
+#[path = "common_scan_tests.rs"]
+mod tests;

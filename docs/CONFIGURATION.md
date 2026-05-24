@@ -288,7 +288,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   Canonical supported-language families and recognized extensions are listed in
   [`docs/LANGUAGES.md`](LANGUAGES.md).
 - `[cache]`: `root` and `tool_outputs`. Relative paths resolve against the
-  workspace root, not the process working directory.
+  workspace root, not the process working directory. Graph warm-start state,
+  cross-session receipt metadata, and internal observations are stored in
+  `state.redb` under `root` or `.squeezy/cache` when `root` is unset.
 - `[tui]`: `tick_rate_ms` controls the TUI poll interval.
   `status_verbosity = "compact"` keeps the footer calm and focused on
   provider/model, mode, repo, permissions, telemetry, activity, and spend.
