@@ -14,10 +14,7 @@ use crossterm::{
     },
     execute,
     style::Print,
-    terminal::{
-        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
-        enable_raw_mode,
-    },
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
@@ -293,6 +290,7 @@ async fn run_inner(
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
+        terminal.sync_scrollback_history(&app)?;
         terminal.draw(|frame| render(frame, &app))?;
 
         drain_job_events(&mut app);
@@ -4032,8 +4030,108 @@ struct PendingApproval {
     decision_tx: oneshot::Sender<ToolApprovalDecision>,
 }
 
+fn scrollback_history_lines(
+    app: &TuiApp,
+    width: u16,
+    include_startup_card: bool,
+    start_entry: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if include_startup_card {
+        lines.extend(startup_card_lines(app, width));
+        lines.push(Line::from(""));
+    }
+    for (index, entry) in app.transcript.iter().enumerate().skip(start_entry) {
+        lines.extend(format_transcript_entry_with_width(
+            entry,
+            false,
+            app.tool_output_verbosity,
+            message_outcome(&app.transcript, index),
+            Some(width),
+        ));
+    }
+    lines
+}
+
+fn ansi_line(line: &Line<'_>) -> String {
+    let mut output = String::new();
+    for span in &line.spans {
+        output.push_str(&ansi_style(span.style));
+        append_terminal_safe_text(&mut output, span.content.as_ref());
+        output.push_str("\x1b[0m");
+    }
+    output
+}
+
+fn ansi_style(style: Style) -> String {
+    let mut codes = Vec::new();
+    if style.add_modifier.contains(Modifier::BOLD) {
+        codes.push("1".to_string());
+    }
+    if let Some(color) = style.fg
+        && let Some(code) = ansi_color(color, true)
+    {
+        codes.push(code);
+    }
+    if let Some(color) = style.bg
+        && let Some(code) = ansi_color(color, false)
+    {
+        codes.push(code);
+    }
+    if codes.is_empty() {
+        String::new()
+    } else {
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+fn ansi_color(color: Color, foreground: bool) -> Option<String> {
+    let base = if foreground { 30 } else { 40 };
+    let bright_base = if foreground { 90 } else { 100 };
+    let code = match color {
+        Color::Black => base,
+        Color::Red => base + 1,
+        Color::Green => base + 2,
+        Color::Yellow => base + 3,
+        Color::Blue => base + 4,
+        Color::Magenta => base + 5,
+        Color::Cyan => base + 6,
+        Color::Gray | Color::White => base + 7,
+        Color::DarkGray => bright_base,
+        Color::LightRed => bright_base + 1,
+        Color::LightGreen => bright_base + 2,
+        Color::LightYellow => bright_base + 3,
+        Color::LightBlue => bright_base + 4,
+        Color::LightMagenta => bright_base + 5,
+        Color::LightCyan => bright_base + 6,
+        Color::Rgb(r, g, b) => {
+            let prefix = if foreground { 38 } else { 48 };
+            return Some(format!("{prefix};2;{r};{g};{b}"));
+        }
+        Color::Indexed(index) => {
+            let prefix = if foreground { 38 } else { 48 };
+            return Some(format!("{prefix};5;{index}"));
+        }
+        Color::Reset => return Some("0".to_string()),
+    };
+    Some(code.to_string())
+}
+
+fn append_terminal_safe_text(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '\t' => output.push('\t'),
+            '\x1b' => output.push('?'),
+            ch if ch.is_control() => output.push(' '),
+            ch => output.push(ch),
+        }
+    }
+}
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    scrollback_seeded: bool,
+    scrollback_entries: usize,
 }
 
 impl TerminalGuard {
@@ -4042,9 +4140,6 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         execute!(
             stdout,
-            Clear(ClearType::Purge),
-            MoveTo(0, 0),
-            EnterAlternateScreen,
             Clear(ClearType::All),
             MoveTo(0, 0),
             EnableBracketedPaste,
@@ -4053,7 +4148,37 @@ impl TerminalGuard {
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
             .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            scrollback_seeded: false,
+            scrollback_entries: 0,
+        })
+    }
+
+    fn sync_scrollback_history(&mut self, app: &TuiApp) -> Result<()> {
+        let width = self
+            .terminal
+            .size()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?
+            .width;
+        let lines =
+            scrollback_history_lines(app, width, !self.scrollback_seeded, self.scrollback_entries);
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let backend = self.terminal.backend_mut();
+        for line in &lines {
+            backend
+                .write_all(ansi_line(line).as_bytes())
+                .and_then(|()| backend.write_all(b"\r\n"))
+                .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        }
+        backend
+            .flush()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.scrollback_seeded = true;
+        self.scrollback_entries = app.transcript.len();
+        Ok(())
     }
 
     fn draw<F>(&mut self, f: F) -> Result<()>
@@ -4076,8 +4201,7 @@ impl Drop for TerminalGuard {
             Print(DISABLE_ALTERNATE_SCROLL),
             Print(DISABLE_MOUSE_MODES),
             Clear(ClearType::All),
-            MoveTo(0, 0),
-            LeaveAlternateScreen
+            MoveTo(0, 0)
         );
         let _ = self.terminal.show_cursor();
     }

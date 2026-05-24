@@ -156,6 +156,36 @@ fn checkpoint_rollback_restores_modified_added_and_deleted_files() {
 }
 
 #[test]
+fn checkpoint_tracking_skips_ignored_large_files_without_failing() {
+    let root = temp_repo("checkpoint_ignored_large_files");
+    fs::write(root.join(".gitignore"), "target\n").expect("write gitignore");
+    fs::create_dir(root.join("target")).expect("create target");
+    let large = fs::File::create(root.join("target").join("large.bin")).expect("create large");
+    large
+        .set_len(DEFAULT_MAX_CHECKPOINT_FILE_BYTES + 1)
+        .expect("size large");
+    fs::write(root.join("src.rs"), "fn before() {}\n").expect("write src");
+
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+    assert!(
+        before.large_files.is_empty(),
+        "ignored large files must not become explicit checkpoint pathspecs"
+    );
+
+    fs::write(root.join("src.rs"), "fn after() {}\n").expect("modify src");
+    let record = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    assert_eq!(record.summary.files_changed, 1);
+    assert_eq!(record.files[0].path, "src.rs");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn checkpoint_rollback_reports_conflicts_without_overwriting_user_changes() {
     let root = temp_repo("checkpoint_conflict");
     fs::write(root.join("a.txt"), "A\n").expect("write a");

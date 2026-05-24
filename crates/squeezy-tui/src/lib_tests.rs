@@ -1052,6 +1052,62 @@ fn startup_card_scrolls_with_transcript_history() {
 }
 
 #[test]
+fn native_scrollback_history_mirrors_startup_and_committed_entries_once() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("hi"));
+    app.pending_assistant = "streaming".to_string();
+
+    let seeded = scrollback_history_lines(&app, 80, true, 0)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(seeded.iter().any(|line| line.contains(">_ Squeezy v")));
+    assert!(seeded.iter().any(|line| line.contains("> hi")));
+    assert!(
+        seeded.iter().all(|line| !line.contains("streaming")),
+        "pending assistant text must stay in the live frame only: {seeded:?}"
+    );
+
+    app.push_transcript_item(TranscriptItem::assistant("hello"));
+    let incremental = scrollback_history_lines(&app, 80, false, 1)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    assert!(!incremental.iter().any(|line| line.contains(">_ Squeezy v")));
+    assert!(!incremental.iter().any(|line| line.contains("> hi")));
+    assert!(incremental.iter().any(|line| line.contains("● hello")));
+}
+
+#[test]
+fn native_scrollback_ansi_sanitizes_control_sequences() {
+    let line = Line::from(vec![
+        Span::styled(
+            "> ",
+            Style::default()
+                .fg(GOLD)
+                .bg(PROMPT_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("hello\x1b[31m"),
+    ]);
+
+    let rendered = ansi_line(&line);
+
+    assert!(rendered.contains("\x1b[1;38;2;254;240;138;48;2;31;31;35m"));
+    assert!(rendered.contains("hello?[31m"), "{rendered:?}");
+}
+
+#[test]
 fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
     app.input = "ship it".to_string();

@@ -1055,9 +1055,57 @@ impl CheckpointStore {
 
     fn large_file_fingerprints(&self) -> Result<Vec<LargeFileFingerprint>> {
         let mut files = Vec::new();
-        collect_large_file_fingerprints(&self.root, &self.root, &mut files)?;
+        self.collect_large_file_fingerprints(&self.root, &mut files)?;
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
+    }
+
+    fn collect_large_file_fingerprints(
+        &self,
+        dir: &Path,
+        files: &mut Vec<LargeFileFingerprint>,
+    ) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
+            {
+                continue;
+            }
+            if self.is_git_ignored(&path)? {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                self.collect_large_file_fingerprints(&path, files)?;
+            } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
+                let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
+                files.push(LargeFileFingerprint {
+                    path: rel_path(&self.root, &path),
+                    size_bytes: metadata.len(),
+                    mtime_secs,
+                    mtime_nanos,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn is_git_ignored(&self, path: &Path) -> Result<bool> {
+        let rel = rel_path(&self.root, path);
+        let output = self.git_vec_allow_status(
+            vec![
+                "check-ignore".to_string(),
+                "--quiet".to_string(),
+                "--".to_string(),
+                rel,
+            ],
+            &[0, 1],
+        )?;
+        Ok(output.status.code() == Some(0))
     }
 
     fn protect_checkpoint_trees(&self, record: &CheckpointRecord) -> Result<()> {
@@ -1281,37 +1329,6 @@ fn checkpoint_id() -> String {
 
 fn checkpoint_ref(id: &str, side: &str) -> String {
     format!("refs/squeezy/checkpoints/{id}/{side}")
-}
-
-fn collect_large_file_fingerprints(
-    root: &Path,
-    dir: &Path,
-    files: &mut Vec<LargeFileFingerprint>,
-) -> Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| matches!(name, ".git" | ".squeezy"))
-        {
-            continue;
-        }
-        let metadata = entry.metadata()?;
-        if metadata.is_dir() {
-            collect_large_file_fingerprints(root, &path, files)?;
-        } else if metadata.is_file() && metadata.len() > DEFAULT_MAX_CHECKPOINT_FILE_BYTES {
-            let (mtime_secs, mtime_nanos) = mtime_parts(&metadata);
-            files.push(LargeFileFingerprint {
-                path: rel_path(root, &path),
-                size_bytes: metadata.len(),
-                mtime_secs,
-                mtime_nanos,
-            });
-        }
-    }
-    Ok(())
 }
 
 fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {

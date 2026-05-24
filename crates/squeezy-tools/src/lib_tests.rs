@@ -1932,6 +1932,39 @@ async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
 }
 
 #[tokio::test]
+async fn shell_checkpoint_ignores_gitignored_target_outputs() {
+    let root = temp_workspace("checkpoint_shell_ignored_target");
+    fs::write(root.join(".gitignore"), "target\n").expect("write gitignore");
+    fs::create_dir(root.join("target")).expect("create target");
+    let large = fs::File::create(root.join("target").join("debug.bin")).expect("create large");
+    large
+        .set_len(3 * 1024 * 1024)
+        .expect("write large placeholder");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "shell-build".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok > built.txt",
+                    "description": "simulate a build artifact beside ignored target output"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-build".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-build");
+    assert!(root.join("built.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn checkpoint_undo_reports_conflict_and_preserves_dirty_user_change() {
     let root = temp_workspace("checkpoint_conflict");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
