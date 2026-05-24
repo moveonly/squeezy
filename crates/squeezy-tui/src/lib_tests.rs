@@ -73,7 +73,7 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
         "missing toggle hint: {status}",
     );
     assert!(
-        status.contains("Wheel/PgUp/PgDn scroll"),
+        status.contains("PgUp/PgDn scroll"),
         "missing scroll hint: {status}"
     );
     assert!(
@@ -245,38 +245,6 @@ async fn alternate_screen_arrows_recall_prompt_history_when_trimmed_empty() {
 
     assert!(app.input.is_empty());
     assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
-#[test]
-fn mouse_wheel_scrolls_transcript_without_prompt_history() {
-    let mut app = test_app(SessionMode::Build);
-    push_input_history(&mut app, "previous prompt".to_string());
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 200,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 4);
-    assert!(app.input.is_empty());
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 200,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-    assert!(app.input.is_empty());
 }
 
 #[tokio::test]
@@ -1247,7 +1215,7 @@ fn render_uses_two_line_status_footer() {
         "{output}"
     );
     assert!(!output.contains("ready"), "{output}");
-    assert!(output.contains("Wheel/PgUp/PgDn scroll"), "{output}");
+    assert!(output.contains("PgUp/PgDn scroll"), "{output}");
 }
 
 #[test]
@@ -1379,21 +1347,6 @@ fn alternate_scroll_commands_use_xterm_private_mode() {
         .write_ansi(&mut disable)
         .expect("disable alternate scroll");
     assert_eq!(disable, "\x1b[?1007l");
-}
-
-#[test]
-fn mouse_scroll_commands_use_minimal_xterm_tracking_modes() {
-    let mut enable = String::new();
-    EnableMouseScroll
-        .write_ansi(&mut enable)
-        .expect("enable mouse scroll");
-    assert_eq!(enable, "\x1b[?1006h\x1b[?1000h");
-
-    let mut disable = String::new();
-    DisableMouseScroll
-        .write_ansi(&mut disable)
-        .expect("disable mouse scroll");
-    assert_eq!(disable, "\x1b[?1000l\x1b[?1006l");
 }
 
 #[test]
@@ -2002,6 +1955,61 @@ async fn esc_cancels_active_turn_and_requires_double_press_to_quit_when_idle() {
     .await
     .expect("second idle esc");
     assert!(quit);
+}
+
+#[tokio::test]
+async fn esc_cancels_pending_approval_without_active_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("approval esc");
+
+    assert!(!quit);
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::Cancelled
+    );
+    assert!(app.pending_approval.is_none());
+    assert_eq!(app.status, "cancelling");
+    assert!(!app.exit_armed);
+}
+
+#[tokio::test]
+async fn ctrl_c_cancels_pending_approval_without_exiting() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("approval ctrl-c");
+
+    assert!(!quit);
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::Cancelled
+    );
+    assert!(app.pending_approval.is_none());
+    assert_eq!(app.status, "cancelling");
 }
 
 #[tokio::test]

@@ -1415,6 +1415,27 @@ impl Agent {
             {
                 return;
             }
+            if let Some(answer) = local_workspace_command_answer(&task_title, &config) {
+                complete_local_command_turn(
+                    turn_id,
+                    task_title,
+                    answer,
+                    redacted_input.redactions,
+                    HelpTurnDeps {
+                        tx: tx.clone(),
+                        redactor: redactor.clone(),
+                        session_log: session_log.clone(),
+                        conversation_state: conversation_state.clone(),
+                        session_metrics: session_metrics.clone(),
+                        telemetry: telemetry.clone(),
+                        config: config.clone(),
+                        task_state: task_state.clone(),
+                        session_mode: session_mode.clone(),
+                    },
+                )
+                .await;
+                return;
+            }
             // Cheap pre-check first so unrelated coding turns do not pay for a
             // full `inspect_redacted()` rendering on every turn.
             if matches_squeezy_help_input(&task_title)
@@ -1669,6 +1690,183 @@ async fn complete_squeezy_help_turn(
             metrics,
         })
         .await;
+}
+
+async fn complete_local_command_turn(
+    turn_id: TurnId,
+    task_title: String,
+    answer: String,
+    seed_redactions: u64,
+    deps: HelpTurnDeps,
+) {
+    let HelpTurnDeps {
+        tx,
+        redactor,
+        session_log,
+        conversation_state,
+        session_metrics,
+        telemetry,
+        config,
+        task_state,
+        session_mode,
+    } = deps;
+    let user_item = LlmInputItem::UserText(task_title.clone());
+    let user_transcript = TranscriptItem::user(task_title.clone());
+    let rendered = redactor.redact(&answer);
+    let message = TranscriptItem::assistant(rendered.text);
+    let metrics = TurnMetrics {
+        redactions: seed_redactions + rendered.redactions,
+        ..TurnMetrics::default()
+    };
+    let cost = CostSnapshot::default();
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "user_message",
+        Some(turn_id),
+        user_item_summary(&user_item),
+        json!({}),
+    );
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::starting(task_title.clone()),
+    )
+    .await;
+    let _ = tx.send(AgentEvent::Started { turn_id }).await;
+    let _ = tx
+        .send(AgentEvent::AssistantDelta {
+            turn_id,
+            delta: message.content.clone(),
+        })
+        .await;
+    let latest_task_state = task_state.lock().await.clone();
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::terminal_from(
+            latest_task_state.as_ref(),
+            task_title.clone(),
+            TaskStateStatus::Completed,
+            Some("local workspace command".to_string()),
+        ),
+    )
+    .await;
+
+    {
+        let mut state = conversation_state.lock().await;
+        state.conversation.push(user_item);
+        state
+            .conversation
+            .push(LlmInputItem::AssistantText(message.content.clone()));
+        state.transcript.push(user_transcript);
+        state.transcript.push(message.clone());
+        merge_cost(&mut state.cost, &cost);
+        state.metrics.merge_turn(&metrics);
+        state.redactions += metrics.redactions;
+        if let Some(session) = &session_log {
+            let _ = session.write_resume_state(&state.to_resume_state());
+            let _ = session.update_metadata(|metadata| {
+                metadata.cost = state.cost.clone();
+                metadata.metrics = state.metrics.clone();
+                metadata.redactions = state.redactions;
+                metadata.resume_available = true;
+                metadata.mode = load_session_mode(&session_mode);
+            });
+        }
+    }
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "local_command",
+        Some(turn_id),
+        Some("workspace listing".to_string()),
+        json!({ "command": task_title }),
+    );
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "assistant_completed",
+        Some(turn_id),
+        Some("local workspace command".to_string()),
+        json!({
+            "response_id": null,
+            "cost": cost,
+            "metrics": metrics,
+        }),
+    );
+
+    telemetry.spawn(TelemetryEvent::turn_completed(
+        &config,
+        turn_id.get(),
+        metrics.clone(),
+    ));
+    session_metrics.lock().await.merge_turn(&metrics);
+    let _ = tx
+        .send(AgentEvent::Completed {
+            turn_id,
+            message,
+            response_id: None,
+            cost,
+            metrics,
+        })
+        .await;
+}
+
+fn local_workspace_command_answer(input: &str, config: &AppConfig) -> Option<String> {
+    match input.trim() {
+        "ls" | "ls ." => local_ls_answer(config),
+        "pwd" => Some(config.workspace_root.display().to_string()),
+        _ => None,
+    }
+}
+
+fn local_ls_answer(config: &AppConfig) -> Option<String> {
+    let mut entries = fs::read_dir(&config.workspace_root)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name == ".git" {
+                return None;
+            }
+            let suffix = entry
+                .file_type()
+                .ok()
+                .filter(|file_type| file_type.is_dir())
+                .map(|_| "/")
+                .unwrap_or("");
+            Some(format!("{file_name}{suffix}"))
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    let total = entries.len();
+    let shown = entries.iter().take(80).cloned().collect::<Vec<_>>();
+    let mut answer = if shown.is_empty() {
+        "No top-level entries found.".to_string()
+    } else {
+        format!(
+            "Top-level entries ({total}):\n\n{}",
+            shown
+                .iter()
+                .map(|entry| format!("- {entry}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    if total > shown.len() {
+        answer.push_str(&format!("\n\n... {} more", total - shown.len()));
+    }
+    Some(answer)
 }
 
 struct TurnRuntime {

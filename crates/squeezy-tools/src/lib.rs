@@ -6710,6 +6710,19 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             parser_backed,
             dynamic,
         }
+    } else if segments
+        .iter()
+        .all(|segment| is_read_only_shell_segment(segment))
+    {
+        ShellPermissionAnalysis {
+            capability: PermissionCapability::Search,
+            risk: PermissionRisk::Low,
+            rule_target: format!("{first}:*"),
+            network: false,
+            destructive: false,
+            parser_backed,
+            dynamic,
+        }
     } else {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
@@ -7400,6 +7413,13 @@ fn is_git_read_only_segment(segment: &str) -> bool {
     matches!(
         shell_command_prefix(segment).as_str(),
         "git status" | "git diff" | "git log" | "git show" | "git branch"
+    )
+}
+
+fn is_read_only_shell_segment(segment: &str) -> bool {
+    matches!(
+        shell_command_prefix(segment).as_str(),
+        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"
     )
 }
 

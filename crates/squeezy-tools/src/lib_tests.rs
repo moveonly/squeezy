@@ -99,6 +99,33 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
 }
 
 #[test]
+fn shell_permission_metadata_classifies_read_only_listing_commands_as_low_risk_search() {
+    let root = temp_workspace("permission_read_only_shell");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "ls".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "ls",
+            "description": "list workspace files"
+        }),
+    });
+
+    assert_eq!(request.capability, PermissionCapability::Search);
+    assert_eq!(request.risk, PermissionRisk::Low);
+    assert_eq!(request.target, "ls:*");
+    assert_eq!(request.metadata["destructive"], "false");
+    assert_eq!(request.metadata["network"], "none");
+
+    let grep = analyze_shell_command("rg getFoo");
+    assert_eq!(grep.capability, PermissionCapability::Search);
+    assert_eq!(grep.risk, PermissionRisk::Low);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_permission_metadata_detects_network_commands() {
     let root = temp_workspace("permission_network_metadata");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -2499,7 +2526,7 @@ async fn shell_rejects_workdir_outside_workspace_with_structured_policy_reason()
     assert_eq!(result.status, ToolStatus::Denied);
     assert_eq!(result.content["permission_denied"], true);
     assert_eq!(result.content["policy_denied"], true);
-    assert_eq!(result.content["capability"], "shell");
+    assert_eq!(result.content["capability"], "search");
     assert!(
         result.content["error"]
             .as_str()

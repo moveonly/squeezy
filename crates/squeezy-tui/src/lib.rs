@@ -12,7 +12,6 @@ use crossterm::{
     cursor::MoveTo,
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEvent, MouseEventKind,
     },
     execute,
     style::Print,
@@ -101,50 +100,6 @@ impl Command for DisableAlternateScroll {
     fn execute_winapi(&self) -> io::Result<()> {
         Err(io::Error::other(
             "alternate scroll is only supported through ANSI escape sequences",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EnableMouseScroll;
-
-impl Command for EnableMouseScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        // SGR + normal mouse tracking is the smallest common xterm mode set
-        // that reports wheel events without subscribing to mouse motion.
-        f.write_str("\x1b[?1006h\x1b[?1000h")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "mouse scroll reporting is only supported through ANSI escape sequences",
-        ))
-    }
-
-    #[cfg(windows)]
-    fn is_ansi_code_supported(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DisableMouseScroll;
-
-impl Command for DisableMouseScroll {
-    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
-        f.write_str("\x1b[?1000l\x1b[?1006l")
-    }
-
-    #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "mouse scroll reporting is only supported through ANSI escape sequences",
         ))
     }
 
@@ -614,10 +569,6 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
-        Event::Mouse(mouse) => {
-            handle_mouse(app, mouse);
-            Ok(false)
-        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
@@ -632,7 +583,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        if cancel_active_turn(app) {
+        if cancel_active_turn(app) || cancel_pending_approval(app) {
             return Ok(false);
         }
         return Ok(true);
@@ -689,8 +640,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.code == KeyCode::Esc && app.cancel.is_some() {
-        cancel_active_turn(app);
+    if key.code == KeyCode::Esc && (cancel_active_turn(app) || cancel_pending_approval(app)) {
         return Ok(false);
     }
 
@@ -700,7 +650,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     match key.code {
         KeyCode::Esc => {
-            if cancel_active_turn(app) {
+            if cancel_active_turn(app) || cancel_pending_approval(app) {
                 Ok(false)
             } else if app.exit_armed {
                 Ok(true)
@@ -809,14 +759,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             Ok(false)
         }
         _ => Ok(false),
-    }
-}
-
-fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => scroll_transcript_up(app, 4),
-        MouseEventKind::ScrollDown => scroll_transcript_down(app, 4),
-        _ => {}
     }
 }
 
@@ -986,6 +928,15 @@ fn cancel_active_turn(app: &mut TuiApp) -> bool {
     if let Some(pending) = app.pending_approval.take() {
         let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
     }
+    app.status = "cancelling".to_string();
+    true
+}
+
+fn cancel_pending_approval(app: &mut TuiApp) -> bool {
+    let Some(pending) = app.pending_approval.take() else {
+        return false;
+    };
+    let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
     app.status = "cancelling".to_string();
     true
 }
@@ -2082,11 +2033,9 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('p') | KeyCode::Char('P') => {
             send_approval_decision(app, pending, APPROVAL_PROJECT)
         }
-        KeyCode::Char('n')
-        | KeyCode::Char('N')
-        | KeyCode::Char('d')
-        | KeyCode::Char('D')
-        | KeyCode::Esc => send_approval_decision(app, pending, APPROVAL_DENY),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
+            send_approval_decision(app, pending, APPROVAL_DENY)
+        }
         _ => {
             app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
@@ -4842,7 +4791,7 @@ fn format_status_details(app: &TuiApp) -> String {
 
 fn format_status_hints(app: &TuiApp) -> String {
     if app.pending_approval.is_some() {
-        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Ctrl-C cancel"
+        return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
         return "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
@@ -4852,7 +4801,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     }
     if app.alternate_scroll_enabled {
-        "Enter send · Wheel/PgUp/PgDn scroll · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · PgUp/PgDn scroll · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     } else {
         "Enter send · Up/Down menu/history · Ctrl+J newline · PgUp/PgDn scroll · Ctrl-E expand/collapse · /help"
@@ -5550,7 +5499,6 @@ impl TerminalGuard {
                     EnterAlternateScreen,
                     Print(DISABLE_MOUSE_MODES),
                     EnableAlternateScroll,
-                    EnableMouseScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
                     EnableBracketedPaste
@@ -5634,7 +5582,6 @@ impl Drop for TerminalGuard {
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
                     DisableAlternateScroll,
-                    DisableMouseScroll,
                     Print(DISABLE_MOUSE_MODES)
                 );
                 let _ = self.terminal.clear();
@@ -5644,7 +5591,6 @@ impl Drop for TerminalGuard {
                     self.terminal.backend_mut(),
                     DisableBracketedPaste,
                     DisableAlternateScroll,
-                    DisableMouseScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Clear(ClearType::All),
                     MoveTo(0, 0),

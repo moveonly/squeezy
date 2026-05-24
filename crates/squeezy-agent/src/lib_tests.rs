@@ -1077,6 +1077,37 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
 }
 
 #[tokio::test]
+async fn simple_ls_completes_locally_without_provider_request() {
+    let root = temp_workspace("agent_local_ls");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    fs::create_dir_all(root.join("src")).expect("mkdir src");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("ls".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            completed = Some(message.content);
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    let completed = completed.expect("ls turn should complete");
+    assert!(completed.contains("Top-level entries"), "{completed}");
+    assert!(completed.contains("Cargo.toml"), "{completed}");
+    assert!(completed.contains("src/"), "{completed}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
