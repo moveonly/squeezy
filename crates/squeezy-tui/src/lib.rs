@@ -25,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
 };
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
@@ -54,6 +54,7 @@ const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 const AMBER: Color = Color::Rgb(252, 211, 77);
 const GOLD: Color = Color::Rgb(254, 240, 138);
 const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
+const MODE_BUILD_GREEN: Color = Color::Rgb(187, 247, 208);
 const ERROR_RED: Color = Color::Rgb(248, 113, 113);
 const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
@@ -390,6 +391,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     ..
                 } => {
                     app.status = format_approval_status_line(&request);
+                    app.approval_selection_index = 0;
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
@@ -1933,42 +1935,37 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     };
 
     match key.code {
+        KeyCode::Up => {
+            app.approval_selection_index = app.approval_selection_index.saturating_sub(1);
+            app.status = format_approval_status_line(&pending.request);
+            app.pending_approval = Some(pending);
+            true
+        }
+        KeyCode::Down => {
+            app.approval_selection_index =
+                (app.approval_selection_index + 1).min(approval_options().len() - 1);
+            app.status = format_approval_status_line(&pending.request);
+            app.pending_approval = Some(pending);
+            true
+        }
+        KeyCode::Enter => {
+            let option = approval_options()
+                .get(app.approval_selection_index)
+                .copied()
+                .unwrap_or(APPROVAL_ONCE);
+            send_approval_decision(app, pending, option)
+        }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            let _ = pending.decision_tx.send(ToolApprovalDecision::AllowOnce);
-            app.status = format!("approved {}", pending.request.tool_name);
-            true
+            send_approval_decision(app, pending, APPROVAL_ONCE)
         }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
-            let _ = pending
-                .decision_tx
-                .send(ToolApprovalDecision::AllowRuleUser);
-            app.status = format!("approved user rule for {}", pending.request.tool_name);
-            true
+        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('p') | KeyCode::Char('P') => {
+            send_approval_decision(app, pending, APPROVAL_PROJECT)
         }
-        KeyCode::Char('p') | KeyCode::Char('P') => {
-            let _ = pending
-                .decision_tx
-                .send(ToolApprovalDecision::AllowRuleProject);
-            app.status = format!("approved project rule for {}", pending.request.tool_name);
-            true
-        }
-        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-            let _ = pending.decision_tx.send(ToolApprovalDecision::DenyOnce);
-            app.status = format!("denied {}", pending.request.tool_name);
-            true
-        }
-        KeyCode::Char('d') | KeyCode::Char('D') => {
-            let _ = pending
-                .decision_tx
-                .send(ToolApprovalDecision::DenyRuleProject);
-            app.status = format!("denied project rule for {}", pending.request.tool_name);
-            true
-        }
-        KeyCode::Char('u') | KeyCode::Char('U') => {
-            let _ = pending.decision_tx.send(ToolApprovalDecision::DenyRuleUser);
-            app.status = format!("denied user rule for {}", pending.request.tool_name);
-            true
-        }
+        KeyCode::Char('n')
+        | KeyCode::Char('N')
+        | KeyCode::Char('d')
+        | KeyCode::Char('D')
+        | KeyCode::Esc => send_approval_decision(app, pending, APPROVAL_DENY),
         _ => {
             app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
@@ -1977,69 +1974,137 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
-/// Keys we surface in the approval prompt, in display order. The list
-/// matches the metadata emitted by `ToolRegistry::permission_request` so a
-/// future field becomes visible by adding it here AND in the tool
-/// registry; the doc in `docs/external/CONFIGURATION.md` references this contract.
-pub(crate) const APPROVAL_PROMPT_KEYS: &[&str] = &[
-    "server",
-    "tool",
-    "transport",
-    "target",
-    "arguments",
-    "command",
-    "cwd",
-    "description",
-    "env",
-    "network",
-    "destructive",
-    "timeout_ms",
-    "output_byte_cap",
-    "sandbox",
-    "sandbox_network",
-    "sandbox_read_roots",
-    "sandbox_write_roots",
-    "parser_backed",
-    "dynamic",
-];
+fn send_approval_decision(
+    app: &mut TuiApp,
+    pending: PendingApproval,
+    option: ApprovalOption,
+) -> bool {
+    let tool_name = pending.request.tool_name.clone();
+    let _ = pending.decision_tx.send(option.decision);
+    app.status = match option.choice {
+        ApprovalChoice::Approve => format!("approved {tool_name}"),
+        ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
+        ApprovalChoice::Deny => format!("denied {tool_name}"),
+    };
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    ApproveProject,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApprovalOption {
+    choice: ApprovalChoice,
+    label: &'static str,
+    hint: &'static str,
+    decision: ToolApprovalDecision,
+}
+
+const APPROVAL_ONCE: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::Approve,
+    label: "Approve",
+    hint: "run this once",
+    decision: ToolApprovalDecision::AllowOnce,
+};
+
+const APPROVAL_PROJECT: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::ApproveProject,
+    label: "Always approve this command in this repo",
+    hint: "save a project rule",
+    decision: ToolApprovalDecision::AllowRuleProject,
+};
+
+const APPROVAL_DENY: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::Deny,
+    label: "Deny",
+    hint: "skip this run",
+    decision: ToolApprovalDecision::DenyOnce,
+};
+
+fn approval_options() -> &'static [ApprovalOption] {
+    &[APPROVAL_ONCE, APPROVAL_PROJECT, APPROVAL_DENY]
+}
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
 /// design so the status bar remains useful for non-approval traffic.
 pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> String {
     let permission = &request.permission;
     format!(
-        "approval pending: {tool} risk={risk} target={target} | y once | a user allow | p project allow | u user deny | d project deny | n deny once",
+        "approval needed: {tool} risk={risk} target={target}",
         tool = request.tool_name,
         risk = permission.risk.as_str(),
         target = permission.target,
     )
 }
 
-/// Multi-line approval prompt rendered on its own dedicated TUI panel.
-/// Each metadata field gets its own line so long commands wrap cleanly
-/// instead of being truncated off the right edge of the screen.
+#[cfg(test)]
 pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
+    format_approval_menu_lines(request, 0)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_approval_menu_lines(
+    request: &ToolApprovalRequest,
+    selected: usize,
+) -> Vec<Line<'static>> {
     let permission = &request.permission;
-    let mut lines = Vec::new();
-    lines.push(format!("approve {}", permission.summary.trim()));
-    lines.push(format!(
-        "  risk={risk} target={target}",
-        risk = permission.risk.as_str(),
-        target = permission.target,
-    ));
-    if !request.reason.is_empty() {
-        lines.push(format!("  reason={}", request.reason));
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Approval needed",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {} · {}", request.tool_name, permission.risk.as_str()),
+            Style::default().fg(QUIET),
+        ),
+    ])];
+    if let Some(command) = permission.metadata.get("command") {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(command.clone(), Style::default().fg(Color::White)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(permission.target.clone(), Style::default().fg(Color::White)),
+        ]));
     }
-    for key in APPROVAL_PROMPT_KEYS {
-        if let Some(value) = permission.metadata.get(*key) {
-            lines.push(format!("  {key}={value:?}"));
-        }
+    if let Some(cwd) = permission.metadata.get("cwd") {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("cwd {cwd}"), Style::default().fg(QUIET)),
+        ]));
     }
-    lines.push(
-        "  [y] once  [a] user allow  [p] project allow  [u] user deny  [d] project deny  [n] deny once"
-            .to_string(),
-    );
-    lines.join("\n")
+    for (index, option) in approval_options().iter().enumerate() {
+        let is_selected = index == selected.min(approval_options().len() - 1);
+        let marker = if is_selected { "› " } else { "  " };
+        let label_style = if is_selected {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+            ),
+            Span::styled(option.label, label_style),
+            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+        ]));
+    }
+    lines
 }
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -2047,16 +2112,9 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let header_height: u16 = if area.height >= 12 { 6 } else { 0 };
     let input_height = input_panel_height(app, area.width);
     let attachment_height = attachment_panel_height(app);
-    let approval_prompt = app.pending_approval.as_ref().map(|pending| {
-        // When an approval is pending, reserve a dedicated panel large
-        // enough to show every metadata line of `format_approval_prompt`.
-        let prompt = format_approval_prompt(&pending.request);
-        let line_count = prompt.matches('\n').count() as u16 + 1;
-        let approval_height = line_count.saturating_add(2).clamp(6, 18);
-        (prompt, approval_height)
-    });
+    let approval_height = approval_menu_height(app);
     let task_height = if should_show_task_panel(app) {
-        let h = if approval_prompt.is_some() {
+        let h = if approval_height > 0 {
             task_panel_height(app).min(5)
         } else {
             task_panel_height(app)
@@ -2067,12 +2125,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     };
     let reserved_height = header_height
         .saturating_add(task_height.unwrap_or(0))
-        .saturating_add(
-            approval_prompt
-                .as_ref()
-                .map(|(_, height)| *height)
-                .unwrap_or(0),
-        )
+        .saturating_add(approval_height)
         .saturating_add(attachment_height)
         .saturating_add(input_height)
         .saturating_add(2);
@@ -2089,13 +2142,13 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if let Some(h) = task_height {
         constraints.push(Constraint::Length(h));
     }
-    if let Some((_, approval_height)) = &approval_prompt {
-        constraints.push(Constraint::Length(*approval_height));
-    }
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
     }
     constraints.push(Constraint::Length(input_height));
+    if approval_height > 0 {
+        constraints.push(Constraint::Length(approval_height));
+    }
     constraints.push(Constraint::Length(2));
     constraints.push(Constraint::Min(0));
     let chunks = Layout::default()
@@ -2115,16 +2168,16 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_task_state(frame, chunks[index], app);
         index += 1;
     }
-    if let Some((prompt, _)) = approval_prompt.as_ref() {
-        render_approval(frame, chunks[index], prompt);
-        index += 1;
-    }
     if attachment_height > 0 {
         render_attachments(frame, chunks[index], app);
         index += 1;
     }
     render_input(frame, chunks[index], app);
     index += 1;
+    if approval_height > 0 {
+        render_approval(frame, chunks[index], app);
+        index += 1;
+    }
     render_status(frame, chunks[index], app);
     index += 1;
     // Flexible filler keeps the prompt/status block attached to the transcript
@@ -2311,15 +2364,22 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
     }
 }
 
-fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
-    let paragraph = Paragraph::new(prompt)
-        .block(
-            Block::default()
-                .title("Approval required")
-                .borders(Borders::ALL),
-        )
+fn approval_menu_height(app: &TuiApp) -> u16 {
+    if app.pending_approval.is_some() { 6 } else { 0 }
+}
+
+fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let paragraph = Paragraph::new(approval_lines(app))
+        .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    app.pending_approval
+        .as_ref()
+        .map(|pending| format_approval_menu_lines(&pending.request, app.approval_selection_index))
+        .unwrap_or_default()
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -2720,16 +2780,12 @@ fn format_tool_result_entry(
         status_color(result.status),
         summary,
     )];
-    lines.push(Line::from(format!(
-        "  receipt output={} content={}",
-        short_hash(&result.receipt.output_sha256),
-        result
-            .receipt
-            .content_sha256
-            .as_deref()
-            .map(short_hash)
-            .unwrap_or("-")
-    )));
+    if result.cost_hint.truncated {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("output shortened for display", Style::default().fg(QUIET)),
+        ]));
+    }
     let preview = preview_tool_result(result, tool_output_verbosity);
     lines.extend(indented_text_lines(&preview));
     lines
@@ -2940,18 +2996,19 @@ fn indented_text_lines(content: &str) -> Vec<Line<'static>> {
 }
 
 fn tool_result_summary(result: &ToolResult) -> String {
-    format!(
-        "{} {} {}B{} receipt={}",
-        result.tool_name,
-        tool_status_label(result.status),
-        result.cost_hint.output_bytes,
-        if result.cost_hint.truncated {
-            " truncated"
-        } else {
-            ""
-        },
-        short_hash(&result.receipt.output_sha256),
-    )
+    let mut summary = result.tool_name.clone();
+    match result.status {
+        ToolStatus::Success => {
+            if result.cost_hint.truncated {
+                summary.push_str(" · output shortened");
+            }
+        }
+        ToolStatus::Error => summary.push_str(" · error"),
+        ToolStatus::Denied => summary.push_str(" · denied"),
+        ToolStatus::Stale => summary.push_str(" · stale"),
+        ToolStatus::Cancelled => summary.push_str(" · cancelled"),
+    }
+    summary
 }
 
 fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> String {
@@ -2970,16 +3027,6 @@ fn status_color(status: ToolStatus) -> Color {
         ToolStatus::Success => Color::Green,
         ToolStatus::Error | ToolStatus::Stale => ERROR_RED,
         ToolStatus::Denied | ToolStatus::Cancelled => GOLD,
-    }
-}
-
-fn tool_status_label(status: ToolStatus) -> &'static str {
-    match status {
-        ToolStatus::Success => "success",
-        ToolStatus::Error => "error",
-        ToolStatus::Denied => "denied",
-        ToolStatus::Stale => "stale",
-        ToolStatus::Cancelled => "cancelled",
     }
 }
 
@@ -3085,10 +3132,6 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
-}
-
-fn short_hash(hash: &str) -> &str {
-    hash.get(..12).unwrap_or(hash)
 }
 
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
@@ -3247,7 +3290,7 @@ fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
     Line::from(vec![
         Span::styled(left, Style::default().fg(Color::Gray)),
         Span::raw(padding),
-        Span::styled(right, Style::default().fg(MODE_PURPLE)),
+        Span::styled(right, Style::default().fg(mode_status_color(app.mode))),
     ])
 }
 
@@ -3268,6 +3311,13 @@ fn title_case_mode(mode: SessionMode) -> &'static str {
     match mode {
         SessionMode::Plan => "Plan",
         SessionMode::Build => "Build",
+    }
+}
+
+fn mode_status_color(mode: SessionMode) -> Color {
+    match mode {
+        SessionMode::Plan => MODE_PURPLE,
+        SessionMode::Build => MODE_BUILD_GREEN,
     }
 }
 
@@ -3346,7 +3396,7 @@ fn format_status_details(app: &TuiApp) -> String {
 
 fn format_status_hints(app: &TuiApp) -> &'static str {
     if app.pending_approval.is_some() {
-        "Y allow once | A user | P project | N deny | U/D deny rule | Ctrl-C/Esc cancel | Ctrl-P task"
+        "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Ctrl-C cancel"
     } else if app.cancel.is_some() {
         "Ctrl-C/Esc cancel · Ctrl+J newline · Ctrl-P task · Ctrl-Y copy · /help"
     } else if app.exit_armed {
@@ -3641,6 +3691,7 @@ struct TuiApp {
     notifications: VecDeque<JobNotification>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
+    approval_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
     clipboard: Box<dyn Clipboard>,
@@ -3742,6 +3793,7 @@ impl TuiApp {
             notifications: VecDeque::new(),
             cancel: None,
             pending_approval: None,
+            approval_selection_index: 0,
             pending_feedback: None,
             pending_report: None,
             clipboard,

@@ -77,6 +77,24 @@ fn status_line_surfaces_current_mode_and_switch_hints() {
     );
 }
 
+#[test]
+fn status_mode_color_distinguishes_build_and_plan() {
+    let mut app = test_app(SessionMode::Build);
+
+    let build = format_status_overview_line(&app, 120);
+    assert_eq!(
+        build.spans.last().and_then(|span| span.style.fg),
+        Some(MODE_BUILD_GREEN)
+    );
+
+    app.mode = SessionMode::Plan;
+    let plan = format_status_overview_line(&app, 120);
+    assert_eq!(
+        plan.spans.last().and_then(|span| span.style.fg),
+        Some(MODE_PURPLE)
+    );
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
@@ -553,7 +571,9 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(app.transcript[0].collapsed);
     let collapsed = render_to_string(&app, 100, 12);
     assert!(collapsed.contains("✔ Ran"), "{collapsed}");
-    assert!(collapsed.contains("grep success"), "{collapsed}");
+    assert!(collapsed.contains("grep"), "{collapsed}");
+    assert!(!collapsed.contains("receipt="), "{collapsed}");
+    assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
         !collapsed.contains("needle found"),
         "collapsed view should hide payload: {collapsed}"
@@ -565,6 +585,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(!app.transcript[0].collapsed);
     let expanded = render_to_string(&app, 100, 18);
     assert!(expanded.contains("needle found"), "{expanded}");
+    assert!(!expanded.contains("receipt output="), "{expanded}");
 }
 
 #[tokio::test]
@@ -616,93 +637,23 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
 }
 
 #[test]
-fn approval_prompt_surfaces_risk_target_and_persistence_keys() {
-    let permission = PermissionRequest {
-        call_id: "call".to_string(),
-        tool_name: "shell".to_string(),
-        capability: PermissionCapability::Compiler,
-        target: "cargo test:*".to_string(),
-        risk: PermissionRisk::Medium,
-        summary: "shell description=\"run tests\"".to_string(),
-        metadata: BTreeMap::from([
-            ("command".to_string(), "cargo test".to_string()),
-            ("cwd".to_string(), ".".to_string()),
-            ("env".to_string(), "allowlist (values redacted)".to_string()),
-            ("network".to_string(), "none".to_string()),
-            ("destructive".to_string(), "false".to_string()),
-            ("timeout_ms".to_string(), "30000".to_string()),
-            ("output_byte_cap".to_string(), "32000".to_string()),
-            ("sandbox".to_string(), "required".to_string()),
-            ("sandbox_network".to_string(), "deny_by_default".to_string()),
-        ]),
-        suggested_rules: Vec::new(),
-    };
-    let request = ToolApprovalRequest {
-        id: 1,
-        call_id: "call".to_string(),
-        tool_name: "shell".to_string(),
-        scope: PermissionScope::Shell,
-        permission,
-        matched_rule: None,
-        reason: "default compiler permission is ask".to_string(),
-    };
+fn approval_prompt_renders_actionable_menu_without_metadata_dump() {
+    let request = sample_approval_request();
 
     let prompt = format_approval_prompt(&request);
-    assert!(prompt.contains("risk=medium"), "missing risk: {prompt}");
+
+    assert!(prompt.contains("Approval needed"), "{prompt}");
+    assert!(prompt.contains("cargo test"), "{prompt}");
+    assert!(prompt.contains("Approve"), "{prompt}");
     assert!(
-        prompt.contains("target=cargo test:*"),
-        "missing target: {prompt}",
+        prompt.contains("Always approve this command in this repo"),
+        "{prompt}"
     );
-    assert!(
-        prompt.contains("command=\"cargo test\""),
-        "missing command metadata: {prompt}",
-    );
-    assert!(prompt.contains("cwd=\".\""), "missing cwd: {prompt}");
-    assert!(
-        prompt.contains("env=\"allowlist (values redacted)\""),
-        "missing env: {prompt}"
-    );
-    assert!(
-        prompt.contains("network=\"none\""),
-        "missing network: {prompt}"
-    );
-    assert!(
-        prompt.contains("destructive=\"false\""),
-        "missing destructive flag: {prompt}",
-    );
-    assert!(
-        prompt.contains("timeout_ms=\"30000\""),
-        "missing timeout: {prompt}",
-    );
-    assert!(
-        prompt.contains("output_byte_cap=\"32000\""),
-        "missing output_byte_cap: {prompt}",
-    );
-    assert!(
-        prompt.contains("sandbox=\"required\""),
-        "missing sandbox mode: {prompt}",
-    );
-    assert!(
-        prompt.contains("sandbox_network=\"deny_by_default\""),
-        "missing sandbox_network: {prompt}",
-    );
-    // Reason text appears verbatim on its own line.
-    assert!(
-        prompt.contains("reason=default compiler permission is ask"),
-        "missing reason: {prompt}",
-    );
-    // Multi-line format puts each field on its own line.
-    let line_count = prompt.matches('\n').count();
-    assert!(
-        line_count >= 6,
-        "expected multi-line prompt; got {line_count} newlines:\n{prompt}",
-    );
-    assert!(prompt.contains("[y] once"));
-    assert!(prompt.contains("[a] user allow"));
-    assert!(prompt.contains("[p] project allow"));
-    assert!(prompt.contains("[u] user deny"));
-    assert!(prompt.contains("[d] project deny"));
-    assert!(prompt.contains("[n] deny once"));
+    assert!(prompt.contains("Deny"), "{prompt}");
+    assert!(!prompt.contains("output_byte_cap"), "{prompt}");
+    assert!(!prompt.contains("sandbox_network"), "{prompt}");
+    assert!(!prompt.contains("env="), "{prompt}");
+    assert!(!prompt.contains("reason="), "{prompt}");
 }
 
 #[test]
@@ -728,9 +679,69 @@ fn approval_status_line_is_compact_single_line() {
     };
     let line = format_approval_status_line(&request);
     assert!(!line.contains('\n'), "status line must be single line");
-    assert!(line.contains("approval pending"));
+    assert!(line.contains("approval needed"));
     assert!(line.contains("risk=high"));
     assert!(line.contains("target=shell:*"));
+}
+
+#[tokio::test]
+async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
+    let mut app = test_app(SessionMode::Build);
+    let request = sample_approval_request();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request,
+        decision_tx,
+    });
+
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.approval_selection_index, 1);
+    assert!(handle_approval_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    ));
+
+    assert_eq!(
+        decision_rx.await.expect("approval decision"),
+        ToolApprovalDecision::AllowRuleProject
+    );
+    assert!(app.pending_approval.is_none());
+    assert!(app.status.contains("saved repo approval"), "{}", app.status);
+}
+
+#[test]
+fn approval_menu_renders_below_prompt_without_border_box() {
+    let mut app = test_app(SessionMode::Build);
+    let request = sample_approval_request();
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request,
+        decision_tx,
+    });
+    app.input = "approve?".to_string();
+
+    let output = render_to_string(&app, 120, 24);
+    let lines = output.lines().collect::<Vec<_>>();
+    let prompt = lines
+        .iter()
+        .position(|line| line.contains("approve?┃"))
+        .expect("prompt");
+    let approval = lines
+        .iter()
+        .position(|line| line.contains("Approval needed"))
+        .expect("approval menu");
+
+    assert!(approval > prompt, "{output}");
+    assert!(output.contains("› Approve"), "{output}");
+    assert!(
+        output.contains("Always approve this command in this repo"),
+        "{output}"
+    );
+    assert!(!output.contains("Approval required"), "{output}");
+    assert!(!output.contains('┌'), "{output}");
 }
 
 #[test]
@@ -1901,6 +1912,37 @@ fn test_config_with_root(mode: SessionMode, root: PathBuf) -> AppConfig {
     AppConfig {
         workspace_root: root,
         ..test_config(mode)
+    }
+}
+
+fn sample_approval_request() -> ToolApprovalRequest {
+    ToolApprovalRequest {
+        id: 1,
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission: PermissionRequest {
+            call_id: "call".to_string(),
+            tool_name: "shell".to_string(),
+            capability: PermissionCapability::Compiler,
+            target: "cargo test:*".to_string(),
+            risk: PermissionRisk::Medium,
+            summary: "shell description=\"run tests\"".to_string(),
+            metadata: BTreeMap::from([
+                ("command".to_string(), "cargo test".to_string()),
+                ("cwd".to_string(), ".".to_string()),
+                ("env".to_string(), "allowlist (values redacted)".to_string()),
+                ("network".to_string(), "none".to_string()),
+                ("destructive".to_string(), "false".to_string()),
+                ("timeout_ms".to_string(), "30000".to_string()),
+                ("output_byte_cap".to_string(), "32000".to_string()),
+                ("sandbox".to_string(), "required".to_string()),
+                ("sandbox_network".to_string(), "deny_by_default".to_string()),
+            ]),
+            suggested_rules: Vec::new(),
+        },
+        matched_rule: None,
+        reason: "default compiler permission is ask".to_string(),
     }
 }
 
