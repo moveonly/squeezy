@@ -789,32 +789,6 @@ fn prompt_height_grows_for_multiline_input() {
 }
 
 #[test]
-fn mouse_wheel_scrolls_transcript_inside_app() {
-    let mut app = test_app(SessionMode::Build);
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-    assert_eq!(app.transcript_scroll_from_bottom, 3);
-
-    handle_mouse(
-        &mut app,
-        MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        },
-    );
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
-}
-
-#[test]
 fn task_panel_renders_progress_blocker_next_action_and_verification() {
     let mut app = test_app(SessionMode::Build);
     app.task_state = Some(sample_task_state());

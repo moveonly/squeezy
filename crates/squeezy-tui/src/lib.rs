@@ -10,10 +10,10 @@ use std::{
 use crossterm::{
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
     },
     execute,
+    style::Print,
     terminal::{
         Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -59,6 +59,8 @@ const QUIET: Color = Color::DarkGray;
 const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
+const ENABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007h";
+const DISABLE_ALTERNATE_SCROLL: &str = "\x1b[?1007l";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
@@ -367,27 +369,11 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
 
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
-        Event::Mouse(mouse) => {
-            handle_mouse(app, mouse);
-            Ok(false)
-        }
         Event::Paste(text) => {
             handle_paste(app, agent, text).await?;
             Ok(false)
         }
         _ => Ok(false),
-    }
-}
-
-fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(3);
-        }
-        MouseEventKind::ScrollDown => {
-            app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_sub(3);
-        }
-        _ => {}
     }
 }
 
@@ -3265,11 +3251,13 @@ impl TerminalGuard {
         let mut stdout = io::stdout();
         execute!(
             stdout,
-            EnterAlternateScreen,
             Clear(ClearType::Purge),
             MoveTo(0, 0),
+            EnterAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0),
             EnableBracketedPaste,
-            EnableMouseCapture
+            Print(ENABLE_ALTERNATE_SCROLL)
         )
         .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))
@@ -3294,7 +3282,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
+            Print(DISABLE_ALTERNATE_SCROLL),
             LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
