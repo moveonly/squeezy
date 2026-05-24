@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
+use squeezy_agent::{JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
     PermissionRequest, PermissionRisk, PermissionScope, Role, SessionMode, StatusVerbosity,
@@ -495,6 +496,26 @@ fn compact_status_surfaces_context_without_dense_counters() {
 }
 
 #[test]
+fn status_line_surfaces_job_counts_and_latest_notification() {
+    let mut app = test_app(SessionMode::Build);
+    app.jobs.insert(1, test_job(1, JobStatus::Running));
+    app.jobs.insert(2, test_job(2, JobStatus::Completed));
+    app.notifications.push_back(JobNotification {
+        job_id: 2,
+        kind: JobKind::Shell,
+        status: JobStatus::Completed,
+        title: "shell".to_string(),
+        summary: "shell Success".to_string(),
+        ts_unix_ms: 42,
+    });
+
+    let status = format_status_tokens(&app);
+    assert!(status.contains("jobs=1/2"), "{status}");
+    assert!(status.contains("note=job2:completed"), "{status}");
+    assert!(status.contains("/jobs"), "{status}");
+}
+
+#[test]
 fn verbose_status_surfaces_budget_and_cache_details() {
     let mut config = test_config(SessionMode::Plan);
     config.tui = TuiConfig {
@@ -694,6 +715,102 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
 }
 
 #[tokio::test]
+async fn slash_jobs_lists_and_shows_jobs() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let job = agent.start_local_tool_job(ToolCall {
+        call_id: "test-checkpoints".to_string(),
+        name: "checkpoint_list".to_string(),
+        arguments: serde_json::json!({}),
+    });
+    app.jobs.insert(job.id, job.clone());
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
+    assert_eq!(app.status, "1 jobs");
+    assert!(
+        last_message_content(&app).is_some_and(|content| content.contains("checkpoint_list")),
+        "expected jobs list to include checkpoint_list"
+    );
+
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job {}", job.id)).await);
+    assert!(app.status.starts_with(&format!("job {} ", job.id)));
+    let detail = last_message_content(&app).unwrap_or_default().to_string();
+    assert!(
+        detail.contains("output_handle=-"),
+        "expected job detail to include output handle placeholder: {detail}"
+    );
+    assert!(
+        detail.contains("tool=checkpoint_list"),
+        "expected job detail to include tool name: {detail}"
+    );
+    assert!(
+        detail.contains("call_id=test-checkpoints"),
+        "expected job detail to include call_id: {detail}"
+    );
+}
+
+#[tokio::test]
+async fn slash_job_cancel_cancels_active_job() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let job = agent.start_local_tool_job(ToolCall {
+        call_id: "test-cancel".to_string(),
+        name: "checkpoint_list".to_string(),
+        arguments: serde_json::json!({}),
+    });
+    app.jobs.insert(job.id, job.clone());
+
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await);
+    assert!(
+        app.status.starts_with("cancelling job ")
+            || app.status.starts_with(&format!("job {} ", job.id)),
+        "expected cancel acknowledgement, got {}",
+        app.status
+    );
+
+    // A second cancel for the same id should report inactive once the job has settled.
+    let max_attempts = 50;
+    let mut saw_inactive = false;
+    for _ in 0..max_attempts {
+        assert!(
+            handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await
+        );
+        if app.status == format!("job {} not active", job.id) {
+            saw_inactive = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        saw_inactive,
+        "job never reported as inactive: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn slash_job_cancel_rejects_non_numeric_id() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel abc").await);
+    assert_eq!(app.status, "job id must be a number");
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel").await);
+    assert_eq!(app.status, "usage: /job-cancel <job_id>");
+}
+
+#[tokio::test]
+async fn slash_checkpoint_starts_local_job_instead_of_blocking() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/checkpoints").await);
+    assert!(app.status.starts_with("started job "), "{}", app.status);
+    assert_eq!(app.jobs.len(), 1);
+}
+
+#[tokio::test]
 async fn copy_failure_is_actionable_status() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app_with_clipboard(
@@ -840,6 +957,38 @@ async fn completed_event_preserves_scroll_offset_in_history() {
 }
 
 #[tokio::test]
+async fn job_events_update_state_without_resetting_turn() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::JobUpdated {
+        job: test_job(9, JobStatus::Running),
+    })
+    .await
+    .expect("send job update");
+    tx.send(AgentEvent::JobNotification {
+        notification: JobNotification {
+            job_id: 9,
+            kind: JobKind::Shell,
+            status: JobStatus::Completed,
+            title: "shell".to_string(),
+            summary: "shell Success".to_string(),
+            ts_unix_ms: 42,
+        },
+    })
+    .await
+    .expect("send notification");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(app.jobs[&9].status, JobStatus::Running);
+    assert_eq!(app.notifications.len(), 1);
+    assert_eq!(app.status, "job 9 completed: shell Success");
+    assert!(app.turn_rx.is_some());
+}
+
+#[tokio::test]
 async fn scroll_keys_preserve_status_text() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -976,6 +1125,31 @@ fn sample_task_state() -> TaskStateSnapshot {
         verification: TaskVerificationState::Running,
         recent_changes: vec!["added state model".to_string()],
         replan_reason: Some("status footer is too compact".to_string()),
+    }
+}
+
+fn test_job(id: JobId, status: JobStatus) -> JobSnapshot {
+    JobSnapshot {
+        id,
+        kind: JobKind::Shell,
+        status,
+        title: "shell description=\"run tests\"".to_string(),
+        progress: None,
+        result_summary: None,
+        output_handle: None,
+        turn_id: Some(TurnId::new(1)),
+        tool_name: Some("shell".to_string()),
+        call_id: Some(format!("call_{id}")),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        ended_at_ms: None,
+    }
+}
+
+fn last_message_content(app: &TuiApp) -> Option<&str> {
+    match &app.transcript.last()?.kind {
+        TranscriptEntryKind::Message(item) => Some(item.content.as_str()),
+        _ => None,
     }
 }
 

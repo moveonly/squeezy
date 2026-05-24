@@ -543,6 +543,7 @@ async fn run_agent_with_config(
             AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ApprovalRequested { .. }
             | AgentEvent::TaskStateUpdated { .. } => {}
+            AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

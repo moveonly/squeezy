@@ -13,7 +13,7 @@ use serde_json::json;
 use squeezy_core::{
     AppConfig, ContextAttachmentKind, PermissionAction, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionRuleSource, Result,
-    SessionLogConfig, SessionMode, SkillsConfig, TaskStateStatus,
+    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -57,6 +57,117 @@ impl LlmProvider for MockProvider {
         let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
             Box::pin(stream::iter(events));
         stream
+    }
+}
+
+#[test]
+fn job_registry_tracks_lifecycle_and_bounds_notifications() {
+    let jobs = JobRegistry::new();
+    let first = jobs.create(
+        JobKind::Shell,
+        "run shell",
+        Some(TurnId::new(7)),
+        Some("shell".to_string()),
+        Some("call_1".to_string()),
+        CancellationToken::new(),
+    );
+
+    assert_eq!(first.id, 1);
+    assert_eq!(first.status, JobStatus::Queued);
+    assert_eq!(jobs.snapshot().len(), 1);
+
+    let running = jobs.start(first.id).expect("started");
+    assert_eq!(running.status, JobStatus::Running);
+    assert!(running.status.is_active());
+
+    let done = jobs
+        .finish(
+            first.id,
+            JobStatus::Completed,
+            "shell Success output=2B",
+            Some("handle-1".to_string()),
+        )
+        .expect("finished");
+    assert_eq!(done.status, JobStatus::Completed);
+    assert_eq!(done.output_handle.as_deref(), Some("handle-1"));
+    assert_eq!(jobs.notifications().len(), 1);
+
+    let cancel = CancellationToken::new();
+    let cancellable = jobs.create(
+        JobKind::Tool,
+        "cancellable",
+        None,
+        None,
+        None,
+        cancel.clone(),
+    );
+    assert!(jobs.cancel(cancellable.id));
+    assert!(cancel.is_cancelled());
+    assert_eq!(
+        jobs.get(cancellable.id)
+            .and_then(|job| job.progress)
+            .map(|progress| progress.message),
+        Some("cancellation requested".to_string())
+    );
+
+    for index in 0..25 {
+        let job = jobs.create(
+            JobKind::Tool,
+            format!("job {index}"),
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        );
+        jobs.finish(job.id, JobStatus::Failed, "failed", None)
+            .expect("finish job");
+    }
+
+    assert_eq!(jobs.notifications().len(), MAX_JOB_NOTIFICATIONS);
+}
+
+#[test]
+fn job_registry_prunes_completed_jobs_past_retention_cap() {
+    let jobs = JobRegistry::new();
+    let active_count = 5;
+    let mut active_ids = Vec::new();
+    for index in 0..active_count {
+        let job = jobs.create(
+            JobKind::Tool,
+            format!("active {index}"),
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        );
+        active_ids.push(job.id);
+    }
+
+    let extra = MAX_JOBS_RETAINED + 50;
+    for index in 0..extra {
+        let job = jobs.create(
+            JobKind::Tool,
+            format!("done {index}"),
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        );
+        jobs.finish(job.id, JobStatus::Completed, "ok", None)
+            .expect("finish job");
+    }
+
+    let snapshot = jobs.snapshot();
+    assert!(
+        snapshot.len() <= MAX_JOBS_RETAINED,
+        "expected jobs map to stay bounded, got {}",
+        snapshot.len()
+    );
+    for id in &active_ids {
+        assert!(
+            jobs.get(*id).is_some(),
+            "active job {id} must not be pruned"
+        );
     }
 }
 
@@ -601,6 +712,92 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
     assert_eq!(cost.reasoning_output_tokens, Some(5));
     assert_eq!(provider.requests().len(), 2);
     assert!(!provider.requests()[0].tools.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_tool_emits_job_events_and_session_events() {
+    let root = temp_workspace("agent_shell_job");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf job-ok",
+                    "description": "print a marker",
+                    "timeout_ms": 10_000,
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_2".to_string()),
+            cost: CostSnapshot::default(),
+        })],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Allow,
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: ShellSandboxMode::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+    let session_id = agent.session_id().expect("session id");
+
+    let mut rx = agent.start_turn("run shell".to_string(), CancellationToken::new());
+    let mut job_statuses = Vec::new();
+    let mut notification = None;
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::JobUpdated { job } => job_statuses.push(job.status),
+            AgentEvent::JobNotification { notification: seen } => notification = Some(seen),
+            AgentEvent::ToolCallCompleted { result, .. } => shell_result = Some(result),
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        shell_result.expect("shell result").status,
+        ToolStatus::Success
+    );
+    assert!(
+        job_statuses.contains(&JobStatus::Running),
+        "missing running job event: {job_statuses:?}"
+    );
+    assert!(
+        job_statuses.contains(&JobStatus::Completed),
+        "missing completed job event: {job_statuses:?}"
+    );
+    let notification = notification.expect("job notification");
+    assert_eq!(notification.status, JobStatus::Completed);
+
+    let jobs = agent.jobs_snapshot();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].kind, JobKind::Shell);
+    assert_eq!(jobs[0].status, JobStatus::Completed);
+
+    let record = agent.show_session(&session_id).expect("session record");
+    let event_kinds = record
+        .events
+        .iter()
+        .map(|event| event.kind.as_str())
+        .collect::<Vec<_>>();
+    assert!(event_kinds.contains(&"job_queued"));
+    assert!(event_kinds.contains(&"job_started"));
+    assert!(event_kinds.contains(&"job_finished"));
 
     let _ = fs::remove_dir_all(root);
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     env, fs, io,
     path::PathBuf,
     sync::{
@@ -36,11 +36,14 @@ use squeezy_tools::{
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const MAX_TOOL_ROUNDS: usize = 8;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
+pub const MAX_JOB_NOTIFICATIONS: usize = 20;
+pub const MAX_JOBS_RETAINED: usize = 200;
+const JOB_SUMMARY_MAX_CHARS: usize = 320;
 
 #[derive(Debug, Clone, Default)]
 struct ConversationState {
@@ -93,11 +96,365 @@ pub struct ContextAttachmentUpdate {
     pub active: bool,
 }
 
+pub type JobId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Shell,
+    Verify,
+    Indexing,
+    Benchmark,
+    Compaction,
+    Tool,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Verify => "verify",
+            Self::Indexing => "indexing",
+            Self::Benchmark => "benchmark",
+            Self::Compaction => "compaction",
+            Self::Tool => "tool",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobProgress {
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobSnapshot {
+    pub id: JobId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub title: String,
+    pub progress: Option<JobProgress>,
+    pub result_summary: Option<String>,
+    pub output_handle: Option<String>,
+    pub turn_id: Option<TurnId>,
+    pub tool_name: Option<String>,
+    pub call_id: Option<String>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobNotification {
+    pub job_id: JobId,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    pub title: String,
+    pub summary: String,
+    pub ts_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobEvent {
+    Updated(JobSnapshot),
+    Notification(JobNotification),
+}
+
+#[derive(Clone)]
+pub struct JobRegistry {
+    state: Arc<std::sync::Mutex<JobRegistryState>>,
+    next_id: Arc<AtomicU64>,
+    tx: broadcast::Sender<JobEvent>,
+}
+
+#[derive(Debug, Default)]
+struct JobRegistryState {
+    jobs: BTreeMap<JobId, JobRecord>,
+    notifications: VecDeque<JobNotification>,
+}
+
+#[derive(Debug, Clone)]
+struct JobRecord {
+    snapshot: JobSnapshot,
+    cancel: CancellationToken,
+}
+
+impl Default for JobRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JobRegistry {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(128);
+        Self {
+            state: Arc::new(std::sync::Mutex::new(JobRegistryState::default())),
+            next_id: Arc::new(AtomicU64::new(1)),
+            tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<JobEvent> {
+        self.tx.subscribe()
+    }
+
+    pub fn snapshot(&self) -> Vec<JobSnapshot> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state
+            .jobs
+            .values()
+            .map(|record| record.snapshot.clone())
+            .collect()
+    }
+
+    pub fn notifications(&self) -> Vec<JobNotification> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.notifications.iter().cloned().collect()
+    }
+
+    pub fn get(&self, id: JobId) -> Option<JobSnapshot> {
+        let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        state.jobs.get(&id).map(|record| record.snapshot.clone())
+    }
+
+    pub fn create(
+        &self,
+        kind: JobKind,
+        title: impl Into<String>,
+        turn_id: Option<TurnId>,
+        tool_name: Option<String>,
+        call_id: Option<String>,
+        cancel: CancellationToken,
+    ) -> JobSnapshot {
+        let now = unix_timestamp_millis();
+        let snapshot = JobSnapshot {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            kind,
+            status: JobStatus::Queued,
+            title: title.into(),
+            progress: Some(JobProgress {
+                completed: None,
+                total: None,
+                message: "queued".to_string(),
+            }),
+            result_summary: None,
+            output_handle: None,
+            turn_id,
+            tool_name,
+            call_id,
+            created_at_ms: now,
+            updated_at_ms: now,
+            ended_at_ms: None,
+        };
+        self.update_record(snapshot.clone(), Some(cancel), false);
+        snapshot
+    }
+
+    pub fn start(&self, id: JobId) -> Option<JobSnapshot> {
+        self.update(id, false, |snapshot| {
+            snapshot.status = JobStatus::Running;
+            snapshot.progress = Some(JobProgress {
+                completed: None,
+                total: None,
+                message: "running".to_string(),
+            });
+        })
+    }
+
+    pub fn progress(
+        &self,
+        id: JobId,
+        completed: Option<u64>,
+        total: Option<u64>,
+        message: impl Into<String>,
+    ) -> Option<JobSnapshot> {
+        self.update(id, false, |snapshot| {
+            snapshot.progress = Some(JobProgress {
+                completed,
+                total,
+                message: message.into(),
+            });
+        })
+    }
+
+    pub fn finish(
+        &self,
+        id: JobId,
+        status: JobStatus,
+        summary: impl Into<String>,
+        output_handle: Option<String>,
+    ) -> Option<JobSnapshot> {
+        let summary = truncate_chars(&summary.into(), JOB_SUMMARY_MAX_CHARS);
+        self.update(id, true, |snapshot| {
+            snapshot.status = status;
+            snapshot.result_summary = Some(summary);
+            snapshot.output_handle = output_handle;
+            snapshot.progress = Some(JobProgress {
+                completed: Some(1),
+                total: Some(1),
+                message: status.as_str().to_string(),
+            });
+            snapshot.ended_at_ms = Some(unix_timestamp_millis());
+        })
+    }
+
+    pub fn cancel(&self, id: JobId) -> bool {
+        let cancel = {
+            let state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            let Some(record) = state.jobs.get(&id) else {
+                return false;
+            };
+            if !record.snapshot.status.is_active() {
+                return false;
+            }
+            record.cancel.clone()
+        };
+        cancel.cancel();
+        let _ = self.progress(id, None, None, "cancellation requested");
+        true
+    }
+
+    fn update(
+        &self,
+        id: JobId,
+        notify: bool,
+        update: impl FnOnce(&mut JobSnapshot),
+    ) -> Option<JobSnapshot> {
+        let (snapshot, notification) = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            let record = state.jobs.get_mut(&id)?;
+            update(&mut record.snapshot);
+            record.snapshot.updated_at_ms = unix_timestamp_millis();
+            let snapshot = record.snapshot.clone();
+            let notification = if notify {
+                push_job_notification(&mut state, &snapshot);
+                state.notifications.back().cloned()
+            } else {
+                None
+            };
+            if snapshot.status.is_terminal() {
+                prune_completed_jobs(&mut state);
+            }
+            (snapshot, notification)
+        };
+        let _ = self.tx.send(JobEvent::Updated(snapshot.clone()));
+        if let Some(notification) = notification {
+            let _ = self.tx.send(JobEvent::Notification(notification));
+        }
+        Some(snapshot)
+    }
+
+    fn update_record(
+        &self,
+        snapshot: JobSnapshot,
+        cancel: Option<CancellationToken>,
+        notify: bool,
+    ) {
+        let notification = {
+            let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
+            let record = JobRecord {
+                snapshot: snapshot.clone(),
+                cancel: cancel.unwrap_or_default(),
+            };
+            state.jobs.insert(snapshot.id, record);
+            let notification = if notify {
+                push_job_notification(&mut state, &snapshot);
+                state.notifications.back().cloned()
+            } else {
+                None
+            };
+            prune_completed_jobs(&mut state);
+            notification
+        };
+        let _ = self.tx.send(JobEvent::Updated(snapshot));
+        if let Some(notification) = notification {
+            let _ = self.tx.send(JobEvent::Notification(notification));
+        }
+    }
+}
+
+fn push_job_notification(state: &mut JobRegistryState, snapshot: &JobSnapshot) {
+    let summary = snapshot
+        .result_summary
+        .clone()
+        .or_else(|| {
+            snapshot
+                .progress
+                .as_ref()
+                .map(|progress| progress.message.clone())
+        })
+        .unwrap_or_else(|| snapshot.status.as_str().to_string());
+    state.notifications.push_back(JobNotification {
+        job_id: snapshot.id,
+        kind: snapshot.kind,
+        status: snapshot.status,
+        title: snapshot.title.clone(),
+        summary,
+        ts_unix_ms: unix_timestamp_millis(),
+    });
+    while state.notifications.len() > MAX_JOB_NOTIFICATIONS {
+        state.notifications.pop_front();
+    }
+}
+
+fn prune_completed_jobs(state: &mut JobRegistryState) {
+    if state.jobs.len() <= MAX_JOBS_RETAINED {
+        return;
+    }
+    let mut terminal: Vec<(JobId, u64)> = state
+        .jobs
+        .iter()
+        .filter(|(_, record)| record.snapshot.status.is_terminal())
+        .map(|(id, record)| (*id, record.snapshot.ended_at_ms.unwrap_or(0)))
+        .collect();
+    terminal.sort_by_key(|(_, ended_at)| *ended_at);
+    let mut to_remove = state.jobs.len().saturating_sub(MAX_JOBS_RETAINED);
+    for (id, _) in terminal {
+        if to_remove == 0 {
+            break;
+        }
+        state.jobs.remove(&id);
+        to_remove -= 1;
+    }
+}
+
 #[derive(Clone)]
 pub struct Agent {
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     tools: ToolRegistry,
+    jobs: JobRegistry,
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
@@ -230,6 +587,7 @@ impl Agent {
             config,
             provider,
             tools,
+            jobs: JobRegistry::new(),
             redactor,
             session_metrics,
             session_log,
@@ -304,6 +662,66 @@ impl Agent {
         self.tools
             .execute_for_group(call, CancellationToken::new(), "manual".to_string())
             .await
+    }
+
+    pub fn subscribe_jobs(&self) -> broadcast::Receiver<JobEvent> {
+        self.jobs.subscribe()
+    }
+
+    pub fn jobs_snapshot(&self) -> Vec<JobSnapshot> {
+        self.jobs.snapshot()
+    }
+
+    pub fn job_notifications(&self) -> Vec<JobNotification> {
+        self.jobs.notifications()
+    }
+
+    pub fn job_snapshot(&self, id: JobId) -> Option<JobSnapshot> {
+        self.jobs.get(id)
+    }
+
+    pub fn cancel_job(&self, id: JobId) -> bool {
+        self.jobs.cancel(id)
+    }
+
+    pub fn start_local_tool_job(&self, call: ToolCall) -> JobSnapshot {
+        let kind = job_kind_for_tool(&call.name).unwrap_or(JobKind::Tool);
+        let title = self.tools.describe_call(&call);
+        let cancel = CancellationToken::new();
+        let snapshot = self.jobs.create(
+            kind,
+            title,
+            None,
+            Some(call.name.clone()),
+            Some(call.call_id.clone()),
+            cancel.clone(),
+        );
+        log_job_lifecycle(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "job_queued",
+            &snapshot,
+        );
+        let tools = self.tools.clone();
+        let jobs = self.jobs.clone();
+        let session_log = self.session_log.clone();
+        let redactor = self.redactor.clone();
+        let job_id = snapshot.id;
+        tokio::spawn(async move {
+            if let Some(started) = jobs.start(job_id) {
+                log_job_lifecycle(session_log.as_ref(), &redactor, "job_started", &started);
+            }
+            let result = tools
+                .execute_for_group(call, cancel, format!("job-{job_id}"))
+                .await;
+            let status = job_status_for_tool_status(result.status);
+            let summary = tool_result_summary(&result);
+            let output_handle = tool_result_output_handle(&result);
+            if let Some(done) = jobs.finish(job_id, status, summary, output_handle) {
+                log_job_lifecycle(session_log.as_ref(), &redactor, "job_finished", &done);
+            }
+        });
+        snapshot
     }
 
     pub async fn flush_telemetry(&self) {
@@ -610,6 +1028,7 @@ impl Agent {
         let mut config = self.config.clone();
         config.tui.response_verbosity = response_verbosity;
         let tools = self.tools.clone();
+        let jobs = self.jobs.clone();
         let telemetry = self.telemetry.clone();
         let redactor = self.redactor.clone();
         let session_metrics = self.session_metrics.clone();
@@ -658,6 +1077,7 @@ impl Agent {
                 provider,
                 config,
                 tools,
+                jobs,
                 telemetry: telemetry.clone(),
                 redactor: redactor.clone(),
                 session_metrics,
@@ -719,6 +1139,7 @@ struct TurnRuntime {
     provider: Arc<dyn LlmProvider>,
     config: AppConfig,
     tools: ToolRegistry,
+    jobs: JobRegistry,
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
     session_metrics: Arc<Mutex<SessionMetrics>>,
@@ -1042,6 +1463,7 @@ impl TurnRuntime {
                     turn_id: self.turn_id,
                     provider: self.provider.clone(),
                     tools: &self.tools,
+                    jobs: &self.jobs,
                     config: &self.config,
                     telemetry: self.telemetry.clone(),
                     redactor: self.redactor.clone(),
@@ -1245,6 +1667,7 @@ struct ToolExecutionContext<'a> {
     turn_id: TurnId,
     provider: Arc<dyn LlmProvider>,
     tools: &'a ToolRegistry,
+    jobs: &'a JobRegistry,
     config: &'a AppConfig,
     telemetry: TelemetryClient,
     redactor: Arc<Redactor>,
@@ -1579,6 +2002,38 @@ async fn run_one_tool(
     tool_sequence: u64,
     call: ToolCall,
 ) -> ToolResult {
+    let tracked_job = job_kind_for_tool(&call.name).map(|kind| {
+        let cancel = context.cancel.child_token();
+        let snapshot = context.jobs.create(
+            kind,
+            context.tools.describe_call(&call),
+            Some(context.turn_id),
+            Some(call.name.clone()),
+            Some(call.call_id.clone()),
+            cancel.clone(),
+        );
+        log_job_lifecycle(
+            context.session_log.as_ref(),
+            &context.redactor,
+            "job_queued",
+            &snapshot,
+        );
+        (snapshot.id, cancel)
+    });
+    if let Some((job_id, _)) = &tracked_job
+        && let Some(started) = context.jobs.start(*job_id)
+    {
+        log_job_lifecycle(
+            context.session_log.as_ref(),
+            &context.redactor,
+            "job_started",
+            &started,
+        );
+        let _ = context
+            .tx
+            .send(AgentEvent::JobUpdated { job: started })
+            .await;
+    }
     let _ = context
         .tx
         .send(AgentEvent::ToolCallStarted {
@@ -1589,8 +2044,44 @@ async fn run_one_tool(
     let started = Instant::now();
     let result = context
         .tools
-        .execute_for_group(call, context.cancel.clone(), context.turn_id.to_string())
+        .execute_for_group(
+            call,
+            tracked_job
+                .as_ref()
+                .map(|(_, cancel)| cancel.clone())
+                .unwrap_or_else(|| context.cancel.clone()),
+            context.turn_id.to_string(),
+        )
         .await;
+    if let Some((job_id, _)) = tracked_job {
+        let status = job_status_for_tool_status(result.status);
+        let summary = tool_result_summary(&result);
+        let output_handle = tool_result_output_handle(&result);
+        if let Some(done) = context.jobs.finish(job_id, status, summary, output_handle) {
+            log_job_lifecycle(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "job_finished",
+                &done,
+            );
+            let _ = context
+                .tx
+                .send(AgentEvent::JobUpdated { job: done.clone() })
+                .await;
+            if let Some(notification) = context
+                .jobs
+                .notifications()
+                .into_iter()
+                .rev()
+                .find(|notification| notification.job_id == done.id)
+            {
+                let _ = context
+                    .tx
+                    .send(AgentEvent::JobNotification { notification })
+                    .await;
+            }
+        }
+    }
     emit_tool_telemetry(
         context.config,
         &context.telemetry,
@@ -2614,6 +3105,128 @@ fn log_session_event(
     ));
 }
 
+fn log_job_lifecycle(
+    session: Option<&SessionHandle>,
+    redactor: &Redactor,
+    kind: &str,
+    job: &JobSnapshot,
+) {
+    log_session_event(
+        session,
+        redactor,
+        kind,
+        job.turn_id,
+        Some(format!(
+            "job {} {} {}",
+            job.id,
+            job.status.as_str(),
+            job.title
+        )),
+        json!({
+            "job": job_snapshot_json(job),
+        }),
+    );
+}
+
+fn job_snapshot_json(job: &JobSnapshot) -> Value {
+    json!({
+        "id": job.id,
+        "kind": job.kind.as_str(),
+        "status": job.status.as_str(),
+        "title": &job.title,
+        "progress": job.progress.as_ref().map(|progress| json!({
+            "completed": progress.completed,
+            "total": progress.total,
+            "message": &progress.message,
+        })),
+        "result_summary": job.result_summary.as_ref(),
+        "output_handle": job.output_handle.as_ref(),
+        "turn_id": job.turn_id.map(|turn_id| turn_id.to_string()),
+        "tool_name": job.tool_name.as_ref(),
+        "call_id": job.call_id.as_ref(),
+        "created_at_ms": job.created_at_ms,
+        "updated_at_ms": job.updated_at_ms,
+        "ended_at_ms": job.ended_at_ms,
+    })
+}
+
+fn job_kind_for_tool(name: &str) -> Option<JobKind> {
+    match name {
+        "shell" => Some(JobKind::Shell),
+        "verify" => Some(JobKind::Verify),
+        "symbol_context" | "diff_context" => Some(JobKind::Indexing),
+        _ => None,
+    }
+}
+
+fn job_status_for_tool_status(status: ToolStatus) -> JobStatus {
+    match status {
+        ToolStatus::Success => JobStatus::Completed,
+        ToolStatus::Cancelled => JobStatus::Cancelled,
+        ToolStatus::Error | ToolStatus::Denied | ToolStatus::Stale => JobStatus::Failed,
+    }
+}
+
+fn tool_result_summary(result: &ToolResult) -> String {
+    let mut parts = vec![format!("{} {:?}", result.tool_name, result.status)];
+    if let Some(exit_code) = result.content.get("exit_code").and_then(Value::as_i64) {
+        parts.push(format!("exit={exit_code}"));
+    }
+    if let Some(error) = result.content.get("error").and_then(Value::as_str)
+        && !error.trim().is_empty()
+    {
+        parts.push(format!("error={}", collapse_status_text(error)));
+    }
+    if let Some(handle) = tool_result_output_handle(result) {
+        parts.push(format!("handle={handle}"));
+    }
+    if result.cost_hint.output_bytes > 0 {
+        parts.push(format!("output={}B", result.cost_hint.output_bytes));
+    }
+    if result.cost_hint.truncated {
+        parts.push("truncated".to_string());
+    }
+    truncate_chars(&parts.join(" "), JOB_SUMMARY_MAX_CHARS)
+}
+
+fn tool_result_output_handle(result: &ToolResult) -> Option<String> {
+    result
+        .content
+        .get("handle")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            result
+                .content
+                .get("output")
+                .and_then(|output| output.get("handle"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string)
+}
+
+fn collapse_status_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut output = text
+        .chars()
+        .take(max_chars.saturating_sub(13))
+        .collect::<String>();
+    output.push_str(" [truncated]");
+    output
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 fn user_item_summary(item: &LlmInputItem) -> Option<String> {
     match item {
         LlmInputItem::UserText(text) => Some(text.clone()),
@@ -3053,6 +3666,12 @@ pub enum AgentEvent {
     TaskStateUpdated {
         turn_id: TurnId,
         snapshot: TaskStateSnapshot,
+    },
+    JobUpdated {
+        job: JobSnapshot,
+    },
+    JobNotification {
+        notification: JobNotification,
     },
     ApprovalRequested {
         turn_id: TurnId,

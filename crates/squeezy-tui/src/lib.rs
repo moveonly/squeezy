@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, VecDeque},
     io::{self, Write},
     path::PathBuf,
     sync::Arc,
@@ -20,7 +21,10 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolApprovalRequest};
+use squeezy_agent::{
+    Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
+    MAX_JOBS_RETAINED, ToolApprovalDecision, ToolApprovalRequest,
+};
 use squeezy_core::{
     AppConfig, ContextAttachment, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
     SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
@@ -30,7 +34,7 @@ use squeezy_llm::LlmProvider;
 use squeezy_store::SessionQuery;
 use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
@@ -83,6 +87,13 @@ async fn run_inner(
         app.push_transcript_item(item);
     }
     app.attachments = agent.context_attachments_snapshot().await;
+    app.job_rx = Some(agent.subscribe_jobs());
+    app.jobs = agent
+        .jobs_snapshot()
+        .into_iter()
+        .map(|job| (job.id, job))
+        .collect();
+    app.notifications = agent.job_notifications().into_iter().collect();
     if let Some(session_id) = agent.session_id() {
         app.status = format!("session {session_id}");
     }
@@ -90,6 +101,7 @@ async fn run_inner(
     loop {
         terminal.draw(|frame| render(frame, &app))?;
 
+        drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
         if poll_input(&mut app, &mut agent, config.tick_rate).await? {
             break;
@@ -154,6 +166,12 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.task_state = Some(snapshot);
                     app.status = "task state updated".to_string();
                 }
+                AgentEvent::JobUpdated { job } => {
+                    apply_job_update(app, job);
+                }
+                AgentEvent::JobNotification { notification } => {
+                    apply_job_notification(app, notification);
+                }
                 AgentEvent::ApprovalRequested {
                     request,
                     decision_tx,
@@ -204,6 +222,72 @@ async fn drain_agent_events(app: &mut TuiApp) {
         if keep_rx {
             app.turn_rx = Some(rx);
         }
+    }
+}
+
+fn drain_job_events(app: &mut TuiApp) {
+    loop {
+        let event = match app.job_rx.as_mut() {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match event {
+            Ok(JobEvent::Updated(job)) => apply_job_update(app, job),
+            Ok(JobEvent::Notification(notification)) => apply_job_notification(app, notification),
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                app.status = format!("skipped {skipped} job updates");
+            }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                app.job_rx = None;
+                break;
+            }
+        }
+    }
+}
+
+fn apply_job_update(app: &mut TuiApp, job: JobSnapshot) {
+    app.jobs.insert(job.id, job);
+    prune_tui_jobs(&mut app.jobs);
+}
+
+fn prune_tui_jobs(jobs: &mut BTreeMap<JobId, JobSnapshot>) {
+    if jobs.len() <= MAX_JOBS_RETAINED {
+        return;
+    }
+    let mut terminal: Vec<(JobId, u64)> = jobs
+        .iter()
+        .filter(|(_, job)| job.status.is_terminal())
+        .map(|(id, job)| (*id, job.ended_at_ms.unwrap_or(0)))
+        .collect();
+    terminal.sort_by_key(|(_, ended_at)| *ended_at);
+    let mut to_remove = jobs.len().saturating_sub(MAX_JOBS_RETAINED);
+    for (id, _) in terminal {
+        if to_remove == 0 {
+            break;
+        }
+        jobs.remove(&id);
+        to_remove -= 1;
+    }
+}
+
+fn apply_job_notification(app: &mut TuiApp, notification: JobNotification) {
+    app.status = format!(
+        "job {} {}: {}",
+        notification.job_id,
+        notification.status.as_str(),
+        notification.summary
+    );
+    if app.notifications.back().is_some_and(|previous| {
+        previous.job_id == notification.job_id
+            && previous.status == notification.status
+            && previous.summary == notification.summary
+    }) {
+        return;
+    }
+    app.notifications.push_back(notification);
+    while app.notifications.len() > MAX_JOB_NOTIFICATIONS {
+        app.notifications.pop_front();
     }
 }
 
@@ -488,6 +572,54 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             app.status = format!("tool output verbosity {}", verbosity.as_str());
             return true;
         }
+        "/jobs" => {
+            sync_jobs_from_agent(app, agent);
+            let jobs = format_jobs_list(app);
+            app.status = format!("{} jobs", app.jobs.len());
+            app.push_transcript_item(TranscriptItem::system(jobs));
+            return true;
+        }
+        "/job" => {
+            let Some(raw_id) = parts.next() else {
+                app.status = "usage: /job <job_id>".to_string();
+                return true;
+            };
+            let Some(id) = parse_job_id(raw_id) else {
+                app.status = "job id must be a number".to_string();
+                return true;
+            };
+            sync_jobs_from_agent(app, agent);
+            match app
+                .jobs
+                .get(&id)
+                .cloned()
+                .or_else(|| agent.job_snapshot(id))
+            {
+                Some(job) => {
+                    app.status = format!("job {} {}", job.id, job.status.as_str());
+                    app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
+                }
+                None => app.status = format!("job {id} not found"),
+            }
+            return true;
+        }
+        "/job-cancel" => {
+            let Some(raw_id) = parts.next() else {
+                app.status = "usage: /job-cancel <job_id>".to_string();
+                return true;
+            };
+            let Some(id) = parse_job_id(raw_id) else {
+                app.status = "job id must be a number".to_string();
+                return true;
+            };
+            if agent.cancel_job(id) {
+                app.status = format!("cancelling job {id}");
+                sync_jobs_from_agent(app, agent);
+            } else {
+                app.status = format!("job {id} not active");
+            }
+            return true;
+        }
         "/sessions" => {
             match agent.list_sessions(&SessionQuery::default()) {
                 Ok(sessions) => {
@@ -627,20 +759,13 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         _ => return false,
     };
-    let result = agent
-        .execute_local_tool(ToolCall {
-            call_id: format!("tui-{name}"),
-            name: name.to_string(),
-            arguments,
-        })
-        .await;
-    app.status = format!(
-        "{}: {:?} {}",
-        name,
-        result.status,
-        summarize_local_tool_result(&result.content)
-    );
-    app.push_tool_result(result);
+    let job = agent.start_local_tool_job(ToolCall {
+        call_id: format!("tui-{name}"),
+        name: name.to_string(),
+        arguments,
+    });
+    app.jobs.insert(job.id, job.clone());
+    app.status = format!("started job {} {}", job.id, job.title);
     true
 }
 
@@ -693,44 +818,66 @@ fn format_attachment_line(attachment: &ContextAttachment) -> String {
     )
 }
 
-fn summarize_local_tool_result(content: &serde_json::Value) -> String {
-    if let Some(array) = content
-        .get("checkpoints")
-        .and_then(|value| value.as_array())
-    {
-        return format!("{} checkpoints", array.len());
+fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
+    app.jobs = agent
+        .jobs_snapshot()
+        .into_iter()
+        .map(|job| (job.id, job))
+        .collect();
+    app.notifications = agent.job_notifications().into_iter().collect();
+}
+
+fn parse_job_id(raw: &str) -> Option<JobId> {
+    raw.parse().ok()
+}
+
+fn format_jobs_list(app: &TuiApp) -> String {
+    if app.jobs.is_empty() {
+        return "no jobs".to_string();
     }
-    if let Some(checkpoint) = content.get("checkpoint") {
-        let id = checkpoint
-            .get("id")
-            .and_then(|value| value.as_str())
-            .unwrap_or("?");
-        let files = checkpoint
-            .get("files")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len());
-        let skipped = checkpoint
-            .get("skipped_files")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len());
-        return format!("checkpoint={id} files={files} skipped={skipped}");
-    }
-    if let Some(rollback) = content.get("rollback") {
-        let restored = rollback
-            .get("restored_files")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len());
-        let deleted = rollback
-            .get("deleted_files")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len());
-        let conflicts = rollback
-            .get("conflicts")
-            .and_then(|value| value.as_array())
-            .map_or(0, |items| items.len());
-        return format!("restored={restored} deleted={deleted} conflicts={conflicts}");
-    }
-    String::new()
+    app.jobs
+        .values()
+        .rev()
+        .take(MAX_JOB_NOTIFICATIONS)
+        .map(|job| {
+            format!(
+                "{} {} {} {}",
+                job.id,
+                job.status.as_str(),
+                job.kind.as_str(),
+                sanitize_inline(&job.title)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_job_detail(job: &JobSnapshot) -> String {
+    let progress = job
+        .progress
+        .as_ref()
+        .map(|progress| progress.message.as_str())
+        .unwrap_or("-");
+    let summary = job.result_summary.as_deref().unwrap_or("-");
+    let handle = job.output_handle.as_deref().unwrap_or("-");
+    let tool_name = job.tool_name.as_deref().unwrap_or("-");
+    let call_id = job.call_id.as_deref().unwrap_or("-");
+    format!(
+        "job {id}\nstatus={status}\nkind={kind}\ntool={tool}\ncall_id={call_id}\ntitle={title}\nprogress={progress}\nsummary={summary}\noutput_handle={handle}",
+        id = job.id,
+        status = job.status.as_str(),
+        kind = job.kind.as_str(),
+        tool = tool_name,
+        call_id = call_id,
+        title = sanitize_inline(&job.title),
+        progress = sanitize_inline(progress),
+        summary = sanitize_inline(summary),
+        handle = sanitize_inline(handle),
+    )
+}
+
+fn sanitize_inline(text: &str) -> String {
+    text.replace(['\n', '\r'], " ")
 }
 
 fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
@@ -1527,8 +1674,24 @@ fn format_status_tokens(app: &TuiApp) -> String {
     } else {
         ""
     };
+    let active_jobs = app
+        .jobs
+        .values()
+        .filter(|job| job.status.is_active())
+        .count();
+    let latest_notification = app
+        .notifications
+        .back()
+        .map(|notification| {
+            format!(
+                "  note=job{}:{}",
+                notification.job_id,
+                notification.status.as_str()
+            )
+        })
+        .unwrap_or_default();
     let context = format!(
-        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  status={}{}",
+        "{}:{}  mode={}  {}  {}  sandbox={}  telemetry={}  jobs={}/{}  status={}{}{}",
         app.provider_name,
         app.model,
         app.mode.as_str(),
@@ -1536,7 +1699,10 @@ fn format_status_tokens(app: &TuiApp) -> String {
         app.permissions.compact(),
         app.permissions.sandbox,
         app.telemetry.as_str(),
+        active_jobs,
+        app.jobs.len(),
         app.status,
+        latest_notification,
         scroll_marker,
     );
     let spend = format!(
@@ -1557,7 +1723,7 @@ fn format_status_tokens(app: &TuiApp) -> String {
     } else if app.cancel.is_some() {
         "Enter send | Shift-Tab mode | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | Ctrl-P task | /copy | /sessions /resume | Ctrl-C/Esc cancel"
     } else {
-        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /attach /attachments /detach /sessions /resume /collapse /expand /verbosity | Esc quit"
+        "Enter send | Shift-Tab mode | Up/Down select | Ctrl-E collapse | Ctrl-P task | PgUp/PgDn/Home/End scroll | Ctrl-Y copy | /copy /attach /attachments /detach /sessions /resume /collapse /expand /verbosity /tool-verbosity /jobs | Esc quit"
     };
     match app.status_verbosity {
         StatusVerbosity::Compact => format!("{context}  {spend}\n{hints}"),
@@ -1810,6 +1976,9 @@ struct TuiApp {
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
+    job_rx: Option<broadcast::Receiver<JobEvent>>,
+    jobs: BTreeMap<JobId, JobSnapshot>,
+    notifications: VecDeque<JobNotification>,
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
     clipboard: Box<dyn Clipboard>,
@@ -1884,6 +2053,9 @@ impl TuiApp {
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
+            job_rx: None,
+            jobs: BTreeMap::new(),
+            notifications: VecDeque::new(),
             cancel: None,
             pending_approval: None,
             clipboard,
