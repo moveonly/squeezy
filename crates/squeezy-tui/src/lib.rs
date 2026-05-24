@@ -333,10 +333,11 @@ async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::ToolCallQueued { call, .. } => {
                     app.status = format!("queued {}", call.name);
-                    app.push_tool_call(call);
+                    app.active_tool = Some(call.name);
                 }
                 AgentEvent::ToolCallStarted { call, .. } => {
                     app.status = format!("running {}", call.name);
+                    app.active_tool = Some(call.name);
                 }
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     app.status = format!(
@@ -354,6 +355,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.status
                             .push_str(&format!(" redacted={}", result.cost_hint.redactions));
                     }
+                    app.active_tool = None;
                     app.push_tool_result(result);
                 }
                 AgentEvent::TaskStateUpdated { snapshot, .. } => {
@@ -406,6 +408,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.metrics = metrics;
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
+                    app.active_tool = None;
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
                     app.cancel = None;
@@ -417,6 +420,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
+                    app.active_tool = None;
                     app.cancel = None;
                     keep_rx = false;
                     break;
@@ -426,6 +430,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.turn_visual = TurnVisualState::Failed;
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
+                    app.active_tool = None;
                     app.cancel = None;
                     keep_rx = false;
                     break;
@@ -2091,8 +2096,8 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         constraints.push(Constraint::Length(attachment_height));
     }
     constraints.push(Constraint::Length(input_height));
-    constraints.push(Constraint::Min(0));
     constraints.push(Constraint::Length(2));
+    constraints.push(Constraint::Min(0));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -2120,10 +2125,11 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     render_input(frame, chunks[index], app);
     index += 1;
-    // Flexible filler keeps the prompt attached to the transcript instead of
-    // pinning it to the footer.
-    index += 1;
     render_status(frame, chunks[index], app);
+    index += 1;
+    // Flexible filler keeps the prompt/status block attached to the transcript
+    // instead of pinning it to the terminal bottom.
+    let _ = chunks[index];
 }
 
 fn render_startup_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -2149,16 +2155,26 @@ fn task_panel_height(app: &TuiApp) -> u16 {
     let line_count = app
         .task_state
         .as_ref()
-        .map(|snapshot| format_task_state_lines(snapshot, false).len() as u16)
+        .map(|snapshot| {
+            format_task_state_lines(snapshot, false, app.active_tool.as_deref()).len() as u16
+        })
         .unwrap_or(1);
     line_count.clamp(1, 7)
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let lines = if let Some(snapshot) = app.task_state.as_ref() {
-        format_task_state_lines(snapshot, app.task_panel_collapsed)
+        format_task_state_lines(
+            snapshot,
+            app.task_panel_collapsed,
+            app.active_tool.as_deref(),
+        )
     } else {
-        vec![turn_state_line("Working", None, AMBER)]
+        vec![turn_state_line(
+            "Working",
+            active_tool_detail(app.active_tool.as_deref()),
+            AMBER,
+        )]
     };
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
@@ -2166,16 +2182,24 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec<Line<'static>> {
+fn format_task_state_lines(
+    snapshot: &TaskStateSnapshot,
+    collapsed: bool,
+    active_tool: Option<&str>,
+) -> Vec<Line<'static>> {
     let (label, color) = task_status_label_color(snapshot.status);
     if collapsed {
-        let detail = format!(
+        let mut detail = format!(
             "active {} · blocker {} · next {} · verify {}",
             snapshot.active_step_title().unwrap_or("-"),
             snapshot.blocker.as_deref().unwrap_or("-"),
             snapshot.next_action.as_deref().unwrap_or("-"),
             snapshot.verification.as_str(),
         );
+        if let Some(tool) = active_tool.filter(|tool| !tool.trim().is_empty()) {
+            detail.push_str(" · running ");
+            detail.push_str(tool);
+        }
         return vec![turn_state_line(label, Some(detail), color)];
     }
 
@@ -2185,7 +2209,11 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
     } else {
         Some(task_title(snapshot).to_string())
     };
-    lines.push(turn_state_line(label, title, color));
+    lines.push(turn_state_line(
+        label,
+        turn_title_with_active_tool(title, active_tool),
+        color,
+    ));
     if let Some(summary) = &snapshot.summary {
         lines.push(Line::from(format!("  {summary}")));
     }
@@ -2229,6 +2257,21 @@ fn format_task_state_lines(snapshot: &TaskStateSnapshot, collapsed: bool) -> Vec
         lines.push(Line::from(format!("  replan {reason}")));
     }
     lines
+}
+
+fn active_tool_detail(active_tool: Option<&str>) -> Option<String> {
+    active_tool
+        .filter(|tool| !tool.trim().is_empty())
+        .map(|tool| format!("running {tool}"))
+}
+
+fn turn_title_with_active_tool(title: Option<String>, active_tool: Option<&str>) -> Option<String> {
+    match (title, active_tool_detail(active_tool)) {
+        (Some(title), Some(tool)) => Some(format!("{title} · {tool}")),
+        (Some(title), None) => Some(title),
+        (None, Some(tool)) => Some(tool),
+        (None, None) => None,
+    }
 }
 
 fn task_status_label_color(status: squeezy_core::TaskStateStatus) -> (&'static str, Color) {
@@ -2280,7 +2323,7 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, prompt: &str) {
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let lines = transcript_lines(app);
+    let lines = transcript_lines(app, Some(area.width));
     let scroll =
         transcript_scroll_offset(lines.len(), area.height, app.transcript_scroll_from_bottom);
     let paragraph = Paragraph::new(lines)
@@ -2289,14 +2332,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(paragraph, area);
 }
 
-fn transcript_lines(app: &TuiApp) -> Vec<Line<'static>> {
+fn transcript_lines(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, item) in app.transcript.iter().enumerate() {
-        lines.extend(format_transcript_entry(
+        lines.extend(format_transcript_entry_with_width(
             item,
             app.selected_entry == Some(index),
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
+            width,
         ));
     }
     if !app.pending_assistant.is_empty() {
@@ -2408,7 +2452,7 @@ fn transcript_scroll_offset(line_count: usize, area_height: u16, from_bottom: u1
 
 fn transcript_visual_line_count(app: &TuiApp, width: u16) -> u16 {
     let content_width = width.max(1) as usize;
-    transcript_lines(app)
+    transcript_lines(app, Some(width))
         .iter()
         .map(|line| {
             let chars = line
@@ -2431,18 +2475,26 @@ fn format_transcript_item(item: &TranscriptItem) -> Line<'_> {
         .unwrap_or_else(|| Line::from(""))
 }
 
+#[cfg(test)]
 fn format_transcript_entry(
     entry: &TranscriptEntry,
     selected: bool,
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
+    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None)
+}
+
+fn format_transcript_entry_with_width(
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+) -> Vec<Line<'static>> {
     match &entry.kind {
         TranscriptEntryKind::Message(item) => {
-            format_message_entry(item, entry.collapsed, selected, outcome)
-        }
-        TranscriptEntryKind::ToolCall(call) => {
-            format_tool_call_entry(call, entry.collapsed, selected)
+            format_message_entry_with_width(item, entry.collapsed, selected, outcome, width)
         }
         TranscriptEntryKind::ToolResult(result) => {
             format_tool_result_entry(result, entry.collapsed, selected, tool_output_verbosity)
@@ -2486,14 +2538,25 @@ fn is_failure_log(message: &str) -> bool {
     lower.contains("failed") || lower.contains("error") || lower.contains("cancelled")
 }
 
+#[cfg(test)]
 fn format_message_entry(
     item: &TranscriptItem,
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
+    format_message_entry_with_width(item, collapsed, selected, outcome, None)
+}
+
+fn format_message_entry_with_width(
+    item: &TranscriptItem,
+    collapsed: bool,
+    selected: bool,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+) -> Vec<Line<'static>> {
     if item.role == Role::User {
-        return format_user_prompt_entry(item, selected);
+        return format_user_prompt_entry(item, selected, width);
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -2526,7 +2589,11 @@ fn format_message_entry(
     )
 }
 
-fn format_user_prompt_entry(item: &TranscriptItem, selected: bool) -> Vec<Line<'static>> {
+fn format_user_prompt_entry(
+    item: &TranscriptItem,
+    selected: bool,
+    width: Option<u16>,
+) -> Vec<Line<'static>> {
     let mut content = item.content.lines().collect::<Vec<_>>();
     if content.is_empty() {
         content.push("");
@@ -2536,41 +2603,27 @@ fn format_user_prompt_entry(item: &TranscriptItem, selected: bool) -> Vec<Line<'
         .enumerate()
         .map(|(index, line)| {
             let marker = if selected && index == 0 { "> " } else { "  " };
+            let prompt_prefix = "    ";
+            let text_width = prompt_prefix.chars().count() + line.chars().count();
+            let surface_width = width
+                .map(|width| (width as usize).saturating_sub(marker.chars().count()))
+                .unwrap_or(0);
+            let padding = if surface_width > 0 {
+                " ".repeat(surface_width.saturating_sub(text_width))
+            } else {
+                String::new()
+            };
             Line::from(vec![
                 Span::raw(marker),
-                Span::styled("    ", Style::default().bg(PROMPT_BG)),
+                Span::styled(prompt_prefix, Style::default().bg(PROMPT_BG)),
                 Span::styled(
                     line.to_string(),
                     Style::default().fg(Color::White).bg(PROMPT_BG),
                 ),
+                Span::styled(padding, Style::default().bg(PROMPT_BG)),
             ])
         })
         .collect()
-}
-
-fn format_tool_call_entry(call: &ToolCall, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
-    let summary = format!(
-        "{} queued args={}",
-        call.name,
-        compact_text(&call.arguments.to_string(), 140)
-    );
-    if collapsed {
-        return vec![action_line(selected, "• ", GOLD, "Queued", AMBER, summary)];
-    }
-    let mut lines = vec![action_line(
-        selected,
-        "• ",
-        GOLD,
-        "Queued",
-        AMBER,
-        format!("{} queued", call.name),
-    )];
-    lines.extend(indented_text_lines(
-        serde_json::to_string_pretty(&call.arguments)
-            .unwrap_or_else(|_| call.arguments.to_string())
-            .as_str(),
-    ));
-    lines
 }
 
 fn format_tool_result_entry(
@@ -3453,6 +3506,7 @@ struct TuiApp {
     pending_assistant: String,
     task_state: Option<TaskStateSnapshot>,
     task_panel_collapsed: bool,
+    active_tool: Option<String>,
     status: String,
     turn_visual: TurnVisualState,
     animation_tick: u64,
@@ -3553,6 +3607,7 @@ impl TuiApp {
             pending_assistant: String::new(),
             task_state: None,
             task_panel_collapsed: false,
+            active_tool: None,
             status,
             turn_visual: TurnVisualState::Idle,
             animation_tick: 0,
@@ -3575,15 +3630,6 @@ impl TuiApp {
     fn push_transcript_item(&mut self, item: TranscriptItem) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::message(id, item, self.transcript_default));
-    }
-
-    fn push_tool_call(&mut self, call: ToolCall) {
-        let id = self.next_id();
-        self.push_entry(TranscriptEntry::tool_call(
-            id,
-            call,
-            self.transcript_default,
-        ));
     }
 
     fn push_tool_result(&mut self, result: ToolResult) {
@@ -3630,14 +3676,6 @@ impl TranscriptEntry {
         }
     }
 
-    fn tool_call(id: u64, call: ToolCall, transcript_default: TranscriptDefault) -> Self {
-        Self {
-            id,
-            kind: TranscriptEntryKind::ToolCall(call),
-            collapsed: transcript_default == TranscriptDefault::Compact,
-        }
-    }
-
     fn tool_result(id: u64, result: ToolResult, transcript_default: TranscriptDefault) -> Self {
         Self {
             id,
@@ -3657,10 +3695,7 @@ impl TranscriptEntry {
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
-            TranscriptCategory::Tools => matches!(
-                self.kind,
-                TranscriptEntryKind::ToolCall(_) | TranscriptEntryKind::ToolResult(_)
-            ),
+            TranscriptCategory::Tools => matches!(self.kind, TranscriptEntryKind::ToolResult(_)),
             TranscriptCategory::Logs => match &self.kind {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
@@ -3685,9 +3720,6 @@ impl TranscriptEntry {
         match &self.kind {
             TranscriptEntryKind::Message(item) => {
                 vec![format!("{}: {}", role_label(&item.role), item.content)]
-            }
-            TranscriptEntryKind::ToolCall(call) => {
-                vec![format!("tool call: {}", call.name)]
             }
             TranscriptEntryKind::ToolResult(result) => {
                 vec![format!("tool result: {}", tool_result_summary(result))]
@@ -3714,12 +3746,6 @@ impl TranscriptEntry {
                 item.content.clone(),
                 format!("transcript:{}", self.id),
             ),
-            TranscriptEntryKind::ToolCall(call) => (
-                format!("tool call {}", call.name),
-                serde_json::to_string(&call.arguments)
-                    .unwrap_or_else(|_| call.arguments.to_string()),
-                format!("transcript:{}", self.id),
-            ),
             TranscriptEntryKind::ToolResult(result) => (
                 format!("tool result {}", result.tool_name),
                 tool_result_summary(result),
@@ -3737,7 +3763,6 @@ impl TranscriptEntry {
 #[derive(Debug, Clone)]
 enum TranscriptEntryKind {
     Message(TranscriptItem),
-    ToolCall(ToolCall),
     ToolResult(ToolResult),
     Log(String),
 }

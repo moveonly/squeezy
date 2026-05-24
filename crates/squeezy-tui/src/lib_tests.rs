@@ -873,6 +873,32 @@ fn render_uses_two_line_status_footer() {
 }
 
 #[test]
+fn status_footer_sits_directly_below_prompt_area() {
+    let app = test_app(SessionMode::Build);
+
+    let output = render_to_string(&app, 100, 16);
+    let lines = output.lines().collect::<Vec<_>>();
+    let prompt_line = lines
+        .iter()
+        .position(|line| line.contains('┃'))
+        .expect("prompt cursor");
+    let status_line = lines
+        .iter()
+        .position(|line| line.contains("dir "))
+        .expect("status line");
+    let help_line = lines
+        .iter()
+        .position(|line| line.contains("Enter send"))
+        .expect("help line");
+
+    assert!(
+        status_line > prompt_line && status_line <= prompt_line + PROMPT_MIN_HEIGHT as usize,
+        "{output}"
+    );
+    assert_eq!(help_line, status_line + 1, "{output}");
+}
+
+#[test]
 fn render_keeps_header_when_transcript_has_content() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("hello"));
@@ -1041,6 +1067,24 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
 }
 
 #[test]
+fn submitted_prompt_surface_extends_to_render_width() {
+    let item = TranscriptItem::user("find getFoo");
+
+    let lines =
+        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(40));
+    let rendered = lines[0]
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert_eq!(rendered.chars().count(), 40);
+    assert_eq!(lines[0].spans[1].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[0].spans[2].style.bg, Some(PROMPT_BG));
+    assert_eq!(lines[0].spans[3].style.bg, Some(PROMPT_BG));
+}
+
+#[test]
 fn failure_log_renders_as_detail_under_user_turn() {
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("hi"));
@@ -1053,6 +1097,49 @@ fn failure_log_renders_as_detail_under_user_turn() {
         "{output}"
     );
     assert!(!output.contains("chars  turn failed"), "{output}");
+}
+
+#[test]
+fn active_tool_is_summarized_in_working_line() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.active_tool = Some("definition_search".to_string());
+
+    let output = render_to_string(&app, 120, 16);
+
+    assert!(
+        output.contains("• Working running definition_search"),
+        "{output}"
+    );
+    assert!(!output.contains("Queued"), "{output}");
+}
+
+#[tokio::test]
+async fn queued_tool_event_updates_working_status_without_transcript_row() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::ToolCallQueued {
+        turn_id: TurnId::new(1),
+        call: ToolCall {
+            call_id: "call-1".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({ "query": "getFoo" }),
+        },
+    })
+    .await
+    .expect("send queued");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(app.active_tool.as_deref(), Some("grep"));
+    assert!(app.transcript.is_empty());
+    let output = render_to_string(&app, 120, 16);
+    assert!(output.contains("• Working running grep"), "{output}");
+    assert!(!output.contains("Queued"), "{output}");
+    assert!(!output.contains("args="), "{output}");
 }
 
 #[test]
