@@ -9,6 +9,11 @@ model-facing tool output compact enough to be useful.
 - **Bounded fallback tools.** `glob`, `grep`, `read_file`, `read_tool_output`,
   `write_file`, and `shell` return structured results with cost hints, output
   caps, and sha256 receipts.
+- **Edit-verify loop tools.** `plan_patch` builds a graph-aware evidence packet
+  (impacted symbols, callers, references, tests, configs, owners, locality
+  scoring) before mutation, and `apply_patch` applies search-replace blocks with
+  a required `expected_sha256`, multiple-match guard, locality warnings,
+  optional dry-run preview, and an attached checkpoint for rollback.
 - **Ignore-aware search.** `grep` respects ignore files by default and requires
   `include_ignored=true` when ignored paths are intentionally needed. `glob`
   follows the same default.

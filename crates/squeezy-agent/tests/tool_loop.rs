@@ -142,6 +142,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "plan_patch",
             "read_file",
             "read_slice",
             "read_tool_output",
@@ -172,7 +173,14 @@ async fn build_mode_advertises_full_tool_set() {
 
     let requests = provider.requests();
     let tool_names = tool_names(&requests[0]);
-    for expected in ["write_file", "shell", "verify", "webfetch", "websearch"] {
+    for expected in [
+        "apply_patch",
+        "write_file",
+        "shell",
+        "verify",
+        "webfetch",
+        "websearch",
+    ] {
         assert!(
             tool_names.contains(&expected),
             "build mode should advertise {expected}: {tool_names:?}"
