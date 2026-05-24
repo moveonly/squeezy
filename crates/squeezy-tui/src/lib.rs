@@ -2132,7 +2132,11 @@ fn render_startup_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn should_show_task_panel(app: &TuiApp) -> bool {
-    app.task_state.is_some() || app.turn_rx.is_some()
+    app.turn_rx.is_some()
+        || app
+            .task_state
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.status != squeezy_core::TaskStateStatus::Completed)
 }
 
 fn task_panel_height(app: &TuiApp) -> u16 {
@@ -2493,7 +2497,7 @@ fn format_message_entry(
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
-    let label_color = if failed { ERROR_RED } else { GOLD };
+    let label_color = if failed { ERROR_RED } else { color };
     let action_color = if failed { ERROR_RED } else { color };
     let content_style = message_content_style(&item.role);
     if collapsed {
@@ -2981,8 +2985,10 @@ fn prompt_blank_line() -> Line<'static> {
 fn prompt_input_lines(app: &TuiApp, height: u16) -> Vec<Line<'static>> {
     let content = prompt_input_content_lines(app);
     let spare = (height as usize).saturating_sub(content.len());
-    let bottom_padding = spare;
-    let mut lines = Vec::with_capacity(content.len() + bottom_padding);
+    let top_padding = spare / 2;
+    let bottom_padding = spare.saturating_sub(top_padding);
+    let mut lines = Vec::with_capacity(top_padding + content.len() + bottom_padding);
+    lines.extend((0..top_padding).map(|_| prompt_blank_line()));
     lines.extend(content);
     lines.extend((0..bottom_padding).map(|_| prompt_blank_line()));
     lines

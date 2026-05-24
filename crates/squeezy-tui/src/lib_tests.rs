@@ -908,8 +908,105 @@ fn active_prompt_starts_directly_below_header() {
 
     assert!(
         lines
-            .get(header_bottom + 1)
-            .is_some_and(|line| line.contains('┃')),
+            .iter()
+            .skip(header_bottom + 1)
+            .take(2)
+            .any(|line| line.contains('┃')),
+        "{output}"
+    );
+}
+
+#[test]
+fn active_prompt_cursor_is_vertically_centered() {
+    let app = test_app(SessionMode::Build);
+
+    let lines = prompt_input_lines(&app, PROMPT_MIN_HEIGHT);
+
+    assert_eq!(lines.len(), 3);
+    assert!(!lines[0].spans.iter().any(|span| span.content.contains('┃')));
+    assert!(
+        lines[1].spans.iter().any(|span| span.content.contains('┃')),
+        "{lines:?}"
+    );
+    assert!(!lines[2].spans.iter().any(|span| span.content.contains('┃')));
+}
+
+#[test]
+fn assistant_marker_uses_answer_color() {
+    let item = TranscriptItem::assistant("done");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+
+    assert_eq!(lines[0].spans[1].style.fg, Some(Color::Green));
+    assert_eq!(lines[0].spans[2].style.fg, Some(Color::Green));
+}
+
+#[test]
+fn completed_task_panel_is_hidden_after_answer() {
+    let mut app = test_app(SessionMode::Build);
+    let mut task = sample_task_state();
+    task.status = TaskStateStatus::Completed;
+    app.task_state = Some(task);
+    app.push_transcript_item(TranscriptItem::user("why?"));
+    app.push_transcript_item(TranscriptItem::assistant("Because."));
+
+    let output = render_to_string(&app, 120, 18);
+
+    assert!(output.contains("• Answered Because."), "{output}");
+    assert!(
+        !output.contains("• Done"),
+        "completed task panel should not duplicate the answer: {output}"
+    );
+    assert!(
+        !output.contains("active Start turn"),
+        "completed task details should stay hidden: {output}"
+    );
+}
+
+#[test]
+fn running_prompt_keeps_working_line_below_submitted_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("why?"));
+    app.task_state = Some(TaskStateSnapshot {
+        task: "why?".to_string(),
+        status: TaskStateStatus::Running,
+        steps: vec![TaskStateStep {
+            title: "Start turn".to_string(),
+            status: TaskStepStatus::Active,
+            detail: Some("Preparing the first model request".to_string()),
+        }],
+        next_action: Some("-".to_string()),
+        verification: TaskVerificationState::NotStarted,
+        ..TaskStateSnapshot::default()
+    });
+
+    let output = render_to_string(&app, 120, 18);
+
+    assert!(output.contains("      why?"), "{output}");
+    assert!(output.contains("• Working why?"), "{output}");
+    assert!(!output.contains("• Done"), "{output}");
+}
+
+#[test]
+fn active_prompt_content_stays_centered_after_submitted_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("ship it"));
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+
+    let output = render_to_string(&app, 100, 18);
+    let lines = output.lines().collect::<Vec<_>>();
+    let working_line = lines
+        .iter()
+        .position(|line| line.contains("• Working"))
+        .expect("working line");
+
+    assert!(
+        lines
+            .iter()
+            .skip(working_line + 1)
+            .take(3)
+            .any(|line| line.contains('┃')),
         "{output}"
     );
 }
