@@ -12,7 +12,8 @@ use futures_util::stream;
 use serde_json::Value;
 use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, CostSnapshot, PermissionMode, PermissionPolicy, PermissionScope, Result, SessionMode,
+    AppConfig, ContextCompactionConfig, CostSnapshot, PermissionMode, PermissionPolicy,
+    PermissionScope, Result, SessionMode,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
@@ -1286,6 +1287,126 @@ async fn resumed_session_preserves_cumulative_cost_and_metrics() {
     );
     assert_eq!(resumed_metadata.cost.output_tokens, Some(70));
     assert_eq!(resumed_metadata.metrics.turns, first_turns + 1);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn automatic_context_compaction_replaces_old_raw_history() {
+    let root = temp_workspace("auto_context_compaction");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(format!(
+                "first answer {}",
+                "plan ".repeat(500)
+            ))),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_first".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second answer".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_second".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10,
+        min_items: 3,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+    };
+    let old_prompt = format!("first prompt {}", "raw-old-context ".repeat(400));
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn(old_prompt.clone(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("second prompt".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].input.len(), 2);
+    let LlmInputItem::UserText(summary) = &requests[1].input[0] else {
+        panic!("first compacted item should be user summary");
+    };
+    assert!(summary.contains("Squeezy compacted conversation context"));
+    assert!(summary.contains("Compacted 2 older model-visible item"));
+    assert!(!summary.contains(&old_prompt));
+    assert!(summary.len() < old_prompt.len());
+    assert!(
+        matches!(&requests[1].input[1], LlmInputItem::UserText(text) if text == "second prompt")
+    );
+
+    let record = agent
+        .show_session(&agent.session_id().expect("session id"))
+        .expect("show session");
+    assert_eq!(
+        record
+            .resume_state
+            .expect("resume")
+            .context_compaction
+            .generation,
+        1
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn manual_context_compaction_preserves_pins_in_resume_state() {
+    let root = temp_workspace("manual_context_compaction");
+    let provider = Arc::new(ScriptedProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(format!(
+            "important decision {}",
+            "must ".repeat(200)
+        ))),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_first".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let mut config = config_for(root.clone());
+    config.context_compaction = ContextCompactionConfig {
+        enabled: true,
+        estimated_tokens: 10_000,
+        min_items: 99,
+        recent_items: 1,
+        max_summary_bytes: 1_200,
+    };
+    let agent = Agent::new(config, provider);
+
+    drain_turn(agent.start_turn("first prompt".to_string(), CancellationToken::new())).await;
+    let pin = agent
+        .pin_context_entry(
+            "decision".to_string(),
+            "Use deterministic compaction".to_string(),
+            "test".to_string(),
+        )
+        .await
+        .expect("pin");
+    let report = agent.compact_context_manual().await.expect("compact");
+
+    assert_eq!(report.record.trigger.as_str(), "manual");
+    assert!(report.summary.contains("Use deterministic compaction"));
+    let record = agent
+        .show_session(&agent.session_id().expect("session id"))
+        .expect("show session");
+    let compaction = record.resume_state.expect("resume").context_compaction;
+    assert_eq!(compaction.generation, 1);
+    assert_eq!(compaction.pinned[0].id, pin.id);
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.kind == "context_compacted")
+    );
 
     let _ = fs::remove_dir_all(root);
 }

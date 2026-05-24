@@ -49,6 +49,10 @@ pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
+pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 6_000;
+pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
+pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
+pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +68,7 @@ pub struct AppConfig {
     pub permissions: PermissionPolicy,
     pub session_mode: SessionMode,
     pub session_logs: SessionLogConfig,
+    pub context_compaction: ContextCompactionConfig,
     pub store_responses: bool,
     pub max_parallel_tools: usize,
     pub tool_spill_threshold_bytes: usize,
@@ -384,6 +389,10 @@ impl AppConfig {
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
         let session_logs = SessionLogConfig::from_settings(&session_settings);
+        let context_compaction = ContextCompactionConfig::from_settings_and_env(
+            settings.context.unwrap_or_default(),
+            &mut get_var,
+        );
         let tui = TuiConfig::from_settings(settings.tui.unwrap_or_default());
         if env_used {
             sources.push("env".to_string());
@@ -403,6 +412,7 @@ impl AppConfig {
             permissions,
             session_mode,
             session_logs,
+            context_compaction,
             store_responses,
             max_parallel_tools,
             tool_spill_threshold_bytes,
@@ -511,6 +521,28 @@ impl AppConfig {
         output.push_str(&format!(
             "max_session_bytes = {}\n\n",
             self.session_logs.max_session_bytes
+        ));
+
+        output.push_str("[context]\n");
+        output.push_str(&format!(
+            "compaction_enabled = {}\n",
+            self.context_compaction.enabled
+        ));
+        output.push_str(&format!(
+            "compaction_estimated_tokens = {}\n",
+            self.context_compaction.estimated_tokens
+        ));
+        output.push_str(&format!(
+            "compaction_min_items = {}\n",
+            self.context_compaction.min_items
+        ));
+        output.push_str(&format!(
+            "compaction_recent_items = {}\n",
+            self.context_compaction.recent_items
+        ));
+        output.push_str(&format!(
+            "compaction_max_summary_bytes = {}\n\n",
+            self.context_compaction.max_summary_bytes
         ));
 
         output.push_str("[budgets]\n");
@@ -992,6 +1024,7 @@ pub struct SettingsFile {
     pub model_settings: Option<ModelSettings>,
     pub providers: Option<BTreeMap<String, ProviderSettings>>,
     pub session: Option<SessionSettings>,
+    pub context: Option<ContextCompactionSettings>,
     pub budgets: Option<BudgetSettings>,
     pub permissions: Option<PermissionSettings>,
     pub telemetry: Option<TelemetrySettings>,
@@ -1049,6 +1082,7 @@ impl SettingsFile {
                 "model",
                 "providers",
                 "session",
+                "context",
                 "budgets",
                 "permissions",
                 "telemetry",
@@ -1083,6 +1117,9 @@ impl SettingsFile {
         settings.providers = providers_settings(table, source)?;
         settings.session = optional_table(table, "session", source)?
             .map(|table| SessionSettings::from_table(table, source, "session"))
+            .transpose()?;
+        settings.context = optional_table(table, "context", source)?
+            .map(|table| ContextCompactionSettings::from_table(table, source, "context"))
             .transpose()?;
         settings.budgets = optional_table(table, "budgets", source)?
             .map(|table| BudgetSettings::from_table(table, source, "budgets"))
@@ -1131,6 +1168,11 @@ impl SettingsFile {
         );
         merge_provider_maps(&mut self.providers, next.providers);
         merge_option(&mut self.session, next.session, SessionSettings::merge);
+        merge_option(
+            &mut self.context,
+            next.context,
+            ContextCompactionSettings::merge,
+        );
         merge_option(&mut self.budgets, next.budgets, BudgetSettings::merge);
         merge_option(
             &mut self.permissions,
@@ -1564,6 +1606,140 @@ impl Default for SessionLogConfig {
             log_retention_days: DEFAULT_SESSION_LOG_RETENTION_DAYS,
             max_event_bytes: DEFAULT_SESSION_MAX_EVENT_BYTES,
             max_session_bytes: DEFAULT_SESSION_MAX_SESSION_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ContextCompactionSettings {
+    pub compaction_enabled: Option<bool>,
+    pub compaction_estimated_tokens: Option<u64>,
+    pub compaction_min_items: Option<usize>,
+    pub compaction_recent_items: Option<usize>,
+    pub compaction_max_summary_bytes: Option<usize>,
+}
+
+impl ContextCompactionSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "compaction_enabled",
+                "compaction_estimated_tokens",
+                "compaction_min_items",
+                "compaction_recent_items",
+                "compaction_max_summary_bytes",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            compaction_enabled: bool_value(
+                table,
+                "compaction_enabled",
+                source,
+                &field(path, "compaction_enabled"),
+            )?,
+            compaction_estimated_tokens: u64_value(
+                table,
+                "compaction_estimated_tokens",
+                source,
+                &field(path, "compaction_estimated_tokens"),
+            )?,
+            compaction_min_items: usize_value(
+                table,
+                "compaction_min_items",
+                source,
+                &field(path, "compaction_min_items"),
+            )?,
+            compaction_recent_items: usize_value(
+                table,
+                "compaction_recent_items",
+                source,
+                &field(path, "compaction_recent_items"),
+            )?,
+            compaction_max_summary_bytes: usize_value(
+                table,
+                "compaction_max_summary_bytes",
+                source,
+                &field(path, "compaction_max_summary_bytes"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.compaction_enabled, next.compaction_enabled);
+        replace_if_some(
+            &mut self.compaction_estimated_tokens,
+            next.compaction_estimated_tokens,
+        );
+        replace_if_some(&mut self.compaction_min_items, next.compaction_min_items);
+        replace_if_some(
+            &mut self.compaction_recent_items,
+            next.compaction_recent_items,
+        );
+        replace_if_some(
+            &mut self.compaction_max_summary_bytes,
+            next.compaction_max_summary_bytes,
+        );
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionConfig {
+    pub enabled: bool,
+    pub estimated_tokens: u64,
+    pub min_items: usize,
+    pub recent_items: usize,
+    pub max_summary_bytes: usize,
+}
+
+impl ContextCompactionConfig {
+    fn from_settings_and_env(
+        settings: ContextCompactionSettings,
+        get_var: &mut impl FnMut(&str) -> Option<String>,
+    ) -> Self {
+        Self {
+            enabled: get_var("SQUEEZY_CONTEXT_COMPACTION_ENABLED")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.compaction_enabled.unwrap_or(true)),
+            estimated_tokens: parse_u64(
+                get_var("SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS"),
+                settings
+                    .compaction_estimated_tokens
+                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS),
+            ),
+            min_items: parse_usize(
+                get_var("SQUEEZY_CONTEXT_COMPACTION_MIN_ITEMS"),
+                settings
+                    .compaction_min_items
+                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS),
+            ),
+            recent_items: parse_usize(
+                get_var("SQUEEZY_CONTEXT_COMPACTION_RECENT_ITEMS"),
+                settings
+                    .compaction_recent_items
+                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS),
+            ),
+            max_summary_bytes: parse_usize(
+                get_var("SQUEEZY_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES"),
+                settings
+                    .compaction_max_summary_bytes
+                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES),
+            ),
+        }
+    }
+}
+
+impl Default for ContextCompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            estimated_tokens: DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS,
+            min_items: DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
+            recent_items: DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS,
+            max_summary_bytes: DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
         }
     }
 }
@@ -3658,6 +3834,13 @@ pub fn user_settings_template() -> &'static str {
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
+[context]
+# compaction_enabled = true
+# compaction_estimated_tokens = 6000
+# compaction_min_items = 16
+# compaction_recent_items = 6
+# compaction_max_summary_bytes = 12000
+
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
@@ -3774,6 +3957,13 @@ pub fn project_settings_template() -> &'static str {
 # log_retention_days = 30
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
+
+[context]
+# compaction_enabled = true
+# compaction_estimated_tokens = 6000
+# compaction_min_items = 16
+# compaction_recent_items = 6
+# compaction_max_summary_bytes = 12000
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
@@ -4853,6 +5043,60 @@ pub fn context_attachment_preview(text: &str, max_bytes: usize) -> (String, bool
 
 pub fn context_attachment_storage_text(text: &str, max_bytes: usize) -> (String, bool) {
     truncate_utf8(text, max_bytes)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextEstimate {
+    pub bytes: usize,
+    pub estimated_tokens: u64,
+    pub items: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionTrigger {
+    #[default]
+    Auto,
+    Manual,
+}
+
+impl ContextCompactionTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPin {
+    pub id: String,
+    pub label: String,
+    pub summary: String,
+    pub source: String,
+    pub created_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionRecord {
+    pub generation: u64,
+    pub trigger: ContextCompactionTrigger,
+    pub compacted_at_ms: u64,
+    pub before: ContextEstimate,
+    pub after: ContextEstimate,
+    pub dropped_items: usize,
+    pub summary_bytes: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCompactionState {
+    pub generation: u64,
+    pub summary: Option<String>,
+    pub pinned: Vec<ContextPin>,
+    pub last: Option<ContextCompactionRecord>,
+    #[serde(default)]
+    pub history: Vec<ContextCompactionRecord>,
 }
 
 fn truncate_utf8(text: &str, max_bytes: usize) -> (String, bool) {

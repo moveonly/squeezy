@@ -357,6 +357,8 @@ pub struct StoredToolReceipt {
     pub content_sha256: Option<String>,
     pub model_output_bytes: usize,
     pub created_unix_millis: u128,
+    #[serde(default)]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

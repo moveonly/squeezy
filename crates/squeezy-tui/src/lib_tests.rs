@@ -486,7 +486,7 @@ fn compact_status_surfaces_context_without_dense_counters() {
     assert!(status.contains("telemetry=on"), "{status}");
     assert!(status.contains("status=running search"), "{status}");
     assert!(
-        status.contains("cost=- tok=-/- tools=0 budget=ok"),
+        status.contains("cost=- tok=-/- ctx=0 pins=0 compact=0 tools=0 budget=ok"),
         "{status}"
     );
     assert!(
@@ -549,7 +549,7 @@ fn verbose_status_surfaces_budget_and_cache_details() {
     let status = format_status_tokens(&app);
     assert!(status.contains("mode=plan"), "{status}");
     assert!(
-        status.contains("cost=$0.000042 tok=10/5 tools=2 budget=denied:1"),
+        status.contains("cost=$0.000042 tok=10/5 ctx=0 pins=0 compact=0 tools=2 budget=denied:1"),
         "{status}"
     );
     assert!(status.contains("cfg="), "{status}");
@@ -712,6 +712,33 @@ async fn slash_copy_transcript_copies_plain_text_transcript() {
         ["user: hello\nassistant: answer"]
     );
     assert!(app.status.contains("copied transcript"), "{}", app.status);
+}
+
+#[tokio::test]
+async fn slash_pin_pins_and_unpins_transcript_context() {
+    let root = temp_workspace("pin_context");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("keep this decision"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/pin last").await);
+    assert_eq!(app.context_compaction.pinned.len(), 1);
+    let pin_id = app.context_compaction.pinned[0].id.clone();
+    assert_eq!(app.status, format!("pinned {pin_id}"));
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/pins").await);
+    assert!(app.status.contains("1 pinned"), "{}", app.status);
+    assert!(
+        last_message_content(&app).is_some_and(|content| content.contains("keep this decision")),
+        "pins transcript should include pinned summary"
+    );
+
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/unpin {pin_id}")).await);
+    assert!(app.context_compaction.pinned.is_empty());
+    assert_eq!(app.status, format!("unpinned {pin_id}"));
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[tokio::test]

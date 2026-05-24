@@ -110,6 +110,10 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.max_search_files_per_turn,
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
+    assert_eq!(
+        config.context_compaction,
+        ContextCompactionConfig::default()
+    );
     assert_eq!(config.telemetry, TelemetryConfig::default());
     assert!(config.skills.user_dir.ends_with(DEFAULT_SQUEEZY_SKILLS_DIR));
     assert!(
@@ -125,6 +129,34 @@ fn config_without_env_uses_openai_provider_defaults() {
         }
         _ => panic!("expected OpenAI provider"),
     }
+}
+
+#[test]
+fn context_compaction_config_reads_settings_and_env() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[context]
+compaction_enabled = false
+compaction_estimated_tokens = 1234
+compaction_min_items = 7
+compaction_recent_items = 3
+compaction_max_summary_bytes = 4096
+"#,
+        "test",
+    )
+    .expect("settings");
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_CONTEXT_COMPACTION_ENABLED" => Some("true".to_string()),
+        "SQUEEZY_CONTEXT_COMPACTION_ESTIMATED_TOKENS" => Some("2048".to_string()),
+        _ => None,
+    });
+
+    assert!(config.context_compaction.enabled);
+    assert_eq!(config.context_compaction.estimated_tokens, 2048);
+    assert_eq!(config.context_compaction.min_items, 7);
+    assert_eq!(config.context_compaction.recent_items, 3);
+    assert_eq!(config.context_compaction.max_summary_bytes, 4096);
+    assert!(config.inspect_redacted().contains("[context]"));
 }
 
 #[test]

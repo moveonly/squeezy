@@ -542,7 +542,8 @@ async fn run_agent_with_config(
             AgentEvent::ToolCallQueued { .. } | AgentEvent::ToolCallCompleted { .. } => {}
             AgentEvent::ToolCallStarted { .. }
             | AgentEvent::ApprovalRequested { .. }
-            | AgentEvent::TaskStateUpdated { .. } => {}
+            | AgentEvent::TaskStateUpdated { .. }
+            | AgentEvent::ContextCompacted { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
         }
     }
