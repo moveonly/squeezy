@@ -1635,7 +1635,7 @@ impl Agent {
                 mode,
                 &self.config.tools,
             ),
-            input: redact_llm_input_items(&input, &self.redactor),
+            input,
             max_output_tokens: self.config.max_output_tokens,
             response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
             reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
@@ -3191,11 +3191,22 @@ impl TurnRuntime {
             .collect::<Vec<_>>();
         let user_transcript =
             TranscriptItem::user(format_user_text_with_context(&input, &active_attachments));
-        let user_item = LlmInputItem::UserText(format_user_text_with_context(
-            &activation.task_input,
-            &active_attachments,
-        ));
-        let mut conversation = prior_state.conversation.clone();
+        // Redact at insertion time so the conversation upholds the
+        // "already redacted" invariant. The per-round LLM request build
+        // then sends `next_input` straight through without rebuilding
+        // the vector via `redact_llm_input_items`.
+        let user_item = redact_input_item(
+            LlmInputItem::UserText(format_user_text_with_context(
+                &activation.task_input,
+                &active_attachments,
+            )),
+            &self.redactor,
+        );
+        // Upgrade any legacy conversation items resumed from disk so the
+        // invariant holds for the rest of this turn. Idempotent and
+        // cheap for items already in redacted form.
+        let mut conversation =
+            redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
         let mut context_compaction = prior_state.context_compaction.clone();
         if let Some(report) = maybe_compact_conversation(
@@ -3391,7 +3402,7 @@ impl TurnRuntime {
             let outputs = results
                 .into_iter()
                 .map(|pending| {
-                    let output = pending.result.model_output();
+                    let output = self.redactor.redact(&pending.result.model_output()).text;
                     LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
@@ -3447,7 +3458,7 @@ impl TurnRuntime {
             let request = LlmRequest {
                 model: self.config.model.clone(),
                 instructions: cached_instructions,
-                input: redact_llm_input_items(&next_input, &self.redactor),
+                input: next_input.clone(),
                 max_output_tokens: self.config.max_output_tokens,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
@@ -3573,7 +3584,13 @@ impl TurnRuntime {
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
-                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                // `assistant_stream` has already redacted the text via
+                // `StreamRedactor`, so this push is idempotent w.r.t. the
+                // conversation invariant.
+                conversation.push(redact_input_item(
+                    LlmInputItem::AssistantText(message.content.clone()),
+                    &self.redactor,
+                ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -3612,7 +3629,10 @@ impl TurnRuntime {
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
-                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                conversation.push(redact_input_item(
+                    LlmInputItem::AssistantText(message.content.clone()),
+                    &self.redactor,
+                ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -3709,7 +3729,7 @@ impl TurnRuntime {
             let outputs = results
                 .into_iter()
                 .map(|pending| {
-                    let output = pending.result.model_output();
+                    let output = self.redactor.redact(&pending.result.model_output()).text;
                     LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
@@ -4795,7 +4815,10 @@ async fn run_subagent(
     broker.metrics.redactions += redacted_instructions.redactions;
     let mut assistant_stream = StreamRedactor::new(parent.redactor.clone());
     let mut assistant_message = String::new();
-    let mut conversation = vec![LlmInputItem::UserText(subagent_user_prompt(&request))];
+    let mut conversation = vec![redact_input_item(
+        LlmInputItem::UserText(subagent_user_prompt(&request)),
+        &parent.redactor,
+    )];
     let mut supporting_receipts = Vec::new();
     // Subagent tool execution emits ToolCallStarted/ToolCallCompleted/JobUpdated
     // events on the per-call `tx` channel. The parent never surfaces these
@@ -4863,12 +4886,11 @@ async fn run_subagent_loop(
     model: String,
 ) -> SubagentExecution {
     for _round in 0..config.subagents.max_model_rounds {
-        let llm_input = redact_llm_input_items(conversation, &parent.redactor);
         let request_model = config.model.clone();
         let llm_request = LlmRequest {
             model: request_model.clone(),
             instructions: instructions.to_string(),
-            input: llm_input,
+            input: conversation.clone(),
             max_output_tokens: config.max_output_tokens,
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
@@ -5031,7 +5053,7 @@ async fn run_subagent_loop(
                 .map(|call| llm_function_call_item(call, &parent.redactor)),
         );
         conversation.extend(results.into_iter().map(|pending| {
-            let output = pending.result.model_output();
+            let output = parent.redactor.redact(&pending.result.model_output()).text;
             LlmInputItem::FunctionCallOutput {
                 call_id: pending.result.call_id,
                 output,
@@ -7477,31 +7499,46 @@ fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
     }
 }
 
-fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<LlmInputItem> {
+/// Redact a single `LlmInputItem`. The `Redactor` is idempotent and
+/// keeps a `Cow::Borrowed` until a pattern matches, so calling this on
+/// an already-redacted item is allocation-free.
+///
+/// The conversation invariant is that every item stored in
+/// `ConversationState::conversation` (or in the in-flight `conversation`
+/// / `next_input` buffers within `TurnRuntime::run`) has already been
+/// passed through this function, so the per-request build path never
+/// needs to walk the conversation again to redact it.
+fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
+    match item {
+        LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
+        LlmInputItem::AssistantText(text) => {
+            LlmInputItem::AssistantText(redactor.redact(&text).text)
+        }
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments: redact_json_value(arguments, redactor),
+        },
+        LlmInputItem::FunctionCallOutput { call_id, output } => LlmInputItem::FunctionCallOutput {
+            call_id,
+            output: redactor.redact(&output).text,
+        },
+    }
+}
+
+/// Normalize a vector of `LlmInputItem`s so every entry satisfies the
+/// "already redacted" invariant. Used to upgrade conversation state
+/// loaded from a resume tape that may pre-date the insertion-time
+/// redaction policy. Cost is `O(n)` allocation-free for entries that
+/// already match the invariant.
+fn redact_llm_input_items(input: Vec<LlmInputItem>, redactor: &Redactor) -> Vec<LlmInputItem> {
     input
-        .iter()
-        .cloned()
-        .map(|item| match item {
-            LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
-            LlmInputItem::AssistantText(text) => {
-                LlmInputItem::AssistantText(redactor.redact(&text).text)
-            }
-            LlmInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => LlmInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments: redact_json_value(arguments, redactor),
-            },
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
-                LlmInputItem::FunctionCallOutput {
-                    call_id,
-                    output: redactor.redact(&output).text,
-                }
-            }
-        })
+        .into_iter()
+        .map(|item| redact_input_item(item, redactor))
         .collect()
 }
 
