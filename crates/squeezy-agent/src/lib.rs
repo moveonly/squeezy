@@ -3418,6 +3418,12 @@ impl TurnRuntime {
 
         let mut last_tool_round_summary = None;
         let mut loop_guard = ToolLoopGuard::default();
+        // Per-turn cache of `<instructions> + <tool_index>` keyed by
+        // session mode. `request_instructions`, `self.all_tool_specs`,
+        // and `self.config.tools` are turn-stable; only `active_mode`
+        // (which the TUI can flip mid-turn) varies, and the rare implicit
+        // skill append below invalidates this on a revision boundary.
+        let mut instructions_cache: [Option<String>; 2] = [None, None];
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(&task_title).await;
@@ -3425,14 +3431,22 @@ impl TurnRuntime {
             }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
-            let request = LlmRequest {
-                model: self.config.model.clone(),
-                instructions: instructions_with_tool_index(
+            let mode_slot = active_mode as usize;
+            if instructions_cache[mode_slot].is_none() {
+                instructions_cache[mode_slot] = Some(instructions_with_tool_index(
                     &request_instructions,
                     &self.all_tool_specs,
                     active_mode,
                     &self.config.tools,
-                ),
+                ));
+            }
+            let cached_instructions = instructions_cache[mode_slot]
+                .as_ref()
+                .expect("instructions cache populated above")
+                .clone();
+            let request = LlmRequest {
+                model: self.config.model.clone(),
+                instructions: cached_instructions,
                 input: redact_llm_input_items(&next_input, &self.redactor),
                 max_output_tokens: self.config.max_output_tokens,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
@@ -3681,6 +3695,9 @@ impl TurnRuntime {
                 &mut request_instructions,
                 &mut broker.metrics,
             );
+            if implicit_instructions_added {
+                instructions_cache = [None, None];
+            }
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             self.record_replay_tool_results(&tool_calls, &results);
