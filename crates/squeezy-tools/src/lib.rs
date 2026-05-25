@@ -2630,10 +2630,12 @@ impl ToolRegistry {
         neighborhood.extend(config_paths.iter().cloned());
         neighborhood.extend(owner_paths.iter().cloned());
 
+        let locality = patch_locality_json(&candidate_paths, &neighborhood);
+        neighborhood.extend(candidate_paths.iter().cloned());
+
         let plan_id = patch_plan_id(&call.arguments, &neighborhood);
         self.register_patch_plan(&plan_id, &neighborhood);
         let owners = codeowner_matches(&self.root, &neighborhood);
-        let locality = patch_locality_json(&candidate_paths, &neighborhood);
         let mut payload = graph_payload("plan_patch", manager, &refresh);
         payload.insert("objective".to_string(), json!(args.objective));
         payload.insert("query".to_string(), json!(args.query));
