@@ -29,8 +29,13 @@ use squeezy_core::{
 
 use crate::{
     notification::{NotificationQueue, Severity as NotifySeverity},
-    render::palette::{AMBER, ERROR_RED, GOLD, QUIET, SUCCESS_GREEN},
+    render::palette::{AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SUCCESS_GREEN},
 };
+
+/// Synthetic row index in the Models section that sits right after
+/// `provider` and exposes the API-key editor for the currently selected
+/// provider. Not backed by a `FieldMeta` in `CONFIG_SECTIONS`.
+const SYNTHETIC_KEY_ROW: usize = 1;
 
 /// Three scope tabs surfaced in the screen, ordered low → high precedence.
 ///
@@ -105,10 +110,11 @@ pub(crate) struct SecretEntryState {
     pub provider_label: String,
     pub draft: String,
     pub cursor: usize,
-    /// When `true`, reveal the FIRST four characters so the user can
-    /// double-check what they pasted (most keys are prefix-distinctive
-    /// like `sk-…` / `claude-…`). Toggled with Ctrl+T.
-    pub reveal_head: bool,
+    /// When `true`, render the full plaintext key for sanity-checking
+    /// what was pasted. Toggled explicitly with Ctrl+T — both the toggle
+    /// and the disclosure are the user's own action, so reveal in full
+    /// rather than hiding the suffix.
+    pub reveal: bool,
 }
 
 /// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
@@ -220,8 +226,12 @@ impl ConfigScreenState {
         &CONFIG_SECTIONS[self.section_index]
     }
 
+    /// Real field at the focused row. Panics when the focus lands on the
+    /// synthetic API-key row — callers must check `on_synthetic_api_key_row`
+    /// first.
     pub(crate) fn current_field(&self) -> &'static FieldMeta {
-        &self.current_section().fields[self.field_index]
+        self.field_at_row(self.field_index)
+            .expect("caller should branch on on_synthetic_api_key_row first")
     }
 
     /// Compute the displayed value + source for `field` under the currently
@@ -229,6 +239,53 @@ impl ConfigScreenState {
     /// tier (e.g. on the Local tab: Local → Repo → User → defaults) so
     /// editing the User file doesn't make the Local tab appear to also
     /// have that value — it shows `[inherited-user]` instead.
+    /// `true` when the focus is on the synthetic "API key" row that
+    /// sits right after `[model].provider`. The row has no `FieldMeta`
+    /// in `CONFIG_SECTIONS` — it's a UI affordance keyed off the
+    /// currently-selected provider's `api_key_env`.
+    pub(crate) fn on_synthetic_api_key_row(&self) -> bool {
+        self.current_section().id == SectionId::Models && self.field_index == SYNTHETIC_KEY_ROW
+    }
+
+    /// Number of selectable rows on the active section, including the
+    /// synthetic "API key" row for the Models section.
+    pub(crate) fn row_count(&self) -> usize {
+        let base = self.current_section().fields.len();
+        if self.current_section().id == SectionId::Models {
+            base + 1
+        } else {
+            base
+        }
+    }
+
+    /// Map a row index back to a real `FieldMeta` — `None` for the
+    /// synthetic API-key row.
+    pub(crate) fn field_at_row(&self, row: usize) -> Option<&'static FieldMeta> {
+        let section = self.current_section();
+        if section.id == SectionId::Models {
+            match row {
+                0 => Some(&section.fields[0]),
+                SYNTHETIC_KEY_ROW => None,
+                _ => section.fields.get(row - 1),
+            }
+        } else {
+            section.fields.get(row)
+        }
+    }
+
+    /// Whether the active scope's tier file explicitly sets the field.
+    /// `None` means we don't have a tier source loaded for this scope
+    /// (the file is missing on disk). Used by Space-cycle to decide
+    /// between "start owning" and "advance / clear".
+    pub(crate) fn scope_owns_field(&self, field: &FieldMeta) -> Option<bool> {
+        let tier = match self.scope {
+            ConfigScope::User => self.sources.user.as_ref(),
+            ConfigScope::Repo => self.sources.project.as_ref(),
+            ConfigScope::Local => self.sources.repo.as_ref(),
+        }?;
+        Some(tier.contains_path(field.toml_path))
+    }
+
     pub(crate) fn displayed_value_and_source(
         &self,
         field: &FieldMeta,
@@ -338,7 +395,14 @@ fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
         return "[env]".to_string();
     }
     if source == FieldSource::Default {
-        return "[default]".to_string();
+        // On non-User tabs the default value is technically inherited (it
+        // falls through every tier file that didn't set it), so name it
+        // that way to keep the marker vocabulary uniform with [inherited-user]
+        // and [inherited-repo]. The User tab just calls it [default].
+        return match active {
+            ConfigScope::User => "[default]".to_string(),
+            ConfigScope::Repo | ConfigScope::Local => "[inherited-default]".to_string(),
+        };
     }
     let scope_of_source = match source {
         FieldSource::User => ConfigScope::User,
@@ -437,7 +501,7 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Up, _) | (KeyCode::Char('k'), KeyModifiers::CONTROL) => {
-            let n = state.current_section().fields.len();
+            let n = state.row_count();
             if state.field_index == 0 {
                 state.field_index = n.saturating_sub(1);
             } else {
@@ -446,11 +510,15 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Down, _) | (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
-            let n = state.current_section().fields.len();
+            let n = state.row_count();
             state.field_index = (state.field_index + 1) % n.max(1);
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char(' '), _) => {
+            if state.on_synthetic_api_key_row() {
+                open_api_key_entry_for_current_provider(state, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             // Env-shadowed fields are inert; show the same hint we use for
             // Enter so Space doesn't silently no-op.
@@ -466,13 +534,99 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
-            // Space cycles to the next value inline for any field where
-            // "next" is well-defined: Bool toggles, Enum/OptionalEnum advance,
-            // and the model field cycles through `squeezy_llm` registry
-            // entries scoped to the current provider. Anything else surfaces
-            // a notification so the user knows Space isn't a no-op by
-            // accident.
+            // Space cycles inline through the field's value space. On the
+            // Repo and Local tabs the cycle includes a virtual "inherit"
+            // position so the user can return to the parent tier's value
+            // without leaving the row.
             let current_value = (field.get)(&state.effective);
+            let active_owns_field = state
+                .scope_owns_field(field)
+                .unwrap_or(false);
+            // On non-User tabs that aren't currently owning the field, a
+            // single Space starts owning it with the FIRST option. The
+            // next Spaces walk through the options; when we reach the end
+            // we clear the override (return to inheriting from the parent
+            // tier) and the next Space starts the cycle over.
+            if matches!(state.scope, ConfigScope::Repo | ConfigScope::Local) {
+                let inherit_action = !active_owns_field;
+                let mut should_clear = false;
+                let next_value: Option<FieldValue> = match (field.kind, &current_value) {
+                    _ if inherit_action => {
+                        // Currently inherited — first Space starts owning at
+                        // the first cyclable value (or toggles for Bool).
+                        match (field.kind, &current_value) {
+                            (FieldKind::Bool, FieldValue::Bool(b)) => {
+                                Some(FieldValue::Bool(!b))
+                            }
+                            (FieldKind::Enum { options }, _) => {
+                                Some(FieldValue::Enum(options[0]))
+                            }
+                            (FieldKind::OptionalEnum { options }, _) => {
+                                Some(FieldValue::OptionalEnum(Some(options[0])))
+                            }
+                            _ if field.toml_path == ["model", "model"] => {
+                                cycle_to_next_registry_model(&state.effective, &current_value)
+                            }
+                            _ => None,
+                        }
+                    }
+                    (FieldKind::Bool, FieldValue::Bool(true)) => {
+                        // Last position of Bool — wrap to "inherit" by
+                        // clearing the override.
+                        should_clear = true;
+                        None
+                    }
+                    (FieldKind::Bool, FieldValue::Bool(false)) => {
+                        Some(FieldValue::Bool(true))
+                    }
+                    (FieldKind::Enum { options }, FieldValue::Enum(current)) => {
+                        let idx = options.iter().position(|o| *o == *current).unwrap_or(0);
+                        if idx + 1 >= options.len() {
+                            should_clear = true;
+                            None
+                        } else {
+                            Some(FieldValue::Enum(options[idx + 1]))
+                        }
+                    }
+                    (FieldKind::OptionalEnum { options }, FieldValue::OptionalEnum(current)) => {
+                        let next_idx =
+                            match current.and_then(|c| options.iter().position(|o| *o == c)) {
+                                None => Some(0),
+                                Some(i) if i + 1 < options.len() => Some(i + 1),
+                                Some(_) => None,
+                            };
+                        match next_idx {
+                            Some(i) => Some(FieldValue::OptionalEnum(Some(options[i]))),
+                            None => {
+                                should_clear = true;
+                                None
+                            }
+                        }
+                    }
+                    _ if field.toml_path == ["model", "model"] => {
+                        cycle_to_next_registry_model(&state.effective, &current_value)
+                    }
+                    _ => None,
+                };
+                if should_clear {
+                    clear_scope_override_silent(state, notifications);
+                    return KeyOutcome::KeepOpen;
+                }
+                if let Some(next) = next_value {
+                    if (field.set)(&mut state.effective, next.clone()).is_ok() {
+                        state.dirty = true;
+                        save_field_silent(state, agent, notifications, field, next);
+                    }
+                    return KeyOutcome::KeepOpen;
+                }
+                notifications.push(
+                    format!("Space doesn't cycle {} — press Enter to edit.", field.label),
+                    NotifySeverity::Info,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+
+            // User tab: cycle through values without an inherit position.
             let next: Option<FieldValue> = match (field.kind, &current_value) {
                 (FieldKind::Bool, FieldValue::Bool(b)) => Some(FieldValue::Bool(!b)),
                 (FieldKind::Enum { options }, FieldValue::Enum(current)) => {
@@ -501,7 +655,7 @@ pub(crate) fn handle_key(
             if let Some(next) = next {
                 if (field.set)(&mut state.effective, next.clone()).is_ok() {
                     state.dirty = true;
-                    save_field(state, agent, notifications, field, next);
+                    save_field_silent(state, agent, notifications, field, next);
                 }
             } else {
                 notifications.push(
@@ -512,6 +666,10 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Enter, _) => {
+            if state.on_synthetic_api_key_row() {
+                open_api_key_entry_for_current_provider(state, notifications);
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             // Refuse to edit env-shadowed fields — the value at runtime is
             // the env var's, not the TOML's, so a TOML write is silently
@@ -571,6 +729,13 @@ pub(crate) fn handle_key(
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+            if state.on_synthetic_api_key_row() {
+                notifications.push(
+                    "API key has no default — use Enter / Space here to set, or clear it from the OS keychain manually.",
+                    NotifySeverity::Info,
+                );
+                return KeyOutcome::KeepOpen;
+            }
             let field = state.current_field();
             if let Some(var) = field.env_override
                 && std::env::var(var).is_ok()
@@ -614,10 +779,6 @@ pub(crate) fn handle_key(
                     clear_scope_override(state, notifications);
                 }
             }
-            KeyOutcome::KeepOpen
-        }
-        (KeyCode::Char('K'), m) if m == KeyModifiers::SHIFT || m.is_empty() => {
-            open_api_key_entry_for_current_provider(state, notifications);
             KeyOutcome::KeepOpen
         }
         (KeyCode::Char('z'), KeyModifiers::CONTROL) => {
@@ -1108,7 +1269,7 @@ fn open_api_key_entry_for_current_provider(
                 provider_label: label.to_string(),
                 draft: String::new(),
                 cursor: 0,
-                reveal_head: false,
+                reveal: false,
             });
         }
         None => {
@@ -1137,7 +1298,7 @@ fn handle_secret_entry_key(
             state.secret_entry = None;
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-            entry.reveal_head = !entry.reveal_head;
+            entry.reveal = !entry.reveal;
         }
         (KeyCode::Backspace, _) if entry.cursor > 0 => {
             let mut chars: Vec<char> = entry.draft.chars().collect();
@@ -1267,6 +1428,30 @@ fn save_field(
     field: &'static FieldMeta,
     value: FieldValue,
 ) {
+    save_field_inner(state, agent, notifications, field, value, false);
+}
+
+/// `silent=true` skips the per-save notification — used by Space-cycling
+/// so the user doesn't see "saved …" pile up while flipping through
+/// values. The actual file write and apply-tier dispatch still happen.
+fn save_field_silent(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    field: &'static FieldMeta,
+    value: FieldValue,
+) {
+    save_field_inner(state, agent, notifications, field, value, true);
+}
+
+fn save_field_inner(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    field: &'static FieldMeta,
+    value: FieldValue,
+    silent: bool,
+) {
     let scope = state.scope;
     let target_path = match scope {
         ConfigScope::User => state.sources.user_path_default.clone(),
@@ -1315,7 +1500,7 @@ fn save_field(
         }
     }
 
-    apply_by_tier(state, agent, notifications, field, &outcome);
+    apply_by_tier(state, agent, notifications, field, &outcome, silent);
 }
 
 fn apply_by_tier(
@@ -1324,15 +1509,18 @@ fn apply_by_tier(
     notifications: &mut NotificationQueue,
     field: &'static FieldMeta,
     outcome: &WriteOutcome,
+    silent: bool,
 ) {
     let path_str = outcome.path.display().to_string();
     match field.tier {
         ApplyTier::Immediate => {
             agent.replace_config(state.effective.clone());
-            notifications.push(
-                format!("✓ saved {} to {}", field.label, path_str),
-                NotifySeverity::Success,
-            );
+            if !silent {
+                notifications.push(
+                    format!("✓ saved {} to {}", field.label, path_str),
+                    NotifySeverity::Success,
+                );
+            }
         }
         ApplyTier::NextPrompt => {
             // Edits to any `[model].*` field (and per-provider `[providers.*]`
@@ -1387,22 +1575,26 @@ fn apply_by_tier(
                 provider: new_provider,
                 display_note: Some(format!("{} changed", field.label)),
             });
-            notifications.push(
-                format!(
-                    "{} changed — applies on next prompt. Saved to {}",
-                    field.label, path_str
-                ),
-                NotifySeverity::Info,
-            );
+            if !silent {
+                notifications.push(
+                    format!(
+                        "{} changed — applies on next prompt. Saved to {}",
+                        field.label, path_str
+                    ),
+                    NotifySeverity::Info,
+                );
+            }
         }
         ApplyTier::Restart => {
-            notifications.push(
-                format!(
-                    "{} saved to {}. Restart required for the change to take effect.",
-                    field.label, path_str
-                ),
-                NotifySeverity::Warn,
-            );
+            if !silent {
+                notifications.push(
+                    format!(
+                        "{} saved to {}. Restart required for the change to take effect.",
+                        field.label, path_str
+                    ),
+                    NotifySeverity::Warn,
+                );
+            }
         }
     }
 }
@@ -1551,6 +1743,45 @@ fn reload_sources_and_agent(
                 format!("(note) couldn't rebuild effective config: {err}"),
                 NotifySeverity::Warn,
             );
+        }
+    }
+}
+
+/// Silent variant — used by Space-cycle when wrapping past the last
+/// option to "inherit". Suppresses the chatty "cleared … (now inherited)"
+/// notification that would otherwise pile up.
+fn clear_scope_override_silent(
+    state: &mut ConfigScreenState,
+    _notifications: &mut NotificationQueue,
+) {
+    let field = state.current_field();
+    let (path, scope_target) = match state.scope {
+        ConfigScope::Repo => {
+            let p = state.sources.project_path_default.clone();
+            (p.clone(), SettingsScope::project(&p))
+        }
+        ConfigScope::Local => {
+            let p = state.sources.repo_path_default.clone();
+            (p.clone(), SettingsScope::repo(&p))
+        }
+        ConfigScope::User => return,
+    };
+    let edit = SettingsEdit {
+        path: field.toml_path,
+        op: EditOp::Unset,
+    };
+    // Snapshot for undo before the write.
+    let pre = std::fs::read(&path).ok();
+    state.undo_stack.push((path.clone(), pre));
+    match apply_edits(&scope_target, &[edit]) {
+        Ok(_) => {
+            if let Ok(reloaded) = load_separated_settings_sources() {
+                state.sources = reloaded;
+            }
+        }
+        Err(_) => {
+            // Failed write — drop the unused snapshot so Ctrl+Z stays in sync.
+            state.undo_stack.pop();
         }
     }
 }
@@ -1711,14 +1942,12 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
     let chars: Vec<char> = entry.draft.chars().collect();
     let total = chars.len();
-    let head_visible = if entry.reveal_head { total.min(4) } else { 0 };
-    let mut masked = String::with_capacity(total);
-    for c in &chars[..head_visible] {
-        masked.push(*c);
-    }
-    for _ in head_visible..total {
-        masked.push('•');
-    }
+    let display: String = if entry.reveal {
+        // Explicit Ctrl+T toggle — show the full plaintext for verification.
+        chars.iter().collect()
+    } else {
+        (0..total).map(|_| '•').collect()
+    };
     let lines = vec![
         Line::from(vec![
             Span::styled(
@@ -1738,7 +1967,7 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
         Line::raw(""),
         Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(masked, Style::default().fg(Color::White)),
+            Span::styled(display, Style::default().fg(Color::White)),
             Span::styled("_", Style::default().fg(AMBER)),
         ]),
         Line::raw(""),
@@ -1753,10 +1982,10 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             Span::styled("save  ", Style::default().fg(QUIET)),
             Span::styled("Ctrl+T ", Style::default().fg(GOLD)),
             Span::styled(
-                if entry.reveal_head {
-                    "hide first 4  "
+                if entry.reveal {
+                    "hide key  "
                 } else {
-                    "reveal first 4 chars  "
+                    "reveal full key  "
                 },
                 Style::default().fg(QUIET),
             ),
@@ -1926,66 +2155,124 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
     ]));
     lines.push(Line::raw(""));
 
+    let api_key_label = "api_key";
     let max_label = section
         .fields
         .iter()
         .map(|f| f.label.len())
+        .chain(if section.id == SectionId::Models {
+            Some(api_key_label.len())
+        } else {
+            None
+        })
         .max()
         .unwrap_or(0);
 
-    // When an editor is open, focus the pane on just the active field + the
+    let total_rows = state.row_count();
+    // When an editor is open, focus the pane on just the active row + the
     // editor block, so the editor is always visible in small viewports.
-    // Otherwise list every field.
-    let editing = state.editor.is_some();
-    let fields_iter: Box<dyn Iterator<Item = (usize, &'static FieldMeta)>> = if editing {
-        let idx = state.field_index;
-        Box::new(std::iter::once((idx, &section.fields[idx])))
+    let editing = state.editor.is_some() || state.secret_entry.is_some();
+    let rows: Vec<usize> = if editing {
+        vec![state.field_index]
     } else {
-        Box::new(section.fields.iter().enumerate())
+        (0..total_rows).collect()
     };
 
-    for (idx, field) in fields_iter {
-        let active = idx == state.field_index;
-        let (value, source) = state.displayed_value_and_source(field);
-        let value_str = value.as_display();
-        let source_label = inheritance_label(state.scope, source);
+    for row in rows {
+        let active = row == state.field_index;
         let prefix = if active { "› " } else { "  " };
-        let style = if active {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        lines.push(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default().fg(if active { GOLD } else { QUIET }),
-            ),
-            Span::styled(
-                format!("{:<width$}", field.label, width = max_label + 2),
-                style,
-            ),
-            Span::styled(
-                value_str,
-                Style::default().fg(if active { GOLD } else { Color::White }),
-            ),
-            Span::raw(" "),
-            Span::styled(source_label, source_style(source)),
-        ]));
+        let prefix_style = Style::default().fg(if active { GOLD } else { QUIET });
+        match state.field_at_row(row) {
+            Some(field) => {
+                let (value, source) = state.displayed_value_and_source(field);
+                let value_str = value.as_display();
+                let source_label = inheritance_label(state.scope, source);
+                let label_style = if active {
+                    Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(
+                        format!("{:<width$}", field.label, width = max_label + 2),
+                        label_style,
+                    ),
+                    Span::styled(
+                        value_str,
+                        Style::default().fg(if active { GOLD } else { Color::White }),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(source_label, source_style(source)),
+                ]));
+            }
+            None => {
+                // Synthetic API-key row.
+                let (provider_label, env_var) =
+                    match provider_api_key_env(&state.effective.provider) {
+                        Some(t) => (t.0.to_string(), t.1),
+                        None => ("—".to_string(), String::new()),
+                    };
+                let label_style = if active {
+                    Style::default()
+                        .fg(MODE_PURPLE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MODE_PURPLE)
+                };
+                let env_text = if env_var.is_empty() {
+                    "n/a for this provider".to_string()
+                } else {
+                    format!("•••• ({env_var})")
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, prefix_style),
+                    Span::styled(
+                        format!("{:<width$}", api_key_label, width = max_label + 2),
+                        label_style,
+                    ),
+                    Span::styled(env_text, Style::default().fg(QUIET)),
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("[keychain · {}]", provider_label.to_lowercase()),
+                        Style::default().fg(MODE_PURPLE),
+                    ),
+                ]));
+            }
+        }
     }
 
     lines.push(Line::raw(""));
-    let field = state.current_field();
-    lines.push(Line::from(vec![
-        Span::styled("? ", Style::default().fg(QUIET)),
-        Span::styled(field.help, Style::default().fg(QUIET)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("  apply: ", Style::default().fg(QUIET)),
-        Span::styled(
-            field.tier.label(),
-            Style::default().fg(tier_color(field.tier)),
-        ),
-    ]));
+    if state.on_synthetic_api_key_row() {
+        let (provider_label, env_var) = match provider_api_key_env(&state.effective.provider) {
+            Some(t) => (t.0.to_string(), t.1),
+            None => ("this provider".to_string(), "—".to_string()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled("? ", Style::default().fg(QUIET)),
+            Span::styled(
+                format!(
+                    "Enter / Space sets the API key for {} (keychain account {}). \
+                     The plaintext never lands in any TOML or transcript.",
+                    provider_label, env_var
+                ),
+                Style::default().fg(QUIET),
+            ),
+        ]));
+    } else {
+        let field = state.current_field();
+        lines.push(Line::from(vec![
+            Span::styled("? ", Style::default().fg(QUIET)),
+            Span::styled(field.help, Style::default().fg(QUIET)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("  apply: ", Style::default().fg(QUIET)),
+            Span::styled(
+                field.tier.label(),
+                Style::default().fg(tier_color(field.tier)),
+            ),
+        ]));
+    }
 
     if let Some(editor) = &state.editor {
         lines.push(Line::raw(""));
@@ -2169,14 +2456,12 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
         Span::raw(" edit · "),
         Span::styled("Space", Style::default().fg(GOLD)),
         Span::raw(" cycle · "),
-        Span::styled("K", Style::default().fg(GOLD)),
-        Span::raw(" key · "),
         Span::styled("/", Style::default().fg(GOLD)),
         Span::raw(" search · "),
         Span::styled("Ctrl+Z", Style::default().fg(GOLD)),
         Span::raw(" undo · "),
         Span::styled("X", Style::default().fg(GOLD)),
-        Span::raw(" discard all · "),
+        Span::raw(" discard · "),
         Span::styled("Esc", Style::default().fg(GOLD)),
         Span::raw(" close "),
     ]);

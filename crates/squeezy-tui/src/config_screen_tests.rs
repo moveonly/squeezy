@@ -148,8 +148,9 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    // The `provider` field is index 0; the `model` field is index 1.
-    state.field_index = 1;
+    // The `provider` field is row 0; row 1 is the synthetic API-key row;
+    // the `model` field is row 2.
+    state.field_index = 2;
     handle_key(
         &mut state,
         &mut agent,
@@ -196,7 +197,7 @@ async fn esc_on_model_picker_closes_picker_only() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    state.field_index = 1; // model field
+    state.field_index = 2; // model field (row 1 is the synthetic API-key row)
     handle_key(
         &mut state,
         &mut agent,
@@ -228,7 +229,7 @@ async fn space_cycles_model_field_to_next_registry_entry() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    state.field_index = 1; // model field
+    state.field_index = 2; // model field (row 1 is the synthetic API-key row)
     let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
         FieldValue::String(s) => s,
         other => panic!("expected String, got {other:?}"),
