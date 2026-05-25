@@ -37,25 +37,35 @@ pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
-pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
-pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
-pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
+// Per-turn aggregate budgets. None of the three peer agents (codex,
+// CC, opencode) bound aggregate tool calls, bytes read, or
+// files enumerated across a turn — every cap they have is per single
+// tool invocation. These defaults are sized so they never bind in
+// realistic use; users who want strict cost caps can set tighter
+// values in `squeezy.toml`. Kept finite (rather than `u64::MAX`) so
+// the inspect output remains TOML-roundtrippable.
+pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 10_000;
+pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 1_000_000_000;
+pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 1_000_000;
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_PROVIDER_REQUEST_MAX_RETRIES: u8 = 4;
 pub const DEFAULT_PROVIDER_STREAM_MAX_RETRIES: u8 = 5;
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
-// Emergency ceiling on subagent model rounds — *not* an active limit.
-// Subagent runaway is already bounded by `max_tool_calls_per_call`,
-// `max_tool_bytes_read_per_call`, per-round result bytes, the cost
-// broker, and the cancellation token; the natural exit is the model
-// producing a final answer with no tool calls. Matches the parent
-// agent's own `MAX_TOOL_ROUNDS = 32` so neither ceiling is the
-// load-bearing one.
-pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 32;
+// Per-subagent-invocation budgets. No peer agent has any equivalent —
+// codex, CC, and opencode bound work per single tool call,
+// not per subagent run. Sized so they never bind in realistic use;
+// the subagent's natural exit is the model emitting a final answer
+// with no tool calls.
+pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
+// Emergency belt on subagent model rounds — matches CC's
+// `forkSubagent.maxTurns = 200`, the only concrete cap any peer
+// sets on a full subagent. Above this the cost broker, cancellation
+// token, and per-tool-call truncations should already have caught
+// any runaway.
+pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
 pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 1_200;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =

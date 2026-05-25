@@ -69,7 +69,11 @@ use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
-const MAX_TOOL_ROUNDS: usize = 32;
+// Emergency belt on tool rounds per turn — codex and opencode loop
+// unbounded; CC only caps explicit-purpose subagents (its
+// `forkSubagent` uses 200). 200 keeps a true safety ceiling without
+// truncating legitimate long-running exploration.
+const MAX_TOOL_ROUNDS: usize = 200;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
 const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
 const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -4908,7 +4912,10 @@ async fn run_subagent(
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
-    config.max_tool_result_bytes_per_round = config.max_tool_result_bytes_per_round.min(24_000);
+    // Subagent inherits the parent's per-round result-bytes cap directly.
+    // The previous `.min(24_000)` halved the budget for a subagent that
+    // already had fewer tool calls to spend; no peer agent applies a
+    // smaller per-result cap to subagents than to the parent.
     let model = subagent_model_for_kind(parent.provider.name(), &config, kind);
     config.model = model.clone();
 
