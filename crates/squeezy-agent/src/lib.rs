@@ -4867,7 +4867,7 @@ async fn run_subagent(
 async fn run_subagent_loop(
     parent: &ToolExecutionContext<'_>,
     config: &AppConfig,
-    tool_specs: &[LlmToolSpec],
+    tool_specs: &[Arc<LlmToolSpec>],
     allowed_tools: &[AdvertisedTool],
     allowed_tool_names: &BTreeSet<String>,
     instructions: &str,
@@ -6978,19 +6978,19 @@ pub(crate) fn permission_rule_for_persistence(
 /// of truth lives in `squeezy-tools` next to each tool's builder.
 #[derive(Clone)]
 pub(crate) struct AdvertisedTool {
-    spec: LlmToolSpec,
+    spec: Arc<LlmToolSpec>,
     capability: PermissionCapability,
 }
 
 pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
     AdvertisedTool {
         capability: spec.capability,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: spec.name,
             description: spec.description,
             parameters: spec.parameters,
             strict: false,
-        },
+        }),
     }
 }
 
@@ -7029,7 +7029,7 @@ fn core_control_tools(
 fn load_tool_schema_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
             description: "Attach the full JSON schema for a discoverable tool before using it."
                 .to_string(),
@@ -7045,14 +7045,14 @@ fn load_tool_schema_advertised_tool() -> AdvertisedTool {
                 "required": ["name"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
             description: "Delegate broad research to an isolated subagent. The parent receives only a structured summary, supporting receipts, and separate spend metrics.".to_string(),
             parameters: json!({
@@ -7071,14 +7071,14 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "required": ["prompt"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_plan_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_PLAN_TOOL_NAME.to_string(),
             description: "Delegate read-only implementation planning to a Planner subagent. The parent receives ordered steps, impacted files/symbols, and (when plan_patch is used) a plan_id to bind future edits to.".to_string(),
             parameters: json!({
@@ -7097,14 +7097,14 @@ fn delegate_plan_advertised_tool() -> AdvertisedTool {
                 "required": ["goal"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_review_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
             description: "Delegate read-only review of the current diff to a Reviewer subagent. Returns actionable findings (severity, file, line, message, suggested_fix) and a pass flag.".to_string(),
             parameters: json!({
@@ -7122,7 +7122,7 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
                 }
             }),
             strict: false,
-        },
+        }),
     }
 }
 
@@ -7134,7 +7134,7 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
 fn request_user_input_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
             description:
                 "Plan mode only. Pause the turn and ask the user a clarifying question. Provide a question; optionally provide multiple-choice options with stable values. Returns the user's selection (or notes they cancelled)."
@@ -7174,14 +7174,14 @@ fn request_user_input_advertised_tool() -> AdvertisedTool {
                 "required": ["question"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
             description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools and return a compact briefing before planning or executing.".to_string(),
             parameters: json!({
@@ -7205,15 +7205,15 @@ fn explore_advertised_tool() -> AdvertisedTool {
                 "required": ["prompt"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
-fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
+fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Arc<LlmToolSpec>> {
     tools
         .iter()
         .filter(|tool| !mode_refuses_capability(mode, tool.capability))
-        .map(|tool| tool.spec.clone())
+        .map(|tool| Arc::clone(&tool.spec))
         .collect()
 }
 
@@ -7295,17 +7295,14 @@ fn request_tool_specs(
     mode: SessionMode,
     schema_config: &ToolSchemaConfig,
     loaded_tool_schemas: &[String],
-) -> Vec<LlmToolSpec> {
+) -> Vec<Arc<LlmToolSpec>> {
     if !schema_config.lazy_schema_loading {
         return advertised_tool_specs(tools, mode);
     }
 
-    // Per-round `LlmToolSpec` clones are intentional and bounded by the size
-    // of the advertised tool set (~20 first-party tools today). If the spec
-    // set grows materially — for example once MCP brings in many external
-    // tools — switching `AdvertisedTool::spec` to `Arc<LlmToolSpec>` or
-    // emitting `Vec<Arc<LlmToolSpec>>` from this function would zero the
-    // per-round clone cost.
+    // Specs are stored as `Arc<LlmToolSpec>` so a per-round "spec list"
+    // build is a sequence of cheap atomic refcount bumps regardless of
+    // how many tools (first-party or MCP-loaded) end up in the request.
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
     let advertised_names: BTreeSet<&str> =
@@ -7339,7 +7336,7 @@ fn push_tool_spec_by_name(
     tools: &[AdvertisedTool],
     name: &str,
     mode: SessionMode,
-    specs: &mut Vec<LlmToolSpec>,
+    specs: &mut Vec<Arc<LlmToolSpec>>,
     seen: &mut BTreeSet<String>,
 ) {
     if !seen.insert(name.to_string()) {
@@ -7359,7 +7356,7 @@ fn push_tool_spec_by_name(
         return;
     };
     if !mode_refuses_capability(mode, tool.capability) {
-        specs.push(tool.spec.clone());
+        specs.push(Arc::clone(&tool.spec));
     }
 }
 

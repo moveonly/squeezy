@@ -347,7 +347,7 @@ fn push_message(
     Ok(())
 }
 
-pub(crate) fn tool_configuration(specs: &[LlmToolSpec]) -> Result<Option<ToolConfiguration>> {
+pub(crate) fn tool_configuration(specs: &[Arc<LlmToolSpec>]) -> Result<Option<ToolConfiguration>> {
     if specs.is_empty() {
         return Ok(None);
     }

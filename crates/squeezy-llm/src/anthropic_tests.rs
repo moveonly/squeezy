@@ -12,18 +12,21 @@ fn request_body_uses_messages_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "read_file".to_string(),
-            description: "Read a file".to_string(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" }
-                },
-                "required": ["path"]
-            }),
-            strict: true,
-        }],
+        tools: vec![
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }),
+                strict: true,
+            }
+            .into(),
+        ],
         store: true,
     };
 
@@ -60,13 +63,15 @@ fn request_body_preserves_function_tool_order() {
                 description: "write".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
         ],
         store: false,
     };
@@ -207,13 +212,15 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
                 description: "first".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
                 strict: false,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "tool_b".to_string(),
                 description: "second".to_string(),
                 parameters: serde_json::json!({"type": "object"}),
                 strict: false,
-            },
+            }
+            .into(),
         ],
         store: false,
     };
@@ -239,12 +246,15 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "tool_a".to_string(),
-            description: "first".to_string(),
-            parameters: serde_json::json!({"type": "object"}),
-            strict: false,
-        }],
+        tools: vec![
+            LlmToolSpec {
+                name: "tool_a".to_string(),
+                description: "first".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ],
         store: false,
     };
 

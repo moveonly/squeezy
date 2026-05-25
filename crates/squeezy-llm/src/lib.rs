@@ -49,7 +49,7 @@ pub struct LlmRequest {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub previous_response_id: Option<String>,
     pub cache_key: Option<String>,
-    pub tools: Vec<LlmToolSpec>,
+    pub tools: Vec<Arc<LlmToolSpec>>,
     pub store: bool,
 }
 

@@ -14,12 +14,15 @@ fn request_body_uses_chat_stream_shape() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "grep".to_string(),
-            description: "search".to_string(),
-            parameters: json!({"type": "object"}),
-            strict: true,
-        }],
+        tools: vec![
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            }
+            .into(),
+        ],
         store: false,
     };
 
@@ -50,13 +53,15 @@ fn request_body_preserves_function_tool_order() {
                 description: "write".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
         ],
         store: false,
     };

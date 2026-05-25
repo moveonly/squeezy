@@ -13,16 +13,19 @@ fn request_body_uses_responses_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "grep".to_string(),
-            description: "search files".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {"pattern": {"type": "string"}},
-                "required": ["pattern"]
-            }),
-            strict: true,
-        }],
+        tools: vec![
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search files".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"pattern": {"type": "string"}},
+                    "required": ["pattern"]
+                }),
+                strict: true,
+            }
+            .into(),
+        ],
         store: true,
     };
 
@@ -143,13 +146,15 @@ fn request_body_preserves_function_tool_order() {
                 description: "write".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
         ],
         store: false,
     };
