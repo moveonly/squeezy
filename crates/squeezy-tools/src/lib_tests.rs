@@ -5073,13 +5073,156 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(
         result.content["fallback"]["status"].as_str(),
-        Some("unsupported_language")
+        Some("no_graph_evidence")
+    );
+    assert_eq!(
+        result.content["fallback"]["reason"].as_str(),
+        Some("path_unsupported")
     );
     assert_eq!(
         result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
         Some("grep")
     );
     assert!(result.content["packets"].as_array().unwrap().is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_emits_grep_fallback_for_supported_path() {
+    let root = temp_workspace("graph_zero_hit_supported");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_supported".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src/lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    assert_eq!(
+        fallback["reason"].as_str(),
+        Some("supported_language_no_match")
+    );
+    assert_eq!(fallback["path"].as_str(), Some("src/lib.rs"));
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("src/lib.rs"));
+    assert_eq!(
+        grep["arguments"]["pattern"].as_str(),
+        Some("no_such_symbol")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_no_path_scope() {
+    let root = temp_workspace("graph_zero_hit_no_path");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_no_path".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_unique_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["reason"].as_str(), Some("no_path_scope"));
+    assert!(fallback["path"].is_null());
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("."));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_regex_escapes_query() {
+    let root = temp_workspace("graph_zero_hit_regex");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_regex".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "foo.bar()"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let pattern = result.content["fallback"]["suggested_tools"][0]["arguments"]["pattern"]
+        .as_str()
+        .expect("pattern string");
+    assert!(
+        pattern.contains(r"\."),
+        "regex metacharacters must be escaped; got {pattern:?}"
+    );
+    assert!(
+        pattern.contains(r"\(") && pattern.contains(r"\)"),
+        "parentheses must be escaped; got {pattern:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_non_empty_packets_keeps_null_fallback() {
+    let root = temp_workspace("graph_fallback_null_when_hits");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "non_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(
+        result.content["fallback"].is_null(),
+        "fallback must be null when graph returned packets, got {}",
+        result.content["fallback"]
+    );
 
     let _ = fs::remove_dir_all(root);
 }

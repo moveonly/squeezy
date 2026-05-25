@@ -2873,10 +2873,16 @@ impl ToolRegistry {
         payload.insert("query".to_string(), json!(args.query));
         payload.insert("kind".to_string(), json!(args.kind));
         payload.insert("language".to_string(), json!(args.language));
+        let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                args.query.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("total_matches".to_string(), json!(symbols.len()));
@@ -2938,13 +2944,19 @@ impl ToolRegistry {
                 )
             })
             .collect::<Vec<_>>();
+        let packet_count = packets.len();
         let mut payload = graph_payload("definition_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                args.query.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
@@ -3002,13 +3014,20 @@ impl ToolRegistry {
         let packets = selected.iter().map(reference_packet).collect::<Vec<_>>();
         let confidence_distribution =
             ToolCostHint::confidence_distribution_from(selected.iter().map(|hit| hit.confidence));
+        let query_text = args.text.clone().or_else(|| args.query.clone());
+        let packet_count = packets.len();
         let mut payload = graph_payload("reference_search", manager, refresh);
         payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert("text".to_string(), json!(args.text.or(args.query)));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), None),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                query_text.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -3212,10 +3231,11 @@ impl ToolRegistry {
             json!(diff_mode_str(args.mode.unwrap_or_default())),
         );
         payload.insert("diff_only".to_string(), json!(diff_only));
+        let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, path_filter, Some(&args.query)),
+            graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
         );
         payload.insert("truncated".to_string(), json!(false));
         make_result(
@@ -10275,32 +10295,69 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
         .collect()
 }
 
-fn unsupported_fallback_for_path(
+/// Structured zero-result fallback for graph-anchored tools.
+///
+/// Returns `Value::Null` when the tool has at least one result packet
+/// (callers always pass `packet_count`; the empty case is the only one
+/// that needs a fallback). When `packet_count == 0`, emits an
+/// `evidence-packet-shaped` object with:
+/// - `status`: `"no_graph_evidence"`
+/// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
+///   `path_unknown`, `no_path_scope`
+/// - `path` / `language` (nullable)
+/// - `suggested_tools`: a regex-escaped `grep` invocation plus a
+///   `decl_search` retry shape
+fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
     path: Option<&str>,
     query: Option<&str>,
+    packet_count: usize,
 ) -> Value {
-    let Some(path) = path else {
+    if packet_count > 0 {
         return Value::Null;
+    }
+    let (path_value, language_value, reason) = match path {
+        Some(path) => {
+            let file = graph.files.values().find(|file| {
+                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
+            });
+            match file {
+                Some(file) => {
+                    let reason = match file.language {
+                        LanguageKind::Unsupported => "path_unsupported",
+                        LanguageKind::Unknown => "path_unknown",
+                        _ => "supported_language_no_match",
+                    };
+                    (
+                        Value::String(file.relative_path.clone()),
+                        Value::String(file.language.display_name().to_string()),
+                        reason,
+                    )
+                }
+                None => (Value::String(path.to_string()), Value::Null, "path_unknown"),
+            }
+        }
+        None => (Value::Null, Value::Null, "no_path_scope"),
     };
-    graph
-        .files
-        .values()
-        .find(|file| file.relative_path == path || file.relative_path.ends_with(&format!("/{path}")))
-        .filter(|file| matches!(file.language, LanguageKind::Unsupported | LanguageKind::Unknown))
-        .map(|file| {
-            json!({
-                "status": graph_status_for_language(file.language),
-                "path": file.relative_path,
-                "language": file.language.display_name(),
-                "reason": "semantic graph does not claim navigation confidence for this file",
-                "suggested_tools": [
-                    {"tool": "grep", "arguments": {"pattern": query.unwrap_or("<query>"), "path": file.relative_path}},
-                    {"tool": "read_file", "arguments": {"path": file.relative_path, "limit": DEFAULT_READ_LIMIT}}
-                ]
-            })
-        })
-        .unwrap_or(Value::Null)
+    let grep_path = match &path_value {
+        Value::String(p) => p.clone(),
+        _ => ".".to_string(),
+    };
+    let grep_pattern = match query {
+        Some(q) if !q.is_empty() => regex::escape(q),
+        _ => "<query>".to_string(),
+    };
+    let decl_query = query.unwrap_or("<query>").to_string();
+    json!({
+        "status": "no_graph_evidence",
+        "reason": reason,
+        "path": path_value,
+        "language": language_value,
+        "suggested_tools": [
+            {"tool": "grep", "arguments": {"pattern": grep_pattern, "path": grep_path}},
+            {"tool": "decl_search", "arguments": {"query": decl_query, "kind": null}}
+        ]
+    })
 }
 
 fn graph_status_for_language(language: LanguageKind) -> &'static str {
