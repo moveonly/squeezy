@@ -2867,22 +2867,21 @@ async fn completed_event_preserves_scroll_offset_in_history() {
 async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
     let mut app = test_app(SessionMode::Build);
     let stdout = [
-        "total 104",
-        "drwxr-xr-x@  22 abbassabra  staff    704 May 24 14:59 .",
-        "drwxr-x---+ 109 abbassabra  staff   3488 May 25 13:58 ..",
-        "-rw-r--r--@   1 abbassabra  staff  16326 May 24 23:27 README.md",
-        "drwxr-xr-x@  34 abbassabra  staff   1088 May 23 00:01 tools",
+        "section alpha status ready score 42 owner team-one",
+        "section beta status ready score 84 owner team-two",
+        "section gamma status stale score 21 owner team-three",
+        "section delta status ready score 63 owner team-four",
     ]
     .join("\n");
     let call = ToolCall {
         call_id: "shell-1".to_string(),
         name: "shell".to_string(),
-        arguments: serde_json::json!({"command": "ls -la"}),
+        arguments: serde_json::json!({"command": "inspect workspace summary"}),
     };
     let mut result = sample_tool_result("shell", "");
     result.call_id = "shell-1".to_string();
     result.content = serde_json::json!({
-        "command": "ls -la",
+        "command": "inspect workspace summary",
         "workdir": ".",
         "exit_code": 0,
         "stdout": stdout,
@@ -2895,7 +2894,7 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
     tx.send(AgentEvent::Completed {
         turn_id: TurnId::new(1),
         message: TranscriptItem::assistant(format!(
-            "Here’s `ls -la` for the repo root:\n\n```text\n{stdout}\n```\n\nI can list a subdirectory next."
+            "Here is the summary:\n\n```text\n{stdout}\n```\n\nI can inspect another area next."
         )),
         response_id: None,
         cost: CostSnapshot::default(),
@@ -2917,12 +2916,77 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
             _ => None,
         })
         .expect("assistant message");
-    assert!(assistant.contains("Here’s `ls -la`"), "{assistant}");
+    assert!(assistant.contains("Here is the summary"), "{assistant}");
     assert!(!assistant.contains("```"), "{assistant}");
-    assert!(!assistant.contains("README.md"), "{assistant}");
+    assert!(!assistant.contains("section alpha"), "{assistant}");
 
     let rendered = render_to_string(&app, 140, 24);
-    assert_eq!(rendered.matches("README.md").count(), 1, "{rendered}");
+    assert_eq!(rendered.matches("section alpha").count(), 1, "{rendered}");
+}
+
+#[tokio::test]
+async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
+    let mut app = test_app(SessionMode::Build);
+    let stdout = [
+        "module-alpha owner platform size 704 changed 2026-05-24",
+        "module-beta owner runtime size 3488 changed 2026-05-25",
+        "module-gamma owner docs size 16326 changed 2026-05-24",
+        "module-delta owner tools size 1088 changed 2026-05-23",
+        "module-epsilon owner tests size 2048 changed 2026-05-22",
+    ]
+    .join("\n");
+    let repeated_with_small_drift = [
+        "module-alpha owner platform size 704 changed 2026-05-24",
+        "module-beta owner runtime size 3489 changed 2026-05-25",
+        "module-gamma owner docs size 16326 changed 2026-05-24",
+        "module-delta owner tooling size 1088 changed 2026-05-23",
+        "module-epsilon owner tests size 2048 changed 2026-05-22",
+    ]
+    .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "summarize module inventory"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "summarize module inventory",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": stdout,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant(format!("```text\n{repeated_with_small_drift}\n```")),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    let assistant = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Message(item) if item.role == Role::Assistant => {
+            Some(item.content.as_str())
+        }
+        _ => None,
+    });
+    assert!(
+        assistant.is_none(),
+        "duplicate-only assistant message should be dropped: {assistant:?}",
+    );
+
+    let rendered = render_to_string(&app, 140, 24);
+    assert_eq!(rendered.matches("module-alpha").count(), 1, "{rendered}");
 }
 
 #[tokio::test]

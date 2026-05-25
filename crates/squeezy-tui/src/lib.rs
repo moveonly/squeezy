@@ -3177,11 +3177,66 @@ fn strip_repeated_fenced_tool_output(content: &str, output: &str) -> Option<Stri
 
 fn fenced_block_repeats_tool_output(body: &str, duplicate: &str) -> bool {
     let body = normalize_duplicate_tool_output(body);
-    !body.is_empty() && (body == duplicate || body.contains(duplicate) || duplicate.contains(&body))
+    !body.is_empty()
+        && (body == duplicate
+            || body.contains(duplicate)
+            || duplicate.contains(&body)
+            || tool_output_similarity_is_duplicate(&body, duplicate))
 }
 
 fn normalize_duplicate_tool_output(text: &str) -> String {
     text.replace("\r\n", "\n").trim().to_string()
+}
+
+fn tool_output_similarity_is_duplicate(body: &str, duplicate: &str) -> bool {
+    let shorter_len = body.len().min(duplicate.len());
+    if shorter_len < 80 {
+        return false;
+    }
+
+    let body_lines = output_line_fingerprints(body);
+    let duplicate_lines = output_line_fingerprints(duplicate);
+    if body_lines.len() >= 3 && duplicate_lines.len() >= 3 {
+        let shared_lines = body_lines.intersection(&duplicate_lines).count();
+        let line_containment =
+            shared_lines as f32 / body_lines.len().min(duplicate_lines.len()) as f32;
+        if shared_lines >= 3 && line_containment >= 0.55 {
+            return true;
+        }
+    }
+
+    let body_tokens = output_similarity_tokens(body);
+    let duplicate_tokens = output_similarity_tokens(duplicate);
+    if body_tokens.len() < 12 || duplicate_tokens.len() < 12 {
+        return false;
+    }
+
+    let shared = body_tokens.intersection(&duplicate_tokens).count();
+    let smaller = body_tokens.len().min(duplicate_tokens.len());
+    let union = body_tokens.len() + duplicate_tokens.len() - shared;
+    let containment = shared as f32 / smaller as f32;
+    let jaccard = shared as f32 / union as f32;
+
+    shared >= 12 && containment >= 0.72 && jaccard >= 0.45
+}
+
+fn output_line_fingerprints(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .map(normalize_output_line)
+        .filter(|line| line.len() >= 16)
+        .collect()
+}
+
+fn normalize_output_line(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn output_similarity_tokens(text: &str) -> BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '.' && ch != '-')
+        .map(str::trim)
+        .filter(|token| token.len() >= 2)
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
 }
 
 fn tidy_stripped_assistant_text(text: String) -> String {
