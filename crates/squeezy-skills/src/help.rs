@@ -230,7 +230,7 @@ const TOPICS: &[TopicDefinition] = &[
             "squeezy.toml",
             "settings.toml",
         ],
-        summary: "Squeezy merges built-in defaults, user settings, project `squeezy.toml`, per-repo user settings, environment variables, and CLI flags. `squeezy config inspect` prints the effective merged configuration with sensitive values redacted, and `squeezy --health` validates the configuration and prints the source chain.",
+        summary: "Squeezy merges built-in defaults, user settings, project `squeezy.toml`, per-repo user settings, environment variables, and CLI flags. `squeezy config inspect` prints the effective merged configuration with sensitive values redacted, and `squeezy doctor` validates the configuration along with provider credential, session-store, and sandbox checks.",
         docs: &[
             "docs/external/CONFIGURATION.md",
             "docs/external/REPO_PROFILE.md",
@@ -470,7 +470,7 @@ const TOPICS: &[TopicDefinition] = &[
             "uninstall",
             "upgrade",
         ],
-        summary: "Squeezy can be installed from the `esqueezy/tap` Homebrew tap, with `cargo install squeezy --locked`, or from GitHub release archives for macOS and Linux. Run `squeezy --health` after install, initialize user settings with `squeezy config init --user`, and remove the binary plus optional `~/.squeezy` state when uninstalling.",
+        summary: "Squeezy can be installed with the one-line installer (`curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh`), from the `esqueezy/tap` Homebrew tap, with `cargo install squeezy --locked`, or from GitHub release archives for macOS and Linux. Run `squeezy doctor` after install, initialize user settings with `squeezy config init --user`, and remove the binary plus optional `~/.squeezy` state when uninstalling.",
         docs: &[
             "docs/external/INSTALL.md",
             "docs/external/PLATFORMS.md",
@@ -480,9 +480,10 @@ const TOPICS: &[TopicDefinition] = &[
         config: &["model", "providers.*", "session"],
     },
     TopicDefinition {
-        id: "health",
-        title: "health checks, platforms, and startup mode",
+        id: "doctor",
+        title: "doctor command, platforms, and startup mode",
         aliases: &[
+            "doctor",
             "health",
             "--health",
             "platform",
@@ -494,7 +495,7 @@ const TOPICS: &[TopicDefinition] = &[
             "troubleshooting",
             "troubleshoot",
         ],
-        summary: "`squeezy --health` validates configuration without opening the TUI. The first supported platforms are macOS and Linux. For startup, provider, permission, graph, or local-help issues, run health and config inspection first.",
+        summary: "`squeezy doctor` validates configuration without opening the TUI and reports on the configured provider credential, repo profile, session store, and shell-sandbox availability. The first supported platforms are macOS and Linux. For startup, provider, permission, graph, or local-help issues, run `squeezy doctor` and `squeezy config inspect` first.",
         docs: &[
             "docs/external/PLATFORMS.md",
             "docs/external/TROUBLESHOOTING.md",

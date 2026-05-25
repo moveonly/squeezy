@@ -25,7 +25,7 @@ detected, machine-local repo knowledge in `~/.squeezy/repos.toml` and uses its
 stable repo id for per-repo user settings; see
 [`REPO_PROFILE.md`](REPO_PROFILE.md).
 
-`config inspect` and `--health` both list the source chain so you can see
+`config inspect` and `doctor` both list the source chain so you can see
 which layers actually contributed to a given run.
 
 On first interactive startup, when no provider/model default has been selected,
@@ -44,14 +44,14 @@ squeezy config init --project
 squeezy mcp list
 squeezy mcp add docs --project --transport stdio --command docs-mcp
 squeezy mcp disable docs --project
-squeezy --health
+squeezy doctor
 squeezy --mode plan
 ```
 
 `config inspect` prints the effective merged configuration as valid TOML
 with sensitive-looking values redacted; the document can be parsed back
 through the same loader. `config init` refuses to overwrite an existing
-file unless `--force` is passed. `--health` validates configuration and
+file unless `--force` is passed. `doctor` validates configuration and
 prints the source chain used for resolution. `--mode plan|build` selects the
 starting session mode for the TUI.
 

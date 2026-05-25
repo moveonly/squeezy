@@ -22,7 +22,9 @@ use squeezy_llm::{
 };
 
 mod auth;
+mod doctor;
 use auth::handle_auth_command;
+use doctor::DoctorArgs;
 use squeezy_store::{
     BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
     SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
@@ -55,8 +57,6 @@ struct Cli {
     list_models: bool,
     #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
     prompt: Option<String>,
-    #[arg(long, help = "Check configuration and exit without opening the TUI")]
-    health: bool,
     #[arg(
         long,
         help = "Ignore saved provider/model defaults and run startup selection again"
@@ -102,6 +102,8 @@ enum Command {
         #[command(subcommand)]
         command: auth::AuthCommand,
     },
+    #[command(about = "Diagnose configuration, providers, session store, and sandbox availability")]
+    Doctor(DoctorArgs),
 }
 
 #[derive(Debug, Args)]
@@ -298,6 +300,15 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args),
         Some(Command::Auth { command }) => return handle_auth_command(command),
+        Some(Command::Doctor(args)) => {
+            let report = doctor::run(args)?;
+            report.print();
+            let code = report.exit_code;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            return Ok(());
+        }
         None => {}
     }
 
@@ -344,21 +355,6 @@ async fn main() -> squeezy_core::Result<()> {
                 model.tokenizer.as_str(),
                 model.lifecycle.as_str(),
             );
-        }
-        return Ok(());
-    }
-
-    if cli.health {
-        let onboarding = prepare_repo_profile(&mut config)?;
-        println!("squeezy: ok");
-        println!("config_sources={}", config.config_sources.join(","));
-        println!(
-            "config_source_labels={}",
-            config.config_source_labels().join(",")
-        );
-        println!("help_hint=use /help <topic> in the TUI for local Squeezy help");
-        if let Some(summary) = onboarding.visible_summary {
-            println!("{summary}");
         }
         return Ok(());
     }
@@ -1145,7 +1141,7 @@ struct StartupModelSelection {
 }
 
 fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_core::Result<bool> {
-    if cli.prompt.is_some() || cli.list_models || cli.list_providers || cli.health {
+    if cli.prompt.is_some() || cli.list_models || cli.list_providers {
         return Ok(false);
     }
     if !io::stdin().is_terminal() {

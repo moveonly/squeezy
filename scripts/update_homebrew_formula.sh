@@ -123,7 +123,9 @@ class Squeezy < Formula
   end
 
   test do
-    assert_match "squeezy: ok", shell_output("#{bin}/squeezy --health")
+    output = shell_output("#{bin}/squeezy doctor --json")
+    assert_match "\"failures\": 0", output
+    assert_match "squeezy #{version}", shell_output("#{bin}/squeezy --version")
   end
 end
 FORMULA
