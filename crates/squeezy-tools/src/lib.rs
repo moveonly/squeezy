@@ -3450,7 +3450,7 @@ impl ToolRegistry {
         let baseline_requested = ctx.args.diff_baseline.unwrap_or_default();
         if baseline_requested == DiffReadBaseline::LastReceipt {
             match self.read_slice_last_receipt_diff(ctx) {
-                LastReceiptDiffOutcome::Result(result) => return result,
+                LastReceiptDiffOutcome::Result(result) => return *result,
                 LastReceiptDiffOutcome::Fallback(reason) => {
                     return self.read_slice_git_diff(
                         ctx,
@@ -3788,7 +3788,7 @@ impl ToolRegistry {
                 cost.clone(),
                 DiffNextActionKind::ReadSlice,
             );
-            return LastReceiptDiffOutcome::Result(make_result(
+            return LastReceiptDiffOutcome::Result(Box::new(make_result(
                 call,
                 ToolStatus::Success,
                 json!({
@@ -3814,7 +3814,7 @@ impl ToolRegistry {
                 }),
                 cost,
                 Some(content_sha256.clone()),
-            ));
+            )));
         }
 
         let bytes = match read_range(path, offset as u64, limit) {
@@ -3921,7 +3921,7 @@ impl ToolRegistry {
             cost,
             Some(content_sha256.clone()),
         );
-        LastReceiptDiffOutcome::Result(result)
+        LastReceiptDiffOutcome::Result(Box::new(result))
     }
 
     fn graph_context_for_snapshot(
@@ -8922,7 +8922,13 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
         return true;
     };
     let path = symbol.file_id.0.as_str();
-    path == filter || path.ends_with(&format!("/{filter}"))
+    if path == filter || path.ends_with(&format!("/{filter}")) {
+        return true;
+    }
+    // Append fuzzy path matching as a fallback so casual queries like
+    // `path: "graph_mgr"` resolve to `crates/squeezy-graph/src/lib.rs`.
+    // Suffix matching above keeps precedence; fuzzy only rescues misses.
+    squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
 fn diff_file_json(file: &DiffFile) -> Value {
@@ -8957,7 +8963,7 @@ fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
 }
 
 enum LastReceiptDiffOutcome {
-    Result(ToolResult),
+    Result(Box<ToolResult>),
     Fallback(&'static str),
 }
 
@@ -10136,6 +10142,35 @@ fn graph_symbol_search(
         .filter(|symbol| symbol_matches_path_filter(symbol, path))
         .filter(|symbol| language_matches(graph, symbol, language))
         .collect::<Vec<_>>();
+
+    // Fuzzy widening: when the trigram-anchored candidate pool is empty
+    // but a query was provided, run a fuzzy subsequence scan over all
+    // symbols so casual queries (`graphmgr → GraphManager`) still
+    // resolve. This only runs on a miss so high-confidence behaviour is
+    // unchanged.
+    if symbols.is_empty()
+        && let Some(query) = query
+    {
+        symbols = graph
+            .symbols
+            .values()
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .filter(|symbol| {
+                let view = squeezy_rank::GraphSymbolView {
+                    name: symbol.name.as_str(),
+                    signature: symbol.signature.as_str(),
+                };
+                squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                    != squeezy_rank::symbol_rank::RankTier::NoMatch
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+
     symbols.sort_by(|left, right| {
         query
             .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
@@ -10192,15 +10227,17 @@ fn resolve_definition_candidates(
 }
 
 fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
-    if symbol.name == query {
-        0
-    } else if symbol.name.eq_ignore_ascii_case(query) {
-        1
-    } else if symbol.signature.contains(query) {
-        2
-    } else {
-        3
-    }
+    // Preserve the historical exact > case-insensitive > signature-substring
+    // ordering. `squeezy_rank` adds two extra tiers (token-bag, fuzzy) that
+    // recover near-miss queries like `graphmgr → GraphManager` without
+    // changing the relative ordering of existing high-confidence hits.
+    let view = squeezy_rank::GraphSymbolView {
+        name: symbol.name.as_str(),
+        signature: symbol.signature.as_str(),
+    };
+    squeezy_rank::symbol_rank::rank_symbol(view, query)
+        .0
+        .as_usize()
 }
 
 fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
@@ -10541,7 +10578,12 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     path == filter || path.ends_with(&format!("/{filter}"))
 }
 
-fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
+fn call_edge_packet(
+    graph: &squeezy_graph::SemanticGraph,
+    hit: &CallEdgeHit,
+    tool: &str,
+    upstream: bool,
+) -> Value {
     let actor = if upstream {
         hit.caller.as_ref()
     } else {
@@ -10579,6 +10621,41 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             Some(span),
         )
     });
+    let next_action = if hit.edge.candidates.is_empty() {
+        json!({
+            "tool": "read_slice",
+            "arguments": hit.edge.span.map(|span| json!({
+                "path": hit.caller.as_ref().map(|symbol| symbol.file_id.0.clone()).unwrap_or_default(),
+                "start_byte": span.start_byte,
+                "end_byte": span.end_byte
+            })).unwrap_or_else(|| json!({})),
+            "reason": "read the exact call site"
+        })
+    } else {
+        let fanout: Vec<Value> = hit
+            .edge
+            .candidates
+            .iter()
+            .take(CANDIDATE_FANOUT_LIMIT)
+            .filter_map(|id| graph.symbols.get(id))
+            .map(|sym| {
+                json!({
+                    "tool": "read_slice",
+                    "arguments": {
+                        "path": sym.file_id.0,
+                        "start_byte": sym.span.start_byte,
+                        "end_byte": sym.span.end_byte,
+                    },
+                    "symbol_id": sym.id.0,
+                })
+            })
+            .collect();
+        json!({
+            "tool": "read_slice",
+            "fanout": fanout,
+            "reason": "candidate set: read each candidate's declaration to disambiguate"
+        })
+    };
     let mut packet = evidence_packet(
         claim,
         span.into_iter().collect(),
@@ -10589,15 +10666,7 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             matches_returned: 1,
             ..ToolCostHint::default()
         },
-        json!({
-            "tool": "read_slice",
-            "arguments": hit.edge.span.map(|span| json!({
-                "path": hit.caller.as_ref().map(|symbol| symbol.file_id.0.clone()).unwrap_or_default(),
-                "start_byte": span.start_byte,
-                "end_byte": span.end_byte
-            })).unwrap_or_else(|| json!({})),
-            "reason": "read the exact call site"
-        }),
+        next_action,
     );
     if let Some(object) = packet.as_object_mut() {
         object.insert("tool".to_string(), json!(tool));
@@ -10610,9 +10679,24 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             "callee".to_string(),
             json!(hit.callee.as_ref().map(symbol_summary_json)),
         );
+        if !hit.edge.candidates.is_empty() {
+            let candidate_objects: Vec<Value> = hit
+                .edge
+                .candidates
+                .iter()
+                .filter_map(|id| graph.symbols.get(id))
+                .map(symbol_summary_json)
+                .collect();
+            object.insert("candidates".to_string(), json!(candidate_objects));
+        }
     }
     packet
 }
+
+/// Maximum number of candidate symbols that get a dedicated `read_slice`
+/// entry in the `fanout` next-action. The full list is preserved in the
+/// `candidates` field of the packet.
+const CANDIDATE_FANOUT_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 enum CallDirection {
@@ -10695,7 +10779,8 @@ fn bfs_call_packets(
                     overflowed,
                 };
             }
-            let mut packet = call_edge_packet(&hit, direction.tool(), direction.is_upstream());
+            let mut packet =
+                call_edge_packet(graph, &hit, direction.tool(), direction.is_upstream());
             if let Some(object) = packet.as_object_mut() {
                 object.insert("depth".to_string(), json!(next_depth));
             }
@@ -10874,7 +10959,7 @@ fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
 }
 
 fn edge_json(edge: &GraphEdge) -> Value {
-    json!({
+    let mut value = json!({
         "from": edge.from.0,
         "to": edge.to.as_ref().map(|id| id.0.clone()),
         "target_text": edge.target_text,
@@ -10883,7 +10968,21 @@ fn edge_json(edge: &GraphEdge) -> Value {
         "confidence": format!("{:?}", edge.confidence),
         "freshness": format!("{:?}", edge.freshness),
         "provenance": provenance_json(edge.provenance.clone()),
-    })
+    });
+    if !edge.candidates.is_empty()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "candidates".to_string(),
+            json!(
+                edge.candidates
+                    .iter()
+                    .map(|id| id.0.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    value
 }
 
 fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNode) -> Value {

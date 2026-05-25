@@ -25,6 +25,7 @@ sha2.workspace = true
 squeezy-core.workspace = true
 squeezy-graph.workspace = true
 squeezy-mcp.workspace = true
+squeezy-rank.workspace = true
 squeezy-skills.workspace = true
 squeezy-store.workspace = true
 squeezy-vcs.workspace = true
