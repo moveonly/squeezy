@@ -1,26 +1,51 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-    time::Duration,
+    future::Future,
+    pin::Pin,
+    process::Stdio,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use rmcp::{
-    ServiceExt,
-    model::{CallToolRequestParams, JsonObject, Tool as RmcpTool},
+    ClientHandler, ServiceExt,
+    model::{
+        CallToolRequestParams, CancelledNotificationParam, ClientInfo,
+        CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, JsonObject,
+        LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
+        ProgressNotificationParam, ReadResourceRequestParams, Resource,
+        ResourceUpdatedNotificationParam, Tool as RmcpTool,
+    },
+    service::{NotificationContext, RequestContext, RoleClient},
     transport::{StreamableHttpClientTransport, TokioChildProcess},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use squeezy_core::{McpServerConfig, McpTransport};
-use tokio::sync::Mutex as TokioMutex;
+use squeezy_store::SqueezyStore;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    sync::{Mutex as TokioMutex, watch},
+};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
+const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
+const HASH_SUFFIX_BYTES: usize = 12;
+const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
 
 pub type McpResult<T> = Result<T, McpError>;
 
-type McpService = rmcp::service::RunningService<rmcp::service::RoleClient, ()>;
+type McpService = rmcp::service::RunningService<RoleClient, SqueezyMcpClientHandler>;
+type McpElicitationFuture = Pin<Box<dyn Future<Output = McpElicitationResponse> + Send>>;
+pub type McpElicitationHandler =
+    Arc<dyn Fn(McpElicitationRequest) -> McpElicitationFuture + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
@@ -39,6 +64,12 @@ pub enum McpError {
     InvalidArguments { tool: String },
     #[error("unknown MCP tool {tool:?}")]
     UnknownTool { tool: String },
+    #[error("unknown MCP server {server:?}")]
+    UnknownServer { server: String },
+    #[error("MCP resource {uri:?} is not declared by server {server:?}")]
+    UndeclaredResource { server: String, uri: String },
+    #[error("MCP server {server:?} streamable HTTP session expired")]
+    SessionExpired { server: String },
     #[error("MCP server {server:?}: {message}")]
     Transport { server: String, message: String },
 }
@@ -62,24 +93,119 @@ pub struct ExternalMcpToolResult {
     pub content: Value,
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpServerStatus {
+    Starting,
+    Ready { tools_count: usize, cached: bool },
+    Failed { error: String },
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpStatusSnapshot {
+    pub per_server: BTreeMap<String, McpServerStatus>,
+    pub generated_unix_millis: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpRefreshOutcome {
+    pub errors: Vec<String>,
+    pub status: McpStatusSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpElicitationKind {
+    Form,
+    Url,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpElicitationRequest {
+    pub server: String,
+    pub request_id: String,
+    pub kind: McpElicitationKind,
+    pub message: String,
+    pub schema: Option<Value>,
+    pub url: Option<String>,
+    pub elicitation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpElicitationAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpElicitationResponse {
+    pub action: McpElicitationAction,
+    pub content: Option<Value>,
+}
+
+impl McpElicitationResponse {
+    pub fn accept(content: Option<Value>) -> Self {
+        Self {
+            action: McpElicitationAction::Accept,
+            content,
+        }
+    }
+
+    pub fn decline() -> Self {
+        Self {
+            action: McpElicitationAction::Decline,
+            content: None,
+        }
+    }
+
+    pub fn cancel() -> Self {
+        Self {
+            action: McpElicitationAction::Cancel,
+            content: None,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct McpClientRegistry {
     servers: Arc<BTreeMap<String, McpServerConfig>>,
     cache: Arc<Mutex<BTreeMap<String, ExternalMcpTool>>>,
-    // Long-lived service handles keyed by server name. We reuse them across
-    // discovery and tool calls so we don't pay process-spawn (stdio) or
-    // session-handshake (HTTP) cost on every invocation. Entries are removed
-    // on transport error so the next call transparently reconnects.
-    sessions: Arc<TokioMutex<BTreeMap<String, Arc<McpService>>>>,
+    sessions: Arc<TokioMutex<BTreeMap<String, Arc<SessionEntry>>>>,
+    store: Option<Arc<SqueezyStore>>,
+    status_tx: watch::Sender<McpStatusSnapshot>,
+    elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    pause_state: ElicitationPauseState,
+    resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
+}
+
+impl Default for McpClientRegistry {
+    fn default() -> Self {
+        Self::new(BTreeMap::new())
+    }
 }
 
 impl McpClientRegistry {
     pub fn new(servers: BTreeMap<String, McpServerConfig>) -> Self {
-        Self {
+        Self::new_with_store(servers, None)
+    }
+
+    pub fn new_with_store(
+        servers: BTreeMap<String, McpServerConfig>,
+        store: Option<Arc<SqueezyStore>>,
+    ) -> Self {
+        let (status_tx, _) = watch::channel(McpStatusSnapshot::default());
+        let registry = Self {
             servers: Arc::new(servers),
             cache: Arc::new(Mutex::new(BTreeMap::new())),
             sessions: Arc::new(TokioMutex::new(BTreeMap::new())),
-        }
+            store,
+            status_tx,
+            elicitation_handler: Arc::new(Mutex::new(None)),
+            pause_state: ElicitationPauseState::default(),
+            resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        registry.load_cached_tools();
+        registry
     }
 
     pub fn has_no_enabled_servers(&self) -> bool {
@@ -100,12 +226,21 @@ impl McpClientRegistry {
             .and_then(|cache| cache.get(model_name).cloned())
     }
 
-    /// Refresh the cached tool list by listing tools on every enabled server
-    /// in parallel. On success, the cache is updated with the fresh listing.
-    /// On per-server failure, previously cached entries for the failing
-    /// server are preserved so that a single transient timeout does not
-    /// blow up tools that the model has already learned about this session.
-    pub async fn refresh_tools(&self, cancel: CancellationToken) -> Vec<McpError> {
+    pub fn set_elicitation_handler(&self, handler: Option<McpElicitationHandler>) {
+        if let Ok(mut slot) = self.elicitation_handler.lock() {
+            *slot = handler;
+        }
+    }
+
+    pub fn status_snapshot(&self) -> McpStatusSnapshot {
+        self.status_tx.borrow().clone()
+    }
+
+    pub fn status_watch(&self) -> watch::Receiver<McpStatusSnapshot> {
+        self.status_tx.subscribe()
+    }
+
+    pub async fn refresh_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
         let prior_cache = self
             .cache
             .lock()
@@ -116,8 +251,27 @@ impl McpClientRegistry {
             if let Ok(mut cache) = self.cache.lock() {
                 cache.clear();
             }
-            return Vec::new();
+            let status = McpStatusSnapshot {
+                per_server: BTreeMap::new(),
+                generated_unix_millis: unix_millis(),
+            };
+            self.publish_status(status.clone());
+            return McpRefreshOutcome {
+                errors: Vec::new(),
+                status,
+            };
         }
+
+        let mut starting = self.status_snapshot().per_server;
+        for (name, _server) in self.servers.iter().filter(|(_, server)| server.enabled) {
+            starting
+                .entry(name.clone())
+                .or_insert(McpServerStatus::Starting);
+        }
+        self.publish_status(McpStatusSnapshot {
+            per_server: starting,
+            generated_unix_millis: unix_millis(),
+        });
 
         let mut futures = FuturesUnordered::new();
         for (server_name, server) in self.servers.iter() {
@@ -134,17 +288,23 @@ impl McpClientRegistry {
             });
         }
 
-        let mut next: BTreeMap<String, ExternalMcpTool> = BTreeMap::new();
+        let mut raw_tools = Vec::new();
         let mut succeeded: BTreeSet<String> = BTreeSet::new();
+        let mut per_server = BTreeMap::new();
         let mut errors = Vec::new();
         while let Some((name, result)) = futures.next().await {
             match result {
                 Ok(tools) => {
-                    succeeded.insert(name.clone());
-                    for tool in tools {
-                        let model_name = unique_model_name(&next, &tool.model_name);
-                        next.insert(model_name.clone(), ExternalMcpTool { model_name, ..tool });
-                    }
+                    self.write_tool_cache(&name, &tools);
+                    per_server.insert(
+                        name.clone(),
+                        McpServerStatus::Ready {
+                            tools_count: tools.len(),
+                            cached: false,
+                        },
+                    );
+                    succeeded.insert(name);
+                    raw_tools.extend(tools);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -153,13 +313,21 @@ impl McpClientRegistry {
                         error = %error,
                         "failed to discover MCP tools"
                     );
-                    errors.push(error);
+                    let status = if matches!(error, McpError::Cancelled { .. }) {
+                        McpServerStatus::Cancelled
+                    } else {
+                        McpServerStatus::Failed {
+                            error: error.to_string(),
+                        }
+                    };
+                    per_server.insert(name, status);
+                    errors.push(error.to_string());
                 }
             }
         }
 
-        // Preserve prior tools for enabled servers whose refresh failed this
-        // turn so a flaky server does not vanish mid-session.
+        let mut next = normalize_palette(raw_tools);
+
         for (model_name, tool) in &prior_cache {
             let server_still_enabled = self
                 .servers
@@ -171,13 +339,38 @@ impl McpClientRegistry {
                 && !next.contains_key(model_name)
             {
                 next.insert(model_name.clone(), tool.clone());
+                per_server
+                    .entry(tool.server.clone())
+                    .or_insert(McpServerStatus::Ready {
+                        tools_count: prior_cache
+                            .values()
+                            .filter(|cached| cached.server == tool.server)
+                            .count(),
+                        cached: true,
+                    });
             }
         }
 
         if let Ok(mut cache) = self.cache.lock() {
             *cache = next;
         }
-        errors
+
+        for (name, server) in self.servers.iter() {
+            if !server.enabled {
+                continue;
+            }
+            per_server
+                .entry(name.clone())
+                .or_insert(McpServerStatus::Failed {
+                    error: "discovery did not complete".to_string(),
+                });
+        }
+        let status = McpStatusSnapshot {
+            per_server,
+            generated_unix_millis: unix_millis(),
+        };
+        self.publish_status(status.clone());
+        McpRefreshOutcome { errors, status }
     }
 
     pub async fn call_tool(
@@ -209,8 +402,102 @@ impl McpClientRegistry {
                 .and_then(Value::as_bool)
                 .or_else(|| result.get("is_error").and_then(Value::as_bool))
                 .unwrap_or(false),
-            content: result,
+            content: strip_untrusted_meta(result),
         })
+    }
+
+    pub async fn list_resources(
+        &self,
+        server_name: &str,
+        cursor: Option<String>,
+        cancel: CancellationToken,
+    ) -> McpResult<Value> {
+        let server = self.server_config(server_name)?;
+        let result = self
+            .list_resources_page(server_name, &server, cursor, cancel)
+            .await?;
+        serde_json::to_value(result).map_err(|err| McpError::Transport {
+            server: server_name.to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    pub async fn list_resource_templates(
+        &self,
+        server_name: &str,
+        cursor: Option<String>,
+        cancel: CancellationToken,
+    ) -> McpResult<Value> {
+        let server = self.server_config(server_name)?;
+        let result = self
+            .list_resource_templates_page(server_name, &server, cursor, cancel)
+            .await?;
+        serde_json::to_value(result).map_err(|err| McpError::Transport {
+            server: server_name.to_string(),
+            message: err.to_string(),
+        })
+    }
+
+    pub async fn read_resource(
+        &self,
+        server_name: &str,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> McpResult<Value> {
+        let key = (server_name.to_string(), uri.to_string());
+        if let Ok(cache) = self.resource_reads.lock()
+            && let Some(cached) = cache.get(&key)
+            && cached.fetched_at.elapsed() <= RESOURCE_READ_CACHE_TTL
+        {
+            return Ok(cached.value.clone());
+        }
+
+        let server = self.server_config(server_name)?;
+        if !self
+            .resource_uri_is_declared(server_name, &server, uri, cancel.clone())
+            .await?
+        {
+            return Err(McpError::UndeclaredResource {
+                server: server_name.to_string(),
+                uri: uri.to_string(),
+            });
+        }
+        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let registry = self.clone();
+        let server_name_owned = server_name.to_string();
+        let server_for_call = server.clone();
+        let uri_owned = uri.to_string();
+        let result = with_timeout(
+            server_name,
+            timeout_ms,
+            cancel,
+            self.pause_state.clone(),
+            async move {
+                let service = registry
+                    .session_for(&server_name_owned, &server_for_call)
+                    .await?;
+                let response = service
+                    .read_resource(ReadResourceRequestParams::new(uri_owned.clone()))
+                    .await
+                    .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
+                serde_json::to_value(response).map_err(|err| McpError::Transport {
+                    server: server_name_owned.clone(),
+                    message: err.to_string(),
+                })
+            },
+        )
+        .await?;
+        let result = strip_untrusted_meta(result);
+        if let Ok(mut cache) = self.resource_reads.lock() {
+            cache.insert(
+                key,
+                CachedResourceRead {
+                    value: result.clone(),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        Ok(result)
     }
 
     async fn discover_one(
@@ -223,22 +510,25 @@ impl McpClientRegistry {
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
-        let result = with_timeout(server_name, timeout_ms, cancel, async move {
-            let service = registry
-                .session_for(&server_name_owned, &server_for_call)
-                .await?;
-            let tools = service
-                .list_all_tools()
-                .await
-                .map_err(|err| McpError::Transport {
-                    server: server_name_owned.clone(),
-                    message: err.to_string(),
-                })?;
-            Ok((server_name_owned, tools))
-        })
+        let result = with_timeout(
+            server_name,
+            timeout_ms,
+            cancel,
+            self.pause_state.clone(),
+            async move {
+                let service = registry
+                    .session_for(&server_name_owned, &server_for_call)
+                    .await?;
+                let tools = service
+                    .list_all_tools()
+                    .await
+                    .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
+                Ok((server_name_owned, tools))
+            },
+        )
         .await;
         match result {
-            Ok((_, tools)) => Ok(convert_tools(server_name, server.transport, tools)),
+            Ok((_, tools)) => Ok(convert_tools(server_name, server, tools)),
             Err(error) => {
                 self.invalidate_session(server_name).await;
                 Err(error)
@@ -254,34 +544,67 @@ impl McpClientRegistry {
         arguments: JsonObject,
         cancel: CancellationToken,
     ) -> McpResult<Value> {
+        let result = self
+            .call_one_once(
+                server_name,
+                server,
+                tool_name,
+                arguments.clone(),
+                cancel.clone(),
+            )
+            .await;
+        match result {
+            Err(McpError::SessionExpired { .. })
+                if matches!(server.transport, McpTransport::Http | McpTransport::Sse) =>
+            {
+                self.invalidate_session(server_name).await;
+                self.call_one_once(server_name, server, tool_name, arguments, cancel)
+                    .await
+            }
+            Err(error) => {
+                self.invalidate_session(server_name).await;
+                Err(error)
+            }
+            ok => ok,
+        }
+    }
+
+    async fn call_one_once(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        tool_name: &str,
+        arguments: JsonObject,
+        cancel: CancellationToken,
+    ) -> McpResult<Value> {
         let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
         let tool_name_owned = tool_name.to_string();
-        let result = with_timeout(server_name, timeout_ms, cancel, async move {
-            let service = registry
-                .session_for(&server_name_owned, &server_for_call)
-                .await?;
-            let response = service
-                .call_tool(
-                    CallToolRequestParams::new(tool_name_owned.clone()).with_arguments(arguments),
-                )
-                .await
-                .map_err(|err| McpError::Transport {
+        with_timeout(
+            server_name,
+            timeout_ms,
+            cancel,
+            self.pause_state.clone(),
+            async move {
+                let service = registry
+                    .session_for(&server_name_owned, &server_for_call)
+                    .await?;
+                let response = service
+                    .call_tool(
+                        CallToolRequestParams::new(tool_name_owned.clone())
+                            .with_arguments(arguments),
+                    )
+                    .await
+                    .map_err(|err| service_error_to_mcp(&server_name_owned, err))?;
+                serde_json::to_value(response).map_err(|err| McpError::Transport {
                     server: server_name_owned.clone(),
                     message: err.to_string(),
-                })?;
-            serde_json::to_value(response).map_err(|err| McpError::Transport {
-                server: server_name_owned.clone(),
-                message: err.to_string(),
-            })
-        })
-        .await;
-        if result.is_err() {
-            self.invalidate_session(server_name).await;
-        }
-        result
+                })
+            },
+        )
+        .await
     }
 
     async fn session_for(
@@ -289,32 +612,31 @@ impl McpClientRegistry {
         server_name: &str,
         server: &McpServerConfig,
     ) -> McpResult<Arc<McpService>> {
-        // Fast path: a previously started session is already cached.
         {
             let sessions = self.sessions.lock().await;
-            if let Some(svc) = sessions.get(server_name) {
-                return Ok(svc.clone());
+            if let Some(entry) = sessions.get(server_name) {
+                return Ok(entry.service.clone());
             }
         }
 
-        // Slow path: open a new session outside the lock so concurrent
-        // discovery on other servers is not serialized behind this start.
-        let svc = match server.transport {
-            McpTransport::Stdio => start_stdio_service(server_name, server).await?,
+        let handler = SqueezyMcpClientHandler {
+            server_name: server_name.to_string(),
+            elicitation_handler: self.elicitation_handler.clone(),
+            pause_state: self.pause_state.clone(),
+        };
+        let entry = match server.transport {
+            McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
             McpTransport::Http | McpTransport::Sse => {
-                start_http_service(server_name, server).await?
+                start_http_service(server_name, server, handler).await?
             }
         };
-        let arc = Arc::new(svc);
+        let arc = Arc::new(entry);
         let mut sessions = self.sessions.lock().await;
         if let Some(existing) = sessions.get(server_name) {
-            // Lost the race against a concurrent caller. Use the existing
-            // session and drop the duplicate; the unused service is reaped
-            // by rmcp on Drop.
-            return Ok(existing.clone());
+            return Ok(existing.service.clone());
         }
         sessions.insert(server_name.to_string(), arc.clone());
-        Ok(arc)
+        Ok(arc.service.clone())
     }
 
     async fn invalidate_session(&self, server_name: &str) {
@@ -322,25 +644,480 @@ impl McpClientRegistry {
         sessions.remove(server_name);
     }
 
-    /// Tear down every cached session. Useful at shutdown so child processes
-    /// reap promptly instead of waiting for the registry Arc to drop.
     pub async fn shutdown(&self) {
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
     }
 
-    /// Seed the in-memory tool cache directly. Intended for tests that need
-    /// to pre-populate cached entries to verify refresh/preservation logic
-    /// without spawning real MCP servers.
     #[doc(hidden)]
     pub fn insert_cached_tool_for_test(&self, tool: ExternalMcpTool) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(tool.model_name.clone(), tool);
         }
     }
+
+    fn server_config(&self, server_name: &str) -> McpResult<McpServerConfig> {
+        self.servers
+            .get(server_name)
+            .filter(|server| server.enabled)
+            .cloned()
+            .ok_or_else(|| McpError::UnknownServer {
+                server: server_name.to_string(),
+            })
+    }
+
+    fn publish_status(&self, snapshot: McpStatusSnapshot) {
+        self.status_tx.send_replace(snapshot);
+    }
+
+    fn load_cached_tools(&self) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let mut raw_tools = Vec::new();
+        let mut status = BTreeMap::new();
+        for (name, server) in self.servers.iter().filter(|(_, server)| server.enabled) {
+            let key = tool_cache_key(name, server);
+            let Ok(Some(record)) = store.mcp_tool_cache::<McpToolCacheRecord>(&key) else {
+                continue;
+            };
+            if record.schema_version != MCP_TOOL_CACHE_SCHEMA_VERSION {
+                continue;
+            }
+            status.insert(
+                name.clone(),
+                McpServerStatus::Ready {
+                    tools_count: record.tools.len(),
+                    cached: true,
+                },
+            );
+            raw_tools.extend(record.tools);
+        }
+        if !raw_tools.is_empty() {
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = normalize_palette(raw_tools);
+            }
+            self.publish_status(McpStatusSnapshot {
+                per_server: status,
+                generated_unix_millis: unix_millis(),
+            });
+        }
+    }
+
+    fn write_tool_cache(&self, server_name: &str, tools: &[ExternalMcpTool]) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        let Some(server) = self.servers.get(server_name) else {
+            return;
+        };
+        let record = McpToolCacheRecord {
+            schema_version: MCP_TOOL_CACHE_SCHEMA_VERSION,
+            fetched_unix_millis: unix_millis(),
+            tools: tools.to_vec(),
+        };
+        if let Err(error) = store.put_mcp_tool_cache(&tool_cache_key(server_name, server), &record)
+        {
+            tracing::warn!(
+                target: "squeezy::mcp",
+                server = %server_name,
+                error = %error,
+                "failed to write MCP tool cache"
+            );
+        }
+    }
+
+    async fn list_resources_page(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        cursor: Option<String>,
+        cancel: CancellationToken,
+    ) -> McpResult<rmcp::model::ListResourcesResult> {
+        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let registry = self.clone();
+        let server_name_owned = server_name.to_string();
+        let server_for_call = server.clone();
+        with_timeout(
+            server_name,
+            timeout_ms,
+            cancel,
+            self.pause_state.clone(),
+            async move {
+                let service = registry
+                    .session_for(&server_name_owned, &server_for_call)
+                    .await?;
+                service
+                    .list_resources(Some(PaginatedRequestParams::default().with_cursor(cursor)))
+                    .await
+                    .map_err(|err| service_error_to_mcp(&server_name_owned, err))
+            },
+        )
+        .await
+    }
+
+    async fn list_resource_templates_page(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        cursor: Option<String>,
+        cancel: CancellationToken,
+    ) -> McpResult<rmcp::model::ListResourceTemplatesResult> {
+        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let registry = self.clone();
+        let server_name_owned = server_name.to_string();
+        let server_for_call = server.clone();
+        with_timeout(
+            server_name,
+            timeout_ms,
+            cancel,
+            self.pause_state.clone(),
+            async move {
+                let service = registry
+                    .session_for(&server_name_owned, &server_for_call)
+                    .await?;
+                service
+                    .list_resource_templates(Some(
+                        PaginatedRequestParams::default().with_cursor(cursor),
+                    ))
+                    .await
+                    .map_err(|err| service_error_to_mcp(&server_name_owned, err))
+            },
+        )
+        .await
+    }
+
+    async fn all_resources(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        cancel: CancellationToken,
+    ) -> McpResult<Vec<Resource>> {
+        let mut collected = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self
+                .list_resources_page(server_name, server, cursor.clone(), cancel.clone())
+                .await?;
+            collected.extend(result.resources);
+            match result.next_cursor {
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(McpError::Transport {
+                        server: server_name.to_string(),
+                        message: "resources/list returned duplicate cursor".to_string(),
+                    });
+                }
+                Some(next) => cursor = Some(next),
+                None => return Ok(collected),
+            }
+        }
+    }
+
+    async fn all_resource_templates(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        cancel: CancellationToken,
+    ) -> McpResult<Vec<rmcp::model::ResourceTemplate>> {
+        let mut collected = Vec::new();
+        let mut cursor = None;
+        loop {
+            let result = self
+                .list_resource_templates_page(server_name, server, cursor.clone(), cancel.clone())
+                .await?;
+            collected.extend(result.resource_templates);
+            match result.next_cursor {
+                Some(next) if cursor.as_ref() == Some(&next) => {
+                    return Err(McpError::Transport {
+                        server: server_name.to_string(),
+                        message: "resources/templates/list returned duplicate cursor".to_string(),
+                    });
+                }
+                Some(next) => cursor = Some(next),
+                None => return Ok(collected),
+            }
+        }
+    }
+
+    async fn resource_uri_is_declared(
+        &self,
+        server_name: &str,
+        server: &McpServerConfig,
+        uri: &str,
+        cancel: CancellationToken,
+    ) -> McpResult<bool> {
+        let resources = self
+            .all_resources(server_name, server, cancel.clone())
+            .await
+            .unwrap_or_default();
+        if resources.iter().any(|resource| resource.raw.uri == uri) {
+            return Ok(true);
+        }
+        let templates = self
+            .all_resource_templates(server_name, server, cancel)
+            .await
+            .unwrap_or_default();
+        Ok(templates
+            .iter()
+            .any(|template| uri_matches_template(uri, &template.raw.uri_template)))
+    }
 }
 
-async fn start_stdio_service(server_name: &str, server: &McpServerConfig) -> McpResult<McpService> {
+struct SessionEntry {
+    service: Arc<McpService>,
+    _process: Option<StdioProcessHandle>,
+}
+
+#[derive(Debug)]
+struct CachedResourceRead {
+    value: Value,
+    fetched_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct McpToolCacheRecord {
+    schema_version: u64,
+    fetched_unix_millis: u128,
+    tools: Vec<ExternalMcpTool>,
+}
+
+#[derive(Clone)]
+struct SqueezyMcpClientHandler {
+    server_name: String,
+    elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    pause_state: ElicitationPauseState,
+}
+
+impl ClientHandler for SqueezyMcpClientHandler {
+    async fn create_elicitation(
+        &self,
+        request: CreateElicitationRequestParams,
+        context: RequestContext<RoleClient>,
+    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+        if can_auto_accept_elicitation(&request) {
+            return Ok(CreateElicitationResult {
+                action: ElicitationAction::Accept,
+                content: Some(json!({})),
+                meta: None,
+            });
+        }
+        let handler = self
+            .elicitation_handler
+            .lock()
+            .ok()
+            .and_then(|handler| handler.clone());
+        let Some(handler) = handler else {
+            return Ok(CreateElicitationResult {
+                action: ElicitationAction::Decline,
+                content: None,
+                meta: None,
+            });
+        };
+        let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
+        let _pause = self.pause_state.enter();
+        let response = handler(ui_request).await;
+        Ok(CreateElicitationResult {
+            action: match response.action {
+                McpElicitationAction::Accept => ElicitationAction::Accept,
+                McpElicitationAction::Decline => ElicitationAction::Decline,
+                McpElicitationAction::Cancel => ElicitationAction::Cancel,
+            },
+            content: response.content,
+            meta: None,
+        })
+    }
+
+    async fn on_cancelled(
+        &self,
+        params: CancelledNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            request_id = ?params.request_id,
+            reason = ?params.reason,
+            "MCP server cancelled request"
+        );
+    }
+
+    async fn on_progress(
+        &self,
+        params: ProgressNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            token = ?params.progress_token,
+            progress = params.progress,
+            total = ?params.total,
+            message = ?params.message,
+            "MCP server progress"
+        );
+    }
+
+    async fn on_resource_updated(
+        &self,
+        params: ResourceUpdatedNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            uri = %params.uri,
+            "MCP server resource updated"
+        );
+    }
+
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            "MCP server resource list changed"
+        );
+    }
+
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            "MCP server tool list changed"
+        );
+    }
+
+    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        tracing::info!(
+            target: "squeezy::mcp",
+            server = %self.server_name,
+            "MCP server prompt list changed"
+        );
+    }
+
+    async fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let logger = params.logger.as_deref();
+        match params.level {
+            LoggingLevel::Emergency
+            | LoggingLevel::Alert
+            | LoggingLevel::Critical
+            | LoggingLevel::Error => tracing::error!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                logger = ?logger,
+                data = %params.data,
+                "MCP server log"
+            ),
+            LoggingLevel::Warning => tracing::warn!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                logger = ?logger,
+                data = %params.data,
+                "MCP server log"
+            ),
+            LoggingLevel::Notice | LoggingLevel::Info => tracing::info!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                logger = ?logger,
+                data = %params.data,
+                "MCP server log"
+            ),
+            LoggingLevel::Debug => tracing::debug!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                logger = ?logger,
+                data = %params.data,
+                "MCP server log"
+            ),
+        }
+    }
+
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+}
+
+#[derive(Clone)]
+struct ElicitationPauseState {
+    active: Arc<AtomicUsize>,
+    tx: Arc<watch::Sender<usize>>,
+}
+
+impl Default for ElicitationPauseState {
+    fn default() -> Self {
+        let (tx, _) = watch::channel(0usize);
+        Self {
+            active: Arc::new(AtomicUsize::new(0)),
+            tx: Arc::new(tx),
+        }
+    }
+}
+
+impl ElicitationPauseState {
+    fn enter(&self) -> ElicitationPauseGuard {
+        let next = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.tx.send(next);
+        ElicitationPauseGuard {
+            state: self.clone(),
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<usize> {
+        self.tx.subscribe()
+    }
+}
+
+struct ElicitationPauseGuard {
+    state: ElicitationPauseState,
+}
+
+impl Drop for ElicitationPauseGuard {
+    fn drop(&mut self) {
+        let next = self
+            .state
+            .active
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        let _ = self.state.tx.send(next);
+    }
+}
+
+#[derive(Debug)]
+struct StdioProcessHandle {
+    pid: u32,
+    terminated: AtomicBool,
+}
+
+impl StdioProcessHandle {
+    fn new(pid: u32) -> Self {
+        Self {
+            pid,
+            terminated: AtomicBool::new(false),
+        }
+    }
+
+    fn terminate(&self) {
+        if self.terminated.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        terminate_process_group(self.pid);
+    }
+}
+
+impl Drop for StdioProcessHandle {
+    fn drop(&mut self) {
+        self.terminate();
+    }
+}
+
+async fn start_stdio_service(
+    server_name: &str,
+    server: &McpServerConfig,
+    handler: SqueezyMcpClientHandler,
+) -> McpResult<SessionEntry> {
     let command = server
         .command
         .as_ref()
@@ -348,21 +1125,66 @@ async fn start_stdio_service(server_name: &str, server: &McpServerConfig) -> Mcp
             server: server_name.to_string(),
         })?;
     let mut process = tokio::process::Command::new(command);
-    process.args(&server.args);
-    process.envs(&server.env);
-    let transport = TokioChildProcess::new(process).map_err(|err| McpError::Transport {
-        server: server_name.to_string(),
-        message: err.to_string(),
-    })?;
-    ().serve(transport)
+    process
+        .args(&server.args)
+        .envs(&server.env)
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    #[cfg(unix)]
+    process.process_group(0);
+    let (transport, stderr) = TokioChildProcess::builder(process)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| McpError::Transport {
+            server: server_name.to_string(),
+            message: err.to_string(),
+        })?;
+    let process_handle = transport.id().map(StdioProcessHandle::new);
+    if let Some(stderr) = stderr {
+        let server_name = server_name.to_string();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => tracing::info!(
+                        target: "squeezy::mcp",
+                        server = %server_name,
+                        stderr = %line,
+                        "MCP server stderr"
+                    ),
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "squeezy::mcp",
+                            server = %server_name,
+                            error = %error,
+                            "failed to read MCP server stderr"
+                        );
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    let service = handler
+        .serve(transport)
         .await
         .map_err(|err| McpError::Transport {
             server: server_name.to_string(),
             message: err.to_string(),
-        })
+        })?;
+    Ok(SessionEntry {
+        service: Arc::new(service),
+        _process: process_handle,
+    })
 }
 
-async fn start_http_service(server_name: &str, server: &McpServerConfig) -> McpResult<McpService> {
+async fn start_http_service(
+    server_name: &str,
+    server: &McpServerConfig,
+    handler: SqueezyMcpClientHandler,
+) -> McpResult<SessionEntry> {
     let url = server.url.as_ref().ok_or_else(|| McpError::MissingUrl {
         server: server_name.to_string(),
         transport: match server.transport {
@@ -372,38 +1194,72 @@ async fn start_http_service(server_name: &str, server: &McpServerConfig) -> McpR
         },
     })?;
     let transport = StreamableHttpClientTransport::from_uri(url.clone());
-    ().serve(transport)
+    let service = handler
+        .serve(transport)
         .await
         .map_err(|err| McpError::Transport {
             server: server_name.to_string(),
             message: err.to_string(),
-        })
+        })?;
+    Ok(SessionEntry {
+        service: Arc::new(service),
+        _process: None,
+    })
 }
 
 async fn with_timeout<T>(
     server_name: &str,
     timeout_ms: u64,
     cancel: CancellationToken,
-    future: impl std::future::Future<Output = McpResult<T>>,
+    pause_state: ElicitationPauseState,
+    future: impl Future<Output = McpResult<T>>,
 ) -> McpResult<T> {
-    tokio::select! {
-        _ = cancel.cancelled() => Err(McpError::Cancelled { server: server_name.to_string() }),
-        result = tokio::time::timeout(Duration::from_millis(timeout_ms), future) => {
-            result.map_err(|_| McpError::Timeout {
-                server: server_name.to_string(),
-                timeout_ms,
-            })?
+    let mut pause_rx = pause_state.subscribe();
+    let timeout = Duration::from_millis(timeout_ms);
+    let mut future = Box::pin(future);
+    loop {
+        if *pause_rx.borrow() > 0 {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(McpError::Transport {
+                            server: server_name.to_string(),
+                            message: "MCP timeout pause watcher closed".to_string(),
+                        });
+                    }
+                }
+                result = &mut future => return result,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(McpError::Cancelled { server: server_name.to_string() }),
+                _ = tokio::time::sleep(timeout) => return Err(McpError::Timeout {
+                    server: server_name.to_string(),
+                    timeout_ms,
+                }),
+                changed = pause_rx.changed() => {
+                    if changed.is_err() {
+                        return Err(McpError::Transport {
+                            server: server_name.to_string(),
+                            message: "MCP timeout pause watcher closed".to_string(),
+                        });
+                    }
+                }
+                result = &mut future => return result,
+            }
         }
     }
 }
 
 fn convert_tools(
     server_name: &str,
-    transport: McpTransport,
+    server: &McpServerConfig,
     tools: Vec<RmcpTool>,
 ) -> Vec<ExternalMcpTool> {
     tools
         .into_iter()
+        .filter(|tool| tool_allowed(server, &tool.name))
         .map(|tool| {
             let raw_name = tool.name.to_string();
             let description = tool
@@ -418,10 +1274,19 @@ fn convert_tools(
                 model_name: external_tool_name(server_name, &raw_name),
                 description,
                 parameters,
-                transport,
+                transport: server.transport,
             }
         })
         .collect()
+}
+
+fn tool_allowed(server: &McpServerConfig, raw_name: &str) -> bool {
+    if let Some(enabled) = &server.enabled_tools
+        && !enabled.iter().any(|tool| tool == raw_name)
+    {
+        return false;
+    }
+    !server.disabled_tools.iter().any(|tool| tool == raw_name)
 }
 
 fn schema_object(value: Value) -> Value {
@@ -467,18 +1332,194 @@ fn sanitize_name(value: &str) -> String {
     }
 }
 
-fn unique_model_name(existing: &BTreeMap<String, ExternalMcpTool>, candidate: &str) -> String {
-    if !existing.contains_key(candidate) {
-        return candidate.to_string();
+fn normalize_palette(tools: Vec<ExternalMcpTool>) -> BTreeMap<String, ExternalMcpTool> {
+    let mut tools = tools;
+    tools.sort_by(|left, right| {
+        (&left.server, &left.raw_name, &left.model_name).cmp(&(
+            &right.server,
+            &right.raw_name,
+            &right.model_name,
+        ))
+    });
+    let mut by_base: BTreeMap<String, usize> = BTreeMap::new();
+    for tool in &tools {
+        *by_base.entry(tool.model_name.clone()).or_default() += 1;
     }
-    for index in 2usize.. {
-        let next = format!("{candidate}__{index}");
-        if !existing.contains_key(&next) {
-            return next;
+    let mut next = BTreeMap::new();
+    for mut tool in tools {
+        let raw_identity = format!("{}\0{}", tool.server, tool.raw_name);
+        let base = tool.model_name.clone();
+        let collides = by_base.get(&base).copied().unwrap_or_default() > 1;
+        tool.model_name = fit_model_name(&base, &raw_identity, collides || base.len() > 64);
+        let mut attempt = 0u32;
+        while next.contains_key(&tool.model_name) {
+            attempt = attempt.saturating_add(1);
+            tool.model_name = fit_model_name(&base, &format!("{raw_identity}\0{attempt}"), true);
         }
+        next.insert(tool.model_name.clone(), tool);
     }
-    unreachable!("unbounded suffix search must find a unique name")
+    next
 }
+
+fn fit_model_name(base: &str, raw_identity: &str, force_hash: bool) -> String {
+    if !force_hash && base.len() <= MAX_MODEL_TOOL_NAME_BYTES {
+        return base.to_string();
+    }
+    let suffix = format!(
+        "_{}",
+        &sha256_hex(raw_identity.as_bytes())[..HASH_SUFFIX_BYTES]
+    );
+    let max_prefix = MAX_MODEL_TOOL_NAME_BYTES.saturating_sub(suffix.len());
+    format!("{}{}", truncate_ascii(base, max_prefix), suffix)
+}
+
+fn truncate_ascii(value: &str, max_bytes: usize) -> String {
+    value.chars().take(max_bytes).collect()
+}
+
+fn strip_untrusted_meta(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(object) => {
+            object.remove("_meta");
+            object.remove("meta");
+            for value in object.values_mut() {
+                *value = strip_untrusted_meta(std::mem::take(value));
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                *value = strip_untrusted_meta(std::mem::take(value));
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
+fn service_error_to_mcp(server: &str, err: rmcp::ServiceError) -> McpError {
+    if service_error_is_session_expired(&err) {
+        return McpError::SessionExpired {
+            server: server.to_string(),
+        };
+    }
+    McpError::Transport {
+        server: server.to_string(),
+        message: err.to_string(),
+    }
+}
+
+fn service_error_is_session_expired(err: &rmcp::ServiceError) -> bool {
+    err.to_string().contains("Session expired (HTTP 404)")
+}
+
+fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool {
+    match request {
+        CreateElicitationRequestParams::FormElicitationParams {
+            requested_schema, ..
+        } => requested_schema
+            .required
+            .as_ref()
+            .map(|required| required.is_empty())
+            .unwrap_or(true),
+        CreateElicitationRequestParams::UrlElicitationParams { .. } => false,
+    }
+}
+
+fn elicitation_request_for_ui(
+    server: &str,
+    context: &RequestContext<RoleClient>,
+    request: &CreateElicitationRequestParams,
+) -> McpElicitationRequest {
+    match request {
+        CreateElicitationRequestParams::FormElicitationParams {
+            message,
+            requested_schema,
+            ..
+        } => McpElicitationRequest {
+            server: server.to_string(),
+            request_id: format!("{:?}", context.id),
+            kind: McpElicitationKind::Form,
+            message: message.clone(),
+            schema: serde_json::to_value(requested_schema).ok(),
+            url: None,
+            elicitation_id: None,
+        },
+        CreateElicitationRequestParams::UrlElicitationParams {
+            message,
+            url,
+            elicitation_id,
+            ..
+        } => McpElicitationRequest {
+            server: server.to_string(),
+            request_id: format!("{:?}", context.id),
+            kind: McpElicitationKind::Url,
+            message: message.clone(),
+            schema: None,
+            url: Some(url.clone()),
+            elicitation_id: Some(elicitation_id.clone()),
+        },
+    }
+}
+
+fn uri_matches_template(uri: &str, template: &str) -> bool {
+    if uri == template {
+        return true;
+    }
+    let prefix = template.split('{').next().unwrap_or(template);
+    !prefix.is_empty() && uri.starts_with(prefix)
+}
+
+fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
+    let fingerprint = json!({
+        "schema": MCP_TOOL_CACHE_SCHEMA_VERSION,
+        "server": server_name,
+        "transport": server.transport.as_str(),
+        "command": &server.command,
+        "args": &server.args,
+        "url": &server.url,
+        "timeout_ms": server.timeout_ms,
+        "env_keys": server.env.keys().collect::<Vec<_>>(),
+        "enabled_tools": &server.enabled_tools,
+        "disabled_tools": &server.disabled_tools,
+    });
+    format!(
+        "{server_name}\0{}",
+        sha256_hex(fingerprint.to_string().as_bytes())
+    )
+}
+
+fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    let digest = Sha256::digest(bytes.as_ref());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push_str(&format!("{byte:02x}"));
+    }
+    output
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[cfg(unix)]
+fn terminate_process_group(pid: u32) {
+    let pgid = -(pid as libc::pid_t);
+    unsafe {
+        libc::kill(pgid, libc::SIGTERM);
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(2));
+        unsafe {
+            libc::kill(pgid, libc::SIGKILL);
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_pid: u32) {}
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

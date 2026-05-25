@@ -37,6 +37,7 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GRAPH_PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_partitions");
 const TOOL_RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tool_receipts");
 const READ_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("read_snapshots");
+const MCP_TOOL_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("mcp_tool_cache");
 const OBSERVATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("observations");
 const OBSERVATION_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("observation_index");
 
@@ -196,6 +197,24 @@ impl SqueezyStore {
             )?;
         }
         write.commit().map_err(store_error)
+    }
+
+    pub fn put_mcp_tool_cache<T: Serialize>(&self, key: &str, cache: &T) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write.open_table(MCP_TOOL_CACHE).map_err(store_error)?;
+            insert_json(&mut table, key, cache)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    pub fn mcp_tool_cache<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(MCP_TOOL_CACHE) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_table_json(&table, key)
     }
 
     /// Return the most recently created snapshot for `path`, regardless of
@@ -504,6 +523,7 @@ fn initialize_schema(database: &Database) -> Result<()> {
     write.open_table(GRAPH_PARTITIONS).map_err(store_error)?;
     write.open_table(TOOL_RECEIPTS).map_err(store_error)?;
     write.open_table(READ_SNAPSHOTS).map_err(store_error)?;
+    write.open_table(MCP_TOOL_CACHE).map_err(store_error)?;
     write.open_table(OBSERVATIONS).map_err(store_error)?;
     write.open_table(OBSERVATION_INDEX).map_err(store_error)?;
     write.commit().map_err(store_error)

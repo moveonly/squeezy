@@ -44,7 +44,10 @@ use squeezy_llm::{LlmProvider, RequestTokenEstimate};
 use squeezy_skills::{HelpStatus, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
 use squeezy_telemetry::PreparedFeedback;
-use squeezy_tools::{ToolCall, ToolResult, ToolStatus};
+use squeezy_tools::{
+    McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
+    McpStatusSnapshot, ToolCall, ToolResult, ToolStatus,
+};
 use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -416,6 +419,12 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.status = "planning".to_string();
                     }
                 }
+                AgentEvent::McpStatusUpdated { snapshot, .. } => {
+                    let summary = format_mcp_status_snapshot(&snapshot);
+                    app.mcp_status = Some(snapshot);
+                    app.status = format!("mcp {summary}");
+                    app.push_log(format!("mcp status {summary}"));
+                }
                 AgentEvent::JobUpdated { job } => {
                     apply_job_update(app, job);
                 }
@@ -483,6 +492,22 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     });
                     break;
                 }
+                AgentEvent::McpElicitationRequested {
+                    request,
+                    response_tx,
+                    ..
+                } => {
+                    if let Some(previous) = app.pending_mcp_elicitation.take() {
+                        let _ = previous.response_tx.send(McpElicitationResponse::cancel());
+                    }
+                    app.status = format_mcp_elicitation_status_line(&request);
+                    app.mcp_elicitation_selection_index = 0;
+                    app.pending_mcp_elicitation = Some(PendingMcpElicitation {
+                        request,
+                        response_tx,
+                    });
+                    break;
+                }
                 AgentEvent::Completed {
                     message,
                     cost,
@@ -498,6 +523,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.status = "ready".to_string();
                     app.turn_visual = TurnVisualState::Succeeded;
                     app.clear_active_tools();
+                    app.pending_mcp_elicitation = None;
                     app.note_turn_finished();
                     // Preserve the user's scroll position; if they paged up
                     // mid-turn we shouldn't snap them down on completion.
@@ -511,6 +537,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.push_log("turn cancelled".to_string());
                     app.pending_assistant.clear();
                     app.clear_active_tools();
+                    app.pending_mcp_elicitation = None;
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -522,6 +549,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.push_log(format!("turn failed: {}", app.status));
                     app.pending_assistant.clear();
                     app.clear_active_tools();
+                    app.pending_mcp_elicitation = None;
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
@@ -665,6 +693,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if handle_mcp_elicitation_key(app, key) {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
@@ -687,7 +719,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         && let Some(mode) = mode_command(app.input.trim())
     {
         switch_mode(app, agent, Some(mode), "tui_command");
-        if app.turn_rx.is_none() && app.pending_approval.is_none() {
+        if app.turn_rx.is_none()
+            && app.pending_approval.is_none()
+            && app.pending_mcp_elicitation.is_none()
+        {
             clear_input(app);
         }
         return Ok(false);
@@ -840,7 +875,18 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 }
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
-    if app.turn_rx.is_some() || app.pending_approval.is_some() {
+    if app
+        .pending_mcp_elicitation
+        .as_ref()
+        .is_some_and(|pending| pending.request.kind == McpElicitationKind::Form)
+    {
+        insert_input_text(app, &text);
+        return Ok(());
+    }
+    if app.turn_rx.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+    {
         app.status = "paste unavailable during active turn".to_string();
         return Ok(());
     }
@@ -1121,6 +1167,10 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     }
     if let Some(pending) = app.pending_approval.take() {
         let _ = pending.decision_tx.send(ToolApprovalDecision::Cancelled);
+        interrupted = true;
+    }
+    if let Some(pending) = app.pending_mcp_elicitation.take() {
+        let _ = pending.response_tx.send(McpElicitationResponse::cancel());
         interrupted = true;
     }
     if interrupted {
@@ -2196,7 +2246,10 @@ fn switch_mode(
     requested: Option<SessionMode>,
     source: &'static str,
 ) {
-    if app.turn_rx.is_some() || app.pending_approval.is_some() {
+    if app.turn_rx.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+    {
         app.status = "mode switch unavailable during active turn".to_string();
         return;
     }
@@ -2220,6 +2273,183 @@ fn switch_mode(
         app.mode = agent.session_mode();
         app.status = format!("already in {} mode", app.mode.as_str());
     }
+}
+
+fn handle_mcp_elicitation_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(pending) = app.pending_mcp_elicitation.take() else {
+        return false;
+    };
+    let is_form = pending.request.kind == McpElicitationKind::Form;
+
+    if is_form
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
+    {
+        insert_input_char(app, '\n');
+        keep_mcp_elicitation_pending(app, pending);
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            app.mcp_elicitation_selection_index =
+                app.mcp_elicitation_selection_index.saturating_sub(1);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Down => {
+            app.mcp_elicitation_selection_index =
+                (app.mcp_elicitation_selection_index + 1).min(mcp_elicitation_options().len() - 1);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Enter => {
+            let option = mcp_elicitation_options()
+                .get(app.mcp_elicitation_selection_index)
+                .copied()
+                .unwrap_or(MCP_ELICITATION_ACCEPT);
+            send_mcp_elicitation_response(app, pending, option.choice)
+        }
+        KeyCode::Esc => send_mcp_elicitation_cancel(app, pending),
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            send_mcp_elicitation_response(app, pending, McpElicitationChoice::Accept)
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
+            send_mcp_elicitation_response(app, pending, McpElicitationChoice::Decline)
+        }
+        KeyCode::Backspace if is_form => {
+            delete_before_cursor(app);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Delete if is_form => {
+            delete_at_cursor(app);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Left if is_form => {
+            move_input_cursor_left(app);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Right if is_form => {
+            move_input_cursor_right(app);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Home if is_form => {
+            app.input_cursor = 0;
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::End if is_form => {
+            app.input_cursor = app.input.len();
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        KeyCode::Char(ch)
+            if is_form && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+        {
+            insert_input_char(app, ch);
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+        _ => {
+            keep_mcp_elicitation_pending(app, pending);
+            true
+        }
+    }
+}
+
+fn keep_mcp_elicitation_pending(app: &mut TuiApp, pending: PendingMcpElicitation) {
+    app.status = format_mcp_elicitation_status_line(&pending.request);
+    app.pending_mcp_elicitation = Some(pending);
+}
+
+fn send_mcp_elicitation_response(
+    app: &mut TuiApp,
+    pending: PendingMcpElicitation,
+    choice: McpElicitationChoice,
+) -> bool {
+    match choice {
+        McpElicitationChoice::Accept => {
+            let content = if pending.request.kind == McpElicitationKind::Form {
+                match parse_mcp_elicitation_form_content(&app.input) {
+                    Ok(content) => Some(content),
+                    Err(error) => {
+                        app.status = error;
+                        app.pending_mcp_elicitation = Some(pending);
+                        return true;
+                    }
+                }
+            } else {
+                None
+            };
+            let server = pending.request.server.clone();
+            let _ = pending
+                .response_tx
+                .send(McpElicitationResponse::accept(content));
+            clear_input(app);
+            app.status = format!("accepted mcp request from {server}");
+            true
+        }
+        McpElicitationChoice::Decline => {
+            let server = pending.request.server.clone();
+            let _ = pending.response_tx.send(McpElicitationResponse::decline());
+            app.status = format!("declined mcp request from {server}");
+            true
+        }
+    }
+}
+
+fn send_mcp_elicitation_cancel(app: &mut TuiApp, pending: PendingMcpElicitation) -> bool {
+    let server = pending.request.server.clone();
+    let _ = pending.response_tx.send(McpElicitationResponse::cancel());
+    app.status = format!("cancelled mcp request from {server}");
+    true
+}
+
+fn parse_mcp_elicitation_form_content(
+    input: &str,
+) -> std::result::Result<serde_json::Value, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(value @ serde_json::Value::Object(_)) => Ok(value),
+        Ok(_) => Err("MCP form response must be a JSON object".to_string()),
+        Err(error) => Err(format!("MCP form response JSON is invalid: {error}")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpElicitationChoice {
+    Accept,
+    Decline,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct McpElicitationOption {
+    choice: McpElicitationChoice,
+    label: &'static str,
+    hint: &'static str,
+}
+
+const MCP_ELICITATION_ACCEPT: McpElicitationOption = McpElicitationOption {
+    choice: McpElicitationChoice::Accept,
+    label: "Accept",
+    hint: "send response",
+};
+
+const MCP_ELICITATION_DECLINE: McpElicitationOption = McpElicitationOption {
+    choice: McpElicitationChoice::Decline,
+    label: "Decline",
+    hint: "deny request",
+};
+
+fn mcp_elicitation_options() -> &'static [McpElicitationOption] {
+    &[MCP_ELICITATION_ACCEPT, MCP_ELICITATION_DECLINE]
 }
 
 fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -2332,6 +2562,15 @@ pub(crate) fn format_approval_status_line(request: &ToolApprovalRequest) -> Stri
     )
 }
 
+pub(crate) fn format_mcp_elicitation_status_line(request: &McpElicitationRequest) -> String {
+    format!(
+        "mcp request: {} {} {}",
+        request.server,
+        mcp_elicitation_kind_label(&request.kind),
+        compact_text(&request.message, 120),
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
     format_approval_menu_lines(request, 0)
@@ -2344,6 +2583,98 @@ pub(crate) fn format_approval_prompt(request: &ToolApprovalRequest) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn format_mcp_elicitation_menu_lines(
+    request: &McpElicitationRequest,
+    selected: usize,
+    input: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "MCP request",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " · {} · {}",
+                request.server,
+                mcp_elicitation_kind_label(&request.kind)
+            ),
+            Style::default().fg(QUIET),
+        ),
+    ])];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            compact_text(&request.message, 180),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    match request.kind {
+        McpElicitationKind::Form => {
+            if let Some(schema) = request.schema.as_ref() {
+                let schema = serde_json::to_string(schema)
+                    .unwrap_or_else(|_| "<schema unavailable>".to_string());
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("schema {}", compact_text(&schema, 160)),
+                        Style::default().fg(QUIET),
+                    ),
+                ]));
+            }
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("response {}", mcp_elicitation_response_preview(input)),
+                    Style::default().fg(QUIET),
+                ),
+            ]));
+        }
+        McpElicitationKind::Url => {
+            if let Some(url) = request.url.as_ref() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(compact_text(url, 180), Style::default().fg(QUIET)),
+                ]));
+            }
+        }
+    }
+    for (index, option) in mcp_elicitation_options().iter().enumerate() {
+        let is_selected = index == selected.min(mcp_elicitation_options().len() - 1);
+        let marker = if is_selected { "› " } else { "  " };
+        let label_style = if is_selected {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+            ),
+            Span::styled(option.label, label_style),
+            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+        ]));
+    }
+    lines
+}
+
+fn mcp_elicitation_kind_label(kind: &McpElicitationKind) -> &'static str {
+    match kind {
+        McpElicitationKind::Form => "form",
+        McpElicitationKind::Url => "url",
+    }
+}
+
+fn mcp_elicitation_response_preview(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        "{}".to_string()
+    } else {
+        compact_text(trimmed, 160)
+    }
 }
 
 fn format_approval_menu_lines(
@@ -2795,7 +3126,28 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
 }
 
 fn approval_menu_height(app: &TuiApp) -> u16 {
-    if app.pending_approval.is_some() { 6 } else { 0 }
+    if app.pending_approval.is_some() {
+        6
+    } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
+        match pending.request.kind {
+            McpElicitationKind::Form => {
+                if pending.request.schema.is_some() {
+                    6
+                } else {
+                    5
+                }
+            }
+            McpElicitationKind::Url => {
+                if pending.request.url.is_some() {
+                    5
+                } else {
+                    4
+                }
+            }
+        }
+    } else {
+        0
+    }
 }
 
 fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -2806,10 +3158,17 @@ fn render_approval(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 }
 
 fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    app.pending_approval
-        .as_ref()
-        .map(|pending| format_approval_menu_lines(&pending.request, app.approval_selection_index))
-        .unwrap_or_default()
+    if let Some(pending) = app.pending_approval.as_ref() {
+        format_approval_menu_lines(&pending.request, app.approval_selection_index)
+    } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
+        format_mcp_elicitation_menu_lines(
+            &pending.request,
+            app.mcp_elicitation_selection_index,
+            &app.input,
+        )
+    } else {
+        Vec::new()
+    }
 }
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_startup_card: bool) {
@@ -5707,11 +6066,12 @@ fn format_status_context(app: &TuiApp) -> String {
 
 fn format_status_details(app: &TuiApp) -> String {
     format!(
-        "{}  repo {}  sandbox {}  telemetry {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
+        "{}  repo {}  sandbox {}  telemetry {}  mcp {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
         app.permissions.compact(),
         app.repo.detail(),
         app.permissions.sandbox,
         app.telemetry.as_str(),
+        format_mcp_status(app),
         format_cost(&app.cost),
         format_optional_u64(app.cost.input_tokens),
         format_optional_u64(app.cost.output_tokens),
@@ -5735,7 +6095,16 @@ fn format_status_details(app: &TuiApp) -> String {
 }
 
 fn format_status_hints(app: &TuiApp) -> String {
-    if app.pending_approval.is_some() {
+    if app.pending_mcp_elicitation.is_some() {
+        if app
+            .pending_mcp_elicitation
+            .as_ref()
+            .is_some_and(|pending| pending.request.kind == McpElicitationKind::Form)
+        {
+            return "type JSON object · Enter accept · N decline · Esc cancel".to_string();
+        }
+        return "Enter accept · N decline · Esc cancel".to_string();
+    } else if app.pending_approval.is_some() {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
@@ -5752,6 +6121,53 @@ fn format_status_hints(app: &TuiApp) -> String {
         "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
             .to_string()
     }
+}
+
+fn format_mcp_status(app: &TuiApp) -> String {
+    app.mcp_status
+        .as_ref()
+        .map(format_mcp_status_snapshot)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String {
+    let total = snapshot.per_server.len();
+    if total == 0 {
+        return "none".to_string();
+    }
+    let mut ready = 0usize;
+    let mut cached = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = 0usize;
+    let mut tools = 0usize;
+    for status in snapshot.per_server.values() {
+        match status {
+            McpServerStatus::Ready {
+                tools_count,
+                cached: is_cached,
+            } => {
+                ready += 1;
+                tools += *tools_count;
+                if *is_cached {
+                    cached += 1;
+                }
+            }
+            McpServerStatus::Failed { .. } => failed += 1,
+            McpServerStatus::Cancelled => cancelled += 1,
+            McpServerStatus::Starting => {}
+        }
+    }
+    let mut parts = vec![format!("{ready}/{total} ready"), format!("{tools} tools")];
+    if cached > 0 {
+        parts.push(format!("{cached} cached"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} cancelled"));
+    }
+    parts.join(" ")
 }
 
 fn reasoning_status_fragment(app: &TuiApp) -> String {
@@ -6026,6 +6442,7 @@ struct TuiApp {
     transcript_scroll_from_bottom: u16,
     pending_assistant: String,
     task_state: Option<TaskStateSnapshot>,
+    mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
     active_tool: Option<String>,
     status: String,
@@ -6045,6 +6462,8 @@ struct TuiApp {
     cancel: Option<CancellationToken>,
     pending_approval: Option<PendingApproval>,
     approval_selection_index: usize,
+    pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    mcp_elicitation_selection_index: usize,
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
     clipboard: Box<dyn Clipboard>,
@@ -6134,6 +6553,7 @@ impl TuiApp {
             transcript_scroll_from_bottom: 0,
             pending_assistant: String::new(),
             task_state: None,
+            mcp_status: None,
             task_panel_collapsed: false,
             active_tool: None,
             status,
@@ -6153,6 +6573,8 @@ impl TuiApp {
             cancel: None,
             pending_approval: None,
             approval_selection_index: 0,
+            pending_mcp_elicitation: None,
+            mcp_elicitation_selection_index: 0,
             pending_feedback: None,
             pending_report: None,
             clipboard,
@@ -6412,6 +6834,11 @@ enum TranscriptCategory {
 struct PendingApproval {
     request: ToolApprovalRequest,
     decision_tx: oneshot::Sender<ToolApprovalDecision>,
+}
+
+struct PendingMcpElicitation {
+    request: McpElicitationRequest,
+    response_tx: oneshot::Sender<McpElicitationResponse>,
 }
 
 fn exit_hint(session_id: Option<&str>) -> Option<String> {
