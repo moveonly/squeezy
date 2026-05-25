@@ -11,6 +11,7 @@ fn request_body_uses_messages_streaming_shape() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
+        cache_key: None,
         tools: vec![LlmToolSpec {
             name: "read_file".to_string(),
             description: "Read a file".to_string(),
@@ -52,6 +53,7 @@ fn request_body_preserves_function_tool_order() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -85,6 +87,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -115,6 +118,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -133,6 +137,85 @@ fn request_body_maps_tool_roundtrip_messages() {
     assert_eq!(body["messages"][2]["role"], "user");
     assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
     assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_1");
+}
+
+#[test]
+fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_caching() {
+    // Use a real Anthropic model id so the registry capability lookup
+    // reports prompt_caching=true; pair it with a cache_key so the
+    // anthropic adapter inserts ephemeral cache markers.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
+        instructions: "system prompt".to_string(),
+        input: vec![
+            LlmInputItem::UserText("first turn".to_string()),
+            LlmInputItem::AssistantText("ack".to_string()),
+            LlmInputItem::UserText("second turn".to_string()),
+        ],
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+
+    // System tail carries an ephemeral cache_control marker.
+    assert_eq!(body["system"][0]["type"], "text");
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+
+    // Only the last user block (the second turn) gets the cache marker.
+    let messages = body["messages"].as_array().expect("messages array");
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|msg| msg["role"] == "user")
+        .expect("user message");
+    let last_block = last_user["content"]
+        .as_array()
+        .expect("content")
+        .last()
+        .expect("last block");
+    assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+
+    // Older user turn is not marked.
+    let first_user = messages
+        .iter()
+        .find(|msg| msg["role"] == "user")
+        .expect("first user message");
+    let first_block = &first_user["content"][0];
+    assert!(first_block.get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_skips_cache_control_when_cache_key_is_absent() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
+        instructions: "system".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+
+    // Without a cache_key the system field stays a plain string and no
+    // cache_control markers appear in messages.
+    assert_eq!(body["system"], "system");
+    let messages = body["messages"].as_array().expect("messages");
+    for message in messages {
+        for block in message["content"].as_array().expect("blocks") {
+            assert!(block.get("cache_control").is_none(), "{block}");
+        }
+    }
 }
 
 #[test]

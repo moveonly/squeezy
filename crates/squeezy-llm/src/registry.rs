@@ -1,5 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use serde::Deserialize;
 use serde_json::Value;
 use squeezy_core::{CostSnapshot, ModelProfile, ProviderConfig, Result};
 
@@ -8,7 +9,7 @@ use crate::{
     OllamaProvider, OpenAiProvider,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct ModelCapabilities {
     pub streaming: bool,
     pub tool_calling: bool,
@@ -18,6 +19,8 @@ pub struct ModelCapabilities {
     pub reasoning_tokens: bool,
     pub reasoning_effort: bool,
     pub text_verbosity: bool,
+    #[serde(default)]
+    pub prompt_caching: bool,
 }
 
 impl ModelCapabilities {
@@ -30,10 +33,11 @@ impl ModelCapabilities {
         reasoning_tokens: false,
         reasoning_effort: false,
         text_verbosity: false,
+        prompt_caching: false,
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct TokenPricing {
     pub input_usd_micros_per_mtok: u64,
     pub output_usd_micros_per_mtok: u64,
@@ -41,8 +45,10 @@ pub struct TokenPricing {
     pub cache_write_usd_micros_per_mtok: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TokenizerKind {
+    #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     Anthropic,
     Google,
@@ -60,7 +66,8 @@ impl TokenizerKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelLifecycle {
     Active,
     Local,
@@ -75,10 +82,12 @@ impl ModelLifecycle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct ModelLimits {
     pub context_window_tokens: u64,
     pub max_output_tokens: u64,
+    #[serde(default = "default_effective_context_window_percent")]
+    pub effective_context_window_percent: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +107,8 @@ pub struct ModelInfo {
 pub struct RequestTokenEstimate {
     pub input_tokens: u64,
     pub context_window_tokens: Option<u64>,
+    pub effective_context_window_tokens: Option<u64>,
+    pub headroom_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub input_budget_tokens: Option<u64>,
     pub remaining_input_tokens: Option<u64>,
@@ -107,307 +118,76 @@ pub struct RequestTokenEstimate {
     pub estimated: bool,
 }
 
-pub const MODEL_REGISTRY: &[ModelInfo] = &[
+pub static MODEL_REGISTRY: LazyLock<Vec<ModelInfo>> = LazyLock::new(load_models);
+
+#[derive(Debug, Deserialize)]
+struct RawModelInfo {
+    provider: String,
+    id: String,
+    profile: ModelProfile,
+    capabilities: ModelCapabilities,
+    pricing: Option<TokenPricing>,
+    limits: Option<ModelLimits>,
+    tokenizer: TokenizerKind,
+    lifecycle: ModelLifecycle,
+    metadata_source: String,
+}
+
+fn default_effective_context_window_percent() -> u8 {
+    95
+}
+
+fn load_models() -> Vec<ModelInfo> {
+    let raw = serde_json::from_str::<Vec<RawModelInfo>>(include_str!("models.json"))
+        .expect("bundled models.json must be valid");
+    raw.into_iter().map(model_info_from_raw).collect()
+}
+
+fn model_info_from_raw(raw: RawModelInfo) -> ModelInfo {
     ModelInfo {
-        provider: "openai",
-        id: squeezy_core::DEFAULT_OPENAI_MODEL,
-        profile: ModelProfile::Strong,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
-        },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 5_000_000,
-            output_usd_micros_per_mtok: 30_000_000,
-            cache_read_usd_micros_per_mtok: Some(500_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/guides/latest-model.md",
-    },
+        provider: leak_string(raw.provider),
+        id: leak_string(raw.id),
+        profile: raw.profile,
+        capabilities: raw.capabilities,
+        pricing: raw.pricing,
+        limits: raw.limits,
+        tokenizer: raw.tokenizer,
+        lifecycle: raw.lifecycle,
+        metadata_source: leak_string(raw.metadata_source),
+    }
+}
+
+fn fallback_model_info(provider: &str, model: &str) -> ModelInfo {
+    let tokenizer = match provider {
+        "anthropic" | "bedrock" => TokenizerKind::Anthropic,
+        "google" => TokenizerKind::Google,
+        "ollama" => TokenizerKind::Ollama,
+        _ => TokenizerKind::OpenAiCompatible,
+    };
     ModelInfo {
-        provider: "openai",
-        id: "gpt-5.4-mini",
-        profile: ModelProfile::Balanced,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
-        },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 750_000,
-            output_usd_micros_per_mtok: 4_500_000,
-            cache_read_usd_micros_per_mtok: Some(75_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/pricing",
-    },
-    ModelInfo {
-        provider: "openai",
-        id: "gpt-5.4-nano",
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
-        },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 200_000,
-            output_usd_micros_per_mtok: 1_250_000,
-            cache_read_usd_micros_per_mtok: Some(20_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/pricing",
-    },
-    ModelInfo {
-        provider: "anthropic",
-        id: squeezy_core::DEFAULT_ANTHROPIC_MODEL,
-        profile: ModelProfile::Strong,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 15_000_000,
-            output_usd_micros_per_mtok: 75_000_000,
-            cache_read_usd_micros_per_mtok: Some(1_500_000),
-            cache_write_usd_micros_per_mtok: Some(18_750_000),
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 200_000,
-            max_output_tokens: 64_000,
-        }),
-        tokenizer: TokenizerKind::Anthropic,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
-    },
-    ModelInfo {
-        provider: "anthropic",
-        id: "claude-sonnet-4-6",
+        provider: leak_string(provider.to_string()),
+        id: leak_string(model.to_string()),
         profile: ModelProfile::Balanced,
         capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 3_000_000,
-            output_usd_micros_per_mtok: 15_000_000,
-            cache_read_usd_micros_per_mtok: Some(300_000),
-            cache_write_usd_micros_per_mtok: Some(3_750_000),
-        }),
+        pricing: None,
         limits: Some(ModelLimits {
-            context_window_tokens: 200_000,
+            context_window_tokens: 272_000,
             max_output_tokens: 64_000,
+            effective_context_window_percent: 95,
         }),
-        tokenizer: TokenizerKind::Anthropic,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
-    },
-    ModelInfo {
-        provider: "anthropic",
-        id: "claude-haiku-4-5-20251001",
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 1_000_000,
-            output_usd_micros_per_mtok: 5_000_000,
-            cache_read_usd_micros_per_mtok: Some(100_000),
-            cache_write_usd_micros_per_mtok: Some(1_250_000),
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 200_000,
-            max_output_tokens: 64_000,
-        }),
-        tokenizer: TokenizerKind::Anthropic,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
-    },
-    ModelInfo {
-        provider: "google",
-        id: squeezy_core::DEFAULT_GOOGLE_MODEL,
-        profile: ModelProfile::Strong,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 1_250_000,
-            output_usd_micros_per_mtok: 10_000_000,
-            cache_read_usd_micros_per_mtok: Some(310_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 1_048_576,
-            max_output_tokens: 65_536,
-        }),
-        tokenizer: TokenizerKind::Google,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
-    },
-    ModelInfo {
-        provider: "google",
-        id: "gemini-2.5-flash",
-        profile: ModelProfile::Balanced,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 300_000,
-            output_usd_micros_per_mtok: 2_500_000,
-            cache_read_usd_micros_per_mtok: Some(75_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 1_048_576,
-            max_output_tokens: 65_536,
-        }),
-        tokenizer: TokenizerKind::Google,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
-    },
-    ModelInfo {
-        provider: "google",
-        id: "gemini-2.5-flash-lite",
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 100_000,
-            output_usd_micros_per_mtok: 400_000,
-            cache_read_usd_micros_per_mtok: Some(25_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 1_048_576,
-            max_output_tokens: 65_536,
-        }),
-        tokenizer: TokenizerKind::Google,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
-    },
-    ModelInfo {
-        provider: "azure_openai",
-        id: squeezy_core::DEFAULT_AZURE_OPENAI_MODEL,
-        profile: ModelProfile::Strong,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
+        tokenizer,
+        lifecycle: if provider == "ollama" {
+            ModelLifecycle::Local
+        } else {
+            ModelLifecycle::Active
         },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 5_000_000,
-            output_usd_micros_per_mtok: 30_000_000,
-            cache_read_usd_micros_per_mtok: Some(500_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/guides/latest-model.md",
-    },
-    ModelInfo {
-        provider: "azure_openai",
-        id: "gpt-5.4-mini",
-        profile: ModelProfile::Balanced,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
-        },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 750_000,
-            output_usd_micros_per_mtok: 4_500_000,
-            cache_read_usd_micros_per_mtok: Some(75_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/pricing",
-    },
-    ModelInfo {
-        provider: "azure_openai",
-        id: "gpt-5.4-nano",
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities {
-            response_state: true,
-            reasoning_tokens: true,
-            reasoning_effort: true,
-            text_verbosity: true,
-            ..ModelCapabilities::TEXT_TOOLS
-        },
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 200_000,
-            output_usd_micros_per_mtok: 1_250_000,
-            cache_read_usd_micros_per_mtok: Some(20_000),
-            cache_write_usd_micros_per_mtok: None,
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 400_000,
-            max_output_tokens: 128_000,
-        }),
-        tokenizer: TokenizerKind::OpenAiCompatible,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://developers.openai.com/api/docs/pricing",
-    },
-    ModelInfo {
-        provider: "bedrock",
-        id: squeezy_core::DEFAULT_BEDROCK_MODEL,
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 1_000_000,
-            output_usd_micros_per_mtok: 5_000_000,
-            cache_read_usd_micros_per_mtok: Some(100_000),
-            cache_write_usd_micros_per_mtok: Some(1_250_000),
-        }),
-        limits: Some(ModelLimits {
-            context_window_tokens: 200_000,
-            max_output_tokens: 64_000,
-        }),
-        tokenizer: TokenizerKind::Anthropic,
-        lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html",
-    },
-    ModelInfo {
-        provider: "ollama",
-        id: squeezy_core::DEFAULT_OLLAMA_MODEL,
-        profile: ModelProfile::Cheap,
-        capabilities: ModelCapabilities::TEXT_TOOLS,
-        pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 0,
-            output_usd_micros_per_mtok: 0,
-            cache_read_usd_micros_per_mtok: Some(0),
-            cache_write_usd_micros_per_mtok: Some(0),
-        }),
-        limits: None,
-        tokenizer: TokenizerKind::Ollama,
-        lifecycle: ModelLifecycle::Local,
-        metadata_source: "runtime ollama /api/show metadata",
-    },
-];
+        metadata_source: "fallback",
+    }
+}
+
+fn leak_string(value: String) -> &'static str {
+    Box::leak(value.into_boxed_str())
+}
 
 pub const PROVIDERS: &[&str] = &[
     "openai",
@@ -428,6 +208,11 @@ pub fn model_info_for(provider: &str, model: &str) -> Option<&'static ModelInfo>
     MODEL_REGISTRY
         .iter()
         .find(|entry| entry.provider == provider && entry.id == model)
+        .or_else(|| {
+            let leaked: &'static mut ModelInfo =
+                Box::leak(Box::new(fallback_model_info(provider, model)));
+            Some(&*leaked)
+        })
 }
 
 pub fn capabilities_for(provider: &str, model: &str) -> Option<ModelCapabilities> {
@@ -448,6 +233,20 @@ pub fn estimate_request_context(
     let model_limits = info.and_then(|entry| entry.limits);
     let context_window_tokens =
         context_window_override.or(model_limits.map(|limits| limits.context_window_tokens));
+    let effective_context_window_tokens = context_window_tokens.map(|window| {
+        let percent = model_limits
+            .map(|limits| limits.effective_context_window_percent)
+            .unwrap_or(95);
+        window
+            .saturating_mul(u64::from(percent))
+            .saturating_div(100)
+    });
+    const BASELINE_TOKENS: u64 = 12_000;
+    let effective_context_window_tokens =
+        effective_context_window_tokens.map(|window| window.saturating_sub(BASELINE_TOKENS));
+    let headroom_tokens = context_window_tokens
+        .zip(effective_context_window_tokens)
+        .map(|(raw_window, effective_window)| raw_window.saturating_sub(effective_window));
     let max_output_tokens = request
         .max_output_tokens
         .map(u64::from)
@@ -457,8 +256,8 @@ pub fn estimate_request_context(
                 .map(|limits| tokens.min(limits.max_output_tokens))
                 .unwrap_or(tokens)
         });
-    let input_budget_tokens =
-        context_window_tokens.map(|window| window.saturating_sub(max_output_tokens.unwrap_or(0)));
+    let input_budget_tokens = effective_context_window_tokens
+        .map(|window| window.saturating_sub(max_output_tokens.unwrap_or(0)));
     let remaining_input_tokens =
         input_budget_tokens.map(|budget| budget.saturating_sub(input_tokens));
     let used_input_percent_x100 = input_budget_tokens
@@ -469,6 +268,8 @@ pub fn estimate_request_context(
     RequestTokenEstimate {
         input_tokens,
         context_window_tokens,
+        effective_context_window_tokens,
+        headroom_tokens,
         max_output_tokens,
         input_budget_tokens,
         remaining_input_tokens,
@@ -505,10 +306,7 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
 }
 
 pub fn estimate_cost(provider: &str, model: &str, cost: &CostSnapshot) -> Option<u64> {
-    let pricing = MODEL_REGISTRY
-        .iter()
-        .find(|entry| entry.provider == provider && entry.id == model)
-        .and_then(|entry| entry.pricing)?;
+    let pricing = model_info_for(provider, model).and_then(|entry| entry.pricing)?;
     let cached_input_tokens = cost.cached_input_tokens.unwrap_or(0);
     let cache_write_input_tokens = cost.cache_write_input_tokens.unwrap_or(0);
     // OpenAI/Gemini report `input_tokens` as the total including cached and

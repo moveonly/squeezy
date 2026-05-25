@@ -2,8 +2,8 @@ use std::env;
 
 use futures_util::StreamExt;
 use squeezy_core::{
-    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_MODEL, OpenAiConfig, Result,
-    SqueezyError,
+    DEFAULT_MAX_OUTPUT_TOKENS, DEFAULT_OPENAI_BASE_URL, DEFAULT_OPENAI_MODEL, OpenAiConfig,
+    ProviderTransportConfig, Result, SqueezyError,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, OpenAiProvider};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         api_key_env: OPENAI_KEY_ENV.to_string(),
         base_url: env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string()),
+        transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {
         model: env::var("SQUEEZY_COSTLY_MODEL")
@@ -36,6 +37,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };

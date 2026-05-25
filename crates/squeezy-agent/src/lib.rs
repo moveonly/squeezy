@@ -206,7 +206,7 @@ impl ReplayRuntime {
             .get("hash")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let actual = replay_hash(request);
+        let actual = replay_hash(&replay_request_view(request));
         if self.strict_requests && expected != actual {
             return Err(SqueezyError::Agent(format!(
                 "replay model request diverged: expected {expected}, got {actual}"
@@ -1350,6 +1350,10 @@ impl Agent {
             .map(|handle| handle.session_id().to_string())
     }
 
+    fn session_prompt_cache_key(&self) -> Option<String> {
+        self.session_id().map(|id| format!("squeezy::{id}"))
+    }
+
     pub async fn session_accounting_snapshot(&self) -> SessionAccountingSnapshot {
         let state = self.conversation_state.lock().await.clone();
         let mode = load_session_mode(&self.session_mode);
@@ -1446,6 +1450,7 @@ impl Agent {
             } else {
                 None
             },
+            cache_key: self.session_prompt_cache_key(),
             tools: request_tool_specs(
                 &all_tool_specs,
                 mode,
@@ -2751,6 +2756,12 @@ fn instructions_with_response_verbosity(
 }
 
 impl TurnRuntime {
+    fn session_prompt_cache_key(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| format!("squeezy::{}", handle.session_id()))
+    }
+
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
@@ -3024,6 +3035,7 @@ impl TurnRuntime {
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
+                cache_key: self.session_prompt_cache_key(),
                 tools: request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
@@ -3537,7 +3549,7 @@ impl TurnRuntime {
         self.record_replay(
             SessionReplayEventKind::ModelRequest,
             json!({
-                "hash": replay_hash(request),
+                "hash": replay_hash(&replay_request_view(request)),
                 "request": request,
             }),
         );
@@ -4194,6 +4206,7 @@ async fn run_subagent_loop(
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
+            cache_key: None,
             tools: tool_specs.to_vec(),
             store: false,
         };
@@ -5823,6 +5836,7 @@ Working target: {:?}",
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -6844,6 +6858,17 @@ fn unix_timestamp_millis() -> u64 {
 
 fn replay_hash(value: &impl Serialize) -> String {
     sha256_hex(serde_json::to_vec(value).unwrap_or_default())
+}
+
+/// Returns a stable LlmRequest snapshot for replay-hash purposes.
+///
+/// `cache_key` is derived from the live session id, which changes
+/// across record/replay runs, so it must be excluded from the
+/// divergence hash.
+fn replay_request_view(request: &LlmRequest) -> LlmRequest {
+    let mut view = request.clone();
+    view.cache_key = None;
+    view
 }
 
 fn replay_user_inputs(tape: &SessionReplayTape) -> Vec<String> {

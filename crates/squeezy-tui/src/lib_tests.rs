@@ -811,20 +811,20 @@ async fn slash_context_reports_known_model_budget_percentages() {
 }
 
 #[tokio::test]
-async fn slash_context_keeps_percentages_unknown_without_model_limits() {
+async fn slash_context_uses_registry_fallback_for_unknown_models() {
+    // The registry now ships a fallback metadata path for unknown model
+    // ids, so /context produces concrete numbers (drawn from the fallback
+    // window) rather than `unknown` placeholders.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/context").await);
 
     let output = last_message_content(&app).expect("context output");
-    assert!(output.contains("context_window=unknown"), "{output}");
-    assert!(
-        output.contains("remaining_input_budget=unknown"),
-        "{output}"
-    );
-    assert!(output.contains("used=unknown"), "{output}");
-    assert!(!output.contains('%'), "{output}");
+    assert!(output.contains("context_window=272000"), "{output}");
+    assert!(output.contains("max_output_reserve=64000"), "{output}");
+    assert!(output.contains("input_budget="), "{output}");
+    assert!(output.contains("used="), "{output}");
 }
 
 #[tokio::test]

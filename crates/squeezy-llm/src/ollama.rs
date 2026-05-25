@@ -1,16 +1,21 @@
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use squeezy_core::{CostSnapshot, OllamaConfig, Result, SqueezyError};
+use squeezy_core::{CostSnapshot, OllamaConfig, ProviderTransportConfig, Result, SqueezyError};
 use std::time::Duration;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use crate::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    retry::{RetryPolicy, idle_timeout, send_with_retry},
+};
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
+    transport: ProviderTransportConfig,
 }
 
 impl OllamaProvider {
@@ -18,6 +23,7 @@ impl OllamaProvider {
         Self {
             client: reqwest::Client::new(),
             base_url: config.base_url.trim_end_matches('/').to_string(),
+            transport: config.transport,
         }
     }
 
@@ -141,17 +147,12 @@ impl LlmProvider for OllamaProvider {
         let client = self.client.clone();
         let url = format!("{}/chat", self.base_url);
         let body = Self::request_body(&request);
+        let transport = self.transport;
 
         Box::pin(try_stream! {
-            let response_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                response = client.post(&url).json(&body).send() => response,
-            };
-            let response = response_result
-                .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
+            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+                client.post(&url).json(&body)
+            }).await?;
             let status = response.status();
             let response = if status.is_success() {
                 response
@@ -164,13 +165,18 @@ impl LlmProvider for OllamaProvider {
             yield LlmEvent::Started;
             let mut decoder = JsonLineDecoder::default();
             let mut bytes = response.bytes_stream();
-            while let Some(chunk) = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                chunk = bytes.next() => chunk
-            } {
+            loop {
+                let polled = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        yield LlmEvent::Cancelled;
+                        return;
+                    }
+                    next = timeout(idle_timeout(transport), bytes.next()) => next,
+                };
+                let next = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("Ollama stream idle timeout".to_string())
+                })?;
+                let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for line in decoder.push(&chunk) {
                     for event in parse_ollama_line(&line)? {
