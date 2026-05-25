@@ -380,3 +380,66 @@ async fn shell_linux_userns_result_carries_network_metadata() {
     assert_eq!(result.content["sandbox"]["network"], "denied_classified");
     let _ = fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+#[cfg(target_os = "windows")]
+async fn shell_windows_required_mode_denies_pre_spawn() {
+    let root = temp_workspace("windows_required_denies");
+    let registry = smoke_registry(&root, required_deny_config());
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "cmd /C echo hello",
+                    "description": "required mode on Windows denies pre-spawn"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    let error = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("required shell sandbox unavailable on windows"),
+        "expected windows deny message, got {error:?}"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+#[cfg(target_os = "windows")]
+async fn shell_windows_best_effort_runs_with_job_object_backend() {
+    let root = temp_workspace("windows_best_effort");
+    let config = ShellSandboxConfig {
+        mode: ShellSandboxMode::BestEffort,
+        network: ShellSandboxNetworkPolicy::DenyByDefault,
+        ..ShellSandboxConfig::default()
+    };
+    let registry = smoke_registry(&root, config);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "cmd /C echo hello",
+                    "description": "best-effort Windows shell runs"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result);
+    assert_eq!(result.content["sandbox"]["backend"], "windows-job-object");
+    assert_eq!(
+        result.content["sandbox"]["filesystem"],
+        "best_effort_unavailable"
+    );
+    let _ = fs::remove_dir_all(root);
+}
