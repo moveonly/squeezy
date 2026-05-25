@@ -36,6 +36,10 @@ pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
 pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
 pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_PROVIDER_REQUEST_MAX_RETRIES: u8 = 4;
+pub const DEFAULT_PROVIDER_STREAM_MAX_RETRIES: u8 = 5;
+pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
@@ -126,6 +130,8 @@ pub struct AppConfig {
     pub max_tool_calls_per_turn: u64,
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
+    pub max_session_cost_usd_micros: Option<u64>,
+    pub cost_warn_percent: u8,
     pub telemetry: TelemetryConfig,
     pub feedback: FeedbackConfig,
     pub redaction: RedactionConfig,
@@ -247,6 +253,7 @@ impl AppConfig {
                 base_url: get_var("ANTHROPIC_BASE_URL")
                     .or_else(|| provider_setting(&providers, "anthropic", "base_url"))
                     .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
+                transport: provider_transport_settings(&providers, &["anthropic"]),
             }),
             "google" | "gemini" => ProviderConfig::Google(GoogleConfig {
                 api_key_env: get_var("GOOGLE_API_KEY_ENV")
@@ -255,6 +262,7 @@ impl AppConfig {
                 base_url: get_var("GOOGLE_BASE_URL")
                     .or_else(|| provider_setting(&providers, "google", "base_url"))
                     .unwrap_or_else(|| DEFAULT_GOOGLE_BASE_URL.to_string()),
+                transport: provider_transport_settings(&providers, &["google"]),
             }),
             "azure" | "azure-openai" | "azure_openai" => {
                 ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
@@ -270,6 +278,7 @@ impl AppConfig {
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_version"))
                         .or_else(|| provider_setting(&providers, "azure", "api_version"))
                         .unwrap_or_else(|| DEFAULT_AZURE_OPENAI_API_VERSION.to_string()),
+                    transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
             "bedrock" | "amazon-bedrock" | "amazon_bedrock" => {
@@ -280,12 +289,14 @@ impl AppConfig {
                         .unwrap_or_else(|| DEFAULT_BEDROCK_REGION.to_string()),
                     base_url: get_var("BEDROCK_BASE_URL")
                         .or_else(|| provider_setting(&providers, "bedrock", "base_url")),
+                    transport: provider_transport_settings(&providers, &["bedrock"]),
                 })
             }
             "ollama" | "local" => ProviderConfig::Ollama(OllamaConfig {
                 base_url: get_var("OLLAMA_BASE_URL")
                     .or_else(|| provider_setting(&providers, "ollama", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+                transport: provider_transport_settings(&providers, &["ollama"]),
             }),
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
                 api_key_env: get_var("OPENAI_API_KEY_ENV")
@@ -294,6 +305,7 @@ impl AppConfig {
                 base_url: get_var("OPENAI_BASE_URL")
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
+                transport: provider_transport_settings(&providers, &["openai"]),
             }),
             unknown => {
                 return Err(SqueezyError::Config(format!(
@@ -431,6 +443,15 @@ impl AppConfig {
                 .max_search_files_per_turn
                 .unwrap_or(DEFAULT_MAX_SEARCH_FILES_PER_TURN),
         );
+        let max_session_cost_usd_micros = get_var("SQUEEZY_MAX_SESSION_COST_USD_MICROS")
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .or(budgets.max_session_cost_usd_micros);
+        let cost_warn_percent = get_var("SQUEEZY_COST_WARN_PERCENT")
+            .and_then(|value| value.parse::<u8>().ok())
+            .filter(|value| (1..=100).contains(value))
+            .or(budgets.cost_warn_percent)
+            .unwrap_or(DEFAULT_COST_WARN_PERCENT);
         let telemetry = TelemetryConfig::from_settings_and_env(
             settings.telemetry.unwrap_or_default(),
             &mut get_var,
@@ -516,6 +537,8 @@ impl AppConfig {
             max_tool_calls_per_turn,
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
+            max_session_cost_usd_micros,
+            cost_warn_percent,
             telemetry,
             feedback,
             redaction,
@@ -702,6 +725,17 @@ impl AppConfig {
         output.push_str(&format!(
             "max_tool_result_bytes_per_round = {}\n\n",
             self.max_tool_result_bytes_per_round
+        ));
+        if let Some(max_session_cost_usd_micros) = self.max_session_cost_usd_micros {
+            output.push_str(&format!(
+                "max_session_cost_usd_micros = {max_session_cost_usd_micros}\n"
+            ));
+        } else {
+            output.push_str("# max_session_cost_usd_micros = unset\n");
+        }
+        output.push_str(&format!(
+            "cost_warn_percent = {}\n\n",
+            self.cost_warn_percent
         ));
 
         output.push_str("[permissions]\n");
@@ -1131,18 +1165,21 @@ pub enum ProviderConfig {
 pub struct OpenAiConfig {
     pub api_key_env: String,
     pub base_url: String,
+    pub transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
     pub base_url: String,
+    pub transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleConfig {
     pub api_key_env: String,
     pub base_url: String,
+    pub transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1150,17 +1187,37 @@ pub struct AzureOpenAiConfig {
     pub api_key_env: String,
     pub base_url: String,
     pub api_version: String,
+    pub transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BedrockConfig {
     pub region: String,
     pub base_url: Option<String>,
+    pub transport: ProviderTransportConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
+    pub transport: ProviderTransportConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTransportConfig {
+    pub request_max_retries: u8,
+    pub stream_max_retries: u8,
+    pub stream_idle_timeout_ms: u64,
+}
+
+impl Default for ProviderTransportConfig {
+    fn default() -> Self {
+        Self {
+            request_max_retries: DEFAULT_PROVIDER_REQUEST_MAX_RETRIES,
+            stream_max_retries: DEFAULT_PROVIDER_STREAM_MAX_RETRIES,
+            stream_idle_timeout_ms: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1426,6 +1483,8 @@ pub struct ProviderSettings {
     pub default_model: Option<String>,
     pub api_version: Option<String>,
     pub region: Option<String>,
+    pub request_max_retries: Option<u8>,
+    pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
 }
 
@@ -1439,6 +1498,8 @@ impl ProviderSettings {
                 "default_model",
                 "api_version",
                 "region",
+                "request_max_retries",
+                "stream_max_retries",
                 "stream_idle_timeout_ms",
             ],
             source,
@@ -1455,7 +1516,19 @@ impl ProviderSettings {
             )?,
             api_version: string_value(table, "api_version", source, &field(path, "api_version"))?,
             region: string_value(table, "region", source, &field(path, "region"))?,
-            stream_idle_timeout_ms: u64_value(
+            request_max_retries: u8_nonnegative_value(
+                table,
+                "request_max_retries",
+                source,
+                &field(path, "request_max_retries"),
+            )?,
+            stream_max_retries: u8_nonnegative_value(
+                table,
+                "stream_max_retries",
+                source,
+                &field(path, "stream_max_retries"),
+            )?,
+            stream_idle_timeout_ms: u64_nonnegative_value(
                 table,
                 "stream_idle_timeout_ms",
                 source,
@@ -1470,6 +1543,8 @@ impl ProviderSettings {
         replace_if_some(&mut self.default_model, next.default_model);
         replace_if_some(&mut self.api_version, next.api_version);
         replace_if_some(&mut self.region, next.region);
+        replace_if_some(&mut self.request_max_retries, next.request_max_retries);
+        replace_if_some(&mut self.stream_max_retries, next.stream_max_retries);
         replace_if_some(
             &mut self.stream_idle_timeout_ms,
             next.stream_idle_timeout_ms,
@@ -1601,6 +1676,8 @@ pub struct BudgetSettings {
     pub max_tool_calls_per_turn: Option<u64>,
     pub max_tool_bytes_read_per_turn: Option<u64>,
     pub max_search_files_per_turn: Option<u64>,
+    pub max_session_cost_usd_micros: Option<u64>,
+    pub cost_warn_percent: Option<u8>,
 }
 
 impl BudgetSettings {
@@ -1616,6 +1693,8 @@ impl BudgetSettings {
                 "max_tool_calls_per_turn",
                 "max_tool_bytes_read_per_turn",
                 "max_search_files_per_turn",
+                "max_session_cost_usd_micros",
+                "cost_warn_percent",
             ],
             source,
             path,
@@ -1669,6 +1748,18 @@ impl BudgetSettings {
                 source,
                 &field(path, "max_search_files_per_turn"),
             )?,
+            max_session_cost_usd_micros: u64_value(
+                table,
+                "max_session_cost_usd_micros",
+                source,
+                &field(path, "max_session_cost_usd_micros"),
+            )?,
+            cost_warn_percent: percent_value(
+                table,
+                "cost_warn_percent",
+                source,
+                &field(path, "cost_warn_percent"),
+            )?,
         })
     }
 
@@ -1699,6 +1790,11 @@ impl BudgetSettings {
             &mut self.max_search_files_per_turn,
             next.max_search_files_per_turn,
         );
+        replace_if_some(
+            &mut self.max_session_cost_usd_micros,
+            next.max_session_cost_usd_micros,
+        );
+        replace_if_some(&mut self.cost_warn_percent, next.cost_warn_percent);
     }
 }
 
@@ -4680,6 +4776,8 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_turn = 20000000
 # max_search_files_per_turn = 50000
 # max_tool_result_bytes_per_round = 50000
+# max_session_cost_usd_micros = 5000000
+# cost_warn_percent = 85
 
 [agent]
 # exploration_compiler = true  # graph-first planner for common navigation prompts
@@ -4878,6 +4976,28 @@ fn provider_u64_setting_any(
         }?;
         Some(value.to_string())
     })
+}
+
+fn provider_transport_settings(
+    providers: &BTreeMap<String, ProviderSettings>,
+    names: &[&str],
+) -> ProviderTransportConfig {
+    let mut transport = ProviderTransportConfig::default();
+    for name in names {
+        let Some(settings) = providers.get(*name) else {
+            continue;
+        };
+        if let Some(value) = settings.request_max_retries {
+            transport.request_max_retries = value;
+        }
+        if let Some(value) = settings.stream_max_retries {
+            transport.stream_max_retries = value;
+        }
+        if let Some(value) = settings.stream_idle_timeout_ms {
+            transport.stream_idle_timeout_ms = value;
+        }
+    }
+    transport
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -5200,6 +5320,23 @@ fn u32_value(
     }
 }
 
+fn u8_nonnegative_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<u8>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let integer = non_negative_integer(value, source, path)?;
+            u8::try_from(integer)
+                .map(Some)
+                .map_err(|_| SqueezyError::Config(format!("{source}: {path}: value is too large")))
+        }
+    }
+}
+
 fn u64_value(
     table: &toml::value::Table,
     key: &str,
@@ -5209,6 +5346,36 @@ fn u64_value(
     match table.get(key) {
         None => Ok(None),
         Some(value) => Ok(Some(positive_integer(value, source, path)?)),
+    }
+}
+
+fn u64_nonnegative_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<u64>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => Ok(Some(non_negative_integer(value, source, path)?)),
+    }
+}
+
+fn percent_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<u8>> {
+    let Some(value) = u8_nonnegative_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    if (1..=100).contains(&value) {
+        Ok(Some(value))
+    } else {
+        Err(SqueezyError::Config(format!(
+            "{source}: {path}: expected an integer from 1 to 100"
+        )))
     }
 }
 
@@ -5223,6 +5390,20 @@ fn positive_integer(value: &toml::Value, source: &str, path: &str) -> Result<u64
     }
     u64::try_from(integer)
         .map_err(|_| SqueezyError::Config(format!("{source}: {path}: expected a positive integer")))
+}
+
+fn non_negative_integer(value: &toml::Value, source: &str, path: &str) -> Result<u64> {
+    let Some(integer) = value.as_integer() else {
+        return Err(type_error(source, path, "non-negative integer"));
+    };
+    if integer < 0 {
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: expected a non-negative integer"
+        )));
+    }
+    u64::try_from(integer).map_err(|_| {
+        SqueezyError::Config(format!("{source}: {path}: expected a non-negative integer"))
+    })
 }
 
 fn path_value(

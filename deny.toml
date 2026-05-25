@@ -48,6 +48,28 @@ skip = [
     # cleanly (no symbol conflicts, separate feature sets). Revisit when
     # either rmcp downgrades its reqwest dep or we upgrade the workspace.
     { crate = "reqwest:0.13.3", reason = "rmcp 1.7 streamable-http transport requires reqwest 0.13; workspace on 0.12" },
+    # The AWS SDK (aws-sigv4 / aws-smithy-eventstream) ships internally on a
+    # newer `digest 0.11` / `sha2 0.11` stack while the rest of the workspace
+    # (and `keyring` 3.6 via `secret-service`) still uses `digest 0.10`. The
+    # two coexist without symbol conflicts. Revisit when AWS or our other
+    # dependents converge on a single digest major.
+    { crate = "block-buffer:0.10.4", reason = "aws-sigv4/sha2 0.11 vs digest 0.10 ecosystem (keyring, sha1)" },
+    { crate = "cpufeatures:0.2.17", reason = "aws-sigv4/sha2 0.11 pulls cpufeatures 0.3 while sha1 0.10 stays on 0.2" },
+    { crate = "crypto-common:0.1.6", reason = "aws-sigv4/sha2 0.11 ships crypto-common 0.2 alongside the workspace's 0.1" },
+    { crate = "digest:0.10.7", reason = "aws-sigv4 depends on digest 0.11; keyring's sha1 stays on 0.10" },
+    # `aws-smithy-eventstream` reuses the original `http 0.2` types in its
+    # public API; the rest of the AWS SDK + the workspace are on `http 1.x`.
+    # Both coexist; AWS upstream is tracking the migration.
+    { crate = "http:0.2.12", reason = "aws-smithy-eventstream still exposes http 0.2 alongside the http 1.x stack" },
+    { crate = "http-body:0.4.6", reason = "aws-smithy-eventstream still uses http-body 0.4 alongside http-body 1.x" },
+    # `keyring 3.6` (via `zbus 4`) and `rmcp 1.7` (via `process-wrap`) pull
+    # different `nix` majors. Both are platform-conditional and isolated.
+    { crate = "nix:0.29.0", reason = "keyring 3.6 / zbus 4 on Linux still pin nix 0.29; rmcp's process-wrap is on 0.31" },
+    # `secret-service`'s `crypto-rust` runtime depends on `hmac 0.12` /
+    # `sha2 0.10`; aws-sigv4 pulls `hmac 0.13` / `sha2 0.11`. Both stacks
+    # are platform-conditional or used in disjoint code paths.
+    { crate = "hmac:0.12.1", reason = "secret-service (Linux keyring) on hmac 0.12 vs aws-sigv4 on 0.13" },
+    { crate = "sha2:0.10.9", reason = "secret-service (Linux keyring) on sha2 0.10 vs aws-sigv4 on 0.11" },
 ]
 skip-tree = []
 

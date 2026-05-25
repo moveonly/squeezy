@@ -12,13 +12,20 @@ pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
 mod anthropic;
 mod bedrock;
+mod credentials;
 mod google;
 mod ollama;
 mod openai;
 mod registry;
+mod retry;
+pub mod tokens;
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
+pub use credentials::{
+    DefaultCredentialStore, KeyringCredentialStore, resolve_api_key, save_api_key,
+    save_api_key_with_store,
+};
 pub use google::GoogleProvider;
 pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
 pub use openai::OpenAiProvider;
@@ -40,6 +47,7 @@ pub struct LlmRequest {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub previous_response_id: Option<String>,
+    pub cache_key: Option<String>,
     pub tools: Vec<LlmToolSpec>,
     pub store: bool,
 }
@@ -59,6 +67,7 @@ impl LlmRequest {
             response_verbosity: None,
             reasoning_effort: None,
             previous_response_id: None,
+            cache_key: None,
             tools: Vec::new(),
             store: false,
         }

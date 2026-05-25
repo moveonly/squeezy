@@ -12,6 +12,7 @@ fn request_body_uses_responses_streaming_shape() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
+        cache_key: None,
         tools: vec![LlmToolSpec {
             name: "grep".to_string(),
             description: "search files".to_string(),
@@ -113,6 +114,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -134,6 +136,7 @@ fn request_body_preserves_function_tool_order() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -168,6 +171,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         response_verbosity: Some(squeezy_core::ResponseVerbosity::Verbose),
         reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -193,6 +197,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             response_verbosity: Some(squeezy),
             reasoning_effort: None,
             previous_response_id: None,
+            cache_key: None,
             tools: Vec::new(),
             store: false,
         };
@@ -201,6 +206,44 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
 
         assert_eq!(body["text"]["verbosity"], openai);
     }
+}
+
+#[test]
+fn request_body_emits_prompt_cache_key_when_set() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "hi".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "squeezy::session-1");
+}
+
+#[test]
+fn request_body_omits_prompt_cache_key_when_unset() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string(),
+        instructions: "hi".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = OpenAiProvider::request_body(&request);
+    assert!(body.get("prompt_cache_key").is_none());
 }
 
 #[test]
