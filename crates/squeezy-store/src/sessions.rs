@@ -4,9 +4,11 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
+    thread,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -63,6 +65,7 @@ impl SessionStore {
             store: self.clone(),
             session_id: metadata.session_id,
             counters: Arc::new(HandleCounters::default()),
+            event_writer: SessionLogWriter::spawn(self.clone(), dir),
         })
     }
 
@@ -90,8 +93,9 @@ impl SessionStore {
         }
         SessionHandle {
             store: self.clone(),
-            session_id,
+            session_id: session_id.clone(),
             counters: Arc::new(counters),
+            event_writer: SessionLogWriter::spawn(self.clone(), self.session_dir(&session_id)),
         }
     }
 
@@ -224,6 +228,7 @@ pub struct SessionHandle {
     // avoid the read-mutate-write of `metadata.json` for routine events that
     // don't change any user-visible discovery field.
     counters: Arc<HandleCounters>,
+    event_writer: Arc<SessionLogWriter>,
 }
 
 #[derive(Debug, Default)]
@@ -231,6 +236,224 @@ struct HandleCounters {
     event_count: AtomicU64,
     replay_count: AtomicU64,
     has_first_user_task: AtomicBool,
+}
+
+#[derive(Debug)]
+struct SessionLogAppend {
+    payload: Vec<u8>,
+}
+
+enum SessionLogCmd {
+    Append(SessionLogAppend),
+    Flush { ack: mpsc::Sender<Result<()>> },
+    Shutdown { ack: mpsc::Sender<Result<()>> },
+}
+
+#[derive(Debug)]
+struct SessionLogWriter {
+    tx: mpsc::Sender<SessionLogCmd>,
+    worker: StdMutex<Option<thread::JoinHandle<()>>>,
+    terminal_failure: StdMutex<Option<String>>,
+}
+
+impl SessionLogWriter {
+    fn spawn(store: SessionStore, dir: PathBuf) -> Arc<Self> {
+        let (tx, rx) = mpsc::channel();
+        let terminal_failure = StdMutex::new(None);
+        let writer = Arc::new(Self {
+            tx,
+            worker: StdMutex::new(None),
+            terminal_failure,
+        });
+        let failure = Arc::downgrade(&writer);
+        let worker = thread::spawn(move || {
+            run_session_log_writer(store, dir, rx, failure);
+        });
+        *writer.worker.lock().expect("session log writer worker") = Some(worker);
+        writer
+    }
+
+    fn append(&self, append: SessionLogAppend) -> Result<()> {
+        self.check_failure()?;
+        self.tx
+            .send(SessionLogCmd::Append(append))
+            .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
+        self.check_failure()
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.check_failure()?;
+        let (ack, rx) = mpsc::channel();
+        self.tx
+            .send(SessionLogCmd::Flush { ack })
+            .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?;
+        rx.recv()
+            .map_err(|_| SqueezyError::Agent("session log writer stopped".to_string()))?
+    }
+
+    fn record_failure(&self, error: impl ToString) {
+        let mut failure = self
+            .terminal_failure
+            .lock()
+            .expect("session log writer failure");
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+    }
+
+    fn check_failure(&self) -> Result<()> {
+        if let Some(error) = self
+            .terminal_failure
+            .lock()
+            .expect("session log writer failure")
+            .clone()
+        {
+            return Err(SqueezyError::Io(std::io::Error::other(error)));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SessionLogWriter {
+    fn drop(&mut self) {
+        let (ack, rx) = mpsc::channel();
+        let _ = self.tx.send(SessionLogCmd::Shutdown { ack });
+        let _ = rx.recv();
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .expect("session log writer worker")
+            .take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn run_session_log_writer(
+    store: SessionStore,
+    dir: PathBuf,
+    rx: mpsc::Receiver<SessionLogCmd>,
+    writer: std::sync::Weak<SessionLogWriter>,
+) {
+    let path = dir.join("events.jsonl");
+    let mut current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
+    let mut terminal_failure: Option<String> = None;
+    for command in rx {
+        match command {
+            SessionLogCmd::Append(append) => {
+                if terminal_failure.is_some() {
+                    continue;
+                }
+                if let Err(error) =
+                    write_session_log_append(&store, &dir, &path, &mut current_size, append)
+                {
+                    let message = error.to_string();
+                    if let Some(writer) = writer.upgrade() {
+                        writer.record_failure(&message);
+                    }
+                    terminal_failure = Some(message);
+                }
+            }
+            SessionLogCmd::Flush { ack } => {
+                let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
+            }
+            SessionLogCmd::Shutdown { ack } => {
+                let _ = ack.send(session_log_writer_result(terminal_failure.as_deref()));
+                break;
+            }
+        }
+    }
+}
+
+fn session_log_writer_result(failure: Option<&str>) -> Result<()> {
+    if let Some(failure) = failure {
+        return Err(SqueezyError::Io(std::io::Error::other(failure.to_string())));
+    }
+    Ok(())
+}
+
+fn write_session_log_append(
+    store: &SessionStore,
+    dir: &Path,
+    path: &Path,
+    current_size: &mut usize,
+    append: SessionLogAppend,
+) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    if current_size.saturating_add(append.payload.len()) > store.max_session_bytes {
+        update_metadata_file(dir, |metadata| {
+            metadata.status = SessionStatus::Truncated;
+            metadata.resume_available = false;
+            metadata.resume_unavailable_reason =
+                Some("session exceeded max_session_bytes".to_string());
+        })?;
+        return Ok(());
+    }
+    append_payload_with_recovery(path, &append.payload, current_size)?;
+    Ok(())
+}
+
+fn append_payload_with_recovery(
+    path: &Path,
+    payload: &[u8],
+    current_size: &mut usize,
+) -> std::io::Result<()> {
+    match append_payload_once(path, payload) {
+        Ok(written) => {
+            *current_size = current_size.saturating_add(written);
+            Ok(())
+        }
+        Err((written, first_error)) => {
+            *current_size = current_size.saturating_add(written);
+            if written > 0 {
+                return Err(first_error);
+            }
+            match append_payload_once(path, payload) {
+                Ok(written) => {
+                    *current_size = current_size.saturating_add(written);
+                    Ok(())
+                }
+                Err((retry_written, retry_error)) => {
+                    *current_size = current_size.saturating_add(retry_written);
+                    Err(retry_error)
+                }
+            }
+        }
+    }
+}
+
+fn append_payload_once(
+    path: &Path,
+    payload: &[u8],
+) -> std::result::Result<usize, (usize, std::io::Error)> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| (0, error))?;
+    let mut written = 0;
+    while written < payload.len() {
+        match file.write(&payload[written..]) {
+            Ok(0) => {
+                return Err((
+                    written,
+                    std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write event"),
+                ));
+            }
+            Ok(bytes) => written += bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err((written, error)),
+        }
+    }
+    Ok(written)
+}
+
+fn update_metadata_file(dir: &Path, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
+    let path = dir.join("metadata.json");
+    let mut metadata: SessionMetadata = read_json(&path)?;
+    update(&mut metadata);
+    write_json(&path, &metadata)
 }
 
 impl SessionHandle {
@@ -255,10 +478,11 @@ impl SessionHandle {
         write_json(&self.dir().join("metadata.json"), &metadata)
     }
 
+    pub fn flush_events(&self) -> Result<()> {
+        self.event_writer.flush()
+    }
+
     pub fn append_event(&self, event: SessionEvent) -> Result<()> {
-        let dir = self.dir();
-        fs::create_dir_all(&dir)?;
-        let path = dir.join("events.jsonl");
         let event_kind = event.kind.clone();
         let event_summary = event.summary.clone();
         let mut payload = to_json_vec(&event)?;
@@ -277,22 +501,10 @@ impl SessionHandle {
         }
         payload.push(b'\n');
 
-        let current_size = fs::metadata(&path).map_or(0, |metadata| metadata.len() as usize);
-        if current_size.saturating_add(payload.len()) > self.store.max_session_bytes {
-            self.update_metadata(|metadata| {
-                metadata.status = SessionStatus::Truncated;
-                metadata.resume_available = false;
-                metadata.resume_unavailable_reason =
-                    Some("session exceeded max_session_bytes".to_string());
-            })?;
-            return Ok(());
-        }
-
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(&payload)?;
+        self.event_writer.append(SessionLogAppend { payload })?;
         // Hot-path bookkeeping lives in memory: the on-disk event_count is
         // resynced lazily during `metadata()` / `update_metadata`, and the
-        // file write below only fires when a discovery-visible field is
+        // metadata write below only fires when a discovery-visible field is
         // actually about to change.
         let new_count = self.counters.event_count.fetch_add(1, Ordering::Relaxed) + 1;
         let set_first_user_task = event_kind == "user_message"
@@ -386,6 +598,7 @@ impl SessionHandle {
         metrics: SessionMetrics,
         redactions: u64,
     ) -> Result<()> {
+        self.flush_events()?;
         self.update_metadata(|metadata| {
             metadata.ended_at_ms = Some(now_ms());
             // Preserve any terminal status that an earlier event (truncation,

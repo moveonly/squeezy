@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
 
 use redb::{Database, TableDefinition};
 use serde_json::json;
@@ -39,6 +39,7 @@ fn session_store_lists_filters_and_exports_sessions() {
             json!({"ok": true}),
         ))
         .expect("append event");
+    handle.flush_events().expect("flush events");
 
     let sessions = store
         .list(&SessionQuery {
@@ -86,6 +87,7 @@ fn session_export_preserves_task_state_events() {
             }),
         ))
         .expect("append task state");
+    handle.flush_events().expect("flush events");
 
     let exported = store.export(handle.session_id()).expect("export");
     let events = exported["events"].as_array().expect("events");
@@ -152,6 +154,7 @@ fn session_resume_state_preserves_context_compaction() {
             json!({ "record": compaction.last.clone() }),
         ))
         .expect("append compaction event");
+    handle.flush_events().expect("flush events");
 
     let record = store.show(handle.session_id()).expect("show");
     assert_eq!(
@@ -323,6 +326,7 @@ fn bug_report_archive_redacts_events_and_records_exclusions() {
             json!({"permission": {"metadata": {"env": "TOKEN=secret-token-value"}}}),
         ))
         .expect("append approval");
+    handle.flush_events().expect("flush events");
 
     let bundle = store
         .build_bug_report(
@@ -503,6 +507,90 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
     let metadata = handle.metadata().expect("read metadata");
     assert_eq!(metadata.event_count, 21);
     assert_eq!(metadata.first_user_task.as_deref(), Some("first task"));
+}
+
+#[test]
+fn session_log_writer_flushes_concurrent_events() {
+    let root = temp_root("async-session-log-concurrent");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = Arc::new(
+        store
+            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .expect("start session"),
+    );
+
+    let threads = (0..50)
+        .map(|index| {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                handle
+                    .append_event(SessionEvent::new(
+                        "tool_call",
+                        Some("1".to_string()),
+                        Some(format!("tool {index}")),
+                        json!({"index": index}),
+                    ))
+                    .expect("append event");
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().expect("append thread");
+    }
+    handle.flush_events().expect("flush events");
+
+    let record = store.show(handle.session_id()).expect("show session");
+    assert_eq!(record.events.len(), 50);
+    assert_eq!(handle.metadata().expect("metadata").event_count, 50);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_event_does_not_block_tokio_reactor() {
+    let root = temp_root("async-session-log-reactor");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = Arc::new(
+        store
+            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .expect("start session"),
+    );
+    let canary = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    });
+
+    let mut tasks = Vec::new();
+    for index in 0..100 {
+        let handle = handle.clone();
+        tasks.push(tokio::spawn(async move {
+            handle
+                .append_event(SessionEvent::new(
+                    "tool_call",
+                    Some("1".to_string()),
+                    Some(format!("tool {index}")),
+                    json!({"index": index}),
+                ))
+                .expect("append event");
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_millis(50), canary)
+        .await
+        .expect("reactor canary should not be starved")
+        .expect("canary task");
+    for task in tasks {
+        task.await.expect("append task");
+    }
+    handle.flush_events().expect("flush events");
+
+    let record = store.show(handle.session_id()).expect("show session");
+    assert_eq!(record.events.len(), 100);
 }
 
 #[test]

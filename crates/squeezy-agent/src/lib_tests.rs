@@ -88,6 +88,21 @@ impl LlmProvider for HangingProvider {
     }
 }
 
+async fn wait_for_job_status(jobs: &JobRegistry, id: JobId, expected: JobStatus) -> JobSnapshot {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(job) = jobs.get(id)
+                && job.status == expected
+            {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("job reached expected status")
+}
+
 #[test]
 fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     let jobs = JobRegistry::new();
@@ -152,6 +167,50 @@ fn job_registry_tracks_lifecycle_and_bounds_notifications() {
     }
 
     assert_eq!(jobs.notifications().len(), MAX_JOB_NOTIFICATIONS);
+}
+
+#[tokio::test]
+async fn panicked_job_transitions_to_failed_status() {
+    let jobs = JobRegistry::new();
+    let job = jobs.create(
+        JobKind::Tool,
+        "panic job",
+        None,
+        None,
+        None,
+        CancellationToken::new(),
+    );
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        panic!("intentional job panic");
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    let failed = wait_for_job_status(&jobs, job.id, JobStatus::Failed).await;
+    assert_eq!(failed.result_summary.as_deref(), Some("job panicked"));
+}
+
+#[tokio::test]
+async fn slow_job_is_hard_aborted_after_grace_window() {
+    let jobs = JobRegistry::new();
+    let cancel = CancellationToken::new();
+    let job = jobs.create(JobKind::Tool, "slow job", None, None, None, cancel);
+    jobs.start(job.id).expect("started");
+    let done = Arc::new(Notify::new());
+    let handle = spawn_observed_job(jobs.clone(), job.id, done.clone(), async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+    assert!(jobs.attach_handle(job.id, handle.abort_handle(), done));
+
+    assert!(jobs.cancel(job.id));
+    let cancelled = wait_for_job_status(&jobs, job.id, JobStatus::Cancelled).await;
+    assert_eq!(
+        cancelled.result_summary.as_deref(),
+        Some("cancelled after grace window")
+    );
 }
 
 #[test]
@@ -229,6 +288,37 @@ async fn turn_stream_accumulates_assistant_text() {
         completed,
         Some(("hello".to_string(), Some("resp_1".to_string())))
     );
+}
+
+#[tokio::test]
+async fn llm_stream_observes_cancellation_within_one_yield() {
+    let provider = Arc::new(HangingProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider);
+    let cancel = CancellationToken::new();
+    let cancel_task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel.cancel();
+        })
+    };
+
+    let mut rx = agent.start_turn("hi".to_string(), cancel);
+    let saw_cancelled = tokio::time::timeout(Duration::from_millis(200), async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                AgentEvent::Cancelled { .. } => return true,
+                AgentEvent::Failed { error, .. } => panic!("turn failed: {error}"),
+                _ => {}
+            }
+        }
+        false
+    })
+    .await
+    .expect("turn cancellation should not wait for another provider event");
+
+    cancel_task.await.expect("cancel task");
+    assert!(saw_cancelled);
 }
 
 #[tokio::test]

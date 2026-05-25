@@ -2226,6 +2226,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-workspace",
  "thiserror",
+ "tokio",
  "toml",
 ]
 

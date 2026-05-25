@@ -96,14 +96,15 @@ Defaults:
 - idle refresh interval: 15 seconds
 - per-tool refresh budget: 250 ms
 
-Refresh is event-first with a polling fallback. A file watcher or tool layer
-should call `record_changed_path` when it sees an edit; the next graph query
-refreshes immediately after debounce. If no events arrive, Squeezy polls every
-15 seconds as a safety net. Refresh recrawls tracked files, compares stable
-hashes, reparses changed files only, removes deleted files, and preserves
-unchanged graph partitions. Body-only edits replace body-derived facts for that
-file. Signature/module/import edits replace that file's stub and rebuild
-cross-file indexes. JS/TS config edits such as `tsconfig.json` path changes or
+Refresh is tool-event-first with a polling fallback. Tool paths that know they
+changed files should call `record_changed_path`; the next graph query refreshes
+immediately after debounce. There is intentionally no always-on workspace file
+watcher today. If no events arrive, Squeezy polls every 15 seconds as a safety
+net. Refresh recrawls tracked files, compares stable hashes, reparses changed
+files only, removes deleted files, and preserves unchanged graph partitions.
+Body-only edits replace body-derived facts for that file.
+Signature/module/import edits replace that file's stub and rebuild cross-file
+indexes. JS/TS config edits such as `tsconfig.json` path changes or
 `package.json` export changes rebuild the local resolver and dependent import
 edges without reparsing unchanged source files.
 

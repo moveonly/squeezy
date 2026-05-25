@@ -21,3 +21,6 @@ squeezy-core.workspace = true
 squeezy-workspace.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
