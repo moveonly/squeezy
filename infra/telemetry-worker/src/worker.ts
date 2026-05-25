@@ -6,6 +6,11 @@ const MAX_EVENTS = 50;
 const SCHEMA_VERSION = 1;
 const DEFAULT_POSTHOG_HOST = "https://eu.i.posthog.com";
 
+const TEXT_ENCODER = new TextEncoder();
+function utf8ByteLength(text: string): number {
+  return TEXT_ENCODER.encode(text).length;
+}
+
 interface Env {
   POSTHOG_PROJECT_TOKEN: string;
   POSTHOG_HOST?: string;
@@ -118,7 +123,7 @@ export default {
     }
 
     const text = await request.text();
-    if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) {
+    if (utf8ByteLength(text) > MAX_BODY_BYTES) {
       return jsonResponse(413, { error: "body_too_large" });
     }
 
@@ -329,7 +334,7 @@ function validateFeedback(feedback: JsonObject): void {
   assertU64(feedback.timestamp_ms, "timestamp_ms");
   assertBoundedText(feedback.message, "message", 1, MAX_FEEDBACK_MESSAGE_BYTES);
   assertU64(feedback.message_bytes, "message_bytes");
-  if (new TextEncoder().encode(feedback.message as string).length !== feedback.message_bytes) {
+  if (utf8ByteLength(feedback.message as string) !== feedback.message_bytes) {
     throw new Error("message_bytes mismatch");
   }
   assertU64(feedback.redactions, "redactions");
@@ -462,7 +467,7 @@ function assertBoundedText(value: unknown, label: string, min: number, maxBytes:
   if (value.includes("\u0000")) {
     throw new Error(`${label} must not contain NUL bytes`);
   }
-  if (new TextEncoder().encode(value).length > maxBytes) {
+  if (utf8ByteLength(value) > maxBytes) {
     throw new Error(`${label} is too large`);
   }
 }
@@ -500,7 +505,7 @@ async function boundedText(request: Request, maxBytes: number): Promise<string> 
     throw new Error("body_too_large");
   }
   const text = await request.text();
-  if (new TextEncoder().encode(text).length > maxBytes) {
+  if (utf8ByteLength(text) > maxBytes) {
     throw new Error("body_too_large");
   }
   return text;
