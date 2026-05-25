@@ -34,3 +34,4 @@ tokio.workspace = true
 tokio-util.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
+which.workspace = true

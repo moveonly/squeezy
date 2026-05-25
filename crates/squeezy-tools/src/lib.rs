@@ -69,11 +69,13 @@ use tree_sitter::{Node, Parser};
 mod ipc;
 mod safety;
 mod schema;
+mod shell_program;
 mod truncate;
 
 use ipc::IpcListener;
 pub use ipc::{IpcEndpoint, IpcStream};
 use schema::compact_tool_parameters;
+use shell_program::ShellProgram;
 use truncate::truncate_middle_bytes;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
@@ -833,9 +835,10 @@ impl ShellSandboxPlan {
         config: &ShellSandboxConfig,
         fallback_reason: Option<String>,
     ) -> Self {
+        let shell = ShellProgram::for_command(command);
         Self {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
+            program: shell.program,
+            args: shell.args,
             backend: "none",
             mode: mode.as_str(),
             network: "not_enforced",
@@ -850,9 +853,10 @@ impl ShellSandboxPlan {
     }
 
     fn external(command: &str, config: &ShellSandboxConfig) -> Self {
+        let shell = ShellProgram::for_command(command);
         Self {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
+            program: shell.program,
+            args: shell.args,
             backend: "external",
             mode: ShellSandboxMode::External.as_str(),
             network: "external",
