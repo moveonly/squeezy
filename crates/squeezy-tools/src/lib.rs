@@ -66,6 +66,11 @@ use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
 mod safety;
+mod schema;
+mod truncate;
+
+use schema::compact_tool_parameters;
+use truncate::truncate_middle_bytes;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
@@ -191,6 +196,15 @@ pub struct ToolSpec {
     /// shell → git via the shell classifier); session mode gating in the agent
     /// applies on top of both layers.
     pub capability: PermissionCapability,
+}
+
+impl ToolSpec {
+    /// Apply the schema-compaction pipeline to `parameters`. Idempotent — safe
+    /// to call on a spec that has already been compacted.
+    pub(crate) fn with_compacted_parameters(mut self) -> Self {
+        compact_tool_parameters(&mut self.parameters);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +551,12 @@ pub struct ToolRegistry {
     shell_workdir_locks: Arc<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
     shell_inflight: Arc<Semaphore>,
     mcp: Arc<McpClientRegistry>,
+    /// F04: cache for the per-turn `specs()` advertisement. The agent calls
+    /// this at least once per round for cost accounting plus once more when
+    /// building the LLM request; recomputing means cloning ~30 `ToolSpec`s
+    /// with their `parameters: Value` blobs every time. The cache is
+    /// invalidated whenever MCP refresh changes the external tool set.
+    cached_specs: Arc<StdMutex<Option<Arc<Vec<ToolSpec>>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -997,6 +1017,7 @@ impl ToolRegistry {
                 config.mcp_servers,
                 state_store.clone(),
             )),
+            cached_specs: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -1039,6 +1060,7 @@ impl ToolRegistry {
             shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
             shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
+            cached_specs: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -1227,7 +1249,23 @@ impl ToolRegistry {
         )
     }
 
-    pub fn specs(&self) -> Vec<ToolSpec> {
+    /// Return the advertised tool list. The result is cached behind an
+    /// `Arc<Vec<ToolSpec>>` and re-used across turns; the cache is
+    /// invalidated when [`refresh_mcp_tools`] changes the external tool set.
+    pub fn specs(&self) -> Arc<Vec<ToolSpec>> {
+        if let Ok(mut slot) = self.cached_specs.lock() {
+            if let Some(cached) = slot.as_ref() {
+                return Arc::clone(cached);
+            }
+            let built = Arc::new(self.build_specs());
+            *slot = Some(Arc::clone(&built));
+            return built;
+        }
+        // Lock poisoned — recover by rebuilding without caching.
+        Arc::new(self.build_specs())
+    }
+
+    fn build_specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             apply_patch_spec(),
             decl_search_spec(),
@@ -1269,13 +1307,31 @@ impl ToolRegistry {
                 checkpoint_undo_spec(),
             ]);
         }
+        // First-party specs are statically defined inline above. Funnel them
+        // through the compaction pipeline so the budget contract holds
+        // uniformly regardless of how a spec was built.
+        for spec in specs.iter_mut() {
+            compact_tool_parameters(&mut spec.parameters);
+        }
+        // `mcp_tool_spec` already compacts at construction; append after the
+        // first-party loop to avoid double work.
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
     }
 
+    fn invalidate_cached_specs(&self) {
+        if let Ok(mut slot) = self.cached_specs.lock() {
+            *slot = None;
+        }
+    }
+
     pub async fn refresh_mcp_tools(&self, cancel: CancellationToken) -> McpRefreshOutcome {
-        self.mcp.refresh_tools(cancel).await
+        let outcome = self.mcp.refresh_tools(cancel).await;
+        // Drop any cached `specs()` so the next call sees the refreshed MCP
+        // tool set.
+        self.invalidate_cached_specs();
+        outcome
     }
 
     pub fn mcp_status_snapshot(&self) -> McpStatusSnapshot {
@@ -4261,16 +4317,63 @@ impl ToolRegistry {
             .map(ExclusionReason::as_str);
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+
+        // F03: dedup against the last receipt for this (path, offset, end)
+        // window. Mirror the pattern used by `read_slice_last_receipt_diff`:
+        // if the full-file hash matches what we already returned for the same
+        // window in a prior call, emit a stub instead of re-serializing
+        // identical bytes.
+        let content_sha256 = match sha256_file(&path) {
+            Ok(hash) => hash,
+            Err(err) => return tool_error(call, err),
+        };
+        let projected_end = offset.saturating_add(limit).min(total_bytes as usize);
+        if let Some(store) = self.state_store.as_deref() {
+            let rel_str = rel.to_string_lossy();
+            if let Ok(snapshots) = store.read_snapshots_for_path(rel_str.as_ref()) {
+                let prior = snapshots
+                    .iter()
+                    .filter(|snap| {
+                        snap.start_byte == offset as u64
+                            && snap.end_byte == projected_end as u64
+                            && snap.tool_name == "read_file"
+                    })
+                    .filter(|snap| snap.content_sha256.as_deref() == Some(content_sha256.as_str()))
+                    .max_by_key(|snap| snap.created_unix_millis);
+                if let Some(snap) = prior {
+                    return make_result(
+                        call,
+                        ToolStatus::Success,
+                        json!({
+                            "tool": "read_file",
+                            "path": rel_str,
+                            "offset": offset,
+                            "bytes_returned": 0,
+                            "total_bytes": total_bytes,
+                            "sha256": &content_sha256,
+                            "unchanged": true,
+                            "receipt_stub": true,
+                            "dedup": true,
+                            "same_as_call_id": snap.call_id,
+                            "same_as_tool_name": snap.tool_name,
+                            "original_output_sha256": snap.stable_output_sha256,
+                            "original_content_sha256": snap.content_sha256,
+                            "original_model_output_bytes": snap.model_output_bytes,
+                            "truncated": false,
+                        }),
+                        ToolCostHint::default(),
+                        Some(content_sha256.clone()),
+                    );
+                }
+            }
+        }
+
         let bytes = match read_range(&path, offset as u64, limit) {
             Ok(bytes) => bytes,
             Err(err) => return tool_error(call, err),
         };
         let end = offset.saturating_add(bytes.len());
         let content = String::from_utf8_lossy(&bytes).to_string();
-        let content_sha256 = match sha256_file(&path) {
-            Ok(hash) => hash,
-            Err(err) => return tool_error(call, err),
-        };
         let cost = ToolCostHint {
             bytes_read: total_bytes,
             output_bytes: content.len() as u64,
@@ -5736,7 +5839,7 @@ impl ToolRegistry {
         let retrieved_at_unix_ms = unix_timestamp_millis(SystemTime::now());
         let source_urls = extract_http_urls(&result);
         let redacted = self.redactor.redact(&result);
-        let (quote, output_truncated) = truncate_to_bytes(&redacted.text, output_byte_cap);
+        let (quote, output_truncated) = truncate_middle_bytes(&redacted.text, output_byte_cap);
         let quote_sha256 = sha256_hex(quote.as_bytes());
         let stable_output_sha256 = web_stable_output_sha256(
             "websearch",
@@ -5917,7 +6020,7 @@ impl ToolRegistry {
                 let retrieved_at_unix_ms = unix_timestamp_millis(SystemTime::now());
                 let redacted = self.redactor.redact(&rendered);
                 let (content, output_truncated) =
-                    truncate_to_bytes(&redacted.text, output_byte_cap);
+                    truncate_middle_bytes(&redacted.text, output_byte_cap);
                 let content_sha256 = sha256_hex(&bytes);
                 let quote_sha256 = sha256_hex(content.as_bytes());
                 let request_sha256 =
@@ -6688,7 +6791,7 @@ fn enforce_web_quote_limit(mut result: ToolResult) -> ToolResult {
         .get("quote_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (quote, limit_truncated) = truncate_to_bytes(&text, limit);
+    let (quote, limit_truncated) = truncate_middle_bytes(&text, limit);
     let quote_truncated = was_truncated || limit_truncated;
     let quote_bytes = quote.len();
     let quote_sha256 = sha256_hex(quote.as_bytes());
@@ -6799,7 +6902,7 @@ impl ToolOutputStore {
             return result;
         }
 
-        let (preview, _) = truncate_to_bytes(&model_output, self.preview_bytes);
+        let (preview, _) = truncate_middle_bytes(&model_output, self.preview_bytes);
         let ToolResult {
             call_id,
             tool_name,
@@ -12791,17 +12894,6 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
         .collect()
 }
 
-fn truncate_to_bytes(value: &str, cap: usize) -> (String, bool) {
-    if value.len() <= cap {
-        return (value.to_string(), false);
-    }
-    let mut end = cap;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (value[..end].to_string(), true)
-}
-
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     let digest = Sha256::digest(bytes.as_ref());
     let mut output = String::with_capacity(digest.len() * 2);
@@ -12822,6 +12914,7 @@ fn mcp_tool_spec(tool: ExternalMcpTool) -> ToolSpec {
         parameters: tool.parameters,
         capability: PermissionCapability::Mcp,
     }
+    .with_compacted_parameters()
 }
 
 fn mcp_list_resources_spec() -> ToolSpec {

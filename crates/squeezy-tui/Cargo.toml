@@ -15,6 +15,7 @@ publish.workspace = true
 [dependencies]
 ansi-to-tui.workspace = true
 crossterm.workspace = true
+ignore.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true

@@ -1547,7 +1547,7 @@ impl Agent {
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents);
-        all_tool_specs.extend(self.tools.specs().into_iter().map(advertised_tool));
+        all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
             instructions: instructions_with_tool_index(
@@ -2152,7 +2152,7 @@ impl Agent {
                     return;
                 }
                 let mut all_tool_specs = core_control_tools(&config.subagents);
-                all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
+                all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
                     tools.clone(),
@@ -5160,6 +5160,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5185,6 +5186,7 @@ async fn execute_tool_calls(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                call,
                 &result,
                 Duration::ZERO,
             );
@@ -5210,6 +5212,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5231,6 +5234,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5264,6 +5268,7 @@ async fn execute_tool_calls(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                &call,
                 &result,
                 Duration::ZERO,
             );
@@ -5287,6 +5292,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5305,6 +5311,7 @@ async fn execute_tool_calls(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5389,6 +5396,7 @@ async fn flush_parallel_batch(
                 &context.telemetry,
                 context.turn_id,
                 tool_sequence,
+                &call,
                 &result,
                 Duration::ZERO,
             );
@@ -5413,6 +5421,7 @@ async fn flush_parallel_batch(
                     &context.telemetry,
                     context.turn_id,
                     tool_sequence,
+                    &call,
                     &result,
                     Duration::ZERO,
                 );
@@ -5464,6 +5473,7 @@ async fn run_one_tool(
             &context.telemetry,
             context.turn_id,
             tool_sequence,
+            &call,
             &result,
             Duration::ZERO,
         );
@@ -5521,6 +5531,10 @@ async fn run_one_tool(
     } else {
         None
     };
+    // Capture a borrow-able snapshot of the call before it moves into the
+    // tool registry, so paired-SHA telemetry (F06) can hash its arguments
+    // when emitting the completion event.
+    let call_for_telemetry = call.clone();
     let result = context
         .tools
         .execute_for_group_with_options(
@@ -5568,6 +5582,7 @@ async fn run_one_tool(
         &context.telemetry,
         context.turn_id,
         tool_sequence,
+        &call_for_telemetry,
         &result,
         started.elapsed(),
     );
@@ -5705,9 +5720,11 @@ fn emit_tool_telemetry(
     telemetry: &TelemetryClient,
     turn_id: TurnId,
     tool_sequence: u64,
+    call: &ToolCall,
     result: &ToolResult,
     duration: Duration,
 ) {
+    let args_sha256 = tool_call_args_sha256(call);
     telemetry.spawn(TelemetryEvent::tool_completed(ToolTelemetryReport {
         provider: &config.provider,
         model: &config.model,
@@ -5722,7 +5739,18 @@ fn emit_tool_telemetry(
             matches_returned: result.cost_hint.matches_returned,
             output_bytes: result.cost_hint.output_bytes,
         },
+        args_sha256: args_sha256.as_deref(),
+        output_sha256: Some(result.receipt.output_sha256.as_str()),
+        content_sha256: result.receipt.content_sha256.as_deref(),
     }));
+}
+
+/// SHA-256 of the canonical JSON arguments the model sent for a tool call.
+/// Used to pair with `output_sha256` in telemetry (F06).
+fn tool_call_args_sha256(call: &ToolCall) -> Option<String> {
+    serde_json::to_vec(&call.arguments)
+        .ok()
+        .map(|bytes| squeezy_tools::sha256_hex(&bytes))
 }
 
 fn telemetry_tool_status(status: ToolStatus) -> TelemetryToolStatusKind {

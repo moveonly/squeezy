@@ -162,6 +162,9 @@ fn tool_event_does_not_include_arguments_or_paths() {
             matches_returned: 1,
             output_bytes: 50,
         },
+        args_sha256: None,
+        output_sha256: None,
+        content_sha256: None,
     });
     let text = serde_json::to_string(&event).unwrap();
 
@@ -173,6 +176,70 @@ fn tool_event_does_not_include_arguments_or_paths() {
     assert!(!text.contains("/Users/"));
     assert!(!text.contains("OPENAI_API_KEY"));
     assert!(!text.contains(DEFAULT_TELEMETRY_ENDPOINT));
+}
+
+#[test]
+fn tool_completed_event_pairs_args_output_content_sha256() {
+    // F06: paired-SHA dispatch trace. Each tool_completed event must carry
+    // (args_sha256, output_sha256, content_sha256) so offline replay can
+    // answer "did we already pay for this exact call?" without re-running.
+    let config = AppConfig::default();
+    let args = "a".repeat(64);
+    let output = "b".repeat(64);
+    let content = "c".repeat(64);
+    let event = TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: 1,
+        tool_sequence: 1,
+        tool_name: "read_file",
+        status: ToolStatusKind::Success,
+        duration: Duration::from_millis(7),
+        cost: ToolCostProperties {
+            files_scanned: 0,
+            bytes_read: 16,
+            matches_returned: 0,
+            output_bytes: 32,
+        },
+        args_sha256: Some(&args),
+        output_sha256: Some(&output),
+        content_sha256: Some(&content),
+    });
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(
+        text.contains(&format!("\"args_sha256\":\"{args}\"")),
+        "args_sha256 missing: {text}"
+    );
+    assert!(
+        text.contains(&format!("\"output_sha256\":\"{output}\"")),
+        "output_sha256 missing: {text}"
+    );
+    assert!(
+        text.contains(&format!("\"content_sha256\":\"{content}\"")),
+        "content_sha256 missing: {text}"
+    );
+}
+
+#[test]
+fn tool_completed_event_omits_sha_fields_when_absent() {
+    let config = AppConfig::default();
+    let event = TelemetryEvent::tool_completed(ToolTelemetryReport {
+        provider: &config.provider,
+        model: &config.model,
+        turn_index: 1,
+        tool_sequence: 1,
+        tool_name: "grep",
+        status: ToolStatusKind::Success,
+        duration: Duration::from_millis(1),
+        cost: ToolCostProperties::default(),
+        args_sha256: None,
+        output_sha256: None,
+        content_sha256: None,
+    });
+    let text = serde_json::to_string(&event).unwrap();
+    assert!(!text.contains("args_sha256"));
+    assert!(!text.contains("output_sha256"));
+    assert!(!text.contains("content_sha256"));
 }
 
 #[test]
@@ -192,6 +259,9 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
             matches_returned: 1,
             output_bytes: 64,
         },
+        args_sha256: None,
+        output_sha256: None,
+        content_sha256: None,
     });
     let text = serde_json::to_string(&event).unwrap();
 

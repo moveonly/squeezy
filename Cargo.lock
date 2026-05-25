@@ -3465,6 +3465,7 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "crossterm",
+ "ignore",
  "pulldown-cmark",
  "ratatui",
  "serde_json",
