@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, LazyLock, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -1156,7 +1156,7 @@ impl ToolRegistry {
         }
     }
 
-    fn prepare_shell_sandbox(
+    async fn prepare_shell_sandbox(
         &self,
         command: &str,
         analysis: &ShellPermissionAnalysis,
@@ -1180,6 +1180,7 @@ impl ToolRegistry {
                     plan,
                     shell_sandbox_backend_probe_failure,
                 )
+                .await
             }
         }
     }
@@ -5932,7 +5933,7 @@ impl ToolRegistry {
         let mut sandbox_plan = if direct_user_shell {
             ShellSandboxPlan::direct(&args.command, ShellSandboxMode::Off, &self.shell_sandbox)
         } else {
-            match self.prepare_shell_sandbox(&args.command, &analysis) {
+            match self.prepare_shell_sandbox(&args.command, &analysis).await {
                 Ok(plan) => plan,
                 Err(reason) => {
                     self.audit_shell(
@@ -7804,12 +7805,13 @@ fn web_citations_json(
     )
 }
 
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s<>"'`\)\]\}]+"#).expect("URL_REGEX is a valid pattern")
+});
+
 fn extract_http_urls(text: &str) -> Vec<String> {
-    let Ok(regex) = Regex::new(r#"https?://[^\s<>"'`\)\]\}]+"#) else {
-        return Vec::new();
-    };
     let mut urls = BTreeSet::new();
-    for found in regex.find_iter(text) {
+    for found in URL_REGEX.find_iter(text) {
         let url = found
             .as_str()
             .trim_end_matches(['.', ',', ';', ':', '!', '?']);
@@ -12543,13 +12545,17 @@ fn prepare_shell_sandbox_plan(
     )
 }
 
-fn apply_shell_sandbox_backend_health(
+async fn apply_shell_sandbox_backend_health<F, Fut>(
     command: &str,
     config: &ShellSandboxConfig,
     health: &ShellSandboxHealth,
     plan: ShellSandboxPlan,
-    probe_failure: impl FnOnce(&ShellSandboxPlan, Duration) -> Option<String>,
-) -> std::result::Result<ShellSandboxPlan, String> {
+    probe_failure: F,
+) -> std::result::Result<ShellSandboxPlan, String>
+where
+    F: FnOnce(ShellSandboxPlan, Duration) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
     let backend = plan.backend;
     if backend == "none" {
         return Ok(plan);
@@ -12563,7 +12569,8 @@ fn apply_shell_sandbox_backend_health(
         None => {}
     }
 
-    if let Some(reason) = probe_failure(&plan, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT) {
+    let probe_input = plan.clone();
+    if let Some(reason) = probe_failure(probe_input, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT).await {
         health.mark_unavailable(backend, reason.clone());
         return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
     }
@@ -12598,12 +12605,12 @@ fn shell_sandbox_backend_disabled_reason(backend: &'static str, reason: &str) ->
     )
 }
 
-fn shell_sandbox_backend_probe_failure(
-    plan: &ShellSandboxPlan,
+async fn shell_sandbox_backend_probe_failure(
+    plan: ShellSandboxPlan,
     timeout: Duration,
 ) -> Option<String> {
     match plan.backend {
-        "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout),
+        "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout).await,
         // Linux support is already probed before this point via unshare and
         // Landlock capability checks; a second process probe would add latency
         // without exercising the same pre_exec path.
@@ -12613,7 +12620,10 @@ fn shell_sandbox_backend_probe_failure(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_sandbox_plan_probe_failure(plan: &ShellSandboxPlan, timeout: Duration) -> Option<String> {
+async fn macos_sandbox_plan_probe_failure(
+    plan: ShellSandboxPlan,
+    timeout: Duration,
+) -> Option<String> {
     let mut args = plan.args.clone();
     let Some(command_arg) = args.last_mut() else {
         return Some(format!(
@@ -12623,7 +12633,7 @@ fn macos_sandbox_plan_probe_failure(plan: &ShellSandboxPlan, timeout: Duration) 
     };
     *command_arg = "true".to_string();
 
-    let mut child = match std::process::Command::new(&plan.program)
+    let mut child = match tokio::process::Command::new(&plan.program)
         .args(&args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -12638,43 +12648,35 @@ fn macos_sandbox_plan_probe_failure(plan: &ShellSandboxPlan, timeout: Duration) 
         }
     };
 
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return None,
-            Ok(Some(status)) => {
-                return Some(shell_sandbox_backend_probe_status_reason(
-                    plan.backend,
-                    &status,
-                ));
-            }
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Some(format!(
-                    "shell sandbox backend {} probe timed out after {} ms",
-                    plan.backend,
-                    timeout.as_millis()
-                ));
-            }
-            Err(err) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Some(format!(
-                    "shell sandbox backend {} probe wait failed: {err}",
-                    plan.backend
-                ));
-            }
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => None,
+        Ok(Ok(status)) => Some(shell_sandbox_backend_probe_status_reason(
+            plan.backend,
+            &status,
+        )),
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Some(format!(
+                "shell sandbox backend {} probe wait failed: {err}",
+                plan.backend
+            ))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Some(format!(
+                "shell sandbox backend {} probe timed out after {} ms",
+                plan.backend,
+                timeout.as_millis()
+            ))
         }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn macos_sandbox_plan_probe_failure(
-    _plan: &ShellSandboxPlan,
+async fn macos_sandbox_plan_probe_failure(
+    _plan: ShellSandboxPlan,
     _timeout: Duration,
 ) -> Option<String> {
     None

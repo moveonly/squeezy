@@ -192,9 +192,11 @@ async function setupDashboard(): Promise<void> {
   const dashboard = await ensureDashboard(client);
   console.log(`Dashboard: ${dashboard.name} (${dashboard.id})`);
 
-  for (const insight of INSIGHTS) {
-    const created = await ensureInsight(client, dashboard.id, insight);
-    console.log(`Insight: ${created.name} (${created.id})`);
+  const created = await Promise.all(
+    INSIGHTS.map((insight) => ensureInsight(client, dashboard.id, insight)),
+  );
+  for (const insight of created) {
+    console.log(`Insight: ${insight.name} (${insight.id})`);
   }
 }
 

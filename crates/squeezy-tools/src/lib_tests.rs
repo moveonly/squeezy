@@ -6976,17 +6976,21 @@ fn shell_sandbox_backend_health_skips_probe_after_best_effort_failure() {
     );
     let probed = std::cell::Cell::new(false);
 
-    let plan = apply_shell_sandbox_backend_health(
-        "printf ok",
-        &config,
-        &health,
-        fake_sandbox_plan("macos-sandbox-exec", false),
-        |_, _| {
-            probed.set(true);
-            None
-        },
-    )
-    .expect("best effort direct fallback");
+    let plan = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(apply_shell_sandbox_backend_health(
+            "printf ok",
+            &config,
+            &health,
+            fake_sandbox_plan("macos-sandbox-exec", false),
+            |_, _| {
+                probed.set(true);
+                std::future::ready(None)
+            },
+        ))
+        .expect("best effort direct fallback");
 
     assert!(!probed.get(), "cached failure should skip the probe");
     assert_eq!(plan.backend, "none");
@@ -7009,17 +7013,21 @@ fn shell_sandbox_backend_health_fails_closed_for_required_mode() {
     );
     let probed = std::cell::Cell::new(false);
 
-    let err = apply_shell_sandbox_backend_health(
-        "printf ok",
-        &config,
-        &health,
-        fake_sandbox_plan("macos-sandbox-exec", true),
-        |_, _| {
-            probed.set(true);
-            None
-        },
-    )
-    .expect_err("required mode fails closed");
+    let err = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(apply_shell_sandbox_backend_health(
+            "printf ok",
+            &config,
+            &health,
+            fake_sandbox_plan("macos-sandbox-exec", true),
+            |_, _| {
+                probed.set(true);
+                std::future::ready(None)
+            },
+        ))
+        .expect_err("required mode fails closed");
 
     assert!(!probed.get(), "cached failure should skip the probe");
     assert!(err.contains("required shell sandbox backend macos-sandbox-exec unavailable"));
@@ -7034,14 +7042,18 @@ fn shell_sandbox_backend_health_caches_probe_failure() {
         ShellSandboxNetworkPolicy::DenyByDefault,
     );
 
-    let plan = apply_shell_sandbox_backend_health(
-        "printf ok",
-        &config,
-        &health,
-        fake_sandbox_plan("macos-sandbox-exec", false),
-        |_, _| Some("probe timed out after 500 ms".to_string()),
-    )
-    .expect("best effort direct fallback");
+    let plan = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(apply_shell_sandbox_backend_health(
+            "printf ok",
+            &config,
+            &health,
+            fake_sandbox_plan("macos-sandbox-exec", false),
+            |_, _| std::future::ready(Some("probe timed out after 500 ms".to_string())),
+        ))
+        .expect("best effort direct fallback");
 
     assert_eq!(plan.backend, "none");
     assert!(
@@ -7063,14 +7075,18 @@ fn shell_sandbox_backend_health_caches_probe_success() {
         ShellSandboxNetworkPolicy::DenyByDefault,
     );
 
-    let plan = apply_shell_sandbox_backend_health(
-        "printf ok",
-        &config,
-        &health,
-        fake_sandbox_plan("macos-sandbox-exec", false),
-        |_, _| None,
-    )
-    .expect("healthy backend");
+    let plan = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(apply_shell_sandbox_backend_health(
+            "printf ok",
+            &config,
+            &health,
+            fake_sandbox_plan("macos-sandbox-exec", false),
+            |_, _| std::future::ready(None),
+        ))
+        .expect("healthy backend");
 
     assert_eq!(plan.backend, "macos-sandbox-exec");
     assert!(matches!(

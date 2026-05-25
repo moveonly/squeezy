@@ -73,18 +73,21 @@ fn conversation_messages_round_trip_tool_call_and_result() {
 
 #[test]
 fn tool_configuration_round_trips_json_schema() {
-    let specs = vec![LlmToolSpec {
-        name: "search".to_string(),
-        description: "Web search".to_string(),
-        parameters: json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"}
-            },
-            "required": ["query"]
-        }),
-        strict: false,
-    }];
+    let specs = vec![
+        LlmToolSpec {
+            name: "search".to_string(),
+            description: "Web search".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+            strict: false,
+        }
+        .into(),
+    ];
     let config = tool_configuration(&specs).expect("ok").expect("present");
     assert_eq!(config.tools().len(), 1);
     let tool_spec = match &config.tools()[0] {

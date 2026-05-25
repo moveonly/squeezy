@@ -1,4 +1,5 @@
 use futures_util::StreamExt;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -7,15 +8,15 @@ use super::*;
 async fn unavailable_provider_reports_configuration_error() {
     let provider = UnavailableProvider::new("openai", "missing OPENAI_API_KEY");
     let request = LlmRequest {
-        model: "test-model".to_string(),
-        instructions: "test".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "test-model".to_string().into(),
+        instructions: "test".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(16),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -148,15 +149,15 @@ fn registry_lists_three_tiers_for_major_hosted_providers() {
 #[test]
 fn request_context_estimate_reports_budget_when_model_limit_exists() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
-        instructions: "short system prompt".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string().into(),
+        instructions: "short system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(128),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -186,17 +187,19 @@ fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
     // its provider packs more bytes per token shows a smaller projected
     // input usage.
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
-        instructions: "a moderately long system prompt with enough text to estimate".to_string(),
-        input: vec![LlmInputItem::UserText(
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string().into(),
+        instructions: "a moderately long system prompt with enough text to estimate"
+            .to_string()
+            .into(),
+        input: Arc::from(vec![LlmInputItem::UserText(
             "another moderately long user message with several words".to_string(),
-        )],
+        )]),
         max_output_tokens: Some(128),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -234,15 +237,15 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
     // model ids still get useful headroom/budget figures instead of empty
     // optionals.
     let request = LlmRequest {
-        model: "custom-model".to_string(),
-        instructions: "system".to_string(),
-        input: Vec::new(),
+        model: "custom-model".to_string().into(),
+        instructions: "system".to_string().into(),
+        input: Arc::from(Vec::<LlmInputItem>::new()),
         max_output_tokens: Some(128),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 

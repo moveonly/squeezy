@@ -376,10 +376,10 @@ fn estimate_request_input_tokens(request: &LlmRequest, bytes_per_token: f64) -> 
     if request.store {
         total = total.saturating_add(2);
     }
-    for item in &request.input {
+    for item in request.input.iter() {
         total = total.saturating_add(estimate_input_item_tokens(item, bytes_per_token));
     }
-    for tool in &request.tools {
+    for tool in request.tools.iter() {
         total = total.saturating_add(12);
         total = total.saturating_add(estimate_text_tokens(&tool.name, bytes_per_token));
         total = total.saturating_add(estimate_text_tokens(&tool.description, bytes_per_token));

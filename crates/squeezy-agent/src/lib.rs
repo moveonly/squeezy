@@ -1700,14 +1700,14 @@ impl Agent {
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
-            model: self.config.model.clone(),
-            instructions: instructions_with_tool_index(
+            model: Arc::from(self.config.model.as_str()),
+            instructions: Arc::from(instructions_with_tool_index(
                 &request_instructions,
                 &all_tool_specs,
                 mode,
                 &self.config.tools,
-            ),
-            input: redact_llm_input_items(&input, &self.redactor),
+            )),
+            input: Arc::from(input),
             max_output_tokens: self.config.max_output_tokens,
             response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
             reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
@@ -1717,12 +1717,12 @@ impl Agent {
                 None
             },
             cache_key: self.session_prompt_cache_key(),
-            tools: request_tool_specs(
+            tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,
                 &self.config.tools,
                 loaded_tool_schemas,
-            ),
+            )),
             store,
         }
     }
@@ -3263,11 +3263,22 @@ impl TurnRuntime {
             .collect::<Vec<_>>();
         let user_transcript =
             TranscriptItem::user(format_user_text_with_context(&input, &active_attachments));
-        let user_item = LlmInputItem::UserText(format_user_text_with_context(
-            &activation.task_input,
-            &active_attachments,
-        ));
-        let mut conversation = prior_state.conversation.clone();
+        // Redact at insertion time so the conversation upholds the
+        // "already redacted" invariant. The per-round LLM request build
+        // then sends `next_input` straight through without rebuilding
+        // the vector via `redact_llm_input_items`.
+        let user_item = redact_input_item(
+            LlmInputItem::UserText(format_user_text_with_context(
+                &activation.task_input,
+                &active_attachments,
+            )),
+            &self.redactor,
+        );
+        // Upgrade any legacy conversation items resumed from disk so the
+        // invariant holds for the rest of this turn. Idempotent and
+        // cheap for items already in redacted form.
+        let mut conversation =
+            redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
         let mut context_compaction = prior_state.context_compaction.clone();
         if let Some(report) = maybe_compact_conversation(
@@ -3467,7 +3478,7 @@ impl TurnRuntime {
             let outputs = results
                 .into_iter()
                 .map(|pending| {
-                    let output = pending.result.model_output();
+                    let output = self.redactor.redact(&pending.result.model_output()).text;
                     LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
@@ -3494,6 +3505,12 @@ impl TurnRuntime {
 
         let mut last_tool_round_summary = None;
         let mut loop_guard = ToolLoopGuard::default();
+        // Per-turn cache of `<instructions> + <tool_index>` keyed by
+        // session mode. `request_instructions`, `self.all_tool_specs`,
+        // and `self.config.tools` are turn-stable; only `active_mode`
+        // (which the TUI can flip mid-turn) varies, and the rare implicit
+        // skill append below invalidates this on a revision boundary.
+        let mut instructions_cache: [Option<String>; 2] = [None, None];
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(&task_title).await;
@@ -3518,29 +3535,37 @@ impl TurnRuntime {
             }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
-            let request = LlmRequest {
-                model: self.config.model.clone(),
-                instructions: instructions_with_tool_index(
+            let mode_slot = active_mode as usize;
+            if instructions_cache[mode_slot].is_none() {
+                instructions_cache[mode_slot] = Some(instructions_with_tool_index(
                     &request_instructions,
                     &self.all_tool_specs,
                     active_mode,
                     &self.config.tools,
-                ),
-                input: redact_llm_input_items(&next_input, &self.redactor),
+                ));
+            }
+            let cached_instructions = instructions_cache[mode_slot]
+                .as_ref()
+                .expect("instructions cache populated above")
+                .clone();
+            let request = LlmRequest {
+                model: Arc::from(self.config.model.as_str()),
+                instructions: Arc::from(cached_instructions),
+                input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: self.session_prompt_cache_key(),
-                tools: request_tool_specs(
+                tools: Arc::from(request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
                     &self.config.tools,
                     &loaded_tool_schemas,
-                ),
+                )),
                 store: self.config.store_responses,
             };
-            let request_model = request.model.clone();
+            let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
             self.record_replay_request(&request);
             let mut stream = self
@@ -3667,7 +3692,13 @@ impl TurnRuntime {
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
-                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                // `assistant_stream` has already redacted the text via
+                // `StreamRedactor`, so this push is idempotent w.r.t. the
+                // conversation invariant.
+                conversation.push(redact_input_item(
+                    LlmInputItem::AssistantText(message.content.clone()),
+                    &self.redactor,
+                ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -3707,7 +3738,10 @@ impl TurnRuntime {
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
                 let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
-                conversation.push(LlmInputItem::AssistantText(message.content.clone()));
+                conversation.push(redact_input_item(
+                    LlmInputItem::AssistantText(message.content.clone()),
+                    &self.redactor,
+                ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
                 self.persist_turn_state(TurnPersistInput {
@@ -3791,6 +3825,9 @@ impl TurnRuntime {
                 &mut request_instructions,
                 &mut broker.metrics,
             );
+            if implicit_instructions_added {
+                instructions_cache = [None, None];
+            }
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             self.record_replay_tool_results(&tool_calls, &results);
@@ -3802,7 +3839,7 @@ impl TurnRuntime {
             let outputs = results
                 .into_iter()
                 .map(|pending| {
-                    let output = pending.result.model_output();
+                    let output = self.redactor.redact(&pending.result.model_output()).text;
                     LlmInputItem::FunctionCallOutput {
                         call_id: pending.result.call_id,
                         output,
@@ -4898,7 +4935,10 @@ async fn run_subagent(
     broker.metrics.redactions += redacted_instructions.redactions;
     let mut assistant_stream = StreamRedactor::new(parent.redactor.clone());
     let mut assistant_message = String::new();
-    let mut conversation = vec![LlmInputItem::UserText(subagent_user_prompt(&request))];
+    let mut conversation = vec![redact_input_item(
+        LlmInputItem::UserText(subagent_user_prompt(&request)),
+        &parent.redactor,
+    )];
     let mut supporting_receipts = Vec::new();
     // Subagent tool execution emits ToolCallStarted/ToolCallCompleted/JobUpdated
     // events on the per-call `tx` channel. The parent never surfaces these
@@ -4947,7 +4987,7 @@ async fn run_subagent(
 async fn run_subagent_loop(
     parent: &ToolExecutionContext<'_>,
     config: &AppConfig,
-    tool_specs: &[LlmToolSpec],
+    tool_specs: &[Arc<LlmToolSpec>],
     allowed_tools: &[AdvertisedTool],
     allowed_tool_names: &BTreeSet<String>,
     instructions: &str,
@@ -4966,18 +5006,17 @@ async fn run_subagent_loop(
     model: String,
 ) -> SubagentExecution {
     for _round in 0..config.subagents.max_model_rounds {
-        let llm_input = redact_llm_input_items(conversation, &parent.redactor);
-        let request_model = config.model.clone();
+        let request_model: Arc<str> = Arc::from(config.model.as_str());
         let llm_request = LlmRequest {
-            model: request_model.clone(),
-            instructions: instructions.to_string(),
-            input: llm_input,
+            model: Arc::clone(&request_model),
+            instructions: Arc::from(instructions),
+            input: Arc::from(conversation.as_slice()),
             max_output_tokens: config.max_output_tokens,
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
-            tools: tool_specs.to_vec(),
+            tools: Arc::from(tool_specs),
             store: false,
         };
         let mut stream = parent
@@ -5134,7 +5173,7 @@ async fn run_subagent_loop(
                 .map(|call| llm_function_call_item(call, &parent.redactor)),
         );
         conversation.extend(results.into_iter().map(|pending| {
-            let output = pending.result.model_output();
+            let output = parent.redactor.redact(&pending.result.model_output()).text;
             LlmInputItem::FunctionCallOutput {
                 call_id: pending.result.call_id,
                 output,
@@ -6382,7 +6421,7 @@ impl CostBroker {
 /// transmitted.
 fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
     let mut total: u64 = request.instructions.len() as u64;
-    for item in &request.input {
+    for item in request.input.iter() {
         total = total.saturating_add(match item {
             LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len() as u64,
             LlmInputItem::FunctionCallOutput { output, .. } => output.len() as u64,
@@ -6391,7 +6430,7 @@ fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
                 .unwrap_or(0),
         });
     }
-    for spec in &request.tools {
+    for spec in request.tools.iter() {
         total = total.saturating_add(
             serde_json::to_vec(spec)
                 .map(|v| v.len() as u64)
@@ -6694,7 +6733,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Session,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     log_session_event(
                         context.session_log.as_ref(),
                         &context.redactor,
@@ -6715,7 +6755,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AllowRuleProject) => {
@@ -6724,7 +6765,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Allow,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Approved
                 }
                 Ok(ToolApprovalDecision::AskRuleUser) => {
@@ -6733,7 +6775,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Ask,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(
                         "user asked to require approval for future matching calls".to_string(),
                     )
@@ -6744,7 +6787,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Ask,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(
                         "user asked to require approval for future matching calls".to_string(),
                     )
@@ -6761,7 +6805,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Session,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     log_session_event(
                         context.session_log.as_ref(),
                         &context.redactor,
@@ -6785,7 +6830,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::User,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied and persisted a user rule",
@@ -6797,7 +6843,8 @@ async fn permission_decision_for_request(
                         &request,
                         PermissionRuleSource::Project,
                         PermissionAction::Deny,
-                    );
+                    )
+                    .await;
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied and persisted a project rule",
@@ -6976,16 +7023,17 @@ Working target: {:?}",
         request.target
     );
     let llm_request = LlmRequest {
-        model: config.model.clone(),
-        instructions: "You classify shell-command risk for a local coding agent. Return JSON only."
-            .to_string(),
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: Arc::from(config.model.as_str()),
+        instructions: Arc::from(
+            "You classify shell-command risk for a local coding agent. Return JSON only.",
+        ),
+        input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(80),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
@@ -7097,7 +7145,7 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
 /// effort) on disk. Returns immediately when the rule cannot be persisted; the
 /// failure is logged but never bubbled to the caller, since the current call
 /// has already been resolved by the approval response.
-fn install_persistent_rule(
+async fn install_persistent_rule(
     context: &PermissionDecisionContext,
     request: &PermissionRequest,
     source: PermissionRuleSource,
@@ -7129,16 +7177,37 @@ fn install_persistent_rule(
         Some(path) => path,
         None => return,
     };
-    let persisted = match persist_permission_rule(&path, &rule) {
-        Ok(persisted) => persisted,
-        Err(err) => {
-            tracing::warn!(
-                target: "squeezy::permissions",
-                path = %path.display(),
-                error = %err,
-                "failed to persist permission rule",
-            );
-            return;
+    // Persistence touches the filesystem and uses a file-presence lock
+    // with a 10ms retry sleep; running it on a Tokio worker would block
+    // other tasks. `spawn_blocking` parks the work on a dedicated
+    // blocking thread instead.
+    let persisted = {
+        let rule = rule.clone();
+        let path_for_blocking = path.clone();
+        match tokio::task::spawn_blocking(move || {
+            persist_permission_rule(&path_for_blocking, &rule)
+        })
+        .await
+        {
+            Ok(Ok(persisted)) => persisted,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    path = %path.display(),
+                    error = %err,
+                    "failed to persist permission rule",
+                );
+                return;
+            }
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "squeezy::permissions",
+                    path = %path.display(),
+                    error = %join_err,
+                    "permission persistence task panicked",
+                );
+                return;
+            }
         }
     };
     if !persisted {
@@ -7212,19 +7281,19 @@ pub(crate) fn permission_rule_for_persistence(
 /// of truth lives in `squeezy-tools` next to each tool's builder.
 #[derive(Clone)]
 pub(crate) struct AdvertisedTool {
-    spec: LlmToolSpec,
+    spec: Arc<LlmToolSpec>,
     capability: PermissionCapability,
 }
 
 pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
     AdvertisedTool {
         capability: spec.capability,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: spec.name,
             description: spec.description,
             parameters: spec.parameters,
             strict: false,
-        },
+        }),
     }
 }
 
@@ -7263,7 +7332,7 @@ fn core_control_tools(
 fn load_tool_schema_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: LOAD_TOOL_SCHEMA_TOOL_NAME.to_string(),
             description: "Attach the full JSON schema for a discoverable tool before using it."
                 .to_string(),
@@ -7279,14 +7348,14 @@ fn load_tool_schema_advertised_tool() -> AdvertisedTool {
                 "required": ["name"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
             description: "Delegate broad research to an isolated subagent. The parent receives only a structured summary, supporting receipts, and separate spend metrics.".to_string(),
             parameters: json!({
@@ -7305,14 +7374,14 @@ fn delegate_advertised_tool() -> AdvertisedTool {
                 "required": ["prompt"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_plan_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_PLAN_TOOL_NAME.to_string(),
             description: "Delegate read-only implementation planning to a Planner subagent. The parent receives ordered steps, impacted files/symbols, and (when plan_patch is used) a plan_id to bind future edits to.".to_string(),
             parameters: json!({
@@ -7331,14 +7400,14 @@ fn delegate_plan_advertised_tool() -> AdvertisedTool {
                 "required": ["goal"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn delegate_review_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
             description: "Delegate read-only review of the current diff to a Reviewer subagent. Returns actionable findings (severity, file, line, message, suggested_fix) and a pass flag.".to_string(),
             parameters: json!({
@@ -7356,7 +7425,7 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
                 }
             }),
             strict: false,
-        },
+        }),
     }
 }
 
@@ -7368,7 +7437,7 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
 fn request_user_input_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
             description:
                 "Plan mode only. Pause the turn and ask the user a clarifying question. Provide a question; optionally provide multiple-choice options with stable values. Returns the user's selection (or notes they cancelled)."
@@ -7408,14 +7477,14 @@ fn request_user_input_advertised_tool() -> AdvertisedTool {
                 "required": ["question"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
+        spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
             description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools and return a compact briefing before planning or executing.".to_string(),
             parameters: json!({
@@ -7439,15 +7508,15 @@ fn explore_advertised_tool() -> AdvertisedTool {
                 "required": ["prompt"]
             }),
             strict: false,
-        },
+        }),
     }
 }
 
-fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<LlmToolSpec> {
+fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Arc<LlmToolSpec>> {
     tools
         .iter()
         .filter(|tool| !mode_refuses_capability(mode, tool.capability))
-        .map(|tool| tool.spec.clone())
+        .map(|tool| Arc::clone(&tool.spec))
         .collect()
 }
 
@@ -7529,17 +7598,14 @@ fn request_tool_specs(
     mode: SessionMode,
     schema_config: &ToolSchemaConfig,
     loaded_tool_schemas: &[String],
-) -> Vec<LlmToolSpec> {
+) -> Vec<Arc<LlmToolSpec>> {
     if !schema_config.lazy_schema_loading {
         return advertised_tool_specs(tools, mode);
     }
 
-    // Per-round `LlmToolSpec` clones are intentional and bounded by the size
-    // of the advertised tool set (~20 first-party tools today). If the spec
-    // set grows materially — for example once MCP brings in many external
-    // tools — switching `AdvertisedTool::spec` to `Arc<LlmToolSpec>` or
-    // emitting `Vec<Arc<LlmToolSpec>>` from this function would zero the
-    // per-round clone cost.
+    // Specs are stored as `Arc<LlmToolSpec>` so a per-round "spec list"
+    // build is a sequence of cheap atomic refcount bumps regardless of
+    // how many tools (first-party or MCP-loaded) end up in the request.
     let mut specs = Vec::new();
     let mut seen = BTreeSet::new();
     let advertised_names: BTreeSet<&str> =
@@ -7573,7 +7639,7 @@ fn push_tool_spec_by_name(
     tools: &[AdvertisedTool],
     name: &str,
     mode: SessionMode,
-    specs: &mut Vec<LlmToolSpec>,
+    specs: &mut Vec<Arc<LlmToolSpec>>,
     seen: &mut BTreeSet<String>,
 ) {
     if !seen.insert(name.to_string()) {
@@ -7593,7 +7659,7 @@ fn push_tool_spec_by_name(
         return;
     };
     if !mode_refuses_capability(mode, tool.capability) {
-        specs.push(tool.spec.clone());
+        specs.push(Arc::clone(&tool.spec));
     }
 }
 
@@ -7658,7 +7724,10 @@ fn tool_schema_index(
     // Alphabetic ordering (not first-load order like `request_tool_specs`)
     // keeps the rendered `<tools_index>` byte-stable across rounds even if
     // the registry's iteration order shifts, which matters for provider-side
-    // prompt-prefix caching.
+    // prompt-prefix caching. Note: the Anthropic provider marks the last
+    // tool definition with `cache_control: ephemeral` (see
+    // `crates/squeezy-llm/src/anthropic.rs` `request_body`), so byte-stable
+    // tool specs are load-bearing for that prefix cache as well.
     rows.sort();
     if rows.is_empty() {
         return None;
@@ -7730,31 +7799,46 @@ fn llm_function_call_item(call: ToolCall, redactor: &Redactor) -> LlmInputItem {
     }
 }
 
-fn redact_llm_input_items(input: &[LlmInputItem], redactor: &Redactor) -> Vec<LlmInputItem> {
+/// Redact a single `LlmInputItem`. The `Redactor` is idempotent and
+/// keeps a `Cow::Borrowed` until a pattern matches, so calling this on
+/// an already-redacted item is allocation-free.
+///
+/// The conversation invariant is that every item stored in
+/// `ConversationState::conversation` (or in the in-flight `conversation`
+/// / `next_input` buffers within `TurnRuntime::run`) has already been
+/// passed through this function, so the per-request build path never
+/// needs to walk the conversation again to redact it.
+fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
+    match item {
+        LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
+        LlmInputItem::AssistantText(text) => {
+            LlmInputItem::AssistantText(redactor.redact(&text).text)
+        }
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments: redact_json_value(arguments, redactor),
+        },
+        LlmInputItem::FunctionCallOutput { call_id, output } => LlmInputItem::FunctionCallOutput {
+            call_id,
+            output: redactor.redact(&output).text,
+        },
+    }
+}
+
+/// Normalize a vector of `LlmInputItem`s so every entry satisfies the
+/// "already redacted" invariant. Used to upgrade conversation state
+/// loaded from a resume tape that may pre-date the insertion-time
+/// redaction policy. Cost is `O(n)` allocation-free for entries that
+/// already match the invariant.
+fn redact_llm_input_items(input: Vec<LlmInputItem>, redactor: &Redactor) -> Vec<LlmInputItem> {
     input
-        .iter()
-        .cloned()
-        .map(|item| match item {
-            LlmInputItem::UserText(text) => LlmInputItem::UserText(redactor.redact(&text).text),
-            LlmInputItem::AssistantText(text) => {
-                LlmInputItem::AssistantText(redactor.redact(&text).text)
-            }
-            LlmInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-            } => LlmInputItem::FunctionCall {
-                call_id,
-                name,
-                arguments: redact_json_value(arguments, redactor),
-            },
-            LlmInputItem::FunctionCallOutput { call_id, output } => {
-                LlmInputItem::FunctionCallOutput {
-                    call_id,
-                    output: redactor.redact(&output).text,
-                }
-            }
-        })
+        .into_iter()
+        .map(|item| redact_input_item(item, redactor))
         .collect()
 }
 
@@ -8518,16 +8602,16 @@ async fn compact_conversation_with_strategy(
          question. Do not invent new facts. Output the summary only.\n\n{extractive_summary}"
     );
     let request = LlmRequest {
-        model,
-        instructions:
-            "You compact conversation summaries faithfully. Never add new facts; never omit decisions."
-                .to_string(),
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: Arc::from(model.as_str()),
+        instructions: Arc::from(
+            "You compact conversation summaries faithfully. Never add new facts; never omit decisions.",
+        ),
+        input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(max_output),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
         cache_key: None,
     };

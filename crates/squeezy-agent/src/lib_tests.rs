@@ -400,7 +400,13 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let request_names = provider
         .requests()
         .into_iter()
-        .flat_map(|request| request.tools.into_iter().map(|tool| tool.name))
+        .flat_map(|request| {
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert!(
         !request_names
@@ -1825,8 +1831,8 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
     assert!(request.instructions.contains("<active_skills>"));
     assert!(request.instructions.contains("# Rust Nav"));
     assert_eq!(
-        request.input,
-        vec![LlmInputItem::UserText("inspect main".to_string())]
+        request.input.as_ref(),
+        vec![LlmInputItem::UserText("inspect main".to_string())].as_slice()
     );
 
     let _ = fs::remove_dir_all(root);
@@ -2288,7 +2294,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
     };
     let names: Vec<_> = core_control_tools(&subagents, SessionMode::Build)
         .into_iter()
-        .map(|tool| tool.spec.name)
+        .map(|tool| tool.spec.name.clone())
         .collect();
     assert!(names.is_empty());
 
@@ -2298,7 +2304,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
     };
     let names: Vec<_> = core_control_tools(&explore_only_off, SessionMode::Build)
         .into_iter()
-        .map(|tool| tool.spec.name)
+        .map(|tool| tool.spec.name.clone())
         .collect();
     assert_eq!(
         names,
@@ -2709,7 +2715,7 @@ fn test_advertised_tool(name: &str, capability: PermissionCapability) -> Adverti
     })
 }
 
-fn advertised_tool_names(specs: &[LlmToolSpec]) -> Vec<&str> {
+fn advertised_tool_names(specs: &[Arc<LlmToolSpec>]) -> Vec<&str> {
     specs.iter().map(|spec| spec.name.as_str()).collect()
 }
 
@@ -3162,7 +3168,7 @@ fn core_control_tools_includes_new_delegate_planner_reviewer() {
     };
     let names: Vec<_> = core_control_tools(&config, SessionMode::Build)
         .into_iter()
-        .map(|tool| tool.spec.name)
+        .map(|tool| tool.spec.name.clone())
         .collect();
     assert!(names.iter().any(|n| n == DELEGATE_TOOL_NAME));
     assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));

@@ -426,10 +426,10 @@ async fn explore_subagent_uses_cheap_model_and_hides_intermediate_tool_outputs()
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 4);
-    assert_eq!(requests[0].model, "expensive-main");
-    assert_eq!(requests[1].model, "cheap-explore");
-    assert_eq!(requests[2].model, "cheap-explore");
-    assert_eq!(requests[3].model, "expensive-main");
+    assert_eq!(&*requests[0].model, "expensive-main");
+    assert_eq!(&*requests[1].model, "cheap-explore");
+    assert_eq!(&*requests[2].model, "cheap-explore");
+    assert_eq!(&*requests[3].model, "expensive-main");
     let subagent_tools = tool_names(&requests[1]);
     assert!(subagent_tools.contains(&"read_file"));
     assert!(subagent_tools.contains(&"repo_map"));
@@ -580,7 +580,7 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
 
     let requests = provider.requests();
     assert_eq!(requests.len(), 3);
-    assert_eq!(requests[1].model, "main-model");
+    assert_eq!(&*requests[1].model, "main-model");
     let outputs = function_outputs(&requests[2]);
     assert_eq!(outputs.len(), 1);
     let content = &outputs[0].1["content"];
@@ -2323,7 +2323,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
             _ => None,
         })
         .collect();
-    for item in compacted_input {
+    for item in compacted_input.iter() {
         if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
             assert!(
                 declared_calls.contains(call_id.as_str()),
