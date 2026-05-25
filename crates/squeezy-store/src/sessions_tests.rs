@@ -874,6 +874,46 @@ fn write_schema_version(path: &std::path::Path, version: u64) {
     write.commit().expect("commit");
 }
 
+#[test]
+fn token_calibration_round_trips_through_metadata_and_global_file() {
+    let root = temp_root("calibration-roundtrip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+
+    // Initial global file is missing -> defaults are returned, the call must
+    // not panic or return an error.
+    let initial = store.load_global_calibration();
+    assert!(
+        initial.providers.is_empty(),
+        "fresh stores must yield an empty calibration"
+    );
+
+    // Persist a non-trivial calibration into the global file and confirm a
+    // subsequent load sees the same ratios. The EMA blending is exercised by
+    // the squeezy-llm tests; here we only verify the round trip.
+    let mut calibration = squeezy_llm::TokenCalibration::default();
+    calibration.record_sample("openai", 4500, 1000);
+    calibration.record_sample("anthropic", 3800, 1000);
+    store
+        .save_global_calibration(&calibration)
+        .expect("save global calibration");
+    let reloaded = store.load_global_calibration();
+    assert_eq!(reloaded, calibration);
+
+    // The same calibration must also survive being written into a session's
+    // metadata.json and read back via `show`.
+    let mut metadata = SessionMetadata::new(&config, "openai");
+    metadata.token_calibration = calibration.clone();
+    let handle = store.start_session(metadata).expect("start session");
+    let session_id = handle.session_id().to_string();
+    drop(handle);
+    let record = store.show(&session_id).expect("show session");
+    assert_eq!(record.metadata.token_calibration, calibration);
+}
+
 fn temp_root(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("squeezy-store-test-{name}-{}", std::process::id()));

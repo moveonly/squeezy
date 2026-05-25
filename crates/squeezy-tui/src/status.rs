@@ -35,9 +35,37 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
     pieces.join("  ")
 }
 
+/// Render the `cost ...` segment with optional cap and percent. Kept as a
+/// free function so unit tests can exercise the format string without
+/// having to construct a full `TuiApp`. When `cap_usd_micros` is `None` or
+/// zero, falls back to the historical `cost $X.XXXXXX` form.
+pub(crate) fn format_cost_segment(
+    cost: &squeezy_core::CostSnapshot,
+    cap_usd_micros: Option<u64>,
+) -> String {
+    use crate::format_cost;
+    match cap_usd_micros {
+        Some(cap) if cap > 0 => {
+            let spent = cost.estimated_usd_micros.unwrap_or(0);
+            let percent = if cap == 0 {
+                0
+            } else {
+                ((spent as u128 * 100) / cap as u128).min(255) as u8
+            };
+            format!(
+                "cost {} / ${:.2} ({}%)",
+                format_cost(cost),
+                cap as f64 / 1_000_000.0,
+                percent
+            )
+        }
+        _ => format!("cost {}", format_cost(cost)),
+    }
+}
+
 pub(crate) mod segments {
     use super::*;
-    use crate::{format_cost, format_mcp_status, format_optional_u64, reasoning_status_fragment};
+    use crate::{format_mcp_status, format_optional_u64, reasoning_status_fragment};
 
     pub(crate) fn permissions(app: &TuiApp) -> Option<String> {
         Some(app.permissions.compact())
@@ -60,7 +88,7 @@ pub(crate) mod segments {
     }
 
     pub(crate) fn cost(app: &TuiApp) -> Option<String> {
-        Some(format!("cost {}", format_cost(&app.cost)))
+        Some(format_cost_segment(&app.cost, app.cost_cap_usd_micros))
     }
 
     pub(crate) fn tokens(app: &TuiApp) -> Option<String> {

@@ -3417,6 +3417,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "squeezy-core",
+ "squeezy-llm",
  "squeezy-workspace",
  "thiserror",
  "tokio",
