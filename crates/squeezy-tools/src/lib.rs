@@ -71,12 +71,16 @@ mod safety;
 mod schema;
 mod shell_program;
 mod truncate;
+#[cfg(windows)]
+mod win_job;
 
 use ipc::IpcListener;
 pub use ipc::{IpcEndpoint, IpcStream};
 use schema::compact_tool_parameters;
 use shell_program::ShellProgram;
 use truncate::truncate_middle_bytes;
+#[cfg(windows)]
+use win_job::ShellJob;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
@@ -6353,6 +6357,20 @@ impl ToolRegistry {
             }
             Err(err) => return Err(ShellRunError::Io(err)),
         };
+        // Windows analog to Unix process groups: a Job Object created with
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when
+        // either `terminate(...)` is called or the handle drops at
+        // function exit.
+        #[cfg(windows)]
+        let shell_job: Option<ShellJob> = match ShellJob::new() {
+            Ok(job) => {
+                if let Some(pid) = child.id() {
+                    let _ = job.assign_process(pid);
+                }
+                Some(job)
+            }
+            Err(_) => None,
+        };
 
         let stdout_capture = ShellStreamCapture::default();
         let stderr_capture = ShellStreamCapture::default();
@@ -6378,6 +6396,10 @@ impl ToolRegistry {
         let status = tokio::select! {
             _ = cancel.cancelled() => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                #[cfg(windows)]
+                if let Some(job) = shell_job.as_ref() {
+                    let _ = job.terminate(1);
+                }
                 stdout_task.abort();
                 stderr_task.abort();
                 drop(ask_server);
@@ -6391,6 +6413,10 @@ impl ToolRegistry {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                #[cfg(windows)]
+                if let Some(job) = shell_job.as_ref() {
+                    let _ = job.terminate(1);
+                }
                 None
             }
             Ok(Err(err)) => return Err(ShellRunError::Io(err)),
@@ -12854,7 +12880,38 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if required {
+            return Err(
+                "required shell sandbox unavailable on windows: filesystem and network isolation are not provided; use mode = \"best_effort\" or mode = \"external\""
+                    .to_string(),
+            );
+        }
+        let shell = ShellProgram::for_command(command);
+        return Ok(ShellSandboxPlan {
+            program: shell.program,
+            args: shell.args,
+            backend: "windows-job-object",
+            mode: config.mode.as_str(),
+            network: if network == "denied" {
+                "denied_best_effort"
+            } else {
+                network
+            },
+            filesystem: "best_effort_unavailable",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: Some(
+                "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
+            ),
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         if required {
             return Err(format!(
@@ -13817,6 +13874,7 @@ fn linux_unshare_supported() -> bool {
 }
 
 async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {
+    #[cfg(unix)]
     if let Some(pid) = child.id() {
         kill_process_group(pid, libc::SIGTERM);
         if time::timeout(Duration::from_millis(grace_ms), child.wait())
@@ -13827,18 +13885,17 @@ async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64)
         }
         kill_process_group(pid, libc::SIGKILL);
     }
+    #[cfg(not(unix))]
+    let _ = grace_ms;
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
+#[cfg(unix)]
 fn kill_process_group(pid: u32, signal: libc::c_int) {
-    #[cfg(unix)]
     unsafe {
         let _ = libc::kill(-(pid as libc::pid_t), signal);
     }
-
-    #[cfg(not(unix))]
-    let _ = (pid, signal);
 }
 
 fn apply_shell_environment_policy(

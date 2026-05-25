@@ -17,6 +17,7 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "MIT",
+    "MPL-2.0",
     "Unicode-3.0",
 ]
 confidence-threshold = 0.8
@@ -77,11 +78,19 @@ skip = [
     # `getrandom 0.2`. Both coexist; aws-lc-sys upstream is migrating.
     { crate = "getrandom:0.2.17", reason = "aws-lc-sys cc/jobserver build deps pull getrandom 0.3 on Windows; rand_core 0.6 stays on 0.2" },
     # Several Windows-touching crates (tokio, crossterm, dirs-sys, mio,
-    # parking_lot, rustls-platform-verifier, …) sit on different
-    # `windows-sys` majors. They are platform-conditional and isolated; the
-    # rest of the workspace targets do not link multiple copies.
-    { crate = "windows-sys:0.59.0", reason = "platform-conditional Windows shims sit on different windows-sys majors; coexist without symbol conflicts" },
-    { crate = "windows-sys:0.61.2", reason = "platform-conditional Windows shims sit on different windows-sys majors; coexist without symbol conflicts" },
+    # parking_lot, rustls-platform-verifier, …) and the direct windows-sys
+    # used by squeezy-tools' Job Object backend sit on different
+    # `windows-sys` / `windows-targets` majors. They are platform-conditional
+    # and isolated; the rest of the workspace targets do not link multiple
+    # copies.
+    { crate = "windows-sys:0.52.0", reason = "transitive Windows shims pin windows-sys 0.52 alongside the 0.59/0.60/0.61 used elsewhere" },
+    { crate = "windows-sys:0.59.0", reason = "squeezy-tools win_job uses windows-sys 0.59; other transitive crates pin 0.52/0.60/0.61" },
+    { crate = "windows-sys:0.60.2", reason = "transitive Windows shims pin windows-sys 0.60 alongside 0.52/0.59/0.61" },
+    { crate = "windows-sys:0.61.2", reason = "transitive Windows shims pin windows-sys 0.61 alongside 0.52/0.59/0.60" },
+    { crate = "windows-targets:0.52.6", reason = "windows-sys 0.52/0.59 → windows-targets 0.52 vs windows-sys 0.60+ → windows-targets 0.53" },
+    { crate = "windows-targets:0.53.5", reason = "newer windows-sys split — coexists with 0.52" },
+    { crate = "windows_x86_64_msvc:0.52.6", reason = "follows windows-targets 0.52 split" },
+    { crate = "windows_x86_64_msvc:0.53.1", reason = "follows windows-targets 0.53 split" },
 ]
 skip-tree = []
 

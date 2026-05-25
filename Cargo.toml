@@ -89,6 +89,7 @@ tree-sitter-python = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 which = "8"
+windows-sys = "0.59"
 
 squeezy-agent = { path = "crates/squeezy-agent", version = "=0.1.0" }
 squeezy-core = { path = "crates/squeezy-core", version = "=0.1.0" }
