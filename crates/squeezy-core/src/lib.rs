@@ -961,6 +961,18 @@ impl AppConfig {
             if let Some(timeout_ms) = server.timeout_ms {
                 output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
             }
+            if let Some(enabled_tools) = &server.enabled_tools {
+                output.push_str(&format!(
+                    "enabled_tools = {}\n",
+                    toml_string_array(enabled_tools)
+                ));
+            }
+            if !server.disabled_tools.is_empty() {
+                output.push_str(&format!(
+                    "disabled_tools = {}\n",
+                    toml_string_array(&server.disabled_tools)
+                ));
+            }
             if !server.env.is_empty() {
                 let entries = server
                     .env
@@ -4599,6 +4611,8 @@ pub fn user_settings_template() -> &'static str {
 # transport = "stdio"       # stdio | http | sse
 # command = "docs-mcp"
 # args = []
+# enabled_tools = ["lookup"]
+# disabled_tools = []
 #
 # [mcp.servers.docs.permissions]
 # default = "ask"
@@ -4707,6 +4721,8 @@ pub fn project_settings_template() -> &'static str {
 # transport = "stdio"       # stdio | http | sse
 # command = "docs-mcp"
 # args = []
+# enabled_tools = ["lookup"]
+# disabled_tools = []
 #
 # [mcp.servers.docs.permissions]
 # default = "ask"
@@ -4851,6 +4867,8 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub permissions: McpPermissionConfig,
 }
@@ -4871,6 +4889,8 @@ impl McpServerConfig {
                 "args",
                 "url",
                 "timeout_ms",
+                "enabled_tools",
+                "disabled_tools",
                 "env",
                 "permissions",
             ],
@@ -4894,6 +4914,19 @@ impl McpServerConfig {
                 .unwrap_or_default(),
             url: string_value(table, "url", source, &field(path, "url"))?,
             timeout_ms: u64_value(table, "timeout_ms", source, &field(path, "timeout_ms"))?,
+            enabled_tools: string_array_value(
+                table,
+                "enabled_tools",
+                source,
+                &field(path, "enabled_tools"),
+            )?,
+            disabled_tools: string_array_value(
+                table,
+                "disabled_tools",
+                source,
+                &field(path, "disabled_tools"),
+            )?
+            .unwrap_or_default(),
             env,
             permissions,
         })
@@ -4908,6 +4941,10 @@ impl McpServerConfig {
         }
         replace_if_some(&mut self.url, next.url);
         replace_if_some(&mut self.timeout_ms, next.timeout_ms);
+        replace_if_some(&mut self.enabled_tools, next.enabled_tools);
+        if !next.disabled_tools.is_empty() {
+            self.disabled_tools = next.disabled_tools;
+        }
         if !next.env.is_empty() {
             self.env.extend(next.env);
         }

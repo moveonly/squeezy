@@ -46,6 +46,7 @@ use squeezy_telemetry::{
     ToolTelemetryReport, prepare_feedback,
 };
 use squeezy_tools::{
+    McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
@@ -1874,6 +1875,7 @@ impl Agent {
                 cancel.clone(),
                 session_log.clone(),
                 redactor.clone(),
+                tx.clone(),
                 turn_id,
             );
 
@@ -2305,11 +2307,26 @@ fn refresh_mcp_tools_in_background(
     cancel: CancellationToken,
     session_log: Option<SessionHandle>,
     redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
     turn_id: TurnId,
 ) {
     tokio::spawn(async move {
-        let mcp_errors = tools.refresh_mcp_tools(cancel).await;
-        for error in mcp_errors {
+        let outcome = tools.refresh_mcp_tools(cancel).await;
+        log_session_event(
+            session_log.as_ref(),
+            &redactor,
+            "mcp_status_updated",
+            Some(turn_id),
+            None,
+            serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
+        );
+        let _ = tx
+            .send(AgentEvent::McpStatusUpdated {
+                turn_id,
+                snapshot: outcome.status.clone(),
+            })
+            .await;
+        for error in outcome.errors {
             log_session_event(
                 session_log.as_ref(),
                 &redactor,
@@ -3425,6 +3442,51 @@ struct ToolExecutionContext<'a> {
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
 }
 
+struct McpElicitationHandlerScope<'a> {
+    tools: &'a ToolRegistry,
+}
+
+impl Drop for McpElicitationHandlerScope<'_> {
+    fn drop(&mut self) {
+        self.tools.set_mcp_elicitation_handler(None);
+    }
+}
+
+fn install_mcp_elicitation_handler<'a>(
+    context: &'a ToolExecutionContext<'_>,
+) -> McpElicitationHandlerScope<'a> {
+    let turn_id = context.turn_id;
+    let tx = context.tx.clone();
+    let cancel = context.cancel.clone();
+    let handler: McpElicitationHandler = Arc::new(move |request| {
+        let tx = tx.clone();
+        let cancel = cancel.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            let send_request = tx.send(AgentEvent::McpElicitationRequested {
+                turn_id,
+                request,
+                response_tx,
+            });
+            let send_result = tokio::select! {
+                _ = cancel.cancelled() => return McpElicitationResponse::cancel(),
+                result = send_request => result,
+            };
+            if send_result.is_err() {
+                return McpElicitationResponse::decline();
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => McpElicitationResponse::cancel(),
+                response = response_rx => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+            }
+        })
+    });
+    context.tools.set_mcp_elicitation_handler(Some(handler));
+    McpElicitationHandlerScope {
+        tools: context.tools,
+    }
+}
+
 async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
     let snapshot = match serde_json::from_value::<TaskStateSnapshot>(call.arguments.clone()) {
         Ok(snapshot) => snapshot.normalized(),
@@ -4441,6 +4503,7 @@ async fn execute_tool_calls(
     context: ToolExecutionContext<'_>,
     broker: &mut CostBroker,
 ) -> Vec<ToolResult> {
+    let _mcp_elicitation_handler = install_mcp_elicitation_handler(&context);
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut recorded = vec![false; calls.len()];
@@ -7284,6 +7347,15 @@ pub enum AgentEvent {
     TaskStateUpdated {
         turn_id: TurnId,
         snapshot: TaskStateSnapshot,
+    },
+    McpStatusUpdated {
+        turn_id: TurnId,
+        snapshot: McpStatusSnapshot,
+    },
+    McpElicitationRequested {
+        turn_id: TurnId,
+        request: McpElicitationRequest,
+        response_tx: oneshot::Sender<McpElicitationResponse>,
     },
     JobUpdated {
         job: JobSnapshot,
