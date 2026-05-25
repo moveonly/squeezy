@@ -146,17 +146,36 @@ fn picker_q_quits() {
 }
 
 #[test]
-fn picker_clamps_arrow_at_bounds() {
+fn picker_arrow_wraps_through_start_fresh() {
+    // With one candidate the list has 2 rows: [candidate, start_fresh].
     let mut state = ResumePickerState::new(vec![SessionSummary {
         session_id: "only".to_string(),
         started_at_ms: 0,
         first_user_task: None,
         latest_summary: None,
     }]);
-    state.dispatch(press(KeyCode::Up));
-    state.dispatch(press(KeyCode::Down));
-    state.dispatch(press(KeyCode::Down));
     assert_eq!(state.cursor, 0);
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 1); // moved to start_fresh
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 0); // wrapped back to first candidate
+    state.dispatch(press(KeyCode::Up));
+    assert_eq!(state.cursor, 1); // wrapped up to start_fresh
+}
+
+#[test]
+fn picker_enter_on_start_fresh_row_starts_fresh() {
+    let mut state = ResumePickerState::new(vec![SessionSummary {
+        session_id: "first".to_string(),
+        started_at_ms: 0,
+        first_user_task: None,
+        latest_summary: None,
+    }]);
+    state.dispatch(press(KeyCode::Down)); // cursor on start_fresh
+    assert_eq!(
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::StartFresh)
+    );
 }
 
 #[test]

@@ -25,6 +25,8 @@ use ratatui::{
 use squeezy_core::{AppConfig, SqueezyError};
 use squeezy_store::{SessionMetadata, SessionQuery, SessionStore};
 
+use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET};
+
 /// Maximum number of sessions shown in the overlay. Keep small — the user
 /// is choosing one of "most recent" and a longer list is just noise.
 pub(crate) const MAX_PICKER_ENTRIES: usize = 5;
@@ -119,6 +121,17 @@ impl ResumePickerState {
         }
     }
 
+    /// Number of selectable rows in the list — the candidates plus the
+    /// trailing "Start fresh" row.
+    fn row_count(&self) -> usize {
+        self.candidates.len() + 1
+    }
+
+    /// Index of the "Start fresh" row.
+    fn start_fresh_index(&self) -> usize {
+        self.candidates.len()
+    }
+
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
         if key.kind == KeyEventKind::Release {
             return None;
@@ -127,19 +140,24 @@ impl ResumePickerState {
             (KeyCode::Up, _) => {
                 if self.cursor > 0 {
                     self.cursor -= 1;
+                } else {
+                    self.cursor = self.row_count().saturating_sub(1);
                 }
                 None
             }
             (KeyCode::Down, _) => {
-                if self.cursor + 1 < self.candidates.len() {
-                    self.cursor += 1;
-                }
+                self.cursor = (self.cursor + 1) % self.row_count().max(1);
                 None
             }
-            (KeyCode::Enter, _) => self
-                .candidates
-                .get(self.cursor)
-                .map(|summary| ResumeChoice::Resume(summary.session_id.clone())),
+            (KeyCode::Enter, _) => {
+                if self.cursor == self.start_fresh_index() {
+                    Some(ResumeChoice::StartFresh)
+                } else {
+                    self.candidates
+                        .get(self.cursor)
+                        .map(|summary| ResumeChoice::Resume(summary.session_id.clone()))
+                }
+            }
             (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
                 Some(ResumeChoice::StartFresh)
             }
@@ -199,72 +217,148 @@ pub(crate) fn run_picker<W: io::Write>(
 }
 
 fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
-    let area = frame.area();
+    let full = frame.area();
+    let area = centered_area(full);
+
+    frame.render_widget(Clear, full);
+
+    let title = Line::from(vec![
+        Span::styled(" ◆ ", Style::default().fg(AMBER)),
+        Span::styled(
+            "squeezy",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(QUIET)),
+        Span::styled(
+            "resume a recent session",
+            Style::default().fg(Color::White),
+        ),
+        Span::raw(" "),
+    ]);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(Span::styled(
-            " Resume a recent session ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(AMBER))
+        .title(title)
+        .title_alignment(Alignment::Left);
     let inner = block.inner(area);
-    frame.render_widget(Clear, area);
     frame.render_widget(block, area);
 
     let layout = Layout::default()
         .direction(Direction::Vertical)
+        .margin(1)
         .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(1), // intro
+            Constraint::Length(1), // spacer
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // footer
         ])
         .split(inner);
 
-    let header = Paragraph::new(Line::from(vec![Span::styled(
-        format!(
-            "Found {} recent session{} for this directory:",
-            state.candidates.len(),
-            if state.candidates.len() == 1 { "" } else { "s" }
+    let intro = Paragraph::new(Line::from(vec![
+        Span::styled(
+            format!("{}", state.candidates.len()),
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         ),
-        Style::default().fg(Color::DarkGray),
-    )]))
+        Span::styled(
+            format!(
+                " recent session{} for this directory",
+                if state.candidates.len() == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(QUIET),
+        ),
+    ]))
     .alignment(Alignment::Left);
-    frame.render_widget(header, layout[0]);
+    frame.render_widget(intro, layout[0]);
 
-    let rows: Vec<Line<'_>> = state
+    let mut rows: Vec<Line<'_>> = state
         .candidates
         .iter()
         .enumerate()
-        .map(|(idx, summary)| {
-            let prefix = if idx == state.cursor { "▸ " } else { "  " };
-            let style = if idx == state.cursor {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            Line::from(vec![
-                Span::styled(prefix.to_string(), style),
-                Span::styled(format_started_at(summary.started_at_ms), style),
-                Span::styled("  ", style),
-                Span::styled(summary.label(), style),
-            ])
-        })
+        .map(|(idx, summary)| render_candidate_row(idx, summary, idx == state.cursor))
         .collect();
-    let body = Paragraph::new(rows);
-    frame.render_widget(body, body_area(layout[1]));
+    rows.push(render_start_fresh_row(state.cursor == state.start_fresh_index()));
 
-    let footer = Paragraph::new(Line::from(vec![Span::styled(
-        "Enter resume · Esc start fresh · Q quit",
-        Style::default().fg(Color::DarkGray),
-    )]))
+    let body = Paragraph::new(rows);
+    frame.render_widget(body, layout[2]);
+
+    let footer = Paragraph::new(Line::from(vec![
+        Span::styled("↑/↓ ", Style::default().fg(GOLD)),
+        Span::styled("move  ", Style::default().fg(QUIET)),
+        Span::styled("Enter ", Style::default().fg(GOLD)),
+        Span::styled("confirm  ", Style::default().fg(QUIET)),
+        Span::styled("Esc ", Style::default().fg(GOLD)),
+        Span::styled("start fresh  ", Style::default().fg(QUIET)),
+        Span::styled("Q ", Style::default().fg(GOLD)),
+        Span::styled("quit", Style::default().fg(QUIET)),
+    ]))
     .alignment(Alignment::Left);
-    frame.render_widget(footer, layout[2]);
+    frame.render_widget(footer, layout[4]);
 }
 
-fn body_area(area: Rect) -> Rect {
-    // No-op pass-through so future formatting tweaks have a single place
-    // to insert padding without disturbing the call site.
-    area
+fn render_candidate_row(
+    _idx: usize,
+    summary: &SessionSummary,
+    active: bool,
+) -> Line<'static> {
+    let (prefix_color, label_style) = if active {
+        (AMBER, Style::default().fg(GOLD).add_modifier(Modifier::BOLD))
+    } else {
+        (QUIET, Style::default().fg(Color::White))
+    };
+    let prefix = if active { "▸ " } else { "  " };
+    let timestamp_style = if active {
+        Style::default().fg(AMBER)
+    } else {
+        Style::default().fg(QUIET)
+    };
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(prefix_color)),
+        Span::styled(format_started_at(summary.started_at_ms), timestamp_style),
+        Span::styled("  ", Style::default()),
+        Span::styled(summary.label(), label_style),
+    ])
+}
+
+fn render_start_fresh_row(active: bool) -> Line<'static> {
+    let (prefix_color, label_style, hint_style) = if active {
+        (
+            MODE_PURPLE,
+            Style::default().fg(MODE_PURPLE).add_modifier(Modifier::BOLD),
+            Style::default().fg(QUIET),
+        )
+    } else {
+        (
+            QUIET,
+            Style::default().fg(MODE_PURPLE),
+            Style::default().fg(QUIET),
+        )
+    };
+    let prefix = if active { "▸ " } else { "  " };
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(prefix_color)),
+        Span::styled("◇ ", label_style),
+        Span::styled("Start fresh", label_style),
+        Span::styled("    — new conversation", hint_style),
+    ])
+}
+
+/// Center a fixed-size area inside `full` with reasonable bounds for small
+/// terminals.
+fn centered_area(full: Rect) -> Rect {
+    let max_width = 86u16;
+    let max_height = 18u16;
+    let width = full.width.min(max_width);
+    let height = full.height.min(max_height);
+    let x = full.x + full.width.saturating_sub(width) / 2;
+    let y = full.y + full.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn format_started_at(started_at_ms: u64) -> String {
