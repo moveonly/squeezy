@@ -1,0 +1,39 @@
+id = "multirepo-pqueue"
+title = "Graph nav probe: sindresorhus/p-queue (TypeScript)"
+description = """
+Probes TypeScript/JavaScript language support against a popular,
+modestly-sized library. Verifies named-export navigation and
+class-method graph for TS code.
+"""
+
+[workspace.github]
+repo = "sindresorhus/p-queue"
+sha = "cfa917af261fb6db9eb1281221ba21093eb49e3d"
+
+[squeezy]
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Where is the `PQueue` class defined? Reply with the file path."
+
+[[steps]]
+kind = "prompt"
+text = "Name two distinct public methods on `PQueue`. Cite each with the line number of its declaration if available."
+
+[[steps]]
+kind = "prompt"
+text = "How does a task get scheduled — what's the chain from `PQueue.add` to the underlying timer / promise? Cite each piece of evidence with a confidence label (exact_syntax, import_resolved, candidate_set, external, unknown); use `label_missing` when unavailable."
+
+[expect]
+final_text_contains = ["PQueue"]
+max_wall_clock_seconds = 180
+max_input_tokens = 200000
+max_tools_per_turn = 8
+
+[triage]
+enabled = true
+model = "gpt-5.4-mini"
+focus = "TypeScript-specific gaps: missing class-method graph, type-only export confusion, wrong file paths, planner over-fetch, hallucinated APIs. Ignore stylistic feedback."
