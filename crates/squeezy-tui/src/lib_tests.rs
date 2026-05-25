@@ -129,6 +129,102 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn slash_plan_with_trailing_space_still_switches_mode() {
+    // Regression for the old Enter-time pre-intercept that compared the
+    // trimmed input via `mode_command` and silently dropped `/plan ` (with
+    // trailing whitespace) when the slash command flow had no `/plan` arm.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "/plan ".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn slash_config_opens_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some(), "config screen should be open");
+}
+
+#[tokio::test]
+async fn slash_model_opens_config_at_models_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/model".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Models
+    );
+}
+
+#[tokio::test]
+async fn slash_config_with_section_argument_focuses_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config permissions".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Permissions
+    );
+}
+
+#[tokio::test]
+async fn f11_toggles_config_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.config_screen.is_none());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_none());
+}
+
+#[tokio::test]
 async fn slash_plan_and_build_force_modes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);

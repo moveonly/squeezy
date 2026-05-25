@@ -53,8 +53,11 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod config_screen;
+mod notification;
 mod render;
 
+use notification::{NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
     WORKING_SHIMMER_HIGHLIGHT, blend_color,
@@ -158,12 +161,16 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "show local Squeezy help topics",
     },
     SlashCommand {
+        name: "/config",
+        description: "open the config screen (or pass a section name)",
+    },
+    SlashCommand {
         name: "/model",
-        description: "show current provider and model",
+        description: "open config focused on provider and model",
     },
     SlashCommand {
         name: "/permissions",
-        description: "show current permission policy",
+        description: "open config focused on permissions",
     },
     SlashCommand {
         name: "/plan",
@@ -376,6 +383,7 @@ async fn run_inner(
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
+        app.app_notifications.tick();
         terminal.draw_app(&app)?;
 
         drain_job_events(&mut app);
@@ -689,6 +697,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    // F11 toggles the config screen from anywhere. Ctrl+C is still honored
+    // below so users can always abort even with the screen open.
+    if key.code == KeyCode::F(11) && key.modifiers.is_empty() {
+        toggle_config_screen(app, agent, None);
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if request_turn_interrupt(app) {
             app.exit_confirm_armed = false;
@@ -699,6 +714,16 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         }
         app.exit_confirm_armed = true;
         app.status = "press Ctrl+C or Y to exit · any other key to cancel".to_string();
+        return Ok(false);
+    }
+
+    // While the config screen is open, route all other keys to it.
+    if app.config_screen.is_some() {
+        let state = app.config_screen.as_mut().expect("checked above");
+        let outcome = config_screen::handle_key(state, agent, &mut app.app_notifications, key);
+        if matches!(outcome, config_screen::KeyOutcome::Close) {
+            app.config_screen = None;
+        }
         return Ok(false);
     }
 
@@ -812,24 +837,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    // The /plan and /build shortcuts intentionally fire before
-    // `handle_approval_key` and the regular Enter handler so a user can flip
-    // modes between turns without first clearing the input buffer. When an
-    // approval prompt is pending or a turn is in flight, `switch_mode`
-    // refuses the change and the input is preserved so it survives the
-    // current interaction.
-    if key.code == KeyCode::Enter
-        && let Some(mode) = mode_command(app.input.trim())
-    {
-        switch_mode(app, agent, Some(mode), "tui_command");
-        if app.turn_rx.is_none()
-            && app.pending_approval.is_none()
-            && app.pending_mcp_elicitation.is_none()
-        {
-            clear_input(app);
-        }
-        return Ok(false);
-    }
+    // `/plan` and `/build` flow through `handle_slash_command` like every
+    // other slash command — see the dispatcher arms there. The old
+    // Enter-time pre-intercept used to live here, but it silently dropped
+    // any input with a trailing space (e.g. `/plan `).
 
     if key.code == KeyCode::Esc && request_turn_interrupt(app) {
         return Ok(false);
@@ -954,6 +965,18 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             }
             clear_input(app);
             push_input_history(app, input.clone());
+            // Apply any pending config swap before the request goes out so
+            // the running turn picks up the new model/provider. The TUI's
+            // app fields (verbosity etc.) are already updated by the
+            // Immediate-tier handler; this drain covers NextPrompt-tier.
+            if let Some(swap) = agent.drain_pending_swap() {
+                let note = swap
+                    .display_note
+                    .clone()
+                    .unwrap_or_else(|| "config applied".to_string());
+                app.app_notifications
+                    .push(format!("✓ applied: {note}"), NotifySeverity::Success);
+            }
             let cancel = CancellationToken::new();
             app.task_state = None;
             app.task_panel_collapsed = false;
@@ -1457,6 +1480,21 @@ fn request_turn_interrupt(app: &mut TuiApp) -> bool {
     interrupted
 }
 
+fn toggle_config_screen(
+    app: &mut TuiApp,
+    agent: &Agent,
+    focus: Option<squeezy_core::config_schema::SectionId>,
+) {
+    if app.config_screen.is_some() {
+        app.config_screen = None;
+        app.status = "config closed".to_string();
+        return;
+    }
+    let state = config_screen::ConfigScreenState::new(agent.config_snapshot(), focus);
+    app.config_screen = Some(state);
+    app.status = "config".to_string();
+}
+
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
@@ -1467,6 +1505,23 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         .map(str::trim)
         .unwrap_or_default();
     match command {
+        "/config" => {
+            let section = if rest.is_empty() {
+                None
+            } else {
+                squeezy_core::config_schema::section_from_slug(rest)
+            };
+            toggle_config_screen(app, agent, section);
+            return true;
+        }
+        "/plan" => {
+            switch_mode(app, agent, Some(SessionMode::Plan), "tui_command");
+            return true;
+        }
+        "/build" => {
+            switch_mode(app, agent, Some(SessionMode::Build), "tui_command");
+            return true;
+        }
         "/cost" => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
@@ -1484,20 +1539,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/model" => {
-            app.status = "model settings".to_string();
-            app.push_transcript_item(TranscriptItem::system(format!(
-                "Model\nprovider={}\nmodel={}\nchange=exit and run `squeezy --no-default`, or start with `--provider <id> --model <id>`",
-                app.provider_name, app.model
-            )));
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Models),
+            );
             return true;
         }
         "/permissions" => {
-            app.status = "permission settings".to_string();
-            app.push_transcript_item(TranscriptItem::system(format!(
-                "Permissions\n{}\nsandbox={}",
-                app.permissions.compact(),
-                app.permissions.sandbox
-            )));
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Permissions),
+            );
             return true;
         }
         "/feedback" => {
@@ -1641,29 +1695,48 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/verbosity" => {
-            let Some(value) = parts.next() else {
-                app.status = "usage: /verbosity concise|normal|verbose".to_string();
+            // Back-compat: `/verbosity concise|normal|verbose` still works as
+            // a quick set. Without an arg, opens the config screen on the
+            // Verbosity section.
+            if let Some(value) = parts.next()
+                && let Some(verbosity) = parse_response_verbosity(value)
+            {
+                app.response_verbosity = verbosity;
+                let mut next = agent.config_snapshot();
+                next.tui.response_verbosity = verbosity;
+                agent.replace_config(next);
+                app.app_notifications.push(
+                    format!("response verbosity → {}", verbosity.as_str()),
+                    NotifySeverity::Success,
+                );
                 return true;
-            };
-            let Some(verbosity) = parse_response_verbosity(value) else {
-                app.status = "usage: /verbosity concise|normal|verbose".to_string();
-                return true;
-            };
-            app.response_verbosity = verbosity;
-            app.status = format!("response verbosity {}", verbosity.as_str());
+            }
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Verbosity),
+            );
             return true;
         }
         "/tool-verbosity" => {
-            let Some(value) = parts.next() else {
-                app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
+            if let Some(value) = parts.next()
+                && let Some(verbosity) = parse_tool_output_verbosity(value)
+            {
+                app.tool_output_verbosity = verbosity;
+                let mut next = agent.config_snapshot();
+                next.tui.tool_output_verbosity = verbosity;
+                agent.replace_config(next);
+                app.app_notifications.push(
+                    format!("tool output verbosity → {}", verbosity.as_str()),
+                    NotifySeverity::Success,
+                );
                 return true;
-            };
-            let Some(verbosity) = parse_tool_output_verbosity(value) else {
-                app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
-                return true;
-            };
-            app.tool_output_verbosity = verbosity;
-            app.status = format!("tool output verbosity {}", verbosity.as_str());
+            }
+            toggle_config_screen(
+                app,
+                agent,
+                Some(squeezy_core::config_schema::SectionId::Verbosity),
+            );
             return true;
         }
         "/jobs" => {
@@ -2403,14 +2476,6 @@ fn transcript_plain_text(app: &TuiApp) -> String {
     lines.join("\n")
 }
 
-fn mode_command(input: &str) -> Option<SessionMode> {
-    match input {
-        "/plan" => Some(SessionMode::Plan),
-        "/build" => Some(SessionMode::Build),
-        _ => None,
-    }
-}
-
 fn parse_transcript_category(value: &str) -> Option<TranscriptCategory> {
     match value {
         "all" => Some(TranscriptCategory::All),
@@ -3021,6 +3086,22 @@ fn format_approval_menu_lines(
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if let Some(state) = &app.config_screen {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        config_screen::render(frame, chunks[0], state);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
+        return;
+    }
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
@@ -3073,6 +3154,10 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
     }
+    let notification_height = app.app_notifications.height();
+    if notification_height > 0 {
+        constraints.push(Constraint::Length(notification_height));
+    }
     constraints.push(Constraint::Length(2));
     constraints.push(Constraint::Min(0));
     let chunks = Layout::default()
@@ -3101,11 +3186,54 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         render_approval(frame, chunks[index], app);
         index += 1;
     }
+    if notification_height > 0 {
+        render_notification_pane(frame, chunks[index], app);
+        index += 1;
+    }
     render_status(frame, chunks[index], app);
     index += 1;
     // Flexible filler keeps the prompt/status block attached to the transcript
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
+}
+
+fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::Paragraph,
+    };
+    let Some(current) = app.app_notifications.current() else {
+        return;
+    };
+    let remaining_secs = current.remaining().as_secs();
+    let mut spans = vec![
+        Span::styled(
+            current.severity.glyph(),
+            Style::default()
+                .fg(current.severity.color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(current.message.as_str(), Style::default().fg(Color::White)),
+    ];
+    if let Some(hint) = current.action_hint {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(hint, Style::default().fg(QUIET)));
+    }
+    if app.app_notifications.len() > 1 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("({}+)", app.app_notifications.len() - 1),
+            Style::default().fg(QUIET),
+        ));
+    }
+    spans.push(Span::raw("  "));
+    spans.push(Span::styled(
+        format!("· {remaining_secs}s"),
+        Style::default().fg(QUIET),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -6685,6 +6813,8 @@ struct TuiApp {
     pending_feedback: Option<PreparedFeedback>,
     pending_report: Option<BugReportBundle>,
     clipboard: Box<dyn Clipboard>,
+    app_notifications: NotificationQueue,
+    config_screen: Option<config_screen::ConfigScreenState>,
 }
 
 impl TuiApp {
@@ -6796,6 +6926,8 @@ impl TuiApp {
             pending_feedback: None,
             pending_report: None,
             clipboard,
+            app_notifications: NotificationQueue::new(),
+            config_screen: None,
         }
     }
 

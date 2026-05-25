@@ -3299,6 +3299,7 @@ dependencies = [
  "serde",
  "thiserror",
  "toml",
+ "toml_edit",
  "tracing",
 ]
 
@@ -3463,6 +3464,7 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "crossterm",
+ "futures-util",
  "pulldown-cmark",
  "ratatui",
  "serde_json",

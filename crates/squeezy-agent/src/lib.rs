@@ -1058,6 +1058,21 @@ pub struct Agent {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     store: Option<Arc<SqueezyStore>>,
     replay: Option<Arc<ReplayRuntime>>,
+    /// Config save queued from the config screen. Drained before each
+    /// `start_turn` so the running turn (if any) finishes on the old config
+    /// and the next turn picks up the new one.
+    pending_swap: Option<PendingConfigSwap>,
+}
+
+/// A configuration change that has been written to disk but is waiting for
+/// the next turn boundary to take effect. The provider is optional because
+/// many fields (verbosity, permissions, telemetry endpoint) reuse the
+/// existing LLM client.
+#[derive(Clone)]
+pub struct PendingConfigSwap {
+    pub config: AppConfig,
+    pub provider: Option<Arc<dyn LlmProvider>>,
+    pub display_note: Option<String>,
 }
 
 impl Agent {
@@ -1323,7 +1338,58 @@ impl Agent {
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
             replay,
+            pending_swap: None,
         }
+    }
+
+    /// Borrow the current effective config.
+    pub fn config(&self) -> &AppConfig {
+        &self.config
+    }
+
+    /// Clone the current effective config — used by the config screen to
+    /// initialize its editing buffer.
+    pub fn config_snapshot(&self) -> AppConfig {
+        self.config.clone()
+    }
+
+    /// Replace the in-process config immediately. Use for Immediate-tier
+    /// saves: verbosity, permissions, telemetry on/off — fields that are
+    /// consulted fresh on each operation. Fields baked into derived state at
+    /// build time (tools/MCP/redactor) are NOT rebuilt; pair this with the
+    /// "restart required" badge in the UI for those.
+    pub fn replace_config(&mut self, next: AppConfig) {
+        self.config = next;
+    }
+
+    /// Replace the LLM client. The in-flight turn (if any) holds a clone of
+    /// the old `Arc` so it finishes against the old client; subsequent turns
+    /// pick up the new one.
+    pub fn replace_provider(&mut self, next: Arc<dyn LlmProvider>, model: String) {
+        self.provider = next;
+        self.config.model = model;
+    }
+
+    /// Queue a NextPrompt-tier swap. Drained by `drain_pending_swap()` at the
+    /// top of the next user turn so the running turn is undisturbed.
+    pub fn arm_config_swap(&mut self, swap: PendingConfigSwap) {
+        self.pending_swap = Some(swap);
+    }
+
+    pub fn pending_config_swap(&self) -> Option<&PendingConfigSwap> {
+        self.pending_swap.as_ref()
+    }
+
+    /// Apply the queued swap (if any) and return it for telemetry / display.
+    /// Call this from the TUI immediately before `start_turn()` so the new
+    /// config takes effect for the very next request.
+    pub fn drain_pending_swap(&mut self) -> Option<PendingConfigSwap> {
+        let swap = self.pending_swap.take()?;
+        self.config = swap.config.clone();
+        if let Some(provider) = swap.provider.clone() {
+            self.provider = provider;
+        }
+        Some(swap)
     }
 
     /// Snapshot of session-scoped permission rules. Primarily intended for

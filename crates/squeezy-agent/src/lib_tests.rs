@@ -2685,3 +2685,44 @@ fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
         "review should synthesize a default prompt"
     );
 }
+
+#[test]
+fn replace_config_swaps_immediately() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![]));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    assert_eq!(
+        agent.config_snapshot().tui.response_verbosity,
+        squeezy_core::ResponseVerbosity::Normal
+    );
+    let mut next = agent.config_snapshot();
+    next.tui.response_verbosity = squeezy_core::ResponseVerbosity::Concise;
+    agent.replace_config(next);
+    assert_eq!(
+        agent.config_snapshot().tui.response_verbosity,
+        squeezy_core::ResponseVerbosity::Concise
+    );
+    assert!(agent.pending_config_swap().is_none());
+}
+
+#[test]
+fn arm_then_drain_applies_swap_with_optional_provider() {
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(vec![]));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    let original_model = agent.config_snapshot().model.clone();
+
+    let mut next = agent.config_snapshot();
+    next.model = "claude-opus-4-7".to_string();
+    agent.arm_config_swap(PendingConfigSwap {
+        config: next,
+        provider: None,
+        display_note: Some("model swap".to_string()),
+    });
+    // Pre-drain: still the old config.
+    assert_eq!(agent.config_snapshot().model, original_model);
+    assert!(agent.pending_config_swap().is_some());
+
+    let drained = agent.drain_pending_swap().expect("swap was armed");
+    assert_eq!(drained.display_note.as_deref(), Some("model swap"));
+    assert_eq!(agent.config_snapshot().model, "claude-opus-4-7");
+    assert!(agent.pending_config_swap().is_none());
+}

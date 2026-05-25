@@ -10,6 +10,9 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod config_schema;
+pub mod settings_writer;
+
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -4893,6 +4896,117 @@ fn load_default_settings_sources() -> Result<(SettingsFile, Vec<String>)> {
         project_path.as_deref(),
         Some(repo_path.as_path()),
     )
+}
+
+/// A single tier's settings file as both its parsed form and its raw
+/// `toml_edit` document. The document is what the writer mutates so saves
+/// preserve user-authored comments and formatting. The path is what the UI
+/// shows when the user asks "where does this value live?"
+#[derive(Debug, Clone)]
+pub struct TierSource {
+    pub path: PathBuf,
+    pub doc: toml_edit::DocumentMut,
+}
+
+impl TierSource {
+    /// Whether this tier explicitly sets the leaf at `path`. Walks the parent
+    /// tables and reports `true` only when the final segment is present.
+    pub fn contains_path(&self, path: &[&str]) -> bool {
+        if path.is_empty() {
+            return false;
+        }
+        let (leaf, parents) = path.split_last().unwrap();
+        let mut current = self.doc.as_table();
+        for seg in parents {
+            match current.get(seg) {
+                Some(toml_edit::Item::Table(t)) => current = t,
+                _ => return false,
+            }
+        }
+        current.contains_key(leaf)
+    }
+}
+
+/// The three tier files plus the effective merged config. Used by the config
+/// screen to compute per-leaf inheritance badges.
+#[derive(Debug, Clone)]
+pub struct SeparatedSources {
+    pub user: Option<TierSource>,
+    pub project: Option<TierSource>,
+    pub repo: Option<TierSource>,
+    pub user_path_default: PathBuf,
+    pub project_path_default: PathBuf,
+}
+
+/// Loads each tier separately so the UI can compute inheritance per leaf.
+/// Reads each file independently (no merging here).
+pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
+    let user_path = default_settings_path();
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_path = find_project_settings_path(&cwd);
+    let repo_root = project_path
+        .as_deref()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| cwd.clone());
+    let repo_path = per_repo_settings_path(&repo_root);
+
+    let user = load_tier_source(&user_path)?;
+    let project = match project_path.as_ref() {
+        Some(p) => load_tier_source(p)?,
+        None => None,
+    };
+    let repo = load_tier_source(&repo_path)?;
+    let project_path_default =
+        project_path.unwrap_or_else(|| repo_root.join(PROJECT_SETTINGS_FILE));
+    Ok(SeparatedSources {
+        user,
+        project,
+        repo,
+        user_path_default: user_path,
+        project_path_default,
+    })
+}
+
+fn load_tier_source(path: &Path) -> Result<Option<TierSource>> {
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+                SqueezyError::Config(format!("toml_edit parse {}: {err}", path.display()))
+            })?;
+            Ok(Some(TierSource {
+                path: path.to_path_buf(),
+                doc,
+            }))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Resolves which tier owns a leaf, using repo > project > user > default
+/// precedence (repo wins because that's how the merge composes — last write
+/// in `load_settings_from_paths` is the effective value).
+pub fn resolve_field_source(
+    sources: &SeparatedSources,
+    path: &[&str],
+) -> config_schema::FieldSource {
+    if let Some(repo) = &sources.repo
+        && repo.contains_path(path)
+    {
+        return config_schema::FieldSource::Repo;
+    }
+    if let Some(project) = &sources.project
+        && project.contains_path(path)
+    {
+        return config_schema::FieldSource::Project;
+    }
+    if let Some(user) = &sources.user
+        && user.contains_path(path)
+    {
+        return config_schema::FieldSource::User;
+    }
+    config_schema::FieldSource::Default
 }
 
 fn load_settings_from_paths(
