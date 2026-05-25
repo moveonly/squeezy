@@ -3671,6 +3671,7 @@ fn test_job(id: JobId, status: JobStatus) -> JobSnapshot {
         turn_id: Some(TurnId::new(1)),
         tool_name: Some("shell".to_string()),
         call_id: Some(format!("call_{id}")),
+        subagent_id: None,
         created_at_ms: 1,
         updated_at_ms: 1,
         ended_at_ms: None,

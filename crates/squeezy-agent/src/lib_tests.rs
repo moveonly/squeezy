@@ -1937,13 +1937,20 @@ fn advertised_tool_specs_are_mode_aware() {
 fn control_tools_are_advertised_in_build_and_plan_modes() {
     let tools = core_control_tools(&SubagentConfig::default());
 
+    let expected = vec![
+        DELEGATE_TOOL_NAME,
+        EXPLORE_TOOL_NAME,
+        DELEGATE_PLAN_TOOL_NAME,
+        DELEGATE_REVIEW_TOOL_NAME,
+    ];
+
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(build_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(build_names, expected);
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(plan_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
+    assert_eq!(plan_names, expected);
 }
 
 #[test]
@@ -1966,7 +1973,14 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(names, vec![DELEGATE_TOOL_NAME.to_string()]);
+    assert_eq!(
+        names,
+        vec![
+            DELEGATE_TOOL_NAME.to_string(),
+            DELEGATE_PLAN_TOOL_NAME.to_string(),
+            DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        ]
+    );
 }
 
 #[test]
@@ -2550,4 +2564,123 @@ fn write_skill(dir: &Path, name: &str, triggers: &[&str]) {
         ),
     )
     .expect("write skill");
+}
+
+#[test]
+fn subagent_registry_caps_concurrency() {
+    let registry = SubagentRegistry::default();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..SUBAGENT_MAX_CONCURRENT {
+        let lease = registry
+            .start(
+                roles::SubagentRole::Explorer,
+                cancel.child_token(),
+                SUBAGENT_MAX_CONCURRENT,
+                format!("slot {slot}"),
+            )
+            .expect("starting under the cap should succeed");
+        leases.push(lease);
+    }
+    let err = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "overflow",
+        )
+        .expect_err("starting past the cap should fail");
+    assert!(
+        err.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
+        "cap error should mention the limit: {err}"
+    );
+    drop(leases.pop());
+    let lease = registry
+        .start(
+            roles::SubagentRole::Explorer,
+            cancel.child_token(),
+            SUBAGENT_MAX_CONCURRENT,
+            "after drop",
+        )
+        .expect("dropping a lease frees a slot");
+    drop(lease);
+    drop(leases);
+}
+
+#[test]
+fn core_control_tools_includes_new_delegate_planner_reviewer() {
+    let config = SubagentConfig {
+        enabled: true,
+        explore_enabled: true,
+        ..SubagentConfig::default()
+    };
+    let names: Vec<_> = core_control_tools(&config)
+        .into_iter()
+        .map(|tool| tool.spec.name)
+        .collect();
+    assert!(names.iter().any(|n| n == DELEGATE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_PLAN_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_REVIEW_TOOL_NAME));
+}
+
+#[test]
+fn core_control_tools_drops_all_when_subagents_disabled() {
+    let config = SubagentConfig {
+        enabled: false,
+        ..SubagentConfig::default()
+    };
+    assert!(core_control_tools(&config).is_empty());
+}
+
+#[test]
+fn subagent_kind_role_does_not_overlay_delegate() {
+    // Delegate's broader research tool set is intentionally not constrained
+    // by the Worker role (which is roadmap). Other kinds must map to an
+    // active role overlay.
+    assert!(SubagentKind::Delegate.role().is_none());
+    assert_eq!(
+        SubagentKind::Explore.role(),
+        Some(roles::SubagentRole::Explorer)
+    );
+    assert_eq!(
+        SubagentKind::Plan.role(),
+        Some(roles::SubagentRole::Planner)
+    );
+    assert_eq!(
+        SubagentKind::Review.role(),
+        Some(roles::SubagentRole::Reviewer)
+    );
+}
+
+#[test]
+fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
+    let plan_call = ToolCall {
+        call_id: "c1".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let err = parse_subagent_request(&plan_call, SubagentKind::Plan)
+        .expect_err("plan without goal must error");
+    assert!(err.contains("goal"), "error should mention goal: {err}");
+
+    let plan_call = ToolCall {
+        call_id: "c2".to_string(),
+        name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+        arguments: json!({ "goal": "add tracing to ingest pipeline" }),
+    };
+    let request = parse_subagent_request(&plan_call, SubagentKind::Plan).expect("plan args valid");
+    assert!(request.prompt.contains("ingest"));
+
+    let review_call = ToolCall {
+        call_id: "c3".to_string(),
+        name: DELEGATE_REVIEW_TOOL_NAME.to_string(),
+        arguments: json!({}),
+    };
+    let request =
+        parse_subagent_request(&review_call, SubagentKind::Review).expect("review accepts empty");
+    assert!(
+        !request.prompt.is_empty(),
+        "review should synthesize a default prompt"
+    );
 }
