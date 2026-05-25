@@ -2087,3 +2087,57 @@ fn init_user_template_contains_no_uncommented_assignments() {
         panic!("user template line should be commented or sectional, got: {trimmed:?}");
     }
 }
+
+#[test]
+fn tier_source_contains_path_walks_nested_tables() {
+    let doc: toml_edit::DocumentMut =
+        "[model]\nprovider = \"openai\"\n[mcp.servers.docs]\ncommand = \"x\"\n"
+            .parse()
+            .unwrap();
+    let tier = TierSource {
+        path: PathBuf::from("/tmp/nope.toml"),
+        doc,
+    };
+    assert!(tier.contains_path(&["model", "provider"]));
+    assert!(!tier.contains_path(&["model", "model"]));
+    assert!(tier.contains_path(&["mcp", "servers", "docs", "command"]));
+    assert!(!tier.contains_path(&["mcp", "servers", "other", "command"]));
+    assert!(!tier.contains_path(&[]));
+}
+
+#[test]
+fn resolve_field_source_uses_repo_then_project_then_user() {
+    let user_doc: toml_edit::DocumentMut = "[model]\nprovider = \"openai\"\nmodel = \"gpt-5\"\n"
+        .parse()
+        .unwrap();
+    let project_doc: toml_edit::DocumentMut = "[model]\nmodel = \"gpt-4\"\n".parse().unwrap();
+    let repo_doc: toml_edit::DocumentMut = "".parse().unwrap();
+    let sources = SeparatedSources {
+        user: Some(TierSource {
+            path: PathBuf::from("/u.toml"),
+            doc: user_doc,
+        }),
+        project: Some(TierSource {
+            path: PathBuf::from("/p.toml"),
+            doc: project_doc,
+        }),
+        repo: Some(TierSource {
+            path: PathBuf::from("/r.toml"),
+            doc: repo_doc,
+        }),
+        user_path_default: PathBuf::from("/u.toml"),
+        project_path_default: PathBuf::from("/p.toml"),
+    };
+    assert_eq!(
+        resolve_field_source(&sources, &["model", "provider"]),
+        config_schema::FieldSource::User
+    );
+    assert_eq!(
+        resolve_field_source(&sources, &["model", "model"]),
+        config_schema::FieldSource::Project
+    );
+    assert_eq!(
+        resolve_field_source(&sources, &["model", "profile"]),
+        config_schema::FieldSource::Default
+    );
+}

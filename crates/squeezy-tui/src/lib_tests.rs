@@ -129,6 +129,102 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn slash_plan_with_trailing_space_still_switches_mode() {
+    // Regression for the old Enter-time pre-intercept that compared the
+    // trimmed input via `mode_command` and silently dropped `/plan ` (with
+    // trailing whitespace) when the slash command flow had no `/plan` arm.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    set_input(&mut app, "/plan ".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert!(app.input.is_empty());
+}
+
+#[tokio::test]
+async fn slash_config_opens_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some(), "config screen should be open");
+}
+
+#[tokio::test]
+async fn slash_model_opens_config_at_models_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/model".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Models
+    );
+}
+
+#[tokio::test]
+async fn slash_config_with_section_argument_focuses_section() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/config permissions".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let state = app.config_screen.expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Permissions
+    );
+}
+
+#[tokio::test]
+async fn f11_toggles_config_screen() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.config_screen.is_none());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_some());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(app.config_screen.is_none());
+}
+
+#[tokio::test]
 async fn slash_plan_and_build_force_modes() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -4264,84 +4360,45 @@ fn sample_attachment(id: &str) -> ContextAttachment {
     }
 }
 
-// ---- F41: model/verbosity overlay ----
+// ---- /verbosity inline back-compat ----
+//
+// `/model`, `/permissions`, `/verbosity`, and `/tool-verbosity` open the
+// `/config` screen focused on the matching section; the original overlay
+// flow was replaced by the full editor. Section-routing coverage lives in
+// `slash_model_opens_config_at_models_section` and friends below.
 
 #[tokio::test]
-async fn slash_model_opens_overlay_with_registry_entries() {
+async fn slash_verbosity_with_inline_arg_applies_immediately() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-
-    let ran = handle_slash_command(&mut app, &mut agent, "/model").await;
-    assert!(ran, "/model should execute");
-    assert!(app.overlay.is_some(), "overlay should be set");
-
-    let rendered = render_inline_to_string(&app, 120, 24);
+    app.response_verbosity = ResponseVerbosity::Normal;
+    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity verbose").await;
+    assert!(ran);
     assert!(
-        rendered.contains("Select model"),
-        "header missing: {rendered}"
+        app.config_screen.is_none(),
+        "inline form should not open the screen"
     );
-    // Some registry entry's id should appear.
-    let mut found = false;
-    for model in squeezy_llm::MODEL_REGISTRY.iter() {
-        if rendered.contains(model.id) {
-            found = true;
-            break;
-        }
-    }
-    assert!(found, "no model id appeared in overlay: {rendered}");
+    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
+    assert_eq!(
+        agent.config_snapshot().tui.response_verbosity,
+        ResponseVerbosity::Verbose
+    );
 }
 
 #[tokio::test]
-async fn slash_verbosity_opens_overlay_without_arg() {
+async fn slash_verbosity_opens_config_when_called_without_arg() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
     assert!(ran);
-    let rendered = render_inline_to_string(&app, 120, 24);
-    assert!(rendered.contains("Select response verbosity"), "{rendered}");
-}
-
-#[tokio::test]
-async fn overlay_enter_applies_verbosity_selection() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    app.response_verbosity = ResponseVerbosity::Normal;
-    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    assert!(app.overlay.is_some());
-    // The default index is "normal" — move down once to verbose.
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-    )
-    .await
-    .expect("down");
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-    )
-    .await
-    .expect("enter");
-    assert!(app.overlay.is_none(), "overlay should close after Enter");
-    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
-}
-
-#[tokio::test]
-async fn overlay_esc_cancels_without_change() {
-    let mut agent = test_agent(SessionMode::Build);
-    let mut app = test_app(SessionMode::Build);
-    let original = app.response_verbosity;
-    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
-    handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("esc");
-    assert!(app.overlay.is_none());
-    assert_eq!(app.response_verbosity, original);
+    let state = app
+        .config_screen
+        .as_ref()
+        .expect("config screen should be open");
+    assert_eq!(
+        state.current_section().id,
+        squeezy_core::config_schema::SectionId::Verbosity
+    );
 }
 
 // ---- F37: @-mention composer ----
