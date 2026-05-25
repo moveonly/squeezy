@@ -3,7 +3,7 @@ use std::env;
 use futures_util::StreamExt;
 use squeezy_core::{
     AnthropicConfig, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_ANTHROPIC_MODEL,
-    DEFAULT_MAX_OUTPUT_TOKENS, Result, SqueezyError,
+    DEFAULT_MAX_OUTPUT_TOKENS, ProviderTransportConfig, Result, SqueezyError,
 };
 use squeezy_llm::{AnthropicProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use tokio_util::sync::CancellationToken;
@@ -24,6 +24,7 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
         api_key_env: ANTHROPIC_KEY_ENV.to_string(),
         base_url: env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
+        transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {
         model: env::var("SQUEEZY_COSTLY_ANTHROPIC_MODEL")
@@ -37,6 +38,7 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };

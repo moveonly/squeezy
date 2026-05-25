@@ -1,0 +1,418 @@
+[
+  {
+    "provider": "openai",
+    "id": "gpt-5.5",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 5000000,
+      "output_usd_micros_per_mtok": 30000000,
+      "cache_read_usd_micros_per_mtok": 500000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/guides/latest-model.md"
+  },
+  {
+    "provider": "openai",
+    "id": "gpt-5.4-mini",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 750000,
+      "output_usd_micros_per_mtok": 4500000,
+      "cache_read_usd_micros_per_mtok": 75000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/pricing"
+  },
+  {
+    "provider": "openai",
+    "id": "gpt-5.4-nano",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 200000,
+      "output_usd_micros_per_mtok": 1250000,
+      "cache_read_usd_micros_per_mtok": 20000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/pricing"
+  },
+  {
+    "provider": "anthropic",
+    "id": "claude-opus-4-7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 15000000,
+      "output_usd_micros_per_mtok": 75000000,
+      "cache_read_usd_micros_per_mtok": 1500000,
+      "cache_write_usd_micros_per_mtok": 18750000
+    },
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+  },
+  {
+    "provider": "anthropic",
+    "id": "claude-sonnet-4-6",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 3000000,
+      "output_usd_micros_per_mtok": 15000000,
+      "cache_read_usd_micros_per_mtok": 300000,
+      "cache_write_usd_micros_per_mtok": 3750000
+    },
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+  },
+  {
+    "provider": "anthropic",
+    "id": "claude-haiku-4-5-20251001",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1000000,
+      "output_usd_micros_per_mtok": 5000000,
+      "cache_read_usd_micros_per_mtok": 100000,
+      "cache_write_usd_micros_per_mtok": 1250000
+    },
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://platform.claude.com/docs/en/about-claude/models/overview"
+  },
+  {
+    "provider": "google",
+    "id": "gemini-2.5-pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1250000,
+      "output_usd_micros_per_mtok": 10000000,
+      "cache_read_usd_micros_per_mtok": 310000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://ai.google.dev/gemini-api/docs/models"
+  },
+  {
+    "provider": "google",
+    "id": "gemini-2.5-flash",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 300000,
+      "output_usd_micros_per_mtok": 2500000,
+      "cache_read_usd_micros_per_mtok": 75000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://ai.google.dev/gemini-api/docs/models"
+  },
+  {
+    "provider": "google",
+    "id": "gemini-2.5-flash-lite",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 100000,
+      "output_usd_micros_per_mtok": 400000,
+      "cache_read_usd_micros_per_mtok": 25000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://ai.google.dev/gemini-api/docs/models"
+  },
+  {
+    "provider": "azure_openai",
+    "id": "gpt-5.5",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 5000000,
+      "output_usd_micros_per_mtok": 30000000,
+      "cache_read_usd_micros_per_mtok": 500000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/guides/latest-model.md"
+  },
+  {
+    "provider": "azure_openai",
+    "id": "gpt-5.4-mini",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 750000,
+      "output_usd_micros_per_mtok": 4500000,
+      "cache_read_usd_micros_per_mtok": 75000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/pricing"
+  },
+  {
+    "provider": "azure_openai",
+    "id": "gpt-5.4-nano",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": true,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
+      "text_verbosity": true,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 200000,
+      "output_usd_micros_per_mtok": 1250000,
+      "cache_read_usd_micros_per_mtok": 20000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://developers.openai.com/api/docs/pricing"
+  },
+  {
+    "provider": "bedrock",
+    "id": "anthropic.claude-haiku-4-5-20251001-v1:0",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": true
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1000000,
+      "output_usd_micros_per_mtok": 5000000,
+      "cache_read_usd_micros_per_mtok": 100000,
+      "cache_write_usd_micros_per_mtok": 1250000
+    },
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-anthropic-claude-haiku-4-5.html"
+  },
+  {
+    "provider": "ollama",
+    "id": "qwen3-coder",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 0,
+      "output_usd_micros_per_mtok": 0,
+      "cache_read_usd_micros_per_mtok": 0,
+      "cache_write_usd_micros_per_mtok": 0
+    },
+    "limits": null,
+    "tokenizer": "ollama",
+    "lifecycle": "local",
+    "metadata_source": "runtime ollama /api/show metadata"
+  }
+]

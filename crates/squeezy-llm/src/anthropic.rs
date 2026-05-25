@@ -1,13 +1,18 @@
-use std::{collections::BTreeMap, env};
+use std::collections::BTreeMap;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{AnthropicConfig, CostSnapshot, Result, SqueezyError};
+use squeezy_core::{AnthropicConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use crate::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    credentials::resolve_api_key,
+    retry::{RetryPolicy, idle_timeout, send_with_retry},
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
@@ -17,6 +22,7 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    transport: ProviderTransportConfig,
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -25,23 +31,26 @@ impl std::fmt::Debug for AnthropicProvider {
             .field("client", &self.client)
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
             .finish()
     }
 }
 
 impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
-        let api_key = env::var(&config.api_key_env).map_err(|_| {
-            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
-        })?;
+        let api_key = resolve_api_key(&config.api_key_env)?;
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
+            transport: config.transport,
         })
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        let prompt_caching = request.cache_key.is_some()
+            && crate::capabilities_for("anthropic", &request.model)
+                .is_some_and(|capabilities| capabilities.prompt_caching);
         let max_tokens = request
             .max_output_tokens
             .map(u64::from)
@@ -53,8 +62,8 @@ impl AnthropicProvider {
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
         let mut body = json!({
             "model": request.model,
-            "system": request.instructions,
-            "messages": anthropic_messages(&request.input),
+            "system": anthropic_system(&request.instructions, prompt_caching),
+            "messages": anthropic_messages(&request.input, prompt_caching),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -77,7 +86,18 @@ impl AnthropicProvider {
     }
 }
 
-fn anthropic_messages(input: &[LlmInputItem]) -> Value {
+fn anthropic_system(instructions: &str, prompt_caching: bool) -> Value {
+    if !prompt_caching {
+        return json!(instructions);
+    }
+    json!([{
+        "type": "text",
+        "text": instructions,
+        "cache_control": { "type": "ephemeral" },
+    }])
+}
+
+fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
     let mut messages = Vec::new();
     for item in input {
         match item {
@@ -122,7 +142,27 @@ fn anthropic_messages(input: &[LlmInputItem]) -> Value {
             ),
         }
     }
+    if prompt_caching {
+        mark_last_user_block_for_cache(&mut messages);
+    }
     Value::Array(messages)
+}
+
+fn mark_last_user_block_for_cache(messages: &mut [Value]) {
+    for message in messages.iter_mut().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if let Some(block) = message
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|content| content.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            block.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+        }
+        return;
+    }
 }
 
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
@@ -150,22 +190,16 @@ impl LlmProvider for AnthropicProvider {
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
         let body = Self::request_body(&request);
+        let transport = self.transport;
 
         Box::pin(try_stream! {
-            let response_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                response = client
+            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+                client
                     .post(&url)
-                    .header("x-api-key", api_key)
+                    .header("x-api-key", api_key.clone())
                     .header("anthropic-version", ANTHROPIC_VERSION)
                     .json(&body)
-                    .send() => response,
-            };
-            let response = response_result
-                .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
+            }).await?;
 
             let status = response.status();
             let response = if status == StatusCode::OK {
@@ -185,13 +219,18 @@ impl LlmProvider for AnthropicProvider {
             let mut state = AnthropicStreamState::default();
             let mut saw_completed = false;
             let mut bytes = response.bytes_stream();
-            while let Some(chunk) = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                chunk = bytes.next() => chunk
-            } {
+            loop {
+                let polled = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        yield LlmEvent::Cancelled;
+                        return;
+                    }
+                    next = timeout(idle_timeout(transport), bytes.next()) => next,
+                };
+                let next = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("Anthropic stream idle timeout".to_string())
+                })?;
+                let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     if let Some(llm_event) = parse_anthropic_event(&event, &mut state)? {

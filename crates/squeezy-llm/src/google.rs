@@ -1,19 +1,25 @@
-use std::{collections::BTreeMap, env};
+use std::collections::BTreeMap;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{CostSnapshot, GoogleConfig, Result, SqueezyError};
+use squeezy_core::{CostSnapshot, GoogleConfig, ProviderTransportConfig, Result, SqueezyError};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use crate::{
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    credentials::resolve_api_key,
+    retry::{RetryPolicy, idle_timeout, send_with_retry},
+};
 
 #[derive(Clone)]
 pub struct GoogleProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    transport: ProviderTransportConfig,
 }
 
 impl std::fmt::Debug for GoogleProvider {
@@ -22,19 +28,19 @@ impl std::fmt::Debug for GoogleProvider {
             .field("client", &self.client)
             .field("api_key", &"<redacted>")
             .field("base_url", &self.base_url)
+            .field("transport", &self.transport)
             .finish()
     }
 }
 
 impl GoogleProvider {
     pub fn from_config(config: &GoogleConfig) -> Result<Self> {
-        let api_key = env::var(&config.api_key_env).map_err(|_| {
-            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
-        })?;
+        let api_key = resolve_api_key(&config.api_key_env)?;
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,
             base_url: config.base_url.trim_end_matches('/').to_string(),
+            transport: config.transport,
         })
     }
 
@@ -82,21 +88,15 @@ impl LlmProvider for GoogleProvider {
         let url = google_stream_url(&self.base_url, &request.model);
         let api_key = self.api_key.clone();
         let body = Self::request_body(&request);
+        let transport = self.transport;
 
         Box::pin(try_stream! {
-            let response_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                response = client
+            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+                client
                     .post(&url)
                     .header("x-goog-api-key", &api_key)
                     .json(&body)
-                    .send() => response,
-            };
-            let response = response_result
-                .map_err(|err| SqueezyError::ProviderRequest(err.to_string()))?;
+            }).await?;
             let status = response.status();
             let response = if status == StatusCode::OK {
                 response
@@ -114,13 +114,18 @@ impl LlmProvider for GoogleProvider {
             let mut last_cost = CostSnapshot::default();
             let mut saw_any = false;
             let mut bytes = response.bytes_stream();
-            while let Some(chunk) = tokio::select! {
-                _ = cancel.cancelled() => {
-                    yield LlmEvent::Cancelled;
-                    return;
-                }
-                chunk = bytes.next() => chunk
-            } {
+            loop {
+                let polled = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        yield LlmEvent::Cancelled;
+                        return;
+                    }
+                    next = timeout(idle_timeout(transport), bytes.next()) => next,
+                };
+                let next = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("Google stream idle timeout".to_string())
+                })?;
+                let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     saw_any = true;

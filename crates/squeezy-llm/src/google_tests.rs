@@ -29,6 +29,7 @@ fn request_body_uses_generate_content_shape() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: vec![LlmToolSpec {
             name: "read_file".to_string(),
             description: "read".to_string(),
@@ -60,6 +61,7 @@ fn request_body_preserves_function_tool_order() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -106,6 +108,7 @@ fn request_body_preserves_function_response_name() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };

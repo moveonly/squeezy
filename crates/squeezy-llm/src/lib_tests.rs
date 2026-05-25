@@ -14,6 +14,7 @@ async fn unavailable_provider_reports_configuration_error() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -154,6 +155,7 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -163,14 +165,23 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
 
     assert!(estimate.input_tokens > 0);
     assert_eq!(estimate.context_window_tokens, Some(400_000));
+    // 95% of the raw window, minus a fixed 12_000-token baseline reserved
+    // for system framing.
+    assert_eq!(estimate.effective_context_window_tokens, Some(368_000));
+    // Headroom = raw window - effective window.
+    assert_eq!(estimate.headroom_tokens, Some(32_000));
     assert_eq!(estimate.max_output_tokens, Some(128));
-    assert_eq!(estimate.input_budget_tokens, Some(399_872));
-    assert!(estimate.remaining_input_tokens.unwrap() < 399_872);
+    // Effective window minus max_output_tokens.
+    assert_eq!(estimate.input_budget_tokens, Some(367_872));
+    assert!(estimate.remaining_input_tokens.unwrap() < 367_872);
     assert!(estimate.used_input_percent_x100.is_some());
 }
 
 #[test]
-fn request_context_estimate_omits_budget_when_model_limit_is_unknown() {
+fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
+    // The bundled registry now ships a fallback metadata path so unknown
+    // model ids still get useful headroom/budget figures instead of empty
+    // optionals.
     let request = LlmRequest {
         model: "custom-model".to_string(),
         instructions: "system".to_string(),
@@ -179,6 +190,7 @@ fn request_context_estimate_omits_budget_when_model_limit_is_unknown() {
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
+        cache_key: None,
         tools: Vec::new(),
         store: false,
     };
@@ -186,8 +198,10 @@ fn request_context_estimate_omits_budget_when_model_limit_is_unknown() {
     let estimate = estimate_request_context("openai", "custom-model", &request, None);
 
     assert!(estimate.input_tokens > 0);
-    assert_eq!(estimate.context_window_tokens, None);
-    assert_eq!(estimate.input_budget_tokens, None);
-    assert_eq!(estimate.remaining_input_tokens, None);
-    assert_eq!(estimate.used_input_percent_x100, None);
+    assert_eq!(estimate.context_window_tokens, Some(272_000));
+    assert!(estimate.effective_context_window_tokens.unwrap() < 272_000);
+    assert!(estimate.headroom_tokens.unwrap() > 0);
+    assert!(estimate.input_budget_tokens.unwrap() > 0);
+    assert!(estimate.remaining_input_tokens.is_some());
+    assert!(estimate.used_input_percent_x100.is_some());
 }
