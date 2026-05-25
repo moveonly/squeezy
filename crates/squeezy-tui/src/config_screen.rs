@@ -293,15 +293,19 @@ pub(crate) fn handle_key(
                 );
                 return KeyOutcome::KeepOpen;
             }
-            // Space cycles to the next value inline for Bool / Enum /
-            // OptionalEnum so the user can flip simple settings without
-            // opening the editor.
-            let next: Option<FieldValue> = match (field.kind, (field.get)(&state.effective)) {
+            // Space cycles to the next value inline for any field where
+            // "next" is well-defined: Bool toggles, Enum/OptionalEnum advance,
+            // and the model field cycles through `squeezy_llm` registry
+            // entries scoped to the current provider. Anything else surfaces
+            // a notification so the user knows Space isn't a no-op by
+            // accident.
+            let current_value = (field.get)(&state.effective);
+            let next: Option<FieldValue> = match (field.kind, &current_value) {
                 (FieldKind::Bool, FieldValue::Bool(b)) => Some(FieldValue::Bool(!b)),
                 (FieldKind::Enum { options }, FieldValue::Enum(current)) => {
                     let idx = options
                         .iter()
-                        .position(|o| *o == current)
+                        .position(|o| *o == *current)
                         .map(|i| (i + 1) % options.len())
                         .unwrap_or(0);
                     Some(FieldValue::Enum(options[idx]))
@@ -316,13 +320,24 @@ pub(crate) fn handle_key(
                     };
                     Some(FieldValue::OptionalEnum(next_idx.map(|i| options[i])))
                 }
+                _ if field.toml_path == ["model", "model"] => {
+                    cycle_to_next_registry_model(&state.effective, &current_value)
+                }
                 _ => None,
             };
-            if let Some(next) = next
-                && (field.set)(&mut state.effective, next.clone()).is_ok()
-            {
-                state.dirty = true;
-                save_field(state, agent, notifications, field, next);
+            if let Some(next) = next {
+                if (field.set)(&mut state.effective, next.clone()).is_ok() {
+                    state.dirty = true;
+                    save_field(state, agent, notifications, field, next);
+                }
+            } else {
+                notifications.push(
+                    format!(
+                        "Space doesn't cycle {} — press Enter to edit.",
+                        field.label
+                    ),
+                    NotifySeverity::Info,
+                );
             }
             KeyOutcome::KeepOpen
         }
@@ -758,6 +773,35 @@ fn integer_editor_key(
 // ─── Save pipeline ───────────────────────────────────────────────────────────
 
 // ─── Model picker ─────────────────────────────────────────────────────────────
+
+/// Find the next model id from the `squeezy_llm` registry for the currently
+/// configured provider. Returns `None` when the provider has no registry
+/// entries (e.g. ollama on first run) so the caller can surface a hint
+/// instead of silently no-op.
+pub(crate) fn cycle_to_next_registry_model(
+    effective: &AppConfig,
+    current_value: &FieldValue,
+) -> Option<FieldValue> {
+    let provider = match (CONFIG_SECTIONS[0].fields[0].get)(effective) {
+        FieldValue::Enum(s) => s,
+        _ => "openai",
+    };
+    let models: Vec<&'static squeezy_llm::ModelInfo> =
+        squeezy_llm::models_for_provider(provider).collect();
+    if models.is_empty() {
+        return None;
+    }
+    let current_id = match current_value {
+        FieldValue::String(s) => s.as_str(),
+        _ => "",
+    };
+    let next_idx = models
+        .iter()
+        .position(|m| m.id == current_id)
+        .map(|i| (i + 1) % models.len())
+        .unwrap_or(0);
+    Some(FieldValue::String(models[next_idx].id.to_string()))
+}
 
 fn picker_matches(state: &ModelPickerState) -> Vec<&'static squeezy_llm::ModelInfo> {
     let filter_lower = state.filter.to_lowercase();

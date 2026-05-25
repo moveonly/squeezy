@@ -215,6 +215,57 @@ async fn esc_on_model_picker_closes_picker_only() {
 }
 
 #[tokio::test]
+async fn space_cycles_model_field_to_next_registry_entry() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_MODEL");
+        std::env::remove_var("SQUEEZY_PROVIDER");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1; // model field
+    let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let after = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_ne!(before, after, "Space on model should advance to a different registry entry");
+}
+
+#[tokio::test]
+async fn space_on_non_cyclable_field_emits_hint() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Limits));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // max_parallel_tools is Integer — Space should surface a hint, not silently no-op.
+    state.field_index = 0;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let current = q.current().expect("hint notification queued");
+    assert!(
+        current.message.contains("Space doesn't cycle"),
+        "expected cycling hint, got: {}",
+        current.message
+    );
+}
+
+#[tokio::test]
 async fn space_cycles_enum_field_to_next_option() {
     use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
     // SAFETY: tests in this module run single-threaded.
