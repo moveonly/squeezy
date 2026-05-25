@@ -30,13 +30,19 @@ cargo build --release -p squeezy --target aarch64-apple-darwin
 CI smoke-tests both debug and release artifacts with:
 
 ```sh
-squeezy --health
+squeezy doctor
 ```
 
-`squeezy --health` prints `squeezy: ok` followed by `key=value` lines. Today it
-emits `config_sources`, `config_source_labels`, and `help_hint`; consumers must
-tolerate new keys being appended at the end. The `help_hint` line points users
-at the TUI `/help <topic>` command for local Squeezy help.
+`squeezy doctor` prints a `squeezy: ok` (or `squeezy: ok (warnings)` /
+`squeezy: fail`) header, the binary version and target triple, and one
+indented row per check in the form `[ok|warn|fail] name  detail`. Checks
+cover the merged config sources, the local repo profile, the configured
+provider's credential, the session-store path, and shell-sandbox tool
+availability. For machine-readable output, pass `--json`; the JSON object
+includes `failures`, `warnings`, and a `checks` array, and new fields may
+be appended in future releases. Consumers that smoke-test the binary
+should rely on the exit code (0 on success, non-zero on a hard failure)
+rather than parsing the human output.
 
 ## Linux
 
@@ -57,7 +63,7 @@ CI uses the musl target for Linux validation and artifact upload. The jobs set `
 - `cargo build --release -p squeezy --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../.github/workflows/release.yml))
 - `readelf -l` must not report a program interpreter.
 - `readelf -d` must not report dynamic `NEEDED` dependencies.
-- the binary must pass `--health`, `--version`, and `--help`.
+- the binary must pass `doctor`, `--version`, and `--help`.
 
 Manual CI runs accept an optional `checkout_ref` input for building a branch,
 tag, SHA, or pull request ref such as `refs/pull/123/merge`. Manual release

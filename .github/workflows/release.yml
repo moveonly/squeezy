@@ -136,7 +136,7 @@ jobs:
             fi
           fi
 
-          "$binary" --health
+          "$binary" doctor
           "$binary" --version
           "$binary" --help >/dev/null
 

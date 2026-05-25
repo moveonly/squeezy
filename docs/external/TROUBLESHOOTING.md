@@ -1,8 +1,13 @@
 # Troubleshooting
 
-Use `squeezy --health` first when startup or configuration looks wrong. It
-validates the merged configuration without opening the TUI and prints the source
-chain that contributed settings.
+Use `squeezy doctor` first when startup or configuration looks wrong. It
+validates configuration without opening the TUI, then runs a small set of
+checks (config sources, repo profile, configured provider credential,
+session store writeability, shell-sandbox tool availability) and reports
+each as `ok`, `warn`, or `fail`. Pass `--json` for machine-readable
+output suitable for scripts and CI smoke tests. Exit code is `0` on
+success (including warnings) and non-zero on a hard failure such as a
+broken config or an unwriteable session store.
 
 ## Provider Or Model Errors
 

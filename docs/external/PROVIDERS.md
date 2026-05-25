@@ -14,7 +14,7 @@ configuration system. From highest to lowest precedence:
 5. Built-in defaults
 
 See [`CONFIGURATION.md`](CONFIGURATION.md) for the merging rules and the
-`config inspect` / `--health` source reporting. The default user settings
+`config inspect` / `doctor` source reporting. The default user settings
 path can be overridden with `SQUEEZY_SETTINGS_PATH`.
 
 ## Settings File
