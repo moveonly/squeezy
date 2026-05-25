@@ -29,7 +29,7 @@ use squeezy_core::{
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolCall, LlmToolSpec,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
     RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context,
     fetch_ollama_context_window,
 };
@@ -84,6 +84,25 @@ const COMPACTION_DURABLE_LINES_LIMIT: usize = 24;
 const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
 const COMPACTION_RECEIPT_LINES_LIMIT: usize = 12;
 const COMPACTION_MAX_HISTORY: usize = 20;
+
+async fn next_llm_stream_event(
+    stream: &mut LlmStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> squeezy_core::Result<Option<LlmEvent>> {
+    let next = tokio::select! {
+        _ = cancel.cancelled() => return Ok(Some(LlmEvent::Cancelled)),
+        next = tokio::time::timeout(idle_timeout, stream.next()) => next,
+    };
+    match next {
+        Ok(Some(event)) => event.map(Some),
+        Ok(None) => Ok(None),
+        Err(_) => Err(SqueezyError::ProviderStream(format!(
+            "idle timeout waiting for model stream after {}ms",
+            idle_timeout.as_millis()
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct ConversationState {
@@ -2736,13 +2755,16 @@ impl TurnRuntime {
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
 
-            while let Some(event) = stream.next().await {
+            while let Some(event) =
+                next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
+                    .await?
+            {
                 if self.cancel.is_cancelled() {
                     self.finish_cancelled_turn(&task_title).await;
                     return Ok(());
                 }
                 match event {
-                    Ok(LlmEvent::Started) => {
+                    LlmEvent::Started => {
                         self.record_replay_model_started();
                         if self
                             .tx
@@ -2755,7 +2777,7 @@ impl TurnRuntime {
                             return Ok(());
                         }
                     }
-                    Ok(LlmEvent::TextDelta(delta)) => {
+                    LlmEvent::TextDelta(delta) => {
                         let chunk = assistant_stream.push(&delta);
                         if chunk.text.is_empty() {
                             continue;
@@ -2774,7 +2796,7 @@ impl TurnRuntime {
                             return Ok(());
                         }
                     }
-                    Ok(LlmEvent::ToolCall(tool_call)) => {
+                    LlmEvent::ToolCall(tool_call) => {
                         let call = ToolCall {
                             call_id: tool_call.call_id,
                             name: tool_call.name,
@@ -2804,10 +2826,10 @@ impl TurnRuntime {
                         }
                         tool_calls.push(call);
                     }
-                    Ok(LlmEvent::Completed {
+                    LlmEvent::Completed {
                         response_id: id,
                         mut cost,
-                    }) => {
+                    } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
                                 estimate_cost(self.provider.name(), &request_model, &cost);
@@ -2819,11 +2841,10 @@ impl TurnRuntime {
                         completed = true;
                         break;
                     }
-                    Ok(LlmEvent::Cancelled) => {
+                    LlmEvent::Cancelled => {
                         self.finish_cancelled_turn(&task_title).await;
                         return Ok(());
                     }
-                    Err(error) => return Err(error),
                 }
             }
 
@@ -3751,23 +3772,45 @@ async fn run_subagent_loop(
             .stream_response(llm_request, parent.cancel.child_token());
         let mut tool_calls = Vec::new();
         let mut completed = false;
-        while let Some(event) = stream.next().await {
+        loop {
+            let event = match next_llm_stream_event(
+                &mut stream,
+                &parent.cancel,
+                config.stream_idle_timeout,
+            )
+            .await
+            {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    broker.metrics.redactions += assistant_stream.total_redactions();
+                    return SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "failed",
+                        error: Some(error.to_string()),
+                        metrics: broker.metrics.clone(),
+                        supporting_receipts: std::mem::take(supporting_receipts),
+                        model,
+                    };
+                }
+            };
             match event {
-                Ok(LlmEvent::Started) => {}
-                Ok(LlmEvent::TextDelta(delta)) => {
+                LlmEvent::Started => {}
+                LlmEvent::TextDelta(delta) => {
                     let chunk = assistant_stream.push(&delta);
                     if !chunk.text.is_empty() {
                         assistant_message.push_str(&chunk.text);
                     }
                 }
-                Ok(LlmEvent::ToolCall(tool_call)) => {
+                LlmEvent::ToolCall(tool_call) => {
                     tool_calls.push(ToolCall {
                         call_id: tool_call.call_id,
                         name: tool_call.name,
                         arguments: tool_call.arguments,
                     });
                 }
-                Ok(LlmEvent::Completed { mut cost, .. }) => {
+                LlmEvent::Completed { mut cost, .. } => {
                     if cost.estimated_usd_micros.is_none() {
                         cost.estimated_usd_micros =
                             estimate_cost(parent.provider.name(), &request_model, &cost);
@@ -3776,25 +3819,13 @@ async fn run_subagent_loop(
                     completed = true;
                     break;
                 }
-                Ok(LlmEvent::Cancelled) => {
+                LlmEvent::Cancelled => {
                     broker.metrics.redactions += assistant_stream.total_redactions();
                     return SubagentExecution {
                         status: ToolStatus::Cancelled,
                         summary: String::new(),
                         status_label: "cancelled",
                         error: Some("subagent cancelled".to_string()),
-                        metrics: broker.metrics.clone(),
-                        supporting_receipts: std::mem::take(supporting_receipts),
-                        model,
-                    };
-                }
-                Err(error) => {
-                    broker.metrics.redactions += assistant_stream.total_redactions();
-                    return SubagentExecution {
-                        status: ToolStatus::Error,
-                        summary: String::new(),
-                        status_label: "failed",
-                        error: Some(error.to_string()),
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
@@ -5323,10 +5354,13 @@ Working target: {:?}",
         tools: Vec::new(),
         store: false,
     };
-    let mut stream = provider.stream_response(llm_request, cancel);
+    let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event.ok()? {
+    while let Some(event) = next_llm_stream_event(&mut stream, &cancel, config.stream_idle_timeout)
+        .await
+        .ok()?
+    {
+        match event {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
             LlmEvent::Completed { .. } => break,
             LlmEvent::Cancelled => return None,

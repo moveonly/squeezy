@@ -1068,6 +1068,9 @@ max_output_tokens = 512
 store_responses = true
 selection_version = 1
 
+[providers.openai]
+stream_idle_timeout_ms = 1234
+
 [agent]
 exploration_compiler = false
 
@@ -1163,6 +1166,7 @@ reason = "docs lookups are safe"
     assert_eq!(config.model, "gpt-custom");
     assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
     assert_eq!(config.max_output_tokens, Some(512));
+    assert_eq!(config.stream_idle_timeout, Duration::from_millis(1234));
     assert!(config.store_responses);
     assert!(!config.exploration_compiler);
     assert_eq!(config.session_mode, SessionMode::Plan);
