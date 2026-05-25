@@ -2137,7 +2137,8 @@ fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
 #[test]
 fn registry_specs_carry_capability_aligned_with_permission_request() {
     let tools = ToolRegistry::new("/tmp").expect("registry");
-    for spec in tools.specs() {
+    let specs = tools.specs();
+    for spec in specs.iter() {
         let call = ToolCall {
             call_id: "probe".to_string(),
             name: spec.name.clone(),
