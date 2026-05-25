@@ -1,0 +1,56 @@
+id = "bug-probe"
+title = "Probe squeezy's navigation, edit, and slash-command surfaces for bugs"
+description = """
+Multi-prompt probe scenario designed to surface real defects: hallucination
+on nonexistent symbols, planner over-fetch, slash-command coverage,
+edit_file failure reporting, and graph confidence labels.
+Runs against the squeezy repo itself with gpt-5.4-mini.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+
+# Probe 1: nonexistent symbol — should report unknown, not hallucinate.
+[[steps]]
+kind = "prompt"
+text = "Which file defines the function `make_widget`? If it does not exist in this repo, say so explicitly."
+
+# Probe 2: easy grep target — check planner does not over-fetch.
+[[steps]]
+kind = "prompt"
+text = "In one short sentence, what does `pub fn start_turn` on the `Agent` struct return?"
+
+# Probe 3: in-flight slash command.
+[[steps]]
+kind = "action"
+action = "slash_command"
+command = "/compact"
+
+# Probe 4: edit_file with a `find` substring that does not exist — driver
+# should record this gracefully rather than crash or silently succeed.
+[[steps]]
+kind = "action"
+action = "edit_file"
+path = "crates/squeezy-eval/src/lib.rs"
+
+[steps.replace]
+find = "@@@__definitely_not_present__@@@"
+with = "ignored"
+
+# Probe 5: graph confidence — ask about a likely private/cross-crate symbol.
+[[steps]]
+kind = "prompt"
+text = "What's the relationship between `Agent::start_turn` and the `LlmProvider` trait? Cite confidence labels (exact_syntax, import_resolved, etc.) if your evidence supports them."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 120000
+
+[triage]
+enabled = true
+model = "gpt-5.4-mini"
