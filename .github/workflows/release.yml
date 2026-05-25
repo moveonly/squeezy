@@ -59,6 +59,30 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          tag_version="${RELEASE_TAG#v}"
+          workspace_version="$(
+            awk '/^\[workspace\.package\]/ {in_section=1; next}
+                 /^\[/ {in_section=0}
+                 in_section && /^version[[:space:]]*=/ {
+                   match($0, /"[^"]+"/);
+                   print substr($0, RSTART + 1, RLENGTH - 2);
+                   exit
+                 }' Cargo.toml
+          )"
+          if [[ -z "$workspace_version" ]]; then
+            echo "could not read workspace.package.version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$workspace_version" ]]; then
+            echo "release tag $RELEASE_TAG does not match Cargo.toml workspace version $workspace_version" >&2
+            echo "bump workspace.package.version in Cargo.toml in the same commit as the tag." >&2
+            exit 1
+          fi
+          echo "release tag $RELEASE_TAG matches workspace version $workspace_version"
+
       - name: Show Rust toolchain
         run: |
           rustup show

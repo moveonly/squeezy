@@ -61,6 +61,25 @@ doc list in `crates/squeezy-skills/src/help.rs`. Tests should fail if a topic
 cites a missing doc or if an internal doc is accidentally bundled into normal
 help.
 
+## Release Process
+
+The release workflow (`.github/workflows/release.yml`) is triggered by a
+`v*` tag push or a manual `workflow_dispatch` with an existing tag.
+
+The version contract is:
+
+1. The git tag must match `vMAJOR.MINOR.PATCH[-PRERELEASE]`.
+2. The tag (with the leading `v` stripped) must equal
+   `workspace.package.version` in the root `Cargo.toml`.
+3. Both are enforced by the workflow's `Validate release tag` and
+   `Verify tag matches workspace version` steps, and again by
+   `scripts/update_homebrew_formula.sh` as defense in depth.
+
+When cutting a release, bump `workspace.package.version` in `Cargo.toml`
+in the same commit that the release tag points at. Pushing a tag whose
+version disagrees with `Cargo.toml` will fail the workflow before any
+artifacts are built or published.
+
 ## Provider SDK Policy
 
 An earlier rule of thumb said Squeezy should not depend on any vendor SDK
