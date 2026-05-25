@@ -10,6 +10,7 @@
 pub mod capture;
 pub mod driver;
 pub mod frames;
+pub mod mock_provider;
 pub mod scenario;
 pub mod tickets;
 pub mod triage;

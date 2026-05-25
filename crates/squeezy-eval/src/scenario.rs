@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::driver::EvalError;
+use crate::mock_provider::MockProviderConfig;
 
 /// A full scenario loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,9 @@ pub struct Scenario {
     pub expect: Expect,
     #[serde(default)]
     pub triage: TriageConfig,
+    /// Optional scripted responses used when `[squeezy] provider = "mock"`.
+    #[serde(default)]
+    pub mock: MockProviderConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

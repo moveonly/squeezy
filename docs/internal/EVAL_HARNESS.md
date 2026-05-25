@@ -11,6 +11,16 @@ live-agent for exploratory QA.
 
 ## Quick start
 
+The fully offline path — no provider keys, no network — runs the
+bundled `mock-smoke` scenario against the built-in scripted provider:
+
+```sh
+cargo run -p squeezy-eval -- run crates/squeezy-eval/fixtures/scenarios/mock-smoke.toml --no-triage
+```
+
+For live runs against a real provider (after `squeezy auth` is set up),
+swap in `find-and-fix.toml` or any of your own scenarios:
+
 ```sh
 cargo run -p squeezy-eval -- list crates/squeezy-eval/fixtures/scenarios
 cargo run -p squeezy-eval -- run crates/squeezy-eval/fixtures/scenarios/find-and-fix.toml --no-triage
@@ -61,6 +71,32 @@ markdown + one JSON per finding under `tickets/`. With
 `--emit github --gh-repo owner/name` it also shells out to `gh issue
 create`. Local artifacts are the source of truth; failing to open a GH
 issue does not abort the run.
+
+## Offline / mock provider
+
+Set `[squeezy] provider = "mock"` to use the built-in scripted
+provider. The scenario then declares a `[mock]` block with the
+responses, one per agent turn:
+
+```toml
+[mock]
+default_text = "(mock fallback for unscripted turns)"
+
+[[mock.turns]]
+text = "src/lib.rs defines make_widget."
+input_tokens = 42
+output_tokens = 7
+
+[[mock.turns]]
+text = "Yes — tests/widget.rs covers it."
+```
+
+Each `mock.turns` entry can also carry `tool_calls = [{ name, arguments }]`
+to exercise the agent's tool / approval path. The mock fools only the
+LLM layer; the rest of the agent loop (workspace tools, exploration
+planner, redaction, telemetry) still runs for real against the
+target workspace, which is exactly what makes this a useful
+self-test.
 
 ## Limits in the first cut
 

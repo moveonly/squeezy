@@ -78,8 +78,12 @@ pub async fn run_scenario(
     let mut config = AppConfig::from_env_and_settings()
         .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?;
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
-    let provider = provider_from_config(&config.provider)
-        .map_err(|err| EvalError::Provider(format!("{err}")))?;
+    let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
+        crate::mock_provider::MockProvider::shared(scenario.mock.clone())
+    } else {
+        provider_from_config(&config.provider)
+            .map_err(|err| EvalError::Provider(provider_hint(err)))?
+    };
     let agent = Agent::new(config.clone(), provider);
 
     // 3. Drive the steps.
@@ -283,6 +287,13 @@ fn apply_overlay(
         // model still applies. Documented in EVAL_HARNESS.md.
     }
     Ok(())
+}
+
+fn provider_hint(err: squeezy_core::SqueezyError) -> String {
+    format!(
+        "{err}\nhint: for an offline run, set `[squeezy] provider = \"mock\"` in your scenario \
+         and add a `[mock]` block with scripted `turns`. See docs/internal/EVAL_HARNESS.md."
+    )
 }
 
 fn timestamp_dir_slug() -> String {
@@ -574,7 +585,6 @@ impl Driver {
                 AgentEvent::ToolCallQueued { turn_id, call } => {
                     let turn_str = format!("{turn_id:?}");
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
-                    frame.tool_calls.push(call.name.clone());
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ToolCallQueued {
@@ -587,6 +597,9 @@ impl Driver {
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
                     received_tool_call = true;
                     *self.total_tool_calls.lock().await += 1;
+                    if !frame.tool_calls.contains(&call.name) {
+                        frame.tool_calls.push(call.name.clone());
+                    }
                     self.fire_on_tool_actions(&call.name).await?;
                     self.capture.record(
                         Some(turn_str),

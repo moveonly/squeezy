@@ -1,6 +1,9 @@
 id = "find-and-fix-make-widget"
 title = "Find a function and rename it"
-description = "Smoke-test exploration + edit + approval flow on a small local repo."
+description = """
+Smoke-test exploration + edit + approval flow on a small local repo.
+Requires a live provider key. For an offline smoke see mock-smoke.toml.
+"""
 
 [workspace]
 local = "."
