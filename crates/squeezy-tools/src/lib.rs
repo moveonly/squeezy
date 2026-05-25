@@ -11111,7 +11111,15 @@ fn graph_symbol_search(
     let query = query.map(str::trim).filter(|value| !value.is_empty());
     let kind_filter = kind.and_then(parse_symbol_kind_filter);
     let mut seen = HashSet::new();
-    let candidates = if let Some(query) = query {
+    // Dotted query semantics: `Type.method` / `Module::function` /
+    // `pkg.Type.method` should resolve via the parent_id graph edge,
+    // not via subsequence matching that picks up unrelated symbols
+    // whose names happen to share characters (e.g. `PQueue.add`
+    // colliding with `QueueAddOptions`).
+    let dotted_hits = query.and_then(|q| resolve_dotted_query(graph, q));
+    let candidates = if let Some(matches) = dotted_hits {
+        matches
+    } else if let Some(query) = query {
         graph
             .signature_search(&SignatureQuery {
                 text: query.to_string(),
@@ -11171,6 +11179,66 @@ fn graph_symbol_search(
             .then(left.span.start_byte.cmp(&right.span.start_byte))
     });
     symbols
+}
+
+/// Resolve a dotted-or-double-coloned query like `PQueue.add` or
+/// `cobra::Command::Execute` into the concrete member symbol(s) by
+/// walking `parent_id` edges. Returns `None` for plain-name queries
+/// so the existing trigram/subsequence search runs unchanged.
+///
+/// This is the fix for triage-bug-12: without it,
+/// `downstream_flow(query="PQueue.add")` was landing on
+/// `QueueAddOptions` (a TypeAlias whose name happens to contain
+/// "Add") instead of `PQueue::add` (the method on the class).
+fn resolve_dotted_query(
+    graph: &squeezy_graph::SemanticGraph,
+    query: &str,
+) -> Option<Vec<GraphSymbol>> {
+    // Split on `.` or `::`. Require at least one separator and at
+    // least two non-empty segments — otherwise this is a plain name.
+    let separators: &[&str] = &["::", "."];
+    let mut segments: Vec<&str> = vec![query];
+    for sep in separators {
+        segments = segments.into_iter().flat_map(|s| s.split(*sep)).collect();
+    }
+    let segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    // Walk parent chain: find every symbol matching the last segment;
+    // for each, verify its parent chain (via parent_id) reaches a
+    // symbol whose name matches segment[0]. Intermediate segments
+    // (segments[1..n-1]) must also appear in the chain in order.
+    let member = segments[segments.len() - 1];
+    let mut member_candidates = graph.find_symbol_by_name(member);
+    if member_candidates.is_empty() {
+        return None;
+    }
+    let expected_chain: Vec<&str> = segments[..segments.len() - 1].to_vec();
+    member_candidates.retain(|cand| {
+        let mut want = expected_chain.iter().rev().peekable();
+        let mut current = cand.parent_id.clone();
+        while let Some(needed) = want.peek() {
+            let Some(parent_id) = current.clone() else {
+                return false;
+            };
+            let Some(parent) = graph.symbols.get(&parent_id) else {
+                return false;
+            };
+            if parent.name.as_str() == **needed {
+                want.next();
+                current = parent.parent_id.clone();
+            } else {
+                current = parent.parent_id.clone();
+            }
+        }
+        want.peek().is_none()
+    });
+    if member_candidates.is_empty() {
+        None
+    } else {
+        Some(member_candidates)
+    }
 }
 
 fn decl_counts_by_language(graph: &squeezy_graph::SemanticGraph, symbols: &[GraphSymbol]) -> Value {
