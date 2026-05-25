@@ -2191,6 +2191,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
         exploration_state: Arc::new(tokio::sync::Mutex::new(ExplorationTurnState::from_plan(
             None,
         ))),
+        subagents: SubagentRegistry::default(),
     };
 
     let approver = shell_ask_approver_for_context(&context);
