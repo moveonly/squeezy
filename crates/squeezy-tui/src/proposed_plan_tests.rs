@@ -1,4 +1,7 @@
-use super::{PLAN_DIR, ProposedPlanExtractor, persist_plan, plan_file_for, plan_id_for};
+use super::{
+    PLAN_DIR, PLAN_RETENTION_LIMIT, ProposedPlanExtractor, persist_plan, plan_file_for,
+    plan_id_for, prune_plan_dir,
+};
 
 #[test]
 fn passthrough_when_no_block() {
@@ -110,5 +113,62 @@ fn persist_plan_identical_body_reuses_plan_id() {
     let (id_b, path_b) = persist_plan(&root, "same body").expect("persist b");
     assert_eq!(id_a, id_b);
     assert_eq!(path_a, path_b);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prune_plan_dir_keeps_newest_within_retention_limit() {
+    let root = fresh_workspace("prune_caps_dir");
+    let plans_dir = root.join(PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let total = PLAN_RETENTION_LIMIT + 5;
+    let now = std::time::SystemTime::now();
+    let mut newest_paths = Vec::new();
+    for idx in 0..total {
+        let path = plans_dir.join(format!("plan-{idx:04}.md"));
+        std::fs::write(&path, format!("plan body {idx}")).expect("write plan");
+        let mtime = now - std::time::Duration::from_secs((total - idx) as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open plan")
+            .set_modified(mtime)
+            .expect("set mtime");
+        if idx >= total - PLAN_RETENTION_LIMIT {
+            newest_paths.push(path);
+        }
+    }
+    let deleted = prune_plan_dir(&root);
+    assert_eq!(deleted, total - PLAN_RETENTION_LIMIT);
+    let remaining: Vec<_> = std::fs::read_dir(&plans_dir)
+        .expect("read plans")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(remaining.len(), PLAN_RETENTION_LIMIT);
+    for path in &newest_paths {
+        assert!(path.exists(), "newest plans must survive prune: {path:?}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prune_plan_dir_noops_when_under_limit() {
+    let root = fresh_workspace("prune_under_limit");
+    let plans_dir = root.join(PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    for idx in 0..3 {
+        std::fs::write(plans_dir.join(format!("plan-{idx}.md")), "body").expect("write");
+    }
+    assert_eq!(prune_plan_dir(&root), 0);
+    let count = std::fs::read_dir(&plans_dir).expect("read").count();
+    assert_eq!(count, 3);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prune_plan_dir_noops_when_dir_missing() {
+    let root = fresh_workspace("prune_missing");
+    assert_eq!(prune_plan_dir(&root), 0);
     let _ = std::fs::remove_dir_all(&root);
 }

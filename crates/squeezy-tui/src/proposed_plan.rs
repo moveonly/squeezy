@@ -45,6 +45,49 @@ pub(crate) fn plan_file_for(workspace_root: &Path, plan_id: &str) -> PathBuf {
     workspace_root.join(PLAN_DIR).join(format!("{plan_id}.md"))
 }
 
+/// Maximum number of plan files kept under `.squeezy/plans/`. Pruning
+/// runs at session start so the directory cannot grow unbounded across
+/// many sessions; the cap is high enough that recent plans always
+/// survive a normal day of work.
+pub(crate) const PLAN_RETENTION_LIMIT: usize = 20;
+
+/// Trim `.squeezy/plans/` to at most [`PLAN_RETENTION_LIMIT`] markdown
+/// files, keeping the newest by mtime. Returns the number of files
+/// deleted; `0` when the dir is missing, empty, or already under the
+/// limit. Read errors are silently treated as "nothing to prune" so a
+/// permissions issue can never crash session startup.
+pub(crate) fn prune_plan_dir(workspace_root: &Path) -> usize {
+    let dir = workspace_root.join(PLAN_DIR);
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return 0;
+    };
+    let mut plans: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()?;
+            Some((modified, path))
+        })
+        .collect();
+    if plans.len() <= PLAN_RETENTION_LIMIT {
+        return 0;
+    }
+    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut deleted = 0;
+    for (_, path) in plans.into_iter().skip(PLAN_RETENTION_LIMIT) {
+        if fs::remove_file(&path).is_ok() {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
 /// Persist a proposed plan body as `<workspace>/.squeezy/plans/<plan_id>.md`.
 /// Returns the plan id and the absolute path. The body is written verbatim
 /// (no front-matter) with a trailing newline so the file round-trips

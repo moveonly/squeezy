@@ -164,6 +164,7 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
         .join("");
     assert!(rendered.contains("Plan ready"), "render: {rendered}");
     assert!(rendered.contains("[e] Execute"));
+    assert!(rendered.contains("[c] Execute (clean)"));
     assert!(rendered.contains("[r] Refine"));
     assert!(rendered.contains("[d] Discard"));
     assert!(rendered.contains("[v] View"));
@@ -200,9 +201,71 @@ async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
 
     assert_eq!(app.mode, SessionMode::Build);
     assert!(app.pending_plan_choice.is_none());
+    // Execute auto-submits a "begin executing the plan" prompt, which both
+    // consumes the queued handoff (so the field clears) and starts a turn
+    // the TUI is now listening to.
+    assert!(
+        app.pending_plan_handoff.is_none(),
+        "handoff is consumed by the auto-submitted execute turn"
+    );
+    assert!(
+        app.turn_rx.is_some(),
+        "Execute must start a turn so the agent actually runs the plan"
+    );
+    assert_eq!(app.status, "starting turn");
+    let _ = plan_path;
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() {
+    let root = temp_workspace("plan_choice_clean");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-clean001".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id.clone());
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
     assert_eq!(
-        app.pending_plan_handoff.as_deref(),
-        Some(plan_path.as_path())
+        app.mode,
+        SessionMode::Build,
+        "clean execute still switches to Build"
+    );
+    assert!(app.pending_plan_choice.is_none());
+    assert!(
+        app.turn_rx.is_some(),
+        "clean execute must also start a turn"
+    );
+    // We don't assert successful compaction here — the test agent has no
+    // history to compact, so the agent returns the "not enough context"
+    // error. We just verify the path is exercised: a log entry mentions
+    // either the compaction success or the skip.
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(msg) if msg.contains("execute-clean") || msg.contains("compacted prior context")
+        )),
+        "expected an execute-clean log line; transcript={:?}",
+        app.transcript
     );
 
     let _ = fs::remove_dir_all(&root);

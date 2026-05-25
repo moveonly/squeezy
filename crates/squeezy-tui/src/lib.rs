@@ -344,12 +344,20 @@ async fn run_inner(
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
+    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root);
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
         agent.session_mode(),
         startup,
     );
+    if pruned > 0 {
+        app.push_log(format!(
+            "pruned {pruned} stale plan file(s) from {} (kept {} newest)",
+            proposed_plan::PLAN_DIR,
+            proposed_plan::PLAN_RETENTION_LIMIT
+        ));
+    }
     for item in initial_transcript {
         app.push_transcript_item(item);
     }
@@ -757,7 +765,7 @@ fn cancel_pending_request_user_input(app: &mut TuiApp) {
     }
 }
 
-fn handle_plan_choice_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> bool {
+async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
     let Some(mut pending) = app.pending_plan_choice.take() else {
         return false;
     };
@@ -800,15 +808,72 @@ fn handle_plan_choice_key(app: &mut TuiApp, agent: &Agent, key: KeyEvent) -> boo
         app.pending_plan_choice = Some(pending);
         return true;
     };
-    apply_plan_choice(app, agent, &pending, idx);
+    apply_plan_choice(app, agent, &pending, idx).await;
     true
 }
 
-fn apply_plan_choice(app: &mut TuiApp, agent: &Agent, pending: &PendingPlanChoice, idx: usize) {
+async fn apply_plan_choice(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    pending: &PendingPlanChoice,
+    idx: usize,
+) {
     let option = &PLAN_CHOICES[idx.min(PLAN_CHOICES.len() - 1)];
     match option.action {
         PlanChoiceAction::Execute => {
             switch_mode(app, agent, Some(SessionMode::Build), "plan_choice_execute");
+            if app.mode != SessionMode::Build {
+                // Mode switch was refused (active turn, pending approval,
+                // …) — leave the queued handoff in place and let the user
+                // retry once the blocker clears.
+                return;
+            }
+            start_user_turn(
+                app,
+                agent,
+                "Begin executing the plan above, step by step.".to_string(),
+            );
+        }
+        PlanChoiceAction::ExecuteClean => {
+            // Compact the prior conversation so the agent doesn't replay
+            // the planning chatter on execution. The plan body still rides
+            // in via the handoff prefix queued by the mode switch, so the
+            // model retains the full plan even with an emptied transcript.
+            match agent.compact_context_manual().await {
+                Ok(report) => {
+                    app.context_compaction.last = Some(report.record.clone());
+                    app.context_compaction.generation = report.record.generation;
+                    app.context_compaction.summary = Some(report.summary.clone());
+                    app.context_compaction.history.push(report.record.clone());
+                    app.context_estimate = report.record.after.clone();
+                    app.context_compaction_nudge_shown = false;
+                    app.push_log(format!(
+                        "compacted prior context before executing plan {}",
+                        pending.plan_id
+                    ));
+                }
+                Err(err) => {
+                    // "not enough context to compact" is fine — common on a
+                    // fresh session and not a blocker for execution.
+                    app.push_log(format!(
+                        "execute-clean: skipped compaction ({err}); running plan"
+                    ));
+                }
+            }
+            switch_mode(
+                app,
+                agent,
+                Some(SessionMode::Build),
+                "plan_choice_execute_clean",
+            );
+            if app.mode != SessionMode::Build {
+                return;
+            }
+            start_user_turn(
+                app,
+                agent,
+                "Begin executing the plan above, step by step.".to_string(),
+            );
         }
         PlanChoiceAction::Refine => {
             app.status = "stay in Plan; describe the refinement".into();
@@ -1164,7 +1229,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if handle_plan_choice_key(app, agent, key) {
+    if handle_plan_choice_key(app, agent, key).await {
         return Ok(false);
     }
 
@@ -1382,34 +1447,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             app.cancelled_prompt = Some(input.clone());
             clear_input(app);
             push_input_history(app, input.clone());
-            // Apply any pending config swap before the request goes out so
-            // the running turn picks up the new model/provider. The TUI's
-            // app fields (verbosity etc.) are already updated by the
-            // Immediate-tier handler; this drain covers NextPrompt-tier.
-            if let Some(swap) = agent.drain_pending_swap() {
-                let note = swap
-                    .display_note
-                    .clone()
-                    .unwrap_or_else(|| "config applied".to_string());
-                app.app_notifications
-                    .push(format!("✓ applied: {note}"), NotifySeverity::Success);
-            }
-            let cancel = CancellationToken::new();
-            app.task_state = None;
-            app.task_panel_collapsed = false;
-            app.note_turn_started();
-            let prefixed_input = match take_pending_plan_prefix(app) {
-                Some(prefix) => format!("{prefix}{input}"),
-                None => input,
-            };
-            app.turn_rx = Some(agent.start_turn_with_response_verbosity(
-                prefixed_input,
-                cancel.clone(),
-                app.response_verbosity,
-            ));
-            app.cancel = Some(cancel);
-            app.status = "starting turn".to_string();
-            app.turn_visual = TurnVisualState::Running;
+            start_user_turn(app, agent, input);
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -3175,6 +3213,38 @@ fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
         .rev()
         .find(|(_, entry)| entry.collapsed && entry.is_toggleable())
         .map(|(index, _)| index)
+}
+
+/// Kick off a user-driven turn. Drains any pending config swap, consumes a
+/// queued plan handoff (prepending the plan body to `input`), and hands
+/// the resulting prompt to the agent. Used by the Enter key handler and
+/// by the post-plan Execute action so both paths share the same plan
+/// prefix and turn-state bookkeeping.
+fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
+    if let Some(swap) = agent.drain_pending_swap() {
+        let note = swap
+            .display_note
+            .clone()
+            .unwrap_or_else(|| "config applied".to_string());
+        app.app_notifications
+            .push(format!("✓ applied: {note}"), NotifySeverity::Success);
+    }
+    let cancel = CancellationToken::new();
+    app.task_state = None;
+    app.task_panel_collapsed = false;
+    app.note_turn_started();
+    let prefixed_input = match take_pending_plan_prefix(app) {
+        Some(prefix) => format!("{prefix}{input}"),
+        None => input,
+    };
+    app.turn_rx = Some(agent.start_turn_with_response_verbosity(
+        prefixed_input,
+        cancel.clone(),
+        app.response_verbosity,
+    ));
+    app.cancel = Some(cancel);
+    app.status = "starting turn".to_string();
+    app.turn_visual = TurnVisualState::Running;
 }
 
 /// If a Plan→Build switch queued a plan file for handoff, read it and
@@ -8194,6 +8264,7 @@ struct PendingPlanChoice {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PlanChoiceAction {
     Execute,
+    ExecuteClean,
     Refine,
     Discard,
     View,
@@ -8210,8 +8281,14 @@ const PLAN_CHOICES: &[PlanChoiceOption] = &[
     PlanChoiceOption {
         action: PlanChoiceAction::Execute,
         label: "Execute",
-        hint: "switch to Build; the plan rides into your next prompt",
+        hint: "switch to Build; keep history; run the plan",
         shortcut: 'e',
+    },
+    PlanChoiceOption {
+        action: PlanChoiceAction::ExecuteClean,
+        label: "Execute (clean)",
+        hint: "compact prior chat to a summary, then run the plan",
+        shortcut: 'c',
     },
     PlanChoiceOption {
         action: PlanChoiceAction::Refine,
