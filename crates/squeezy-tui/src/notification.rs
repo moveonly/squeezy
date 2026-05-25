@@ -106,11 +106,27 @@ impl NotificationQueue {
         ttl: Duration,
         action_hint: Option<&'static str>,
     ) -> u64 {
+        let message = message.into();
+        // Coalesce when the tail item carries the exact same message and
+        // severity. Burst sources — Space-cycling, repeated saves on the
+        // same field, rapid status updates — would otherwise queue
+        // identical entries and the rotation would loop "✓ saved foo /
+        // ✓ saved foo / ✓ saved foo" for a minute. We just refresh the
+        // existing entry's ttl and return its id instead.
+        if let Some(last) = self.items.back_mut()
+            && last.message == message
+            && last.severity == severity
+        {
+            last.created_at = Instant::now();
+            last.ttl = ttl;
+            last.action_hint = action_hint;
+            return last.id;
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.items.push_back(Notification {
             id,
-            message: message.into(),
+            message,
             severity,
             created_at: Instant::now(),
             ttl,

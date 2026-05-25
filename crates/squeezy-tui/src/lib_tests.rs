@@ -5339,8 +5339,9 @@ fn slash_parameter_hint_appears_in_render() {
     set_input(&mut app, "/verbosity".to_string());
     let output = render_to_string(&app, 120, 16);
     assert!(
-        output.contains("quiet|normal|verbose"),
-        "expected parameter hint to render: {output}"
+        output.contains("concise|normal|verbose"),
+        "expected parameter hint to render the response-verbosity options actually accepted \
+         by `/verbosity`: {output}"
     );
 }
 

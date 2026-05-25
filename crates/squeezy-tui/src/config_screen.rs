@@ -147,12 +147,65 @@ pub(crate) struct SecretEntryState {
     /// Human-readable provider name for the header (e.g. "OpenAI").
     pub provider_label: String,
     pub draft: String,
+    /// Cursor position in chars (not bytes). Stays valid across multibyte
+    /// pastes; converted to a byte index on the fly when we need to mutate
+    /// `draft`.
     pub cursor: usize,
     /// When `true`, render the full plaintext key for sanity-checking
     /// what was pasted. Toggled explicitly with Ctrl+T — both the toggle
     /// and the disclosure are the user's own action, so reveal in full
     /// rather than hiding the suffix.
     pub reveal: bool,
+}
+
+impl SecretEntryState {
+    /// Number of characters in `draft`. Used for the cursor bound and the
+    /// render mask width.
+    fn char_len(&self) -> usize {
+        self.draft.chars().count()
+    }
+
+    /// Map a char-index cursor to a byte position usable by
+    /// `String::insert` / `String::remove`. Returns `None` when the index
+    /// sits past the end of the string.
+    fn char_to_byte(&self, char_idx: usize) -> Option<usize> {
+        if char_idx == self.char_len() {
+            return Some(self.draft.len());
+        }
+        self.draft
+            .char_indices()
+            .nth(char_idx)
+            .map(|(byte_idx, _)| byte_idx)
+    }
+
+    /// Insert `c` at the current cursor and advance one char to the right.
+    /// Used by interactive typing and by bracketed-paste delivery, which
+    /// arrives as a stream of single-char `KeyEvent::Char` events.
+    fn insert_char(&mut self, c: char) {
+        if let Some(byte_idx) = self.char_to_byte(self.cursor) {
+            self.draft.insert(byte_idx, c);
+            self.cursor += 1;
+        }
+    }
+
+    /// Delete the char immediately to the left of the cursor (backspace).
+    /// No-op when the cursor is already at the start.
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        if let Some(byte_idx) = self.char_to_byte(self.cursor - 1) {
+            self.draft.remove(byte_idx);
+            self.cursor -= 1;
+        }
+    }
+
+    /// Zero out the in-memory plaintext. Called on Esc / Enter to keep a
+    /// post-cancel peeker from reading the bytes off the heap.
+    fn wipe(&mut self) {
+        self.draft.clear();
+        self.cursor = 0;
+    }
 }
 
 /// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
@@ -1397,20 +1450,54 @@ fn commit_model_picker(
     model_id: String,
 ) {
     state.picker = None;
-    // The model field is the second field of the Models section. Look it up
-    // by path rather than index in case the schema is reordered.
-    let field = CONFIG_SECTIONS
+    // If the chosen id belongs to a different provider in the registry
+    // (only possible when the picker was in `all_providers` mode), swap
+    // the provider field first. This keeps the on-disk pair consistent
+    // and avoids the symmetric bug we just guarded for the Space-cycle
+    // path — a registry lookup that fails (custom Ctrl+Enter id) simply
+    // skips the provider swap, since we can't infer the provider.
+    let provider_field = &CONFIG_SECTIONS[0].fields[0];
+    let current_provider = match (provider_field.get)(&state.effective) {
+        FieldValue::Enum(s) => s,
+        _ => "openai",
+    };
+    let picked_provider = squeezy_llm::MODEL_REGISTRY
         .iter()
-        .flat_map(|s| s.fields.iter())
-        .find(|f| f.toml_path == ["model", "model"])
-        .expect("model field exists in CONFIG_SECTIONS");
-    let value = FieldValue::String(model_id);
-    if let Err(msg) = (field.set)(&mut state.effective, value.clone()) {
+        .find(|m| m.id == model_id)
+        .map(|m| m.provider);
+    if let Some(new_provider) = picked_provider
+        && new_provider != current_provider
+        && let Err(msg) = (provider_field.set)(&mut state.effective, FieldValue::Enum(new_provider))
+    {
+        notifications.push(format!("invalid provider: {msg}"), NotifySeverity::Error);
+        return;
+    }
+    // After a provider swap `set_provider` rewrote `cfg.model` to that
+    // provider's default; overwrite it again with the user's chosen id
+    // and save through the regular pipeline, which now persists
+    // (provider, model) together.
+    let model_field = model_field_meta();
+    let model_value = FieldValue::String(model_id);
+    if let Err(msg) = (model_field.set)(&mut state.effective, model_value.clone()) {
         notifications.push(format!("invalid: {msg}"), NotifySeverity::Error);
         return;
     }
     state.dirty = true;
-    save_field(state, agent, notifications, field, value);
+    if let Some(new_provider) = picked_provider
+        && new_provider != current_provider
+    {
+        // Persist the provider swap first (which chains the model write
+        // via the provider→model pairing in `save_field_inner`), then
+        // persist the explicit model id the user picked.
+        save_field(
+            state,
+            agent,
+            notifications,
+            provider_field,
+            FieldValue::Enum(new_provider),
+        );
+    }
+    save_field(state, agent, notifications, model_field, model_value);
 }
 
 // ─── API key (Secret) entry ───────────────────────────────────────────────────
@@ -1461,39 +1548,30 @@ fn handle_secret_entry_key(
     let entry = state.secret_entry.as_mut().expect("checked by caller");
     match (key.code, key.modifiers) {
         (KeyCode::Esc, _) => {
-            // Wipe the draft so a peeker post-cancel can't read the
-            // bytes off the heap.
-            entry.draft.clear();
-            entry.cursor = 0;
+            entry.wipe();
             state.secret_entry = None;
         }
         (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
             entry.reveal = !entry.reveal;
         }
-        (KeyCode::Backspace, _) if entry.cursor > 0 => {
-            let mut chars: Vec<char> = entry.draft.chars().collect();
-            chars.remove(entry.cursor - 1);
-            entry.draft = chars.into_iter().collect();
-            entry.cursor -= 1;
+        (KeyCode::Backspace, _) => {
+            entry.backspace();
         }
         (KeyCode::Left, _) => {
             entry.cursor = entry.cursor.saturating_sub(1);
         }
         (KeyCode::Right, _) => {
-            entry.cursor = (entry.cursor + 1).min(entry.draft.chars().count());
+            entry.cursor = (entry.cursor + 1).min(entry.char_len());
         }
         (KeyCode::Home, _) => entry.cursor = 0,
-        (KeyCode::End, _) => entry.cursor = entry.draft.chars().count(),
+        (KeyCode::End, _) => entry.cursor = entry.char_len(),
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
             // Bracketed paste delivers each char individually through the
             // event loop, so this handles both interactive typing and
             // paste from the clipboard.
-            let mut chars: Vec<char> = entry.draft.chars().collect();
-            chars.insert(entry.cursor, c);
-            entry.draft = chars.into_iter().collect();
-            entry.cursor += 1;
+            entry.insert_char(c);
         }
         (KeyCode::Enter, _) => {
             let env_var = entry.env_var.clone();
@@ -1907,7 +1985,16 @@ fn restore_path(path: &std::path::Path, bytes: Option<&[u8]>) -> std::io::Result
 }
 
 /// Reload separated sources and refresh the agent's effective config so
-/// the post-undo/discard state propagates without requiring a restart.
+/// the post-undo/discard/reset state propagates without requiring a
+/// restart.
+///
+/// If the provider *variant* changed (e.g. anthropic → openai because a
+/// Local override was reset), the LLM client must be rebuilt — otherwise
+/// the next turn runs an Anthropic client against an OpenAI config and
+/// fails immediately. The rebuild happens on a plain OS thread (same
+/// trick as `apply_by_tier::NextPrompt`) so the Linux keychain doesn't
+/// panic from inside a tokio runtime, and is armed as a NextPrompt swap
+/// so any in-flight turn keeps its current client.
 fn reload_sources_and_agent(
     state: &mut ConfigScreenState,
     agent: &mut Agent,
@@ -1916,15 +2003,45 @@ fn reload_sources_and_agent(
     if let Ok(reloaded) = load_separated_settings_sources() {
         state.sources = reloaded;
     }
-    match AppConfig::from_env_and_settings() {
-        Ok(new_cfg) => {
-            state.effective = new_cfg.clone();
-            agent.replace_config(new_cfg);
-        }
+    let new_cfg = match AppConfig::from_env_and_settings() {
+        Ok(cfg) => cfg,
         Err(err) => {
             notifications.push(
                 format!("(note) couldn't rebuild effective config: {err}"),
                 NotifySeverity::Warn,
+            );
+            return;
+        }
+    };
+    let provider_changed = std::mem::discriminant(&state.effective.provider)
+        != std::mem::discriminant(&new_cfg.provider);
+    state.effective = new_cfg.clone();
+    if !provider_changed {
+        agent.replace_config(new_cfg);
+        return;
+    }
+    let provider_cfg = new_cfg.provider.clone();
+    let handle = std::thread::spawn(move || squeezy_llm::provider_from_config(&provider_cfg));
+    match handle.join() {
+        Ok(Ok(provider)) => {
+            agent.arm_config_swap(PendingConfigSwap {
+                config: new_cfg,
+                provider: Some(provider),
+                display_note: Some("provider switched (settings reset)".to_string()),
+            });
+        }
+        Ok(Err(err)) => {
+            agent.replace_config(new_cfg);
+            notifications.push(
+                format!("provider switched in config but the new client failed to build: {err}"),
+                NotifySeverity::Error,
+            );
+        }
+        Err(_) => {
+            agent.replace_config(new_cfg);
+            notifications.push(
+                "provider switched but the builder thread panicked",
+                NotifySeverity::Error,
             );
         }
     }
@@ -2232,13 +2349,11 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
 }
 
 fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
-    let chars: Vec<char> = entry.draft.chars().collect();
-    let total = chars.len();
     let display: String = if entry.reveal {
         // Explicit Ctrl+T toggle — show the full plaintext for verification.
-        chars.iter().collect()
+        entry.draft.clone()
     } else {
-        (0..total).map(|_| '•').collect()
+        "•".repeat(entry.char_len())
     };
     let lines = vec![
         Line::from(vec![

@@ -259,13 +259,13 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
         "/verbosity",
         "open config focused on response verbosity (or set inline)",
         false,
-        "[quiet|normal|verbose]",
+        "[concise|normal|verbose]",
     ),
     slash_args(
         "/tool-verbosity",
         "open config focused on tool output verbosity (or set inline)",
         false,
-        "[quiet|normal|verbose]",
+        "[compact|normal|verbose]",
     ),
     slash_args("/detach", "remove attached context", false, "<id>"),
 ];

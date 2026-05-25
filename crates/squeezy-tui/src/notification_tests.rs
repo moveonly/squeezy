@@ -58,6 +58,20 @@ fn dismiss_by_id_removes_item() {
 }
 
 #[test]
+fn adjacent_identical_messages_coalesce() {
+    let mut q = NotificationQueue::new();
+    let first = q.push("✓ saved shell", Severity::Success);
+    let again = q.push("✓ saved shell", Severity::Success);
+    assert_eq!(q.len(), 1, "identical adjacent pushes should coalesce");
+    assert_eq!(first, again, "coalesced push returns the original id");
+    // Different severity or message breaks the run.
+    q.push("✓ saved shell", Severity::Warn);
+    assert_eq!(q.len(), 2);
+    q.push("✓ saved read", Severity::Warn);
+    assert_eq!(q.len(), 3);
+}
+
+#[test]
 fn severity_color_matches_palette() {
     assert_eq!(Severity::Info.color(), AMBER);
     assert_eq!(Severity::Success.color(), SUCCESS_GREEN);

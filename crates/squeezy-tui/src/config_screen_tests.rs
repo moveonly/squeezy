@@ -437,6 +437,34 @@ async fn space_cycling_provider_resets_model_in_memory() {
     );
 }
 
+#[test]
+fn secret_entry_editor_inserts_and_backspaces_multibyte() {
+    let mut entry = SecretEntryState {
+        env_var: "SQUEEZY_OPENAI_KEY".to_string(),
+        provider_label: "OpenAI".to_string(),
+        draft: String::new(),
+        cursor: 0,
+        reveal: false,
+    };
+    for c in ['s', 'k', '-', 'é'] {
+        entry.insert_char(c);
+    }
+    assert_eq!(entry.draft, "sk-é");
+    assert_eq!(entry.cursor, 4);
+    assert_eq!(entry.char_len(), 4);
+    entry.backspace();
+    assert_eq!(entry.draft, "sk-");
+    assert_eq!(entry.cursor, 3);
+    // Cursor mid-string then insert should land between the existing chars.
+    entry.cursor = 1;
+    entry.insert_char('!');
+    assert_eq!(entry.draft, "s!k-");
+    assert_eq!(entry.cursor, 2);
+    entry.wipe();
+    assert!(entry.draft.is_empty());
+    assert_eq!(entry.cursor, 0);
+}
+
 #[tokio::test]
 async fn reset_section_enter_arms_confirmation_and_n_cancels() {
     use squeezy_core::config_schema::SectionId as SId;
