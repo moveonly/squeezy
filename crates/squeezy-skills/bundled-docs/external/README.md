@@ -34,6 +34,8 @@ closed local corpus embedded into built-in Squeezy help.
 
 - [Shell sandboxing](SHELL_SANDBOXING.md): permission policy, local sandboxing,
   audit records, and limits.
+- [Approval policy](APPROVAL_POLICY.md): optional AI approval reviewer rules,
+  allowlist boundaries, and circuit-breaker posture.
 - [Telemetry](TELEMETRY.md): anonymous product telemetry and opt-out controls.
 - [Feedback and reports](FEEDBACK.md): consented maintainer-intake flows.
 - [Cost controls](tool-call-saving-strategy.md): receipts, budgets, caching,

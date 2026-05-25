@@ -37,6 +37,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
+    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     let cli = Cli::parse();
     match cli.command {
         Command::List { tasks } => {

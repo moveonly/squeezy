@@ -3295,6 +3295,7 @@ dependencies = [
 name = "squeezy-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "regex",
  "serde",
  "thiserror",
@@ -3344,6 +3345,7 @@ dependencies = [
  "futures-util",
  "keyring",
  "reqwest 0.12.28",
+ "security-framework 3.7.0",
  "serde",
  "serde_json",
  "squeezy-core",

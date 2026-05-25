@@ -14,6 +14,7 @@ mod anthropic;
 mod bedrock;
 mod credentials;
 mod google;
+mod keychain;
 mod ollama;
 mod openai;
 mod registry;

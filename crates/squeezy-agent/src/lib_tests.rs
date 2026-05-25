@@ -1118,6 +1118,286 @@ async fn asks_for_edit_permission_before_write_tool() {
 }
 
 #[tokio::test]
+async fn session_approval_installs_in_memory_rule_without_persisting() {
+    let root = temp_workspace("agent_session_approval");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({"path": "sample.txt", "content": "hello"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("write file".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            decision_tx
+                .send(ToolApprovalDecision::AllowSession)
+                .expect("send decision");
+        }
+    }
+
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "hello"
+    );
+    assert!(
+        !root.join("squeezy.toml").exists(),
+        "session approvals must not persist to project settings"
+    );
+    let session_rules = agent.session_rules_snapshot();
+    assert_eq!(session_rules.len(), 1);
+    assert_eq!(session_rules[0].source, PermissionRuleSource::Session);
+    assert_eq!(session_rules[0].action, PermissionAction::Allow);
+    assert_eq!(session_rules[0].target, "path:sample.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
+    let root = temp_workspace("agent_ai_reviewer_allow");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"read is in scope"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    assert_eq!(
+        read_result.expect("read result").status,
+        ToolStatus::Success
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        matches!(&requests[1].input[0], LlmInputItem::UserText(text) if text.contains("Approval policy") && text.contains("\"tool_name\":\"read_file\"")),
+        "reviewer prompt should carry policy and request: {:?}",
+        requests[1].input
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_denies_without_user_prompt() {
+    let root = temp_workspace("agent_ai_reviewer_deny");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"deny","reason":"too broad"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("read everything".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(approvals_seen, 0);
+    let read_result = read_result.expect("read result");
+    assert_eq!(read_result.status, ToolStatus::Denied);
+    assert!(
+        read_result.content["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("AI reviewer denied")),
+        "{:?}",
+        read_result.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
+    let root = temp_workspace("agent_ai_reviewer_edit_escalates");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "write_1".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({"path": "sample.txt", "content": "hello"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                r#"{"action":"allow","reason":"looks okay"}"#.to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("reviewer".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            edit: PermissionMode::Ask,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    config.permissions.ai_reviewer.enabled = true;
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("write file".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ApprovalRequested { decision_tx, .. } = event {
+            approvals_seen += 1;
+            decision_tx
+                .send(ToolApprovalDecision::Denied)
+                .expect("send decision");
+        }
+    }
+
+    assert_eq!(approvals_seen, 1);
+    assert!(!root.join("sample.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn cancelling_turn_unblocks_pending_approval() {
     let root = temp_workspace("agent_cancel_approval");
     let provider = Arc::new(MockProvider::new(vec![vec![
@@ -2184,8 +2464,10 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
         cancel: CancellationToken::new(),
         approval_ids: Arc::new(AtomicU64::new(1)),
         session_rules: Arc::new(RwLock::new(Vec::new())),
+        ai_reviewer_state: Arc::new(Mutex::new(ai_reviewer::AiReviewerState::default())),
         session_mode: Arc::new(AtomicU8::new(SessionMode::Build.to_u8())),
         session_log: None,
+        conversation_state: None,
         task_state: Arc::new(tokio::sync::Mutex::new(None)),
         all_tool_specs: &advertised,
         loaded_tool_schemas: Arc::new(tokio::sync::Mutex::new(Vec::new())),

@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    env, fs, io,
+    env, fs,
     panic::AssertUnwindSafe,
     path::PathBuf,
     pin::Pin,
@@ -26,7 +26,6 @@ use squeezy_core::{
     SessionMode, SqueezyError, StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus,
     ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
-    escape_toml_basic_string,
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
@@ -58,12 +57,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod ai_reviewer;
 mod cancel;
 mod exploration_compiler;
+mod permission_persist;
 mod roles;
 
 use cancel::{CancelErr, OrCancelExt};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 const MAX_TOOL_ROUNDS: usize = 32;
@@ -1041,6 +1043,7 @@ pub struct Agent {
     session_metrics: Arc<Mutex<SessionMetrics>>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     next_turn_id: Arc<AtomicU64>,
     next_approval_id: Arc<AtomicU64>,
     next_attachment_id: Arc<AtomicU64>,
@@ -1314,6 +1317,7 @@ impl Agent {
             session_metrics,
             session_log,
             conversation_state: Arc::new(Mutex::new(conversation_state)),
+            ai_reviewer_state: Arc::new(StdMutex::new(ai_reviewer::AiReviewerState::default())),
             next_turn_id: Arc::new(AtomicU64::new(1)),
             next_approval_id: Arc::new(AtomicU64::new(1)),
             next_attachment_id: Arc::new(AtomicU64::new(next_attachment_id)),
@@ -2051,6 +2055,7 @@ impl Agent {
         let session_mode = self.session_mode.clone();
         let session_log = self.session_log.clone();
         let conversation_state = self.conversation_state.clone();
+        let ai_reviewer_state = self.ai_reviewer_state.clone();
         let store = self.store.clone();
         let task_state = Arc::new(Mutex::new(None));
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
@@ -2112,6 +2117,7 @@ impl Agent {
                             cancel: cancel.clone(),
                             approval_ids: approval_ids.clone(),
                             session_rules: session_rules.clone(),
+                            ai_reviewer_state: ai_reviewer_state.clone(),
                             loaded_tool_schemas: loaded_tool_schemas.clone(),
                             subagents: subagents.clone(),
                         },
@@ -2172,6 +2178,7 @@ impl Agent {
                     approval_ids,
                     seed_redactions: redacted_input.redactions,
                     session_rules,
+                    ai_reviewer_state,
                     session_mode,
                     session_log,
                     conversation_state,
@@ -2336,6 +2343,7 @@ struct LocalToolTurnDeps {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     subagents: SubagentRegistry,
 }
@@ -2503,6 +2511,7 @@ async fn complete_local_tool_turn(
         cancel,
         approval_ids,
         session_rules,
+        ai_reviewer_state,
         loaded_tool_schemas,
         subagents,
     } = deps;
@@ -2551,8 +2560,10 @@ async fn complete_local_tool_turn(
             cancel,
             approval_ids,
             session_rules,
+            ai_reviewer_state,
             session_mode: session_mode.clone(),
             session_log: session_log.clone(),
+            conversation_state: None,
             task_state: task_state.clone(),
             all_tool_specs: &all_tool_specs,
             loaded_tool_schemas,
@@ -2797,6 +2808,7 @@ struct TurnRuntime {
     // session metric never undercounts user-side scrubbing.
     seed_redactions: u64,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     conversation_state: Arc<Mutex<ConversationState>>,
@@ -3067,8 +3079,10 @@ impl TurnRuntime {
                         cancel: self.cancel.clone(),
                         approval_ids: self.approval_ids.clone(),
                         session_rules: self.session_rules.clone(),
+                        ai_reviewer_state: self.ai_reviewer_state.clone(),
                         session_mode: self.session_mode.clone(),
                         session_log: self.session_log.clone(),
+                        conversation_state: Some(self.conversation_state.clone()),
                         task_state: self.task_state.clone(),
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
@@ -3365,8 +3379,10 @@ impl TurnRuntime {
                         cancel: self.cancel.clone(),
                         approval_ids: self.approval_ids.clone(),
                         session_rules: self.session_rules.clone(),
+                        ai_reviewer_state: self.ai_reviewer_state.clone(),
                         session_mode: self.session_mode.clone(),
                         session_log: self.session_log.clone(),
+                        conversation_state: Some(self.conversation_state.clone()),
                         task_state: self.task_state.clone(),
                         all_tool_specs: &self.all_tool_specs,
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
@@ -3832,8 +3848,10 @@ struct ToolExecutionContext<'a> {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
+    conversation_state: Option<Arc<Mutex<ConversationState>>>,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     subagents: SubagentRegistry,
     all_tool_specs: &'a [AdvertisedTool],
@@ -3897,8 +3915,10 @@ struct PermissionDecisionContext {
     cancel: CancellationToken,
     approval_ids: Arc<AtomicU64>,
     session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
+    conversation_state: Option<Arc<Mutex<ConversationState>>>,
 }
 
 impl PermissionDecisionContext {
@@ -3913,8 +3933,10 @@ impl PermissionDecisionContext {
             cancel: context.cancel.clone(),
             approval_ids: context.approval_ids.clone(),
             session_rules: context.session_rules.clone(),
+            ai_reviewer_state: context.ai_reviewer_state.clone(),
             session_mode: context.session_mode.clone(),
             session_log: context.session_log.clone(),
+            conversation_state: context.conversation_state.clone(),
         }
     }
 }
@@ -4520,8 +4542,10 @@ async fn run_subagent_loop(
                         cancel: parent.cancel.child_token(),
                         approval_ids: parent.approval_ids.clone(),
                         session_rules: parent.session_rules.clone(),
+                        ai_reviewer_state: parent.ai_reviewer_state.clone(),
                         session_mode: local_mode.clone(),
                         session_log: None,
+                        conversation_state: None,
                         task_state: local_task_state.clone(),
                         all_tool_specs: allowed_tools,
                         loaded_tool_schemas: local_loaded_schemas.clone(),
@@ -5787,6 +5811,82 @@ async fn permission_decision_for_request(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
+    if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
+        let transcript = if let Some(conversation_state) = &context.conversation_state {
+            let state = conversation_state.lock().await;
+            Some(ai_reviewer::AiReviewerTranscriptSnapshot {
+                items: state.transcript.clone(),
+                history_version: state.context_compaction.generation,
+                entry_count: state.transcript.len(),
+            })
+        } else {
+            None
+        };
+        match ai_reviewer::review_permission(ai_reviewer::AiReviewerInput {
+            config: &context.config,
+            provider: context.provider.clone(),
+            request: &request,
+            transcript,
+            state: context.ai_reviewer_state.clone(),
+            turn_id: context.turn_id,
+            cancel: context.cancel.child_token(),
+        })
+        .await
+        {
+            ai_reviewer::AiReviewerOutcome::Verdict(reviewed) => {
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_decided",
+                    Some(context.turn_id),
+                    Some(reviewed.action.as_str().to_string()),
+                    json!({
+                        "action": reviewed.action.as_str(),
+                        "reason": reviewed.reason.clone(),
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = reviewed;
+            }
+            ai_reviewer::AiReviewerOutcome::NoDecision { reason } => {
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_no_decision",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+            }
+            ai_reviewer::AiReviewerOutcome::CircuitTripped { reason } => {
+                let reason = context.redactor.redact(&reason).text;
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_ai_reviewer_tripped",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                let _ = context
+                    .tx
+                    .send(AgentEvent::AiReviewerTripped {
+                        turn_id: context.turn_id,
+                        reason,
+                    })
+                    .await;
+            }
+        }
+    }
     if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
@@ -5856,6 +5956,27 @@ async fn permission_decision_for_request(
                 Ok(ToolApprovalDecision::Approved | ToolApprovalDecision::AllowOnce) => {
                     ApprovalDecision::Approved
                 }
+                Ok(ToolApprovalDecision::AllowSession) => {
+                    install_persistent_rule(
+                        context,
+                        &request,
+                        PermissionRuleSource::Session,
+                        PermissionAction::Allow,
+                    );
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_session_rule_installed",
+                        Some(context.turn_id),
+                        Some(request.target.clone()),
+                        json!({
+                            "capability": request.capability.as_str(),
+                            "target": request.target,
+                            "action": "allow",
+                        }),
+                    );
+                    ApprovalDecision::Approved
+                }
                 Ok(ToolApprovalDecision::AllowRuleUser) => {
                     install_persistent_rule(
                         context,
@@ -5900,6 +6021,30 @@ async fn permission_decision_for_request(
                     ApprovalDecision::Denied(permission_denied_reason(
                         &request,
                         "user denied tool call",
+                    ))
+                }
+                Ok(ToolApprovalDecision::DenySession) => {
+                    install_persistent_rule(
+                        context,
+                        &request,
+                        PermissionRuleSource::Session,
+                        PermissionAction::Deny,
+                    );
+                    log_session_event(
+                        context.session_log.as_ref(),
+                        &context.redactor,
+                        "permission_session_rule_installed",
+                        Some(context.turn_id),
+                        Some(request.target.clone()),
+                        json!({
+                            "capability": request.capability.as_str(),
+                            "target": request.target,
+                            "action": "deny",
+                        }),
+                    );
+                    ApprovalDecision::Denied(permission_denied_reason(
+                        &request,
+                        "user denied and installed a session rule",
                     ))
                 }
                 Ok(ToolApprovalDecision::DenyRuleUser) => {
@@ -6252,12 +6397,27 @@ fn install_persistent_rule(
         Some(path) => path,
         None => return,
     };
-    if let Err(err) = write_permission_rule(&path, &rule) {
-        tracing::warn!(
+    let persisted = match persist_permission_rule(&path, &rule) {
+        Ok(persisted) => persisted,
+        Err(err) => {
+            tracing::warn!(
+                target: "squeezy::permissions",
+                path = %path.display(),
+                error = %err,
+                "failed to persist permission rule",
+            );
+            return;
+        }
+    };
+    if !persisted {
+        tracing::info!(
             target: "squeezy::permissions",
             path = %path.display(),
-            error = %err,
-            "failed to persist permission rule",
+            capability = %rule.capability,
+            target = %rule.target,
+            action = %rule.action.as_str(),
+            source = %rule.source.as_str(),
+            "permission rule already persisted",
         );
     } else {
         tracing::info!(
@@ -6278,41 +6438,6 @@ fn persistence_path_for(config: &AppConfig, source: PermissionRuleSource) -> Opt
         PermissionRuleSource::Project => Some(config.workspace_root.join(PROJECT_SETTINGS_FILE)),
         PermissionRuleSource::Builtin | PermissionRuleSource::Session => None,
     }
-}
-
-fn write_permission_rule(path: &std::path::Path, rule: &PermissionRule) -> io::Result<()> {
-    use std::io::Write;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let reason = rule
-        .reason
-        .clone()
-        .unwrap_or_else(|| "added from approval prompt".to_string());
-    let mut text = String::new();
-    text.push_str("\n[[permissions.rules]]\n");
-    text.push_str(&format!(
-        "capability = {}\n",
-        escape_toml_basic_string(&rule.capability)
-    ));
-    text.push_str(&format!(
-        "target = {}\n",
-        escape_toml_basic_string(&rule.target)
-    ));
-    text.push_str(&format!(
-        "action = {}\n",
-        escape_toml_basic_string(rule.action.as_str())
-    ));
-    text.push_str(&format!(
-        "source = {}\n",
-        escape_toml_basic_string(rule.source.as_str())
-    ));
-    text.push_str(&format!("reason = {}\n", escape_toml_basic_string(&reason)));
-    file.write_all(text.as_bytes())
 }
 
 /// Pick a rule shape to persist for this approval. Refuses Allow on any
@@ -7989,11 +8114,13 @@ pub enum ToolApprovalDecision {
     Approved,
     Denied,
     AllowOnce,
+    AllowSession,
     AllowRuleUser,
     AllowRuleProject,
     AskRuleUser,
     AskRuleProject,
     DenyOnce,
+    DenySession,
     DenyRuleUser,
     DenyRuleProject,
     Cancelled,
@@ -8069,6 +8196,10 @@ pub enum AgentEvent {
         agent: String,
         error: String,
         metrics: TurnMetrics,
+    },
+    AiReviewerTripped {
+        turn_id: TurnId,
+        reason: String,
     },
     ApprovalRequested {
         turn_id: TurnId,

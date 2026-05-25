@@ -27,21 +27,25 @@ model = ""
 
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
+api_key_keychain = "squeezy:openai"
 base_url = "https://api.openai.com/v1"
 default_model = "gpt-5.5"
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
+api_key_keychain = "squeezy:anthropic"
 base_url = "https://api.anthropic.com/v1"
 default_model = "claude-opus-4-7"
 
 [providers.google]
 api_key_env = "GEMINI_API_KEY"
+api_key_keychain = "squeezy:google"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 default_model = "gemini-2.5-pro"
 
 [providers.azure_openai]
 api_key_env = "AZURE_OPENAI_API_KEY"
+api_key_keychain = "squeezy:azure_openai"
 base_url = "https://RESOURCE.openai.azure.com/openai/v1"
 api_version = "v1"
 default_model = "gpt-5.5"
@@ -64,6 +68,13 @@ plus local Ollama availability. It asks for provider/token, model, and supported
 model options such as OpenAI reasoning effort, then saves only the environment
 variable name and selected defaults to `~/.squeezy/settings.toml`. Secret token
 values are never written. Use `--no-default` to run the selector again.
+
+For OpenAI, Anthropic, Google, and Azure OpenAI, `api_key_keychain` is a macOS
+fallback service name for a Generic Password entry. The environment variable
+named by `api_key_env` always wins. When the environment variable is absent,
+Squeezy asks Keychain for the configured service with account `openai`,
+`anthropic`, `google`, or `azure_openai`. On non-macOS hosts this fallback is
+not available.
 
 ## CLI
 

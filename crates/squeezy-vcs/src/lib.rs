@@ -765,18 +765,7 @@ impl CheckpointStore {
         target: RollbackTarget<'_>,
         mode: RollbackMode,
     ) -> Result<RollbackResult> {
-        let records = self.list_checkpoints()?;
-        let mut selected = match target {
-            RollbackTarget::Latest => records.into_iter().rev().take(1).collect::<Vec<_>>(),
-            RollbackTarget::Group(group_id) => records
-                .into_iter()
-                .filter(|record| record.group_id == group_id)
-                .collect::<Vec<_>>(),
-            RollbackTarget::Checkpoint(id) => records
-                .into_iter()
-                .filter(|record| record.id == id)
-                .collect::<Vec<_>>(),
-        };
+        let selected = self.selected_rollback_records(target)?;
         if selected.is_empty() {
             return Ok(RollbackResult {
                 mode,
@@ -789,7 +778,6 @@ impl CheckpointStore {
                 applied: false,
             });
         }
-        selected.sort_by_key(|record| Reverse(record.created_at_ms));
         let conflicts = self.preflight_conflicts(&selected)?;
         let planned_files = selected.iter().map(|record| record.files.len()).sum();
 
@@ -830,6 +818,36 @@ impl CheckpointStore {
             "result": result,
         }))?;
         Ok(result)
+    }
+
+    pub fn rollback_paths(&self, target: RollbackTarget<'_>) -> Result<Vec<String>> {
+        let mut paths = BTreeSet::new();
+        for record in self.selected_rollback_records(target)? {
+            for file in record.files {
+                paths.insert(file.path);
+            }
+        }
+        Ok(paths.into_iter().collect())
+    }
+
+    fn selected_rollback_records(
+        &self,
+        target: RollbackTarget<'_>,
+    ) -> Result<Vec<CheckpointRecord>> {
+        let records = self.list_checkpoints()?;
+        let mut selected = match target {
+            RollbackTarget::Latest => records.into_iter().rev().take(1).collect::<Vec<_>>(),
+            RollbackTarget::Group(group_id) => records
+                .into_iter()
+                .filter(|record| record.group_id == group_id)
+                .collect::<Vec<_>>(),
+            RollbackTarget::Checkpoint(id) => records
+                .into_iter()
+                .filter(|record| record.id == id)
+                .collect::<Vec<_>>(),
+        };
+        selected.sort_by_key(|record| Reverse(record.created_at_ms));
+        Ok(selected)
     }
 
     fn checkpoint_files(

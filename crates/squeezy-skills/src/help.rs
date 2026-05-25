@@ -292,9 +292,14 @@ const TOPICS: &[TopicDefinition] = &[
         summary: "Squeezy separates permission policy from OS shell sandboxing. Permissions decide whether read, edit, shell, web, and MCP operations may start. The shell sandbox is defense in depth for approved commands and can run in required, best-effort, or off modes.",
         docs: &[
             "docs/external/SHELL_SANDBOXING.md",
+            "docs/external/APPROVAL_POLICY.md",
             "docs/external/CONFIGURATION.md",
         ],
-        config: &["permissions", "permissions.shell_sandbox"],
+        config: &[
+            "permissions",
+            "permissions.ai_reviewer",
+            "permissions.shell_sandbox",
+        ],
     },
     TopicDefinition {
         id: "skills",

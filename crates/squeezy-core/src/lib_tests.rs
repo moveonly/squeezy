@@ -93,7 +93,18 @@ fn config_without_env_uses_openai_provider_defaults() {
     assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
     assert_eq!(config.permissions.edit, PermissionMode::Allow);
+    assert!(!config.permissions.ai_reviewer.enabled);
+    assert_eq!(
+        config.permissions.ai_reviewer.allow_capabilities,
+        vec![PermissionCapability::Read, PermissionCapability::Search]
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.protected_metadata_names,
+        [".git", ".squeezy", ".agents"]
+    );
     assert_eq!(config.session_mode, SessionMode::Build);
+    assert!(config.hardening.disable_core_dumps);
+    assert!(config.hardening.deny_debug_attach);
     assert!(!config.store_responses);
     assert!(config.exploration_compiler);
     assert_eq!(config.max_parallel_tools, 8);
@@ -153,6 +164,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
+            assert_eq!(openai.api_key_keychain.as_deref(), Some("squeezy:openai"));
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
         _ => panic!("expected OpenAI provider"),
@@ -256,6 +268,7 @@ read_roots = [{}]
 write_roots = [{}]
 sensitive_path_patterns = [".ssh/**", ".env*"]
 replace_sensitive_path_patterns = true
+protected_metadata_names = [".git", ".custom"]
 "#,
             toml_string(&read_root.display().to_string()),
             toml_string(&write_root.display().to_string()),
@@ -291,10 +304,15 @@ replace_sensitive_path_patterns = true
         config.permissions.shell_sandbox.sensitive_path_patterns,
         [".ssh/**", ".env*"]
     );
+    assert_eq!(
+        config.permissions.shell_sandbox.protected_metadata_names,
+        [".git", ".custom"]
+    );
 
     let inspect = config.inspect_redacted();
     assert!(inspect.contains("[permissions.shell_sandbox]"));
     assert!(inspect.contains("mode = \"best_effort\""));
+    assert!(inspect.contains("protected_metadata_names = [\".git\", \".custom\"]"));
     let round_tripped = SettingsFile::from_toml_str(&inspect, "round-trip")
         .expect("inspect output parses back as settings");
     let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
@@ -313,6 +331,76 @@ fn shell_sandbox_defaults_to_best_effort() {
         config.permissions.shell_sandbox.mode,
         ShellSandboxMode::BestEffort
     );
+}
+
+#[test]
+fn sandbox_ai_reviewer_keychain_and_hardening_settings_parse_and_inspect() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key_keychain = "custom:openai"
+
+[permissions.ai_reviewer]
+enabled = true
+model = "reviewer-model"
+allow_capabilities = ["read", "search", "edit"]
+policy_file = "docs/approval.md"
+timeout_secs = 7
+
+[permissions.shell_sandbox]
+mode = "external"
+protected_metadata_names = [".git", ".meta"]
+
+[hardening]
+disable_core_dumps = false
+deny_debug_attach = false
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::External
+    );
+    assert_eq!(
+        config.permissions.shell_sandbox.protected_metadata_names,
+        [".git", ".meta"]
+    );
+    assert!(config.permissions.ai_reviewer.enabled);
+    assert_eq!(
+        config.permissions.ai_reviewer.model.as_deref(),
+        Some("reviewer-model")
+    );
+    assert_eq!(config.permissions.ai_reviewer.timeout_secs, 7);
+    assert_eq!(
+        config.permissions.ai_reviewer.allow_capabilities,
+        vec![
+            PermissionCapability::Read,
+            PermissionCapability::Search,
+            PermissionCapability::Edit,
+        ]
+    );
+    assert_eq!(
+        config.permissions.ai_reviewer.policy_file.as_deref(),
+        Some(Path::new("docs/approval.md"))
+    );
+    assert!(!config.hardening.disable_core_dumps);
+    assert!(!config.hardening.deny_debug_attach);
+    match &config.provider {
+        ProviderConfig::OpenAi(openai) => {
+            assert_eq!(openai.api_key_keychain.as_deref(), Some("custom:openai"));
+        }
+        _ => panic!("expected OpenAI provider"),
+    }
+
+    let inspect = config.inspect_redacted();
+    assert!(inspect.contains("[permissions.ai_reviewer]"));
+    assert!(inspect.contains("enabled = true"));
+    assert!(inspect.contains("mode = \"external\""));
+    assert!(inspect.contains("[hardening]"));
+    SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
 }
 
 #[test]

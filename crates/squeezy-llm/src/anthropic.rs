@@ -38,7 +38,11 @@ impl std::fmt::Debug for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
-        let api_key = resolve_api_key(&config.api_key_env)?;
+        let api_key = if let Some(service) = config.api_key_keychain.as_deref() {
+            crate::keychain::resolve_api_key(&config.api_key_env, Some(service), "anthropic")?
+        } else {
+            resolve_api_key(&config.api_key_env)?
+        };
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,

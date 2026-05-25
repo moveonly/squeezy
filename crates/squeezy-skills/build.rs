@@ -6,6 +6,7 @@ use std::{
 const DOCS: &[(&str, &str)] = &[
     ("README.md", "docs/external/README.md"),
     ("AGENT_APPROACH.md", "docs/external/AGENT_APPROACH.md"),
+    ("APPROVAL_POLICY.md", "docs/external/APPROVAL_POLICY.md"),
     ("CHECKPOINTS.md", "docs/external/CHECKPOINTS.md"),
     ("CONFIGURATION.md", "docs/external/CONFIGURATION.md"),
     ("FEEDBACK.md", "docs/external/FEEDBACK.md"),
