@@ -48,7 +48,7 @@ impl Writer {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
-                self.push_text(&text, self.current_style);
+                self.push_text_with_confidence_labels(&text, self.current_style);
             }
             Event::Code(code) => {
                 self.push_text(&code, self.current_style.patch(inline_code_style()));
@@ -187,6 +187,37 @@ impl Writer {
         self.current_style = self.style_stack.pop().unwrap_or_default();
     }
 
+    /// Render `text` while colouring graph confidence labels (`exact_syntax`,
+    /// `candidate_set`, `label_missing`, …) so a watcher can scan a turn for
+    /// quality at a glance instead of reading every clause.
+    ///
+    /// Two forms are recognised:
+    ///   1. `… — exact_syntax …` — the em-dash separator survives parsing,
+    ///      so we find it inside a single Event::Text.
+    ///   2. `[exact_syntax]` — pulldown_cmark splits this into three
+    ///      separate `[`, `label`, `]` text events, so we colour the
+    ///      whole event when its content is exactly a known label.
+    fn push_text_with_confidence_labels(&mut self, text: &str, base_style: Style) {
+        if let Some(label) = confidence_label_exact_match(text) {
+            let label_style = base_style.patch(Style::default().fg(confidence_label_color(label)));
+            self.push_text(text, label_style);
+            return;
+        }
+        let mut cursor = 0;
+        while let Some((start, end, label)) = find_next_confidence_label(text, cursor) {
+            if start > cursor {
+                self.push_text(&text[cursor..start], base_style);
+            }
+            let color = confidence_label_color(label);
+            let label_style = base_style.patch(Style::default().fg(color));
+            self.push_text(&text[start..end], label_style);
+            cursor = end;
+        }
+        if cursor < text.len() {
+            self.push_text(&text[cursor..], base_style);
+        }
+    }
+
     fn push_text(&mut self, text: &str, style: Style) {
         for segment in text.split_inclusive('\n') {
             self.ensure_quote_prefix();
@@ -250,6 +281,96 @@ fn heading_style(level: HeadingLevel) -> Style {
 
 fn inline_code_style() -> Style {
     Style::default().fg(Color::Cyan)
+}
+
+/// Graph confidence labels squeezy emits in assistant prose
+/// (`exact_syntax`, `import_resolved`, `candidate_set`, `external`,
+/// `unknown`, `label_missing`). The renderer highlights any of these
+/// when they appear:
+///   * preceded by an em dash and space (`X — exact_syntax`), or
+///   * wrapped in square brackets (`[exact_syntax]`).
+///
+/// The label itself is the part that gets the palette colour; the
+/// surrounding punctuation keeps the inherited style.
+const CONFIDENCE_LABELS: &[&str] = &[
+    "exact_syntax",
+    "import_resolved",
+    "candidate_set",
+    "external",
+    "unknown",
+    "label_missing",
+];
+
+/// Returns the label if `text` is exactly one of the known confidence
+/// labels (used by the bracketed form, which pulldown_cmark splits
+/// into separate `[`, `label`, `]` text events).
+fn confidence_label_exact_match(text: &str) -> Option<&'static str> {
+    CONFIDENCE_LABELS
+        .iter()
+        .copied()
+        .find(|label| *label == text)
+}
+
+fn confidence_label_color(label: &str) -> Color {
+    match label {
+        "exact_syntax" => palette::SUCCESS_GREEN,
+        "import_resolved" => palette::AMBER,
+        "candidate_set" => palette::GOLD,
+        "external" | "unknown" => palette::QUIET,
+        "label_missing" => palette::ERROR_RED,
+        _ => palette::QUIET,
+    }
+}
+
+/// Locate the next confidence label in `text` starting from `from`.
+/// Returns the byte range to style and the matched label string.
+fn find_next_confidence_label(text: &str, from: usize) -> Option<(usize, usize, &'static str)> {
+    let haystack = &text[from..];
+    let mut best: Option<(usize, usize, &'static str)> = None;
+    for &label in CONFIDENCE_LABELS {
+        // `— label` form: match the literal " — label" or " — label" with
+        // an em dash; require a leading separator so we don't colour
+        // bare matches inside identifiers (`my_exact_syntax_test`).
+        let with_em_dash = format!(" — {label}");
+        if let Some(off) = haystack.find(&with_em_dash) {
+            // Highlight just the label, not the em-dash separator.
+            let label_start = from + off + with_em_dash.len() - label.len();
+            let label_end = label_start + label.len();
+            if !is_identifier_continuation(text, label_end) {
+                pick_earliest(&mut best, (label_start, label_end, label));
+            }
+        }
+        let bracketed = format!("[{label}]");
+        if let Some(off) = haystack.find(&bracketed) {
+            // Skip the leading `[`; colour `label` only (the brackets
+            // stay in the inherited style so the punctuation reads
+            // normally).
+            let label_start = from + off + 1;
+            let label_end = label_start + label.len();
+            pick_earliest(&mut best, (label_start, label_end, label));
+        }
+    }
+    best
+}
+
+fn pick_earliest<'a>(
+    best: &mut Option<(usize, usize, &'a str)>,
+    candidate: (usize, usize, &'a str),
+) {
+    match best {
+        Some(current) if current.0 <= candidate.0 => {}
+        _ => *best = Some(candidate),
+    }
+}
+
+/// Returns true when the byte after `end` is alphanumeric or `_` — i.e.
+/// we're still inside an identifier, so the apparent label is actually
+/// the prefix of a longer word (`exact_syntax_foo`).
+fn is_identifier_continuation(text: &str, end: usize) -> bool {
+    text.as_bytes()
+        .get(end)
+        .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        .unwrap_or(false)
 }
 
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {

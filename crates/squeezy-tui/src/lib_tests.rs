@@ -2307,6 +2307,59 @@ fn markdown_renders_heading_and_code() {
 }
 
 #[test]
+fn markdown_colors_confidence_labels_after_em_dash() {
+    let cases = [
+        ("exact_syntax", render::palette::SUCCESS_GREEN),
+        ("import_resolved", render::palette::AMBER),
+        ("candidate_set", render::palette::GOLD),
+        ("external", render::palette::QUIET),
+        ("unknown", render::palette::QUIET),
+        ("label_missing", render::palette::ERROR_RED),
+    ];
+    for (label, expected) in cases {
+        let lines = render::markdown::render_markdown(&format!(
+            "X is constructed via from_path — {label}."
+        ));
+        let span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == label)
+            .unwrap_or_else(|| panic!("label span for `{label}` is missing"));
+        assert_eq!(span.style.fg, Some(expected), "color for `{label}`");
+    }
+}
+
+#[test]
+fn markdown_colors_confidence_labels_in_brackets() {
+    let lines =
+        render::markdown::render_markdown("the call resolves [candidate_set] across two impls");
+    let span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "candidate_set")
+        .expect("bracketed label should render its own span");
+    assert_eq!(span.style.fg, Some(render::palette::GOLD));
+}
+
+#[test]
+fn markdown_leaves_identifier_lookalikes_uncoloured() {
+    let lines = render::markdown::render_markdown(
+        "the helper `exact_syntax_test` is not a confidence label",
+    );
+    // No span equal to the bare label string `exact_syntax` should
+    // appear — it only shows up as a substring of the longer
+    // identifier inside a code span.
+    let any_styled_label = lines.iter().flat_map(|line| line.spans.iter()).any(|span| {
+        span.content.as_ref() == "exact_syntax"
+            && span.style.fg == Some(render::palette::SUCCESS_GREEN)
+    });
+    assert!(
+        !any_styled_label,
+        "should not colour `exact_syntax` when it is part of a longer identifier"
+    );
+}
+
+#[test]
 fn palette_returns_ansi16_when_unsupported() {
     assert_eq!(
         render::palette::best_color_for_level((255, 0, 0), render::palette::ColorLevel::Ansi16),
