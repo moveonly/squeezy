@@ -1479,6 +1479,11 @@ async fn approval_menu_uses_arrows_and_enter_for_repo_rule() {
     assert_eq!(app.approval_selection_index, 1);
     assert!(handle_approval_key(
         &mut app,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    ));
+    assert_eq!(app.approval_selection_index, 2);
+    assert!(handle_approval_key(
+        &mut app,
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
     ));
 
@@ -1514,10 +1519,12 @@ fn approval_menu_renders_below_prompt_without_border_box() {
 
     assert!(approval > prompt, "{output}");
     assert!(output.contains("› Approve"), "{output}");
+    assert!(output.contains("Approve for this session"), "{output}");
     assert!(
         output.contains("Always approve this command in this repo"),
         "{output}"
     );
+    assert!(output.contains("Deny for this session"), "{output}");
     assert!(!output.contains("Approval required"), "{output}");
     assert!(!output.contains('┌'), "{output}");
 }

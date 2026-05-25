@@ -10,6 +10,9 @@ use regex::{Captures, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod hardening;
+pub use hardening::pre_main_hardening;
+
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -134,6 +137,7 @@ pub struct AppConfig {
     pub checkpoints_enabled: bool,
     pub tui: TuiConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub hardening: HardeningConfig,
     pub config_sources: Vec<String>,
 }
 
@@ -242,6 +246,8 @@ impl AppConfig {
                 api_key_env: get_var("ANTHROPIC_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "anthropic", "api_key_env"))
                     .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_string()),
+                api_key_keychain: provider_setting(&providers, "anthropic", "api_key_keychain")
+                    .or_else(|| Some("squeezy:anthropic".to_string())),
                 base_url: get_var("ANTHROPIC_BASE_URL")
                     .or_else(|| provider_setting(&providers, "anthropic", "base_url"))
                     .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
@@ -250,6 +256,8 @@ impl AppConfig {
                 api_key_env: get_var("GOOGLE_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "google", "api_key_env"))
                     .unwrap_or_else(|| "GEMINI_API_KEY".to_string()),
+                api_key_keychain: provider_setting(&providers, "google", "api_key_keychain")
+                    .or_else(|| Some("squeezy:google".to_string())),
                 base_url: get_var("GOOGLE_BASE_URL")
                     .or_else(|| provider_setting(&providers, "google", "base_url"))
                     .unwrap_or_else(|| DEFAULT_GOOGLE_BASE_URL.to_string()),
@@ -260,6 +268,13 @@ impl AppConfig {
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
                         .or_else(|| provider_setting(&providers, "azure", "api_key_env"))
                         .unwrap_or_else(|| "AZURE_OPENAI_API_KEY".to_string()),
+                    api_key_keychain: provider_setting(
+                        &providers,
+                        "azure_openai",
+                        "api_key_keychain",
+                    )
+                    .or_else(|| provider_setting(&providers, "azure", "api_key_keychain"))
+                    .or_else(|| Some("squeezy:azure_openai".to_string())),
                     base_url: get_var("AZURE_OPENAI_BASE_URL")
                         .or_else(|| provider_setting(&providers, "azure_openai", "base_url"))
                         .or_else(|| provider_setting(&providers, "azure", "base_url"))
@@ -289,6 +304,8 @@ impl AppConfig {
                 api_key_env: get_var("OPENAI_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "openai", "api_key_env"))
                     .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+                api_key_keychain: provider_setting(&providers, "openai", "api_key_keychain")
+                    .or_else(|| Some("squeezy:openai".to_string())),
                 base_url: get_var("OPENAI_BASE_URL")
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
@@ -506,6 +523,7 @@ impl AppConfig {
             checkpoints_enabled,
             tui,
             mcp_servers,
+            hardening: HardeningConfig::from_settings(settings.hardening.unwrap_or_default()),
             config_sources: sources,
         })
     }
@@ -709,6 +727,36 @@ impl AppConfig {
             "shell_classifier = {}\n\n",
             self.permissions.shell_classifier
         ));
+        output.push_str("[permissions.ai_reviewer]\n");
+        output.push_str(&format!(
+            "enabled = {}\n",
+            self.permissions.ai_reviewer.enabled
+        ));
+        if let Some(model) = &self.permissions.ai_reviewer.model {
+            output.push_str(&format!("model = {}\n", toml_string(model)));
+        }
+        output.push_str(&format!(
+            "allow_capabilities = {}\n",
+            toml_string_array(
+                &self
+                    .permissions
+                    .ai_reviewer
+                    .allow_capabilities
+                    .iter()
+                    .map(|capability| capability.as_str().to_string())
+                    .collect::<Vec<_>>()
+            )
+        ));
+        if let Some(policy_file) = &self.permissions.ai_reviewer.policy_file {
+            output.push_str(&format!(
+                "policy_file = {}\n",
+                toml_string(&policy_file.display().to_string())
+            ));
+        }
+        output.push_str(&format!(
+            "timeout_secs = {}\n\n",
+            self.permissions.ai_reviewer.timeout_secs
+        ));
         output.push_str("[permissions.shell_sandbox]\n");
         output.push_str(&format!(
             "mode = {}\n",
@@ -739,6 +787,10 @@ impl AppConfig {
             toml_path_array(&self.permissions.shell_sandbox.write_roots)
         ));
         output.push_str(&format!(
+            "protected_metadata_names = {}\n",
+            toml_string_array(&self.permissions.shell_sandbox.protected_metadata_names)
+        ));
+        output.push_str(&format!(
             "sensitive_path_patterns = {}\n",
             toml_string_array(&self.permissions.shell_sandbox.sensitive_path_patterns)
         ));
@@ -762,6 +814,16 @@ impl AppConfig {
             }
             output.push('\n');
         }
+
+        output.push_str("[hardening]\n");
+        output.push_str(&format!(
+            "disable_core_dumps = {}\n",
+            self.hardening.disable_core_dumps
+        ));
+        output.push_str(&format!(
+            "deny_debug_attach = {}\n\n",
+            self.hardening.deny_debug_attach
+        ));
 
         output.push_str("[telemetry]\n");
         output.push_str(&format!("enabled = {}\n", self.telemetry.enabled));
@@ -1106,24 +1168,28 @@ pub enum ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiConfig {
     pub api_key_env: String,
+    pub api_key_keychain: Option<String>,
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
+    pub api_key_keychain: Option<String>,
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleConfig {
     pub api_key_env: String,
+    pub api_key_keychain: Option<String>,
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
+    pub api_key_keychain: Option<String>,
     pub base_url: String,
     pub api_version: String,
 }
@@ -1221,6 +1287,7 @@ pub struct SettingsFile {
     pub tools: Option<ToolSchemaSettings>,
     pub tui: Option<TuiSettings>,
     pub mcp: Option<McpSettings>,
+    pub hardening: Option<HardeningSettings>,
 }
 
 impl SettingsFile {
@@ -1278,6 +1345,7 @@ impl SettingsFile {
                 "tools",
                 "tui",
                 "mcp",
+                "hardening",
             ],
             source,
             "",
@@ -1347,6 +1415,9 @@ impl SettingsFile {
         settings.mcp = optional_table(table, "mcp", source)?
             .map(|table| McpSettings::from_table(table, source, "mcp"))
             .transpose()?;
+        settings.hardening = optional_table(table, "hardening", source)?
+            .map(|table| HardeningSettings::from_table(table, source, "hardening"))
+            .transpose()?;
         Ok(settings)
     }
 
@@ -1392,12 +1463,78 @@ impl SettingsFile {
         merge_option(&mut self.tools, next.tools, ToolSchemaSettings::merge);
         merge_option(&mut self.tui, next.tui, TuiSettings::merge);
         merge_option(&mut self.mcp, next.mcp, McpSettings::merge);
+        merge_option(
+            &mut self.hardening,
+            next.hardening,
+            HardeningSettings::merge,
+        );
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct HardeningSettings {
+    pub disable_core_dumps: Option<bool>,
+    pub deny_debug_attach: Option<bool>,
+}
+
+impl HardeningSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &["disable_core_dumps", "deny_debug_attach"],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            disable_core_dumps: bool_value(
+                table,
+                "disable_core_dumps",
+                source,
+                &field(path, "disable_core_dumps"),
+            )?,
+            deny_debug_attach: bool_value(
+                table,
+                "deny_debug_attach",
+                source,
+                &field(path, "deny_debug_attach"),
+            )?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.disable_core_dumps, next.disable_core_dumps);
+        replace_if_some(&mut self.deny_debug_attach, next.deny_debug_attach);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HardeningConfig {
+    pub disable_core_dumps: bool,
+    pub deny_debug_attach: bool,
+}
+
+impl Default for HardeningConfig {
+    fn default() -> Self {
+        Self {
+            disable_core_dumps: true,
+            deny_debug_attach: true,
+        }
+    }
+}
+
+impl HardeningConfig {
+    fn from_settings(settings: HardeningSettings) -> Self {
+        Self {
+            disable_core_dumps: settings.disable_core_dumps.unwrap_or(true),
+            deny_debug_attach: settings.deny_debug_attach.unwrap_or(true),
+        }
     }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub api_key_env: Option<String>,
+    pub api_key_keychain: Option<String>,
     pub base_url: Option<String>,
     pub default_model: Option<String>,
     pub api_version: Option<String>,
@@ -1410,6 +1547,7 @@ impl ProviderSettings {
             table,
             &[
                 "api_key_env",
+                "api_key_keychain",
                 "base_url",
                 "default_model",
                 "api_version",
@@ -1420,6 +1558,12 @@ impl ProviderSettings {
         )?;
         Ok(Self {
             api_key_env: string_value(table, "api_key_env", source, &field(path, "api_key_env"))?,
+            api_key_keychain: string_value(
+                table,
+                "api_key_keychain",
+                source,
+                &field(path, "api_key_keychain"),
+            )?,
             base_url: string_value(table, "base_url", source, &field(path, "base_url"))?,
             default_model: string_value(
                 table,
@@ -1434,6 +1578,7 @@ impl ProviderSettings {
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.api_key_env, next.api_key_env);
+        replace_if_some(&mut self.api_key_keychain, next.api_key_keychain);
         replace_if_some(&mut self.base_url, next.base_url);
         replace_if_some(&mut self.default_model, next.default_model);
         replace_if_some(&mut self.api_version, next.api_version);
@@ -2415,6 +2560,7 @@ pub struct PermissionSettings {
     pub web: Option<PermissionMode>,
     pub mcp: Option<PermissionMode>,
     pub shell_classifier: Option<bool>,
+    pub ai_reviewer: Option<AiReviewerSettings>,
     pub shell_sandbox: Option<ShellSandboxSettings>,
     pub rules: Vec<PermissionRule>,
 }
@@ -2431,6 +2577,7 @@ impl PermissionSettings {
                 "web",
                 "mcp",
                 "shell_classifier",
+                "ai_reviewer",
                 "shell_sandbox",
                 "rules",
             ],
@@ -2455,6 +2602,11 @@ impl PermissionSettings {
                 source,
                 &field(path, "shell_classifier"),
             )?,
+            ai_reviewer: optional_table(table, "ai_reviewer", source)?
+                .map(|table| {
+                    AiReviewerSettings::from_table(table, source, &field(path, "ai_reviewer"))
+                })
+                .transpose()?,
             shell_sandbox: optional_table(table, "shell_sandbox", source)?
                 .map(|table| {
                     ShellSandboxSettings::from_table(table, source, &field(path, "shell_sandbox"))
@@ -2473,11 +2625,130 @@ impl PermissionSettings {
         replace_if_some(&mut self.mcp, next.mcp);
         replace_if_some(&mut self.shell_classifier, next.shell_classifier);
         merge_option(
+            &mut self.ai_reviewer,
+            next.ai_reviewer,
+            AiReviewerSettings::merge,
+        );
+        merge_option(
             &mut self.shell_sandbox,
             next.shell_sandbox,
             ShellSandboxSettings::merge,
         );
         self.rules.extend(next.rules);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AiReviewerSettings {
+    pub enabled: Option<bool>,
+    pub model: Option<String>,
+    pub allow_capabilities: Option<Vec<String>>,
+    pub policy_file: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+impl AiReviewerSettings {
+    fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
+        reject_unknown_keys(
+            table,
+            &[
+                "enabled",
+                "model",
+                "allow_capabilities",
+                "policy_file",
+                "timeout_secs",
+            ],
+            source,
+            path,
+        )?;
+        Ok(Self {
+            enabled: bool_value(table, "enabled", source, &field(path, "enabled"))?,
+            model: string_value(table, "model", source, &field(path, "model"))?,
+            allow_capabilities: string_array_value(
+                table,
+                "allow_capabilities",
+                source,
+                &field(path, "allow_capabilities"),
+            )?,
+            policy_file: string_value(table, "policy_file", source, &field(path, "policy_file"))?,
+            timeout_secs: u64_value(table, "timeout_secs", source, &field(path, "timeout_secs"))?,
+        })
+    }
+
+    fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.enabled, next.enabled);
+        replace_if_some(&mut self.model, next.model);
+        replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
+        replace_if_some(&mut self.policy_file, next.policy_file);
+        replace_if_some(&mut self.timeout_secs, next.timeout_secs);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiReviewerConfig {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub allow_capabilities: Vec<PermissionCapability>,
+    pub policy_file: Option<PathBuf>,
+    pub timeout_secs: u64,
+}
+
+impl Default for AiReviewerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: None,
+            allow_capabilities: vec![PermissionCapability::Read, PermissionCapability::Search],
+            policy_file: None,
+            timeout_secs: 15,
+        }
+    }
+}
+
+impl AiReviewerConfig {
+    fn from_settings(settings: Option<AiReviewerSettings>, source: &str) -> Result<Self> {
+        let mut config = Self::default();
+        let Some(settings) = settings else {
+            return Ok(config);
+        };
+        if let Some(enabled) = settings.enabled {
+            config.enabled = enabled;
+        }
+        if let Some(model) = settings.model {
+            let model = model.trim();
+            if !model.is_empty() {
+                config.model = Some(model.to_string());
+            }
+        }
+        if let Some(policy_file) = settings.policy_file {
+            let policy_file = policy_file.trim();
+            if !policy_file.is_empty() {
+                config.policy_file = Some(expand_home_path(PathBuf::from(policy_file)));
+            }
+        }
+        if let Some(timeout_secs) = settings.timeout_secs {
+            if !(1..=120).contains(&timeout_secs) {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.ai_reviewer.timeout_secs {timeout_secs} outside supported range 1..=120"
+                )));
+            }
+            config.timeout_secs = timeout_secs;
+        }
+        if let Some(allow_capabilities) = settings.allow_capabilities {
+            let mut parsed = Vec::new();
+            for capability in allow_capabilities {
+                let Some(capability) = PermissionCapability::parse(&capability) else {
+                    return Err(SqueezyError::Config(format!(
+                        "{source}: permissions.ai_reviewer.allow_capabilities contains invalid capability {capability:?}"
+                    )));
+                };
+                if !parsed.contains(&capability) {
+                    parsed.push(capability);
+                }
+            }
+            config.allow_capabilities = parsed;
+        }
+        Ok(config)
     }
 }
 
@@ -2490,6 +2761,7 @@ pub struct ShellSandboxSettings {
     pub env_allowlist: Option<Vec<String>>,
     pub read_roots: Option<Vec<String>>,
     pub write_roots: Option<Vec<String>>,
+    pub protected_metadata_names: Option<Vec<String>>,
     pub sensitive_path_patterns: Option<Vec<String>>,
     /// When `true`, the user-provided `sensitive_path_patterns` REPLACE the
     /// built-in floor. The default behavior (`false` / unset) extends the
@@ -2510,6 +2782,7 @@ impl ShellSandboxSettings {
                 "env_allowlist",
                 "read_roots",
                 "write_roots",
+                "protected_metadata_names",
                 "sensitive_path_patterns",
                 "replace_sensitive_path_patterns",
             ],
@@ -2544,6 +2817,12 @@ impl ShellSandboxSettings {
                 source,
                 &field(path, "write_roots"),
             )?,
+            protected_metadata_names: string_array_value(
+                table,
+                "protected_metadata_names",
+                source,
+                &field(path, "protected_metadata_names"),
+            )?,
             sensitive_path_patterns: string_array_value(
                 table,
                 "sensitive_path_patterns",
@@ -2568,6 +2847,10 @@ impl ShellSandboxSettings {
         merge_string_lists(&mut self.read_roots, next.read_roots);
         merge_string_lists(&mut self.write_roots, next.write_roots);
         replace_if_some(
+            &mut self.protected_metadata_names,
+            next.protected_metadata_names,
+        );
+        replace_if_some(
             &mut self.sensitive_path_patterns,
             next.sensitive_path_patterns,
         );
@@ -2583,6 +2866,7 @@ pub enum ShellSandboxMode {
     Required,
     BestEffort,
     Off,
+    External,
 }
 
 impl ShellSandboxMode {
@@ -2591,6 +2875,7 @@ impl ShellSandboxMode {
             "required" => Some(Self::Required),
             "best_effort" | "best-effort" => Some(Self::BestEffort),
             "off" | "disabled" => Some(Self::Off),
+            "external" | "external_sandbox" | "external-sandbox" => Some(Self::External),
             _ => None,
         }
     }
@@ -2600,6 +2885,7 @@ impl ShellSandboxMode {
             Self::Required => "required",
             Self::BestEffort => "best_effort",
             Self::Off => "off",
+            Self::External => "external",
         }
     }
 }
@@ -2636,6 +2922,7 @@ pub struct ShellSandboxConfig {
     pub env_allowlist: Vec<String>,
     pub read_roots: Vec<PathBuf>,
     pub write_roots: Vec<PathBuf>,
+    pub protected_metadata_names: Vec<String>,
     pub sensitive_path_patterns: Vec<String>,
 }
 
@@ -2649,6 +2936,7 @@ impl Default for ShellSandboxConfig {
             env_allowlist: default_shell_env_allowlist(),
             read_roots: Vec::new(),
             write_roots: Vec::new(),
+            protected_metadata_names: default_protected_metadata_names(),
             sensitive_path_patterns: default_sensitive_path_patterns(),
         }
     }
@@ -2670,7 +2958,7 @@ impl ShellSandboxConfig {
         if let Some(mode) = settings.mode {
             config.mode = ShellSandboxMode::parse(&mode).ok_or_else(|| {
                 SqueezyError::Config(format!(
-                    "{source}: permissions.shell_sandbox.mode invalid value {mode:?}; expected required, best_effort, or off"
+                    "{source}: permissions.shell_sandbox.mode invalid value {mode:?}; expected required, best_effort, off, or external"
                 ))
             })?;
         }
@@ -2755,6 +3043,10 @@ impl ShellSandboxConfig {
                 workspace_root,
                 &config.sensitive_path_patterns,
             )?;
+        }
+        if let Some(protected_metadata_names) = settings.protected_metadata_names {
+            config.protected_metadata_names =
+                validate_protected_metadata_names(protected_metadata_names, source)?;
         }
         reject_duplicate_shell_roots(source, &config.read_roots, &config.write_roots)?;
         Ok(config)
@@ -2880,6 +3172,35 @@ fn reject_duplicate_shell_roots(
     Ok(())
 }
 
+fn validate_protected_metadata_names(names: Vec<String>, source: &str) -> Result<Vec<String>> {
+    let mut validated = Vec::new();
+    for raw in names {
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.protected_metadata_names contains empty name"
+            )));
+        }
+        if name.contains('/') || name.contains('\\') || name == "." || name == ".." {
+            return Err(SqueezyError::Config(format!(
+                "{source}: permissions.shell_sandbox.protected_metadata_names name {raw:?} must be a single path segment"
+            )));
+        }
+        let name = name.to_string();
+        if !validated.contains(&name) {
+            validated.push(name);
+        }
+    }
+    if validated.is_empty() {
+        tracing::warn!(
+            target: "squeezy::permissions",
+            source = %source,
+            "permissions.shell_sandbox.protected_metadata_names is empty; metadata directory write protection is disabled"
+        );
+    }
+    Ok(validated)
+}
+
 fn shell_root_sensitive_overlap(
     root: &Path,
     workspace_root: &Path,
@@ -2967,6 +3288,13 @@ fn default_sensitive_path_patterns() -> Vec<String> {
     .collect()
 }
 
+fn default_protected_metadata_names() -> Vec<String> {
+    [".git", ".squeezy", ".agents"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PermissionScope {
     Read,
@@ -2989,6 +3317,7 @@ pub struct PermissionPolicy {
     pub web: PermissionMode,
     pub mcp: PermissionMode,
     pub shell_classifier: bool,
+    pub ai_reviewer: AiReviewerConfig,
     pub shell_sandbox: ShellSandboxConfig,
     pub rules: Vec<PermissionRule>,
 }
@@ -3039,6 +3368,7 @@ impl PermissionPolicy {
                 var("SQUEEZY_SHELL_PERMISSION_CLASSIFIER"),
                 settings.shell_classifier.unwrap_or(false),
             ),
+            ai_reviewer: AiReviewerConfig::from_settings(settings.ai_reviewer, source)?,
             shell_sandbox: ShellSandboxConfig::from_settings(
                 settings.shell_sandbox,
                 source,
@@ -3165,6 +3495,7 @@ impl Default for PermissionPolicy {
             web: PermissionMode::Ask,
             mcp: PermissionMode::Ask,
             shell_classifier: false,
+            ai_reviewer: AiReviewerConfig::default(),
             shell_sandbox: ShellSandboxConfig::default(),
             rules: Vec::new(),
         }
@@ -4502,11 +4833,13 @@ pub fn user_settings_template() -> &'static str {
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
+# api_key_keychain = "squeezy:openai"
 # base_url = "https://api.openai.com/v1"
 # default_model = "gpt-5.5"
 
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
+# api_key_keychain = "squeezy:anthropic"
 # base_url = "https://api.anthropic.com/v1"
 # default_model = "claude-opus-4-7"
 
@@ -4518,6 +4851,13 @@ pub fn user_settings_template() -> &'static str {
 # web = "ask"
 # mcp = "ask"
 # shell_classifier = false       # narrow LLM fallback for ambiguous shell commands (extra LLM call)
+
+# [permissions.ai_reviewer]
+# enabled = false
+# model = "gpt-5-mini"          # optional reviewer model override
+# allow_capabilities = ["read", "search"]
+# policy_file = ""              # optional local approval policy override
+# timeout_secs = 15
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
 # Known prefixes:
@@ -4550,14 +4890,19 @@ pub fn user_settings_template() -> &'static str {
 # source = "project"
 
 # [permissions.shell_sandbox]
-# mode = "best_effort"              # best_effort | required | off
+# mode = "best_effort"              # best_effort | required | off | external
 # network = "deny_by_default"       # deny_by_default | allow_when_approved
 # audit = true
 # kill_grace_ms = 250
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
 # read_roots = []                  # extra absolute directories shell may read
 # write_roots = []                 # extra absolute directories shell may read/write
+# protected_metadata_names = [".git", ".squeezy", ".agents"]
 # sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
+
+[hardening]
+# disable_core_dumps = true
+# deny_debug_attach = true
 
 [telemetry]
 # enabled = true
@@ -4670,6 +5015,10 @@ pub fn project_settings_template() -> &'static str {
 # web = "ask"
 # mcp = "ask"
 #
+# [permissions.ai_reviewer]
+# enabled = false
+# allow_capabilities = ["read", "search"]
+#
 # [[permissions.rules]]
 # capability = "compiler"
 # target = "cargo test:*"
@@ -4679,6 +5028,11 @@ pub fn project_settings_template() -> &'static str {
 # [permissions.shell_sandbox]
 # read_roots = []                  # shared absolute read-only shell roots
 # write_roots = []                 # shared absolute read/write shell roots
+# protected_metadata_names = [".git", ".squeezy", ".agents"]
+
+[hardening]
+# disable_core_dumps = true
+# deny_debug_attach = true
 
 # `[graph]` controls workspace indexing. `[mcp.servers.*]` configures
 # external MCP tools that are discovered before each agent turn.
@@ -4794,6 +5148,7 @@ fn provider_setting(
     let settings = providers.get(provider)?;
     let value = match key {
         "api_key_env" => settings.api_key_env.as_ref(),
+        "api_key_keychain" => settings.api_key_keychain.as_ref(),
         "base_url" => settings.base_url.as_ref(),
         "default_model" => settings.default_model.as_ref(),
         "api_version" => settings.api_version.as_ref(),

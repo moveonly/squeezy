@@ -26,3 +26,6 @@ serde_json.workspace = true
 squeezy-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"

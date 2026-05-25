@@ -479,6 +479,10 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         compact_text(&error, 180)
                     ));
                 }
+                AgentEvent::AiReviewerTripped { reason, .. } => {
+                    app.status = "approval review paused".to_string();
+                    app.push_log(format!("AI approval reviewer paused: {reason}"));
+                }
                 AgentEvent::ApprovalRequested {
                     request,
                     decision_tx,
@@ -2504,8 +2508,10 @@ fn send_approval_decision(
     let _ = pending.decision_tx.send(option.decision);
     app.status = match option.choice {
         ApprovalChoice::Approve => format!("approved {tool_name}"),
+        ApprovalChoice::ApproveSession => format!("saved session approval for {tool_name}"),
         ApprovalChoice::ApproveProject => format!("saved repo approval for {tool_name}"),
         ApprovalChoice::Deny => format!("denied {tool_name}"),
+        ApprovalChoice::DenySession => format!("saved session deny for {tool_name}"),
     };
     true
 }
@@ -2513,8 +2519,10 @@ fn send_approval_decision(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalChoice {
     Approve,
+    ApproveSession,
     ApproveProject,
     Deny,
+    DenySession,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2532,6 +2540,13 @@ const APPROVAL_ONCE: ApprovalOption = ApprovalOption {
     decision: ToolApprovalDecision::AllowOnce,
 };
 
+const APPROVAL_SESSION: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::ApproveSession,
+    label: "Approve for this session",
+    hint: "save an in-memory rule",
+    decision: ToolApprovalDecision::AllowSession,
+};
+
 const APPROVAL_PROJECT: ApprovalOption = ApprovalOption {
     choice: ApprovalChoice::ApproveProject,
     label: "Always approve this command in this repo",
@@ -2546,8 +2561,21 @@ const APPROVAL_DENY: ApprovalOption = ApprovalOption {
     decision: ToolApprovalDecision::DenyOnce,
 };
 
+const APPROVAL_DENY_SESSION: ApprovalOption = ApprovalOption {
+    choice: ApprovalChoice::DenySession,
+    label: "Deny for this session",
+    hint: "save an in-memory deny rule",
+    decision: ToolApprovalDecision::DenySession,
+};
+
 fn approval_options() -> &'static [ApprovalOption] {
-    &[APPROVAL_ONCE, APPROVAL_PROJECT, APPROVAL_DENY]
+    &[
+        APPROVAL_ONCE,
+        APPROVAL_SESSION,
+        APPROVAL_PROJECT,
+        APPROVAL_DENY,
+        APPROVAL_DENY_SESSION,
+    ]
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
@@ -3126,8 +3154,8 @@ fn task_title(snapshot: &TaskStateSnapshot) -> &str {
 }
 
 fn approval_menu_height(app: &TuiApp) -> u16 {
-    if app.pending_approval.is_some() {
-        6
+    if let Some(pending) = app.pending_approval.as_ref() {
+        format_approval_menu_lines(&pending.request, app.approval_selection_index).len() as u16
     } else if let Some(pending) = app.pending_mcp_elicitation.as_ref() {
         match pending.request.kind {
             McpElicitationKind::Form => {

@@ -13,6 +13,7 @@ pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 mod anthropic;
 mod bedrock;
 mod google;
+mod keychain;
 mod ollama;
 mod openai;
 mod registry;

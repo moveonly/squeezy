@@ -22,6 +22,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
 
     let provider = OpenAiProvider::from_config(&OpenAiConfig {
         api_key_env: OPENAI_KEY_ENV.to_string(),
+        api_key_keychain: None,
         base_url: env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_OPENAI_BASE_URL.to_string()),
     })?;

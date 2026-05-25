@@ -248,6 +248,7 @@ struct SessionReportArgs {
 
 #[tokio::main]
 async fn main() -> squeezy_core::Result<()> {
+    squeezy_core::pre_main_hardening(squeezy_core::HardeningConfig::default());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)

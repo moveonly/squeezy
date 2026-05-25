@@ -55,6 +55,8 @@ use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
+mod safety;
+
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
 const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
@@ -680,6 +682,23 @@ impl ShellSandboxPlan {
         }
     }
 
+    fn external(command: &str, config: &ShellSandboxConfig) -> Self {
+        Self {
+            program: "sh".to_string(),
+            args: vec!["-lc".to_string(), command.to_string()],
+            backend: "external",
+            mode: ShellSandboxMode::External.as_str(),
+            network: "external",
+            filesystem: "external",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: None,
+        }
+    }
+
     fn metadata(&self) -> Value {
         json!({
             "backend": self.backend,
@@ -988,6 +1007,9 @@ impl ToolRegistry {
                 ShellSandboxMode::Off,
                 &self.shell_sandbox,
             )),
+            ShellSandboxMode::External => {
+                Ok(ShellSandboxPlan::external(command, &self.shell_sandbox))
+            }
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
                 let plan =
                     prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
@@ -2089,6 +2111,30 @@ impl ToolRegistry {
         let Some(checkpoints) = self.checkpoints.as_ref() else {
             return checkpoints_disabled_result(call);
         };
+        match checkpoints.rollback_paths(target) {
+            Ok(paths) => {
+                for path in paths {
+                    if let Err(err) =
+                        safety::assess_write_path(&path, &self.root, &self.shell_sandbox)
+                    {
+                        return make_result(
+                            call,
+                            ToolStatus::Denied,
+                            json!({
+                                "error": err.message(),
+                                "path": path,
+                                "reason": err.code(),
+                                "permission_denied": true,
+                                "policy_denied": true,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        );
+                    }
+                }
+            }
+            Err(err) => return tool_error(call, err),
+        }
         match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
@@ -4419,6 +4465,23 @@ impl ToolRegistry {
         let mut operations = Vec::new();
 
         for (index, patch) in args.patches.iter().enumerate() {
+            if let Err(err) =
+                safety::assess_write_path(&patch.path, &self.root, &self.shell_sandbox)
+            {
+                return make_result(
+                    call,
+                    ToolStatus::Denied,
+                    json!({
+                        "error": err.message(),
+                        "path": patch.path,
+                        "reason": err.code(),
+                        "permission_denied": true,
+                        "policy_denied": true,
+                    }),
+                    ToolCostHint::default(),
+                    None,
+                );
+            }
             if patch.search.is_empty() {
                 return make_result(
                     call,
@@ -4448,12 +4511,15 @@ impl ToolRegistry {
                 }
             };
             let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
-            if is_secret_path(Path::new(&rel)) {
+            if is_secret_path(Path::new(&rel))
+                || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                    .is_some()
+            {
                 return make_result(
                     call,
                     ToolStatus::Denied,
                     json!({
-                        "error": "refusing to patch a likely secret file",
+                        "error": "refusing to patch a likely secret or protected metadata file",
                         "path": rel,
                         "permission_denied": true,
                         "policy_denied": true,
@@ -4790,16 +4856,34 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({
+                    "error": err.message(),
+                    "path": args.path,
+                    "reason": err.code(),
+                    "permission_denied": true,
+                    "policy_denied": true,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let path = match self.resolve_for_write(&args.path) {
             Ok(path) => path,
             Err(err) => return tool_error(call, err),
         };
         let rel = self.relative(&path);
-        if is_secret_path(&rel) {
+        if is_secret_path(&rel)
+            || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                .is_some()
+        {
             return make_result(
                 call,
                 ToolStatus::Denied,
-                json!({ "error": "refusing to write a likely secret file" }),
+                json!({ "error": "refusing to write a likely secret or protected metadata file" }),
                 ToolCostHint::default(),
                 None,
             );
@@ -4931,6 +5015,27 @@ impl ToolRegistry {
             &self.shell_sandbox.sensitive_path_patterns,
         ) {
             let reason = format!("shell command references sensitive path pattern {pattern:?}");
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                shell_sandbox_status_metadata(&self.shell_sandbox, "denied"),
+                timeout_ms,
+                output_cap,
+                "denied",
+                Some(&reason),
+                None,
+                &[],
+                &[],
+            );
+            return shell_policy_denied(call, &analysis, reason);
+        }
+        if let Some(name) = shell_command_writes_protected_metadata(
+            &args.command,
+            &self.shell_sandbox.protected_metadata_names,
+        ) {
+            let reason = format!("shell command writes protected metadata directory {name:?}");
             self.audit_shell(
                 call,
                 &args,
@@ -6988,10 +7093,13 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
         .iter()
         .any(|segment| is_network_shell_segment(segment))
     {
+        let target = extract_shell_network_host(&segments)
+            .map(|host| format!("shell:{first}:{host}"))
+            .unwrap_or_else(|| format!("shell:{first}:*"));
         ShellPermissionAnalysis {
             capability: PermissionCapability::Network,
             risk: PermissionRisk::High,
-            rule_target: format!("shell:{first}:*"),
+            rule_target: target,
             network: true,
             destructive: false,
             parser_backed,
@@ -7711,6 +7819,52 @@ fn is_network_shell_segment(segment: &str) -> bool {
             | "yarn install"
             | "bun install"
     )
+}
+
+fn extract_shell_network_host(segments: &[String]) -> Option<String> {
+    for segment in segments {
+        for token in tokenize_shell_segment(segment) {
+            if let Some(host) = host_from_network_token(dequote_token(&token)) {
+                return Some(host);
+            }
+        }
+    }
+    None
+}
+
+fn host_from_network_token(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() || token.starts_with('-') {
+        return None;
+    }
+    if let Ok(url) = Url::parse(token)
+        && matches!(url.scheme(), "http" | "https" | "ssh" | "git")
+    {
+        return url.host_str().map(normalize_permission_host);
+    }
+    if let Some(rest) = token.strip_prefix("git@")
+        && let Some((host, _path)) = rest.split_once(':')
+    {
+        return Some(normalize_permission_host(host));
+    }
+    if let Some((host, _path)) = token.split_once(':')
+        && !host.is_empty()
+        && host.contains('.')
+        && !host.contains('/')
+    {
+        return Some(normalize_permission_host(host));
+    }
+    token
+        .contains('.')
+        .then(|| token.split('/').next().unwrap_or(token))
+        .filter(|host| !host.is_empty() && !host.contains('@'))
+        .map(normalize_permission_host)
+}
+
+fn normalize_permission_host(host: &str) -> String {
+    host.trim_matches(|ch| matches!(ch, '[' | ']'))
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 fn is_compiler_shell_segment(segment: &str) -> bool {
@@ -10911,6 +11065,9 @@ fn prepare_shell_sandbox_plan_with_probe(
             config,
         ));
     }
+    if config.mode == ShellSandboxMode::External {
+        return Ok(ShellSandboxPlan::external(command, config));
+    }
 
     let required = config.mode == ShellSandboxMode::Required;
     // The sandbox-level network posture has THREE distinct states:
@@ -11071,7 +11228,18 @@ fn macos_shell_sandbox_profile(
     for path in write_roots {
         let escaped = sandbox_profile_string(&path.display().to_string());
         profile.push_str(&format!("(allow file-read* (subpath {escaped}))\n"));
-        profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+        if config.protected_metadata_names.is_empty() {
+            profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+        } else {
+            profile.push_str(&format!(
+                "(allow file-write* (require-all (subpath {escaped})"
+            ));
+            for name in &config.protected_metadata_names {
+                let protected = sandbox_profile_string(&path.join(name).display().to_string());
+                profile.push_str(&format!(" (require-not (subpath {protected}))"));
+            }
+            profile.push_str("))\n");
+        }
     }
     // Sensitive paths get an EXPLICIT deny on top of the default deny so
     // even if a future allow rule widens reads, these subpaths stay
@@ -11271,6 +11439,77 @@ fn shell_command_references_sensitive_path(command: &str, patterns: &[String]) -
         }
     }
     None
+}
+
+fn shell_command_references_protected_metadata(
+    command: &str,
+    protected_names: &[String],
+) -> Option<String> {
+    if protected_names.is_empty() {
+        return None;
+    }
+    let tokens = tokenize_shell_segment(command);
+    for raw in &tokens {
+        let normalized = dequote_token(raw).replace('\\', "/");
+        for part in normalized.split('/') {
+            if protected_names.iter().any(|name| name == part) {
+                return Some(part.to_string());
+            }
+        }
+    }
+    let normalized_command = command.replace('\\', "/");
+    for name in protected_names {
+        if normalized_command
+            .split_whitespace()
+            .any(|token| token.split('/').any(|part| part.trim_matches('"') == name))
+        {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn shell_command_writes_protected_metadata(
+    command: &str,
+    protected_names: &[String],
+) -> Option<String> {
+    let name = shell_command_references_protected_metadata(command, protected_names)?;
+    let parsed = parse_shell_command(command);
+    let raw_segments = parsed
+        .as_ref()
+        .map(|parsed| parsed.segments.clone())
+        .filter(|segments| !segments.is_empty())
+        .unwrap_or_else(|| shell_segments(command));
+    let segments = expand_wrapper_segments(raw_segments);
+    if segments
+        .iter()
+        .any(|segment| shell_segment_writes_filesystem(segment))
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+fn shell_segment_writes_filesystem(segment: &str) -> bool {
+    if is_destructive_shell_segment(segment) {
+        return true;
+    }
+    let tokens = tokenize_shell_segment(segment)
+        .into_iter()
+        .map(|token| dequote_token(&token).to_string())
+        .collect::<Vec<_>>();
+    let first = tokens.first().map(String::as_str).unwrap_or("");
+    if matches!(
+        first,
+        "cp" | "install" | "ln" | "mkdir" | "mktemp" | "rsync" | "tee" | "touch"
+    ) {
+        return true;
+    }
+    first == "sed"
+        && tokens
+            .iter()
+            .any(|token| token == "-i" || token.starts_with("-i."))
 }
 
 /// Normalises a path-like token for sensitive-path matching:

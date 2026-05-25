@@ -1,5 +1,3 @@
-use std::env;
-
 use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
@@ -37,9 +35,11 @@ impl std::fmt::Debug for OpenAiProvider {
 
 impl OpenAiProvider {
     pub fn from_config(config: &OpenAiConfig) -> Result<Self> {
-        let api_key = env::var(&config.api_key_env).map_err(|_| {
-            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
-        })?;
+        let api_key = crate::keychain::resolve_api_key(
+            &config.api_key_env,
+            config.api_key_keychain.as_deref(),
+            "openai",
+        )?;
         Ok(Self {
             name: "openai",
             client: reqwest::Client::new(),
@@ -55,9 +55,11 @@ impl OpenAiProvider {
                 "missing AZURE_OPENAI_BASE_URL or providers.azure_openai.base_url".to_string(),
             ));
         }
-        let api_key = env::var(&config.api_key_env).map_err(|_| {
-            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
-        })?;
+        let api_key = crate::keychain::resolve_api_key(
+            &config.api_key_env,
+            config.api_key_keychain.as_deref(),
+            "azure_openai",
+        )?;
         Ok(Self {
             name: "azure_openai",
             client: reqwest::Client::new(),

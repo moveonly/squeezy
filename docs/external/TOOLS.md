@@ -23,7 +23,9 @@ configured as core tools, and some are discoverable through lazy schema loading.
 
 - `plan_patch`: plan a search-replace edit using graph impact context.
 - `apply_patch`, `write_file`: mutate workspace files with stale-content checks
-  and checkpoint coverage.
+  and checkpoint coverage. Mutating tools preflight target paths before any
+  filesystem write and refuse paths outside writable roots or under protected
+  metadata directories such as `.git`, `.squeezy`, and `.agents`.
 - `shell`: run a bounded local shell command after permission checks and sandbox
   planning.
 - `verify`: run bounded local verification, defaulting to the current diff

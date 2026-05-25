@@ -34,6 +34,9 @@ The current implementation:
   on timeout or cancellation (`SIGTERM`, then `SIGKILL` after `kill_grace_ms`).
 - Applies an allowlisted environment via `env_clear` + per-name preservation,
   and never returns environment values in approvals or tool results.
+- Protects metadata directories (`.git`, `.squeezy`, and `.agents` by
+  default) before spawn. Shell command text that writes one of those
+  directories is denied even if the workspace root is otherwise writable.
 - Blocks command strings that reference configured sensitive path patterns
   such as `.ssh/**`, `.aws/**`, `.netrc`, `.kube/**`, `.npmrc`, and `.env*`.
   The matcher tokenizes the command, expands `~/` and `$HOME`, and matches
@@ -83,6 +86,12 @@ permission-gated direct runner when macOS or Linux refuses nested sandboxing.
 
 Use `mode = "required"` when strict isolation is more important than command
 execution. A missing or unavailable sandbox backend becomes an explicit denial.
+
+Use `mode = "external"` when Squeezy itself is already running inside a
+trusted outer sandbox. Squeezy does not apply a nested OS backend in this mode,
+but it still keeps the permission policy, environment allowlist, audit trail,
+timeouts, output caps, sensitive-path checks, metadata-directory checks, and
+approval metadata.
 
 Use `mode = "off"` only for controlled tests, local debugging of the sandbox
 itself, or environments that provide an equivalent outer sandbox. Turning it off
@@ -140,6 +149,8 @@ If the command is allowed, Squeezy prepares a sandbox plan:
 - `best_effort`: use the backend when possible and otherwise run with the
   remaining shell policy controls (env allowlist, timeout/output cap, audit).
 - `off`: run directly with no OS sandbox.
+- `external`: run directly because an outer sandbox is responsible for
+  isolation; Squeezy still records the sandbox posture as `external`.
 
 Filesystem roots are opt-in. The default writable set is the workspace, temp
 directories, and Rust toolchain caches. Add shared project roots in committed
@@ -148,6 +159,10 @@ directories, and Rust toolchain caches. Add shared project roots in committed
 `write_roots` allow read/write. Both lists must contain existing absolute
 directories. Sensitive path patterns still deny before spawn, and macOS adds
 explicit deny rules for sensitive paths inside allowed roots.
+`protected_metadata_names` defaults to `.git`, `.squeezy`, and `.agents`.
+Write-capable shell commands that target these names are denied at
+command-analysis time and, on macOS, via explicit `require-not` write guards
+under every writable root.
 
 For process cleanup, Squeezy creates a process group for the shell command. On
 timeout or cancellation it sends `SIGTERM`, waits for `kill_grace_ms`, then
@@ -189,6 +204,7 @@ kill_grace_ms = 250
 env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
 read_roots = []
 write_roots = []
+protected_metadata_names = [".git", ".squeezy", ".agents"]
 sensitive_path_patterns = [".ssh/**", ".aws/**", ".config/gh/**", ".netrc", ".gnupg/**", ".kube/**", ".docker/config.json", ".cargo/credentials*", ".npmrc", ".pypirc", ".env*"]
 # replace_sensitive_path_patterns = false  # default; user list EXTENDS the floor above.
 ```
@@ -213,6 +229,10 @@ load time.
 user, project, and per-repo user settings, canonicalized, and rejected when a
 path is missing, relative, a file, duplicated across read/write roots, or
 inside a sensitive path base. `write_roots` imply read access.
+
+`protected_metadata_names` entries must be single path segments. Setting the
+list to an empty array disables metadata directory protection and emits a
+configuration warning.
 
 `sensitive_path_patterns` patterns must include a literal prefix before any
 wildcard. By default a user-supplied list **extends** the built-in floor —

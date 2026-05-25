@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, env};
+use std::collections::BTreeMap;
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -28,9 +28,11 @@ impl std::fmt::Debug for GoogleProvider {
 
 impl GoogleProvider {
     pub fn from_config(config: &GoogleConfig) -> Result<Self> {
-        let api_key = env::var(&config.api_key_env).map_err(|_| {
-            SqueezyError::ProviderNotConfigured(format!("missing {}", config.api_key_env))
-        })?;
+        let api_key = crate::keychain::resolve_api_key(
+            &config.api_key_env,
+            config.api_key_keychain.as_deref(),
+            "google",
+        )?;
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,

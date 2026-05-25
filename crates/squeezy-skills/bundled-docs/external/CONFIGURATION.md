@@ -107,6 +107,7 @@ commented examples so that built-in defaults can evolve over time:
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
+# api_key_keychain = "squeezy:openai"        # macOS fallback; env var wins
 # base_url = "https://api.openai.com/v1"
 # default_model = "gpt-5.5"
 
@@ -130,6 +131,13 @@ commented examples so that built-in defaults can evolve over time:
 # action = "ask"
 # source = "project"
 
+# [permissions.ai_reviewer]
+# enabled = false
+# model = "gpt-5-nano"
+# allow_capabilities = ["read", "search"]
+# policy_file = "docs/external/APPROVAL_POLICY.md"
+# timeout_secs = 15
+
 # [permissions.shell_sandbox]
 # mode = "best_effort"
 # network = "deny_by_default"
@@ -138,6 +146,7 @@ commented examples so that built-in defaults can evolve over time:
 # env_allowlist = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME", "RUSTFLAGS", "RUST_BACKTRACE", "SSL_CERT_FILE", "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "LC_*"]
 # read_roots = []                              # extra absolute directories shell may read
 # write_roots = []                             # extra absolute directories shell may read/write
+# protected_metadata_names = [".git", ".squeezy", ".agents"]
 # # The list below EXTENDS the built-in floor; set
 # # replace_sensitive_path_patterns = true to replace it instead.
 # sensitive_path_patterns = ["secrets/**", ".vault/**"]
@@ -145,6 +154,10 @@ commented examples so that built-in defaults can evolve over time:
 
 [telemetry]
 # enabled = true
+
+[hardening]
+# disable_core_dumps = true
+# deny_debug_attach = true
 
 # [redaction]
 # custom_patterns = []
@@ -226,8 +239,14 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   `reasoning_effort` accepts `low`, `medium`, `high`, or `xhigh` and is only
   sent to providers whose model registry entry marks native reasoning controls
   as supported.
-- `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
-  `default_model`, `api_version`, and `region`.
+- `[providers.<id>]`: provider defaults such as `api_key_env`,
+  `api_key_keychain`, `base_url`, `default_model`, `api_version`, and
+  `region`. Environment variables always win. On macOS, when a provider has
+  `api_key_keychain`, Squeezy can read a Generic Password item from Keychain
+  using that service name and the provider account name (`openai`,
+  `anthropic`, `google`, or `azure_openai`). On non-macOS hosts this fallback
+  is unavailable and missing environment variables remain provider-config
+  errors.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
   normal tool behavior subject to permission policy. Plan mode advertises only
   read/search/navigation tools and refuses edit, shell, git, network, MCP,
@@ -263,11 +282,23 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
+- `[permissions.ai_reviewer]`: optional model-backed pre-review for permission
+  prompts. It is disabled by default. When enabled, it receives a bounded
+  transcript window, the pending permission request, and the approval policy
+  document, then returns `allow`, `deny`, or `ask` JSON. It may deny any
+  request, but it may only auto-allow capabilities listed in
+  `allow_capabilities` (default `read` and `search`); non-allowlisted allows
+  fall back to the normal user approval prompt. `timeout_secs` bounds the extra
+  model call. Repeated denials trip a per-turn circuit breaker and return to
+  user approval. See [`APPROVAL_POLICY.md`](APPROVAL_POLICY.md).
 - `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
   The default `mode = "best_effort"` uses a supported sandbox backend when one
   can be applied, then falls back to the permission-gated direct runner when the
   host blocks nested sandboxing. Set `mode = "required"` when an unavailable
-  backend should deny shell execution. macOS launches through `sandbox-exec`
+  backend should deny shell execution. Set `mode = "external"` when an outer
+  sandbox is responsible for filesystem/network isolation; Squeezy skips the
+  inner OS backend but still applies permission policy, environment allowlists,
+  audit records, timeouts, output caps, and approval metadata. macOS launches through `sandbox-exec`
   with a `(deny default)` profile that re-allows reads under system prefixes and
   reads+writes inside the workspace, tmp dirs, and toolchain caches
   (`$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, `$HOME/.rustup`).
@@ -275,6 +306,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   of those defaults. `write_roots`
   imply read access. Put shared project roots in `squeezy.toml`; put
   machine-specific roots in `~/.squeezy/projects/<repo-id>/settings.toml`.
+  `protected_metadata_names` defaults to `.git`, `.squeezy`, and `.agents`;
+  shell commands that write and mutating tools refuse paths under those metadata
+  directories even when the containing root is otherwise writable.
   Linux probes
   `/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user` before
   spawn; when namespacing is available, the child runs in a fresh user, mount,
@@ -314,8 +348,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   - `<mcp-server>/<tool-name>` for external MCP tools.
   - `<cmd-prefix>:*` for shell/git/compiler rules (e.g. `cargo test:*`,
     `rm:*`). `*` itself is treated as a wildcard segment in any position.
-  - `shell:<cmd-prefix>:*` for shell commands classified as network attempts
-    (e.g. `shell:curl:*` and `shell:npm install:*`).
+  - `shell:<cmd-prefix>:<host>` for shell commands classified as network
+    attempts with a parsed host (e.g. `shell:curl:docs.rs`); Squeezy falls back
+    to `shell:<cmd-prefix>:*` when the host is dynamic or unavailable.
   Allow rules on the `destructive` capability and Allow rules whose `target`
   is functionally a "match everything" wildcard (`*`, `**`, `* *`, …) are
   refused at THREE layers so the three paths cannot drift:
@@ -354,6 +389,9 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   cache-receipt metadata. The receipt is metadata only; Squeezy still performs
   the approved network request and does not serve cached remote page content
   from the receipt.
+- `[hardening]`: pre-main process hardening. Defaults disable core dumps and,
+  on macOS, request debugger attach denial while removing dynamic-loader and
+  malloc logging environment variables before the TUI or harness runs.
 - `[mcp.servers.<name>]`: external MCP server configuration. `transport` is
   `stdio`, `http` (Streamable HTTP), or `sse` (legacy-compatible remote
   stream handling). `stdio` servers use `command`, optional `args`, and

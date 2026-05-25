@@ -180,7 +180,7 @@ fn shell_permission_metadata_detects_network_commands() {
 
     assert_eq!(request.capability, PermissionCapability::Network);
     assert_eq!(request.risk, PermissionRisk::High);
-    assert_eq!(request.target, "shell:curl:*");
+    assert_eq!(request.target, "shell:curl:example.com");
     assert_eq!(request.metadata["network"], "classified");
     assert_eq!(request.metadata["cwd"], "src");
     assert_eq!(request.metadata["timeout_ms"], "1000");
@@ -196,7 +196,7 @@ fn shell_permission_metadata_detects_network_commands() {
         }),
     });
     assert_eq!(git_clone.capability, PermissionCapability::Network);
-    assert_eq!(git_clone.target, "shell:git clone:*");
+    assert_eq!(git_clone.target, "shell:git clone:example.com");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1617,6 +1617,71 @@ async fn apply_patch_denies_secret_paths() {
 }
 
 #[tokio::test]
+async fn apply_patch_denies_protected_metadata_paths_before_mutation() {
+    let root = temp_workspace("apply_patch_metadata");
+    fs::create_dir_all(root.join(".git")).expect("mkdir git");
+    fs::write(root.join(".git/config"), "before\n").expect("write git config");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_metadata".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": ".git/config",
+                        "search": "before\n",
+                        "replace": "after\n",
+                        "expected_sha256": sha256_hex("before\n".as_bytes())
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["reason"], "protected_metadata_path");
+    assert_eq!(result.content["permission_denied"], true);
+    assert_eq!(
+        fs::read_to_string(root.join(".git/config")).unwrap(),
+        "before\n",
+        "protected metadata must not be modified by a denied patch",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_denies_protected_metadata_paths_before_mutation() {
+    let root = temp_workspace("write_metadata");
+    fs::create_dir_all(root.join(".squeezy")).expect("mkdir metadata");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "write_metadata".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": ".squeezy/state.toml",
+                    "content": "after\n",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["reason"], "protected_metadata_path");
+    assert_eq!(result.content["permission_denied"], true);
+    assert!(!root.join(".squeezy/state.toml").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn secret_name_checks_use_workspace_relative_paths() {
     let root = temp_workspace("secret_parent");
     fs::write(root.join("plain.txt"), "visible").expect("write plain");
@@ -2663,6 +2728,78 @@ async fn shell_default_sandbox_runs_benign_command() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(result.content["stdout"], "ok");
     assert_eq!(result.content["sandbox"]["mode"], "best_effort");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_external_sandbox_mode_preserves_policy_metadata() {
+    let root = temp_workspace("shell_external_sandbox");
+    let registry = registry_with_runtime_config(
+        &root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::External,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            ..ToolRuntimeConfig::default()
+        },
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_external_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok",
+                    "description": "outer sandbox handles isolation"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(result.content["sandbox"]["backend"], "external");
+    assert_eq!(result.content["sandbox"]["mode"], "external");
+    assert_eq!(result.content["sandbox"]["network"], "external");
+    assert_eq!(result.content["env"]["policy"], "allowlist");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_denies_protected_metadata_write_before_spawn() {
+    let root = temp_workspace("shell_metadata_write");
+    fs::create_dir_all(root.join(".git")).expect("mkdir git");
+    fs::write(root.join(".git/config"), "secret-ish").expect("write git config");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_metadata_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "touch .git/config",
+                    "description": "try metadata write"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Denied);
+    assert_eq!(result.content["permission_denied"], true);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("protected metadata directory")),
+        "{:?}",
+        result.content
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5356,6 +5493,39 @@ fn shell_sandbox_plan_mode_off_returns_direct() {
     assert_eq!(plan.mode, "off");
     assert_eq!(plan.program, "sh");
     assert!(!plan.required);
+}
+
+#[test]
+fn shell_sandbox_plan_external_skips_inner_backend() {
+    let plan = prepare_sandbox_plan_with_probes(
+        "printf ok",
+        &sandbox_config(
+            ShellSandboxMode::External,
+            ShellSandboxNetworkPolicy::DenyByDefault,
+        ),
+        true,
+        true,
+    )
+    .expect("external plan");
+
+    assert_eq!(plan.backend, "external");
+    assert_eq!(plan.mode, "external");
+    assert_eq!(plan.network, "external");
+    assert_eq!(plan.filesystem, "external");
+    assert!(!plan.required);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile_deny_lists_protected_metadata_under_write_roots() {
+    let root = temp_workspace("macos_profile_metadata");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), false);
+    let git_path = root.join(".git").display().to_string();
+
+    assert!(profile.contains("require-not"), "{profile}");
+    assert!(profile.contains(&git_path), "{profile}");
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
