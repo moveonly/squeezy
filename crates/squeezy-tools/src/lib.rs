@@ -57,7 +57,6 @@ use squeezy_workspace::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
     process::Command,
     sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
     time,
@@ -65,15 +64,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
-// Wired into the shell-ask permission server and the `squeezy ask` CLI in
-// the next commits; declared here so the abstraction lands as its own
-// subject.
-#[allow(dead_code)]
 mod ipc;
 mod safety;
 mod schema;
 mod truncate;
 
+use ipc::{IpcEndpoint, IpcListener, IpcStream};
 use schema::compact_tool_parameters;
 use truncate::truncate_middle_bytes;
 
@@ -6315,7 +6311,7 @@ impl ToolRegistry {
             .await
             {
                 Ok(server) => {
-                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.path());
+                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.env_value());
                     command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
                     preserved_env.push(SQUEEZY_ASK_SOCKET_ENV.to_string());
                     preserved_env.push(SQUEEZY_ASK_CALL_ID_ENV.to_string());
@@ -13323,7 +13319,7 @@ fn open_shell_pty() -> std::io::Result<ShellPty> {
 }
 
 struct ShellAskServer {
-    path: PathBuf,
+    endpoint: IpcEndpoint,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -13336,15 +13332,21 @@ impl ShellAskServer {
         approver: ShellAskApprover,
         cancel: CancellationToken,
     ) -> std::io::Result<Self> {
-        let run_dir = root.join(".squeezy").join("run");
-        fs::create_dir_all(&run_dir)?;
-        let root_path = run_dir.join(format!("shell-{}.sock", sanitize_shell_call_id(call_id)));
-        let (path, listener) = match bind_shell_ask_listener(&root_path) {
-            Ok(bound) => bound,
-            Err(err) if unix_socket_path_too_long(&err) => {
+        let sanitized = sanitize_shell_call_id(call_id);
+        #[cfg(unix)]
+        {
+            let run_dir = root.join(".squeezy").join("run");
+            fs::create_dir_all(&run_dir)?;
+        }
+        let primary = IpcEndpoint::for_shell_ask(root, &sanitized);
+        let (endpoint, listener) = match IpcListener::bind(&primary) {
+            Ok(listener) => (primary, listener),
+            #[cfg(unix)]
+            Err(err) if ipc::is_path_too_long(&err) => {
                 let digest = sha256_hex(format!("{}:{call_id}", root.display()));
-                let short = PathBuf::from("/tmp").join(format!("squeezy-{}.sock", &digest[..16]));
-                bind_shell_ask_listener(&short)?
+                let fallback = IpcEndpoint::unix_short_fallback(&digest[..16]);
+                let listener = IpcListener::bind(&fallback)?;
+                (fallback, listener)
             }
             Err(err) => return Err(err),
         };
@@ -13355,27 +13357,22 @@ impl ShellAskServer {
             shell_ask_server_loop(listener, call_id, parent_command, workdir, approver, cancel)
                 .await;
         });
-        Ok(Self { path, task })
+        Ok(Self { endpoint, task })
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn env_value(&self) -> std::ffi::OsString {
+        self.endpoint.as_env_value()
     }
-}
-
-fn bind_shell_ask_listener(path: &Path) -> std::io::Result<(PathBuf, UnixListener)> {
-    let _ = fs::remove_file(path);
-    UnixListener::bind(path).map(|listener| (path.to_path_buf(), listener))
-}
-
-fn unix_socket_path_too_long(err: &std::io::Error) -> bool {
-    err.to_string().contains("SUN_LEN") || err.raw_os_error() == Some(libc::ENAMETOOLONG)
 }
 
 impl Drop for ShellAskServer {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_file(&self.path);
+        // Synchronously remove the Unix sock so callers that observe the
+        // path immediately after server-drop see it gone. Tokio's task
+        // abort is async — relying on `IpcListener::Drop` inside the
+        // spawned future races with the assertion. No-op on Windows.
+        self.endpoint.remove_local_artifacts();
     }
 }
 
@@ -13386,7 +13383,7 @@ struct ShellAskWireRequest {
 }
 
 async fn shell_ask_server_loop(
-    listener: UnixListener,
+    listener: IpcListener,
     call_id: String,
     parent_command: String,
     workdir: PathBuf,
@@ -13398,7 +13395,7 @@ async fn shell_ask_server_loop(
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else {
+        let Ok(stream) = accepted else {
             break;
         };
         let request_call_id = call_id.clone();
@@ -13419,7 +13416,7 @@ async fn shell_ask_server_loop(
 }
 
 async fn handle_shell_ask_client(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     call_id: String,
     parent_command: String,
     workdir: PathBuf,

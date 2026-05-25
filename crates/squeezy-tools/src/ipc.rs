@@ -87,7 +87,9 @@ impl IpcEndpoint {
     }
 
     /// Recover an endpoint from the `SQUEEZY_ASK_SOCKET` value the parent
-    /// process exported to a shell child.
+    /// process exported to a shell child. Wired up by the next commit when
+    /// `squeezy ask` moves onto this abstraction.
+    #[allow(dead_code)]
     pub(crate) fn from_env_value(value: &OsStr) -> Self {
         #[cfg(unix)]
         {
@@ -116,9 +118,24 @@ impl IpcEndpoint {
     /// Underlying Unix path, if any. Used by callers that need to surface
     /// the path in audit/log output.
     #[cfg(unix)]
+    #[allow(dead_code)]
     pub(crate) fn as_unix_path(&self) -> &Path {
         match &self.inner {
             EndpointInner::Unix(path) => path.as_path(),
+        }
+    }
+
+    /// Synchronously remove any filesystem artifact this endpoint owns.
+    /// On Unix that's the `.sock` file; on Windows pipes live in kernel
+    /// namespace and need no cleanup.
+    pub(crate) fn remove_local_artifacts(&self) {
+        match &self.inner {
+            #[cfg(unix)]
+            EndpointInner::Unix(path) => {
+                let _ = std::fs::remove_file(path);
+            }
+            #[cfg(windows)]
+            EndpointInner::Windows(_) => {}
         }
     }
 }
@@ -251,6 +268,9 @@ enum StreamInner {
 }
 
 impl IpcStream {
+    /// Wired up by the next commit when `squeezy ask` moves onto this
+    /// abstraction; declared `pub(crate)` so it can be re-exported.
+    #[allow(dead_code)]
     pub(crate) async fn connect(endpoint: &IpcEndpoint) -> io::Result<Self> {
         match &endpoint.inner {
             #[cfg(unix)]
