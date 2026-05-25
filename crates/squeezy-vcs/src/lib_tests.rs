@@ -520,6 +520,100 @@ fn old_checkpoints_are_pruned_from_the_journal() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn checkpoint_records_rename_as_single_renamed_entry() {
+    let root = temp_repo("checkpoint_rename");
+    fs::write(root.join("alpha.txt"), "alpha contents\n").expect("seed alpha");
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    let before = store.track_tree().expect("track before");
+
+    fs::rename(root.join("alpha.txt"), root.join("beta.txt")).expect("rename");
+    let record = store
+        .create_checkpoint(
+            &before,
+            "apply_patch",
+            "call",
+            "turn-1",
+            "success",
+            Vec::new(),
+        )
+        .expect("create checkpoint")
+        .expect("checkpoint");
+
+    assert_eq!(
+        record.files.len(),
+        1,
+        "rename should collapse to a single entry, got {:?}",
+        record.files
+    );
+    let entry = &record.files[0];
+    assert_eq!(entry.status, DiffFileStatus::Renamed);
+    assert_eq!(entry.path, "beta.txt");
+    assert_eq!(entry.from_path.as_deref(), Some("alpha.txt"));
+    assert!(entry.before_sha256.is_some());
+    assert!(entry.after_sha256.is_some());
+
+    let rollback = store
+        .rollback(RollbackTarget::Latest, RollbackMode::BestEffort)
+        .expect("rollback");
+    assert!(rollback.applied);
+    assert!(!root.join("beta.txt").exists());
+    assert_eq!(
+        fs::read_to_string(root.join("alpha.txt")).expect("alpha restored"),
+        "alpha contents\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shadow_repo_ignores_user_hooks() {
+    let root = temp_repo("shadow_repo_hooks");
+    init_repo(&root);
+    fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-m", "seed"]);
+
+    let hooks_dir = root.join("user-hooks");
+    fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+    let marker_path = root.join(".user-hook-marker");
+    let hook_script = format!("#!/bin/sh\ntouch '{}'\n", marker_path.to_string_lossy());
+    for name in ["post-index-change", "pre-commit", "post-commit"] {
+        let hook = hooks_dir.join(name);
+        fs::write(&hook, &hook_script).expect("write hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&hook).expect("hook perms").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&hook, perms).expect("chmod hook");
+        }
+    }
+    git(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            hooks_dir.to_string_lossy().as_ref(),
+        ],
+    );
+
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    fs::write(root.join("seed.txt"), "updated\n").expect("modify seed");
+    let before = store.track_tree().expect("track before");
+    fs::write(root.join("seed.txt"), "updated again\n").expect("modify seed again");
+    let _ = store
+        .create_checkpoint(&before, "shell", "call", "turn-1", "success", Vec::new())
+        .expect("create checkpoint");
+
+    assert!(
+        !marker_path.exists(),
+        "shadow-repo writes must not invoke user hooks at {hooks_dir:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn temp_repo(name: &str) -> PathBuf {
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)

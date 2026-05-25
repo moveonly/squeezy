@@ -1724,6 +1724,38 @@ async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
             "expected partial-failure result to carry a checkpoint, got: {}",
             result.content
         );
+        let applied_delta = result
+            .content
+            .get("applied_delta")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let ops = applied_delta
+            .get("operations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            ops.len(),
+            2,
+            "applied_delta must contain one entry per requested op, got: {applied_delta}"
+        );
+        assert_eq!(
+            ops[0].get("status").and_then(|v| v.as_str()),
+            Some("applied"),
+            "first op should be applied, got: {}",
+            ops[0]
+        );
+        assert_eq!(
+            ops[1].get("status").and_then(|v| v.as_str()),
+            Some("failed"),
+            "second op should be failed, got: {}",
+            ops[1]
+        );
+        assert_eq!(
+            applied_delta.get("exact").and_then(|v| v.as_bool()),
+            Some(false),
+            "applied_delta.exact must be false when any op failed"
+        );
         assert_eq!(
             fs::read_to_string(root.join("first.txt")).unwrap(),
             "first-after\n",
@@ -1833,6 +1865,149 @@ async fn apply_patch_denies_protected_metadata_paths_before_mutation() {
 }
 
 #[tokio::test]
+async fn apply_patch_move_collapses_to_single_checkpoint_entry() {
+    let root = temp_workspace("apply_patch_move");
+    fs::write(root.join("alpha.txt"), "alpha\n").expect("seed alpha");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_move".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "move_file",
+                        "from": "alpha.txt",
+                        "to": "beta.txt",
+                        "expected_sha256": sha256_hex("alpha\n".as_bytes()),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-move".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert!(!root.join("alpha.txt").exists(), "source should be removed");
+    assert_eq!(
+        fs::read_to_string(root.join("beta.txt")).unwrap(),
+        "alpha\n",
+        "destination should hold the source content"
+    );
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("checkpoint emitted");
+    let files = checkpoint
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        files.len(),
+        1,
+        "rename should collapse to a single checkpoint entry, got {files:?}"
+    );
+    assert_eq!(files[0]["status"], "renamed");
+    assert_eq!(files[0]["path"], "beta.txt");
+    assert_eq!(files[0]["from_path"], "alpha.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_create_and_delete_in_one_call() {
+    let root = temp_workspace("apply_patch_create_delete");
+    fs::write(root.join("doomed.txt"), "bye\n").expect("seed doomed");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_create_delete".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "create_file",
+                            "path": "fresh.txt",
+                            "contents": "hello\n",
+                        },
+                        {
+                            "kind": "delete_file",
+                            "path": "doomed.txt",
+                            "expected_sha256": sha256_hex("bye\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-create-delete".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("fresh.txt")).unwrap(),
+        "hello\n"
+    );
+    assert!(!root.join("doomed.txt").exists());
+    let delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let ops = delta
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["status"], "applied");
+    assert_eq!(ops[0]["kind"], "create_file");
+    assert_eq!(ops[1]["status"], "applied");
+    assert_eq!(ops[1]["kind"], "delete_file");
+    assert_eq!(delta["exact"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_create_file_rejects_existing_target() {
+    let root = temp_workspace("apply_patch_create_existing");
+    fs::write(root.join("there.txt"), "stay\n").expect("seed there");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_create_existing".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "create_file",
+                        "path": "there.txt",
+                        "contents": "stomp\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-create-existing".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Stale);
+    assert_eq!(
+        fs::read_to_string(root.join("there.txt")).unwrap(),
+        "stay\n",
+        "existing file must not be clobbered by create_file"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn write_file_denies_protected_metadata_paths_before_mutation() {
     let root = temp_workspace("write_metadata");
     fs::create_dir_all(root.join(".squeezy")).expect("mkdir metadata");
@@ -1856,6 +2031,276 @@ async fn write_file_denies_protected_metadata_paths_before_mutation() {
     assert_eq!(result.content["reason"], "protected_metadata_path");
     assert_eq!(result.content["permission_denied"], true);
     assert!(!root.join(".squeezy/state.toml").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
+    // The fallback's job is to honour a unified-diff body the model places in
+    // `search` (e.g. when its literal search string drifted or it knows the
+    // change as a hunk, not a contiguous substring). On a clean worktree
+    // `git apply --3way` lands the diff and the resulting file lives at the
+    // diff's `+` lines.
+    let root = temp_workspace("apply_patch_unified_diff");
+    let initial = "line one\nline two\nline three\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    git_init_commit(&root);
+
+    let diff = "--- a/doc.txt\n+++ b/doc.txt\n@@ -1,3 +1,3 @@\n line one\n-line two\n+LINE TWO\n line three\n";
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_fallback".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        // `search` here is the unified diff body — the literal
+                        // string won't be found in the file, so the fallback
+                        // path is the only way this could succeed.
+                        "search": diff,
+                        "replace": "",
+                        "expected_sha256": on_disk_hash,
+                        "fallback": "unified_diff",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-fallback".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert!(
+        final_doc.contains("LINE TWO"),
+        "fallback should replace via git apply, got: {final_doc:?}"
+    );
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("fallback should emit checkpoint");
+    let files = checkpoint
+        .get("files")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        files.iter().any(|f| f["path"] == "doc.txt"),
+        "checkpoint should record the touched file"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_succeeds_inside_neighborhood() {
+    let root = temp_workspace("plan_binding_inside");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success, "{:?}", plan.content);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id returned")
+        .to_string();
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("src/lib.rs"))
+            .expect("read src/lib.rs")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_inside".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "patches": [{
+                        "path": "src/lib.rs",
+                        "search": "pub fn target() -> usize { 1 }\n",
+                        "replace": "pub fn target() -> usize { 2 }\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-inside".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert!(
+        fs::read_to_string(root.join("src/lib.rs"))
+            .unwrap()
+            .contains("pub fn target() -> usize { 2 }")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_rejects_outside_neighborhood() {
+    let root = temp_workspace("plan_binding_outside");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    fs::write(root.join("stranger.txt"), "out\n").expect("write stranger");
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan_out".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string();
+    if plan
+        .content
+        .get("graph_available")
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        // Without the semantic graph the neighborhood is empty and the plan
+        // would not bind any path, so the binding check is a no-op. Skip.
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("stranger.txt"))
+            .expect("read stranger")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_outside".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "patches": [{
+                        "path": "stranger.txt",
+                        "search": "out\n",
+                        "replace": "in\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-outside".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("plan_id"),
+        "rejection should mention plan_id, got: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("stranger.txt")).unwrap(),
+        "out\n",
+        "out-of-neighborhood file must not be written"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn plan_patch_binding_can_be_bypassed_with_confirm_outside_plan() {
+    let root = temp_workspace("plan_binding_confirm");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    fs::write(root.join("stranger.txt"), "out\n").expect("write stranger");
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan_confirm".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success);
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string();
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("stranger.txt"))
+            .expect("read stranger")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_confirm".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "confirm_outside_plan": true,
+                    "patches": [{
+                        "path": "stranger.txt",
+                        "search": "out\n",
+                        "replace": "in\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-confirm".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("stranger.txt")).unwrap(),
+        "in\n"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4725,6 +5170,8 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "notes_recall",
+            "notes_remember",
             "plan_patch",
             "read_file",
             "read_slice",
@@ -6768,4 +7215,91 @@ fn read_file_spec_promotes_graph_first() {
         include_str!("../tests/artifacts/tool-spec-descriptions/read_file_spec_description.txt")
             .trim();
     assert_eq!(description.trim(), golden);
+}
+
+#[tokio::test]
+async fn notes_remember_then_recall_round_trip() {
+    let root = temp_workspace("notes_round_trip");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store.clone());
+
+    let remember_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "decision",
+                    "text": "Prefer rg over grep for workspace search.",
+                    "tags": ["search", "tooling"],
+                    "source": "test-suite"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(remember_result.status, ToolStatus::Success);
+
+    let recall_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_recall".to_string(),
+                name: "notes_recall".to_string(),
+                arguments: json!({ "query": "search" }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(recall_result.status, ToolStatus::Success);
+    let matches = recall_result.content["matches"]
+        .as_array()
+        .expect("matches array");
+    assert!(
+        matches
+            .iter()
+            .any(|item| item["text"].as_str().unwrap_or("").contains("Prefer rg")),
+        "recall should return the persisted decision: {recall_result:?}",
+    );
+}
+
+#[tokio::test]
+async fn notes_remember_rejects_unknown_kind() {
+    let root = temp_workspace("notes_invalid_kind");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_invalid".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "unsupported_kind",
+                    "text": "this should be rejected"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+}
+
+#[tokio::test]
+async fn notes_tools_fail_when_no_store_handle_available() {
+    let root = temp_workspace("notes_no_store");
+    let registry = registry_with_runtime_config(&root, ToolRuntimeConfig::default());
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "note",
+                    "text": "no store available"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
 }

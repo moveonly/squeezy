@@ -13,7 +13,7 @@ use std::{
 
 use futures_core::Stream;
 use futures_util::{FutureExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
@@ -61,6 +61,7 @@ mod ai_reviewer;
 mod cancel;
 mod exploration_compiler;
 mod permission_persist;
+mod plan_mode;
 mod roles;
 
 use cancel::{CancelErr, OrCancelExt};
@@ -78,6 +79,7 @@ const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
 const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
 const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -479,6 +481,10 @@ impl SessionAccountingSnapshot {
 pub struct ContextCompactionReport {
     pub record: ContextCompactionRecord,
     pub summary: String,
+    /// Pre-compaction conversation slice. Stamped into the
+    /// `context_compacted` session event so replay can snap to this
+    /// checkpoint without re-reading the redb mirror.
+    pub dropped: Vec<ResumeItem>,
 }
 
 pub type JobId = u64;
@@ -1082,7 +1088,21 @@ impl Agent {
     ) -> squeezy_core::Result<(Self, Vec<TranscriptItem>)> {
         let store = SessionStore::open(&config);
         let handle = store.open_session(session_id.to_string());
-        let resume_state = handle.read_resume_state()?;
+        // Prefer the durable snapshot, but fall back to replaying
+        // events.jsonl when resume_state.json is missing, corrupt, or
+        // marks the session non-resumable. The event log is appended on
+        // every turn, so it survives a crash that ate the snapshot.
+        let resume_state = match handle.read_resume_state() {
+            Ok(state) if state.resume_available => state,
+            _ => match handle.replay_resume_state() {
+                Ok(state) => state,
+                Err(_) => {
+                    return Err(SqueezyError::Agent(format!(
+                        "session {session_id} is not resumable"
+                    )));
+                }
+            },
+        };
         if !resume_state.resume_available {
             return Err(SqueezyError::Agent(format!(
                 "session {session_id} is not resumable"
@@ -1159,6 +1179,12 @@ impl Agent {
         let session_id = session_id.into();
         config.model = model;
         config.session_mode = mode;
+        // Replay must produce byte-identical model requests against the
+        // recorded tape. Workspace-specific ingestion (AGENTS.md and
+        // user memory) would change `config.instructions` based on the
+        // host environment, breaking the hash check. Disable it here.
+        config.context_compaction.repo_doc_max_bytes = 0;
+        config.context_compaction.user_memory_max_bytes = 0;
         let user_inputs = replay_user_inputs(&tape);
         if user_inputs.is_empty() {
             return Err(SqueezyError::Agent(format!(
@@ -1240,6 +1266,23 @@ impl Agent {
         let store = SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref())
             .ok()
             .map(Arc::new);
+        if let Some(store) = store.as_deref() {
+            let now: u128 = unix_timestamp_millis() as u128;
+            let ttl_ms: u128 = (squeezy_store::DEFAULT_COMPACTION_CHECKPOINT_RETENTION_DAYS
+                as u128)
+                * 24
+                * 60
+                * 60
+                * 1_000;
+            let cutoff = now.saturating_sub(ttl_ms);
+            if let Err(err) = store.prune_compaction_checkpoints(cutoff) {
+                tracing::warn!(
+                    target: "squeezy::store",
+                    error = %err,
+                    "failed to prune compaction_checkpoints; old entries may persist",
+                );
+            }
+        }
         let registry_runtime = ToolRegistryRuntime::new(store.clone(), redactor.clone());
         let tools = ToolRegistry::new_with_configs_skills_and_mcp(
             config.workspace_root.clone(),
@@ -1289,6 +1332,42 @@ impl Agent {
                 );
             }
             config.instructions = format!("{}\n\n{}", config.instructions, preamble.body);
+        }
+        if let Some(repo_doc) = ingest_agents_md(
+            &config.workspace_root,
+            config.context_compaction.repo_doc_max_bytes,
+        ) {
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "agents_md_ingested",
+                None,
+                Some(format!("{} bytes ingested from AGENTS.md", repo_doc.len())),
+                json!({ "bytes": repo_doc.len() }),
+            );
+            config.instructions = format!(
+                "{}\n\nProject conventions from AGENTS.md:\n{}",
+                config.instructions, repo_doc
+            );
+        }
+        if let Some(user_memory) =
+            ingest_user_memory(config.context_compaction.user_memory_max_bytes)
+        {
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "user_memory_ingested",
+                None,
+                Some(format!(
+                    "{} bytes ingested from ~/.squeezy/memory.md",
+                    user_memory.len()
+                )),
+                json!({ "bytes": user_memory.len() }),
+            );
+            config.instructions = format!(
+                "{}\n\nUser-level memory (~/.squeezy/memory.md):\n{}",
+                config.instructions, user_memory
+            );
         }
         let ambiguous_skills = tools.ambiguous_skill_names();
         if !ambiguous_skills.is_empty() {
@@ -1546,7 +1625,7 @@ impl Agent {
             native_text_verbosity,
         );
         let request_instructions = self.redactor.redact(&raw_instructions).text;
-        let mut all_tool_specs = core_control_tools(&self.config.subagents);
+        let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
             model: self.config.model.clone(),
@@ -1790,15 +1869,19 @@ impl Agent {
         let mut conversation = state.conversation.clone();
         let mut context_compaction = state.context_compaction.clone();
         let attachments = state.context_attachments.clone();
-        let report = compact_conversation(
+        let report = compact_conversation_with_strategy(
             &mut conversation,
             &mut context_compaction,
             &attachments,
             self.store.as_deref(),
+            &self.provider,
+            self.session_log.as_ref(),
+            &self.redactor,
             &self.config,
             ContextCompactionTrigger::Manual,
             true,
         )
+        .await
         .ok_or_else(|| SqueezyError::Agent("not enough context to compact".to_string()))?;
         state.conversation = conversation;
         state.context_compaction = context_compaction;
@@ -1809,6 +1892,71 @@ impl Agent {
         drop(state);
         self.log_compaction_event(&report);
         Ok(report)
+    }
+
+    /// Restore the most recent compaction checkpoint, undoing the last
+    /// `compact_context_manual` (or auto-compaction). Returns the restored
+    /// record on success, or `Ok(None)` when there is nothing to undo
+    /// (no compaction history, or the checkpoint expired / was never
+    /// persisted because the agent had no store handle).
+    pub async fn compact_context_undo(
+        &self,
+    ) -> squeezy_core::Result<Option<ContextCompactionRecord>> {
+        let mut state = self.conversation_state.lock().await;
+        let Some(last) = state.context_compaction.last.clone() else {
+            return Ok(None);
+        };
+        let Some(replacement_id) = last.replacement_id.clone() else {
+            return Ok(None);
+        };
+        let Some(store) = self.store.as_deref() else {
+            return Ok(None);
+        };
+        let Some(checkpoint) = store.get_compaction_checkpoint(&replacement_id)? else {
+            return Ok(None);
+        };
+        // The synthetic summary head occupies index 0 of `conversation`.
+        // Drop it and prepend the restored items so the conversation now
+        // matches the pre-compaction shape (plus any items added after
+        // the compaction event, which stay verbatim).
+        if !matches!(state.conversation.first(), Some(LlmInputItem::UserText(_))) {
+            return Err(SqueezyError::Agent(
+                "cannot undo compaction: conversation head is not a synthetic summary".to_string(),
+            ));
+        }
+        let mut restored: Vec<LlmInputItem> = checkpoint
+            .items
+            .into_iter()
+            .map(resume_item_to_llm_input)
+            .collect();
+        let tail = state.conversation.split_off(1);
+        restored.extend(tail);
+        state.conversation = restored;
+        state.context_compaction.generation = state.context_compaction.generation.saturating_sub(1);
+        state.context_compaction.history.pop();
+        state.context_compaction.last = state.context_compaction.history.last().cloned();
+        state.context_compaction.summary = state
+            .context_compaction
+            .last
+            .as_ref()
+            .and_then(|_| state.context_compaction.summary.clone());
+        state.previous_response_id = None;
+        if let Some(session) = &self.session_log {
+            session.write_resume_state(&state.to_resume_state())?;
+        }
+        drop(state);
+        log_session_event(
+            self.session_log.as_ref(),
+            &self.redactor,
+            "context_compaction_undone",
+            None,
+            Some(format!(
+                "undid compaction gen={} via {}",
+                last.generation, replacement_id,
+            )),
+            json!({ "record": last.clone(), "replacement_id": replacement_id }),
+        );
+        Ok(Some(last))
     }
 
     pub async fn pin_context_entry(
@@ -1882,6 +2030,8 @@ impl Agent {
             json!({
                 "record": report.record,
                 "summary": report.summary,
+                "replacement_id": report.record.replacement_id,
+                "conversation": report.dropped,
             }),
         );
     }
@@ -2151,7 +2301,8 @@ impl Agent {
                     .await;
                     return;
                 }
-                let mut all_tool_specs = core_control_tools(&config.subagents);
+                let mut all_tool_specs =
+                    core_control_tools(&config.subagents, load_session_mode(&session_mode));
                 all_tool_specs.extend(tools.specs().iter().cloned().map(advertised_tool));
                 warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
                 refresh_mcp_tools_in_background(
@@ -2477,6 +2628,10 @@ async fn complete_squeezy_help_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2484,6 +2639,7 @@ async fn complete_squeezy_help_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -2670,6 +2826,10 @@ async fn complete_local_tool_turn(
         metrics.clone(),
     ));
     session_metrics.lock().await.merge_turn(&metrics);
+    let context_estimate = {
+        let state = conversation_state.lock().await;
+        estimate_context(&state.conversation)
+    };
     let _ = tx
         .send(AgentEvent::Completed {
             turn_id,
@@ -2677,6 +2837,7 @@ async fn complete_local_tool_turn(
             response_id: None,
             cost,
             metrics,
+            context_estimate,
         })
         .await;
 }
@@ -2845,6 +3006,107 @@ fn request_reasoning_effort(
 /// otherwise `/pin` is purely UI until the conversation crosses the
 /// compaction threshold. Each pin contributes one line; long summaries
 /// are clipped via `compact_text` so the instructions stay bounded.
+/// Walk from `cwd` up to the nearest `.git` directory and concatenate every
+/// `AGENTS.md` found from root downward, capped at `max_bytes` of UTF-8.
+/// Returns `None` when ingestion is disabled (`max_bytes == 0`), no
+/// `AGENTS.md` exists in the walked range, or every read fails.
+fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let canonical_cwd = fs::canonicalize(cwd)
+        .ok()
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let mut root: Option<std::path::PathBuf> = None;
+    for ancestor in canonical_cwd.ancestors() {
+        if ancestor.join(".git").exists() {
+            root = Some(ancestor.to_path_buf());
+            break;
+        }
+    }
+    let root = root.unwrap_or_else(|| canonical_cwd.clone());
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut current = canonical_cwd.as_path();
+    loop {
+        dirs.push(current.to_path_buf());
+        if current == root {
+            break;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+    dirs.reverse(); // root-first
+    let mut combined = String::new();
+    let mut remaining = max_bytes;
+    for dir in dirs {
+        let candidate = dir.join("AGENTS.md");
+        let Ok(body) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        let header = format!("--- {} ---\n", candidate.display());
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        let header_bytes = header.len().min(remaining);
+        combined.push_str(&header[..header_bytes]);
+        remaining = remaining.saturating_sub(header_bytes);
+        if remaining == 0 {
+            combined.push_str("[truncated]");
+            break;
+        }
+        let take = body.len().min(remaining);
+        let mut end = take;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        combined.push_str(&body[..end]);
+        remaining = remaining.saturating_sub(end);
+        if body.len() > end {
+            combined.push_str("\n[truncated]");
+            break;
+        }
+    }
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined)
+    }
+}
+
+/// Read `~/.squeezy/memory.md` and return its contents truncated to
+/// `max_bytes`. Returns `None` when ingestion is disabled, `HOME` is unset,
+/// or the file is absent / unreadable. Errors are silent on purpose: this is
+/// a best-effort enrichment, never load-bearing.
+fn ingest_user_memory(max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 {
+        return None;
+    }
+    let home = env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home)
+        .join(".squeezy")
+        .join("memory.md");
+    let body = fs::read_to_string(&path).ok()?;
+    if body.is_empty() {
+        return None;
+    }
+    if body.len() <= max_bytes {
+        return Some(body);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = String::with_capacity(end + 16);
+    truncated.push_str(&body[..end]);
+    truncated.push_str("\n[truncated]");
+    Some(truncated)
+}
+
 fn instructions_with_pinned_context(instructions: &str, pinned: &[ContextPin]) -> String {
     if pinned.is_empty() {
         return instructions.to_string();
@@ -2906,13 +3168,19 @@ impl TurnRuntime {
             self.config.tui.response_verbosity,
             native_text_verbosity,
         );
+        // Plan mode is enforced by tool-filtering elsewhere; the overlay
+        // here tells the model *why* its toolbox shrank and what the
+        // expected output contract (`<proposed_plan>`) looks like.
+        let active_mode = load_session_mode(&self.session_mode);
+        let mode_instructions =
+            plan_mode::instructions_for_mode(&verbosity_instructions, active_mode);
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
         // after a compaction has occurred. Inline it into the per-turn
         // instructions so a `/pin` is immediately visible to the model
         // even on sessions that never cross the compaction threshold.
         let raw_instructions = instructions_with_pinned_context(
-            &verbosity_instructions,
+            &mode_instructions,
             &prior_state.context_compaction.pinned,
         );
         let active_attachments = prior_state
@@ -2950,6 +3218,8 @@ impl TurnRuntime {
                 json!({
                     "record": report.record,
                     "summary": report.summary,
+                    "replacement_id": report.record.replacement_id,
+                    "conversation": report.dropped,
                 }),
             );
             let _ = self
@@ -3302,6 +3572,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3310,6 +3581,7 @@ impl TurnRuntime {
                         response_id: None,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -3339,6 +3611,7 @@ impl TurnRuntime {
                     context_compaction: context_compaction.clone(),
                 })
                 .await;
+                let context_estimate = estimate_context(&conversation);
                 let _ = self
                     .tx
                     .send(AgentEvent::Completed {
@@ -3347,6 +3620,7 @@ impl TurnRuntime {
                         response_id,
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
+                        context_estimate,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -3441,13 +3715,59 @@ impl TurnRuntime {
                 );
             }
 
+            // Mid-turn compaction (F75): if the provider reported usage
+            // crossing the configured fraction of `model_context_window`,
+            // shrink the conversation before the next sample. Bumps the
+            // compaction generation, which forces previous_response_id
+            // off the next request to keep the provider state consistent
+            // with the new history.
+            let mid_turn_report = maybe_compact_mid_turn(
+                &mut conversation,
+                &mut context_compaction,
+                &active_attachments,
+                self.store.as_deref(),
+                &self.config,
+                total_tokens_from_cost(&completed_cost),
+            );
+            let mid_turn_compacted = mid_turn_report.is_some();
+            if let Some(report) = mid_turn_report {
+                self.log_event(
+                    "context_compacted",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "mid-turn compacted gen={} {}->{} estimated tokens",
+                        report.record.generation,
+                        report.record.before.estimated_tokens,
+                        report.record.after.estimated_tokens,
+                    )),
+                    json!({
+                        "record": report.record,
+                        "summary": report.summary,
+                        "replacement_id": report.record.replacement_id,
+                        "conversation": report.dropped,
+                        "phase": "mid_turn",
+                    }),
+                );
+                let _ = self
+                    .tx
+                    .send(AgentEvent::ContextCompacted {
+                        turn_id: self.turn_id,
+                        report,
+                    })
+                    .await;
+            }
+
             if self.config.store_responses {
-                previous_response_id = if implicit_instructions_added {
+                previous_response_id = if implicit_instructions_added || mid_turn_compacted {
                     None
                 } else {
                     response_id
                 };
-                next_input = outputs;
+                next_input = if mid_turn_compacted {
+                    conversation.clone()
+                } else {
+                    outputs
+                };
             } else {
                 previous_response_id = None;
                 next_input = conversation.clone();
@@ -3966,6 +4286,128 @@ async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolC
         ToolStatus::Success,
         json!({ "ok": true, "summary": snapshot.compact_summary() }),
     )
+}
+
+async fn handle_request_user_input_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+) -> ToolResult {
+    let active_mode = load_session_mode(&context.session_mode);
+    if active_mode != SessionMode::Plan {
+        return control_tool_result(
+            call,
+            ToolStatus::Denied,
+            json!({
+                "ok": false,
+                "status": "refused",
+                "mode": active_mode.as_str(),
+                "error": "request_user_input is only available in Plan mode"
+            }),
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct Args {
+        question: String,
+        #[serde(default)]
+        choices: Vec<ArgChoice>,
+        #[serde(default)]
+        allow_freeform: bool,
+    }
+    #[derive(Deserialize)]
+    struct ArgChoice {
+        label: String,
+        value: String,
+    }
+
+    let args: Args = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(error) => {
+            return control_tool_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "ok": false,
+                    "error": format!("invalid request_user_input arguments: {error}")
+                }),
+            );
+        }
+    };
+
+    let question = args.question.trim().to_string();
+    if question.is_empty() {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "request_user_input.question must be non-empty"
+            }),
+        );
+    }
+
+    let request = RequestUserInputRequest {
+        question,
+        choices: args
+            .choices
+            .into_iter()
+            .map(|c| RequestUserInputChoice {
+                label: c.label,
+                value: c.value,
+            })
+            .collect(),
+        allow_freeform: args.allow_freeform,
+    };
+
+    let (response_tx, response_rx) = oneshot::channel::<RequestUserInputResponse>();
+    if context
+        .tx
+        .send(AgentEvent::RequestUserInputRequested {
+            turn_id: context.turn_id,
+            request,
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return control_tool_result(
+            call,
+            ToolStatus::Error,
+            json!({
+                "ok": false,
+                "error": "TUI is no longer receiving events; cannot ask the user"
+            }),
+        );
+    }
+
+    let response = tokio::select! {
+        biased;
+        _ = context.cancel.cancelled() => RequestUserInputResponse::cancelled(),
+        result = response_rx => result.unwrap_or_else(|_| RequestUserInputResponse::cancelled()),
+    };
+
+    let mut payload = json!({
+        "ok": true,
+        "action": match response.action {
+            RequestUserInputAction::Choice => "choice",
+            RequestUserInputAction::Freeform => "freeform",
+            RequestUserInputAction::Cancelled => "cancelled",
+        },
+    });
+    if let Some(map) = payload.as_object_mut() {
+        if let Some(choice) = response.choice_value {
+            map.insert("choice_value".to_string(), Value::String(choice));
+        }
+        if let Some(text) = response.freeform {
+            map.insert("freeform".to_string(), Value::String(text));
+        }
+    }
+    let status = if matches!(response.action, RequestUserInputAction::Cancelled) {
+        ToolStatus::Cancelled
+    } else {
+        ToolStatus::Success
+    };
+    control_tool_result(call, status, payload)
 }
 
 async fn handle_load_tool_schema_call(
@@ -5010,7 +5452,10 @@ fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
 }
 
 fn is_control_tool_name(name: &str) -> bool {
-    matches!(name, TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME)
+    matches!(
+        name,
+        TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
+    )
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {
@@ -5081,6 +5526,20 @@ async fn execute_tool_calls(
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+        if call.name == REQUEST_USER_INPUT_TOOL_NAME {
+            let result = handle_request_user_input_call(&context, call).await;
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
@@ -6503,7 +6962,10 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
 /// `delegate` and `explore` are gated on [`SubagentConfig::enabled`] /
 /// `explore_enabled` so we don't spend prompt tokens advertising tools the
 /// agent would refuse on every call.
-fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
+fn core_control_tools(
+    subagents: &SubagentConfig,
+    session_mode: SessionMode,
+) -> Vec<AdvertisedTool> {
     let mut tools = Vec::new();
     if subagents.enabled {
         tools.push(delegate_advertised_tool());
@@ -6512,6 +6974,9 @@ fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
         }
         tools.push(delegate_plan_advertised_tool());
         tools.push(delegate_review_advertised_tool());
+    }
+    if session_mode == SessionMode::Plan {
+        tools.push(request_user_input_advertised_tool());
     }
     tools
 }
@@ -6622,6 +7087,58 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
     }
 }
 
+/// Plan-mode tool that lets the model pause the turn and ask the user a
+/// clarifying multiple-choice (or free-form) question. The capability is
+/// `Read` so it survives Plan-mode tool filtering; mode gating happens at
+/// execute time so a Build-mode call returns a clear error instead of
+/// silently disappearing.
+fn request_user_input_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: LlmToolSpec {
+            name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+            description:
+                "Plan mode only. Pause the turn and ask the user a clarifying question. Provide a question; optionally provide multiple-choice options with stable values. Returns the user's selection (or notes they cancelled)."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Question to display to the user. Should be a complete sentence."
+                    },
+                    "choices": {
+                        "type": "array",
+                        "description": "Multiple-choice options. Omit or pass an empty array for free-form input.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description": "Short human-readable label shown to the user."
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": "Stable value returned to the model when this choice is picked."
+                                }
+                            },
+                            "required": ["label", "value"]
+                        }
+                    },
+                    "allow_freeform": {
+                        "type": "boolean",
+                        "description": "When true, the user may also type a free-form answer alongside choices. Default false."
+                    }
+                },
+                "required": ["question"]
+            }),
+            strict: false,
+        },
+    }
+}
+
 fn explore_advertised_tool() -> AdvertisedTool {
     AdvertisedTool {
         capability: PermissionCapability::Read,
@@ -6668,6 +7185,7 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
         DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
         DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
+        REQUEST_USER_INPUT_TOOL_NAME => Some(request_user_input_advertised_tool()),
         _ => None,
     }
 }
@@ -6757,13 +7275,15 @@ fn request_tool_specs(
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
+        REQUEST_USER_INPUT_TOOL_NAME,
     ];
     for name in synthetic_order
         .into_iter()
         .filter(|name| {
             // Synthetic control tools may have been filtered out of
-            // `core_control_tools` (e.g. subagents disabled). In that case
-            // don't push them back into the request via name lookup.
+            // `core_control_tools` (e.g. subagents disabled, or Plan-only
+            // tools in Build mode). In that case don't push them back
+            // into the request via name lookup.
             *name == LOAD_TOOL_SCHEMA_TOOL_NAME || advertised_names.contains(name)
         })
         .chain(schema_config.core.iter().map(String::as_str))
@@ -7409,6 +7929,64 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
     }
 }
 
+/// Combined token count from a `CostSnapshot`. Sums `input_tokens`,
+/// `output_tokens`, and `reasoning_output_tokens` when present; falls back
+/// to `None` if the provider reported no usage.
+fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut saw_any = false;
+    for value in [
+        cost.input_tokens,
+        cost.output_tokens,
+        cost.reasoning_output_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        saw_any = true;
+        total = total.saturating_add(value);
+    }
+    if saw_any { Some(total) } else { None }
+}
+
+/// Trigger compaction mid-turn when the configured context window is in
+/// danger. Returns the produced compaction report when it fired; `None`
+/// when the feature is disabled, the window isn't configured, or the
+/// threshold hasn't been crossed.
+fn maybe_compact_mid_turn(
+    conversation: &mut Vec<LlmInputItem>,
+    state: &mut ContextCompactionState,
+    attachments: &[ContextAttachment],
+    store: Option<&SqueezyStore>,
+    config: &AppConfig,
+    last_total_tokens: Option<u64>,
+) -> Option<ContextCompactionReport> {
+    if !config.context_compaction.enabled_mid_turn {
+        return None;
+    }
+    let window = config.context_compaction.model_context_window?;
+    if window == 0 {
+        return None;
+    }
+    let threshold = window
+        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
+        .saturating_div(100);
+    let observed =
+        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
+    if observed < threshold {
+        return None;
+    }
+    compact_conversation(
+        conversation,
+        state,
+        attachments,
+        store,
+        config,
+        ContextCompactionTrigger::Auto,
+        true,
+    )
+}
+
 fn maybe_compact_conversation(
     conversation: &mut Vec<LlmInputItem>,
     state: &mut ContextCompactionState,
@@ -7480,14 +8058,48 @@ fn compact_conversation(
     }
     *conversation = compacted;
 
+    let dropped: Vec<squeezy_store::ResumeItem> =
+        older.into_iter().map(llm_input_to_resume_item).collect();
+
+    // Persist the dropped slice as a checkpoint so a future
+    // `compact_context_undo` can hydrate it. The write is best-effort:
+    // failing to persist must not abort the compaction itself, otherwise
+    // a transient redb hiccup would mean losing the summary as well.
+    let compacted_at_ms = unix_timestamp_millis();
+    let replacement_id = store.and_then(|store| {
+        if dropped.is_empty() {
+            return None;
+        }
+        let id = format!("ckpt-{generation}-{compacted_at_ms}");
+        let checkpoint = squeezy_store::CompactionCheckpoint {
+            replacement_id: id.clone(),
+            session_id: String::new(),
+            generation,
+            items: dropped.clone(),
+            created_unix_millis: compacted_at_ms as u128,
+        };
+        match store.put_compaction_checkpoint(&checkpoint) {
+            Ok(()) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    target: "squeezy::compaction",
+                    error = %err,
+                    "failed to persist compaction checkpoint; undo will be unavailable",
+                );
+                None
+            }
+        }
+    });
+
     let record = ContextCompactionRecord {
         generation,
         trigger,
-        compacted_at_ms: unix_timestamp_millis(),
+        compacted_at_ms,
         before,
         after,
         dropped_items: split,
         summary_bytes: summary.len(),
+        replacement_id,
     };
     state.generation = generation;
     state.summary = Some(summary.clone());
@@ -7497,7 +8109,11 @@ fn compact_conversation(
         let excess = state.history.len() - COMPACTION_MAX_HISTORY;
         state.history.drain(0..excess);
     }
-    Some(ContextCompactionReport { record, summary })
+    Some(ContextCompactionReport {
+        record,
+        summary,
+        dropped,
+    })
 }
 
 /// Adjusts a proposed compaction split point so `recent` does not start
@@ -7564,6 +8180,149 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
     }
 }
 
+/// Strategy-aware compaction. Always runs the extractive pipeline first;
+/// when the configured strategy is `ModelAssisted` (or `LayeredFallback`
+/// over its threshold) and a cheap model is configured, the synthetic
+/// summary head is then re-written by that model with a hard timeout.
+/// Any error, timeout, or empty response falls back to the extractive
+/// summary verbatim — the extractive contract is load-bearing.
+#[allow(clippy::too_many_arguments)]
+async fn compact_conversation_with_strategy(
+    conversation: &mut Vec<LlmInputItem>,
+    state: &mut ContextCompactionState,
+    attachments: &[ContextAttachment],
+    store: Option<&SqueezyStore>,
+    provider: &Arc<dyn LlmProvider>,
+    session: Option<&SessionHandle>,
+    redactor: &Redactor,
+    config: &AppConfig,
+    trigger: ContextCompactionTrigger,
+    force: bool,
+) -> Option<ContextCompactionReport> {
+    let report = compact_conversation(
+        conversation,
+        state,
+        attachments,
+        store,
+        config,
+        trigger,
+        force,
+    )?;
+    let strategy = config.context_compaction.strategy;
+    if strategy == squeezy_core::CompactionStrategy::Extractive {
+        return Some(report);
+    }
+    let dropped_estimated_tokens = report
+        .record
+        .before
+        .estimated_tokens
+        .saturating_sub(report.record.after.estimated_tokens);
+    let threshold = config
+        .context_compaction
+        .layered_fallback_extractive_threshold_tokens as u64;
+    if strategy == squeezy_core::CompactionStrategy::LayeredFallback
+        && dropped_estimated_tokens < threshold
+    {
+        return Some(report);
+    }
+    let Some(model) = config.context_compaction.model_assisted_model.clone() else {
+        log_session_event(
+            session,
+            redactor,
+            "compaction_fallback",
+            None,
+            Some("model_assisted_model not configured; using extractive output".to_string()),
+            json!({ "reason": "missing_model", "strategy": strategy.as_str() }),
+        );
+        return Some(report);
+    };
+    let max_output = config.context_compaction.model_assisted_max_output_tokens;
+    let timeout_secs = config.context_compaction.model_assisted_timeout_secs;
+    let extractive_summary = report.summary.clone();
+    let prompt = format!(
+        "Rewrite the conversation summary below verbatim in <= {max_output} tokens. \
+         Keep every decision, plan, dead-end, attachment, receipt, and unresolved \
+         question. Do not invent new facts. Output the summary only.\n\n{extractive_summary}"
+    );
+    let request = LlmRequest {
+        model,
+        instructions:
+            "You compact conversation summaries faithfully. Never add new facts; never omit decisions."
+                .to_string(),
+        input: vec![LlmInputItem::UserText(prompt)],
+        max_output_tokens: Some(max_output),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+        cache_key: None,
+    };
+    let cancel = CancellationToken::new();
+    let mut stream = provider.stream_response(request, cancel);
+    let mut buffer = String::new();
+    let collected = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(LlmEvent::TextDelta(delta)) => buffer.push_str(&delta),
+                Ok(LlmEvent::Completed { .. }) => return Ok::<(), SqueezyError>(()),
+                Ok(LlmEvent::Cancelled) => {
+                    return Err(SqueezyError::Agent(
+                        "model-assisted compaction cancelled".to_string(),
+                    ));
+                }
+                Ok(_) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    })
+    .await;
+    let reason = match collected {
+        Err(_) => "model_assisted_timeout",
+        Ok(Err(err)) => {
+            tracing::warn!(
+                target: "squeezy::compaction",
+                error = %err,
+                "model-assisted compaction failed; falling back to extractive",
+            );
+            "model_assisted_error"
+        }
+        Ok(Ok(())) if buffer.trim().is_empty() => "model_assisted_empty",
+        Ok(Ok(())) => {
+            let new_summary = buffer.trim().to_string();
+            if let Some(LlmInputItem::UserText(slot)) = conversation.first_mut() {
+                *slot = new_summary.clone();
+            }
+            state.summary = Some(new_summary.clone());
+            let mut patched_record = report.record.clone();
+            patched_record.summary_bytes = new_summary.len();
+            if let Some(last) = state.last.as_mut() {
+                last.summary_bytes = new_summary.len();
+            }
+            if let Some(last) = state.history.last_mut() {
+                last.summary_bytes = new_summary.len();
+            }
+            return Some(ContextCompactionReport {
+                summary: new_summary,
+                record: patched_record,
+                dropped: report.dropped,
+            });
+        }
+    };
+    log_session_event(
+        session,
+        redactor,
+        "compaction_fallback",
+        None,
+        Some(format!(
+            "model-assisted compaction fell back to extractive ({reason})"
+        )),
+        json!({ "reason": reason, "strategy": strategy.as_str() }),
+    );
+    Some(report)
+}
+
 fn build_compaction_summary(
     generation: u64,
     state: &ContextCompactionState,
@@ -7594,6 +8353,24 @@ fn build_compaction_summary(
                 pin.id,
                 pin.label,
                 compact_text(&pin.summary, COMPACTION_PIN_SUMMARY_MAX_CHARS)
+            ));
+        }
+    }
+    // Cross-session observations carry decisions/conventions/dead-ends the
+    // user (or a prior session) explicitly persisted via the `notes_*`
+    // tools. Surface the most recent few so compaction never silently
+    // discards them. Empty query falls through to a recency-ordered
+    // listing inside the store.
+    if let Some(store) = store
+        && let Ok(recent) = store.list_recent_observations(5)
+        && !recent.is_empty()
+    {
+        lines.push("Prior decisions and notes (notes_recall):".to_string());
+        for obs in recent.iter().take(5) {
+            lines.push(format!(
+                "- [{}] {}",
+                format!("{:?}", obs.kind).to_ascii_lowercase(),
+                compact_text(&obs.text, COMPACTION_DURABLE_LINE_MAX_CHARS),
             ));
         }
     }
@@ -8132,7 +8909,68 @@ enum ApprovalDecision {
     Cancelled,
 }
 
-#[derive(Debug)]
+/// Request payload sent to the TUI when the model calls
+/// `request_user_input` from Plan mode. The TUI renders a modal, gathers
+/// the user's choice, and replies via the matching
+/// [`RequestUserInputResponse`] over a oneshot channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputRequest {
+    /// Question to display to the user.
+    pub question: String,
+    /// Optional multiple-choice options. Empty means "free-form only".
+    pub choices: Vec<RequestUserInputChoice>,
+    /// When true, the UI offers a free-form text path alongside any
+    /// configured choices.
+    pub allow_freeform: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputChoice {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestUserInputAction {
+    Choice,
+    Freeform,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestUserInputResponse {
+    pub action: RequestUserInputAction,
+    pub choice_value: Option<String>,
+    pub freeform: Option<String>,
+}
+
+impl RequestUserInputResponse {
+    pub fn choice(value: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Choice,
+            choice_value: Some(value.into()),
+            freeform: None,
+        }
+    }
+
+    pub fn freeform(text: impl Into<String>) -> Self {
+        Self {
+            action: RequestUserInputAction::Freeform,
+            choice_value: None,
+            freeform: Some(text.into()),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            action: RequestUserInputAction::Cancelled,
+            choice_value: None,
+            freeform: None,
+        }
+    }
+}
+
 pub enum AgentEvent {
     UserMessage {
         turn_id: TurnId,
@@ -8169,6 +9007,11 @@ pub enum AgentEvent {
         turn_id: TurnId,
         request: McpElicitationRequest,
         response_tx: oneshot::Sender<McpElicitationResponse>,
+    },
+    RequestUserInputRequested {
+        turn_id: TurnId,
+        request: RequestUserInputRequest,
+        response_tx: oneshot::Sender<RequestUserInputResponse>,
     },
     JobUpdated {
         job: JobSnapshot,
@@ -8212,6 +9055,10 @@ pub enum AgentEvent {
         response_id: Option<String>,
         cost: CostSnapshot,
         metrics: TurnMetrics,
+        /// Post-turn estimate of the conversation footprint, used by the
+        /// TUI to update its context-budget indicator without needing a
+        /// follow-up `context_estimate_snapshot()` call.
+        context_estimate: ContextEstimate,
     },
     Cancelled {
         turn_id: TurnId,

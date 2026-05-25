@@ -136,6 +136,7 @@ fn session_resume_state_preserves_context_compaction() {
             },
             dropped_items: 15,
             summary_bytes: 700,
+            replacement_id: None,
         }),
         history: Vec::new(),
     };
@@ -879,4 +880,233 @@ fn temp_root(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+#[test]
+fn replay_resume_state_without_resume_json() {
+    let root = temp_root("replay-without-resume-json");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("find payment bug".to_string()),
+            json!({}),
+        ))
+        .expect("append user event");
+    handle
+        .append_event(SessionEvent::new(
+            "assistant_completed",
+            None,
+            Some("checking the payments module".to_string()),
+            json!({ "response_id": "resp_1" }),
+        ))
+        .expect("append assistant event");
+    handle.flush_events().expect("flush events");
+    let session_dir = store.root().join(handle.session_id());
+    std::fs::remove_file(session_dir.join("resume_state.json")).expect("delete resume_state.json");
+
+    let replayed = handle.replay_resume_state().expect("replay");
+    assert!(replayed.resume_available);
+    assert_eq!(replayed.conversation.len(), 2);
+    match &replayed.conversation[0] {
+        ResumeItem::UserText { text } => assert!(text.contains("find payment bug")),
+        other => panic!("expected UserText, got {other:?}"),
+    }
+    match &replayed.conversation[1] {
+        ResumeItem::AssistantText { text } => assert!(text.contains("checking the payments")),
+        other => panic!("expected AssistantText, got {other:?}"),
+    }
+}
+
+#[test]
+fn replay_snaps_to_compaction_checkpoint() {
+    let root = temp_root("replay-snap-checkpoint");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("stale-prelude".to_string()),
+            json!({}),
+        ))
+        .expect("stale event");
+    let checkpoint_conversation = vec![
+        ResumeItem::UserText {
+            text: "compacted user line".to_string(),
+        },
+        ResumeItem::AssistantText {
+            text: "compacted assistant line".to_string(),
+        },
+    ];
+    handle
+        .append_event(SessionEvent::new(
+            "context_compacted",
+            None,
+            Some("compacted".to_string()),
+            json!({
+                "record": null,
+                "summary": "compacted summary",
+                "replacement_id": "ckpt-1",
+                "conversation": checkpoint_conversation.clone(),
+            }),
+        ))
+        .expect("compaction event");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("post-compaction question".to_string()),
+            json!({}),
+        ))
+        .expect("post event");
+    handle.flush_events().expect("flush events");
+
+    let replayed = handle.replay_resume_state().expect("replay");
+    assert!(
+        replayed
+            .conversation
+            .iter()
+            .all(|item| !matches!(item, ResumeItem::UserText { text } if text == "stale-prelude")),
+        "stale events before the checkpoint must be skipped: {:?}",
+        replayed.conversation,
+    );
+    assert!(
+        replayed.conversation.iter().any(
+            |item| matches!(item, ResumeItem::UserText { text } if text == "compacted user line")
+        ),
+        "snapshot user line should be present",
+    );
+    assert!(
+        replayed.conversation.iter().any(|item| matches!(item, ResumeItem::UserText { text } if text.contains("post-compaction question"))),
+        "post-checkpoint event should be replayed forward",
+    );
+}
+
+#[test]
+fn session_event_kind_parses_unknown_as_unknown() {
+    let event = SessionEvent::new("bogus_kind", None, None, json!({"foo": "bar"}));
+    let typed = SessionEventKind::try_from_event(&event).expect("typed");
+    assert_eq!(typed, SessionEventKind::Unknown);
+}
+
+fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
+    let root = temp_root(label);
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            log_retention_days: 0,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    (root, store, config)
+}
+
+#[test]
+fn archive_excludes_session_from_default_list() {
+    let (_root, store, config) = open_test_store("archive-excludes");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive session");
+
+    let listed_default = store.list(&SessionQuery::default()).expect("list default");
+    assert!(
+        listed_default
+            .iter()
+            .all(|metadata| metadata.session_id != session_id),
+        "archived session must be hidden from default list",
+    );
+
+    let listed_include = store
+        .list(&SessionQuery {
+            include_archived: true,
+            ..SessionQuery::default()
+        })
+        .expect("list include archived");
+    let found = listed_include
+        .iter()
+        .find(|metadata| metadata.session_id == session_id)
+        .expect("archived session visible with include_archived=true");
+    assert_eq!(found.status, SessionStatus::Archived);
+}
+
+#[test]
+fn cleanup_skips_archived_sessions() {
+    let (_root, store, config) = open_test_store("cleanup-skips-archived");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive session");
+
+    let report = store
+        .cleanup(std::slice::from_ref(&session_id))
+        .expect("cleanup with archived id");
+    assert!(
+        !report.removed.contains(&session_id),
+        "archived session must not be removed by cleanup",
+    );
+
+    let still_there = store
+        .list(&SessionQuery {
+            include_archived: true,
+            ..SessionQuery::default()
+        })
+        .expect("post-cleanup list");
+    assert!(
+        still_there
+            .iter()
+            .any(|metadata| metadata.session_id == session_id),
+        "archived session survives cleanup",
+    );
+}
+
+#[test]
+fn unarchive_round_trip_restores_session() {
+    let (_root, store, config) = open_test_store("unarchive-round-trip");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive");
+    store.unarchive_session(&session_id).expect("unarchive");
+
+    let listed = store
+        .list(&SessionQuery::default())
+        .expect("list after unarchive");
+    let found = listed
+        .iter()
+        .find(|metadata| metadata.session_id == session_id)
+        .expect("unarchived session in default list");
+    assert_eq!(found.status, SessionStatus::Completed);
 }

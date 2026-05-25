@@ -33,6 +33,10 @@ pub use sessions::*;
 pub const CRATE_NAME: &str = "squeezy-store";
 pub const SCHEMA_VERSION: u64 = 1;
 
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
+
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const GRAPH_PARTITIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("graph_partitions");
 const TOOL_RECEIPTS: TableDefinition<&str, &[u8]> = TableDefinition::new("tool_receipts");
@@ -40,6 +44,13 @@ const READ_SNAPSHOTS: TableDefinition<&str, &[u8]> = TableDefinition::new("read_
 const MCP_TOOL_CACHE: TableDefinition<&str, &[u8]> = TableDefinition::new("mcp_tool_cache");
 const OBSERVATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("observations");
 const OBSERVATION_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("observation_index");
+const COMPACTION_CHECKPOINTS: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("compaction_checkpoints");
+
+/// Default retention for `compaction_checkpoints`. Mirrors the VCS
+/// checkpoint TTL; intentionally duplicated so this crate does not depend
+/// on `squeezy-vcs`.
+pub const DEFAULT_COMPACTION_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 
 pub fn crate_name() -> &'static str {
     CRATE_NAME
@@ -360,6 +371,34 @@ impl SqueezyStore {
         Ok(matches)
     }
 
+    /// Return up to `limit` observations sorted by `updated_unix_millis`
+    /// (newest first). Use when there is no specific query but the caller
+    /// wants a recency-ordered tail for prompt injection or display.
+    pub fn list_recent_observations(&self, limit: usize) -> Result<Vec<Observation>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(OBSERVATIONS) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut all = Vec::new();
+        for entry in table.iter().map_err(store_error)? {
+            let (_, value) = entry.map_err(store_error)?;
+            let observation: Observation = decode(value.value())?;
+            all.push(observation);
+        }
+        all.sort_by(|left, right| {
+            right
+                .updated_unix_millis
+                .cmp(&left.updated_unix_millis)
+                .then(left.id.cmp(&right.id))
+        });
+        all.truncate(limit);
+        Ok(all)
+    }
+
     pub fn delete_observation(&self, id: &str) -> Result<()> {
         let existing = self.get_observation(id)?;
         let write = self.begin_write()?;
@@ -381,6 +420,67 @@ impl SqueezyStore {
             }
         }
         write.commit().map_err(store_error)
+    }
+
+    /// Persist a pre-compaction snapshot so a later `compact_context_undo`
+    /// can restore the dropped slice. Idempotent on `replacement_id`.
+    pub fn put_compaction_checkpoint(&self, checkpoint: &CompactionCheckpoint) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write
+                .open_table(COMPACTION_CHECKPOINTS)
+                .map_err(store_error)?;
+            insert_json(&mut table, checkpoint.replacement_id.as_str(), checkpoint)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    pub fn get_compaction_checkpoint(
+        &self,
+        replacement_id: &str,
+    ) -> Result<Option<CompactionCheckpoint>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(COMPACTION_CHECKPOINTS) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_table_json(&table, replacement_id)
+    }
+
+    /// Drop every checkpoint whose `created_unix_millis < older_than_unix_millis`.
+    /// Returns the number removed.
+    pub fn prune_compaction_checkpoints(&self, older_than_unix_millis: u128) -> Result<usize> {
+        let stale = {
+            let read = self.database.begin_read().map_err(store_error)?;
+            let table = match read.open_table(COMPACTION_CHECKPOINTS) {
+                Ok(table) => table,
+                Err(_) => return Ok(0),
+            };
+            let mut stale = Vec::new();
+            for entry in table.iter().map_err(store_error)? {
+                let (key, value) = entry.map_err(store_error)?;
+                let checkpoint: CompactionCheckpoint = decode(value.value())?;
+                if checkpoint.created_unix_millis < older_than_unix_millis {
+                    stale.push(key.value().to_string());
+                }
+            }
+            stale
+        };
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let removed = stale.len();
+        let write = self.begin_write()?;
+        {
+            let mut table = write
+                .open_table(COMPACTION_CHECKPOINTS)
+                .map_err(store_error)?;
+            for key in &stale {
+                table.remove(key.as_str()).map_err(store_error)?;
+            }
+        }
+        write.commit().map_err(store_error)?;
+        Ok(removed)
     }
 
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
@@ -499,6 +599,18 @@ pub enum ObservationKind {
     Note,
 }
 
+/// A snapshot of the pre-compaction conversation slice, persisted so the
+/// agent can later restore it via `compact_context_undo`. Keyed in redb by
+/// `replacement_id` (typically `format!("ckpt-{generation}-{ms}")`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    pub replacement_id: String,
+    pub session_id: String,
+    pub generation: u64,
+    pub items: Vec<crate::sessions::ResumeItem>,
+    pub created_unix_millis: u128,
+}
+
 fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     match cache_root {
         Some(path) if path.is_absolute() => path.join("state.redb"),
@@ -526,6 +638,9 @@ fn initialize_schema(database: &Database) -> Result<()> {
     write.open_table(MCP_TOOL_CACHE).map_err(store_error)?;
     write.open_table(OBSERVATIONS).map_err(store_error)?;
     write.open_table(OBSERVATION_INDEX).map_err(store_error)?;
+    write
+        .open_table(COMPACTION_CHECKPOINTS)
+        .map_err(store_error)?;
     write.commit().map_err(store_error)
 }
 
