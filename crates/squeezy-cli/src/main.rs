@@ -62,6 +62,11 @@ struct Cli {
         help = "Ignore saved provider/model defaults and run startup selection again"
     )]
     no_default: bool,
+    #[arg(
+        long = "no-resume-picker",
+        help = "Skip the startup picker that offers to resume a recent session for this directory"
+    )]
+    no_resume_picker: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -380,6 +385,7 @@ async fn main() -> squeezy_core::Result<()> {
         squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary,
             languages: onboarding.language_summary,
+            skip_resume_picker: cli.no_resume_picker,
         },
     )
     .await;

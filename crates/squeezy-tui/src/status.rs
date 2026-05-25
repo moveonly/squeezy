@@ -6,7 +6,7 @@
 //! the existing `"  "` separator. Adding a new status field is a one-file
 //! change here.
 
-use crate::TuiApp;
+use crate::{TuiApp, context_window_pct};
 
 /// Render the full detail line. Preserves the historical format so existing
 /// tests and consumers keep working.
@@ -73,7 +73,15 @@ pub(crate) mod segments {
     }
 
     pub(crate) fn context(app: &TuiApp) -> Option<String> {
-        Some(format!("ctx {}", app.context_estimate.estimated_tokens))
+        let used = app.context_estimate.estimated_tokens;
+        if app.context_compaction_threshold == 0 {
+            return Some(format!("ctx {used}"));
+        }
+        let pct = context_window_pct(used, app.context_compaction_threshold);
+        Some(format!(
+            "ctx {used}/{threshold} ({pct}%)",
+            threshold = app.context_compaction_threshold,
+        ))
     }
 
     pub(crate) fn pins(app: &TuiApp) -> Option<String> {

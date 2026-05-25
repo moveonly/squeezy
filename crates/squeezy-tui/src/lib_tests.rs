@@ -8,10 +8,10 @@ use ratatui::backend::TestBackend;
 use squeezy_agent::{JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, CostSnapshot, PermissionCapability, PermissionMode, PermissionPolicy,
-    PermissionRequest, PermissionRisk, PermissionScope, SessionMode, StatusVerbosity,
-    TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus, TaskVerificationState,
-    ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
+    ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
+    PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
+    StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
+    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
@@ -3290,6 +3290,330 @@ fn base64_encoder_supports_osc52_payloads() {
 }
 
 #[tokio::test]
+async fn successful_edit_turn_pushes_diff_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("apply_patch", "patched ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message)
+            if message.contains("/diff") && message.contains("/undo") =>
+        {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert!(
+        hint.is_some(),
+        "successful edit turn must push a /diff /undo hint; transcript: {:?}",
+        app.transcript
+    );
+    assert!(
+        !app.last_turn_had_edits,
+        "flag must reset after the hint fires"
+    );
+}
+
+#[tokio::test]
+async fn readonly_turn_does_not_push_undo_hint() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let read_result = sample_tool_result("read_file", "file body");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: read_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let hint_count = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("/diff") && message.contains("/undo"))
+        })
+        .count();
+    assert_eq!(hint_count, 0, "read-only turn must not produce /undo hint");
+}
+
+#[tokio::test]
+async fn failed_edit_turn_error_status_mentions_undo() {
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    let edit_result = sample_tool_result("write_file", "wrote ok");
+    tx.send(AgentEvent::ToolCallCompleted {
+        turn_id: TurnId::new(1),
+        result: edit_result,
+    })
+    .await
+    .expect("send tool result");
+    tx.send(AgentEvent::Failed {
+        turn_id: TurnId::new(1),
+        error: SqueezyError::Permission("denied".to_string()),
+    })
+    .await
+    .expect("send failed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.status.contains("/undo"),
+        "failed turn after an edit must surface /undo in status; got: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn cancel_preserves_pending_prompt_for_ctrl_r() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("write the README".to_string());
+
+    let hint = format_status_hints(&app);
+    assert!(
+        hint.contains("Ctrl-R"),
+        "idle hint must advertise Ctrl-R when a cancelled prompt is stashed; got: {hint}"
+    );
+    assert!(restore_cancelled_prompt(&mut app), "restore must succeed");
+    assert_eq!(app.input, "write the README");
+    assert!(app.cancelled_prompt.is_none());
+    assert_eq!(app.input_cursor, app.input.len());
+}
+
+#[test]
+fn restore_is_noop_when_no_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must report no-op when nothing is stashed"
+    );
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn restore_does_not_overwrite_in_progress_input() {
+    let mut app = test_app(SessionMode::Build);
+    app.input = "draft".to_string();
+    app.input_cursor = app.input.len();
+    app.cancelled_prompt = Some("previous".to_string());
+    assert!(
+        !restore_cancelled_prompt(&mut app),
+        "restore must refuse when composer is non-empty"
+    );
+    assert_eq!(app.input, "draft");
+    assert_eq!(app.cancelled_prompt.as_deref(), Some("previous"));
+}
+
+#[tokio::test]
+async fn completion_clears_cancelled_prompt() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("hello".to_string());
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("done"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "successful completion must clear the cancelled-prompt slot",
+    );
+}
+
+#[test]
+fn context_budget_renders_percent_and_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 4_500,
+        ..ContextEstimate::default()
+    };
+    let details = format_status_details(&app);
+    assert!(
+        details.contains("ctx 4500/6000 (75%)"),
+        "expected context cell with percent; got: {details}"
+    );
+}
+
+#[test]
+fn context_budget_hint_at_high_usage() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 5_800,
+        ..ContextEstimate::default()
+    };
+    let hint = format_status_hints(&app);
+    assert!(
+        hint.contains("/pin") && hint.contains("/compact"),
+        "expected /pin and /compact hints when near threshold; got: {hint}"
+    );
+}
+
+#[test]
+fn context_budget_hint_omitted_below_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+    app.context_estimate = ContextEstimate {
+        estimated_tokens: 2_000,
+        ..ContextEstimate::default()
+    };
+    let hint = format_status_hints(&app);
+    assert!(
+        !hint.contains("/pin to keep"),
+        "low usage must not surface /pin hint; got: {hint}"
+    );
+}
+
+#[tokio::test]
+async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            estimated_tokens: 5_800,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let nudges = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("context window") && message.contains("full"))
+        })
+        .count();
+    assert_eq!(nudges, 1, "nudge must fire exactly once on first crossing");
+
+    // A second high-usage turn must not fire the nudge again until
+    // compaction resets the latch.
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(2),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            estimated_tokens: 5_900,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let nudges = app
+        .transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("context window") && message.contains("full"))
+        })
+        .count();
+    assert_eq!(nudges, 1, "nudge must not fire again until compaction");
+}
+
+#[tokio::test]
+async fn proposed_plan_block_renders_as_log_entry() {
+    let mut app = test_app(SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    for delta in [
+        "intro <propos",
+        "ed_plan>\nstep 1\nstep 2\n</propos",
+        "ed_plan>\ntrailing\n",
+    ] {
+        tx.send(AgentEvent::AssistantDelta {
+            turn_id: TurnId::new(1),
+            delta: delta.to_string(),
+        })
+        .await
+        .expect("send delta");
+    }
+    drop(tx);
+
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        app.pending_assistant.text(),
+        "intro \ntrailing\n",
+        "proposed plan markers must not appear in the live assistant pane",
+    );
+    let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
+        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan:") => {
+            Some(message.clone())
+        }
+        _ => None,
+    });
+    assert_eq!(
+        plan_log,
+        Some("proposed plan:\nstep 1\nstep 2".to_string()),
+        "expected exactly one proposed-plan log entry; transcript={:?}",
+        app.transcript
+    );
+}
+
+#[tokio::test]
 async fn assistant_delta_preserves_scroll_offset_in_history() {
     let mut app = test_app(SessionMode::Build);
     app.transcript_scroll_from_bottom = 8;
@@ -3324,6 +3648,7 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3375,6 +3700,7 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3431,6 +3757,7 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");
@@ -3497,6 +3824,7 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         response_id: None,
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
     })
     .await
     .expect("send completed");

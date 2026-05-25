@@ -140,6 +140,7 @@ async fn plan_mode_advertises_only_read_only_tools() {
             "delegate",
             "explore",
             "load_tool_schema",
+            "request_user_input",
             "glob",
             "grep",
             "read_file",
