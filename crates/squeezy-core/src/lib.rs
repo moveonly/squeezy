@@ -6915,6 +6915,19 @@ impl LanguageFamily {
         }
     }
 
+    /// Human-readable label suitable for prose (tool descriptions, docs).
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::Python => "Python",
+            Self::Java => "Java",
+            Self::CSharp => "C#",
+            Self::Go => "Go",
+            Self::CFamily => "C/C++",
+            Self::JsTs => "JavaScript/TypeScript",
+        }
+    }
+
     pub const fn of(kind: LanguageKind) -> Option<Self> {
         match kind {
             LanguageKind::Rust => Some(Self::Rust),

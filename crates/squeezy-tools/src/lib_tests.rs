@@ -6722,3 +6722,50 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
         false,
     ));
 }
+
+#[test]
+fn grep_spec_promotes_graph_first() {
+    let description = grep_spec().description;
+    for marker in [
+        "decl_search",
+        "reference_search",
+        "symbol_context",
+        "graph returned zero packets",
+    ] {
+        assert!(
+            description.contains(marker),
+            "grep_spec must mention `{marker}`; got: {description}"
+        );
+    }
+    for family in squeezy_core::LanguageFamily::all() {
+        assert!(
+            description.contains(family.display_name()),
+            "grep_spec must name `{}` from LanguageFamily::all(); got: {description}",
+            family.display_name(),
+        );
+    }
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/grep_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn glob_spec_promotes_graph_first() {
+    let description = glob_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("graph returned zero packets"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/glob_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn read_file_spec_promotes_graph_first() {
+    let description = read_file_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("symbol_context"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/read_file_spec_description.txt")
+            .trim();
+    assert_eq!(description.trim(), golden);
+}

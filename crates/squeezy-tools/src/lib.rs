@@ -13265,10 +13265,39 @@ fn diff_context_spec() -> ToolSpec {
     }
 }
 
+/// Comma-joined list of supported language families, generated from
+/// `squeezy_core::LanguageFamily::all()` so the prose stays in sync when
+/// new families are added.
+fn supported_language_list() -> String {
+    let names: Vec<&'static str> = squeezy_core::LanguageFamily::all()
+        .iter()
+        .map(|family| family.display_name())
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [only] => only.to_string(),
+        [head @ .., last] => format!("{}, and {}", head.join(", "), last),
+    }
+}
+
+/// Preamble that promotes graph-anchored tools (`decl_search`,
+/// `reference_search`, `symbol_context`) over the lexical fallbacks
+/// (`grep`, `glob`, `read_file`). The language list is built from
+/// `LanguageFamily::all()` at runtime.
+fn graph_first_preamble(fallback_tool: &str) -> String {
+    format!(
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` first for symbol-shaped queries in {languages} files. Use `{fallback_tool}` for free-form text, unsupported languages, or after the graph returned zero packets.",
+        languages = supported_language_list(),
+    )
+}
+
 fn grep_spec() -> ToolSpec {
     ToolSpec {
         name: "grep".to_string(),
-        description: "Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.".to_string(),
+        description: format!(
+            "{preamble} Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.",
+            preamble = graph_first_preamble("grep"),
+        ),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
@@ -13294,7 +13323,10 @@ fn grep_spec() -> ToolSpec {
 fn glob_spec() -> ToolSpec {
     ToolSpec {
         name: "glob".to_string(),
-        description: "List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.".to_string(),
+        description: format!(
+            "{preamble} List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.",
+            preamble = graph_first_preamble("glob"),
+        ),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
@@ -13315,7 +13347,10 @@ fn glob_spec() -> ToolSpec {
 fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
-        description: "Read a bounded byte slice from one workspace file and return its sha256 receipt. Use grep first when locating unknown files.".to_string(),
+        description: format!(
+            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span.",
+            preamble = graph_first_preamble("read_file"),
+        ),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",
