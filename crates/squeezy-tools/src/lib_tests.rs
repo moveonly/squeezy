@@ -6051,8 +6051,8 @@ def caller(obj):
         .expect("downstream packets");
     let candidate_packet = packets
         .iter()
-        .find(|packet| packet["edge"]["confidence"].as_str() == Some("CandidateSet"))
-        .unwrap_or_else(|| panic!("expected at least one CandidateSet packet: {packets:?}"));
+        .find(|packet| packet["edge"]["confidence"].as_str() == Some("candidate_set"))
+        .unwrap_or_else(|| panic!("expected at least one candidate_set packet: {packets:?}"));
     let candidates = candidate_packet["candidates"]
         .as_array()
         .unwrap_or_else(|| {

@@ -259,10 +259,10 @@ impl ToolCostHint {
     pub fn confidence_distribution_from_packets(packets: &[Value]) -> BTreeMap<String, u32> {
         let mut map: BTreeMap<String, u32> = BTreeMap::new();
         for packet in packets {
-            let Some(debug_label) = packet.get("confidence").and_then(Value::as_str) else {
+            let Some(label) = packet.get("confidence").and_then(Value::as_str) else {
                 continue;
             };
-            if let Some(c) = confidence_from_debug_label(debug_label) {
+            if let Some(c) = confidence_from_label(label) {
                 *map.entry(c.id().to_string()).or_insert(0) += 1;
             }
         }
@@ -270,14 +270,16 @@ impl ToolCostHint {
     }
 }
 
-/// Map a `{:?}`-formatted `Confidence` (`"ExactSyntax"`, `"Heuristic"`,
-/// …) back to the typed variant. Returns `None` for strings that don't
-/// match a known variant.
-fn confidence_from_debug_label(label: &str) -> Option<Confidence> {
+/// Map a packet's `confidence` string back to the typed variant. Accepts
+/// the canonical snake_case `id()` form (e.g. `"exact_syntax"`) as well as
+/// the legacy `{:?}`-formatted variant name (`"ExactSyntax"`) so older
+/// captured packets continue to aggregate. Returns `None` for unknown
+/// strings.
+fn confidence_from_label(label: &str) -> Option<Confidence> {
     Confidence::ALL
         .iter()
         .copied()
-        .find(|c| format!("{c:?}") == label)
+        .find(|c| c.id() == label || format!("{c:?}") == label)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -10876,7 +10878,7 @@ fn symbol_context_json(
         "references": references,
         "callers": callers,
         "diagnostics": diagnostics,
-        "confidence": format!("{:?}", symbol.confidence),
+        "confidence": symbol.confidence.id(),
         "freshness": format!("{:?}", symbol.freshness),
     })
 }
@@ -11398,7 +11400,7 @@ fn evidence_packet(
     json!({
         "claim": claim.into(),
         "spans": spans,
-        "confidence": format!("{:?}", confidence),
+        "confidence": confidence.id(),
         "freshness": format!("{:?}", freshness),
         "provenance": provenance.into_iter().map(provenance_json).collect::<Vec<_>>(),
         "cost_hint": cost_hint,
@@ -11924,7 +11926,7 @@ fn symbol_json(graph: &squeezy_graph::SemanticGraph, symbol: &GraphSymbol) -> Va
                 "end_line": range.end_line,
             })).collect::<Vec<_>>(),
         })),
-        "confidence": format!("{:?}", symbol.confidence),
+        "confidence": symbol.confidence.id(),
         "freshness": format!("{:?}", symbol.freshness),
     })
 }
@@ -11946,7 +11948,7 @@ fn edge_json(edge: &GraphEdge) -> Value {
         "target_text": edge.target_text,
         "kind": format!("{:?}", edge.kind),
         "span": edge.span.map(span_json),
-        "confidence": format!("{:?}", edge.confidence),
+        "confidence": edge.confidence.id(),
         "freshness": format!("{:?}", edge.freshness),
         "provenance": provenance_json(edge.provenance.clone()),
     });
@@ -12323,7 +12325,7 @@ fn reference_json(hit: ReferenceHit) -> Value {
             "name": owner.name,
             "kind": format!("{:?}", owner.kind),
         })),
-        "confidence": format!("{:?}", hit.confidence),
+        "confidence": hit.confidence.id(),
     })
 }
 
