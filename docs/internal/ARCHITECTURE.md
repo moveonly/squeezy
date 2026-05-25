@@ -61,6 +61,27 @@ doc list in `crates/squeezy-skills/src/help.rs`. Tests should fail if a topic
 cites a missing doc or if an internal doc is accidentally bundled into normal
 help.
 
+## Provider SDK Policy
+
+An earlier rule of thumb said Squeezy should not depend on any vendor SDK
+and should call provider APIs directly with `reqwest`. That guidance is
+retired:
+
+- **Vendor SDKs are allowed when they materially reduce auth, retry, or
+  pagination complexity.** Bedrock is the existing example — SigV4 is
+  not practical to reimplement, so `aws-sdk-bedrockruntime` and
+  `aws-config` are the right tools.
+- **Raw `reqwest` remains the default for simple bearer-token REST
+  APIs** (Anthropic, OpenAI, Google, Azure OpenAI, Ollama). This is
+  momentum, not principle. Do not rewrite an existing provider purely
+  to add an SDK; only reach for one when the new provider's auth or
+  protocol justifies it.
+- **No embedded HTTP server, ever.** Squeezy is CLI/TUI only. Do not
+  add `axum`, `warp`, `actix-web`, or any other framework that accepts
+  inbound connections. The current `squeezy ask` Unix-socket bridge is
+  the only acceptable form of local IPC, and it is bound to a session
+  socket — not a network port.
+
 ## Adding A Language Family
 
 1. Add the `LanguageKind` variant and map it to a `LanguageFamily` in
