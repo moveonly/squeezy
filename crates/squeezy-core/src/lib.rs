@@ -35,6 +35,7 @@ pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
 pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
 pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
 pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
+pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
@@ -105,6 +106,7 @@ pub struct AppConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
     pub max_output_tokens: Option<u32>,
+    pub stream_idle_timeout: Duration,
     pub tick_rate: Duration,
     pub workspace_root: PathBuf,
     pub permissions: PermissionPolicy,
@@ -335,6 +337,23 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
             .or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let provider_timeout_keys = provider_settings_keys(&provider);
+        let stream_idle_timeout_ms = parse_u64(
+            get_var("SQUEEZY_STREAM_IDLE_TIMEOUT_MS")
+                .or_else(|| {
+                    model_settings
+                        .stream_idle_timeout_ms
+                        .map(|value| value.to_string())
+                })
+                .or_else(|| {
+                    provider_u64_setting_any(
+                        &providers,
+                        provider_timeout_keys,
+                        "stream_idle_timeout_ms",
+                    )
+                }),
+            DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+        );
         let web = settings.web.unwrap_or_default();
         let exa_mcp_url = get_var("SQUEEZY_EXA_MCP_URL")
             .or(web.exa_mcp_url)
@@ -477,6 +496,7 @@ impl AppConfig {
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens,
+            stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
             permissions,
@@ -574,6 +594,10 @@ impl AppConfig {
                 "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
             );
         }
+        output.push_str(&format!(
+            "stream_idle_timeout_ms = {}\n",
+            self.stream_idle_timeout.as_millis()
+        ));
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
 
         output.push_str("[agent]\n");
@@ -1402,6 +1426,7 @@ pub struct ProviderSettings {
     pub default_model: Option<String>,
     pub api_version: Option<String>,
     pub region: Option<String>,
+    pub stream_idle_timeout_ms: Option<u64>,
 }
 
 impl ProviderSettings {
@@ -1414,6 +1439,7 @@ impl ProviderSettings {
                 "default_model",
                 "api_version",
                 "region",
+                "stream_idle_timeout_ms",
             ],
             source,
             path,
@@ -1429,6 +1455,12 @@ impl ProviderSettings {
             )?,
             api_version: string_value(table, "api_version", source, &field(path, "api_version"))?,
             region: string_value(table, "region", source, &field(path, "region"))?,
+            stream_idle_timeout_ms: u64_value(
+                table,
+                "stream_idle_timeout_ms",
+                source,
+                &field(path, "stream_idle_timeout_ms"),
+            )?,
         })
     }
 
@@ -1438,6 +1470,10 @@ impl ProviderSettings {
         replace_if_some(&mut self.default_model, next.default_model);
         replace_if_some(&mut self.api_version, next.api_version);
         replace_if_some(&mut self.region, next.region);
+        replace_if_some(
+            &mut self.stream_idle_timeout_ms,
+            next.stream_idle_timeout_ms,
+        );
     }
 }
 
@@ -1448,6 +1484,7 @@ pub struct ModelSettings {
     pub profile: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
+    pub stream_idle_timeout_ms: Option<u64>,
     pub store_responses: Option<bool>,
     pub selection_version: Option<u32>,
 }
@@ -1462,6 +1499,7 @@ impl ModelSettings {
                 "profile",
                 "reasoning_effort",
                 "max_output_tokens",
+                "stream_idle_timeout_ms",
                 "store_responses",
                 "selection_version",
             ],
@@ -1494,6 +1532,12 @@ impl ModelSettings {
                 source,
                 &field(path, "max_output_tokens"),
             )?,
+            stream_idle_timeout_ms: u64_value(
+                table,
+                "stream_idle_timeout_ms",
+                source,
+                &field(path, "stream_idle_timeout_ms"),
+            )?,
             store_responses: bool_value(
                 table,
                 "store_responses",
@@ -1515,6 +1559,10 @@ impl ModelSettings {
         replace_if_some(&mut self.profile, next.profile);
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
+        replace_if_some(
+            &mut self.stream_idle_timeout_ms,
+            next.stream_idle_timeout_ms,
+        );
         replace_if_some(&mut self.store_responses, next.store_responses);
         replace_if_some(&mut self.selection_version, next.selection_version);
     }
@@ -4470,6 +4518,7 @@ pub fn user_settings_template() -> &'static str {
 # model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
 # reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
 # max_output_tokens = 64000    # optional output cap; unset means provider/model limit
+# stream_idle_timeout_ms = 300000 # fail a stalled model stream after 5m idle
 # store_responses = false      # only honored by openai/azure_openai
 # selection_version = 1        # maintained by the startup provider/model selector
 
@@ -4504,11 +4553,13 @@ pub fn user_settings_template() -> &'static str {
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
 # default_model = "gpt-5.5"
+# stream_idle_timeout_ms = 300000
 
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
 # default_model = "claude-opus-4-7"
+# stream_idle_timeout_ms = 300000
 
 [permissions]
 # read = "allow"
@@ -4801,6 +4852,32 @@ fn provider_setting(
         _ => None,
     }?;
     Some(value.clone())
+}
+
+fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] {
+    match provider {
+        ProviderConfig::OpenAi(_) => &["openai"],
+        ProviderConfig::Anthropic(_) => &["anthropic"],
+        ProviderConfig::Google(_) => &["google"],
+        ProviderConfig::AzureOpenAi(_) => &["azure_openai", "azure"],
+        ProviderConfig::Bedrock(_) => &["bedrock"],
+        ProviderConfig::Ollama(_) => &["ollama"],
+    }
+}
+
+fn provider_u64_setting_any(
+    providers: &BTreeMap<String, ProviderSettings>,
+    provider_keys: &[&str],
+    key: &str,
+) -> Option<String> {
+    provider_keys.iter().find_map(|provider| {
+        let settings = providers.get(*provider)?;
+        let value = match key {
+            "stream_idle_timeout_ms" => settings.stream_idle_timeout_ms,
+            _ => None,
+        }?;
+        Some(value.to_string())
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
