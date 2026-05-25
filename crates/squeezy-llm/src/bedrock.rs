@@ -86,7 +86,7 @@ impl LlmProvider for BedrockProvider {
                 result = provider.client() => result,
             };
             let client = client_result?;
-            let model = request.model.clone();
+            let model = request.model.to_string();
             let mut builder = client.converse_stream().model_id(model);
             for block in system_blocks(&request.instructions) {
                 builder = builder.system(block);

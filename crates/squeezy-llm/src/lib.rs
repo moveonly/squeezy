@@ -41,15 +41,15 @@ pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlmRequest {
-    pub model: String,
-    pub instructions: String,
-    pub input: Vec<LlmInputItem>,
+    pub model: Arc<str>,
+    pub instructions: Arc<str>,
+    pub input: Arc<[LlmInputItem]>,
     pub max_output_tokens: Option<u32>,
     pub response_verbosity: Option<ResponseVerbosity>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub previous_response_id: Option<String>,
     pub cache_key: Option<String>,
-    pub tools: Vec<Arc<LlmToolSpec>>,
+    pub tools: Arc<[Arc<LlmToolSpec>]>,
     pub store: bool,
 }
 
@@ -61,15 +61,15 @@ impl LlmRequest {
         max_output_tokens: Option<u32>,
     ) -> Self {
         Self {
-            model,
-            instructions,
-            input: vec![LlmInputItem::UserText(input)],
+            model: Arc::from(model),
+            instructions: Arc::from(instructions),
+            input: Arc::from(vec![LlmInputItem::UserText(input)]),
             max_output_tokens,
             response_verbosity: None,
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
-            tools: Vec::new(),
+            tools: Arc::from(Vec::new()),
             store: false,
         }
     }

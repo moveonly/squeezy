@@ -400,7 +400,13 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
     let request_names = provider
         .requests()
         .into_iter()
-        .flat_map(|request| request.tools.into_iter().map(|tool| tool.name.clone()))
+        .flat_map(|request| {
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
     assert!(
         !request_names
@@ -1780,8 +1786,8 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
     assert!(request.instructions.contains("<active_skills>"));
     assert!(request.instructions.contains("# Rust Nav"));
     assert_eq!(
-        request.input,
-        vec![LlmInputItem::UserText("inspect main".to_string())]
+        request.input.as_ref(),
+        vec![LlmInputItem::UserText("inspect main".to_string())].as_slice()
     );
 
     let _ = fs::remove_dir_all(root);

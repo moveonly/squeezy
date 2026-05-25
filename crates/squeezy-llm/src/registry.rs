@@ -359,10 +359,10 @@ fn estimate_request_input_tokens(request: &LlmRequest) -> u64 {
     if request.store {
         total = total.saturating_add(2);
     }
-    for item in &request.input {
+    for item in request.input.iter() {
         total = total.saturating_add(estimate_input_item_tokens(item));
     }
-    for tool in &request.tools {
+    for tool in request.tools.iter() {
         total = total.saturating_add(12);
         total = total.saturating_add(estimate_text_tokens(&tool.name));
         total = total.saturating_add(estimate_text_tokens(&tool.description));

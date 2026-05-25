@@ -1,19 +1,20 @@
 use super::*;
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
 use serde_json::json;
+use std::sync::Arc;
 
 #[test]
 fn request_body_uses_responses_streaming_shape() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search files".to_string(),
@@ -25,7 +26,7 @@ fn request_body_uses_responses_streaming_shape() {
                 strict: true,
             }
             .into(),
-        ],
+        ]),
         store: true,
     };
 
@@ -100,9 +101,9 @@ fn parser_extracts_text_delta() {
 #[test]
 fn request_body_serializes_tool_outputs_as_input_items() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
             LlmInputItem::FunctionCall {
                 call_id: "call_1".to_string(),
                 name: "grep".to_string(),
@@ -112,13 +113,13 @@ fn request_body_serializes_tool_outputs_as_input_items() {
                 call_id: "call_1".to_string(),
                 output: "{\"status\":\"success\"}".to_string(),
             },
-        ],
+        ]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -132,15 +133,15 @@ fn request_body_serializes_tool_outputs_as_input_items() {
 #[test]
 fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
                 description: "write".to_string(),
@@ -155,7 +156,7 @@ fn request_body_preserves_function_tool_order() {
                 strict: true,
             }
             .into(),
-        ],
+        ]),
         store: false,
     };
 
@@ -169,15 +170,15 @@ fn request_body_preserves_function_tool_order() {
 #[test]
 fn request_body_includes_reasoning_and_text_verbosity_when_set() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: Some(squeezy_core::ResponseVerbosity::Verbose),
         reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -195,15 +196,15 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
         (squeezy_core::ResponseVerbosity::Verbose, "high"),
     ] {
         let request = LlmRequest {
-            model: "gpt-test".to_string(),
-            instructions: "be brief".to_string(),
-            input: vec![LlmInputItem::UserText("hello".to_string())],
+            model: "gpt-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
             max_output_tokens: None,
             response_verbosity: Some(squeezy),
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
-            tools: Vec::new(),
+            tools: Arc::from(Vec::new()),
             store: false,
         };
 
@@ -216,15 +217,15 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
 #[test]
 fn request_body_emits_prompt_cache_key_when_set() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "hi".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -235,15 +236,15 @@ fn request_body_emits_prompt_cache_key_when_set() {
 #[test]
 fn request_body_omits_prompt_cache_key_when_unset() {
     let request = LlmRequest {
-        model: "gpt-test".to_string(),
-        instructions: "hi".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 

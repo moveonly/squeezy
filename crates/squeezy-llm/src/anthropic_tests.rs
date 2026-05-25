@@ -1,18 +1,19 @@
 use super::*;
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use std::sync::Arc;
 
 #[test]
 fn request_body_uses_messages_streaming_shape() {
     let request = LlmRequest {
-        model: "claude-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "claude-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
                 description: "Read a file".to_string(),
@@ -26,7 +27,7 @@ fn request_body_uses_messages_streaming_shape() {
                 strict: true,
             }
             .into(),
-        ],
+        ]),
         store: true,
     };
 
@@ -49,15 +50,15 @@ fn request_body_uses_messages_streaming_shape() {
 #[test]
 fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
-        model: "claude-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "claude-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
                 description: "write".to_string(),
@@ -72,7 +73,7 @@ fn request_body_preserves_function_tool_order() {
                 strict: true,
             }
             .into(),
-        ],
+        ]),
         store: false,
     };
 
@@ -85,15 +86,15 @@ fn request_body_preserves_function_tool_order() {
 #[test]
 fn request_body_uses_model_limit_when_output_cap_unset() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -105,9 +106,9 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
 #[test]
 fn request_body_maps_tool_roundtrip_messages() {
     let request = LlmRequest {
-        model: "claude-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![
+        model: "claude-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
             LlmInputItem::UserText("read config".to_string()),
             LlmInputItem::FunctionCall {
                 call_id: "toolu_1".to_string(),
@@ -118,13 +119,13 @@ fn request_body_maps_tool_roundtrip_messages() {
                 call_id: "toolu_1".to_string(),
                 output: "model = 'haiku'".to_string(),
             },
-        ],
+        ]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -150,19 +151,19 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
     // reports prompt_caching=true; pair it with a cache_key so the
     // anthropic adapter inserts ephemeral cache markers.
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
-        instructions: "system prompt".to_string(),
-        input: vec![
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![
             LlmInputItem::UserText("first turn".to_string()),
             LlmInputItem::AssistantText("ack".to_string()),
             LlmInputItem::UserText("second turn".to_string()),
-        ],
+        ]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 
@@ -198,15 +199,15 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
 #[test]
 fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
-        instructions: "system prompt".to_string(),
-        input: vec![LlmInputItem::UserText("hi".to_string())],
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
                 description: "first".to_string(),
@@ -221,7 +222,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
                 strict: false,
             }
             .into(),
-        ],
+        ]),
         store: false,
     };
 
@@ -238,15 +239,15 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
 #[test]
 fn request_body_omits_tool_cache_control_when_caching_disabled() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
-        instructions: "system".to_string(),
-        input: vec![LlmInputItem::UserText("hi".to_string())],
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
                 description: "first".to_string(),
@@ -254,7 +255,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
                 strict: false,
             }
             .into(),
-        ],
+        ]),
         store: false,
     };
 
@@ -269,15 +270,15 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
 #[test]
 fn request_body_skips_cache_control_when_cache_key_is_absent() {
     let request = LlmRequest {
-        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
-        instructions: "system".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 

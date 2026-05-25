@@ -1628,14 +1628,14 @@ impl Agent {
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
         LlmRequest {
-            model: self.config.model.clone(),
-            instructions: instructions_with_tool_index(
+            model: Arc::from(self.config.model.as_str()),
+            instructions: Arc::from(instructions_with_tool_index(
                 &request_instructions,
                 &all_tool_specs,
                 mode,
                 &self.config.tools,
-            ),
-            input,
+            )),
+            input: Arc::from(input),
             max_output_tokens: self.config.max_output_tokens,
             response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
             reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
@@ -1645,12 +1645,12 @@ impl Agent {
                 None
             },
             cache_key: self.session_prompt_cache_key(),
-            tools: request_tool_specs(
+            tools: Arc::from(request_tool_specs(
                 &all_tool_specs,
                 mode,
                 &self.config.tools,
                 loaded_tool_schemas,
-            ),
+            )),
             store,
         }
     }
@@ -3456,23 +3456,23 @@ impl TurnRuntime {
                 .expect("instructions cache populated above")
                 .clone();
             let request = LlmRequest {
-                model: self.config.model.clone(),
-                instructions: cached_instructions,
-                input: next_input.clone(),
+                model: Arc::from(self.config.model.as_str()),
+                instructions: Arc::from(cached_instructions),
+                input: Arc::from(next_input.as_slice()),
                 max_output_tokens: self.config.max_output_tokens,
                 response_verbosity: request_response_verbosity(&self.config, self.provider.name()),
                 reasoning_effort: request_reasoning_effort(&self.config, self.provider.name()),
                 previous_response_id: previous_response_id.clone(),
                 cache_key: self.session_prompt_cache_key(),
-                tools: request_tool_specs(
+                tools: Arc::from(request_tool_specs(
                     &self.all_tool_specs,
                     active_mode,
                     &self.config.tools,
                     &loaded_tool_schemas,
-                ),
+                )),
                 store: self.config.store_responses,
             };
-            let request_model = request.model.clone();
+            let request_model = Arc::clone(&request.model);
             self.record_replay_request(&request);
             let mut stream = self
                 .provider
@@ -4886,17 +4886,17 @@ async fn run_subagent_loop(
     model: String,
 ) -> SubagentExecution {
     for _round in 0..config.subagents.max_model_rounds {
-        let request_model = config.model.clone();
+        let request_model: Arc<str> = Arc::from(config.model.as_str());
         let llm_request = LlmRequest {
-            model: request_model.clone(),
-            instructions: instructions.to_string(),
-            input: conversation.clone(),
+            model: Arc::clone(&request_model),
+            instructions: Arc::from(instructions),
+            input: Arc::from(conversation.as_slice()),
             max_output_tokens: config.max_output_tokens,
             response_verbosity: request_response_verbosity(config, parent.provider.name()),
             reasoning_effort: request_reasoning_effort(config, parent.provider.name()),
             previous_response_id: None,
             cache_key: None,
-            tools: tool_specs.to_vec(),
+            tools: Arc::from(tool_specs),
             store: false,
         };
         let mut stream = parent
@@ -6742,16 +6742,17 @@ Working target: {:?}",
         request.target
     );
     let llm_request = LlmRequest {
-        model: config.model.clone(),
-        instructions: "You classify shell-command risk for a local coding agent. Return JSON only."
-            .to_string(),
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: Arc::from(config.model.as_str()),
+        instructions: Arc::from(
+            "You classify shell-command risk for a local coding agent. Return JSON only.",
+        ),
+        input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(80),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
@@ -8299,16 +8300,16 @@ async fn compact_conversation_with_strategy(
          question. Do not invent new facts. Output the summary only.\n\n{extractive_summary}"
     );
     let request = LlmRequest {
-        model,
-        instructions:
-            "You compact conversation summaries faithfully. Never add new facts; never omit decisions."
-                .to_string(),
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: Arc::from(model.as_str()),
+        instructions: Arc::from(
+            "You compact conversation summaries faithfully. Never add new facts; never omit decisions.",
+        ),
+        input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(max_output),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
         cache_key: None,
     };

@@ -102,15 +102,17 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         .clone()
         .unwrap_or_else(|| input.config.model.clone());
     let request = LlmRequest {
-        model,
-        instructions: "Review one Squeezy permission request. Return only compact JSON with action and reason.".to_string(),
-        input: vec![LlmInputItem::UserText(prompt)],
+        model: Arc::from(model.as_str()),
+        instructions: Arc::from(
+            "Review one Squeezy permission request. Return only compact JSON with action and reason.",
+        ),
+        input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(120),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
