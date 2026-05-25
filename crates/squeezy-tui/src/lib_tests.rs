@@ -129,6 +129,126 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
+    let root = temp_workspace("plan_handoff_queued");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-test12345678".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id);
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert_eq!(
+        app.pending_plan_handoff.as_deref(),
+        Some(plan_path.as_path())
+    );
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(message) if message.contains("plan attached for next Build turn")
+        )),
+        "expected handoff log entry; transcript={:?}",
+        app.transcript
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_to_build_switch_skips_handoff_when_no_plan_file() {
+    let root = temp_workspace("plan_handoff_absent");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    // current_plan_id present but the file was deleted out from under us
+    app.current_plan_id = Some("plan-never-persisted".to_string());
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert!(app.pending_plan_handoff.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn build_to_plan_switch_drops_pending_handoff() {
+    let root = temp_workspace("plan_handoff_dropped");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-test12345678".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id);
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+    assert!(app.pending_plan_handoff.is_some());
+    switch_mode(&mut app, &agent, Some(SessionMode::Plan), "test");
+    assert!(app.pending_plan_handoff.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn take_pending_plan_prefix_returns_labelled_contents_and_clears_field() {
+    let root = temp_workspace("plan_prefix_consume");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_path = plans_dir.join("plan-abc.md");
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.pending_plan_handoff = Some(plan_path.clone());
+
+    let prefix = take_pending_plan_prefix(&mut app).expect("prefix returned");
+    assert!(prefix.starts_with("[plan from previous session"));
+    assert!(prefix.contains("step 1\nstep 2"));
+    assert!(prefix.ends_with("[end plan]\n\n"));
+    assert!(app.pending_plan_handoff.is_none());
+
+    // A second consume drains nothing — the prefix is one-shot.
+    assert!(take_pending_plan_prefix(&mut app).is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn take_pending_plan_prefix_drops_handoff_when_file_missing() {
+    let root = temp_workspace("plan_prefix_missing");
+    let phantom = root.join(proposed_plan::PLAN_DIR).join("plan-gone.md");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.pending_plan_handoff = Some(phantom);
+
+    let prefix = take_pending_plan_prefix(&mut app);
+    assert!(prefix.is_none());
+    assert!(app.pending_plan_handoff.is_none());
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(message) if message.contains("could not read plan file")
+        )),
+        "expected a recovery log line for the missing plan file; transcript={:?}",
+        app.transcript
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plan_with_trailing_space_still_switches_mode() {
     // Regression for the old Enter-time pre-intercept that compared the
     // trimmed input via `mode_command` and silently dropped `/plan ` (with

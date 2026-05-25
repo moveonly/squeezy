@@ -1297,8 +1297,12 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             app.task_state = None;
             app.task_panel_collapsed = false;
             app.note_turn_started();
+            let prefixed_input = match take_pending_plan_prefix(app) {
+                Some(prefix) => format!("{prefix}{input}"),
+                None => input,
+            };
             app.turn_rx = Some(agent.start_turn_with_response_verbosity(
-                input,
+                prefixed_input,
                 cancel.clone(),
                 app.response_verbosity,
             ));
@@ -3072,6 +3076,31 @@ fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// If a Plan→Build switch queued a plan file for handoff, read it and
+/// return a labelled prefix to prepend to the next user input. Clears the
+/// pending field on success or non-recoverable failure so a stale handoff
+/// cannot leak across multiple turns. Returns `None` when nothing is
+/// queued.
+fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
+    let plan_path = app.pending_plan_handoff.take()?;
+    match std::fs::read_to_string(&plan_path) {
+        Ok(body) => {
+            let trimmed = body.trim_end();
+            Some(format!(
+                "[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
+                path = plan_path.display(),
+            ))
+        }
+        Err(err) => {
+            app.push_log(format!(
+                "could not read plan file {} for Build handoff: {err}",
+                compact_path(&plan_path)
+            ));
+            None
+        }
+    }
+}
+
 fn switch_mode(
     app: &mut TuiApp,
     agent: &Agent,
@@ -3095,9 +3124,32 @@ fn switch_mode(
         app.status = format!("already in {} mode", app.mode.as_str());
         return;
     }
+    let previous = app.mode;
     if agent.set_session_mode(target, source) {
         app.mode = target;
         app.status = format!("mode switched to {}", app.mode.as_str());
+        match (previous, target) {
+            (SessionMode::Plan, SessionMode::Build) => {
+                if let Some(plan_id) = app.current_plan_id.as_deref() {
+                    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, plan_id);
+                    if plan_path.exists() {
+                        app.pending_plan_handoff = Some(plan_path.clone());
+                        app.push_log(format!(
+                            "plan attached for next Build turn: {}",
+                            compact_path(&plan_path)
+                        ));
+                    }
+                }
+            }
+            (SessionMode::Build, SessionMode::Plan) => {
+                // A handoff queued by an earlier Plan→Build switch is no
+                // longer relevant once the user goes back to Plan; drop it
+                // so the next Build entry recomputes from the current
+                // plan file instead of attaching a stale path.
+                app.pending_plan_handoff = None;
+            }
+            _ => {}
+        }
     } else {
         // Agent saw no change (lock-free path is infallible, so this only
         // fires when the agent observed the same mode we requested). Resync
@@ -7515,6 +7567,11 @@ struct TuiApp {
     /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
     /// to identify which plan file is active without scanning the dir.
     current_plan_id: Option<String>,
+    /// Path to a plan file that should be prepended as starting context to
+    /// the very next Build-mode turn. Set when the user switches Plan→Build
+    /// while a plan is active; consumed and cleared by the prompt-submit
+    /// handler.
+    pending_plan_handoff: Option<PathBuf>,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -7651,6 +7708,7 @@ impl TuiApp {
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
             current_plan_id: None,
+            pending_plan_handoff: None,
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
