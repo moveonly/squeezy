@@ -3304,6 +3304,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-eval"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "squeezy-agent",
+ "squeezy-core",
+ "squeezy-llm",
+ "squeezy-store",
+ "squeezy-tools",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+]
+
+[[package]]
 name = "squeezy-graph"
 version = "0.1.0"
 dependencies = [

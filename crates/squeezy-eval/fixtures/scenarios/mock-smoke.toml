@@ -1,0 +1,42 @@
+id = "mock-smoke"
+title = "Smoke test: drive the eval harness with the built-in mock provider"
+description = """
+Runs entirely offline. Useful for verifying squeezy-eval's own plumbing,
+testing scenario authoring, or running in CI without provider keys.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Which file defines make_widget?"
+
+[[steps]]
+kind = "prompt"
+text = "Are there any tests for it?"
+
+[expect]
+final_text_contains = ["make_widget"]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+[[mock.turns]]
+text = "src/lib.rs defines make_widget."
+input_tokens = 42
+output_tokens = 7
+
+[[mock.turns]]
+text = "Yes — tests/widget.rs covers make_widget."
+input_tokens = 38
+output_tokens = 9
+
+[triage]
+enabled = false

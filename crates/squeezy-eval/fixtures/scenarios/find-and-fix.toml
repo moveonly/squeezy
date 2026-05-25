@@ -1,0 +1,36 @@
+id = "find-and-fix-make-widget"
+title = "Find a function and rename it"
+description = """
+Smoke-test exploration + edit + approval flow on a small local repo.
+Requires a live provider key. For an offline smoke see mock-smoke.toml.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Which file defines make_widget?"
+
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "fs.write"
+
+[[steps]]
+kind = "prompt"
+text = "Rename make_widget to build_widget across the repo and verify the change compiles."
+
+[expect]
+final_text_contains = ["build_widget"]
+max_wall_clock_seconds = 180
+no_tool_errors = true
+
+[triage]
+enabled = false

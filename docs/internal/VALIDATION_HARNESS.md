@@ -2,6 +2,8 @@
 
 The validation harness measures Squeezy behavior against small, repeatable coding tasks. It is intentionally deterministic by default so PRs can run it without network access or model spend.
 
+> For agent-driven exploratory QA against a real workspace, see [`EVAL_HARNESS.md`](./EVAL_HARNESS.md) (`squeezy-eval`). The two harnesses are complementary: this one is for deterministic CI fixtures; eval is for live-agent runs that produce trace + ticket artifacts.
+
 ## Task Specs
 
 Tasks are TOML files with:

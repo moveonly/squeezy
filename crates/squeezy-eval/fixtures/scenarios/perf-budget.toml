@@ -1,0 +1,29 @@
+id = "perf-budget-grep-baseline"
+title = "Bounded grep should stay under a tool-call budget"
+description = "Force a search-heavy prompt and assert it does not blow the per-turn tool ceiling."
+
+[workspace]
+local = "."
+
+[squeezy]
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "List every place that mentions `tool_call_saving` and summarize what each callsite does."
+
+[[steps]]
+kind = "action"
+action = "assert"
+
+[steps.check]
+kind = "max_tool_calls"
+max = 12
+
+[expect]
+max_wall_clock_seconds = 120
+max_input_tokens = 80000
+
+[triage]
+enabled = true
