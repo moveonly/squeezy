@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, LazyLock, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -7804,12 +7804,13 @@ fn web_citations_json(
     )
 }
 
+static URL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"https?://[^\s<>"'`\)\]\}]+"#).expect("URL_REGEX is a valid pattern")
+});
+
 fn extract_http_urls(text: &str) -> Vec<String> {
-    let Ok(regex) = Regex::new(r#"https?://[^\s<>"'`\)\]\}]+"#) else {
-        return Vec::new();
-    };
     let mut urls = BTreeSet::new();
-    for found in regex.find_iter(text) {
+    for found in URL_REGEX.find_iter(text) {
         let url = found
             .as_str()
             .trim_end_matches(['.', ',', ';', ':', '!', '?']);
