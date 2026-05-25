@@ -255,12 +255,7 @@ fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
         .position(|window| window == b"\r\n\r\n")
         .map(|index| (index, 4));
 
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) => Some(if lf.0 < crlf.0 { lf } else { crlf }),
-        (Some(lf), None) => Some(lf),
-        (None, Some(crlf)) => Some(crlf),
-        (None, None) => None,
-    }
+    [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
 }
 
 fn decode_sse_event(bytes: &[u8]) -> Option<String> {

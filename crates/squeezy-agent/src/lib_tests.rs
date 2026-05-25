@@ -1702,6 +1702,51 @@ fn tool_loop_guard_stops_repeated_identical_failures() {
     assert!(reason.contains("repeated apply_patch failure"), "{reason}");
 }
 
+#[test]
+fn tool_loop_guard_distinguishes_shell_failures_by_command() {
+    let make_shell = |call_id: &str, command: &str| {
+        let call = ToolCall {
+            call_id: call_id.to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": command}),
+        };
+        let mut result = control_tool_result(
+            &call,
+            ToolStatus::Error,
+            json!({
+                "command": command,
+                "exit_code": 101,
+                "stderr": "",
+                "stdout": "",
+            }),
+        );
+        result.tool_name = "shell".to_string();
+        (call, result)
+    };
+
+    let (call_a, result_a) = make_shell("shell-1", "cargo check -p sonar-arch-graph");
+    let (call_b, result_b) = make_shell("shell-2", "cargo build --workspace");
+    let mut guard = ToolLoopGuard::default();
+
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call_a), &[result_a])
+            .is_none()
+    );
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call_b), &[result_b])
+            .is_none(),
+        "different commands with same exit code must not be conflated"
+    );
+
+    let (call_c, result_c) = make_shell("shell-3", "cargo check -p sonar-arch-graph");
+    let reason = guard
+        .observe_round(&[call_c], &[result_c])
+        .expect("genuine repeat of the same shell command should still stop");
+    assert!(reason.contains("repeated shell failure"), "{reason}");
+}
+
 #[tokio::test]
 async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
     let provider = Arc::new(MockProvider::new(Vec::new()));

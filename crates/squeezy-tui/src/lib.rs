@@ -31,6 +31,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
+#[cfg(test)]
+use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
     MAX_JOBS_RETAINED, RequestUserInputRequest, RequestUserInputResponse,
@@ -3479,6 +3481,68 @@ fn mcp_elicitation_response_preview(input: &str) -> String {
     }
 }
 
+fn format_request_user_input_menu_lines(
+    request: &RequestUserInputRequest,
+    selected: usize,
+    input: &str,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![{
+        let mut spans = vec![Span::styled(
+            "Plan-mode question",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )];
+        if request.allow_freeform {
+            spans.push(Span::styled(
+                " · freeform allowed",
+                Style::default().fg(QUIET),
+            ));
+        }
+        Line::from(spans)
+    }];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            compact_text(&request.question, 240),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    for (index, choice) in request.choices.iter().enumerate() {
+        let is_selected = index == selected.min(request.choices.len().saturating_sub(1));
+        let marker = if is_selected { "› " } else { "  " };
+        let label_style = if is_selected {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mut spans = vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+            ),
+            Span::styled(compact_text(&choice.label, 180), label_style),
+        ];
+        if choice.value != choice.label {
+            spans.push(Span::styled(
+                format!(" · {}", compact_text(&choice.value, 120)),
+                Style::default().fg(QUIET),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if request.allow_freeform {
+        let preview = if input.trim().is_empty() {
+            "(type in the prompt below)".to_string()
+        } else {
+            compact_text(input.trim(), 180)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("freeform: {preview}"), Style::default().fg(QUIET)),
+        ]));
+    }
+    lines
+}
+
 fn format_approval_menu_lines(
     request: &ToolApprovalRequest,
     selected: usize,
@@ -3999,6 +4063,9 @@ fn approval_menu_height(app: &TuiApp) -> u16 {
                 }
             }
         }
+    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
+        format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
+            .len() as u16
     } else {
         0
     }
@@ -4020,6 +4087,8 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
             app.mcp_elicitation_selection_index,
             &app.input,
         )
+    } else if let Some(pending) = app.pending_request_user_input.as_ref() {
+        format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
     } else {
         Vec::new()
     }
@@ -7796,9 +7865,19 @@ fn tool_retry_key(tool: &ToolTranscript) -> Option<String> {
     if !is_retryable_tool_result(&tool.result) {
         return None;
     }
+    // Include `path` so two apply_patch failures on different files with the
+    // same boilerplate error (e.g. "search text not found") don't coalesce
+    // into a single transcript entry.
+    let path = tool
+        .result
+        .content
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     Some(format!(
-        "{}:{}",
+        "{}:{}:{}",
         tool.result.tool_name,
+        path,
         tool_result_error_detail(&tool.result)
     ))
 }

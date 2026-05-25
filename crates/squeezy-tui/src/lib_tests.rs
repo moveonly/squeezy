@@ -1616,6 +1616,99 @@ fn retryable_apply_patch_failure_is_not_rendered_as_final_failure() {
 }
 
 #[test]
+fn apply_patch_failures_on_different_paths_do_not_coalesce() {
+    let mut app = test_app(SessionMode::Build);
+    for (index, path) in ["src/foo.rs", "src/bar.rs"].into_iter().enumerate() {
+        let mut result = sample_tool_result("apply_patch", "");
+        result.call_id = format!("patch-{index}");
+        result.status = ToolStatus::Stale;
+        result.content = serde_json::json!({
+            "error": "search text not found",
+            "path": path,
+        });
+        app.push_tool_result(result);
+    }
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(output.contains("src/foo.rs"), "{output}");
+    assert!(output.contains("src/bar.rs"), "{output}");
+    assert!(
+        !output.contains("(2x)"),
+        "distinct paths should not coalesce: {output}"
+    );
+    assert_eq!(app.transcript.len(), 2);
+}
+
+#[test]
+fn apply_patch_failures_on_same_path_still_coalesce() {
+    let mut app = test_app(SessionMode::Build);
+    for index in 0..2 {
+        let mut result = sample_tool_result("apply_patch", "");
+        result.call_id = format!("patch-{index}");
+        result.status = ToolStatus::Stale;
+        result.content = serde_json::json!({
+            "error": "search text not found",
+            "path": "src/lib.rs",
+        });
+        app.push_tool_result(result);
+    }
+
+    let output = render_to_string(&app, 140, 14);
+
+    assert!(output.contains("(2x)"), "{output}");
+    assert_eq!(app.transcript.len(), 1);
+}
+
+#[test]
+fn plan_mode_question_renders_with_choices_and_freeform_hint() {
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "How would you like to approach the refactor?".to_string(),
+        choices: vec![
+            RequestUserInputChoice {
+                label: "Split into smaller modules".to_string(),
+                value: "split".to_string(),
+            },
+            RequestUserInputChoice {
+                label: "Keep the current layout".to_string(),
+                value: "keep".to_string(),
+            },
+        ],
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 1,
+    });
+
+    let output = render_to_string(&app, 140, 24);
+
+    assert!(
+        output.contains("Plan-mode question"),
+        "title missing: {output}"
+    );
+    assert!(
+        output.contains("How would you like to approach the refactor?"),
+        "question text missing: {output}"
+    );
+    assert!(
+        output.contains("Split into smaller modules"),
+        "first choice missing: {output}"
+    );
+    assert!(
+        output.contains("› Keep the current layout"),
+        "selected marker missing on second choice: {output}"
+    );
+    assert!(
+        output.contains("freeform"),
+        "freeform hint missing: {output}"
+    );
+}
+
+#[test]
 fn repeated_invalid_tool_arguments_are_coalesced() {
     let mut app = test_app(SessionMode::Build);
     for index in 0..2 {

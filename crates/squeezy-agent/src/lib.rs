@@ -5563,8 +5563,16 @@ fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or("");
+    // Including `command` keeps distinct shell invocations distinct: otherwise
+    // any two cargo errors with exit 101 collapse to the same key and trip the
+    // guard on unrelated failures.
+    let command = result
+        .content
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     Some(format!(
-        "{}:{:?}:{path}:{}",
+        "{}:{:?}:{path}:{command}:{}",
         result.tool_name,
         result.status,
         tool_failure_detail(result)
@@ -9126,12 +9134,7 @@ fn unix_millis() -> u128 {
 }
 
 fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
+    [left, right].into_iter().flatten().reduce(|a, b| a + b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

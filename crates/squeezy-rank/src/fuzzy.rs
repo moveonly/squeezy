@@ -78,12 +78,7 @@ pub fn fuzzy_path_score(path: &str, needle: &str) -> Option<i32> {
     let needle_norm = normalize_path_separators(needle);
     let full_score = fuzzy_score(&path_norm, &needle_norm);
     let base_score = fuzzy_score(&base_norm, &needle_norm);
-    match (full_score, base_score) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    [full_score, base_score].into_iter().flatten().min()
 }
 
 fn normalize_path_separators(input: &str) -> String {

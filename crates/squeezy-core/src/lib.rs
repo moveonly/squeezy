@@ -7231,12 +7231,7 @@ fn merge_cost_snapshot(total: &mut CostSnapshot, next: &CostSnapshot) {
 }
 
 fn add_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left + right),
-        (Some(left), None) => Some(left),
-        (None, Some(right)) => Some(right),
-        (None, None) => None,
-    }
+    [left, right].into_iter().flatten().reduce(|a, b| a + b)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
