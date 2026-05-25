@@ -775,6 +775,16 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::CostWarning { turn_id, status } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::Snapshot {
+                            snapshot_kind: "cost_warning".into(),
+                            payload: json!({"debug": format!("{:?}", status)}),
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
                     cost,
