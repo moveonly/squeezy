@@ -55,9 +55,27 @@ pub(crate) struct ConfigScreenState {
     pub editor: Option<FieldEditor>,
     pub picker: Option<ModelPickerState>,
     pub search: Option<SearchOverlayState>,
+    pub secret_entry: Option<SecretEntryState>,
     pub effective: AppConfig,
     pub sources: SeparatedSources,
     pub dirty: bool,
+}
+
+/// Masked text entry for an API key. The plaintext lives only in `draft`
+/// and is written to the OS keychain on commit — never to TOML, the
+/// transcript, or any log. Render shows `•` per character with an optional
+/// last-four reveal for confirmation.
+pub(crate) struct SecretEntryState {
+    /// Env var name the key is stored under in the keychain
+    /// (e.g. `OPENAI_API_KEY`).
+    pub env_var: String,
+    /// Human-readable provider name for the header (e.g. "OpenAI").
+    pub provider_label: String,
+    pub draft: String,
+    pub cursor: usize,
+    /// When `true`, reveal the last four characters so the user can
+    /// double-check what they pasted. Toggled with Ctrl+T.
+    pub reveal_tail: bool,
 }
 
 /// Filterable picker driven by `squeezy_llm::registry::MODEL_REGISTRY`.
@@ -139,6 +157,7 @@ impl ConfigScreenState {
             editor: None,
             picker: None,
             search: None,
+            secret_entry: None,
             effective,
             sources,
             dirty: false,
@@ -173,6 +192,9 @@ pub(crate) fn handle_key(
     key: KeyEvent,
 ) -> KeyOutcome {
     // Sub-modes take precedence over the regular browse keymap.
+    if state.secret_entry.is_some() {
+        return handle_secret_entry_key(state, agent, notifications, key);
+    }
     if state.search.is_some() {
         return handle_search_key(state, key);
     }
@@ -257,14 +279,50 @@ pub(crate) fn handle_key(
         }
         (KeyCode::Char(' '), _) => {
             let field = state.current_field();
-            if matches!(field.kind, FieldKind::Bool)
-                && let FieldValue::Bool(b) = (field.get)(&state.effective)
+            // Env-shadowed fields are inert; show the same hint we use for
+            // Enter so Space doesn't silently no-op.
+            if let Some(var) = field.env_override
+                && std::env::var(var).is_ok()
             {
-                let next = FieldValue::Bool(!b);
-                if (field.set)(&mut state.effective, next.clone()).is_ok() {
-                    state.dirty = true;
-                    save_field(state, agent, notifications, field, next);
+                notifications.push(
+                    format!(
+                        "{} is set by {}; unset the env var to edit in the screen.",
+                        field.label, var
+                    ),
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+            // Space cycles to the next value inline for Bool / Enum /
+            // OptionalEnum so the user can flip simple settings without
+            // opening the editor.
+            let next: Option<FieldValue> = match (field.kind, (field.get)(&state.effective)) {
+                (FieldKind::Bool, FieldValue::Bool(b)) => Some(FieldValue::Bool(!b)),
+                (FieldKind::Enum { options }, FieldValue::Enum(current)) => {
+                    let idx = options
+                        .iter()
+                        .position(|o| *o == current)
+                        .map(|i| (i + 1) % options.len())
+                        .unwrap_or(0);
+                    Some(FieldValue::Enum(options[idx]))
                 }
+                (FieldKind::OptionalEnum { options }, FieldValue::OptionalEnum(current)) => {
+                    // None → options[0] → options[1] → ... → None
+                    let next_idx = match current.and_then(|c| options.iter().position(|o| *o == c))
+                    {
+                        None => Some(0),
+                        Some(i) if i + 1 < options.len() => Some(i + 1),
+                        Some(_) => None,
+                    };
+                    Some(FieldValue::OptionalEnum(next_idx.map(|i| options[i])))
+                }
+                _ => None,
+            };
+            if let Some(next) = next
+                && (field.set)(&mut state.effective, next.clone()).is_ok()
+            {
+                state.dirty = true;
+                save_field(state, agent, notifications, field, next);
             }
             KeyOutcome::KeepOpen
         }
@@ -368,6 +426,10 @@ pub(crate) fn handle_key(
                     NotifySeverity::Info,
                 );
             }
+            KeyOutcome::KeepOpen
+        }
+        (KeyCode::Char('K'), m) if m == KeyModifiers::SHIFT || m.is_empty() => {
+            open_api_key_entry_for_current_provider(state, notifications);
             KeyOutcome::KeepOpen
         }
         _ => KeyOutcome::KeepOpen,
@@ -795,6 +857,125 @@ fn commit_model_picker(
     save_field(state, agent, notifications, field, value);
 }
 
+// ─── API key (Secret) entry ───────────────────────────────────────────────────
+
+fn provider_api_key_env(provider: &squeezy_core::ProviderConfig) -> Option<(&'static str, String)> {
+    use squeezy_core::ProviderConfig as P;
+    match provider {
+        P::OpenAi(c) => Some(("OpenAI", c.api_key_env.clone())),
+        P::Anthropic(c) => Some(("Anthropic", c.api_key_env.clone())),
+        P::Google(c) => Some(("Google", c.api_key_env.clone())),
+        P::AzureOpenAi(c) => Some(("Azure OpenAI", c.api_key_env.clone())),
+        // Bedrock uses AWS SDK creds; Ollama is local — neither has a single
+        // env-var keychain entry the screen can write.
+        P::Bedrock(_) | P::Ollama(_) => None,
+    }
+}
+
+fn open_api_key_entry_for_current_provider(
+    state: &mut ConfigScreenState,
+    notifications: &mut NotificationQueue,
+) {
+    match provider_api_key_env(&state.effective.provider) {
+        Some((label, env_var)) => {
+            state.secret_entry = Some(SecretEntryState {
+                env_var,
+                provider_label: label.to_string(),
+                draft: String::new(),
+                cursor: 0,
+                reveal_tail: false,
+            });
+        }
+        None => {
+            notifications.push(
+                "This provider does not have a simple API-key env var \
+                 (Bedrock uses AWS creds, Ollama is local).",
+                NotifySeverity::Info,
+            );
+        }
+    }
+}
+
+fn handle_secret_entry_key(
+    state: &mut ConfigScreenState,
+    _agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    key: KeyEvent,
+) -> KeyOutcome {
+    let entry = state.secret_entry.as_mut().expect("checked by caller");
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) => {
+            // Wipe the draft so a peeker post-cancel can't read the
+            // bytes off the heap.
+            entry.draft.clear();
+            entry.cursor = 0;
+            state.secret_entry = None;
+        }
+        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            entry.reveal_tail = !entry.reveal_tail;
+        }
+        (KeyCode::Backspace, _) => {
+            if entry.cursor > 0 {
+                let mut chars: Vec<char> = entry.draft.chars().collect();
+                chars.remove(entry.cursor - 1);
+                entry.draft = chars.into_iter().collect();
+                entry.cursor -= 1;
+            }
+        }
+        (KeyCode::Left, _) => {
+            entry.cursor = entry.cursor.saturating_sub(1);
+        }
+        (KeyCode::Right, _) => {
+            entry.cursor = (entry.cursor + 1).min(entry.draft.chars().count());
+        }
+        (KeyCode::Home, _) => entry.cursor = 0,
+        (KeyCode::End, _) => entry.cursor = entry.draft.chars().count(),
+        (KeyCode::Char(c), m)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
+            // Bracketed paste delivers each char individually through the
+            // event loop, so this handles both interactive typing and
+            // paste from the clipboard.
+            let mut chars: Vec<char> = entry.draft.chars().collect();
+            chars.insert(entry.cursor, c);
+            entry.draft = chars.into_iter().collect();
+            entry.cursor += 1;
+        }
+        (KeyCode::Enter, _) => {
+            let env_var = entry.env_var.clone();
+            let value = std::mem::take(&mut entry.draft);
+            entry.cursor = 0;
+            state.secret_entry = None;
+            if value.trim().is_empty() {
+                notifications.push(
+                    "API key was empty — nothing written to the keychain.",
+                    NotifySeverity::Warn,
+                );
+                return KeyOutcome::KeepOpen;
+            }
+            match squeezy_llm::save_api_key(&env_var, value.trim()) {
+                Ok(()) => {
+                    notifications.push(
+                        format!(
+                            "✓ saved {} to the OS keychain (not stored in any TOML)",
+                            env_var
+                        ),
+                        NotifySeverity::Success,
+                    );
+                }
+                Err(err) => {
+                    notifications.push(
+                        format!("failed to save {env_var}: {err}"),
+                        NotifySeverity::Error,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+    KeyOutcome::KeepOpen
+}
+
 // ─── Search overlay ───────────────────────────────────────────────────────────
 
 pub(crate) fn compute_search_matches(query: &str) -> Vec<(usize, usize, i32)> {
@@ -919,9 +1100,38 @@ fn apply_by_tier(
             );
         }
         ApplyTier::NextPrompt => {
+            // Edits to any `[model].*` field (and per-provider `[providers.*]`
+            // fields, once we surface them) might require rebuilding the LLM
+            // client — different api_key_env, base_url, or whole provider
+            // variant. Build the new provider eagerly so the next turn
+            // doesn't blow up with "missing OPENAI_API_KEY" on a fresh
+            // anthropic swap.
+            let touches_provider = field
+                .toml_path
+                .first()
+                .copied()
+                .map(|head| head == "model" || head == "providers")
+                .unwrap_or(false);
+            let new_provider = if touches_provider {
+                match squeezy_llm::provider_from_config(&state.effective.provider) {
+                    Ok(p) => Some(p),
+                    Err(err) => {
+                        notifications.push(
+                            format!(
+                                "saved to {} but the new provider failed to build: {err}",
+                                path_str
+                            ),
+                            NotifySeverity::Error,
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             agent.arm_config_swap(PendingConfigSwap {
                 config: state.effective.clone(),
-                provider: None,
+                provider: new_provider,
                 display_note: Some(format!("{} changed", field.label)),
             });
             notifications.push(
@@ -1093,13 +1303,75 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         Paragraph::new(sep_lines).style(Style::default().fg(QUIET)),
         chunks[1],
     );
-    if let Some(picker) = &state.picker {
+    if let Some(entry) = &state.secret_entry {
+        render_secret_entry(frame, chunks[2], entry);
+    } else if let Some(picker) = &state.picker {
         render_model_picker(frame, chunks[2], picker);
     } else if let Some(search) = &state.search {
         render_search_overlay(frame, chunks[2], search);
     } else {
         render_field_pane(frame, chunks[2], state);
     }
+}
+
+fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntryState) {
+    let chars: Vec<char> = entry.draft.chars().collect();
+    let total = chars.len();
+    let tail_visible = if entry.reveal_tail { total.min(4) } else { 0 };
+    let masked_count = total - tail_visible;
+    let mut masked = String::with_capacity(total);
+    for _ in 0..masked_count {
+        masked.push('•');
+    }
+    for c in &chars[masked_count..] {
+        masked.push(*c);
+    }
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                "Set API key",
+                Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("for {}", entry.provider_label),
+                Style::default().fg(QUIET),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("keychain → ", Style::default().fg(QUIET)),
+            Span::styled(entry.env_var.as_str(), Style::default().fg(Color::White)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(masked, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(AMBER)),
+        ]),
+        Line::raw(""),
+        Line::from(vec![Span::styled(
+            "Paste your key. Stored in the OS keychain only — never written to any TOML \
+             or transcript. The running provider client is rebuilt on the next prompt.",
+            Style::default().fg(QUIET),
+        )]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("Enter ", Style::default().fg(GOLD)),
+            Span::styled("save  ", Style::default().fg(QUIET)),
+            Span::styled("Ctrl+T ", Style::default().fg(GOLD)),
+            Span::styled(
+                if entry.reveal_tail {
+                    "hide tail  "
+                } else {
+                    "reveal last 4 chars  "
+                },
+                Style::default().fg(QUIET),
+            ),
+            Span::styled("Esc ", Style::default().fg(GOLD)),
+            Span::styled("cancel", Style::default().fg(QUIET)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn render_search_overlay(frame: &mut Frame<'_>, area: Rect, search: &SearchOverlayState) {
@@ -1499,16 +1771,16 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, _state: &ConfigScreenState) 
     let hint = Line::from(vec![
         Span::styled(" Tab", Style::default().fg(GOLD)),
         Span::raw(" scope · "),
-        Span::styled("←/→", Style::default().fg(GOLD)),
-        Span::raw(" section · "),
         Span::styled("↑/↓", Style::default().fg(GOLD)),
         Span::raw(" field · "),
         Span::styled("Enter", Style::default().fg(GOLD)),
         Span::raw(" edit · "),
         Span::styled("Space", Style::default().fg(GOLD)),
-        Span::raw(" toggle · "),
-        Span::styled("Ctrl+D", Style::default().fg(GOLD)),
-        Span::raw(" clear project override · "),
+        Span::raw(" cycle · "),
+        Span::styled("K", Style::default().fg(GOLD)),
+        Span::raw(" set API key · "),
+        Span::styled("/", Style::default().fg(GOLD)),
+        Span::raw(" search · "),
         Span::styled("Esc", Style::default().fg(GOLD)),
         Span::raw(" close "),
     ]);

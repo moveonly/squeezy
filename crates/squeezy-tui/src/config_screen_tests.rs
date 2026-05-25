@@ -81,20 +81,22 @@ fn arrow_keys_navigate_sections_and_fields() {
 
 #[test]
 fn space_toggles_bool_field() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Telemetry));
+    // Use a field whose schema declares no env_override so the assertion
+    // can't race with `enter_on_env_shadowed_field_emits_warning_*` setting
+    // SQUEEZY_TELEMETRY in parallel.
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    let before = state.effective.telemetry.enabled;
-    // first field in Telemetry section is `enabled` (Bool).
+    // show_reasoning_usage is at index 4 in Verbosity: env_override=None, Bool.
+    state.field_index = 4;
+    let before = state.effective.tui.show_reasoning_usage;
     handle_key(
         &mut state,
         &mut agent,
         &mut q,
         KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
     );
-    // Toggling will try to save (which writes to disk) — to keep the test
-    // hermetic we only assert the in-memory effective config flipped.
-    assert_ne!(state.effective.telemetry.enabled, before);
+    assert_ne!(state.effective.tui.show_reasoning_usage, before);
 }
 
 #[test]
@@ -184,6 +186,60 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
         after_tab > 0,
         "all-providers + claude filter should match anthropic models"
     );
+}
+
+#[tokio::test]
+async fn esc_on_model_picker_closes_picker_only() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1; // model field
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(state.picker.is_some(), "picker should be open");
+    let outcome = handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    );
+    assert!(state.picker.is_none(), "Esc should close the picker");
+    assert!(
+        matches!(outcome, KeyOutcome::KeepOpen),
+        "Esc on picker should NOT close the whole screen",
+    );
+}
+
+#[tokio::test]
+async fn space_cycles_enum_field_to_next_option() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_PROVIDER");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 0; // provider (Enum)
+    let before = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+        FieldValue::Enum(v) => v,
+        other => panic!("expected enum, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let after = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+        FieldValue::Enum(v) => v,
+        other => panic!("expected enum, got {other:?}"),
+    };
+    assert_ne!(before, after, "Space should advance enum to a different value");
 }
 
 #[tokio::test]
