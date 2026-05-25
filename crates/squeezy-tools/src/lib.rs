@@ -4704,13 +4704,13 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
-        let checkpoint_before = if direct_user_shell {
-            None
-        } else {
+        let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis) {
             match self.checkpoints.track_tree() {
                 Ok(snapshot) => Some(snapshot),
                 Err(err) => return tool_error(call, err),
             }
+        } else {
+            None
         };
         let coverage_warnings = shell_coverage_warnings(&args.command);
 
@@ -10390,6 +10390,27 @@ fn shell_sandbox_runtime_fallback_reason(
     None
 }
 
+fn shell_command_needs_checkpoint(
+    direct_user_shell: bool,
+    analysis: &ShellPermissionAnalysis,
+) -> bool {
+    if direct_user_shell {
+        return false;
+    }
+    match analysis.capability {
+        PermissionCapability::Read | PermissionCapability::Search => false,
+        PermissionCapability::Git
+            if analysis.risk == PermissionRisk::Low
+                && !analysis.destructive
+                && !analysis.network
+                && !analysis.dynamic =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {
     make_result(
         call,
@@ -10438,17 +10459,7 @@ fn shell_policy_denied(
 fn macos_sandbox_exec_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
-        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *SUPPORTED.get_or_init(|| {
-            let path = Path::new("/usr/bin/sandbox-exec");
-            path.exists()
-                && std::process::Command::new(path)
-                    .args(["-p", "(version 1) (allow default)", "sh", "-lc", "true"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success())
-        })
+        Path::new("/usr/bin/sandbox-exec").exists()
     }
     #[cfg(not(target_os = "macos"))]
     {

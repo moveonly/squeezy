@@ -2092,6 +2092,61 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
 }
 
 #[tokio::test]
+async fn read_only_model_shell_skips_checkpoint() {
+    let root = temp_workspace("read_only_shell_fast_path");
+    fs::write(root.join("sample.txt"), "sample").expect("write sample");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "readonly".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "ls -la",
+                    "description": "list files"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-readonly".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["policy"]["capability"], "search");
+    assert!(result.content.get("checkpoint").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_only_git_shell_skips_checkpoint() {
+    let root = temp_workspace("read_only_git_shell_fast_path");
+    fs::write(root.join("sample.txt"), "sample").expect("write sample");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "git-status".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "git status --short",
+                    "description": "inspect git status"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-git-status".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.content["policy"]["capability"], "git");
+    assert!(result.content.get("checkpoint").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn model_shell_cannot_request_direct_user_shell_fast_path() {
     let root = temp_workspace("direct_user_shell_model_guard");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -5394,6 +5449,19 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
 
     assert!(reason.contains("failed at runtime"), "{reason}");
     assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
+fn shell_checkpoint_policy_skips_read_only_commands() {
+    let ls = analyze_shell_command("ls -la");
+    assert!(!shell_command_needs_checkpoint(false, &ls));
+
+    let git_status = analyze_shell_command("git status --short");
+    assert!(!shell_command_needs_checkpoint(false, &git_status));
+
+    let write = analyze_shell_command("printf created > created.txt");
+    assert!(shell_command_needs_checkpoint(false, &write));
+    assert!(!shell_command_needs_checkpoint(true, &write));
 }
 
 #[test]
