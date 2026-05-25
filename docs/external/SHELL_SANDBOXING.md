@@ -77,12 +77,12 @@ Use shell sandboxing for normal agent-driven shell execution:
 - Keeping accidental network calls blocked unless the command is explicitly
   classified and approved as a network command.
 
-Keep `mode = "required"` for everyday use. It is the safest default because a
-missing or unavailable sandbox backend becomes an explicit denial.
+Keep the default `mode = "best_effort"` for everyday development. Squeezy uses
+the OS sandbox when the host can apply it, and falls back to the
+permission-gated direct runner when macOS or Linux refuses nested sandboxing.
 
-Use `mode = "best_effort"` only when command execution is more important than
-strict isolation, such as a development environment where an older OS or
-container cannot apply the sandbox.
+Use `mode = "required"` when strict isolation is more important than command
+execution. A missing or unavailable sandbox backend becomes an explicit denial.
 
 Use `mode = "off"` only for controlled tests, local debugging of the sandbox
 itself, or environments that provide an equivalent outer sandbox. Turning it off
@@ -182,7 +182,7 @@ Default settings:
 
 ```toml
 [permissions.shell_sandbox]
-mode = "required"
+mode = "best_effort"
 network = "deny_by_default"
 audit = true
 kill_grace_ms = 250

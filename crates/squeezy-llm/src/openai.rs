@@ -4,10 +4,15 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{AzureOpenAiConfig, CostSnapshot, OpenAiConfig, Result, SqueezyError};
+use squeezy_core::{
+    AzureOpenAiConfig, CostSnapshot, OpenAiConfig, ResponseVerbosity, Result, SqueezyError,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
+use crate::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+};
 
 #[derive(Clone)]
 pub struct OpenAiProvider {
@@ -77,7 +82,7 @@ impl OpenAiProvider {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
         if let Some(response_verbosity) = request.response_verbosity {
-            body["text"] = json!({ "verbosity": response_verbosity.as_str() });
+            body["text"] = json!({ "verbosity": openai_text_verbosity(response_verbosity) });
         }
         if let Some(reasoning_effort) = request.reasoning_effort {
             body["reasoning"] = json!({ "effort": reasoning_effort.as_str() });
@@ -100,6 +105,14 @@ impl OpenAiProvider {
             );
         }
         body
+    }
+}
+
+fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
+    match verbosity {
+        ResponseVerbosity::Concise => "low",
+        ResponseVerbosity::Normal => "medium",
+        ResponseVerbosity::Verbose => "high",
     }
 }
 
@@ -373,9 +386,13 @@ fn parse_tool_call(item: Option<&Value>) -> Result<Option<LlmToolCall>> {
         .ok_or_else(|| SqueezyError::ProviderStream("function call missing name".to_string()))?
         .to_string();
     let arguments = match item.get("arguments") {
-        Some(Value::String(arguments)) => serde_json::from_str(arguments).map_err(|err| {
-            SqueezyError::ProviderStream(format!("invalid function call arguments: {err}"))
-        })?,
+        Some(Value::String(arguments)) => serde_json::from_str(arguments).unwrap_or_else(|err| {
+            json!({
+                INVALID_TOOL_ARGUMENTS_KEY: true,
+                INVALID_TOOL_ARGUMENTS_ERROR_KEY: err.to_string(),
+                INVALID_TOOL_ARGUMENTS_RAW_KEY: arguments,
+            })
+        }),
         Some(arguments @ Value::Object(_)) => arguments.clone(),
         None => Value::Object(Default::default()),
         Some(_) => {

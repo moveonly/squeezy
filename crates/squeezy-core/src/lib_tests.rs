@@ -10,6 +10,18 @@ fn turn_id_displays_stably() {
 }
 
 #[test]
+fn default_instructions_do_not_reference_hidden_task_state_tool() {
+    assert!(!DEFAULT_INSTRUCTIONS.contains("update_task_state"));
+}
+
+#[test]
+fn default_instructions_avoid_repeating_ui_rendered_tool_output() {
+    assert!(DEFAULT_INSTRUCTIONS.contains("Do not repeat raw tool output already shown by the UI"));
+    assert!(!DEFAULT_INSTRUCTIONS.contains("command in cwd"));
+    assert!(!DEFAULT_INSTRUCTIONS.contains("Markdown fences"));
+}
+
+#[test]
 fn transcript_constructors_set_roles() {
     assert_eq!(TranscriptItem::user("hello").role, Role::User);
     assert_eq!(TranscriptItem::assistant("hi").role, Role::Assistant);
@@ -78,8 +90,9 @@ fn source_span_contains_byte_inclusively() {
 fn config_without_env_uses_openai_provider_defaults() {
     let config = AppConfig::from_env_vars(None, |_| None);
     assert_eq!(config.model, DEFAULT_OPENAI_MODEL);
-    assert_eq!(config.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+    assert_eq!(config.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     assert_eq!(config.permissions, PermissionPolicy::default());
+    assert_eq!(config.permissions.edit, PermissionMode::Allow);
     assert_eq!(config.session_mode, SessionMode::Build);
     assert!(!config.store_responses);
     assert!(config.exploration_compiler);
@@ -111,6 +124,7 @@ fn config_without_env_uses_openai_provider_defaults() {
         config.max_search_files_per_turn,
         DEFAULT_MAX_SEARCH_FILES_PER_TURN
     );
+    assert!(!config.checkpoints_enabled);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"grep".to_string()));
     assert!(config.tools.core.contains(&"plan_patch".to_string()));
@@ -292,6 +306,16 @@ replace_sensitive_path_patterns = true
 }
 
 #[test]
+fn shell_sandbox_defaults_to_best_effort() {
+    let config = AppConfig::from_settings_and_env_vars(SettingsFile::default(), |_| None);
+
+    assert_eq!(
+        config.permissions.shell_sandbox.mode,
+        ShellSandboxMode::BestEffort
+    );
+}
+
+#[test]
 fn config_reads_supported_env_overrides() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_MODEL" => Some("custom-model".to_string()),
@@ -299,6 +323,7 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_EDIT_PERMISSION" => Some("allow".to_string()),
         "SQUEEZY_SHELL_PERMISSION" => Some("deny".to_string()),
         "SQUEEZY_STORE_RESPONSES" => Some("true".to_string()),
+        "SQUEEZY_MAX_OUTPUT_TOKENS" => Some("64000".to_string()),
         "SQUEEZY_MAX_PARALLEL_TOOLS" => Some("3".to_string()),
         "SQUEEZY_WEB_PERMISSION" => Some("allow".to_string()),
         "SQUEEZY_EXA_MCP_URL" => Some("https://search.example/mcp".to_string()),
@@ -313,6 +338,7 @@ fn config_reads_supported_env_overrides() {
         "SQUEEZY_TELEMETRY" => Some("off".to_string()),
         "SQUEEZY_TELEMETRY_ENDPOINT" => Some("https://telemetry.example/v1/batch".to_string()),
         "SQUEEZY_SESSION_MODE" => Some("plan".to_string()),
+        "SQUEEZY_CHECKPOINTS_ENABLED" => Some("true".to_string()),
         "SQUEEZY_SKILLS_USER_DIR" => Some("/tmp/squeezy-skills".to_string()),
         "SQUEEZY_SKILLS_COMPAT_USER_DIR" => Some("/tmp/agent-skills".to_string()),
         _ => None,
@@ -323,7 +349,9 @@ fn config_reads_supported_env_overrides() {
     assert_eq!(config.permissions.shell, PermissionMode::Deny);
     assert_eq!(config.permissions.web, PermissionMode::Allow);
     assert_eq!(config.session_mode, SessionMode::Plan);
+    assert!(config.checkpoints_enabled);
     assert!(config.store_responses);
+    assert_eq!(config.max_output_tokens, Some(64_000));
     assert_eq!(config.max_parallel_tools, 3);
     assert_eq!(config.exa_mcp_url, "https://search.example/mcp");
     assert_eq!(config.exa_api_key_env, "CUSTOM_EXA_KEY");
@@ -1038,6 +1066,7 @@ model = "gpt-custom"
 reasoning_effort = "high"
 max_output_tokens = 512
 store_responses = true
+selection_version = 1
 
 [agent]
 exploration_compiler = false
@@ -1095,6 +1124,7 @@ root = ".squeezy/cache"
 tool_outputs = ".squeezy/tool_outputs"
 
 [tools]
+checkpoints_enabled = true
 lazy_schema_loading = true
 core = ["webfetch"]
 discoverable = ["read_file"]
@@ -1105,6 +1135,7 @@ status_verbosity = "verbose"
 response_verbosity = "concise"
 tool_output_verbosity = "normal"
 transcript_default = "expanded"
+alternate_screen = "always"
 show_reasoning_usage = false
 
 [mcp.servers.docs]
@@ -1155,6 +1186,7 @@ reason = "docs lookups are safe"
         config.cache.tool_outputs,
         Some(PathBuf::from(".squeezy/tool_outputs"))
     );
+    assert!(config.checkpoints_enabled);
     assert!(config.tools.lazy_schema_loading);
     assert!(config.tools.core.contains(&"webfetch".to_string()));
     assert!(!config.tools.core.contains(&"read_file".to_string()));
@@ -1167,6 +1199,7 @@ reason = "docs lookups are safe"
         ToolOutputVerbosity::Normal
     );
     assert_eq!(config.tui.transcript_default, TranscriptDefault::Expanded);
+    assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Always);
     assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
     assert_eq!(
@@ -1258,10 +1291,23 @@ default = "allow"
 
 #[test]
 fn invalid_reasoning_and_tui_verbosity_values_are_rejected() {
-    let reasoning = SettingsFile::from_toml_str(
+    let settings = SettingsFile::from_toml_str(
         r#"
 [model]
 reasoning_effort = "xhigh"
+"#,
+        "test",
+    )
+    .expect("xhigh reasoning effort");
+    assert_eq!(
+        settings.model_settings.unwrap().reasoning_effort,
+        Some(ReasoningEffort::XHigh)
+    );
+
+    let reasoning = SettingsFile::from_toml_str(
+        r#"
+[model]
+reasoning_effort = "extreme"
 "#,
         "test",
     )
@@ -1700,11 +1746,13 @@ url = "https://docs.example/mcp"
 
     assert!(inspect.contains("profile = \"strong\""));
     assert!(inspect.contains("provider = \"anthropic\""));
+    assert!(inspect.contains("# max_output_tokens = unset"));
     assert!(inspect.contains("read = \"deny\""));
     assert!(inspect.contains("status_verbosity = \"compact\""));
     assert!(inspect.contains("response_verbosity = \"normal\""));
     assert!(inspect.contains("tool_output_verbosity = \"compact\""));
     assert!(inspect.contains("transcript_default = \"compact\""));
+    assert!(inspect.contains("alternate_screen = \"auto\""));
     assert!(inspect.contains("show_reasoning_usage = true"));
     assert!(inspect.contains("transport = \"http\""));
     assert!(!inspect.contains("Balanced"));

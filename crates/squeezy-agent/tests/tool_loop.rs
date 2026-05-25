@@ -137,7 +137,6 @@ async fn plan_mode_advertises_only_read_only_tools() {
     assert_eq!(
         tool_names,
         vec![
-            "update_task_state",
             "delegate",
             "explore",
             "load_tool_schema",
@@ -747,7 +746,6 @@ async fn lazy_schema_loading_disabled_sends_full_schema_set_without_tools_index(
     assert_eq!(requests.len(), 1);
     let names = tool_names(&requests[0]);
     for expected in [
-        "update_task_state",
         "delegate",
         "explore",
         "grep",

@@ -85,9 +85,15 @@ impl RepoRegistry {
             });
         }
         let text = fs::read_to_string(path)?;
-        let mut registry: Self = toml::from_str(&text).map_err(|err| {
-            SqueezyError::Config(format!("{}: invalid repo registry: {err}", path.display()))
-        })?;
+        let mut registry: Self = match toml::from_str(&text) {
+            Ok(registry) => registry,
+            Err(_) => {
+                return Ok(Self {
+                    version: REPO_REGISTRY_VERSION,
+                    repos: Vec::new(),
+                });
+            }
+        };
         if registry.version == 0 {
             registry.version = REPO_REGISTRY_VERSION;
         }
@@ -100,7 +106,15 @@ impl RepoRegistry {
         {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, self.to_toml())?;
+        let temp_path = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("repos.toml"),
+            std::process::id()
+        ));
+        fs::write(&temp_path, self.to_toml())?;
+        fs::rename(&temp_path, path)?;
         Ok(())
     }
 
@@ -153,22 +167,24 @@ impl RepoRegistry {
                 toml_array(&profile.fingerprint.markers)
             ));
 
-            out.push_str("\n[repos.git]\n");
-            // Optional fields are written only when present so a loaded
-            // profile round-trips back to the same in-memory shape. Writing
-            // `""` for `None` would deserialize to `Some("")`, which differs
-            // from a freshly detected profile and breaks downstream
-            // comparisons.
-            push_optional_string_field(&mut out, "vcs_type", profile.git.vcs_type.as_deref());
-            push_optional_string_field(&mut out, "branch", profile.git.branch.as_deref());
-            push_optional_string_field(&mut out, "head", profile.git.head.as_deref());
-            push_optional_string_field(
-                &mut out,
-                "default_branch",
-                profile.git.default_branch.as_deref(),
-            );
-            if let Some(dirty) = profile.git.dirty {
-                out.push_str(&format!("dirty = {dirty}\n"));
+            if profile.git != GitState::default() {
+                out.push_str("\n[repos.git]\n");
+                // Optional fields are written only when present so a loaded
+                // profile round-trips back to the same in-memory shape. Writing
+                // `""` for `None` would deserialize to `Some("")`, which differs
+                // from a freshly detected profile and breaks downstream
+                // comparisons.
+                push_optional_string_field(&mut out, "vcs_type", profile.git.vcs_type.as_deref());
+                push_optional_string_field(&mut out, "branch", profile.git.branch.as_deref());
+                push_optional_string_field(&mut out, "head", profile.git.head.as_deref());
+                push_optional_string_field(
+                    &mut out,
+                    "default_branch",
+                    profile.git.default_branch.as_deref(),
+                );
+                if let Some(dirty) = profile.git.dirty {
+                    out.push_str(&format!("dirty = {dirty}\n"));
+                }
             }
 
             for language in &profile.languages {
@@ -241,6 +257,7 @@ pub struct RepoProfile {
     #[serde(default)]
     pub recommendations: Vec<RepoRecommendation>,
     pub fingerprint: RepoFingerprint,
+    #[serde(default)]
     pub git: GitState,
 }
 

@@ -117,3 +117,19 @@ fn show_metadata_extracts_context_window_from_parameters_fallback() {
 
     assert_eq!(ollama_context_window_from_show(&value), Some(8_192));
 }
+
+#[test]
+fn tags_metadata_extracts_installed_model_names() {
+    let value = json!({
+        "models": [
+            {"name": "qwen3-coder:latest"},
+            {"name": "llama3.3:70b"},
+            {"missing": "name"}
+        ]
+    });
+
+    assert_eq!(
+        ollama_model_names_from_tags(&value),
+        vec!["qwen3-coder:latest", "llama3.3:70b"]
+    );
+}

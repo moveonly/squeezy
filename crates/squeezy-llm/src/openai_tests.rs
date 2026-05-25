@@ -153,6 +153,7 @@ fn request_body_preserves_function_tool_order() {
 
     let body = OpenAiProvider::request_body(&request);
 
+    assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["tools"][0]["name"], "write_file");
     assert_eq!(body["tools"][1]["name"], "grep");
 }
@@ -173,8 +174,33 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
 
     let body = OpenAiProvider::request_body(&request);
 
-    assert_eq!(body["text"]["verbosity"], "verbose");
+    assert_eq!(body["text"]["verbosity"], "high");
     assert_eq!(body["reasoning"]["effort"], "high");
+}
+
+#[test]
+fn request_body_maps_squeezy_verbosity_to_openai_values() {
+    for (squeezy, openai) in [
+        (squeezy_core::ResponseVerbosity::Concise, "low"),
+        (squeezy_core::ResponseVerbosity::Normal, "medium"),
+        (squeezy_core::ResponseVerbosity::Verbose, "high"),
+    ] {
+        let request = LlmRequest {
+            model: "gpt-test".to_string(),
+            instructions: "be brief".to_string(),
+            input: vec![LlmInputItem::UserText("hello".to_string())],
+            max_output_tokens: None,
+            response_verbosity: Some(squeezy),
+            reasoning_effort: None,
+            previous_response_id: None,
+            tools: Vec::new(),
+            store: false,
+        };
+
+        let body = OpenAiProvider::request_body(&request);
+
+        assert_eq!(body["text"]["verbosity"], openai);
+    }
 }
 
 #[test]
@@ -199,6 +225,40 @@ fn parser_extracts_function_call_from_output_item_done() {
             name: "grep".to_string(),
             arguments: json!({"pattern": "needle"}),
         }))
+    );
+}
+
+#[test]
+fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
+    let event = parse_openai_event(
+        r#"{
+          "type": "response.output_item.done",
+          "item": {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "definition_search",
+            "arguments": "{\"query\":\"getFoo"
+          }
+        }"#,
+    )
+    .expect("malformed arguments stay recoverable");
+
+    let Some(LlmEvent::ToolCall(call)) = event else {
+        panic!("expected tool call");
+    };
+    assert_eq!(call.call_id, "call_123");
+    assert_eq!(call.name, "definition_search");
+    assert_eq!(
+        call.arguments[crate::INVALID_TOOL_ARGUMENTS_KEY],
+        json!(true)
+    );
+    assert!(
+        call.arguments[crate::INVALID_TOOL_ARGUMENTS_ERROR_KEY]
+            .as_str()
+            .unwrap()
+            .contains("EOF"),
+        "{}",
+        call.arguments
     );
 }
 

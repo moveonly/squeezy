@@ -136,6 +136,27 @@ fn registry_round_trip_preserves_optional_git_and_language_fields() {
             .expect("language present");
         assert_eq!(language.family, original.family);
     }
+    let persisted = fs::read_to_string(&registry_path).unwrap();
+    assert!(
+        !persisted.contains("[repos.git]"),
+        "empty git table should not be written:\n{persisted}"
+    );
+}
+
+#[test]
+fn corrupt_repo_registry_is_treated_as_generated_cache_miss() {
+    let root = temp_root("repo_profile_corrupt_registry");
+    let registry_path = root.join("repos.toml");
+    fs::write(
+        &registry_path,
+        "version = 1\n\n[[repos]]\nroot = \"broken\"\n\n[repos.git]\n[repos.git]\n",
+    )
+    .unwrap();
+
+    let registry = RepoRegistry::load(&registry_path).unwrap();
+
+    assert_eq!(registry.version, REPO_REGISTRY_VERSION);
+    assert!(registry.repos.is_empty());
 }
 
 #[test]

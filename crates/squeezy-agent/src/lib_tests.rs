@@ -16,9 +16,10 @@ use squeezy_core::{
     SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
 };
-use squeezy_tools::{ToolStatus, sha256_hex};
+use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
@@ -283,10 +284,10 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
         .flat_map(|request| request.tools.into_iter().map(|tool| tool.name))
         .collect::<Vec<_>>();
     assert!(
-        request_names
+        !request_names
             .iter()
             .any(|name| name == TASK_STATE_TOOL_NAME),
-        "task-state tool was not advertised: {request_names:?}",
+        "task-state progress must be runtime-derived, not advertised: {request_names:?}",
     );
 
     let session_id = agent.session_id().expect("session id");
@@ -332,6 +333,66 @@ async fn turn_stream_reports_provider_error() {
     }
 
     assert!(saw_error);
+}
+
+#[tokio::test]
+async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_bad".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({
+                    INVALID_TOOL_ARGUMENTS_KEY: true,
+                    INVALID_TOOL_ARGUMENTS_ERROR_KEY: "EOF while parsing a string at line 1 column 59",
+                    INVALID_TOOL_ARGUMENTS_RAW_KEY: "{\"query\":\"getFoo",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: None,
+                cost: Default::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("recovered".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: None,
+                cost: Default::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.start_turn("where is getFoo?".to_string(), CancellationToken::new());
+    let mut completed = None;
+    let mut failed = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            AgentEvent::Failed { error, .. } => failed = Some(error.to_string()),
+            _ => {}
+        }
+    }
+
+    assert_eq!(completed.as_deref(), Some("recovered"));
+    assert!(failed.is_none(), "{failed:?}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    let output = requests[1]
+        .input
+        .iter()
+        .find_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("tool output returned to model");
+    assert!(
+        output.contains("invalid tool arguments from model"),
+        "{output}"
+    );
+    assert!(output.contains("call the same tool again"), "{output}");
 }
 
 #[tokio::test]
@@ -935,11 +996,12 @@ async fn cancelling_turn_unblocks_pending_approval() {
         },
         ..Default::default()
     };
-    let agent = Agent::new(config, provider);
+    let agent = Agent::new(config, provider.clone());
     let cancel = CancellationToken::new();
     let mut rx = agent.start_turn("write file".to_string(), cancel.clone());
     let mut pending_decision = None;
     let mut saw_cancelled_tool = false;
+    let mut saw_cancelled_turn = false;
 
     tokio::time::timeout(Duration::from_secs(1), async {
         while let Some(event) = rx.recv().await {
@@ -951,6 +1013,9 @@ async fn cancelling_turn_unblocks_pending_approval() {
                 AgentEvent::ToolCallCompleted { result, .. } => {
                     saw_cancelled_tool = result.status == ToolStatus::Cancelled;
                 }
+                AgentEvent::Cancelled { .. } => {
+                    saw_cancelled_turn = true;
+                }
                 _ => {}
             }
         }
@@ -960,6 +1025,12 @@ async fn cancelling_turn_unblocks_pending_approval() {
 
     assert!(pending_decision.is_some());
     assert!(saw_cancelled_tool);
+    assert!(saw_cancelled_turn);
+    assert_eq!(
+        provider.requests().len(),
+        1,
+        "cancelled approval must not feed a cancelled tool result into another model round",
+    );
     assert!(!root.join("sample.txt").exists());
 
     let _ = fs::remove_dir_all(root);
@@ -1075,6 +1146,132 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
         "{completed}"
     );
     assert!(completed.contains("[model]"), "{completed}");
+}
+
+#[tokio::test]
+async fn bang_command_completes_locally_without_provider_request() {
+    let root = temp_workspace("agent_local_bang");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    fs::create_dir_all(root.join("src")).expect("mkdir src");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("!ls".to_string(), CancellationToken::new());
+    let mut completed = None;
+    let mut tool_result = None;
+    let mut queued_tools = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
+            AgentEvent::ToolCallCompleted { result, .. } => tool_result = Some(result),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            _ => {}
+        }
+    }
+
+    assert!(provider.requests().is_empty());
+    assert_eq!(queued_tools.len(), 1);
+    assert_eq!(queued_tools[0].arguments["command"], "ls");
+    let tool_result = tool_result.expect("ls should run through the shell tool");
+    assert_eq!(tool_result.tool_name, "shell");
+    assert_eq!(tool_result.status, ToolStatus::Success);
+    assert_eq!(tool_result.content["policy"]["direct_user_shell"], true);
+    assert_eq!(tool_result.content["sandbox"]["backend"], "none");
+    let completed = completed.expect("ls turn should complete");
+    assert!(completed.contains("Cargo.toml"), "{completed}");
+    assert!(completed.contains("src"), "{completed}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn natural_language_run_ls_phrase_goes_to_provider() {
+    let root = temp_workspace("agent_natural_run_ls");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "I would run `ls -la` for detailed output.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut rx = agent.start_turn("run ls with details".to_string(), CancellationToken::new());
+    let mut completed = None;
+    let mut queued_tools = Vec::new();
+    let mut tool_results = Vec::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ToolCallQueued { call, .. } => queued_tools.push(call),
+            AgentEvent::ToolCallCompleted { result, .. } => tool_results.push(result),
+            AgentEvent::Completed { message, .. } => completed = Some(message.content),
+            _ => {}
+        }
+    }
+
+    assert_eq!(provider.requests().len(), 1);
+    assert!(queued_tools.is_empty());
+    assert!(tool_results.is_empty());
+    let completed = completed.expect("provider turn should complete");
+    assert!(completed.contains("ls -la"), "{completed}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn tool_loop_guard_stops_repeated_identical_failures() {
+    let call = ToolCall {
+        call_id: "patch-1".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({}),
+    };
+    let first = control_tool_result(
+        &call,
+        ToolStatus::Stale,
+        json!({
+            "error": "search text matched more than once",
+            "path": "src/lib.rs"
+        }),
+    );
+    let second = control_tool_result(
+        &ToolCall {
+            call_id: "patch-2".to_string(),
+            ..call.clone()
+        },
+        ToolStatus::Stale,
+        json!({
+            "error": "search text matched more than once",
+            "path": "src/lib.rs"
+        }),
+    );
+    let mut guard = ToolLoopGuard::default();
+
+    assert!(
+        guard
+            .observe_round(std::slice::from_ref(&call), &[first])
+            .is_none()
+    );
+    let reason = guard
+        .observe_round(&[call], &[second])
+        .expect("second identical failure should stop");
+
+    assert!(reason.contains("repeated apply_patch failure"), "{reason}");
 }
 
 #[tokio::test]
@@ -1533,17 +1730,11 @@ fn control_tools_are_advertised_in_build_and_plan_modes() {
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build);
     let build_names = advertised_tool_names(&build_specs);
-    assert_eq!(
-        build_names,
-        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
-    );
+    assert_eq!(build_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
 
     let plan_specs = advertised_tool_specs(&tools, SessionMode::Plan);
     let plan_names = advertised_tool_names(&plan_specs);
-    assert_eq!(
-        plan_names,
-        vec![TASK_STATE_TOOL_NAME, DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]
-    );
+    assert_eq!(plan_names, vec![DELEGATE_TOOL_NAME, EXPLORE_TOOL_NAME]);
 }
 
 #[test]
@@ -1556,7 +1747,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(names, vec![TASK_STATE_TOOL_NAME.to_string()]);
+    assert!(names.is_empty());
 
     let explore_only_off = SubagentConfig {
         explore_enabled: false,
@@ -1566,13 +1757,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
         .into_iter()
         .map(|tool| tool.spec.name)
         .collect();
-    assert_eq!(
-        names,
-        vec![
-            TASK_STATE_TOOL_NAME.to_string(),
-            DELEGATE_TOOL_NAME.to_string(),
-        ]
-    );
+    assert_eq!(names, vec![DELEGATE_TOOL_NAME.to_string()]);
 }
 
 #[test]
@@ -1585,7 +1770,6 @@ fn warn_unknown_tool_schema_names_emits_warning_for_typo_and_skips_known() {
         .finish();
 
     let tools = [
-        task_state_advertised_tool(),
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
     ];
@@ -1643,7 +1827,6 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
     assert_eq!(
         initial_names,
         vec![
-            TASK_STATE_TOOL_NAME,
             DELEGATE_TOOL_NAME,
             EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -1665,7 +1848,6 @@ fn lazy_request_tool_specs_keep_core_first_and_mcp_discoverable_by_default() {
     assert_eq!(
         loaded_names,
         vec![
-            TASK_STATE_TOOL_NAME,
             DELEGATE_TOOL_NAME,
             EXPLORE_TOOL_NAME,
             LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -1696,7 +1878,6 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
         !names.contains(&EXPLORE_TOOL_NAME),
         "explore must not be advertised when subagents.enabled=false: {names:?}"
     );
-    assert!(names.contains(&TASK_STATE_TOOL_NAME));
     assert!(names.contains(&"grep"));
 
     let explore_only = SubagentConfig {
@@ -1717,7 +1898,6 @@ fn request_tool_specs_skips_disabled_subagent_control_tools() {
 #[test]
 fn lazy_tools_index_lists_discoverable_tools_without_core_schemas() {
     let tools = [
-        task_state_advertised_tool(),
         test_advertised_tool("grep", PermissionCapability::Search),
         test_advertised_tool("webfetch", PermissionCapability::Network),
         test_advertised_tool("mcp__docs__lookup", PermissionCapability::Mcp),
@@ -1994,6 +2174,59 @@ fn redact_json_payload_walks_nested_string_values_and_preserves_structure() {
         .as_str()
         .expect("snippet remains a string");
     assert!(!snippet.contains(synthetic_aws_access_key), "{snippet}");
+}
+
+#[test]
+fn tool_round_failure_summary_names_repeated_invalid_tool_arguments() {
+    let results = vec![
+        control_tool_result(
+            &ToolCall {
+                call_id: "call-1".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            ToolStatus::Error,
+            json!({"error": "invalid tool arguments: missing field `query`"}),
+        ),
+        control_tool_result(
+            &ToolCall {
+                call_id: "call-2".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            ToolStatus::Error,
+            json!({"error": "invalid tool arguments: missing field `query`"}),
+        ),
+    ];
+
+    assert_eq!(
+        tool_round_failure_summary(&results).as_deref(),
+        Some("repeated invalid decl_search arguments (2x)")
+    );
+}
+
+#[test]
+fn tool_round_failure_summary_uses_shell_exit_details() {
+    let results = vec![control_tool_result(
+        &ToolCall {
+            call_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "cargo check --bin sonar-arch-graph"}),
+        },
+        ToolStatus::Error,
+        json!({
+            "command": "cargo check --bin sonar-arch-graph",
+            "exit_code": 101,
+            "stdout": "",
+            "stderr": "",
+            "error": null,
+        }),
+    )];
+
+    assert_eq!(
+        tool_round_failure_summary(&results).as_deref(),
+        Some("last shell failure: exit 101")
+    );
 }
 
 struct SharedLogWrite {

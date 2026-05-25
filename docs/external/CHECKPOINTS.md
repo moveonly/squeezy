@@ -1,6 +1,8 @@
 # Checkpoints
 
-Squeezy creates local checkpoints around mutating tools so recent agent changes can be inspected, undone, or reverted without relying on the user's primary Git history.
+Squeezy can create local checkpoints around mutating tools so recent agent changes can be inspected, undone, or reverted without relying on the user's primary Git history.
+
+Checkpointing is disabled by default. To opt in, set `checkpoints_enabled = true` under `[tools]` in Squeezy settings, or set `SQUEEZY_CHECKPOINTS_ENABLED=true` in the environment. When checkpointing is disabled, mutating tools still run normally but do not attach `checkpoint` metadata, and checkpoint commands report that checkpointing is disabled.
 
 Checkpoint state is stored under `.squeezy/checkpoints/` inside the workspace. The shadow Git repository stores before/after trees and `journal.jsonl` stores checkpoint metadata. Checkpoint refs keep those trees reachable until retention cleanup removes them.
 
@@ -12,7 +14,7 @@ Checkpoints are attached to mutating local tools:
 - `shell`
 - `apply_patch`
 
-Read-only tools do not create checkpoints. A tool call that leaves the workspace unchanged does not create a checkpoint. `apply_patch` attaches a checkpoint for both successful applies and partial-failure errors, so a multi-file patch that fails after the first write is still recoverable via `checkpoint_undo`.
+When checkpointing is enabled, read-only tools do not create checkpoints. A tool call that leaves the workspace unchanged does not create a checkpoint. `apply_patch` attaches a checkpoint for both successful applies and partial-failure errors, so a multi-file patch that fails after the first write is still recoverable via `checkpoint_undo`.
 
 ## Inspecting Checkpoints
 

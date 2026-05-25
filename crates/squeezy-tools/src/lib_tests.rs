@@ -23,6 +23,41 @@ fn registry_with_shell_sandbox_off(root: &Path) -> ToolRegistry {
     registry_with_shell_sandbox_off_and_output_config(root, ToolOutputConfig::default())
 }
 
+fn registry_with_checkpoints(root: &Path) -> ToolRegistry {
+    registry_with_runtime_config(
+        root,
+        ToolRuntimeConfig {
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+    )
+}
+
+fn registry_with_shell_sandbox_off_and_checkpoints(root: &Path) -> ToolRegistry {
+    registry_with_runtime_config(
+        root,
+        ToolRuntimeConfig {
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: squeezy_core::ShellSandboxMode::Off,
+                ..squeezy_core::ShellSandboxConfig::default()
+            },
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+    )
+}
+
+fn registry_with_runtime_config(root: &Path, config: ToolRuntimeConfig) -> ToolRegistry {
+    ToolRegistry::new_with_configs_skills_and_mcp(
+        root,
+        config,
+        SkillsConfig::default(),
+        &GraphConfig::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry")
+}
+
 fn registry_with_shell_sandbox_off_and_output_config(
     root: &Path,
     output_config: ToolOutputConfig,
@@ -94,6 +129,33 @@ fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     assert_eq!(refresh.capability, PermissionCapability::Compiler);
     assert_eq!(refresh.target, "cargo facts+check:*");
     assert_eq!(refresh.metadata["diagnostics"], "true");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_permission_metadata_classifies_read_only_listing_commands_as_low_risk_search() {
+    let root = temp_workspace("permission_read_only_shell");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let request = registry.permission_request(&ToolCall {
+        call_id: "ls".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": "ls",
+            "description": "list workspace files"
+        }),
+    });
+
+    assert_eq!(request.capability, PermissionCapability::Search);
+    assert_eq!(request.risk, PermissionRisk::Low);
+    assert_eq!(request.target, "ls:*");
+    assert_eq!(request.metadata["destructive"], "false");
+    assert_eq!(request.metadata["network"], "none");
+
+    let grep = analyze_shell_command("rg getFoo");
+    assert_eq!(grep.capability, PermissionCapability::Search);
+    assert_eq!(grep.risk, PermissionRisk::Low);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1055,6 +1117,11 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
     let root = temp_workspace("verify_command");
     fs::create_dir_all(root.join("crates/example")).expect("create crate");
     fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/example\"]\n",
+    )
+    .expect("write workspace manifest");
+    fs::write(
         root.join("crates/example/Cargo.toml"),
         "[package]\nname = \"squeezy-example\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
     )
@@ -1070,6 +1137,71 @@ fn diff_verify_command_uses_package_scoped_cargo_test() {
     assert_eq!(
         command,
         "cargo test -p squeezy-example --message-format=json"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn diff_verify_command_uses_nested_manifest_when_root_has_no_cargo() {
+    let root = temp_workspace("verify_nested_manifest");
+    fs::create_dir_all(root.join("tools/sonar-arch-graph/src")).expect("create crate");
+    fs::write(
+        root.join("tools/sonar-arch-graph/Cargo.toml"),
+        "[package]\nname = \"sonar-arch-graph\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+
+    let plan = verify_command_plan(
+        &root,
+        VerifyScope::Diff,
+        VerifyLevel::Quick,
+        &["tools/sonar-arch-graph/src/main.rs".to_string()],
+    )
+    .expect("verification plan");
+
+    assert_eq!(
+        plan.command,
+        "cargo test --manifest-path 'tools/sonar-arch-graph/Cargo.toml' --message-format=json"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn verify_reports_not_run_when_no_cargo_manifest_exists() {
+    let root = temp_workspace("verify_no_manifest");
+    fs::create_dir_all(root.join("src")).expect("create src");
+    fs::write(root.join("src/lib.rs"), "pub fn changed() {}\n").expect("write rust");
+    git_init_commit(&root);
+    fs::write(
+        root.join("src/lib.rs"),
+        "pub fn changed() -> bool { true }\n",
+    )
+    .expect("modify rust");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "verify".to_string(),
+                name: "verify".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["no_op"], true);
+    assert_eq!(result.content["not_run"], true);
+    assert!(
+        result.content["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("no Cargo.toml"),
+        "{}",
+        result.content
     );
 
     let _ = fs::remove_dir_all(root);
@@ -1129,7 +1261,7 @@ async fn plan_patch_reports_graph_impact_and_locality_warning() {
 async fn apply_patch_edits_file_and_checkpoint_undo_restores_it() {
     let root = temp_workspace("apply_patch_undo");
     fs::write(root.join("sample.txt"), "before\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1251,7 +1383,7 @@ async fn apply_patch_rejects_stale_hash_without_modifying_file() {
 async fn apply_patch_rejects_multiple_matches_unless_allowed() {
     let root = temp_workspace("apply_patch_multiple");
     fs::write(root.join("sample.txt"), "same same\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let rejected = registry
         .execute(
@@ -1271,6 +1403,15 @@ async fn apply_patch_rejects_multiple_matches_unless_allowed() {
         )
         .await;
     assert_eq!(rejected.status, ToolStatus::Stale);
+    assert_eq!(rejected.content["matches"], 2);
+    assert_eq!(rejected.content["match_contexts"][0]["line"], 1);
+    assert!(
+        rejected.content["match_contexts"][0]["preview"]
+            .as_str()
+            .is_some_and(|preview| preview.contains("same same")),
+        "{}",
+        rejected.content
+    );
     assert_eq!(
         fs::read_to_string(root.join("sample.txt")).unwrap(),
         "same same\n"
@@ -1295,6 +1436,13 @@ async fn apply_patch_rejects_multiple_matches_unless_allowed() {
         )
         .await;
     assert_eq!(accepted.status, ToolStatus::Success);
+    assert!(
+        accepted.content["checkpoint"]["files"][0]["patch"]
+            .as_str()
+            .is_some_and(|patch| patch.contains("-same same") && patch.contains("+next next")),
+        "{}",
+        accepted.content
+    );
     assert_eq!(
         fs::read_to_string(root.join("sample.txt")).unwrap(),
         "next next\n"
@@ -1354,7 +1502,7 @@ async fn apply_patch_partial_failure_records_checkpoint_for_undo() {
     let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
     perms.set_mode(0o444);
     fs::set_permissions(&read_only, perms).expect("set readonly");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1843,7 +1991,7 @@ async fn write_file_rejects_stale_expected_hash() {
 async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
     let root = temp_workspace("checkpoint_write_undo");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1889,11 +2037,70 @@ async fn write_file_creates_checkpoint_and_checkpoint_undo_restores_file() {
 }
 
 #[tokio::test]
+async fn checkpointing_is_disabled_by_default_for_mutations() {
+    let root = temp_workspace("checkpoint_disabled_default");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-disabled".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after"
+    );
+
+    let undo = registry
+        .execute(
+            ToolCall {
+                call_id: "undo".to_string(),
+                name: "checkpoint_undo".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(undo.status, ToolStatus::Stale);
+    assert_eq!(undo.content["enabled"], false);
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "list".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    assert_eq!(list.content["enabled"], false);
+    assert_eq!(list.content["checkpoints"].as_array().unwrap().len(), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
     let root = temp_workspace("checkpoint_shell_undo");
     // Disable the OS sandbox so this test focuses on checkpoint behavior;
     // OS sandbox backend coverage lives in shell_sandbox_tests.
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1932,10 +2139,173 @@ async fn shell_created_file_is_checkpointed_and_deleted_on_undo() {
 }
 
 #[tokio::test]
+async fn direct_user_shell_skips_checkpoint_and_sandbox() {
+    let root = temp_workspace("direct_user_shell_fast_path");
+    let shell_sandbox = squeezy_core::ShellSandboxConfig {
+        mode: squeezy_core::ShellSandboxMode::Required,
+        ..squeezy_core::ShellSandboxConfig::default()
+    };
+    let registry = ToolRegistry::new_inner(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        shell_sandbox,
+        SkillCatalog::empty(),
+        CrawlOptions::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "local-shell-test".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf direct > direct.txt",
+                    "description": "run an explicit user shell command",
+                    "direct_user_shell": true
+                }),
+            },
+            CancellationToken::new(),
+            "turn-direct".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["sandbox"]["backend"], "none");
+    assert_eq!(result.content["sandbox"]["mode"], "off");
+    assert_eq!(result.content["policy"]["direct_user_shell"], true);
+    assert!(result.content.get("checkpoint").is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("direct.txt")).unwrap(),
+        "direct"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_only_model_shell_skips_checkpoint() {
+    let root = temp_workspace("read_only_shell_fast_path");
+    fs::write(root.join("sample.txt"), "sample").expect("write sample");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "readonly".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "ls -la",
+                    "description": "list files"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-readonly".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["policy"]["capability"], "search");
+    assert!(result.content.get("checkpoint").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_only_git_shell_skips_checkpoint() {
+    let root = temp_workspace("read_only_git_shell_fast_path");
+    fs::write(root.join("sample.txt"), "sample").expect("write sample");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "git-status".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "git status --short",
+                    "description": "inspect git status"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-git-status".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.content["policy"]["capability"], "git");
+    assert!(result.content.get("checkpoint").is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn model_shell_cannot_request_direct_user_shell_fast_path() {
+    let root = temp_workspace("direct_user_shell_model_guard");
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "model-call".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf guarded > guarded.txt",
+                    "description": "attempt to set hidden direct shell flag",
+                    "direct_user_shell": true
+                }),
+            },
+            CancellationToken::new(),
+            "turn-model".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-model");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_checkpoint_ignores_gitignored_target_outputs() {
+    let root = temp_workspace("checkpoint_shell_ignored_target");
+    fs::write(root.join(".gitignore"), "target\n").expect("write gitignore");
+    fs::create_dir(root.join("target")).expect("create target");
+    let large = fs::File::create(root.join("target").join("debug.bin")).expect("create large");
+    large
+        .set_len(3 * 1024 * 1024)
+        .expect("write large placeholder");
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "shell-build".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok > built.txt",
+                    "description": "simulate a build artifact beside ignored target output"
+                }),
+            },
+            CancellationToken::new(),
+            "turn-build".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-build");
+    assert!(root.join("built.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn checkpoint_undo_reports_conflict_and_preserves_dirty_user_change() {
     let root = temp_workspace("checkpoint_conflict");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -1984,7 +2354,7 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
     let root = temp_workspace("checkpoint_best_effort");
     fs::write(root.join("a.txt"), "before-a").expect("write a");
     fs::write(root.join("b.txt"), "before-b").expect("write b");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2033,7 +2403,7 @@ async fn checkpoint_undo_best_effort_restores_clean_files_while_reporting_confli
 async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
     let root = temp_workspace("checkpoint_group_revert");
     fs::write(root.join("sample.txt"), "one").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     for (call_id, before, after) in [("write1", "one", "two"), ("write2", "two", "three")] {
         let result = registry
@@ -2079,7 +2449,7 @@ async fn checkpoint_revert_group_restores_multiple_actions_in_reverse_order() {
 async fn checkpoint_show_returns_patch_metadata_for_specific_checkpoint() {
     let root = temp_workspace("checkpoint_show");
     fs::write(root.join("sample.txt"), "before\n").expect("write sample");
-    let registry = ToolRegistry::new(&root).expect("registry");
+    let registry = registry_with_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2134,7 +2504,7 @@ fn suspicious_shell_mutation_reports_checkpoint_coverage_warning() {
 #[tokio::test]
 async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
     let root = temp_workspace("checkpoint_inline_warnings");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let result = registry
         .execute_for_group(
@@ -2170,7 +2540,7 @@ async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
 async fn noop_shell_produces_no_checkpoint_so_undo_targets_real_edit() {
     let root = temp_workspace("checkpoint_noop_undo");
     fs::write(root.join("sample.txt"), "before").expect("write sample");
-    let registry = registry_with_shell_sandbox_off(&root);
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
 
     let edit = registry
         .execute_for_group(
@@ -2267,6 +2637,32 @@ async fn shell_returns_bounded_output_and_exit_code() {
     assert!(audit.contains("\"call_id\":\"call_1\""));
     assert!(audit.contains("\"stdout_sha256\""));
     assert!(!audit.contains("\"stdout\":\"abc\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_default_sandbox_runs_benign_command() {
+    let root = temp_workspace("shell_default_sandbox");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_default_shell".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf ok",
+                    "description": "check default shell sandbox posture"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "ok");
+    assert_eq!(result.content["sandbox"]["mode"], "best_effort");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2440,7 +2836,7 @@ async fn shell_rejects_workdir_outside_workspace_with_structured_policy_reason()
     assert_eq!(result.status, ToolStatus::Denied);
     assert_eq!(result.content["permission_denied"], true);
     assert_eq!(result.content["policy_denied"], true);
-    assert_eq!(result.content["capability"], "shell");
+    assert_eq!(result.content["capability"], "search");
     assert!(
         result.content["error"]
             .as_str()
@@ -3738,10 +4134,6 @@ fn tool_specs_are_sorted_by_name() {
         names,
         vec![
             "apply_patch",
-            "checkpoint_list",
-            "checkpoint_revert",
-            "checkpoint_show",
-            "checkpoint_undo",
             "decl_search",
             "definition_search",
             "diff_context",
@@ -3765,6 +4157,22 @@ fn tool_specs_are_sorted_by_name() {
             "webfetch",
             "websearch",
             "write_file"
+        ]
+    );
+
+    let checkpoint_names = registry_with_checkpoints(&root)
+        .specs()
+        .into_iter()
+        .filter(|spec| spec.name.starts_with("checkpoint_"))
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checkpoint_names,
+        vec![
+            "checkpoint_list",
+            "checkpoint_revert",
+            "checkpoint_show",
+            "checkpoint_undo"
         ]
     );
 
@@ -3956,6 +4364,80 @@ pub fn bad() -> i32 {
             .contains("mismatched types")),
         "{}",
         context.content
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_accepts_filter_only_callable_java_query() {
+    let root = temp_workspace("decl_search_java_callable_count");
+    fs::write(
+        root.join("Foo.java"),
+        r#"
+class Foo {
+    void alpha() {}
+    int beta() { return 1; }
+    static void gamma() {}
+}
+"#,
+    )
+    .expect("write java source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_filter".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "language": "Java",
+                    "kind": "callable",
+                    "max_results": 10
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(result.content["total_matches"].as_u64(), Some(3));
+    assert_eq!(result.content["returned_matches"].as_u64(), Some(3));
+    assert_eq!(
+        result.content["counts_by_language"]["Java"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(result.content["counts_by_kind"]["method"].as_u64(), Some(3));
+    assert_eq!(result.content["packets"].as_array().unwrap().len(), 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_rejects_empty_unfiltered_query() {
+    let root = temp_workspace("decl_search_empty_unfiltered");
+    write_rust_crate(&root, "pub fn marker() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert!(
+        result.content["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("requires a query or at least one filter"),
+        "{}",
+        result.content
     );
 
     let _ = fs::remove_dir_all(root);
@@ -4724,6 +5206,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         configured_write_roots: Vec::new(),
         filesystem_read_roots: Vec::new(),
         filesystem_write_roots: Vec::new(),
+        fallback_reason: None,
     }
 }
 
@@ -4797,6 +5280,13 @@ fn shell_sandbox_plan_best_effort_when_sandbox_exec_absent() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "best_effort");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("sandbox unavailable")),
+        "{:?}",
+        plan.fallback_reason
+    );
 }
 
 #[test]
@@ -4832,6 +5322,29 @@ fn shell_sandbox_plan_best_effort_when_userns_unavailable() {
 
     assert_eq!(plan.backend, "none");
     assert_eq!(plan.mode, "best_effort");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("linux unshare")),
+        "{:?}",
+        plan.fallback_reason
+    );
+}
+
+#[test]
+fn shell_termination_reason_reports_missing_exit_status() {
+    assert_eq!(
+        shell_termination_reason(false, 120_000, None, None).as_deref(),
+        Some("shell command ended without an exit code")
+    );
+    assert_eq!(
+        shell_termination_reason(false, 120_000, None, Some(9)).as_deref(),
+        Some("shell command terminated by signal 9")
+    );
+    assert_eq!(
+        shell_termination_reason(false, 120_000, Some(1), None),
+        None
+    );
 }
 
 #[test]
@@ -4883,6 +5396,178 @@ fn shell_sandbox_plan_network_posture_denied_non_network() {
     .expect("plan");
 
     assert_eq!(plan.network, "denied");
+}
+
+#[test]
+#[cfg(unix)]
+fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let plan = fake_sandbox_plan("macos-sandbox-exec", false);
+    let run = ShellRunOutcome {
+        exit_status: Some(std::process::ExitStatus::from_raw(6)),
+        timed_out: false,
+        stdout_bytes: Vec::new(),
+        stdout_truncated: false,
+        stderr_bytes: Vec::new(),
+        stderr_truncated: false,
+        preserved_env: Vec::new(),
+    };
+
+    let reason =
+        shell_sandbox_direct_fallback_reason(&plan, &run).expect("best effort fallback reason");
+
+    assert!(reason.contains("signal 6"), "{reason}");
+    assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
+fn shell_sandbox_backend_health_skips_probe_after_best_effort_failure() {
+    let health = ShellSandboxHealth::default();
+    health.mark_unavailable("macos-sandbox-exec", "probe exited with code 71");
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let probed = std::cell::Cell::new(false);
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| {
+            probed.set(true);
+            None
+        },
+    )
+    .expect("best effort direct fallback");
+
+    assert!(!probed.get(), "cached failure should skip the probe");
+    assert_eq!(plan.backend, "none");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("probe exited with code 71")),
+        "{:?}",
+        plan.fallback_reason
+    );
+}
+
+#[test]
+fn shell_sandbox_backend_health_fails_closed_for_required_mode() {
+    let health = ShellSandboxHealth::default();
+    health.mark_unavailable("macos-sandbox-exec", "probe exited with code 71");
+    let config = sandbox_config(
+        ShellSandboxMode::Required,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let probed = std::cell::Cell::new(false);
+
+    let err = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", true),
+        |_, _| {
+            probed.set(true);
+            None
+        },
+    )
+    .expect_err("required mode fails closed");
+
+    assert!(!probed.get(), "cached failure should skip the probe");
+    assert!(err.contains("required shell sandbox backend macos-sandbox-exec unavailable"));
+    assert!(err.contains("probe exited with code 71"));
+}
+
+#[test]
+fn shell_sandbox_backend_health_caches_probe_failure() {
+    let health = ShellSandboxHealth::default();
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| Some("probe timed out after 500 ms".to_string()),
+    )
+    .expect("best effort direct fallback");
+
+    assert_eq!(plan.backend, "none");
+    assert!(
+        matches!(
+            health.status("macos-sandbox-exec"),
+            Some(ShellSandboxBackendStatus::Unavailable(reason))
+                if reason.contains("probe timed out")
+        ),
+        "{:?}",
+        health.status("macos-sandbox-exec")
+    );
+}
+
+#[test]
+fn shell_sandbox_backend_health_caches_probe_success() {
+    let health = ShellSandboxHealth::default();
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| None,
+    )
+    .expect("healthy backend");
+
+    assert_eq!(plan.backend, "macos-sandbox-exec");
+    assert!(matches!(
+        health.status("macos-sandbox-exec"),
+        Some(ShellSandboxBackendStatus::Available)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let plan = fake_sandbox_plan("macos-sandbox-exec", false);
+    let run = ShellRunOutcome {
+        exit_status: Some(std::process::ExitStatus::from_raw(71 << 8)),
+        timed_out: false,
+        stdout_bytes: Vec::new(),
+        stdout_truncated: false,
+        stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
+        stderr_truncated: false,
+        preserved_env: Vec::new(),
+    };
+
+    let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
+        .expect("best effort runtime fallback reason");
+
+    assert!(reason.contains("failed at runtime"), "{reason}");
+    assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
+fn shell_checkpoint_policy_skips_read_only_commands() {
+    let ls = analyze_shell_command("ls -la");
+    assert!(!shell_command_needs_checkpoint(false, &ls));
+
+    let git_status = analyze_shell_command("git status --short");
+    assert!(!shell_command_needs_checkpoint(false, &git_status));
+
+    let write = analyze_shell_command("printf created > created.txt");
+    assert!(shell_command_needs_checkpoint(false, &write));
+    assert!(!shell_command_needs_checkpoint(true, &write));
 }
 
 #[test]

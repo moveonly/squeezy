@@ -28,23 +28,23 @@ model = ""
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
 base_url = "https://api.openai.com/v1"
-default_model = "gpt-5-nano"
+default_model = "gpt-5.5"
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
 base_url = "https://api.anthropic.com/v1"
-default_model = "claude-haiku-4-5-20251001"
+default_model = "claude-opus-4-7"
 
 [providers.google]
 api_key_env = "GEMINI_API_KEY"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
-default_model = "gemini-2.5-flash-lite"
+default_model = "gemini-2.5-pro"
 
 [providers.azure_openai]
 api_key_env = "AZURE_OPENAI_API_KEY"
 base_url = "https://RESOURCE.openai.azure.com/openai/v1"
 api_version = "v1"
-default_model = "gpt-5-nano"
+default_model = "gpt-5.5"
 
 [providers.bedrock]
 region = "us-east-1"
@@ -52,10 +52,18 @@ default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
 
 [providers.ollama]
 base_url = "http://localhost:11434/api"
-default_model = "qwen3"
+default_model = "qwen3-coder"
 ```
 
 `model = ""` means Squeezy uses the selected provider default. `profile` is recorded and exposed to telemetry/model selection surfaces; current accepted values are `cheap`, `balanced`, and `strong`.
+
+On first interactive startup, when no provider/model choice has been saved,
+Squeezy detects available API-key environment variables (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, and Azure variants)
+plus local Ollama availability. It asks for provider/token, model, and supported
+model options such as OpenAI reasoning effort, then saves only the environment
+variable name and selected defaults to `~/.squeezy/settings.toml`. Secret token
+values are never written. Use `--no-default` to run the selector again.
 
 ## CLI
 
@@ -74,12 +82,12 @@ estimate assembled-request size without starting a model turn:
 
 | Provider | Default model | Context window | Max output |
 | --- | --- | ---: | ---: |
-| `openai` | `gpt-5-nano` | 400,000 | 128,000 |
-| `azure_openai` | `gpt-5-nano` | 400,000 | 128,000 |
-| `anthropic` | `claude-haiku-4-5-20251001` | 200,000 | 64,000 |
+| `openai` | `gpt-5.5` | 400,000 | 128,000 |
+| `azure_openai` | `gpt-5.5` | 400,000 | 128,000 |
+| `anthropic` | `claude-opus-4-7` | 200,000 | 64,000 |
 | `bedrock` | `anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
-| `google` | `gemini-2.5-flash-lite` | 1,048,576 | 65,536 |
-| `ollama` | `qwen3` | Runtime | Runtime |
+| `google` | `gemini-2.5-pro` | 1,048,576 | 65,536 |
+| `ollama` | `qwen3-coder` | Runtime | Runtime |
 
 Ollama limits are local model metadata. Squeezy tries `/api/show` and uses
 `model_info.*.context_length` or `num_ctx` when available; otherwise the

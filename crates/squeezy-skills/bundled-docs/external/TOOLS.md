@@ -37,7 +37,8 @@ configured as core tools, and some are discoverable through lazy schema loading.
 - `list_skills`, `load_skill`: discover and activate local `SKILL.md`
   instructions.
 - `checkpoint_list`, `checkpoint_show`, `checkpoint_undo`,
-  `checkpoint_revert`: inspect and roll back recent mutating tool checkpoints.
+  `checkpoint_revert`: inspect and roll back recent mutating tool checkpoints
+  when checkpointing is enabled.
 - `websearch`, `webfetch`: permission-gated external lookup through configured
   web tooling.
 - External MCP tools are namespaced by server and follow each server's

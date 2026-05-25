@@ -38,7 +38,7 @@ fn registry_estimates_known_model_costs() {
 
     let estimate = estimate_cost("openai", squeezy_core::DEFAULT_OPENAI_MODEL, &cost);
 
-    assert_eq!(estimate, Some(405_000));
+    assert_eq!(estimate, Some(30_500_000));
 }
 
 #[test]
@@ -100,10 +100,7 @@ fn registry_lists_context_limits_for_hosted_defaults() {
 
     let anthropic =
         model_info_for("anthropic", squeezy_core::DEFAULT_ANTHROPIC_MODEL).expect("anthropic");
-    assert_eq!(
-        squeezy_core::DEFAULT_ANTHROPIC_MODEL,
-        "claude-haiku-4-5-20251001"
-    );
+    assert_eq!(squeezy_core::DEFAULT_ANTHROPIC_MODEL, "claude-opus-4-7");
     assert_eq!(anthropic.limits.unwrap().context_window_tokens, 200_000);
     assert_eq!(anthropic.limits.unwrap().max_output_tokens, 64_000);
 
@@ -119,6 +116,32 @@ fn registry_lists_context_limits_for_hosted_defaults() {
 
     let ollama = model_info_for("ollama", squeezy_core::DEFAULT_OLLAMA_MODEL).expect("ollama");
     assert!(ollama.limits.is_none());
+}
+
+#[test]
+fn registry_lists_three_tiers_for_major_hosted_providers() {
+    for provider in ["openai", "anthropic", "google"] {
+        let models = models_for_provider(provider).collect::<Vec<_>>();
+        assert!(
+            models.len() >= 3,
+            "{provider} should expose at least three selectable models"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.profile == squeezy_core::ModelProfile::Strong)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.profile == squeezy_core::ModelProfile::Balanced)
+        );
+        assert!(
+            models
+                .iter()
+                .any(|model| model.profile == squeezy_core::ModelProfile::Cheap)
+        );
+    }
 }
 
 #[test]

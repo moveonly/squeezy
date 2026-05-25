@@ -435,7 +435,7 @@ async fn run_replay(task: &TaskSpec, tasks_dir: &Path) -> Result<RunnerOutput> {
         ))
     })?;
     let mut config = AppConfig::from_env();
-    config.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+    config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     let provider = replay.provider.as_deref().unwrap_or("mock-openai");
     let model = replay.model.clone().unwrap_or_else(|| provider.to_string());
     let mode = replay.mode.unwrap_or(SessionMode::Build);
@@ -462,7 +462,7 @@ async fn run_planner_probe(
     let provider = Arc::new(PlannerProbeProvider::new(task, baseline));
     let mut config = AppConfig::from_env();
     config.model = runner.name().to_string();
-    config.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+    config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     config.exploration_compiler = exploration_compiler;
     run_agent_with_config(task, runner, provider, config).await
 }
@@ -476,7 +476,7 @@ async fn run_costly(
     require_costly(provider_name)?;
     let mut config = AppConfig::from_env_with_provider(provider_name);
     config.model = costly_model(provider_name);
-    config.max_output_tokens = Some(costly_max_output_tokens()?);
+    config.max_output_tokens = costly_max_output_tokens()?;
 
     let provider = provider_from_config(&config)?;
     let output = run_agent_with_config(task, runner, provider, config).await?;
@@ -561,7 +561,7 @@ async fn run_agent(
 ) -> Result<RunnerOutput> {
     let mut config = AppConfig::from_env();
     config.model = runner.name().to_string();
-    config.max_output_tokens = Some(DEFAULT_MAX_OUTPUT_TOKENS);
+    config.max_output_tokens = DEFAULT_MAX_OUTPUT_TOKENS;
     run_agent_with_config(task, runner, provider, config).await
 }
 
@@ -1137,7 +1137,7 @@ fn costly_model(provider: &str) -> String {
     }
 }
 
-fn costly_max_output_tokens() -> Result<u32> {
+fn costly_max_output_tokens() -> Result<Option<u32>> {
     let Ok(raw) = std::env::var("SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS") else {
         return Ok(DEFAULT_MAX_OUTPUT_TOKENS);
     };
@@ -1151,7 +1151,7 @@ fn costly_max_output_tokens() -> Result<u32> {
             "SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS must be greater than 0".to_string(),
         ));
     }
-    Ok(parsed)
+    Ok(Some(parsed))
 }
 
 fn sanitize(value: &str) -> String {

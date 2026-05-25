@@ -53,6 +53,7 @@ use tree_sitter::{Node, Parser};
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
+const CHECKPOINTS_DISABLED_MESSAGE: &str = "checkpointing is disabled by default; commit or stash with git, or set [tools].checkpoints_enabled = true to re-enable Squeezy checkpoints";
 const DEFAULT_MAX_MATCHES: usize = 100;
 const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
 const DEFAULT_READ_LIMIT: usize = 32_000;
@@ -178,6 +179,7 @@ pub struct ToolRuntimeConfig {
     pub web: WebToolConfig,
     pub shell_sandbox: ShellSandboxConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    pub checkpoints_enabled: bool,
 }
 
 impl Default for ToolOutputConfig {
@@ -463,13 +465,14 @@ pub struct ToolRegistry {
     /// (or `new_with_configs_skills_and_mcp`) with a populated
     /// [`ToolRegistryRuntime`].
     state_store: Option<Arc<SqueezyStore>>,
-    checkpoints: Arc<CheckpointStore>,
+    checkpoints: Option<Arc<CheckpointStore>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     skills: Arc<SkillCatalog>,
     redactor: Arc<Redactor>,
     crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
     shell_sandbox: Arc<ShellSandboxConfig>,
+    shell_sandbox_health: Arc<ShellSandboxHealth>,
     shell_audit: Arc<ShellAuditStore>,
     mcp: Arc<McpClientRegistry>,
 }
@@ -494,6 +497,7 @@ struct CachedDiffSnapshot {
 
 const SHELL_AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SHELL_AUDIT_RETAINED_ROTATIONS: usize = 4;
+const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Append-only JSONL store for shell audit records.
 ///
@@ -568,6 +572,50 @@ impl ShellAuditStore {
 }
 
 #[derive(Debug, Clone)]
+enum ShellSandboxBackendStatus {
+    Available,
+    Unavailable(String),
+}
+
+#[derive(Debug, Default)]
+struct ShellSandboxHealth {
+    backends: StdMutex<HashMap<&'static str, ShellSandboxBackendStatus>>,
+}
+
+impl ShellSandboxHealth {
+    fn status(&self, backend: &'static str) -> Option<ShellSandboxBackendStatus> {
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(backend)
+            .cloned()
+    }
+
+    fn mark_available(&self, backend: &'static str) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(backend, ShellSandboxBackendStatus::Available);
+    }
+
+    fn mark_unavailable(&self, backend: &'static str, reason: impl Into<String>) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                backend,
+                ShellSandboxBackendStatus::Unavailable(reason.into()),
+            );
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ShellSandboxPlan {
     program: String,
     args: Vec<String>,
@@ -582,10 +630,36 @@ struct ShellSandboxPlan {
     filesystem_read_roots: Vec<PathBuf>,
     #[allow(dead_code)]
     filesystem_write_roots: Vec<PathBuf>,
+    fallback_reason: Option<String>,
+}
+
+struct ShellRunOutcome {
+    exit_status: Option<std::process::ExitStatus>,
+    timed_out: bool,
+    stdout_bytes: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_bytes: Vec<u8>,
+    stderr_truncated: bool,
+    preserved_env: Vec<String>,
+}
+
+enum ShellRunError {
+    Cancelled,
+    SandboxStartDenied(String),
+    Io(std::io::Error),
 }
 
 impl ShellSandboxPlan {
     fn direct(command: &str, mode: ShellSandboxMode, config: &ShellSandboxConfig) -> Self {
+        Self::direct_with_fallback(command, mode, config, None)
+    }
+
+    fn direct_with_fallback(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+        fallback_reason: Option<String>,
+    ) -> Self {
         Self {
             program: "sh".to_string(),
             args: vec!["-lc".to_string(), command.to_string()],
@@ -598,6 +672,7 @@ impl ShellSandboxPlan {
             configured_write_roots: config.write_roots.clone(),
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
+            fallback_reason,
         }
     }
 
@@ -610,6 +685,7 @@ impl ShellSandboxPlan {
             "required": self.required,
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
+            "fallback_reason": self.fallback_reason,
         })
     }
 }
@@ -714,6 +790,7 @@ impl ToolRegistry {
                 web: web_config,
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
+                checkpoints_enabled: false,
             },
             skills,
             crawl_options_from_graph_config(graph_config),
@@ -762,6 +839,7 @@ impl ToolRegistry {
                 web: web_config,
                 shell_sandbox,
                 mcp_servers: BTreeMap::new(),
+                checkpoints_enabled: false,
             },
             skills,
             crawl_options,
@@ -795,7 +873,11 @@ impl ToolRegistry {
         .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
-        let checkpoints = CheckpointStore::open(&root)?;
+        let checkpoints = if config.checkpoints_enabled {
+            Some(Arc::new(CheckpointStore::open(&root)?))
+        } else {
+            None
+        };
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -804,13 +886,14 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store,
-            checkpoints: Arc::new(checkpoints),
+            checkpoints,
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
             shell_sandbox: Arc::new(config.shell_sandbox),
+            shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             mcp: Arc::new(McpClientRegistry::new(config.mcp_servers)),
         })
@@ -835,7 +918,6 @@ impl ToolRegistry {
                 .ok();
         let vcs = GitVcs::open(&root)?;
         let shell_audit = ShellAuditStore::new(&root);
-        let checkpoints = CheckpointStore::open(&root)?;
         Ok(Self {
             root: Arc::new(root),
             output_store: Arc::new(output_store),
@@ -844,13 +926,14 @@ impl ToolRegistry {
             graph: Arc::new(StdMutex::new(graph)),
             vcs: Arc::new(vcs),
             state_store: None,
-            checkpoints: Arc::new(checkpoints),
+            checkpoints: None,
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
             shell_sandbox: Arc::new(ShellSandboxConfig::default()),
+            shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
         })
@@ -899,7 +982,15 @@ impl ToolRegistry {
                 &self.shell_sandbox,
             )),
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
-                prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)
+                let plan =
+                    prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
+                apply_shell_sandbox_backend_health(
+                    command,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                    plan,
+                    shell_sandbox_backend_probe_failure,
+                )
             }
         }
     }
@@ -1008,10 +1099,6 @@ impl ToolRegistry {
     pub fn specs(&self) -> Vec<ToolSpec> {
         let mut specs = vec![
             apply_patch_spec(),
-            checkpoint_list_spec(),
-            checkpoint_revert_spec(),
-            checkpoint_show_spec(),
-            checkpoint_undo_spec(),
             decl_search_spec(),
             definition_search_spec(),
             diff_context_spec(),
@@ -1036,6 +1123,14 @@ impl ToolRegistry {
             list_skills_spec(),
             load_skill_spec(),
         ];
+        if self.checkpoints.is_some() {
+            specs.extend([
+                checkpoint_list_spec(),
+                checkpoint_revert_spec(),
+                checkpoint_show_spec(),
+                checkpoint_undo_spec(),
+            ]);
+        }
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
         specs.sort_by(|left, right| left.name.cmp(&right.name));
         specs
@@ -1702,7 +1797,21 @@ impl ToolRegistry {
         if let Err(err) = serde_json::from_value::<CheckpointListArgs>(call.arguments.clone()) {
             return tool_arg_error(call, err);
         }
-        match self.checkpoints.read_journal() {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "enabled": false,
+                    "checkpoints": [],
+                    "journal_warnings": 0,
+                    "message": CHECKPOINTS_DISABLED_MESSAGE,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        match checkpoints.read_journal() {
             Ok(journal) => {
                 let mut checkpoints = journal.checkpoints;
                 checkpoints.sort_by_key(|record| std::cmp::Reverse(record.created_at_ms));
@@ -1729,7 +1838,10 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self.checkpoints.show_checkpoint(&args.checkpoint_id) {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.show_checkpoint(&args.checkpoint_id) {
             Ok(Some(checkpoint)) => make_result(
                 call,
                 ToolStatus::Success,
@@ -1756,10 +1868,10 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        match self
-            .checkpoints
-            .rollback(RollbackTarget::Latest, args.mode.unwrap_or_default())
-        {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.rollback(RollbackTarget::Latest, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 make_result(
@@ -1793,10 +1905,10 @@ impl ToolRegistry {
                 );
             }
         };
-        match self
-            .checkpoints
-            .rollback(target, args.mode.unwrap_or_default())
-        {
+        let Some(checkpoints) = self.checkpoints.as_ref() else {
+            return checkpoints_disabled_result(call);
+        };
+        match checkpoints.rollback(target, args.mode.unwrap_or_default()) {
             Ok(result) => {
                 self.invalidate_diff_cache();
                 make_result(
@@ -2268,11 +2380,23 @@ impl ToolRegistry {
         refresh: &squeezy_graph::RefreshReport,
     ) -> ToolResult {
         let graph = manager.graph();
+        if !decl_search_has_query_or_filter(&args) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "decl_search requires a query or at least one filter",
+                    "retry": "provide query, kind, language, path, visibility, or attribute",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let max_results = graph_limit(args.max_results);
         let offset = args.offset.unwrap_or(0);
         let symbols = graph_symbol_search(
             graph,
-            &args.query,
+            args.query.as_deref(),
             args.kind.as_deref(),
             args.path.as_deref(),
             args.language.as_deref(),
@@ -2292,12 +2416,21 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         let mut payload = graph_payload("decl_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
+        payload.insert("kind".to_string(), json!(args.kind));
+        payload.insert("language".to_string(), json!(args.language));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), Some(&args.query)),
+            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
         );
         payload.insert("offset".to_string(), json!(offset));
+        payload.insert("total_matches".to_string(), json!(symbols.len()));
+        payload.insert("returned_matches".to_string(), json!(selected.len()));
+        payload.insert(
+            "counts_by_language".to_string(),
+            decl_counts_by_language(graph, &symbols),
+        );
+        payload.insert("counts_by_kind".to_string(), decl_counts_by_kind(&symbols));
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
             call,
@@ -2577,14 +2710,21 @@ impl ToolRegistry {
         let max_results = graph_limit(args.max_results);
         let path_filter = args.path.as_deref();
         let diff_only = args.diff_only.unwrap_or(false);
-        let mut symbols =
-            graph_symbol_search(graph, &args.query, None, path_filter, None, None, None)
-                .into_iter()
-                .filter(|symbol| {
-                    !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
-                })
-                .take(max_results)
-                .collect::<Vec<_>>();
+        let mut symbols = graph_symbol_search(
+            graph,
+            Some(&args.query),
+            None,
+            path_filter,
+            None,
+            None,
+            None,
+        )
+        .into_iter()
+        .filter(|symbol| {
+            !diff_only || symbol.dirty.is_some() || dirty_paths.contains(&symbol.file_id.0)
+        })
+        .take(max_results)
+        .collect::<Vec<_>>();
         if symbols.is_empty() && diff_only {
             symbols = graph
                 .dirty_symbols()
@@ -4212,10 +4352,11 @@ impl ToolRegistry {
                     call,
                     ToolStatus::Stale,
                     json!({
-                        "error": "search text matched more than once; set allow_multiple=true to replace all matches",
+                        "error": "search text matched more than once; narrow the search text or set allow_multiple=true to replace all matches",
                         "path": rel,
                         "patch_index": index,
                         "matches": matches,
+                        "match_contexts": patch_match_contexts(&state.current, &patch.search, 5),
                     }),
                     ToolCostHint::default(),
                     Some(state.before_sha256.clone()),
@@ -4281,7 +4422,7 @@ impl ToolRegistry {
             );
         }
 
-        let checkpoint_before = match self.checkpoints.track_tree() {
+        let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
@@ -4313,7 +4454,7 @@ impl ToolRegistry {
             });
             self.append_checkpoint_to_content(
                 &mut error_content,
-                &checkpoint_before,
+                checkpoint_before.as_ref(),
                 call,
                 group_id,
                 ToolStatus::Error,
@@ -4342,7 +4483,7 @@ impl ToolRegistry {
         });
         self.append_checkpoint_to_content(
             &mut content,
-            &checkpoint_before,
+            checkpoint_before.as_ref(),
             call,
             group_id,
             ToolStatus::Success,
@@ -4417,12 +4558,28 @@ impl ToolRegistry {
             );
         }
 
-        let command = verify_command(&self.root, scope, level, &changed_paths);
+        let Some(plan) = verify_command_plan(&self.root, scope, level, &changed_paths) else {
+            return make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "scope": verify_scope_str(scope),
+                    "level": verify_level_str(level),
+                    "changed_files": changed_paths,
+                    "command": null,
+                    "no_op": true,
+                    "not_run": true,
+                    "reason": "no Cargo.toml found for Rust verification",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
         let shell_call = ToolCall {
             call_id: call.call_id.clone(),
             name: "shell".to_string(),
             arguments: json!({
-                "command": command,
+                "command": plan.command,
                 "description": "run verification scoped by current diff",
                 "timeout_ms": VERIFY_SHELL_TIMEOUT_MS,
                 "output_byte_cap": DEFAULT_SHELL_OUTPUT_BYTE_CAP,
@@ -4467,7 +4624,7 @@ impl ToolRegistry {
             );
         }
 
-        let checkpoint_before = match self.checkpoints.track_tree() {
+        let checkpoint_before = match self.track_checkpoint_tree() {
             Ok(snapshot) => snapshot,
             Err(err) => return tool_error(call, err),
         };
@@ -4512,7 +4669,7 @@ impl ToolRegistry {
         });
         self.append_checkpoint_to_content(
             &mut content,
-            &checkpoint_before,
+            checkpoint_before.as_ref(),
             call,
             group_id,
             ToolStatus::Success,
@@ -4556,6 +4713,7 @@ impl ToolRegistry {
                 "shell output_byte_cap must be at least 1",
             );
         }
+        let direct_user_shell = args.direct_user_shell && call.call_id.starts_with("local-shell-");
         let workdir = match self.resolve_shell_workdir(args.workdir.as_deref().unwrap_or(".")) {
             Ok(path) => path,
             Err(err) => {
@@ -4574,9 +4732,15 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
-        let checkpoint_before = match self.checkpoints.track_tree() {
-            Ok(snapshot) => snapshot,
-            Err(err) => return tool_error(call, err),
+        let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis)
+            && self.checkpoints.is_some()
+        {
+            match self.track_checkpoint_tree() {
+                Ok(snapshot) => snapshot,
+                Err(err) => return tool_error(call, err),
+            }
+        } else {
+            None
         };
         let coverage_warnings = shell_coverage_warnings(&args.command);
 
@@ -4602,78 +4766,37 @@ impl ToolRegistry {
             return shell_policy_denied(call, &analysis, reason);
         }
 
-        let sandbox_plan = match self.prepare_shell_sandbox(&args.command, &analysis) {
-            Ok(plan) => plan,
-            Err(reason) => {
-                self.audit_shell(
-                    call,
-                    &args,
-                    &workdir,
-                    &analysis,
-                    shell_sandbox_status_metadata(&self.shell_sandbox, "unavailable"),
-                    timeout_ms,
-                    output_cap,
-                    "denied",
-                    Some(&reason),
-                    None,
-                    &[],
-                    &[],
-                );
-                return shell_policy_denied(call, &analysis, reason);
+        let mut sandbox_plan = if direct_user_shell {
+            ShellSandboxPlan::direct(&args.command, ShellSandboxMode::Off, &self.shell_sandbox)
+        } else {
+            match self.prepare_shell_sandbox(&args.command, &analysis) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        shell_sandbox_status_metadata(&self.shell_sandbox, "unavailable"),
+                        timeout_ms,
+                        output_cap,
+                        "denied",
+                        Some(&reason),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return shell_policy_denied(call, &analysis, reason);
+                }
             }
         };
 
-        let mut command = Command::new(&sandbox_plan.program);
-        command
-            .args(&sandbox_plan.args)
-            .current_dir(&workdir)
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        configure_shell_process_group(&mut command);
-        configure_linux_shell_sandbox(&mut command, &sandbox_plan);
-        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) if sandbox_plan.required => {
-                let reason = format!(
-                    "shell sandbox backend {} failed to start: {err}",
-                    sandbox_plan.backend
-                );
-                self.audit_shell(
-                    call,
-                    &args,
-                    &workdir,
-                    &analysis,
-                    sandbox_plan.metadata(),
-                    timeout_ms,
-                    output_cap,
-                    "denied",
-                    Some(&reason),
-                    None,
-                    &[],
-                    &[],
-                );
-                return shell_policy_denied(call, &analysis, reason);
-            }
-            Err(err) => return tool_error(call, err),
-        };
-
-        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
-        let stdout_task = tokio::spawn(read_limited_pipe(
-            child.stdout.take(),
-            remaining_output_bytes.clone(),
-        ));
-        let stderr_task = tokio::spawn(read_limited_pipe(
-            child.stderr.take(),
-            remaining_output_bytes,
-        ));
-
-        let status = tokio::select! {
-            _ = cancel.cancelled() => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
-                stdout_task.abort();
-                stderr_task.abort();
+        let mut run = match self
+            .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+            .await
+        {
+            Ok(run) => run,
+            Err(ShellRunError::Cancelled) => {
                 self.audit_shell(
                     call,
                     &args,
@@ -4690,27 +4813,101 @@ impl ToolRegistry {
                 );
                 return ToolResult::cancelled(call);
             }
-            result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
-        };
-
-        let timed_out = status.is_err();
-        let exit_status = match status {
-            Ok(Ok(status)) => Some(status),
-            Err(_) => {
-                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
-                None
+            Err(ShellRunError::SandboxStartDenied(reason)) => {
+                self.audit_shell(
+                    call,
+                    &args,
+                    &workdir,
+                    &analysis,
+                    sandbox_plan.metadata(),
+                    timeout_ms,
+                    output_cap,
+                    "denied",
+                    Some(&reason),
+                    None,
+                    &[],
+                    &[],
+                );
+                return shell_policy_denied(call, &analysis, reason);
             }
-            Ok(Err(err)) => return tool_error(call, err),
+            Err(ShellRunError::Io(err)) => return tool_error(call, err),
         };
+        if let Some(reason) = shell_sandbox_best_effort_fallback_reason(&sandbox_plan, &run) {
+            let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+            self.audit_shell(
+                call,
+                &args,
+                &workdir,
+                &analysis,
+                sandbox_plan.metadata(),
+                timeout_ms,
+                output_cap,
+                "fallback",
+                Some(&reason),
+                exit_code,
+                &run.stdout_bytes,
+                &run.stderr_bytes,
+            );
+            self.shell_sandbox_health
+                .mark_unavailable(sandbox_plan.backend, reason.clone());
+            sandbox_plan = ShellSandboxPlan::direct_with_fallback(
+                &args.command,
+                self.shell_sandbox.mode,
+                &self.shell_sandbox,
+                Some(reason),
+            );
+            run = match self
+                .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+                .await
+            {
+                Ok(run) => run,
+                Err(ShellRunError::Cancelled) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        sandbox_plan.metadata(),
+                        timeout_ms,
+                        output_cap,
+                        "cancelled",
+                        Some("shell command cancelled"),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return ToolResult::cancelled(call);
+                }
+                Err(ShellRunError::SandboxStartDenied(reason)) => {
+                    self.audit_shell(
+                        call,
+                        &args,
+                        &workdir,
+                        &analysis,
+                        sandbox_plan.metadata(),
+                        timeout_ms,
+                        output_cap,
+                        "denied",
+                        Some(&reason),
+                        None,
+                        &[],
+                        &[],
+                    );
+                    return shell_policy_denied(call, &analysis, reason);
+                }
+                Err(ShellRunError::Io(err)) => return tool_error(call, err),
+            };
+        }
 
-        let (stdout_bytes, stdout_truncated) = match join_limited_pipe(stdout_task).await {
-            Ok(output) => output,
-            Err(err) => return tool_error(call, err),
-        };
-        let (stderr_bytes, stderr_truncated) = match join_limited_pipe(stderr_task).await {
-            Ok(output) => output,
-            Err(err) => return tool_error(call, err),
-        };
+        let ShellRunOutcome {
+            exit_status,
+            timed_out,
+            stdout_bytes,
+            stdout_truncated,
+            stderr_bytes,
+            stderr_truncated,
+            preserved_env,
+        } = run;
 
         let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
         let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
@@ -4726,6 +4923,7 @@ impl ToolRegistry {
             ..ToolCostHint::default()
         };
         let exit_code = exit_status.as_ref().and_then(|status| status.code());
+        let exit_signal = shell_exit_signal(exit_status.as_ref());
         if sandbox_plan.required
             && shell_sandbox_runtime_unavailable(&sandbox_plan, exit_code, &stderr)
         {
@@ -4733,6 +4931,8 @@ impl ToolRegistry {
                 "required shell sandbox backend {} failed at runtime",
                 sandbox_plan.backend
             );
+            self.shell_sandbox_health
+                .mark_unavailable(sandbox_plan.backend, reason.clone());
             self.audit_shell(
                 call,
                 &args,
@@ -4754,7 +4954,8 @@ impl ToolRegistry {
         } else {
             ToolStatus::Error
         };
-        let error = timed_out.then(|| format!("shell command timed out after {timeout_ms} ms"));
+        let termination = shell_termination_reason(timed_out, timeout_ms, exit_code, exit_signal);
+        let error = termination.clone();
         self.audit_shell(
             call,
             &args,
@@ -4781,6 +4982,8 @@ impl ToolRegistry {
             "command": args.command,
             "workdir": self.relative(&workdir).to_string_lossy(),
             "exit_code": exit_code,
+            "signal": exit_signal,
+            "termination": termination,
             "stdout": stdout,
             "stderr": stderr,
             "error": error,
@@ -4793,6 +4996,7 @@ impl ToolRegistry {
                 "destructive": analysis.destructive,
                 "parser_backed": analysis.parser_backed,
                 "dynamic": analysis.dynamic,
+                "direct_user_shell": direct_user_shell,
                 "timeout_ms": timeout_ms,
                 "output_byte_cap": output_cap,
             },
@@ -4803,14 +5007,16 @@ impl ToolRegistry {
                 "preserved": preserved_env,
             },
         });
-        self.append_checkpoint_to_content(
-            &mut raw_content,
-            &checkpoint_before,
-            call,
-            group_id,
-            status,
-            coverage_warnings,
-        );
+        if let Some(checkpoint_before) = checkpoint_before.as_ref() {
+            self.append_checkpoint_to_content(
+                &mut raw_content,
+                Some(checkpoint_before),
+                call,
+                group_id,
+                status,
+                coverage_warnings,
+            );
+        }
         let raw_result = make_result(call, status, raw_content.clone(), cost.clone(), None);
         let raw_output = raw_result.model_output();
         let raw_output_sha256 = raw_result.receipt.output_sha256.clone();
@@ -4841,6 +5047,83 @@ impl ToolRegistry {
         let mut shaped_result = make_result(call, status, content, cost, None);
         shaped_result.receipt.output_sha256 = raw_output_sha256;
         shaped_result.with_spill_model_output(raw_output)
+    }
+
+    async fn run_shell_plan(
+        &self,
+        sandbox_plan: &ShellSandboxPlan,
+        workdir: &Path,
+        timeout_ms: u64,
+        output_cap: usize,
+        cancel: &CancellationToken,
+    ) -> std::result::Result<ShellRunOutcome, ShellRunError> {
+        let mut command = Command::new(&sandbox_plan.program);
+        command
+            .args(&sandbox_plan.args)
+            .current_dir(workdir)
+            .kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_shell_process_group(&mut command);
+        configure_linux_shell_sandbox(&mut command, sandbox_plan);
+        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) if sandbox_plan.required => {
+                return Err(ShellRunError::SandboxStartDenied(format!(
+                    "shell sandbox backend {} failed to start: {err}",
+                    sandbox_plan.backend
+                )));
+            }
+            Err(err) => return Err(ShellRunError::Io(err)),
+        };
+
+        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
+        let stdout_task = tokio::spawn(read_limited_pipe(
+            child.stdout.take(),
+            remaining_output_bytes.clone(),
+        ));
+        let stderr_task = tokio::spawn(read_limited_pipe(
+            child.stderr.take(),
+            remaining_output_bytes,
+        ));
+
+        let status = tokio::select! {
+            _ = cancel.cancelled() => {
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                stdout_task.abort();
+                stderr_task.abort();
+                return Err(ShellRunError::Cancelled);
+            }
+            result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
+        };
+
+        let timed_out = status.is_err();
+        let exit_status = match status {
+            Ok(Ok(status)) => Some(status),
+            Err(_) => {
+                terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                None
+            }
+            Ok(Err(err)) => return Err(ShellRunError::Io(err)),
+        };
+
+        let (stdout_bytes, stdout_truncated) = join_limited_pipe(stdout_task)
+            .await
+            .map_err(ShellRunError::Io)?;
+        let (stderr_bytes, stderr_truncated) = join_limited_pipe(stderr_task)
+            .await
+            .map_err(ShellRunError::Io)?;
+
+        Ok(ShellRunOutcome {
+            exit_status,
+            timed_out,
+            stdout_bytes,
+            stdout_truncated,
+            stderr_bytes,
+            stderr_truncated,
+            preserved_env,
+        })
     }
 
     async fn execute_websearch(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
@@ -5267,16 +5550,26 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
+    fn track_checkpoint_tree(&self) -> Result<Option<WorkspaceSnapshot>> {
+        self.checkpoints
+            .as_ref()
+            .map(|checkpoints| checkpoints.track_tree())
+            .transpose()
+    }
+
     fn append_checkpoint_to_content(
         &self,
         content: &mut Value,
-        before: &WorkspaceSnapshot,
+        before: Option<&WorkspaceSnapshot>,
         call: &ToolCall,
         group_id: &str,
         status: ToolStatus,
         coverage_warnings: Vec<String>,
     ) {
-        match self.checkpoints.create_checkpoint(
+        let (Some(checkpoints), Some(before)) = (self.checkpoints.as_ref(), before) else {
+            return;
+        };
+        match checkpoints.create_checkpoint(
             before,
             &call.name,
             &call.call_id,
@@ -6546,6 +6839,19 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             parser_backed,
             dynamic,
         }
+    } else if segments
+        .iter()
+        .all(|segment| is_read_only_shell_segment(segment))
+    {
+        ShellPermissionAnalysis {
+            capability: PermissionCapability::Search,
+            risk: PermissionRisk::Low,
+            rule_target: format!("{first}:*"),
+            network: false,
+            destructive: false,
+            parser_backed,
+            dynamic,
+        }
     } else {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
@@ -7239,6 +7545,13 @@ fn is_git_read_only_segment(segment: &str) -> bool {
     )
 }
 
+fn is_read_only_shell_segment(segment: &str) -> bool {
+    matches!(
+        shell_command_prefix(segment).as_str(),
+        "ls" | "pwd" | "cat" | "head" | "tail" | "wc" | "file" | "stat" | "du" | "grep" | "rg"
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct GlobArgs {
     pattern: String,
@@ -7359,7 +7672,7 @@ struct RepoMapArgs {
 
 #[derive(Debug, Deserialize)]
 struct DeclSearchArgs {
-    query: String,
+    query: Option<String>,
     kind: Option<String>,
     path: Option<String>,
     language: Option<String>,
@@ -7552,6 +7865,8 @@ struct ShellArgs {
     output_byte_cap: Option<usize>,
     output_mode: Option<OutputMode>,
     description: Option<String>,
+    #[serde(default)]
+    direct_user_shell: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -8356,7 +8671,87 @@ fn is_rust_verification_path(path: &str) -> bool {
     path.ends_with(".rs") || path.ends_with("Cargo.toml") || path.ends_with("Cargo.lock")
 }
 
+#[cfg(test)]
 fn verify_command(
+    root: &Path,
+    scope: VerifyScope,
+    level: VerifyLevel,
+    changed_paths: &[String],
+) -> String {
+    verify_command_plan(root, scope, level, changed_paths)
+        .map(|plan| plan.command)
+        .unwrap_or_else(|| match level {
+            VerifyLevel::Quick => "cargo test --workspace --message-format=json".to_string(),
+            VerifyLevel::Full => "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && cargo test --workspace --message-format=json".to_string(),
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifyCommandPlan {
+    command: String,
+}
+
+fn verify_command_plan(
+    root: &Path,
+    scope: VerifyScope,
+    level: VerifyLevel,
+    changed_paths: &[String],
+) -> Option<VerifyCommandPlan> {
+    if root.join("Cargo.toml").is_file() {
+        return Some(VerifyCommandPlan {
+            command: workspace_verify_command(root, scope, level, changed_paths),
+        });
+    }
+
+    let manifest_paths = match scope {
+        VerifyScope::Workspace => nested_manifest_paths(root),
+        VerifyScope::Diff => diff_manifest_paths(root, changed_paths),
+    };
+    if manifest_paths.is_empty() {
+        return None;
+    }
+    let test_commands = manifest_paths
+        .iter()
+        .map(|manifest| {
+            format!(
+                "cargo test --manifest-path {} --message-format=json",
+                shell_quote(&manifest.to_string_lossy())
+            )
+        })
+        .collect::<Vec<_>>();
+    let command = match level {
+        VerifyLevel::Quick => test_commands.join(" && "),
+        VerifyLevel::Full => {
+            let fmt_commands = manifest_paths
+                .iter()
+                .map(|manifest| {
+                    format!(
+                        "cargo fmt --check --manifest-path {}",
+                        shell_quote(&manifest.to_string_lossy())
+                    )
+                })
+                .collect::<Vec<_>>();
+            let clippy_commands = manifest_paths
+                .iter()
+                .map(|manifest| {
+                    format!(
+                        "cargo clippy --manifest-path {} --all-targets --message-format=json -- -D warnings",
+                        shell_quote(&manifest.to_string_lossy())
+                    )
+                })
+                .collect::<Vec<_>>();
+            fmt_commands
+                .into_iter()
+                .chain(clippy_commands)
+                .chain(test_commands)
+                .collect::<Vec<_>>()
+                .join(" && ")
+        }
+    };
+    Some(VerifyCommandPlan { command })
+}
+
+fn workspace_verify_command(
     root: &Path,
     scope: VerifyScope,
     level: VerifyLevel,
@@ -8387,6 +8782,64 @@ fn verify_command(
         VerifyLevel::Full => format!(
             "cargo fmt --check && cargo clippy --workspace --all-targets --message-format=json -- -D warnings && {test_command}"
         ),
+    }
+}
+
+fn diff_manifest_paths(root: &Path, changed_paths: &[String]) -> Vec<PathBuf> {
+    changed_paths
+        .iter()
+        .filter(|path| is_rust_verification_path(path))
+        .filter_map(|path| nearest_manifest_for_path(root, path))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn nearest_manifest_for_path(root: &Path, path: &str) -> Option<PathBuf> {
+    let mut cursor = root.join(path);
+    if cursor.extension().is_some() {
+        cursor.pop();
+    }
+    loop {
+        let manifest = cursor.join("Cargo.toml");
+        if manifest.is_file() {
+            return manifest.strip_prefix(root).ok().map(Path::to_path_buf);
+        }
+        if cursor == root || !cursor.pop() {
+            return None;
+        }
+    }
+}
+
+fn nested_manifest_paths(root: &Path) -> Vec<PathBuf> {
+    let mut manifests = BTreeSet::new();
+    collect_nested_manifest_paths(root, root, &mut manifests);
+    manifests.into_iter().collect()
+}
+
+fn collect_nested_manifest_paths(root: &Path, dir: &Path, manifests: &mut BTreeSet<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        if matches!(
+            name.to_string_lossy().as_ref(),
+            ".git" | "target" | "node_modules"
+        ) {
+            continue;
+        }
+        let manifest = path.join("Cargo.toml");
+        if manifest.is_file()
+            && let Ok(relative) = manifest.strip_prefix(root)
+        {
+            manifests.insert(relative.to_path_buf());
+        }
+        collect_nested_manifest_paths(root, &path, manifests);
     }
 }
 
@@ -8688,37 +9141,141 @@ fn graph_limit(limit: Option<usize>) -> usize {
         .clamp(1, MAX_GRAPH_MAX_RESULTS)
 }
 
+fn decl_search_has_query_or_filter(args: &DeclSearchArgs) -> bool {
+    [
+        args.query.as_deref(),
+        args.kind.as_deref(),
+        args.path.as_deref(),
+        args.language.as_deref(),
+        args.visibility.as_deref(),
+        args.attribute.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| !value.trim().is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymbolKindFilter {
+    Single(SymbolKind),
+    Callable,
+}
+
+fn parse_symbol_kind_filter(value: &str) -> Option<SymbolKindFilter> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "callable" | "callables" | "function_like" | "function-like" | "functions"
+    ) {
+        return Some(SymbolKindFilter::Callable);
+    }
+    parse_symbol_kind(value).map(SymbolKindFilter::Single)
+}
+
+fn single_symbol_kind(filter: Option<SymbolKindFilter>) -> Option<SymbolKind> {
+    match filter {
+        Some(SymbolKindFilter::Single(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+fn symbol_matches_kind_filter(kind: SymbolKind, filter: Option<SymbolKindFilter>) -> bool {
+    match filter {
+        None => true,
+        Some(SymbolKindFilter::Single(expected)) => kind == expected,
+        Some(SymbolKindFilter::Callable) => matches!(
+            kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+        ),
+    }
+}
+
+fn symbol_matches_visibility_filter(symbol: &GraphSymbol, visibility: Option<&str>) -> bool {
+    let Some(visibility) = visibility.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    symbol
+        .visibility
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case(visibility))
+}
+
+fn symbol_matches_attribute_filter(symbol: &GraphSymbol, attribute: Option<&str>) -> bool {
+    let Some(attribute) = attribute.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    symbol
+        .attributes
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(attribute) || value.contains(attribute))
+}
+
 fn graph_symbol_search(
     graph: &squeezy_graph::SemanticGraph,
-    query: &str,
+    query: Option<&str>,
     kind: Option<&str>,
     path: Option<&str>,
     language: Option<&str>,
     visibility: Option<&str>,
     attribute: Option<&str>,
 ) -> Vec<GraphSymbol> {
-    let kind = kind.and_then(parse_symbol_kind);
+    let query = query.map(str::trim).filter(|value| !value.is_empty());
+    let kind_filter = kind.and_then(parse_symbol_kind_filter);
     let mut seen = HashSet::new();
-    let mut symbols = graph
-        .signature_search(&SignatureQuery {
-            text: query.to_string(),
-            kind,
-            visibility: visibility.map(str::to_string),
-            attribute: attribute.map(str::to_string),
-        })
+    let candidates = if let Some(query) = query {
+        graph
+            .signature_search(&SignatureQuery {
+                text: query.to_string(),
+                kind: single_symbol_kind(kind_filter),
+                visibility: visibility.map(str::to_string),
+                attribute: attribute.map(str::to_string),
+            })
+            .into_iter()
+            .chain(graph.find_symbol_by_name(query))
+            .collect::<Vec<_>>()
+    } else {
+        graph.symbols.values().cloned().collect::<Vec<_>>()
+    };
+    let mut symbols = candidates
         .into_iter()
-        .chain(graph.find_symbol_by_name(query))
         .filter(|symbol| seen.insert(symbol.id.clone()))
+        .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+        .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+        .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
         .filter(|symbol| symbol_matches_path_filter(symbol, path))
         .filter(|symbol| language_matches(graph, symbol, language))
         .collect::<Vec<_>>();
     symbols.sort_by(|left, right| {
-        symbol_rank(left, query)
-            .cmp(&symbol_rank(right, query))
+        query
+            .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
+            .unwrap_or(std::cmp::Ordering::Equal)
             .then(left.file_id.0.cmp(&right.file_id.0))
             .then(left.span.start_byte.cmp(&right.span.start_byte))
     });
     symbols
+}
+
+fn decl_counts_by_language(graph: &squeezy_graph::SemanticGraph, symbols: &[GraphSymbol]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for symbol in symbols {
+        let label = graph
+            .files
+            .get(&symbol.file_id)
+            .map(|file| file.language.display_name())
+            .unwrap_or("unknown");
+        *counts.entry(label.to_string()).or_default() += 1;
+    }
+    json!(counts)
+}
+
+fn decl_counts_by_kind(symbols: &[GraphSymbol]) -> Value {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for symbol in symbols {
+        *counts
+            .entry(symbol_kind_label(symbol.kind).to_string())
+            .or_default() += 1;
+    }
+    json!(counts)
 }
 
 fn resolve_definition_candidates(
@@ -8740,7 +9297,7 @@ fn resolve_definition_candidates(
     let Some(query) = query else {
         return Vec::new();
     };
-    graph_symbol_search(graph, query, kind, path, language, None, None)
+    graph_symbol_search(graph, Some(query), kind, path, language, None, None)
 }
 
 fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
@@ -8778,6 +9335,31 @@ fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
         "test" => Some(SymbolKind::Test),
         "unknown" => Some(SymbolKind::Unknown),
         _ => None,
+    }
+}
+
+fn symbol_kind_label(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::Class => "class",
+        SymbolKind::Crate => "crate",
+        SymbolKind::File => "file",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Module => "module",
+        SymbolKind::Struct => "struct",
+        SymbolKind::Enum => "enum",
+        SymbolKind::Union => "union",
+        SymbolKind::Trait => "trait",
+        SymbolKind::Impl => "impl",
+        SymbolKind::Function => "function",
+        SymbolKind::Method => "method",
+        SymbolKind::Const => "const",
+        SymbolKind::Static => "static",
+        SymbolKind::TypeAlias => "type_alias",
+        SymbolKind::Field => "field",
+        SymbolKind::Variant => "variant",
+        SymbolKind::Macro => "macro",
+        SymbolKind::Test => "test",
+        SymbolKind::Unknown => "unknown",
     }
 }
 
@@ -9442,7 +10024,7 @@ fn resolve_single_symbol(
     let query = args.query.as_deref()?;
     graph_symbol_search(
         graph,
-        query,
+        Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
         None,
@@ -9461,7 +10043,7 @@ fn resolve_flow_target(
         return graph.symbols.get(&SymbolId::new(symbol_id)).cloned();
     }
     let query = args.target_query.as_deref()?;
-    graph_symbol_search(graph, query, None, None, None, None, None)
+    graph_symbol_search(graph, Some(query), None, None, None, None, None)
         .into_iter()
         .next()
 }
@@ -9480,7 +10062,7 @@ fn unresolved_symbol_result(
     } else {
         graph_symbol_search(
             graph,
-            query,
+            Some(query),
             args.kind.as_deref(),
             args.path.as_deref(),
             None,
@@ -9529,7 +10111,7 @@ fn resolve_hierarchy_root(
     let query = args.query.as_deref()?;
     graph_symbol_search(
         graph,
-        query,
+        Some(query),
         args.kind.as_deref(),
         args.path.as_deref(),
         None,
@@ -9553,7 +10135,7 @@ fn unresolved_hierarchy_result(
     } else {
         graph_symbol_search(
             graph,
-            query,
+            Some(query),
             args.kind.as_deref(),
             args.path.as_deref(),
             None,
@@ -9769,6 +10351,119 @@ fn make_result(
     }
 }
 
+fn shell_exit_signal(status: Option<&std::process::ExitStatus>) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.and_then(|status| status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn shell_termination_reason(
+    timed_out: bool,
+    timeout_ms: u64,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+) -> Option<String> {
+    if timed_out {
+        return Some(format!("shell command timed out after {timeout_ms} ms"));
+    }
+    if exit_code.is_some() {
+        return None;
+    }
+    exit_signal
+        .map(|signal| format!("shell command terminated by signal {signal}"))
+        .or_else(|| Some("shell command ended without an exit code".to_string()))
+}
+
+fn shell_sandbox_direct_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+    if !run.stdout_bytes.is_empty() || !run.stderr_bytes.is_empty() {
+        return None;
+    }
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    if exit_code.is_some() {
+        return None;
+    }
+    let signal = shell_exit_signal(run.exit_status.as_ref())?;
+    Some(format!(
+        "shell sandbox backend {} terminated by signal {signal} with no output; retried without OS sandbox because mode is best_effort",
+        sandbox_plan.backend
+    ))
+}
+
+fn shell_sandbox_best_effort_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    shell_sandbox_direct_fallback_reason(sandbox_plan, run)
+        .or_else(|| shell_sandbox_runtime_fallback_reason(sandbox_plan, run))
+}
+
+fn shell_sandbox_runtime_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    let stderr = String::from_utf8_lossy(&run.stderr_bytes);
+    if shell_sandbox_runtime_unavailable(sandbox_plan, exit_code, &stderr) {
+        return Some(format!(
+            "shell sandbox backend {} failed at runtime; retried without OS sandbox because mode is best_effort",
+            sandbox_plan.backend
+        ));
+    }
+
+    None
+}
+
+fn shell_command_needs_checkpoint(
+    direct_user_shell: bool,
+    analysis: &ShellPermissionAnalysis,
+) -> bool {
+    if direct_user_shell {
+        return false;
+    }
+    match analysis.capability {
+        PermissionCapability::Read | PermissionCapability::Search => false,
+        PermissionCapability::Git
+            if analysis.risk == PermissionRisk::Low
+                && !analysis.destructive
+                && !analysis.network
+                && !analysis.dynamic =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn checkpoints_disabled_result(call: &ToolCall) -> ToolResult {
+    make_result(
+        call,
+        ToolStatus::Stale,
+        json!({
+            "enabled": false,
+            "error": CHECKPOINTS_DISABLED_MESSAGE,
+        }),
+        ToolCostHint::default(),
+        None,
+    )
+}
+
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {
     make_result(
         call,
@@ -9814,6 +10509,17 @@ fn shell_policy_denied(
     )
 }
 
+fn macos_sandbox_exec_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/usr/bin/sandbox-exec").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 fn prepare_shell_sandbox_plan(
     command: &str,
     analysis: &ShellPermissionAnalysis,
@@ -9825,10 +10531,161 @@ fn prepare_shell_sandbox_plan(
         analysis,
         root,
         config,
-        Path::new("/usr/bin/sandbox-exec").exists(),
+        macos_sandbox_exec_supported(),
         linux_unshare_supported(),
         linux_landlock_supported(),
     )
+}
+
+fn apply_shell_sandbox_backend_health(
+    command: &str,
+    config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
+    plan: ShellSandboxPlan,
+    probe_failure: impl FnOnce(&ShellSandboxPlan, Duration) -> Option<String>,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    let backend = plan.backend;
+    if backend == "none" {
+        return Ok(plan);
+    }
+
+    match health.status(backend) {
+        Some(ShellSandboxBackendStatus::Available) => return Ok(plan),
+        Some(ShellSandboxBackendStatus::Unavailable(reason)) => {
+            return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+        }
+        None => {}
+    }
+
+    if let Some(reason) = probe_failure(&plan, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT) {
+        health.mark_unavailable(backend, reason.clone());
+        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+    }
+
+    health.mark_available(backend);
+    Ok(plan)
+}
+
+fn shell_sandbox_backend_unavailable_plan(
+    command: &str,
+    config: &ShellSandboxConfig,
+    backend: &'static str,
+    reason: &str,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    if config.mode == ShellSandboxMode::Required {
+        return Err(format!(
+            "required shell sandbox backend {backend} unavailable: {reason}"
+        ));
+    }
+
+    Ok(ShellSandboxPlan::direct_with_fallback(
+        command,
+        config.mode,
+        config,
+        Some(shell_sandbox_backend_disabled_reason(backend, reason)),
+    ))
+}
+
+fn shell_sandbox_backend_disabled_reason(backend: &'static str, reason: &str) -> String {
+    format!(
+        "shell sandbox backend {backend} disabled after health check failure: {reason}; running without OS sandbox because mode is best_effort"
+    )
+}
+
+fn shell_sandbox_backend_probe_failure(
+    plan: &ShellSandboxPlan,
+    timeout: Duration,
+) -> Option<String> {
+    match plan.backend {
+        "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout),
+        // Linux support is already probed before this point via unshare and
+        // Landlock capability checks; a second process probe would add latency
+        // without exercising the same pre_exec path.
+        "linux-direct-syscalls" => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_plan_probe_failure(plan: &ShellSandboxPlan, timeout: Duration) -> Option<String> {
+    let mut args = plan.args.clone();
+    let Some(command_arg) = args.last_mut() else {
+        return Some(format!(
+            "shell sandbox backend {} probe could not build command",
+            plan.backend
+        ));
+    };
+    *command_arg = "true".to_string();
+
+    let mut child = match std::process::Command::new(&plan.program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return Some(format!(
+                "shell sandbox backend {} probe failed to start: {err}",
+                plan.backend
+            ));
+        }
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return None,
+            Ok(Some(status)) => {
+                return Some(shell_sandbox_backend_probe_status_reason(
+                    plan.backend,
+                    &status,
+                ));
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!(
+                    "shell sandbox backend {} probe timed out after {} ms",
+                    plan.backend,
+                    timeout.as_millis()
+                ));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!(
+                    "shell sandbox backend {} probe wait failed: {err}",
+                    plan.backend
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_sandbox_plan_probe_failure(
+    _plan: &ShellSandboxPlan,
+    _timeout: Duration,
+) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn shell_sandbox_backend_probe_status_reason(
+    backend: &'static str,
+    status: &std::process::ExitStatus,
+) -> String {
+    if let Some(code) = status.code() {
+        return format!("shell sandbox backend {backend} probe exited with code {code}");
+    }
+    if let Some(signal) = shell_exit_signal(Some(status)) {
+        return format!("shell sandbox backend {backend} probe terminated by signal {signal}");
+    }
+    format!("shell sandbox backend {backend} probe ended without an exit code")
 }
 
 #[allow(unused_variables)]
@@ -9864,6 +10721,10 @@ fn prepare_shell_sandbox_plan_with_probe(
         (ShellSandboxNetworkPolicy::DenyByDefault, true) => "denied_classified",
         _ => "denied",
     };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let fallback_reason: Option<String>;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let fallback_reason: Option<String> = None;
 
     #[cfg(target_os = "macos")]
     {
@@ -9886,13 +10747,14 @@ fn prepare_shell_sandbox_plan_with_probe(
                 configured_write_roots: config.write_roots.clone(),
                 filesystem_read_roots: Vec::new(),
                 filesystem_write_roots: Vec::new(),
+                fallback_reason: None,
             });
         }
+        let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
         if required {
-            return Err(
-                "required shell sandbox unavailable: /usr/bin/sandbox-exec not found".to_string(),
-            );
+            return Err(reason.to_string());
         }
+        fallback_reason = Some(reason.to_string());
     }
 
     #[cfg(target_os = "linux")]
@@ -9913,7 +10775,8 @@ fn prepare_shell_sandbox_plan_with_probe(
                     }
                 ));
             }
-            // best_effort: fall through to a direct ShellSandboxPlan below.
+            fallback_reason =
+                Some("required shell sandbox unavailable: linux unshare failed".to_string());
         } else {
             let filesystem = if linux_landlock_available {
                 "enforced"
@@ -9942,6 +10805,7 @@ fn prepare_shell_sandbox_plan_with_probe(
                 } else {
                     Vec::new()
                 },
+                fallback_reason: None,
             });
         }
     }
@@ -9956,7 +10820,12 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    Ok(ShellSandboxPlan::direct(command, config.mode, config))
+    Ok(ShellSandboxPlan::direct_with_fallback(
+        command,
+        config.mode,
+        config,
+        fallback_reason,
+    ))
 }
 
 #[cfg(target_os = "macos")]
@@ -10844,6 +11713,34 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
+    content
+        .match_indices(search)
+        .take(max_matches)
+        .enumerate()
+        .map(|(index, (byte_index, _))| {
+            let line = content[..byte_index]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count()
+                + 1;
+            let line_start = content[..byte_index]
+                .rfind('\n')
+                .map(|position| position + 1)
+                .unwrap_or(0);
+            let line_end = content[byte_index..]
+                .find('\n')
+                .map(|position| byte_index + position)
+                .unwrap_or(content.len());
+            json!({
+                "match_index": index + 1,
+                "line": line,
+                "preview": truncate_text(&content[line_start..line_end], 240),
+            })
+        })
+        .collect()
+}
+
 fn truncate_to_bytes(value: &str, cap: usize) -> (String, bool) {
     if value.len() <= cap {
         return (value.to_string(), false);
@@ -11063,22 +11960,21 @@ fn repo_map_spec() -> ToolSpec {
 fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search graph-backed declarations by signature/name with optional kind, language, path, visibility, and attribute filters. Returns uniform evidence packets.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use filter-only queries for questions like counting Java callables. Returns evidence packets plus total/facet counts.".to_string(),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "query": {"type": "string", "description": "Text to match against indexed declaration names and signatures."},
-                "kind": {"type": "string", "description": "Optional symbol kind such as function, method, struct, module, trait, class."},
+                "query": {"type": "string", "description": "Optional text to match against indexed declaration names and signatures. Omit it when using filters for counts."},
+                "kind": {"type": "string", "description": "Optional symbol kind such as callable, function, method, struct, module, trait, class."},
                 "path": {"type": "string", "description": "Optional workspace-relative path suffix filter."},
                 "language": {"type": "string", "description": "Optional language or language family filter such as Rust, Python, js-ts."},
                 "visibility": {"type": "string"},
                 "attribute": {"type": "string"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": MAX_GRAPH_MAX_RESULTS},
                 "offset": {"type": "integer", "minimum": 0}
-            },
-            "required": ["query"]
+            }
         }),
     }
 }

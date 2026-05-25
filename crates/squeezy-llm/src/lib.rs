@@ -6,6 +6,10 @@ use serde_json::Value;
 use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
+pub const INVALID_TOOL_ARGUMENTS_KEY: &str = "__squeezy_invalid_tool_arguments";
+pub const INVALID_TOOL_ARGUMENTS_ERROR_KEY: &str = "__squeezy_parse_error";
+pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
+
 mod anthropic;
 mod bedrock;
 mod google;
@@ -16,7 +20,7 @@ mod registry;
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use google::GoogleProvider;
-pub use ollama::{OllamaProvider, fetch_ollama_context_window};
+pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
 pub use openai::OpenAiProvider;
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,

@@ -401,9 +401,9 @@ const TOPICS: &[TopicDefinition] = &[
         id: "checkpoints",
         title: "checkpoints, undo, and revert",
         aliases: &["checkpoint", "checkpoints", "undo", "revert", "revert-turn"],
-        summary: "Checkpoints preserve local before and after trees for agent edits. TUI commands expose checkpoint listing, checkpoint detail, undo of the latest checkpoint, and turn-level revert through the checkpoint tools.",
+        summary: "Checkpointing is disabled by default. When enabled, checkpoints preserve local before and after trees for agent edits, and TUI commands expose listing, detail, undo, and turn-level revert through the checkpoint tools.",
         docs: &["docs/external/CHECKPOINTS.md"],
-        config: &[],
+        config: &["tools.checkpoints_enabled"],
     },
     TopicDefinition {
         id: "cost",

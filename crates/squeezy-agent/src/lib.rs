@@ -28,6 +28,7 @@ use squeezy_core::{
     escape_toml_basic_string,
 };
 use squeezy_llm::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmToolCall, LlmToolSpec,
     RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context,
     fetch_ollama_context_window,
@@ -55,7 +56,10 @@ mod exploration_compiler;
 
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 
-const MAX_TOOL_ROUNDS: usize = 8;
+const MAX_TOOL_ROUNDS: usize = 32;
+const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
+const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
+const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 const TASK_STATE_TOOL_NAME: &str = "update_task_state";
 const LOAD_TOOL_SCHEMA_TOOL_NAME: &str = "load_tool_schema";
 const DELEGATE_TOOL_NAME: &str = "delegate";
@@ -1005,6 +1009,7 @@ impl Agent {
                 web: web_config.clone(),
                 shell_sandbox: config.permissions.shell_sandbox.clone(),
                 mcp_servers: config.mcp_servers.clone(),
+                checkpoints_enabled: config.checkpoints_enabled,
             },
             config.skills.clone(),
             &config.graph,
@@ -1022,6 +1027,7 @@ impl Agent {
                     web: web_config,
                     shell_sandbox: config.permissions.shell_sandbox.clone(),
                     mcp_servers: config.mcp_servers.clone(),
+                    checkpoints_enabled: config.checkpoints_enabled,
                 },
                 config.skills.clone(),
                 &config.graph,
@@ -1776,6 +1782,34 @@ impl Agent {
             {
                 return;
             }
+            if let Some(call) = local_shell_command_call(&task_title) {
+                complete_local_tool_turn(
+                    turn_id,
+                    task_title,
+                    call,
+                    redacted_input.redactions,
+                    LocalToolTurnDeps {
+                        tx: tx.clone(),
+                        provider: provider.clone(),
+                        tools: tools.clone(),
+                        jobs: jobs.clone(),
+                        redactor: redactor.clone(),
+                        session_log: session_log.clone(),
+                        conversation_state: conversation_state.clone(),
+                        session_metrics: session_metrics.clone(),
+                        telemetry: telemetry.clone(),
+                        config: config.clone(),
+                        task_state: task_state.clone(),
+                        session_mode: session_mode.clone(),
+                        cancel: cancel.clone(),
+                        approval_ids: approval_ids.clone(),
+                        session_rules: session_rules.clone(),
+                        loaded_tool_schemas: loaded_tool_schemas.clone(),
+                    },
+                )
+                .await;
+                return;
+            }
             // Cheap pre-check first so unrelated coding turns do not pay for a
             // full `inspect_redacted()` rendering on every turn.
             if matches_squeezy_help_input(&task_title)
@@ -1802,20 +1836,16 @@ impl Agent {
                 .await;
                 return;
             }
-            let mcp_errors = tools.refresh_mcp_tools(cancel.clone()).await;
-            for error in mcp_errors {
-                log_session_event(
-                    session_log.as_ref(),
-                    &redactor,
-                    "mcp_discovery_error",
-                    Some(turn_id),
-                    Some(error.clone()),
-                    json!({ "error": error }),
-                );
-            }
             let mut all_tool_specs = core_control_tools(&config.subagents);
             all_tool_specs.extend(tools.specs().into_iter().map(advertised_tool));
             warn_unknown_tool_schema_names(&all_tool_specs, &config.tools);
+            refresh_mcp_tools_in_background(
+                tools.clone(),
+                cancel.clone(),
+                session_log.clone(),
+                redactor.clone(),
+                turn_id,
+            );
 
             let outcome = TurnRuntime {
                 turn_id,
@@ -1891,6 +1921,25 @@ struct HelpTurnDeps {
     config: AppConfig,
     task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
     session_mode: Arc<AtomicU8>,
+}
+
+struct LocalToolTurnDeps {
+    tx: mpsc::Sender<AgentEvent>,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    jobs: JobRegistry,
+    redactor: Arc<Redactor>,
+    session_log: Option<SessionHandle>,
+    conversation_state: Arc<Mutex<ConversationState>>,
+    session_metrics: Arc<Mutex<SessionMetrics>>,
+    telemetry: TelemetryClient,
+    config: AppConfig,
+    task_state: Arc<Mutex<Option<TaskStateSnapshot>>>,
+    session_mode: Arc<AtomicU8>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
 }
 
 async fn complete_squeezy_help_turn(
@@ -2031,6 +2080,288 @@ async fn complete_squeezy_help_turn(
             metrics,
         })
         .await;
+}
+
+async fn complete_local_tool_turn(
+    turn_id: TurnId,
+    task_title: String,
+    call: ToolCall,
+    seed_redactions: u64,
+    deps: LocalToolTurnDeps,
+) {
+    let LocalToolTurnDeps {
+        tx,
+        provider,
+        tools,
+        jobs,
+        redactor,
+        session_log,
+        conversation_state,
+        session_metrics,
+        telemetry,
+        config,
+        task_state,
+        session_mode,
+        cancel,
+        approval_ids,
+        session_rules,
+        loaded_tool_schemas,
+    } = deps;
+    let user_item = LlmInputItem::UserText(task_title.clone());
+    let user_transcript = TranscriptItem::user(task_title.clone());
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "user_message",
+        Some(turn_id),
+        user_item_summary(&user_item),
+        json!({}),
+    );
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::starting(task_title.clone()),
+    )
+    .await;
+    let _ = tx.send(AgentEvent::Started { turn_id }).await;
+    let _ = tx
+        .send(AgentEvent::ToolCallQueued {
+            turn_id,
+            call: redact_tool_call(call.clone(), &redactor),
+        })
+        .await;
+
+    let all_tool_specs = Vec::new();
+    let exploration_state = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
+    let mut broker = CostBroker::new(&config);
+    let results = execute_tool_calls(
+        vec![call],
+        ToolExecutionContext {
+            turn_id,
+            provider,
+            tools: &tools,
+            jobs: &jobs,
+            config: &config,
+            telemetry: telemetry.clone(),
+            redactor: redactor.clone(),
+            tx: tx.clone(),
+            cancel,
+            approval_ids,
+            session_rules,
+            session_mode: session_mode.clone(),
+            session_log: session_log.clone(),
+            task_state: task_state.clone(),
+            all_tool_specs: &all_tool_specs,
+            loaded_tool_schemas,
+            exploration_state,
+        },
+        &mut broker,
+    )
+    .await;
+
+    let message_text = local_tool_completion_message(results.first());
+    let rendered = redactor.redact(&message_text);
+    let message = TranscriptItem::assistant(rendered.text);
+    let mut metrics = broker.metrics.clone();
+    metrics.redactions += seed_redactions + rendered.redactions;
+    let cost = CostSnapshot::default();
+    let _ = tx
+        .send(AgentEvent::AssistantDelta {
+            turn_id,
+            delta: message.content.clone(),
+        })
+        .await;
+    let terminal_status = if results
+        .first()
+        .is_some_and(|result| result.status == ToolStatus::Success)
+    {
+        TaskStateStatus::Completed
+    } else {
+        TaskStateStatus::Failed
+    };
+    let terminal_summary = results
+        .first()
+        .map(|result| {
+            if result.status == ToolStatus::Success {
+                "local command completed".to_string()
+            } else {
+                format!("local command failed: {}", tool_failure_detail(result))
+            }
+        })
+        .unwrap_or_else(|| "local command produced no result".to_string());
+    let latest_task_state = task_state.lock().await.clone();
+    publish_task_state_update(
+        &tx,
+        session_log.as_ref(),
+        &redactor,
+        &task_state,
+        turn_id,
+        TaskStateSnapshot::terminal_from(
+            latest_task_state.as_ref(),
+            task_title.clone(),
+            terminal_status,
+            Some(terminal_summary),
+        ),
+    )
+    .await;
+
+    {
+        let mut state = conversation_state.lock().await;
+        state.conversation.push(user_item);
+        state
+            .conversation
+            .push(LlmInputItem::AssistantText(message.content.clone()));
+        state.transcript.push(user_transcript);
+        state.transcript.push(message.clone());
+        merge_cost(&mut state.cost, &cost);
+        state.metrics.merge_turn(&metrics);
+        state.redactions += metrics.redactions;
+        if let Some(session) = &session_log {
+            let _ = session.write_resume_state(&state.to_resume_state());
+            let _ = session.update_metadata(|metadata| {
+                metadata.cost = state.cost.clone();
+                metadata.metrics = state.metrics.clone();
+                metadata.redactions = state.redactions;
+                metadata.resume_available = true;
+                metadata.mode = load_session_mode(&session_mode);
+            });
+        }
+    }
+
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "local_command",
+        Some(turn_id),
+        results.first().map(tool_result_summary),
+        json!({ "command": task_title }),
+    );
+    log_session_event(
+        session_log.as_ref(),
+        &redactor,
+        "assistant_completed",
+        Some(turn_id),
+        Some("local workspace command".to_string()),
+        json!({
+            "response_id": null,
+            "cost": cost,
+            "metrics": metrics,
+        }),
+    );
+
+    telemetry.spawn(TelemetryEvent::turn_completed(
+        &config,
+        turn_id.get(),
+        metrics.clone(),
+    ));
+    session_metrics.lock().await.merge_turn(&metrics);
+    let _ = tx
+        .send(AgentEvent::Completed {
+            turn_id,
+            message,
+            response_id: None,
+            cost,
+            metrics,
+        })
+        .await;
+}
+
+fn refresh_mcp_tools_in_background(
+    tools: ToolRegistry,
+    cancel: CancellationToken,
+    session_log: Option<SessionHandle>,
+    redactor: Arc<Redactor>,
+    turn_id: TurnId,
+) {
+    tokio::spawn(async move {
+        let mcp_errors = tools.refresh_mcp_tools(cancel).await;
+        for error in mcp_errors {
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "mcp_discovery_error",
+                Some(turn_id),
+                Some(error.clone()),
+                json!({ "error": error }),
+            );
+        }
+    });
+}
+
+fn local_shell_command_call(input: &str) -> Option<ToolCall> {
+    let command = local_shell_command(input)?;
+    Some(ToolCall {
+        call_id: "local-shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": command,
+            "description": "run the user-requested local command",
+            "timeout_ms": LOCAL_SHELL_TIMEOUT_MS,
+            "output_byte_cap": LOCAL_SHELL_OUTPUT_BYTE_CAP,
+            "output_mode": "raw",
+            "direct_user_shell": true,
+        }),
+    })
+}
+
+fn local_shell_command(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || trimmed.lines().count() > 1 {
+        return None;
+    }
+    trimmed.strip_prefix('!').and_then(nonempty_shell_command)
+}
+
+fn nonempty_shell_command(command: &str) -> Option<String> {
+    let command = command.trim().trim_matches('`').trim();
+    (!command.is_empty()).then(|| command.to_string())
+}
+
+fn local_tool_completion_message(result: Option<&ToolResult>) -> String {
+    let Some(result) = result else {
+        return "Local command produced no result.".to_string();
+    };
+    let command = result
+        .content
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("local command");
+    let stdout = result
+        .content
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_end();
+    let stderr = result
+        .content
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim_end();
+    match result.status {
+        ToolStatus::Success => {
+            if !stdout.is_empty() {
+                stdout.to_string()
+            } else if !stderr.is_empty() {
+                stderr.to_string()
+            } else {
+                format!("`{command}` completed successfully.")
+            }
+        }
+        ToolStatus::Cancelled => format!("`{command}` was cancelled."),
+        _ => {
+            let detail = tool_failure_detail(result);
+            if !stderr.is_empty() {
+                format!("`{command}` failed: {detail}\n\n{stderr}")
+            } else {
+                format!("`{command}` failed: {detail}")
+            }
+        }
+    }
 }
 
 struct TurnRuntime {
@@ -2255,6 +2586,10 @@ impl TurnRuntime {
         );
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
+        if self.cancel.is_cancelled() {
+            self.finish_cancelled_turn(&task_title).await;
+            return Ok(());
+        }
 
         if let Some(plan) = exploration_plan.clone()
             && !plan.calls.is_empty()
@@ -2316,6 +2651,10 @@ impl TurnRuntime {
                 )
                 .await
             };
+            if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
             // The planner is advisory: once the preflight block has executed,
             // the model has the planner outputs (success or not) in context, so
             // we lift the raw-read guard to avoid locking the turn on misfires
@@ -2357,7 +2696,13 @@ impl TurnRuntime {
             }
         }
 
+        let mut last_tool_round_summary = None;
+        let mut loop_guard = ToolLoopGuard::default();
         for _round in 0..MAX_TOOL_ROUNDS {
+            if self.cancel.is_cancelled() {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let request = LlmRequest {
@@ -2392,6 +2737,10 @@ impl TurnRuntime {
             let mut completed_cost = CostSnapshot::default();
 
             while let Some(event) = stream.next().await {
+                if self.cancel.is_cancelled() {
+                    self.finish_cancelled_turn(&task_title).await;
+                    return Ok(());
+                }
                 match event {
                     Ok(LlmEvent::Started) => {
                         self.record_replay_model_started();
@@ -2471,31 +2820,7 @@ impl TurnRuntime {
                         break;
                     }
                     Ok(LlmEvent::Cancelled) => {
-                        // A cancelled turn leaves the session active so the
-                        // user can keep working. The lifecycle status only
-                        // flips when the agent itself is finalized (TUI exit
-                        // or `finish_session`). Recording the event here
-                        // still makes the cancellation discoverable in
-                        // `events.jsonl` and `squeezy sessions show`.
-                        self.publish_terminal_task_state(
-                            TaskStateStatus::Cancelled,
-                            Some("turn cancelled".to_string()),
-                            &task_title,
-                        )
-                        .await;
-                        self.log_event(
-                            "cancelled",
-                            Some(self.turn_id),
-                            Some("turn cancelled".to_string()),
-                            json!({}),
-                        );
-                        self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
-                        let _ = self
-                            .tx
-                            .send(AgentEvent::Cancelled {
-                                turn_id: self.turn_id,
-                            })
-                            .await;
+                        self.finish_cancelled_turn(&task_title).await;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
@@ -2612,6 +2937,14 @@ impl TurnRuntime {
                 )
                 .await
             };
+            if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
+                self.finish_cancelled_turn(&task_title).await;
+                return Ok(());
+            }
+            last_tool_round_summary = tool_round_failure_summary(&results);
+            if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
+                return Err(SqueezyError::Agent(reason));
+            }
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             self.record_replay_tool_results(&tool_calls, &results);
@@ -2655,8 +2988,11 @@ impl TurnRuntime {
             }
         }
 
+        let suffix = last_tool_round_summary
+            .map(|summary| format!(" · {summary}"))
+            .unwrap_or_default();
         Err(SqueezyError::Agent(format!(
-            "stopped after {MAX_TOOL_ROUNDS} tool rounds"
+            "stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"
         )))
     }
 
@@ -2761,6 +3097,28 @@ impl TurnRuntime {
             summary,
         ))
         .await;
+    }
+
+    async fn finish_cancelled_turn(&self, task_title: &str) {
+        self.publish_terminal_task_state(
+            TaskStateStatus::Cancelled,
+            Some("turn cancelled".to_string()),
+            task_title,
+        )
+        .await;
+        self.log_event(
+            "cancelled",
+            Some(self.turn_id),
+            Some("turn cancelled".to_string()),
+            json!({}),
+        );
+        self.record_replay(SessionReplayEventKind::ModelCancelled, json!({}));
+        let _ = self
+            .tx
+            .send(AgentEvent::Cancelled {
+                turn_id: self.turn_id,
+            })
+            .await;
     }
 
     async fn current_task_summary(&self) -> Option<String> {
@@ -3824,6 +4182,152 @@ fn control_tool_result(call: &ToolCall, status: ToolStatus, content: Value) -> T
     }
 }
 
+fn has_invalid_tool_arguments(call: &ToolCall) -> bool {
+    call.arguments
+        .get(INVALID_TOOL_ARGUMENTS_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn invalid_tool_arguments_result(call: &ToolCall) -> ToolResult {
+    let parse_error = call
+        .arguments
+        .get(INVALID_TOOL_ARGUMENTS_ERROR_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or("invalid JSON");
+    let raw = call
+        .arguments
+        .get(INVALID_TOOL_ARGUMENTS_RAW_KEY)
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    control_tool_result(
+        call,
+        ToolStatus::Error,
+        json!({
+            "ok": false,
+            "error": "invalid tool arguments from model",
+            "parse_error": parse_error,
+            "raw_arguments_preview": compact_text(raw, 240),
+            "retry": "call the same tool again with complete valid JSON arguments",
+        }),
+    )
+}
+
+fn tool_round_failure_summary(results: &[ToolResult]) -> Option<String> {
+    let mut invalid_counts = BTreeMap::<String, usize>::new();
+    let mut last_error = None;
+    for result in results {
+        if result.status != ToolStatus::Error && result.status != ToolStatus::Stale {
+            continue;
+        }
+        let error = tool_failure_detail(result);
+        if error.contains("invalid tool arguments") {
+            *invalid_counts.entry(result.tool_name.clone()).or_default() += 1;
+        }
+        last_error = Some(format!("last {} failure: {error}", result.tool_name));
+    }
+    invalid_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(tool, count)| {
+            if count > 1 {
+                format!("repeated invalid {tool} arguments ({count}x)")
+            } else {
+                format!("invalid {tool} arguments")
+            }
+        })
+        .or(last_error)
+}
+
+#[derive(Default)]
+struct ToolLoopGuard {
+    control_only_rounds: usize,
+    failure_counts: BTreeMap<String, usize>,
+}
+
+impl ToolLoopGuard {
+    fn observe_round(&mut self, calls: &[ToolCall], results: &[ToolResult]) -> Option<String> {
+        if !calls.is_empty() && calls.iter().all(|call| is_control_tool_name(&call.name)) {
+            self.control_only_rounds += 1;
+            if self.control_only_rounds > MAX_CONTROL_ONLY_TOOL_ROUNDS {
+                return Some(
+                    "agent only updated internal task state; stopping before burning more tool rounds"
+                        .to_string(),
+                );
+            }
+        } else {
+            self.control_only_rounds = 0;
+        }
+
+        for result in results {
+            let Some(key) = repeated_tool_failure_key(result) else {
+                continue;
+            };
+            let count = self.failure_counts.entry(key).or_default();
+            *count += 1;
+            if *count >= 2 {
+                return Some(format!(
+                    "repeated {} failure: {}; stopping before burning more tool rounds",
+                    result.tool_name,
+                    tool_failure_detail(result)
+                ));
+            }
+        }
+        None
+    }
+}
+
+fn repeated_tool_failure_key(result: &ToolResult) -> Option<String> {
+    if result.status != ToolStatus::Error && result.status != ToolStatus::Stale {
+        return None;
+    }
+    let path = result
+        .content
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    Some(format!(
+        "{}:{:?}:{path}:{}",
+        result.tool_name,
+        result.status,
+        tool_failure_detail(result)
+    ))
+}
+
+fn is_control_tool_name(name: &str) -> bool {
+    matches!(name, TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME)
+}
+
+fn tool_failure_detail(result: &ToolResult) -> String {
+    if let Some(error) = result
+        .content
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| result.content.get("parse_error").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return compact_text(error, 180);
+    }
+    if let Some(code) = result.content.get("exit_code").and_then(Value::as_i64) {
+        return format!("exit {code}");
+    }
+    if let Some(signal) = result.content.get("signal").and_then(Value::as_i64) {
+        return format!("signal {signal}");
+    }
+    for key in ["stderr", "stdout"] {
+        if let Some(line) = result
+            .content
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
+        {
+            return compact_text(line, 180);
+        }
+    }
+    "tool failed".to_string()
+}
+
 async fn execute_tool_calls(
     calls: Vec<ToolCall>,
     context: ToolExecutionContext<'_>,
@@ -3834,6 +4338,26 @@ async fn execute_tool_calls(
     let mut recorded = vec![false; calls.len()];
 
     for (index, call) in calls.iter().enumerate() {
+        if context.cancel.is_cancelled() {
+            let result = ToolResult::cancelled(call);
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            return collect_recorded_results(
+                results,
+                recorded,
+                broker,
+                context.config,
+                &context.telemetry,
+            );
+        }
         if call.name == TASK_STATE_TOOL_NAME {
             results[index] = Some(handle_task_state_call(&context, call).await);
             recorded[index] = true;
@@ -3841,6 +4365,20 @@ async fn execute_tool_calls(
         }
         if call.name == LOAD_TOOL_SCHEMA_TOOL_NAME {
             results[index] = Some(handle_load_tool_schema_call(&context, call).await);
+            recorded[index] = true;
+            continue;
+        }
+        if has_invalid_tool_arguments(call) {
+            let result = invalid_tool_arguments_result(call);
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
@@ -3977,6 +4515,28 @@ async fn execute_tool_calls(
 
     let mut parallel_batch = Vec::new();
     for (index, call, tool_sequence) in approved {
+        if context.cancel.is_cancelled() {
+            let result = ToolResult::cancelled(&call);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            break;
+        }
         if context.tools.is_parallel_safe(&call) {
             if let Some(reason) = broker.deny_reason() {
                 let result = budget_denied_result(&call, reason);
@@ -4064,6 +4624,10 @@ fn collect_recorded_results(
     results.into_iter().flatten().collect()
 }
 
+fn cancelled_tool_result(result: &ToolResult) -> bool {
+    result.status == ToolStatus::Cancelled
+}
+
 async fn flush_parallel_batch(
     context: &ToolExecutionContext<'_>,
     broker: &mut CostBroker,
@@ -4075,6 +4639,29 @@ async fn flush_parallel_batch(
     }
 
     let calls = std::mem::take(batch);
+    if context.cancel.is_cancelled() {
+        for (index, call, tool_sequence) in calls {
+            let result = ToolResult::cancelled(&call);
+            emit_tool_telemetry(
+                context.config,
+                &context.telemetry,
+                context.turn_id,
+                tool_sequence,
+                &result,
+                Duration::ZERO,
+            );
+            broker.record_executed_result(&result);
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+        }
+        return;
+    }
     if broker.enforces_result_budgets() {
         for (index, call, tool_sequence) in calls {
             if let Some(reason) = broker.deny_reason() {
@@ -4128,6 +4715,25 @@ async fn run_one_tool(
     tool_sequence: u64,
     call: ToolCall,
 ) -> ToolResult {
+    if context.cancel.is_cancelled() {
+        let result = ToolResult::cancelled(&call);
+        emit_tool_telemetry(
+            context.config,
+            &context.telemetry,
+            context.turn_id,
+            tool_sequence,
+            &result,
+            Duration::ZERO,
+        );
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id: context.turn_id,
+                result: result.clone(),
+            })
+            .await;
+        return result;
+    }
     let tracked_job = job_kind_for_tool(&call.name).map(|kind| {
         let cancel = context.cancel.child_token();
         let snapshot = context.jobs.create(
@@ -4406,6 +5012,9 @@ async fn permission_decision(
     call: &ToolCall,
     context: &ToolExecutionContext<'_>,
 ) -> ApprovalDecision {
+    if is_direct_user_shell_call(call) {
+        return ApprovalDecision::Approved;
+    }
     let request = context.tools.permission_request(call);
     let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
@@ -4561,6 +5170,16 @@ async fn permission_decision(
             }
         }
     }
+}
+
+fn is_direct_user_shell_call(call: &ToolCall) -> bool {
+    call.name == "shell"
+        && call.call_id.starts_with("local-shell-")
+        && call
+            .arguments
+            .get("direct_user_shell")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Lock-free read of the active session mode. Defaults to `Build` if the
@@ -4961,51 +5580,15 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
     }
 }
 
-fn task_state_advertised_tool() -> AdvertisedTool {
-    AdvertisedTool {
-        capability: PermissionCapability::Read,
-        spec: LlmToolSpec {
-            name: TASK_STATE_TOOL_NAME.to_string(),
-            description: "Update the visible task/plan/progress state for the current turn. Use this for task title, step statuses, blockers, recent changes, next action, verification state, and replan reasons.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "task": {"type": "string", "description": "Short task title."},
-                    "status": {"type": "string", "enum": ["running", "blocked", "completed", "cancelled", "failed"], "description": "Overall task state. Default running."},
-                    "summary": {"type": ["string", "null"], "description": "Short state summary."},
-                    "steps": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "properties": {
-                                "title": {"type": "string"},
-                                "status": {"type": "string", "enum": ["pending", "active", "completed", "blocked", "skipped"]},
-                                "detail": {"type": ["string", "null"]}
-                            }
-                        },
-                        "description": "Ordered plan/progress steps."
-                    },
-                    "blocker": {"type": ["string", "null"], "description": "Current blocker, if any."},
-                    "next_action": {"type": ["string", "null"], "description": "What the agent intends to do next."},
-                    "verification": {"type": "string", "enum": ["not_started", "running", "passed", "failed", "skipped"], "description": "Verification state. Default not_started."},
-                    "recent_changes": {"type": "array", "items": {"type": "string"}, "description": "Short bullets for user-visible changes already made."},
-                    "replan_reason": {"type": ["string", "null"], "description": "Why the plan changed, if it changed."}
-                }
-            }),
-            strict: false,
-        },
-    }
-}
-
 /// Synthetic control tools that are advertised to the model on every
-/// request. `task_state` is always present. `delegate` and `explore` are
-/// gated on [`SubagentConfig::enabled`] / `explore_enabled` so we don't
-/// spend prompt tokens advertising tools the agent would refuse on every
-/// call.
+/// request. Progress/task state is intentionally not model-visible: the
+/// runtime derives visible working state from turn and tool lifecycle events,
+/// so simple prompts cannot burn full model rounds on bookkeeping-only calls.
+/// `delegate` and `explore` are gated on [`SubagentConfig::enabled`] /
+/// `explore_enabled` so we don't spend prompt tokens advertising tools the
+/// agent would refuse on every call.
 fn core_control_tools(subagents: &SubagentConfig) -> Vec<AdvertisedTool> {
-    let mut tools = vec![task_state_advertised_tool()];
+    let mut tools = Vec::new();
     if subagents.enabled {
         tools.push(delegate_advertised_tool());
         if subagents.explore_enabled {
@@ -5111,7 +5694,6 @@ fn advertised_tool_specs(tools: &[AdvertisedTool], mode: SessionMode) -> Vec<Llm
 
 fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
     match name {
-        TASK_STATE_TOOL_NAME => Some(task_state_advertised_tool()),
         DELEGATE_TOOL_NAME => Some(delegate_advertised_tool()),
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
@@ -5201,7 +5783,6 @@ fn request_tool_specs(
     let advertised_names: BTreeSet<&str> =
         tools.iter().map(|tool| tool.spec.name.as_str()).collect();
     let synthetic_order = [
-        TASK_STATE_TOOL_NAME,
         DELEGATE_TOOL_NAME,
         EXPLORE_TOOL_NAME,
         LOAD_TOOL_SCHEMA_TOOL_NAME,
@@ -5266,7 +5847,6 @@ fn warn_unknown_tool_schema_names(
         .iter()
         .map(|tool| tool.spec.name.as_str())
         .collect();
-    known.insert(TASK_STATE_TOOL_NAME);
     known.insert(DELEGATE_TOOL_NAME);
     known.insert(EXPLORE_TOOL_NAME);
     known.insert(LOAD_TOOL_SCHEMA_TOOL_NAME);
@@ -5355,8 +5935,7 @@ fn first_line_of_description(description: &str) -> String {
 /// Returns `true` when `tool`'s full JSON schema must be sent on every
 /// request (no lazy `load_tool_schema` hop). Tools fall into one of three
 /// buckets:
-///   * synthetic control tools (`update_task_state`, `delegate`, `explore`,
-///     `load_tool_schema`)
+///   * synthetic control tools (`delegate`, `explore`, `load_tool_schema`)
 ///     and every tool when lazy loading is disabled — always-core,
 ///   * names listed in `[tools].core` — explicit core,
 ///   * everything else (including names listed in `[tools].discoverable`
@@ -5369,7 +5948,7 @@ fn tool_is_core_schema(tool: &AdvertisedTool, schema_config: &ToolSchemaConfig) 
     let name = tool.spec.name.as_str();
     if matches!(
         name,
-        TASK_STATE_TOOL_NAME | DELEGATE_TOOL_NAME | EXPLORE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME
+        DELEGATE_TOOL_NAME | EXPLORE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME
     ) {
         return true;
     }

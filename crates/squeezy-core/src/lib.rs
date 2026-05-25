@@ -11,21 +11,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5-nano";
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com/v1";
-pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-haiku-4-5-20251001";
+pub const DEFAULT_ANTHROPIC_MODEL: &str = "claude-opus-4-7";
 pub const DEFAULT_GOOGLE_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
-pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-flash-lite";
+pub const DEFAULT_GOOGLE_MODEL: &str = "gemini-2.5-pro";
 pub const DEFAULT_AZURE_OPENAI_BASE_URL: &str = "";
 pub const DEFAULT_AZURE_OPENAI_API_VERSION: &str = "v1";
 pub const DEFAULT_AZURE_OPENAI_MODEL: &str = DEFAULT_OPENAI_MODEL;
 pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
-pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3";
+pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128;
+pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<u32> = None;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
@@ -68,12 +69,13 @@ pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// intentionally **not** in this list so they only cost prompt bytes once
 /// the model explicitly attaches them via `load_tool_schema`.
 ///
-/// The two synthetic control tools (`update_task_state`, `load_tool_schema`)
-/// are not duplicated here on purpose: they are forced into the request
-/// `tools` array by name in `squeezy_agent::request_tool_specs`, and
-/// `squeezy_agent::tool_is_core_schema` treats them as always-core. Listing
-/// them in two places risks future skew if one site is updated without the
-/// other.
+/// `load_tool_schema` is not duplicated here on purpose: it is forced into the
+/// request `tools` array by name in `squeezy_agent::request_tool_specs`, and
+/// `squeezy_agent::tool_is_core_schema` treats it as always-core. Listing it
+/// in two places risks future skew if one site is updated without the other.
+///
+/// `update_task_state` is intentionally omitted from model-visible schemas.
+/// The runtime derives visible progress from turn/tool lifecycle events.
 pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",
@@ -129,6 +131,7 @@ pub struct AppConfig {
     pub graph: GraphConfig,
     pub cache: CacheConfig,
     pub tools: ToolSchemaConfig,
+    pub checkpoints_enabled: bool,
     pub tui: TuiConfig,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
     pub config_sources: Vec<String>,
@@ -331,7 +334,7 @@ impl AppConfig {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+            .or(DEFAULT_MAX_OUTPUT_TOKENS);
         let web = settings.web.unwrap_or_default();
         let exa_mcp_url = get_var("SQUEEZY_EXA_MCP_URL")
             .or(web.exa_mcp_url)
@@ -445,7 +448,12 @@ impl AppConfig {
         );
         let graph = GraphConfig::from_settings(settings.graph.unwrap_or_default());
         let cache = CacheConfig::from_settings(settings.cache.unwrap_or_default());
-        let tools = ToolSchemaConfig::from_settings(settings.tools.unwrap_or_default())?;
+        let tool_settings = settings.tools.unwrap_or_default();
+        let checkpoints_enabled = get_var("SQUEEZY_CHECKPOINTS_ENABLED")
+            .as_deref()
+            .map(parse_enabled_bool)
+            .unwrap_or(tool_settings.checkpoints_enabled.unwrap_or(false));
+        let tools = ToolSchemaConfig::from_settings(tool_settings)?;
         let session_logs = SessionLogConfig::from_settings(&session_settings);
         let context_compaction = ContextCompactionConfig::from_settings_and_env(
             settings.context.unwrap_or_default(),
@@ -468,7 +476,7 @@ impl AppConfig {
             profile,
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
-            max_output_tokens: Some(max_output_tokens),
+            max_output_tokens,
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
             permissions,
@@ -495,6 +503,7 @@ impl AppConfig {
             graph,
             cache,
             tools,
+            checkpoints_enabled,
             tui,
             mcp_servers,
             config_sources: sources,
@@ -558,10 +567,13 @@ impl AppConfig {
                 toml_string(reasoning_effort.as_str())
             ));
         }
-        output.push_str(&format!(
-            "max_output_tokens = {}\n",
-            self.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
-        ));
+        if let Some(max_output_tokens) = self.max_output_tokens {
+            output.push_str(&format!("max_output_tokens = {max_output_tokens}\n"));
+        } else {
+            output.push_str(
+                "# max_output_tokens = unset  # no Squeezy cap; provider/model limit applies\n",
+            );
+        }
         output.push_str(&format!("store_responses = {}\n\n", self.store_responses));
 
         output.push_str("[agent]\n");
@@ -855,6 +867,10 @@ impl AppConfig {
 
         output.push_str("[tools]\n");
         output.push_str(&format!(
+            "checkpoints_enabled = {}\n",
+            self.checkpoints_enabled
+        ));
+        output.push_str(&format!(
             "lazy_schema_loading = {}\n",
             self.tools.lazy_schema_loading
         ));
@@ -881,6 +897,10 @@ impl AppConfig {
         output.push_str(&format!(
             "transcript_default = {}\n",
             toml_string(self.tui.transcript_default.as_str())
+        ));
+        output.push_str(&format!(
+            "alternate_screen = {}\n",
+            toml_string(self.tui.alternate_screen.as_str())
         ));
         output.push_str(&format!(
             "show_reasoning_usage = {}\n\n",
@@ -1107,6 +1127,8 @@ pub enum ReasoningEffort {
     Low,
     Medium,
     High,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 impl ReasoningEffort {
@@ -1115,6 +1137,7 @@ impl ReasoningEffort {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
+            "xhigh" | "x-high" | "x_high" => Some(Self::XHigh),
             _ => None,
         }
     }
@@ -1124,6 +1147,7 @@ impl ReasoningEffort {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 }
@@ -1379,6 +1403,7 @@ pub struct ModelSettings {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
     pub store_responses: Option<bool>,
+    pub selection_version: Option<u32>,
 }
 
 impl ModelSettings {
@@ -1392,6 +1417,7 @@ impl ModelSettings {
                 "reasoning_effort",
                 "max_output_tokens",
                 "store_responses",
+                "selection_version",
             ],
             source,
             path,
@@ -1428,6 +1454,12 @@ impl ModelSettings {
                 source,
                 &field(path, "store_responses"),
             )?,
+            selection_version: u32_value(
+                table,
+                "selection_version",
+                source,
+                &field(path, "selection_version"),
+            )?,
         })
     }
 
@@ -1438,6 +1470,7 @@ impl ModelSettings {
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
         replace_if_some(&mut self.store_responses, next.store_responses);
+        replace_if_some(&mut self.selection_version, next.selection_version);
     }
 }
 
@@ -1631,6 +1664,7 @@ impl ToolSchemaConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ToolSchemaSettings {
+    pub checkpoints_enabled: Option<bool>,
     pub lazy_schema_loading: Option<bool>,
     pub core: Option<Vec<String>>,
     pub discoverable: Option<Vec<String>>,
@@ -1640,11 +1674,22 @@ impl ToolSchemaSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
         reject_unknown_keys(
             table,
-            &["lazy_schema_loading", "core", "discoverable"],
+            &[
+                "checkpoints_enabled",
+                "lazy_schema_loading",
+                "core",
+                "discoverable",
+            ],
             source,
             path,
         )?;
         Ok(Self {
+            checkpoints_enabled: bool_value(
+                table,
+                "checkpoints_enabled",
+                source,
+                &field(path, "checkpoints_enabled"),
+            )?,
             lazy_schema_loading: bool_value(
                 table,
                 "lazy_schema_loading",
@@ -1662,6 +1707,7 @@ impl ToolSchemaSettings {
     }
 
     fn merge(&mut self, next: Self) {
+        replace_if_some(&mut self.checkpoints_enabled, next.checkpoints_enabled);
         replace_if_some(&mut self.lazy_schema_loading, next.lazy_schema_loading);
         merge_string_lists(&mut self.core, next.core);
         merge_string_lists(&mut self.discoverable, next.discoverable);
@@ -2550,7 +2596,7 @@ pub struct ShellSandboxConfig {
 impl Default for ShellSandboxConfig {
     fn default() -> Self {
         Self {
-            mode: ShellSandboxMode::Required,
+            mode: ShellSandboxMode::BestEffort,
             network: ShellSandboxNetworkPolicy::DenyByDefault,
             audit: true,
             kill_grace_ms: 250,
@@ -2925,7 +2971,7 @@ impl PermissionPolicy {
             ),
             edit: parse_permission(
                 var("SQUEEZY_EDIT_PERMISSION"),
-                settings.edit.unwrap_or(PermissionMode::Ask),
+                settings.edit.unwrap_or(PermissionMode::Allow),
             ),
             shell: parse_permission(
                 var("SQUEEZY_SHELL_PERMISSION"),
@@ -3067,7 +3113,7 @@ impl Default for PermissionPolicy {
     fn default() -> Self {
         Self {
             read: PermissionMode::Allow,
-            edit: PermissionMode::Ask,
+            edit: PermissionMode::Allow,
             shell: PermissionMode::Ask,
             ignored_search: PermissionMode::Allow,
             web: PermissionMode::Ask,
@@ -4018,12 +4064,31 @@ impl TranscriptDefault {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiAlternateScreen {
+    Auto,
+    Never,
+    Always,
+}
+
+impl TuiAlternateScreen {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Never => "never",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
     pub status_verbosity: StatusVerbosity,
     pub response_verbosity: ResponseVerbosity,
     pub tool_output_verbosity: ToolOutputVerbosity,
     pub transcript_default: TranscriptDefault,
+    pub alternate_screen: TuiAlternateScreen,
     pub show_reasoning_usage: bool,
 }
 
@@ -4043,6 +4108,9 @@ impl TuiConfig {
             transcript_default: settings
                 .transcript_default
                 .unwrap_or(TranscriptDefault::Compact),
+            alternate_screen: settings
+                .alternate_screen
+                .unwrap_or(TuiAlternateScreen::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
         }
     }
@@ -4061,6 +4129,7 @@ pub struct TuiSettings {
     pub response_verbosity: Option<ResponseVerbosity>,
     pub tool_output_verbosity: Option<ToolOutputVerbosity>,
     pub transcript_default: Option<TranscriptDefault>,
+    pub alternate_screen: Option<TuiAlternateScreen>,
     pub show_reasoning_usage: Option<bool>,
 }
 
@@ -4074,6 +4143,7 @@ impl TuiSettings {
                 "response_verbosity",
                 "tool_output_verbosity",
                 "transcript_default",
+                "alternate_screen",
                 "show_reasoning_usage",
             ],
             source,
@@ -4105,6 +4175,12 @@ impl TuiSettings {
                 source,
                 &field(path, "transcript_default"),
             )?,
+            alternate_screen: tui_alternate_screen_value(
+                table,
+                "alternate_screen",
+                source,
+                &field(path, "alternate_screen"),
+            )?,
             show_reasoning_usage: bool_value(
                 table,
                 "show_reasoning_usage",
@@ -4120,6 +4196,7 @@ impl TuiSettings {
         replace_if_some(&mut self.response_verbosity, next.response_verbosity);
         replace_if_some(&mut self.tool_output_verbosity, next.tool_output_verbosity);
         replace_if_some(&mut self.transcript_default, next.transcript_default);
+        replace_if_some(&mut self.alternate_screen, next.alternate_screen);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
     }
 }
@@ -4248,16 +4325,16 @@ pub fn find_project_settings_path(start: impl AsRef<Path>) -> Option<PathBuf> {
 
 pub fn user_settings_template() -> &'static str {
     r#"# User-level Squeezy settings. Uncomment any key you want to override.
-# Values shown after `=` are the built-in defaults that apply when the
-# key is absent or commented out.
+# Commented values are examples or defaults that apply when the key is absent.
 
 [model]
 # provider = "openai"          # openai | anthropic | google | azure_openai | bedrock | ollama
 # profile = "balanced"         # cheap | balanced | strong
-# model = "gpt-5-nano"         # provider-specific model id; leave unset to use the provider default
-# reasoning_effort = "low"     # low | medium | high; only sent to capable providers
-# max_output_tokens = 128
+# model = "gpt-5.5"            # provider-specific model id; leave unset to use the provider default
+# reasoning_effort = "medium"  # low | medium | high | xhigh; only sent to capable providers
+# max_output_tokens = 64000    # optional output cap; unset means provider/model limit
 # store_responses = false      # only honored by openai/azure_openai
+# selection_version = 1        # maintained by the startup provider/model selector
 
 [agent]
 # exploration_compiler = true  # graph-first planner for common navigation prompts
@@ -4289,16 +4366,16 @@ pub fn user_settings_template() -> &'static str {
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
-# default_model = "gpt-5-nano"
+# default_model = "gpt-5.5"
 
 # [providers.anthropic]
 # api_key_env = "ANTHROPIC_API_KEY"
 # base_url = "https://api.anthropic.com/v1"
-# default_model = "claude-haiku-4-5-20251001"
+# default_model = "claude-opus-4-7"
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
@@ -4336,7 +4413,7 @@ pub fn user_settings_template() -> &'static str {
 # source = "project"
 
 # [permissions.shell_sandbox]
-# mode = "required"                 # required | best_effort | off
+# mode = "best_effort"              # best_effort | required | off
 # network = "deny_by_default"       # deny_by_default | allow_when_approved
 # audit = true
 # kill_grace_ms = 250
@@ -4367,6 +4444,7 @@ pub fn user_settings_template() -> &'static str {
 # compat_user_dir = "~/.agents/skills"
 
 # [tools]
+# checkpoints_enabled = false
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -4380,6 +4458,7 @@ pub fn user_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
+# alternate_screen = "auto"     # auto | always | never
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -4438,7 +4517,7 @@ pub fn project_settings_template() -> &'static str {
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
@@ -4473,6 +4552,7 @@ pub fn project_settings_template() -> &'static str {
 # tool_outputs = ".squeezy/tool_outputs"
 
 # [tools]
+# checkpoints_enabled = false
 # lazy_schema_loading = true
 # `update_task_state` and `load_tool_schema` are always-core control tools
 # and do not need to appear in `core`. See `DEFAULT_CORE_TOOL_NAMES` in
@@ -4486,6 +4566,7 @@ pub fn project_settings_template() -> &'static str {
 # response_verbosity = "normal"  # concise | normal | verbose
 # tool_output_verbosity = "compact" # compact | normal | verbose
 # transcript_default = "compact" # compact | expanded
+# alternate_screen = "auto"     # auto | always | never
 # show_reasoning_usage = true
 
 # [mcp.servers.docs]
@@ -5245,6 +5326,25 @@ fn transcript_default_value(
     }
 }
 
+fn tui_alternate_screen_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiAlternateScreen>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(Some(TuiAlternateScreen::Auto)),
+        "never" => Ok(Some(TuiAlternateScreen::Never)),
+        "always" => Ok(Some(TuiAlternateScreen::Always)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
+        ))),
+    }
+}
+
 fn reasoning_effort_value(
     table: &toml::value::Table,
     key: &str,
@@ -5256,7 +5356,7 @@ fn reasoning_effort_value(
     };
     ReasoningEffort::parse(&value).ok_or_else(|| {
         SqueezyError::Config(format!(
-            "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, or high"
+            "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, high, or xhigh"
         ))
     }).map(Some)
 }
@@ -6411,7 +6511,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use update_task_state to keep visible task progress current: start, meaningful step changes, blockers, verification, and replans from new evidence. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. Do not repeat raw tool output already shown by the UI. If a tool call is denied, do not retry the same call.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

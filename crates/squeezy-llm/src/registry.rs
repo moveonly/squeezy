@@ -111,6 +111,56 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
     ModelInfo {
         provider: "openai",
         id: squeezy_core::DEFAULT_OPENAI_MODEL,
+        profile: ModelProfile::Strong,
+        capabilities: ModelCapabilities {
+            response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
+            ..ModelCapabilities::TEXT_TOOLS
+        },
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 5_000_000,
+            output_usd_micros_per_mtok: 30_000_000,
+            cache_read_usd_micros_per_mtok: Some(500_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://developers.openai.com/api/docs/guides/latest-model.md",
+    },
+    ModelInfo {
+        provider: "openai",
+        id: "gpt-5.4-mini",
+        profile: ModelProfile::Balanced,
+        capabilities: ModelCapabilities {
+            response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
+            ..ModelCapabilities::TEXT_TOOLS
+        },
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 750_000,
+            output_usd_micros_per_mtok: 4_500_000,
+            cache_read_usd_micros_per_mtok: Some(75_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "openai",
+        id: "gpt-5.4-nano",
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities {
             response_state: true,
@@ -120,9 +170,9 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             ..ModelCapabilities::TEXT_TOOLS
         },
         pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 50_000,
-            output_usd_micros_per_mtok: 400_000,
-            cache_read_usd_micros_per_mtok: Some(5_000),
+            input_usd_micros_per_mtok: 200_000,
+            output_usd_micros_per_mtok: 1_250_000,
+            cache_read_usd_micros_per_mtok: Some(20_000),
             cache_write_usd_micros_per_mtok: None,
         }),
         limits: Some(ModelLimits {
@@ -131,11 +181,49 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         }),
         tokenizer: TokenizerKind::OpenAiCompatible,
         lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://platform.openai.com/docs/models/gpt-5-nano/",
+        metadata_source: "https://developers.openai.com/api/docs/pricing",
     },
     ModelInfo {
         provider: "anthropic",
         id: squeezy_core::DEFAULT_ANTHROPIC_MODEL,
+        profile: ModelProfile::Strong,
+        capabilities: ModelCapabilities::TEXT_TOOLS,
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 15_000_000,
+            output_usd_micros_per_mtok: 75_000_000,
+            cache_read_usd_micros_per_mtok: Some(1_500_000),
+            cache_write_usd_micros_per_mtok: Some(18_750_000),
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 64_000,
+        }),
+        tokenizer: TokenizerKind::Anthropic,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
+    },
+    ModelInfo {
+        provider: "anthropic",
+        id: "claude-sonnet-4-6",
+        profile: ModelProfile::Balanced,
+        capabilities: ModelCapabilities::TEXT_TOOLS,
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 3_000_000,
+            output_usd_micros_per_mtok: 15_000_000,
+            cache_read_usd_micros_per_mtok: Some(300_000),
+            cache_write_usd_micros_per_mtok: Some(3_750_000),
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 200_000,
+            max_output_tokens: 64_000,
+        }),
+        tokenizer: TokenizerKind::Anthropic,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://platform.claude.com/docs/en/about-claude/models/overview",
+    },
+    ModelInfo {
+        provider: "anthropic",
+        id: "claude-haiku-4-5-20251001",
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities::TEXT_TOOLS,
         pricing: Some(TokenPricing {
@@ -155,6 +243,44 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
     ModelInfo {
         provider: "google",
         id: squeezy_core::DEFAULT_GOOGLE_MODEL,
+        profile: ModelProfile::Strong,
+        capabilities: ModelCapabilities::TEXT_TOOLS,
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 1_250_000,
+            output_usd_micros_per_mtok: 10_000_000,
+            cache_read_usd_micros_per_mtok: Some(310_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 1_048_576,
+            max_output_tokens: 65_536,
+        }),
+        tokenizer: TokenizerKind::Google,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
+    },
+    ModelInfo {
+        provider: "google",
+        id: "gemini-2.5-flash",
+        profile: ModelProfile::Balanced,
+        capabilities: ModelCapabilities::TEXT_TOOLS,
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 300_000,
+            output_usd_micros_per_mtok: 2_500_000,
+            cache_read_usd_micros_per_mtok: Some(75_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 1_048_576,
+            max_output_tokens: 65_536,
+        }),
+        tokenizer: TokenizerKind::Google,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
+    },
+    ModelInfo {
+        provider: "google",
+        id: "gemini-2.5-flash-lite",
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities::TEXT_TOOLS,
         pricing: Some(TokenPricing {
@@ -169,11 +295,61 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         }),
         tokenizer: TokenizerKind::Google,
         lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
+        metadata_source: "https://ai.google.dev/gemini-api/docs/models",
     },
     ModelInfo {
         provider: "azure_openai",
         id: squeezy_core::DEFAULT_AZURE_OPENAI_MODEL,
+        profile: ModelProfile::Strong,
+        capabilities: ModelCapabilities {
+            response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
+            ..ModelCapabilities::TEXT_TOOLS
+        },
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 5_000_000,
+            output_usd_micros_per_mtok: 30_000_000,
+            cache_read_usd_micros_per_mtok: Some(500_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://developers.openai.com/api/docs/guides/latest-model.md",
+    },
+    ModelInfo {
+        provider: "azure_openai",
+        id: "gpt-5.4-mini",
+        profile: ModelProfile::Balanced,
+        capabilities: ModelCapabilities {
+            response_state: true,
+            reasoning_tokens: true,
+            reasoning_effort: true,
+            text_verbosity: true,
+            ..ModelCapabilities::TEXT_TOOLS
+        },
+        pricing: Some(TokenPricing {
+            input_usd_micros_per_mtok: 750_000,
+            output_usd_micros_per_mtok: 4_500_000,
+            cache_read_usd_micros_per_mtok: Some(75_000),
+            cache_write_usd_micros_per_mtok: None,
+        }),
+        limits: Some(ModelLimits {
+            context_window_tokens: 400_000,
+            max_output_tokens: 128_000,
+        }),
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        lifecycle: ModelLifecycle::Active,
+        metadata_source: "https://developers.openai.com/api/docs/pricing",
+    },
+    ModelInfo {
+        provider: "azure_openai",
+        id: "gpt-5.4-nano",
         profile: ModelProfile::Cheap,
         capabilities: ModelCapabilities {
             response_state: true,
@@ -183,9 +359,9 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
             ..ModelCapabilities::TEXT_TOOLS
         },
         pricing: Some(TokenPricing {
-            input_usd_micros_per_mtok: 50_000,
-            output_usd_micros_per_mtok: 400_000,
-            cache_read_usd_micros_per_mtok: Some(5_000),
+            input_usd_micros_per_mtok: 200_000,
+            output_usd_micros_per_mtok: 1_250_000,
+            cache_read_usd_micros_per_mtok: Some(20_000),
             cache_write_usd_micros_per_mtok: None,
         }),
         limits: Some(ModelLimits {
@@ -194,7 +370,7 @@ pub const MODEL_REGISTRY: &[ModelInfo] = &[
         }),
         tokenizer: TokenizerKind::OpenAiCompatible,
         lifecycle: ModelLifecycle::Active,
-        metadata_source: "https://platform.openai.com/docs/models/gpt-5-nano/",
+        metadata_source: "https://developers.openai.com/api/docs/pricing",
     },
     ModelInfo {
         provider: "bedrock",

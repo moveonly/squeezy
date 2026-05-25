@@ -32,7 +32,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         input: vec![LlmInputItem::UserText(
             "Reply with exactly: squeezy-ok".to_string(),
         )],
-        max_output_tokens: Some(costly_max_output_tokens()?),
+        max_output_tokens: costly_max_output_tokens()?,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
@@ -98,7 +98,7 @@ fn require_env_key(name: &str) -> Result<()> {
     )))
 }
 
-fn costly_max_output_tokens() -> Result<u32> {
+fn costly_max_output_tokens() -> Result<Option<u32>> {
     let Ok(raw) = env::var(COSTLY_MAX_OUTPUT_TOKENS_ENV) else {
         return Ok(DEFAULT_MAX_OUTPUT_TOKENS);
     };
@@ -115,5 +115,5 @@ fn costly_max_output_tokens() -> Result<u32> {
         )));
     }
 
-    Ok(parsed)
+    Ok(Some(parsed))
 }

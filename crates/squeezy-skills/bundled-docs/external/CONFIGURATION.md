@@ -28,6 +28,13 @@ stable repo id for per-repo user settings; see
 `config inspect` and `--health` both list the source chain so you can see
 which layers actually contributed to a given run.
 
+On first interactive startup, when no provider/model default has been selected,
+Squeezy detects available provider API-key environment variables, asks for a
+provider, model, and supported model options, then saves the result to
+`~/.squeezy/settings.toml`. The startup selector writes environment variable
+names such as `OPENAI_API_KEY`, not secret values. Use `--no-default` to run the
+selector again and replace the saved default.
+
 ## Commands
 
 ```sh
@@ -65,10 +72,11 @@ commented examples so that built-in defaults can evolve over time:
 [model]
 # provider = "openai"
 # profile = "balanced"
-# model = "gpt-5-nano"
-# reasoning_effort = "low"
-# max_output_tokens = 128
+# model = "gpt-5.5"
+# reasoning_effort = "medium"
+# max_output_tokens = 64000    # optional output cap; unset means provider/model limit
 # store_responses = false
+# selection_version = 1
 
 [agent]
 # exploration_compiler = true
@@ -100,11 +108,11 @@ commented examples so that built-in defaults can evolve over time:
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
 # base_url = "https://api.openai.com/v1"
-# default_model = "gpt-5-nano"
+# default_model = "gpt-5.5"
 
 [permissions]
 # read = "allow"
-# edit = "ask"
+# edit = "allow"
 # shell = "ask"
 # ignored_search = "allow"
 # web = "ask"
@@ -123,7 +131,7 @@ commented examples so that built-in defaults can evolve over time:
 # source = "project"
 
 # [permissions.shell_sandbox]
-# mode = "required"
+# mode = "best_effort"
 # network = "deny_by_default"
 # audit = true
 # kill_grace_ms = 250                          # bounded to 10..=60000
@@ -205,15 +213,19 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 # response_verbosity = "normal"
 # tool_output_verbosity = "compact"
 # transcript_default = "compact"
+# alternate_screen = "auto"
 # show_reasoning_usage = true
 ```
 
 ## Sections
 
 - `[model]`: `provider`, `model`, `profile`, `reasoning_effort`,
-  `max_output_tokens`, and `store_responses`. `reasoning_effort` is only sent
-  to providers whose model registry entry marks native reasoning controls as
-  supported.
+  `max_output_tokens`, `store_responses`, and startup selector
+  `selection_version`. `max_output_tokens` is optional; when unset, Squeezy does
+  not impose its own output cap and lets the provider/model limit apply.
+  `reasoning_effort` accepts `low`, `medium`, `high`, or `xhigh` and is only
+  sent to providers whose model registry entry marks native reasoning controls
+  as supported.
 - `[providers.<id>]`: provider defaults such as `api_key_env`, `base_url`,
   `default_model`, `api_version`, and `region`.
 - `[session]`: `mode`, either `build` (default) or `plan`. Build mode preserves
@@ -244,17 +256,23 @@ are resolved against the project root (the directory holding `squeezy.toml`).
 - `[budgets]`: per-turn and per-tool output limits.
 - `[permissions]`: compatibility defaults `read`, `edit`, `shell`,
   `ignored_search`, and `web`, each set to `allow`, `ask`, or `deny`.
+  Build mode defaults to allowing workspace edits, while shell, network, MCP,
+  and compiler actions still ask unless rules or environment overrides allow
+  them.
   `shell_classifier` (default `false`) enables a narrow LLM fallback that
   can only downgrade an `Ask` shell verdict to `Deny`; it spends one extra
   LLM round-trip per ambiguous shell call, so leave it off unless that cost
   is acceptable.
 - `[permissions.shell_sandbox]`: OS sandbox settings for the local shell tool.
-  The default `mode = "required"` fails closed when a supported sandbox backend
-  is unavailable. macOS launches through `sandbox-exec` with a `(deny default)`
-  profile that re-allows reads under system prefixes and reads+writes inside
-  the workspace, tmp dirs, and toolchain caches (`$CARGO_HOME`, `$RUSTUP_HOME`,
-  `$HOME/.cargo`, `$HOME/.rustup`). `read_roots` and `write_roots` are
-  opt-in absolute directories layered on top of those defaults. `write_roots`
+  The default `mode = "best_effort"` uses a supported sandbox backend when one
+  can be applied, then falls back to the permission-gated direct runner when the
+  host blocks nested sandboxing. Set `mode = "required"` when an unavailable
+  backend should deny shell execution. macOS launches through `sandbox-exec`
+  with a `(deny default)` profile that re-allows reads under system prefixes and
+  reads+writes inside the workspace, tmp dirs, and toolchain caches
+  (`$CARGO_HOME`, `$RUSTUP_HOME`, `$HOME/.cargo`, `$HOME/.rustup`).
+  `read_roots` and `write_roots` are opt-in absolute directories layered on top
+  of those defaults. `write_roots`
   imply read access. Put shared project roots in `squeezy.toml`; put
   machine-specific roots in `~/.squeezy/projects/<repo-id>/settings.toml`.
   Linux probes
@@ -406,8 +424,12 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   tool bytes, receipt hits, budget denials, and redaction counts.
   `response_verbosity` controls answer-length guidance, `tool_output_verbosity`
   controls expanded tool-result preview size, `transcript_default` chooses
-  compact or expanded transcript entries, and `show_reasoning_usage` hides or
-  shows provider-reported reasoning-token accounting when available.
+  compact or expanded transcript entries, `alternate_screen = "auto"` uses a
+  Codex-style inline viewport with real terminal scrollback,
+  `alternate_screen = "always"` forces the dedicated full-screen transcript
+  buffer, `alternate_screen = "never"` also uses the inline viewport, and
+  `show_reasoning_usage` hides or shows provider-reported reasoning-token
+  accounting when available.
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.

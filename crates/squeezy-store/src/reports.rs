@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{AppConfig, Redactor, Result, SqueezyError};
 
-use crate::{SessionEvent, SessionStore, ensure_repo_profile};
+use crate::{RepoProfile, SessionEvent, SessionStore};
 
 const REPORT_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_PATH: &str = "manifest.json";
@@ -427,11 +427,10 @@ fn manifest_value(
 }
 
 fn repo_profile_value(config: &AppConfig, redactor: &Redactor) -> Value {
-    match ensure_repo_profile(&config.workspace_root, &config.graph) {
-        Ok(loaded) => json!({
-            "status": loaded.status.as_str(),
-            "registry_path": redactor.redact(&loaded.registry_path.display().to_string()).text,
-            "profile": loaded.profile,
+    match RepoProfile::detect(&config.workspace_root, &config.graph) {
+        Ok(profile) => json!({
+            "status": "detected",
+            "profile": profile,
         }),
         Err(error) => json!({
             "status": "unavailable",

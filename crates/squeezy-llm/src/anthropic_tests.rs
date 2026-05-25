@@ -76,6 +76,25 @@ fn request_body_preserves_function_tool_order() {
 }
 
 #[test]
+fn request_body_uses_model_limit_when_output_cap_unset() {
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string(),
+        instructions: "be brief".to_string(),
+        input: vec![LlmInputItem::UserText("hello".to_string())],
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+
+    assert_eq!(body["max_tokens"], 64_000);
+}
+
+#[test]
 fn request_body_maps_tool_roundtrip_messages() {
     let request = LlmRequest {
         model: "claude-test".to_string(),

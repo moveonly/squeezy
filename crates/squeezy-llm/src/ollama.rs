@@ -68,6 +68,39 @@ pub async fn fetch_ollama_context_window(base_url: &str, model: &str) -> Option<
     ollama_context_window_from_show(&value)
 }
 
+pub async fn fetch_ollama_model_names(base_url: &str) -> Vec<String> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Vec::new(),
+    };
+    let url = format!("{}/tags", base_url.trim_end_matches('/'));
+    let value: Value = match client.get(url).send().await {
+        Ok(response) => match response.json().await {
+            Ok(value) => value,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    ollama_model_names_from_tags(&value)
+}
+
+pub(crate) fn ollama_model_names_from_tags(value: &Value) -> Vec<String> {
+    value
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn ollama_context_window_from_show(value: &Value) -> Option<u64> {
     value
         .get("model_info")

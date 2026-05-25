@@ -56,8 +56,8 @@ can see when context pressure is shaping behavior.
 
 Tool execution is policy-gated by capability: read, edit, shell, web, compiler,
 or MCP. Shell commands have a separate sandbox layer when enabled. Mutating
-tools create checkpoints so recent workspace edits can be inspected, undone, or
-reverted.
+tools can create checkpoints so recent workspace edits can be inspected, undone,
+or reverted when checkpointing is enabled.
 
 Verification is explicit. The agent uses local build, test, formatter, linter,
 or benchmark commands when the task calls for evidence; navigation tools do not

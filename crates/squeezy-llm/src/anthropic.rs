@@ -4,14 +4,13 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use squeezy_core::{
-    AnthropicConfig, CostSnapshot, DEFAULT_MAX_OUTPUT_TOKENS, Result, SqueezyError,
-};
+use squeezy_core::{AnthropicConfig, CostSnapshot, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
 use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
@@ -45,7 +44,13 @@ impl AnthropicProvider {
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
         let max_tokens = request
             .max_output_tokens
-            .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+            .map(u64::from)
+            .or_else(|| {
+                crate::model_info_for("anthropic", &request.model)
+                    .and_then(|info| info.limits)
+                    .map(|limits| limits.max_output_tokens)
+            })
+            .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
         let mut body = json!({
             "model": request.model,
             "system": request.instructions,
