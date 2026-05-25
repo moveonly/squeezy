@@ -1,10 +1,18 @@
 # Squeezy
 
-A coding agent that treats cost, speed, and code understanding as first-class citizens.
+A coding agent that treats cost, speed, and code understanding as first-class
+citizens. Squeezy parses repositories into a persistent local semantic graph and
+queries that graph through structured tools that return compact evidence
+packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-Squeezy parses repositories and builds a persistent local semantic graph. The agent queries this graph through structured tools that return compact evidence packets — spans, hashes, confidence, freshness — instead of raw file dumps.
+> **Status:** early development. The TUI scaffold is runnable; OpenAI,
+> Anthropic, Gemini, Azure OpenAI, Ollama, and Bedrock adapters are available;
+> deterministic validation harness tasks run in CI; graph-backed navigation
+> tools expose compact evidence packets.
 
-> **Status:** early development. The foundation TUI scaffold is runnable, provider/model selection is registry-backed, OpenAI, Anthropic, Gemini, Azure OpenAI, and Ollama adapters are available, deterministic validation harness tasks run in CI, and graph-backed navigation tools expose compact evidence packets. User docs live in [`docs/external/`](docs/external) and contributor docs live in [`docs/internal/`](docs/internal).
+The **why** lives in [`docs/THESIS.md`](docs/THESIS.md). User docs live in
+[`docs/external/`](docs/external) and contributor docs live in
+[`docs/internal/`](docs/internal).
 
 ## Install
 
@@ -30,57 +38,19 @@ Tagged releases also publish macOS Intel, macOS Apple Silicon, and Linux
 x86_64 musl archives. Full install, first-run, upgrade, and uninstall
 instructions are in [`docs/external/INSTALL.md`](docs/external/INSTALL.md).
 
-## Cost
+## Quickstart
 
-Every model token is a budgeted resource.
+```sh
+squeezy doctor                    # diagnose configuration and providers
+squeezy config init --user        # write the default user settings file
+export OPENAI_API_KEY=...         # or pick another provider; bring your own key
+squeezy                           # open the TUI
+```
 
-- **Context receipts** let re-reads return stubs that reference an earlier result instead of resending bytes.
-- An **exploration compiler** translates model intent into a deterministic local query plan; only the final compact evidence packet ships to the model.
-- A **cost broker** enforces per-turn caps on `grep`, raw reads, and tool calls, and routes trivial work to cheaper models.
-- **Failure memory** keeps the agent from repeating dead-end searches across compactions.
-- The static system prompt is held stable so provider caches actually hit.
-- Current fallback tools use ignore-aware `grep`, path-only `glob`, compact
-  search modes, spill handles, aggregate result budgets, and permission-gated
-  `websearch`/`webfetch` for current external evidence.
-- The agent approach, local-first help behavior, tool surfaces, and TUI slash
-  commands are documented in [`docs/external/AGENT_APPROACH.md`](docs/external/AGENT_APPROACH.md)
-  and [`docs/external/TOOLS.md`](docs/external/TOOLS.md).
-- The tool-call saving roadmap is documented in [`docs/external/tool-call-saving-strategy.md`](docs/external/tool-call-saving-strategy.md).
-- Anonymous product telemetry is documented in [`docs/external/TELEMETRY.md`](docs/external/TELEMETRY.md).
-- Consented feedback and bug-report intake are documented in [`docs/external/FEEDBACK.md`](docs/external/FEEDBACK.md).
-- Configuration is documented in [`docs/external/CONFIGURATION.md`](docs/external/CONFIGURATION.md), with provider details in [`docs/external/PROVIDERS.md`](docs/external/PROVIDERS.md).
-
-## Speed
-
-Latency is tracked along four axes:
-
-- **Time-to-first-token**, by sending focused context rather than raw file dumps.
-- **Task wall-clock**, by reducing tool calls and redo cycles.
-- **Cold start**, by lazy indexing on first run and persisting the graph between sessions.
-- **Tool-call latency**, by serving graph queries from local indexes, not network or compiler services.
-
-## Code understanding
-
-The semantic graph is the primary navigation surface; bounded grep is a labeled fallback.
-
-- Every relationship carries a **confidence label** (`exact_syntax`, `import_resolved`, `candidate_set`, `external`, `unknown`).
-- Every claim carries **provenance**: spans, hashes, parser/query origin, freshness.
-- **Framework-aware extensions** can expose routes and system functions as graph
-  nodes when a supported adapter exists.
-- The **current branch diff** is first-class context: "what did I just change and what does it affect" is one query, not a search.
-- Unsupported languages return structured `unsupported` / `partial` results rather than fabricated graph confidence. The current language coverage matrix lives in [`docs/external/LANGUAGES.md`](docs/external/LANGUAGES.md).
-
-## Scope
-
-Squeezy targets local semantic navigation across Rust, Python, Java, C#/.NET, Go, C/C++, and JavaScript/TypeScript. Initial platforms are macOS and Linux. The Linux release artifact is built for `x86_64-unknown-linux-musl` so it does not depend on glibc. The UI is a TUI. Squeezy is an MCP client: external MCP servers can be installed and consumed as tools.
-
-Squeezy explicitly does not provide:
-
-- a hosted service — it runs locally,
-- an IDE plugin — the TUI is the only interface,
-- LSP-backed navigation — the graph is lightweight, local, and agent optimized,
-- a single-provider integration — bring your own key,
-- an MCP server or remote API for its semantic graph — the graph is internal.
+`squeezy doctor` reports on the merged configuration sources, repo profile,
+configured provider credential, session-store path, and shell-sandbox tool
+availability. See [`docs/external/TROUBLESHOOTING.md`](docs/external/TROUBLESHOOTING.md)
+when startup looks wrong.
 
 ## License
 
@@ -88,4 +58,5 @@ See [LICENSE](LICENSE).
 
 ## Contributing
 
-Build, test, clippy, and coverage commands are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+Build, test, clippy, and coverage commands are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md).
