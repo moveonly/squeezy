@@ -450,10 +450,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     }
                 }
                 AgentEvent::McpStatusUpdated { snapshot, .. } => {
-                    let summary = format_mcp_status_snapshot(&snapshot);
-                    app.mcp_status = Some(snapshot);
-                    app.status = format!("mcp {summary}");
-                    app.push_log(format!("mcp status {summary}"));
+                    apply_mcp_status_update(app, snapshot);
                 }
                 AgentEvent::JobUpdated { job } => {
                     apply_job_update(app, job);
@@ -712,6 +709,26 @@ fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
     app.input_cursor = app.input.len();
     app.status = "restored last prompt — edit and Enter to retry".to_string();
     true
+}
+
+/// Update `app` for an MCP status snapshot. The transcript log line is
+/// pushed only when the status text actually changed AND either the new
+/// or prior snapshot had configured servers — without that gate, users
+/// with no MCP configured see "mcp status none" stamped on every turn.
+fn apply_mcp_status_update(app: &mut TuiApp, snapshot: McpStatusSnapshot) {
+    let summary = format_mcp_status_snapshot(&snapshot);
+    let prior_summary = app.mcp_status.as_ref().map(format_mcp_status_snapshot);
+    let prior_had_servers = app
+        .mcp_status
+        .as_ref()
+        .is_some_and(|prior| !prior.per_server.is_empty());
+    let now_has_servers = !snapshot.per_server.is_empty();
+    app.mcp_status = Some(snapshot);
+    app.status = format!("mcp {summary}");
+    let changed = prior_summary.as_deref() != Some(&summary);
+    if changed && (now_has_servers || prior_had_servers) {
+        app.push_log(format!("mcp status {summary}"));
+    }
 }
 
 fn cancel_pending_request_user_input(app: &mut TuiApp) {

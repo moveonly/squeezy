@@ -4561,6 +4561,69 @@ async fn mention_popup_escapes_on_esc() {
 // ---- F40: working row details ----
 
 #[test]
+fn apply_mcp_status_update_does_not_log_when_no_servers_configured() {
+    let mut app = test_app(SessionMode::Build);
+    let empty = McpStatusSnapshot {
+        per_server: std::collections::BTreeMap::new(),
+        generated_unix_millis: 0,
+    };
+    let baseline = app.transcript.len();
+
+    // First snapshot with no servers — must not push a log entry.
+    super::apply_mcp_status_update(&mut app, empty.clone());
+    assert_eq!(
+        app.transcript.len(),
+        baseline,
+        "empty MCP status should not log"
+    );
+    assert!(app.mcp_status.is_some(), "snapshot should still be cached");
+
+    // A second identical empty snapshot also must not log.
+    super::apply_mcp_status_update(&mut app, empty.clone());
+    assert_eq!(app.transcript.len(), baseline);
+}
+
+#[test]
+fn apply_mcp_status_update_logs_transitions_to_and_from_servers() {
+    let mut app = test_app(SessionMode::Build);
+    let empty = McpStatusSnapshot {
+        per_server: std::collections::BTreeMap::new(),
+        generated_unix_millis: 0,
+    };
+    let mut active_servers = std::collections::BTreeMap::new();
+    active_servers.insert(
+        "alpha".to_string(),
+        McpServerStatus::Ready {
+            tools_count: 4,
+            cached: false,
+        },
+    );
+    let active = McpStatusSnapshot {
+        per_server: active_servers,
+        generated_unix_millis: 0,
+    };
+
+    super::apply_mcp_status_update(&mut app, empty.clone());
+    let after_empty = app.transcript.len();
+
+    // Empty → active should log.
+    super::apply_mcp_status_update(&mut app, active.clone());
+    assert!(
+        app.transcript.len() > after_empty,
+        "transition to active MCP servers should log"
+    );
+    let after_active = app.transcript.len();
+
+    // Repeat of the same active snapshot must not log.
+    super::apply_mcp_status_update(&mut app, active.clone());
+    assert_eq!(app.transcript.len(), after_active);
+
+    // Active → empty should log (servers dropped).
+    super::apply_mcp_status_update(&mut app, empty);
+    assert!(app.transcript.len() > after_active);
+}
+
+#[test]
 fn working_panel_height_is_one_without_detail() {
     let mut app = test_app(SessionMode::Build);
     app.cancel = Some(CancellationToken::new()); // turn in progress
