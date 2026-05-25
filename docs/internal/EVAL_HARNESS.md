@@ -77,7 +77,7 @@ issue does not abort the run.
 Each run writes to `target/eval/<scenario-id>-<ts>/`:
 
 - `trace.jsonl` — structured event stream (one JSON object per line; schema_version=2).
-- `frames.jsonl` — one frame per turn. Each frame carries the assembled assistant markdown, per-tool-call breadcrumbs (`name`, `args_preview`, `args_sha256`, `status`), elapsed wall clock, token totals, and the per-turn USD cost.
+- `frames.jsonl` — one frame per turn. Each frame carries the assembled assistant markdown, per-tool-call breadcrumbs (`name`, `args_preview`, `args_sha256`, `status`), elapsed wall clock, token totals, the per-turn USD cost, **and** a TUI-rendered view: `styled_lines` (structured `Line`/`Span` JSON with `fg`/`bg`/`modifiers`) plus `ansi` (an ANSI-escaped string you can `cat` into your terminal). Rendering goes through the same `squeezy_tui::render_markdown` pipeline the TUI uses, so palette and modifier regressions in the TUI surface in eval frames for free.
 - `findings.jsonl` — auto-derived findings from the rule matcher (`duplicate_tool_call`, `repeated_turn_failure`, `stale_function_call_output`, `high_tool_burst`, `unsupported_slash_command`, `approval_unanswered`, plus `expect_*` rules promoted from soft expectations).
 - `run.json` — manifest with totals (events, frames, findings, `cost_micro_usd`, per-turn cost breakdown) plus scenario / workspace / provider / model metadata.
 - `tickets/` — markdown + JSON per ticket; when the session log is available a shared `tickets/session-bundle.tar.gz` is produced via `SessionStore::build_bug_report`, and each markdown body links to it under `## Bundle`.

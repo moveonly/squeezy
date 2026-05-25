@@ -64,6 +64,7 @@ mod resume_picker;
 mod status;
 mod streaming;
 mod streaming_patch;
+pub use render::markdown::render_markdown;
 pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 use render::palette::{

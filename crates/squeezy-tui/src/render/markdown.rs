@@ -6,7 +6,7 @@ use ratatui::{
 
 use crate::render::{highlight, palette};
 
-pub(crate) fn render_markdown(source: &str) -> Vec<Line<'static>> {
+pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
     let mut writer = Writer::default();
     for event in Parser::new_ext(source, Options::empty()) {
         writer.event(event);

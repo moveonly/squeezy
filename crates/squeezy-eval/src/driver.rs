@@ -980,6 +980,12 @@ impl Driver {
         // Suppress unused warnings in modes where we don't yet branch on
         // these flags.
         let _ = (received_tool_call, &wait_for);
+        // Render the assistant markdown through the TUI's own pipeline so
+        // the frame carries both a structured Line/Span representation
+        // and an ANSI-escaped string a reviewer can replay.
+        let (styled, ansi) = crate::frames::render_styled(&frame.assistant_text);
+        frame.styled_lines = styled;
+        frame.ansi = ansi;
         self.frames.write(&frame)?;
         *self.wall_clock_seconds.lock().await = self.run_start.elapsed().as_secs();
         Ok(())
