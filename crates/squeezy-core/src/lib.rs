@@ -5647,13 +5647,20 @@ fn load_tier_source(path: &Path) -> Result<Option<TierSource>> {
     }
 }
 
-/// Resolves which tier owns a leaf, using repo > project > user > default
-/// precedence (repo wins because that's how the merge composes — last write
-/// in `load_settings_from_paths` is the effective value).
+/// Resolves which tier owns a field, using env > repo > project > user > default
+/// precedence. Env wins because env-var overrides are applied after the merged
+/// settings in `from_settings_and_env_vars`; repo wins next because it's the
+/// last tier merged in `load_settings_from_paths`.
 pub fn resolve_field_source(
     sources: &SeparatedSources,
-    path: &[&str],
+    field: &config_schema::FieldMeta,
 ) -> config_schema::FieldSource {
+    if let Some(var_name) = field.env_override
+        && std::env::var(var_name).is_ok()
+    {
+        return config_schema::FieldSource::Env;
+    }
+    let path = field.toml_path;
     if let Some(repo) = &sources.repo
         && repo.contains_path(path)
     {

@@ -2128,16 +2128,52 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
     };
+    let models = &config_schema::CONFIG_SECTIONS[0];
+    let provider_field = &models.fields[0]; // provider
+    let model_field = &models.fields[1]; // model
+    let profile_field = &models.fields[2]; // profile
+
+    // Env-override fields might be set in the test environment; clear them so
+    // the test asserts the tier precedence, not env precedence.
+    // SAFETY: tests run single-threaded by default for this module.
+    unsafe {
+        std::env::remove_var("SQUEEZY_PROVIDER");
+        std::env::remove_var("SQUEEZY_MODEL");
+        std::env::remove_var("SQUEEZY_PROFILE");
+    }
+
     assert_eq!(
-        resolve_field_source(&sources, &["model", "provider"]),
+        resolve_field_source(&sources, provider_field),
         config_schema::FieldSource::User
     );
     assert_eq!(
-        resolve_field_source(&sources, &["model", "model"]),
+        resolve_field_source(&sources, model_field),
         config_schema::FieldSource::Project
     );
     assert_eq!(
-        resolve_field_source(&sources, &["model", "profile"]),
+        resolve_field_source(&sources, profile_field),
         config_schema::FieldSource::Default
     );
+}
+
+#[test]
+fn resolve_field_source_returns_env_when_env_var_set() {
+    let sources = SeparatedSources {
+        user: None,
+        project: None,
+        repo: None,
+        user_path_default: PathBuf::from("/u.toml"),
+        project_path_default: PathBuf::from("/p.toml"),
+    };
+    let provider_field = &config_schema::CONFIG_SECTIONS[0].fields[0];
+    assert_eq!(
+        provider_field.env_override,
+        Some("SQUEEZY_PROVIDER"),
+        "provider field should declare env_override; precondition for this test"
+    );
+    // SAFETY: tests run single-threaded by default for this module.
+    unsafe { std::env::set_var("SQUEEZY_PROVIDER", "anthropic") };
+    let resolved = resolve_field_source(&sources, provider_field);
+    unsafe { std::env::remove_var("SQUEEZY_PROVIDER") };
+    assert_eq!(resolved, config_schema::FieldSource::Env);
 }

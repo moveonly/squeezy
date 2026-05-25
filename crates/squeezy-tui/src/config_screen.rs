@@ -119,8 +119,8 @@ impl ConfigScreenState {
         &self.current_section().fields[self.field_index]
     }
 
-    pub(crate) fn field_source(&self, path: &[&str]) -> FieldSource {
-        resolve_field_source(&self.sources, path)
+    pub(crate) fn field_source(&self, field: &FieldMeta) -> FieldSource {
+        resolve_field_source(&self.sources, field)
     }
 }
 
@@ -321,6 +321,28 @@ fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEditor {
             cursor: d.as_millis().to_string().len(),
         },
         (FieldKind::DurationMs, _) => FieldEditor::Duration {
+            draft: String::new(),
+            cursor: 0,
+        },
+        // New kinds (StringList / Path / Secret / ProviderSubTabs / TableArray)
+        // get dedicated editors in commits 4 and 5. Until then, fall back to
+        // a placeholder text editor so the section can still render.
+        (FieldKind::StringList { .. }, FieldValue::StringList(items)) => FieldEditor::Text {
+            draft: items.join(", "),
+            cursor: 0,
+        },
+        (FieldKind::Path { .. }, FieldValue::Path(p)) => FieldEditor::Text {
+            draft: p.display().to_string(),
+            cursor: 0,
+        },
+        (
+            FieldKind::StringList { .. }
+            | FieldKind::Path { .. }
+            | FieldKind::Secret { .. }
+            | FieldKind::ProviderSubTabs
+            | FieldKind::TableArray { .. },
+            _,
+        ) => FieldEditor::Text {
             draft: String::new(),
             cursor: 0,
         },
@@ -632,6 +654,15 @@ fn field_edit(field: &'static FieldMeta, value: &FieldValue) -> SettingsEdit {
         (_, FieldValue::OptionalEnum(Some(s))) => EditOp::SetString((*s).to_string()),
         (_, FieldValue::OptionalEnum(None)) => EditOp::Unset,
         (_, FieldValue::Duration(d)) => EditOp::SetInteger(d.as_millis() as i64),
+        (_, FieldValue::StringList(items)) => EditOp::SetArrayOfStrings(items.clone()),
+        (_, FieldValue::Path(p)) => EditOp::SetString(p.display().to_string()),
+        // Secret / SubTabs / TableArray* never go through field_edit; their
+        // commits are routed to dedicated handlers in commit 5. If we ever
+        // reach this arm it's a programmer bug.
+        (_, FieldValue::Secret)
+        | (_, FieldValue::SubTabs(_))
+        | (_, FieldValue::TableArrayKeyed(_))
+        | (_, FieldValue::TableArrayOrdered(_)) => EditOp::Unset,
     };
     SettingsEdit {
         path: field.toml_path,
@@ -807,7 +838,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
         let active = idx == state.field_index;
         let value = (field.get)(&state.effective);
         let value_str = value.as_display();
-        let source = state.field_source(field.toml_path);
+        let source = state.field_source(field);
         let source_label = format!("[{}]", source.badge());
         let prefix = if active { "› " } else { "  " };
         let style = if active {

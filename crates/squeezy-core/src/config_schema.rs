@@ -6,11 +6,14 @@
 //!
 //! New sections are added by appending a `ConfigSectionMeta` entry below.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use crate::{
     AppConfig, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL, DEFAULT_BEDROCK_MODEL,
-    DEFAULT_GOOGLE_MODEL, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, DEFAULT_TELEMETRY_ENDPOINT,
+    DEFAULT_COST_WARN_PERCENT, DEFAULT_GOOGLE_MODEL, DEFAULT_MAX_PARALLEL_TOOLS,
+    DEFAULT_MAX_SEARCH_FILES_PER_TURN, DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN,
+    DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
     PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, StatusVerbosity,
     ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
 };
@@ -65,7 +68,7 @@ impl FieldSource {
 }
 
 /// The editor shape for a field. Drives which widget the UI renders.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum FieldKind {
     Bool,
     Integer {
@@ -89,6 +92,93 @@ pub enum FieldKind {
     },
     /// `<name>_ms` u64 in TOML, rendered as a duration.
     DurationMs,
+    /// Editable list of strings (e.g. `graph.languages`).
+    StringList {
+        min: usize,
+        max: usize,
+    },
+    /// Filesystem path. `must_exist` validation deferred to the editor.
+    Path {
+        must_exist: bool,
+        dir_only: bool,
+    },
+    /// API-key style secret. Never read into `AppConfig`; edits route to
+    /// `squeezy_llm::credentials::save_api_key_with_store(env_var, ...)`.
+    Secret {
+        env_var: &'static str,
+    },
+    /// Singleton kind used only by the `Providers` section to indicate the
+    /// six per-provider sub-tabs along the right pane.
+    ProviderSubTabs,
+    /// Multi-row editor: each row is itself a `FieldMeta` schema. `Keyed`
+    /// rows are addressed by name (`[mcp.servers.<name>]`); `Ordered` rows
+    /// are positional (`[[permissions.rules]]`).
+    TableArray {
+        kind: TableArrayKind,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum TableArrayKind {
+    Keyed { item_fields: &'static [FieldMeta] },
+    Ordered { item_fields: &'static [FieldMeta] },
+}
+
+impl std::fmt::Debug for TableArrayKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Keyed { item_fields } => write!(f, "Keyed {{ {} fields }}", item_fields.len()),
+            Self::Ordered { item_fields } => {
+                write!(f, "Ordered {{ {} fields }}", item_fields.len())
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for FieldKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bool => write!(f, "Bool"),
+            Self::Integer { min, max, suffix } => f
+                .debug_struct("Integer")
+                .field("min", min)
+                .field("max", max)
+                .field("suffix", suffix)
+                .finish(),
+            Self::OptionalInteger { min, max, suffix } => f
+                .debug_struct("OptionalInteger")
+                .field("min", min)
+                .field("max", max)
+                .field("suffix", suffix)
+                .finish(),
+            Self::Enum { options } => f.debug_struct("Enum").field("options", options).finish(),
+            Self::OptionalEnum { options } => f
+                .debug_struct("OptionalEnum")
+                .field("options", options)
+                .finish(),
+            Self::String { multiline } => f
+                .debug_struct("String")
+                .field("multiline", multiline)
+                .finish(),
+            Self::DurationMs => write!(f, "DurationMs"),
+            Self::StringList { min, max } => f
+                .debug_struct("StringList")
+                .field("min", min)
+                .field("max", max)
+                .finish(),
+            Self::Path {
+                must_exist,
+                dir_only,
+            } => f
+                .debug_struct("Path")
+                .field("must_exist", must_exist)
+                .field("dir_only", dir_only)
+                .finish(),
+            Self::Secret { env_var } => f.debug_struct("Secret").field("env_var", env_var).finish(),
+            Self::ProviderSubTabs => write!(f, "ProviderSubTabs"),
+            Self::TableArray { kind } => f.debug_struct("TableArray").field("kind", kind).finish(),
+        }
+    }
 }
 
 /// Concrete value carried through reads, writes, and editor commits.
@@ -102,6 +192,18 @@ pub enum FieldValue {
     String(String),
     Duration(Duration),
     Unset,
+    StringList(Vec<String>),
+    Path(PathBuf),
+    /// Placeholder — secrets never carry the plaintext through `FieldValue`.
+    /// The screen mask-renders this as `••••` and routes editing directly
+    /// to the keychain.
+    Secret,
+    /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
+    SubTabs(usize),
+    /// Keyed table array (e.g. `[mcp.servers.<name>]`).
+    TableArrayKeyed(BTreeMap<String, BTreeMap<String, FieldValue>>),
+    /// Positional table array (e.g. `[[permissions.rules]]`).
+    TableArrayOrdered(Vec<BTreeMap<String, FieldValue>>),
 }
 
 impl FieldValue {
@@ -117,6 +219,18 @@ impl FieldValue {
             Self::String(s) => s.clone(),
             Self::Duration(d) => format!("{} ms", d.as_millis()),
             Self::Unset => "—".to_string(),
+            Self::StringList(items) => {
+                if items.is_empty() {
+                    "—".to_string()
+                } else {
+                    items.join(", ")
+                }
+            }
+            Self::Path(p) => p.display().to_string(),
+            Self::Secret => "••••".to_string(),
+            Self::SubTabs(_) => String::new(),
+            Self::TableArrayKeyed(map) => format!("{} entries", map.len()),
+            Self::TableArrayOrdered(rows) => format!("{} rows", rows.len()),
         }
     }
 }
@@ -132,6 +246,21 @@ pub enum SectionId {
     Verbosity,
     Limits,
     Telemetry,
+    Providers,
+    Session,
+    Modes,
+    Context,
+    Subagents,
+    Skills,
+    Graph,
+    Cache,
+    Tools,
+    Feedback,
+    Redaction,
+    Web,
+    McpServers,
+    ShellSandbox,
+    PermissionRules,
 }
 
 impl SectionId {
@@ -142,6 +271,21 @@ impl SectionId {
             Self::Verbosity => "verbosity",
             Self::Limits => "limits",
             Self::Telemetry => "telemetry",
+            Self::Providers => "providers",
+            Self::Session => "session",
+            Self::Modes => "modes",
+            Self::Context => "context",
+            Self::Subagents => "subagents",
+            Self::Skills => "skills",
+            Self::Graph => "graph",
+            Self::Cache => "cache",
+            Self::Tools => "tools",
+            Self::Feedback => "feedback",
+            Self::Redaction => "redaction",
+            Self::Web => "web",
+            Self::McpServers => "mcp-servers",
+            Self::ShellSandbox => "shell-sandbox",
+            Self::PermissionRules => "permission-rules",
         }
     }
 }
@@ -155,7 +299,16 @@ pub struct FieldMeta {
     pub get: fn(&AppConfig) -> FieldValue,
     pub set: fn(&mut AppConfig, FieldValue) -> Result<(), &'static str>,
     pub default_display: &'static str,
+    /// Programmatic default — invoked by `Ctrl+R` reset. Must mirror what
+    /// `AppConfig::from_env()` would yield with no overrides set.
+    pub default: fn() -> FieldValue,
     pub help: &'static str,
+    /// `SQUEEZY_*` env var that, when set, shadows this field at runtime.
+    /// Displayed as the `[env]` badge and disables in-screen editing.
+    pub env_override: Option<&'static str>,
+    /// `true` for API-key style fields: rendered as `••••`, edits route to
+    /// the keychain rather than `apply_edits`.
+    pub secret: bool,
 }
 
 pub struct ConfigSectionMeta {
@@ -200,7 +353,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_provider,
                 set: set_provider,
                 default_display: "openai",
+                default: || FieldValue::Enum("openai"),
                 help: "Which LLM provider to use. Switching also resets the model to that provider's default unless you set one explicitly.",
+                env_override: Some("SQUEEZY_PROVIDER"),
+                secret: false,
             },
             FieldMeta {
                 label: "model",
@@ -210,7 +366,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_model,
                 set: set_model,
                 default_display: DEFAULT_OPENAI_MODEL,
+                default: || FieldValue::String(String::new()),
                 help: "Provider-specific model identifier.",
+                env_override: Some("SQUEEZY_MODEL"),
+                secret: false,
             },
             FieldMeta {
                 label: "profile",
@@ -222,7 +381,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_profile,
                 set: set_profile,
                 default_display: "balanced",
+                default: || FieldValue::Enum("balanced"),
                 help: "Default cost/capability profile when model is unset.",
+                env_override: Some("SQUEEZY_PROFILE"),
+                secret: false,
             },
             FieldMeta {
                 label: "reasoning_effort",
@@ -234,7 +396,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_reasoning_effort,
                 set: set_reasoning_effort,
                 default_display: "—",
+                default: || FieldValue::OptionalEnum(None),
                 help: "Reasoning effort hint. Only meaningful for reasoning-capable models.",
+                env_override: Some("SQUEEZY_REASONING_EFFORT"),
+                secret: false,
             },
             FieldMeta {
                 label: "max_output_tokens",
@@ -248,7 +413,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_output_tokens,
                 set: set_max_output_tokens,
                 default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
                 help: "Cap on output tokens per request. Unset means provider default.",
+                env_override: Some("SQUEEZY_MAX_OUTPUT_TOKENS"),
+                secret: false,
             },
             FieldMeta {
                 label: "stream_idle_timeout",
@@ -258,7 +426,12 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_stream_idle_timeout,
                 set: set_stream_idle_timeout,
                 default_display: "300000 ms",
+                default: || {
+                    FieldValue::Duration(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
+                },
                 help: "Abort if no streaming bytes arrive for this duration.",
+                env_override: Some("SQUEEZY_STREAM_IDLE_TIMEOUT_MS"),
+                secret: false,
             },
             FieldMeta {
                 label: "store_responses",
@@ -268,7 +441,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_store_responses,
                 set: set_store_responses,
                 default_display: "false",
+                default: || FieldValue::Bool(false),
                 help: "(OpenAI/Azure only) Persist responses on the provider side for retrieval.",
+                env_override: Some("SQUEEZY_STORE_RESPONSES"),
+                secret: false,
             },
         ],
     },
@@ -287,7 +463,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_read,
                 set: set_perm_read,
                 default_display: "allow",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for file reads.",
+                env_override: Some("SQUEEZY_READ_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "edit",
@@ -299,7 +478,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_edit,
                 set: set_perm_edit,
                 default_display: "ask",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for file edits and writes.",
+                env_override: Some("SQUEEZY_EDIT_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "shell",
@@ -311,7 +493,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_shell,
                 set: set_perm_shell,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for shell command execution.",
+                env_override: Some("SQUEEZY_SHELL_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "ignored_search",
@@ -323,7 +508,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_ignored_search,
                 set: set_perm_ignored_search,
                 default_display: "ask",
+                default: || FieldValue::Enum("allow"),
                 help: "Default for searches that escape .gitignore boundaries.",
+                env_override: Some("SQUEEZY_IGNORED_SEARCH_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "web",
@@ -335,7 +523,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_web,
                 set: set_perm_web,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for web fetches and searches.",
+                env_override: Some("SQUEEZY_WEB_PERMISSION"),
+                secret: false,
             },
             FieldMeta {
                 label: "mcp",
@@ -347,7 +538,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_perm_mcp,
                 set: set_perm_mcp,
                 default_display: "ask",
+                default: || FieldValue::Enum("ask"),
                 help: "Default for MCP tool invocations.",
+                env_override: Some("SQUEEZY_MCP_PERMISSION"),
+                secret: false,
             },
         ],
     },
@@ -366,7 +560,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_response_verbosity,
                 set: set_response_verbosity,
                 default_display: "normal",
+                default: || FieldValue::Enum("normal"),
                 help: "How chatty the assistant's prose answers are.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "tool_output_verbosity",
@@ -378,7 +575,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_tool_output_verbosity,
                 set: set_tool_output_verbosity,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "How much tool output is shown inline.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "status_verbosity",
@@ -390,7 +590,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_status_verbosity,
                 set: set_status_verbosity,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "How much detail the bottom status bar shows.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "transcript_default",
@@ -402,7 +605,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_transcript_default,
                 set: set_transcript_default,
                 default_display: "compact",
+                default: || FieldValue::Enum("compact"),
                 help: "Whether new transcript entries start collapsed or expanded.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "show_reasoning_usage",
@@ -412,7 +618,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_show_reasoning_usage,
                 set: set_show_reasoning_usage,
                 default_display: "true",
+                default: || FieldValue::Bool(true),
                 help: "Show reasoning-token usage alongside completion tokens.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "alternate_screen",
@@ -424,7 +633,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_alternate_screen,
                 set: set_alternate_screen,
                 default_display: "auto",
+                default: || FieldValue::Enum("auto"),
                 help: "Whether to take over the terminal screen on launch.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "tick_rate",
@@ -438,7 +650,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_tick_rate,
                 set: set_tick_rate,
                 default_display: "50 ms",
+                default: || FieldValue::Integer(DEFAULT_TICK_RATE_MS as i64),
                 help: "Frame interval for animations.",
+                env_override: None,
+                secret: false,
             },
         ],
     },
@@ -459,7 +674,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_parallel_tools,
                 set: set_max_parallel_tools,
                 default_display: "8",
+                default: || FieldValue::Integer(DEFAULT_MAX_PARALLEL_TOOLS as i64),
                 help: "Maximum tool calls executed concurrently per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_tool_calls_per_turn",
@@ -473,7 +691,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_tool_calls_per_turn,
                 set: set_max_tool_calls_per_turn,
                 default_display: "64",
+                default: || FieldValue::Integer(DEFAULT_MAX_TOOL_CALLS_PER_TURN as i64),
                 help: "Stop the turn after this many tool calls.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_tool_bytes_read_per_turn",
@@ -487,7 +708,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_tool_bytes_read_per_turn,
                 set: set_max_tool_bytes_read_per_turn,
                 default_display: "20000000 bytes",
+                default: || FieldValue::Integer(DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN as i64),
                 help: "Aggregate read budget across all tools per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_search_files_per_turn",
@@ -501,7 +725,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_search_files_per_turn,
                 set: set_max_search_files_per_turn,
                 default_display: "50000 files",
+                default: || FieldValue::Integer(DEFAULT_MAX_SEARCH_FILES_PER_TURN as i64),
                 help: "Files scanned across all search tools per turn.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "cost_warn_percent",
@@ -515,7 +742,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_cost_warn_percent,
                 set: set_cost_warn_percent,
                 default_display: "85 %",
+                default: || FieldValue::Integer(DEFAULT_COST_WARN_PERCENT as i64),
                 help: "Warn when session cost crosses this percentage of the cap.",
+                env_override: None,
+                secret: false,
             },
             FieldMeta {
                 label: "max_session_cost_usd_micros",
@@ -529,7 +759,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_max_session_cost_usd_micros,
                 set: set_max_session_cost_usd_micros,
                 default_display: "—",
+                default: || FieldValue::OptionalInteger(None),
                 help: "Hard cap on session cost in micro-dollars. Unset means no cap.",
+                env_override: None,
+                secret: false,
             },
         ],
     },
@@ -546,7 +779,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_telemetry_enabled,
                 set: set_telemetry_enabled,
                 default_display: "true",
+                default: || FieldValue::Bool(true),
                 help: "Send anonymous usage events.",
+                env_override: Some("SQUEEZY_TELEMETRY"),
+                secret: false,
             },
             FieldMeta {
                 label: "endpoint",
@@ -556,7 +792,10 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 get: get_telemetry_endpoint,
                 set: set_telemetry_endpoint,
                 default_display: DEFAULT_TELEMETRY_ENDPOINT,
+                default: || FieldValue::String(DEFAULT_TELEMETRY_ENDPOINT.to_string()),
                 help: "Where telemetry events are POSTed.",
+                env_override: Some("SQUEEZY_TELEMETRY_ENDPOINT"),
+                secret: false,
             },
         ],
     },
