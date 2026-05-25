@@ -1,0 +1,34 @@
+[package]
+name = "squeezy-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish = false
+
+[dependencies]
+clap.workspace = true
+futures-core.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+squeezy-agent.workspace = true
+squeezy-core.workspace = true
+squeezy-llm.workspace = true
+squeezy-store.workspace = true
+squeezy-tools.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[[bin]]
+name = "squeezy-eval"
+path = "src/main.rs"
