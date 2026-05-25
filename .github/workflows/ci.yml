@@ -371,6 +371,10 @@ jobs:
             os: ubuntu-22.04
             artifact-name: squeezy-linux-x86_64-musl
             binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+          - platform: windows
+            os: windows-2022
+            artifact-name: squeezy-windows-x86_64
+            binary-path: target/release/squeezy.exe
 
     steps:
       - name: Checkout
@@ -432,12 +436,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          cp "${{ matrix.binary-path }}" "dist/${{ matrix.artifact-name }}"
-          chmod +x "dist/${{ matrix.artifact-name }}"
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            cp "${{ matrix.binary-path }}" "dist/${{ matrix.artifact-name }}.exe"
+          else
+            cp "${{ matrix.binary-path }}" "dist/${{ matrix.artifact-name }}"
+            chmod +x "dist/${{ matrix.artifact-name }}"
+          fi
 
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.artifact-name }}
-          path: dist/${{ matrix.artifact-name }}
+          path: dist/${{ matrix.artifact-name }}*
           if-no-files-found: error

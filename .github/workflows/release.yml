@@ -43,6 +43,10 @@ jobs:
             os: ubuntu-22.04
             archive: squeezy-x86_64-unknown-linux-musl.tar.gz
             binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            archive: squeezy-x86_64-pc-windows-msvc.zip
+            binary-path: target/x86_64-pc-windows-msvc/release/squeezy.exe
 
     steps:
       - name: Validate release tag
@@ -144,10 +148,23 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/package
-          cp "${{ matrix.binary-path }}" dist/package/squeezy
-          chmod +x dist/package/squeezy
-          tar -C dist/package -czf "dist/${{ matrix.archive }}" squeezy
-          shasum -a 256 "dist/${{ matrix.archive }}" > "dist/${{ matrix.archive }}.sha256"
+          target="${{ matrix.target }}"
+          archive="${{ matrix.archive }}"
+          binary="${{ matrix.binary-path }}"
+          case "$target" in
+            *-windows-*)
+              cp "$binary" "dist/package/squeezy.exe"
+              powershell -Command "Compress-Archive -Path dist/package/squeezy.exe -DestinationPath dist/$archive -Force"
+              sha=$(powershell -Command "(Get-FileHash -Algorithm SHA256 dist/$archive).Hash.ToLower()")
+              printf '%s  %s\n' "$sha" "$archive" > "dist/$archive.sha256"
+              ;;
+            *)
+              cp "$binary" dist/package/squeezy
+              chmod +x dist/package/squeezy
+              tar -C dist/package -czf "dist/$archive" squeezy
+              shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+              ;;
+          esac
 
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
