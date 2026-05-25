@@ -82,9 +82,14 @@ pub enum EvalEventKind {
         label: String,
         ms: u64,
     },
+    Finding {
+        rule_id: String,
+        severity: String,
+        summary: String,
+    },
 }
 
-pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 1;
+pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;
 
 /// Append-only JSONL trace writer.
 pub struct Capture {

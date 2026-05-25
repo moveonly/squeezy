@@ -1,5 +1,8 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use ignore::WalkBuilder;
 
 use crate::driver::EvalError;
 use crate::scenario::WorkspaceSpec;
@@ -9,24 +12,59 @@ pub struct ProvisionedWorkspace {
     pub path: PathBuf,
     pub source: WorkspaceSource,
     /// When `Some`, the directory will be removed when the workspace is dropped.
-    pub cleanup: Option<TempDirGuard>,
+    pub cleanup: Option<WorkspaceCleanup>,
 }
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceSource {
     Local(PathBuf),
-    Github { repo: String, sha: String },
+    /// Per-run snapshot of a local directory, materialized via `git
+    /// worktree add` (when the source is a git repo) or an
+    /// ignore-respecting tree copy. `sha` is the commit the worktree
+    /// points at when available.
+    Snapshot {
+        from: PathBuf,
+        sha: Option<String>,
+        worktree: bool,
+    },
+    Github {
+        repo: String,
+        sha: String,
+    },
 }
 
-pub struct TempDirGuard {
-    pub path: PathBuf,
+/// Cleanup guard for a per-run scratch directory.
+///
+/// Variant determines how to remove it: a `git worktree remove --force`
+/// for git-backed snapshots, plain directory removal otherwise.
+pub enum WorkspaceCleanup {
+    Worktree { source_repo: PathBuf, path: PathBuf },
+    Directory { path: PathBuf },
 }
 
-impl Drop for TempDirGuard {
+impl Drop for WorkspaceCleanup {
     fn drop(&mut self) {
         // Best-effort cleanup. Eval runs leave artifacts; the workspace
         // itself is fresh per-run so removing it is safe.
-        let _ = std::fs::remove_dir_all(&self.path);
+        match self {
+            WorkspaceCleanup::Worktree { source_repo, path } => {
+                let _ = Command::new("git")
+                    .current_dir(source_repo)
+                    .args([
+                        "worktree",
+                        "remove",
+                        "--force",
+                        path.to_string_lossy().as_ref(),
+                    ])
+                    .output();
+                // Fall through to directory cleanup in case `git
+                // worktree remove` quietly left the directory behind.
+                let _ = fs::remove_dir_all(path);
+            }
+            WorkspaceCleanup::Directory { path } => {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
     }
 }
 
@@ -35,21 +73,29 @@ pub fn provision(
     scratch_root: &Path,
 ) -> Result<ProvisionedWorkspace, EvalError> {
     match spec {
-        WorkspaceSpec::Local { path } => {
+        WorkspaceSpec::Local {
+            path,
+            snapshot,
+            snapshot_ref,
+        } => {
             if !path.exists() {
                 return Err(EvalError::Workspace(format!(
                     "local workspace path does not exist: {}",
                     path.display()
                 )));
             }
-            Ok(ProvisionedWorkspace {
-                path: path.clone(),
-                source: WorkspaceSource::Local(path.clone()),
-                cleanup: None,
-            })
+            if *snapshot {
+                provision_snapshot(path, scratch_root, snapshot_ref.as_deref())
+            } else {
+                Ok(ProvisionedWorkspace {
+                    path: path.clone(),
+                    source: WorkspaceSource::Local(path.clone()),
+                    cleanup: None,
+                })
+            }
         }
         WorkspaceSpec::Github { github } => {
-            std::fs::create_dir_all(scratch_root)
+            fs::create_dir_all(scratch_root)
                 .map_err(|err| EvalError::Io(format!("create_dir_all {scratch_root:?}: {err}")))?;
             let slug = sanitize(&github.repo);
             let target = scratch_root.join(format!(
@@ -74,15 +120,119 @@ pub fn provision(
                     repo: github.repo.clone(),
                     sha: github.sha.clone(),
                 },
-                cleanup: Some(TempDirGuard { path: target }),
+                cleanup: Some(WorkspaceCleanup::Directory { path: target }),
             })
         }
     }
 }
 
+fn provision_snapshot(
+    source: &Path,
+    scratch_root: &Path,
+    snapshot_ref: Option<&str>,
+) -> Result<ProvisionedWorkspace, EvalError> {
+    fs::create_dir_all(scratch_root)
+        .map_err(|err| EvalError::Io(format!("create_dir_all {scratch_root:?}: {err}")))?;
+    let slug = sanitize(&source.to_string_lossy());
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let target = scratch_root.join(format!("snap-{slug}-{ts}"));
+
+    let git_dir = source.join(".git");
+    let use_worktree = git_dir.exists();
+    let snapshot_ref = snapshot_ref.unwrap_or("HEAD");
+
+    if use_worktree {
+        // Add a detached worktree at the requested ref. Note: `git worktree
+        // add --detach` cannot point at another worktree's HEAD if the same
+        // branch is checked out elsewhere, but `--detach` keeps us safe for
+        // arbitrary commit-ish.
+        let target_str = target.to_string_lossy().into_owned();
+        let args: Vec<&str> = vec!["worktree", "add", "--detach", &target_str, snapshot_ref];
+        run_git_in(source, &args)?;
+        // Resolve the SHA we landed on (best effort).
+        let sha = Command::new("git")
+            .current_dir(&target)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            });
+        Ok(ProvisionedWorkspace {
+            path: target.clone(),
+            source: WorkspaceSource::Snapshot {
+                from: source.to_path_buf(),
+                sha,
+                worktree: true,
+            },
+            cleanup: Some(WorkspaceCleanup::Worktree {
+                source_repo: source.to_path_buf(),
+                path: target,
+            }),
+        })
+    } else {
+        copy_tree_ignore_respecting(source, &target)?;
+        Ok(ProvisionedWorkspace {
+            path: target.clone(),
+            source: WorkspaceSource::Snapshot {
+                from: source.to_path_buf(),
+                sha: None,
+                worktree: false,
+            },
+            cleanup: Some(WorkspaceCleanup::Directory { path: target }),
+        })
+    }
+}
+
+fn copy_tree_ignore_respecting(source: &Path, target: &Path) -> Result<(), EvalError> {
+    fs::create_dir_all(target)
+        .map_err(|err| EvalError::Io(format!("create_dir_all {target:?}: {err}")))?;
+    let walker = WalkBuilder::new(source)
+        .hidden(false) // mimic squeezy's own scanning
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+    for entry in walker {
+        let entry = entry.map_err(|err| EvalError::Workspace(format!("walk {source:?}: {err}")))?;
+        let path = entry.path();
+        let rel = match path.strip_prefix(source) {
+            Ok(rel) => rel,
+            Err(_) => continue,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = target.join(rel);
+        if entry.file_type().is_some_and(|t| t.is_dir()) {
+            fs::create_dir_all(&dest)
+                .map_err(|err| EvalError::Io(format!("create_dir_all {dest:?}: {err}")))?;
+        } else if entry.file_type().is_some_and(|t| t.is_file()) {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| EvalError::Io(format!("create_dir_all {parent:?}: {err}")))?;
+            }
+            fs::copy(path, &dest)
+                .map_err(|err| EvalError::Io(format!("copy {path:?} -> {dest:?}: {err}")))?;
+        }
+    }
+    Ok(())
+}
+
 fn sanitize(repo: &str) -> String {
     repo.chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(40)
         .collect()
 }
 

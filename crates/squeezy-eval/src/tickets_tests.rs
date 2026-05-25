@@ -31,7 +31,13 @@ fn renders_basic_markdown() {
         }],
         suggested_fix: None,
     };
-    let md = render_markdown(&ticket);
+    let md = render_markdown(&ticket, None);
     assert!(md.contains("# [squeezy-eval] Bug"));
     assert!(md.contains("trace_event 3"));
+    assert!(!md.contains("## Bundle"));
+
+    let bundle_path = std::path::PathBuf::from("/tmp/bundle.tar.gz");
+    let md_with_bundle = render_markdown(&ticket, Some(&bundle_path));
+    assert!(md_with_bundle.contains("## Bundle"));
+    assert!(md_with_bundle.contains("/tmp/bundle.tar.gz"));
 }

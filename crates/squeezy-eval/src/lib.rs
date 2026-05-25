@@ -8,7 +8,10 @@
 //! mock-trace deterministic for CI; eval is live-agent for exploratory QA.
 
 pub mod capture;
+pub mod ci;
+pub mod diff;
 pub mod driver;
+pub mod findings;
 pub mod frames;
 pub mod mock_provider;
 pub mod scenario;

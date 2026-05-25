@@ -2,6 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use squeezy_core::AppConfig;
+use squeezy_store::{BugReportOptions, SessionStore};
 
 use crate::driver::EvalError;
 
@@ -31,6 +33,16 @@ pub struct EvidencePointer {
 pub struct EmitOptions {
     pub emit_github: bool,
     pub gh_repo: Option<String>,
+    /// Optional bundle source for attaching a `BugReportBundle` to each
+    /// ticket. When set, `emit` calls `SessionStore::build_bug_report`
+    /// once and reuses the archive across all tickets in this batch.
+    pub bundle: Option<BundleSource>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BundleSource {
+    pub config: AppConfig,
+    pub session_id: String,
 }
 
 pub fn emit(
@@ -45,6 +57,13 @@ pub fn emit(
     std::fs::create_dir_all(&tickets_dir)
         .map_err(|err| EvalError::Io(format!("create_dir_all {tickets_dir:?}: {err}")))?;
 
+    // Build the bundle once for the whole batch; all tickets in a single
+    // run share the same captured session state.
+    let bundle_path = options
+        .bundle
+        .as_ref()
+        .and_then(|src| build_bundle(&tickets_dir, src).ok().flatten());
+
     for (idx, ticket) in tickets.iter().enumerate() {
         let slug = sanitize_slug(if ticket.id.is_empty() {
             &ticket.title
@@ -55,7 +74,7 @@ pub fn emit(
         let md_path = tickets_dir.join(format!("{stem}.md"));
         let json_path = tickets_dir.join(format!("{stem}.json"));
 
-        let body = render_markdown(ticket);
+        let body = render_markdown(ticket, bundle_path.as_deref());
         std::fs::write(&md_path, &body)
             .map_err(|err| EvalError::Io(format!("write {md_path:?}: {err}")))?;
         let json = serde_json::to_vec_pretty(ticket)
@@ -79,7 +98,35 @@ pub fn emit(
     Ok(())
 }
 
-fn render_markdown(ticket: &TicketDraft) -> String {
+/// Build the redacted bug-report bundle for the current session and
+/// write it into `tickets_dir`. Returns the bundle path on success,
+/// `None` if bundling is unavailable for this session (e.g. session
+/// logging disabled). Failures here are logged but do not abort
+/// ticket emission.
+fn build_bundle(
+    tickets_dir: &Path,
+    src: &BundleSource,
+) -> Result<Option<std::path::PathBuf>, EvalError> {
+    if src.session_id.is_empty() {
+        return Ok(None);
+    }
+    let store = SessionStore::open(&src.config);
+    match store.build_bug_report(&src.config, &src.session_id, BugReportOptions::default()) {
+        Ok(bundle) => {
+            let path = tickets_dir.join("session-bundle.tar.gz");
+            bundle.write_archive(&path).map_err(|err| {
+                EvalError::Io(format!("write bug-report archive {path:?}: {err}"))
+            })?;
+            Ok(Some(path))
+        }
+        Err(err) => {
+            eprintln!("warning: build_bug_report failed: {err}");
+            Ok(None)
+        }
+    }
+}
+
+fn render_markdown(ticket: &TicketDraft, bundle_path: Option<&Path>) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "# [squeezy-eval] {}", ticket.title);
@@ -114,6 +161,16 @@ fn render_markdown(ticket: &TicketDraft) -> String {
                 (None, None) => {}
             }
         }
+        let _ = writeln!(out);
+    }
+    if let Some(bundle) = bundle_path {
+        let _ = writeln!(out, "## Bundle");
+        let _ = writeln!(
+            out,
+            "Redacted bug-report archive: `{}` (produced via `SessionStore::build_bug_report`).",
+            bundle.display()
+        );
+        let _ = writeln!(out);
     }
     out
 }

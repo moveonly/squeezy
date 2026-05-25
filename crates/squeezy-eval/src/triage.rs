@@ -34,7 +34,10 @@ pub async fn triage(
         .clone()
         .unwrap_or_else(|| config.model.clone());
 
-    let instructions = build_instructions();
+    let instructions = build_instructions(
+        scenario.triage.focus.as_deref(),
+        scenario.triage.extra_prompt.as_deref(),
+    );
     let user = format!(
         "Scenario id: {id}\nScenario title: {title}\n\n--- trace.jsonl tail ---\n{trace}\n\n--- frames.jsonl tail ---\n{frames}\n",
         id = scenario.id,
@@ -65,17 +68,28 @@ pub async fn triage(
     Ok(response.tickets)
 }
 
-fn build_instructions() -> String {
-    "You are a senior software-quality reviewer. You will receive the tail of a Squeezy QA \
-     run: a JSONL event trace and per-turn assistant frames. Identify concrete bugs, perf \
-     issues, UX papercuts, or tooling gaps that an engineer should fix.\n\n\
-     Respond with a single JSON object on the form\n\
-     {\"tickets\":[{\"id\":\"\",\"title\":\"\",\"severity\":\"minor|major|critical\",\
-     \"category\":\"perf|ux|correctness|safety|tooling\",\"summary\":\"\",\"repro\":\"\",\
-     \"evidence\":[{\"trace_event\":N,\"frame\":N}],\"suggested_fix\":\"\"}]}\n\n\
-     If nothing is wrong, return {\"tickets\":[]}. Output only the JSON object — no prose, \
-     no backticks."
-        .to_string()
+fn build_instructions(focus: Option<&str>, extra: Option<&str>) -> String {
+    let mut text = String::from(
+        "You are a senior software-quality reviewer. You will receive the tail of a Squeezy QA \
+         run: a JSONL event trace and per-turn assistant frames. Identify concrete bugs, perf \
+         issues, UX papercuts, or tooling gaps that an engineer should fix.\n\n\
+         Respond with a single JSON object on the form\n\
+         {\"tickets\":[{\"id\":\"\",\"title\":\"\",\"severity\":\"minor|major|critical\",\
+         \"category\":\"perf|ux|correctness|safety|tooling\",\"summary\":\"\",\"repro\":\"\",\
+         \"evidence\":[{\"trace_event\":N,\"frame\":N}],\"suggested_fix\":\"\"}]}\n\n\
+         If nothing is wrong, return {\"tickets\":[]}. Output only the JSON object — no prose, \
+         no backticks.",
+    );
+    if let Some(focus) = focus.map(str::trim).filter(|s| !s.is_empty()) {
+        text.push_str("\n\nFocus area: ");
+        text.push_str(focus);
+        text.push_str(". Drop findings unrelated to this surface area.");
+    }
+    if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        text.push_str("\n\n");
+        text.push_str(extra);
+    }
+    text
 }
 
 fn extract_json(text: &str) -> Option<TriageResponse> {
@@ -111,3 +125,7 @@ fn tail_text(path: &Path, budget: usize) -> Result<String, EvalError> {
         .unwrap_or(start);
     Ok(data[snapped..].to_string())
 }
+
+#[cfg(test)]
+#[path = "triage_tests.rs"]
+mod tests;

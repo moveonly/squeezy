@@ -1966,6 +1966,65 @@ impl Agent {
         Ok(report)
     }
 
+    /// Dispatch an agent-side slash command (e.g. from a non-TUI
+    /// driver such as `squeezy-eval`). Only commands whose behavior
+    /// lives wholly inside `Agent` are handled here — TUI-only
+    /// commands (overlays, help text) return `Unsupported`.
+    ///
+    /// The structured outcome is suitable for embedding in JSON
+    /// transcripts; the TUI is free to render its own variant on top.
+    pub async fn dispatch_command(&self, name: &str, _args: &str) -> CommandOutcome {
+        let normalized = name.trim().trim_start_matches('/').to_ascii_lowercase();
+        match normalized.as_str() {
+            "compact" => match self.compact_context_manual().await {
+                Ok(_) => CommandOutcome::Compacted,
+                Err(err) => CommandOutcome::Error {
+                    command: normalized,
+                    message: format!("{err}"),
+                },
+            },
+            "plan" => {
+                let changed = self.set_session_mode(SessionMode::Plan, "dispatch_command");
+                CommandOutcome::ModeChanged {
+                    mode: "plan".into(),
+                    changed,
+                }
+            }
+            "build" => {
+                let changed = self.set_session_mode(SessionMode::Build, "dispatch_command");
+                CommandOutcome::ModeChanged {
+                    mode: "build".into(),
+                    changed,
+                }
+            }
+            "cost" => {
+                let snap = self.session_accounting_snapshot().await;
+                CommandOutcome::CostSnapshot {
+                    debug: format!("{:?}", snap),
+                }
+            }
+            "jobs" => {
+                let jobs = self.jobs_snapshot();
+                CommandOutcome::JobsList { count: jobs.len() }
+            }
+            "permissions" => {
+                let rules = self.session_rules_snapshot();
+                CommandOutcome::PermissionsList { count: rules.len() }
+            }
+            other => CommandOutcome::Unsupported {
+                command: other.to_string(),
+            },
+        }
+    }
+
+    /// Append an extra user message to the conversation transcript
+    /// without starting a new turn. Use to script "interrupting user"
+    /// behavior from drivers like `squeezy-eval`.
+    pub async fn queue_user_message(&self, text: String) {
+        let mut state = self.conversation_state.lock().await;
+        state.conversation.push(LlmInputItem::UserText(text));
+    }
+
     /// Restore the most recent compaction checkpoint, undoing the last
     /// `compact_context_manual` (or auto-compaction). Returns the restored
     /// record on success, or `Ok(None)` when there is nothing to undo
@@ -9321,6 +9380,21 @@ impl RequestUserInputResponse {
             freeform: None,
         }
     }
+}
+
+/// Structured result of [`Agent::dispatch_command`]. Designed to be
+/// serializable for non-TUI consumers (e.g. eval traces); the TUI is
+/// free to render its own version on top.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandOutcome {
+    Compacted,
+    ModeChanged { mode: String, changed: bool },
+    CostSnapshot { debug: String },
+    JobsList { count: usize },
+    PermissionsList { count: usize },
+    Unsupported { command: String },
+    Error { command: String, message: String },
 }
 
 pub enum AgentEvent {

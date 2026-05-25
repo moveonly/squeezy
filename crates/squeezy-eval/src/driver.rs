@@ -14,7 +14,7 @@ use squeezy_core::{AppConfig, PermissionMode, SessionMode};
 use squeezy_llm::provider_from_config;
 
 use crate::capture::{Capture, EvalEventKind};
-use crate::frames::{FrameFinish, FrameRecord, FrameWriter};
+use crate::frames::{FrameFinish, FrameRecord, FrameWriter, ToolCallSummary};
 use crate::scenario::{
     Action, ApprovalMatch, Assertion, EditReplace, Scenario, SqueezyOverlay, Step, WaitFor,
 };
@@ -37,6 +37,7 @@ pub struct RunOutcome {
     pub frame_count: u64,
     pub ticket_count: u64,
     pub findings: Vec<String>,
+    pub cost_micro_usd: u64,
 }
 
 #[derive(Debug, Error)]
@@ -85,6 +86,9 @@ pub async fn run_scenario(
             .map_err(|err| EvalError::Provider(provider_hint(err)))?
     };
     let agent = Agent::new(config.clone(), provider);
+    let provider_name = agent.provider_name();
+    let model = config.model.clone();
+    let session_id = agent.session_id().unwrap_or_default();
 
     // 3. Drive the steps.
     let driver = Driver {
@@ -101,32 +105,58 @@ pub async fn run_scenario(
         total_tool_calls: TokioMutex::new(0),
         tool_errors: TokioMutex::new(0),
         last_assistant_text: TokioMutex::new(String::new()),
+        provider_name,
+        model: model.clone(),
+        session_id: session_id.clone(),
+        total_cost_micro_usd: TokioMutex::new(0),
     };
 
     driver.dispatch_steps().await?;
 
-    // 4. Evaluate soft expectations into findings.
-    let findings = driver.evaluate_expectations().await;
-    for finding in &findings {
-        capture.record(
-            None,
-            EvalEventKind::ActionStep {
-                action: json!({"kind": "expectation"}),
-                status: format!("finding: {finding}"),
-            },
-        )?;
+    // 4. Run the auto-finding pattern matchers over the captured trace,
+    //    write findings.jsonl, and embed Finding events back into the
+    //    trace so triage and downstream tools see them.
+    let trace_ctx = crate::findings::TraceContext::load(&capture.path())?;
+    let mut findings_log = crate::findings::FindingsLog::create(&run_dir)?;
+    let mut auto_findings: Vec<crate::findings::Finding> = Vec::new();
+    for rule in crate::findings::default_rules() {
+        let hits = rule.check(&trace_ctx, &scenario);
+        for finding in &hits {
+            findings_log.write(finding)?;
+            capture.record(
+                None,
+                EvalEventKind::Finding {
+                    rule_id: finding.rule_id.clone(),
+                    severity: finding.severity.as_str().into(),
+                    summary: finding.summary.clone(),
+                },
+            )?;
+        }
+        auto_findings.extend(hits);
     }
+    // Keep the legacy `findings: Vec<String>` for the manifest /
+    // RunOutcome shape so existing consumers stay green.
+    let legacy_findings: Vec<String> = auto_findings
+        .iter()
+        .map(|f| format!("[{}] {}", f.rule_id, f.summary))
+        .collect();
 
     // 5. Write the run manifest.
     let trace_event_count = read_line_count(&capture.path())?;
     let frame_count = read_line_count(&frames.path())?;
+    let total_cost_micro_usd = *driver.total_cost_micro_usd.lock().await;
+    let per_turn_costs = read_per_turn_costs(&frames.path())?;
     let manifest = build_manifest(
         &scenario,
         &options,
         &workspace,
         trace_event_count,
         frame_count,
-        &findings,
+        &legacy_findings,
+        total_cost_micro_usd,
+        &per_turn_costs,
+        driver.provider_name,
+        &driver.model,
     );
     let manifest_path = run_dir.join("run.json");
     std::fs::write(
@@ -139,7 +169,7 @@ pub async fn run_scenario(
     // 6. Optionally triage and emit tickets.
     let mut ticket_count = 0u64;
     let triage_enabled = options.run_triage && scenario.triage.enabled;
-    let tickets = if triage_enabled {
+    let llm_tickets = if triage_enabled {
         match crate::triage::triage(&scenario, &config, &capture.path(), &frames.path()).await {
             Ok(drafts) => drafts,
             Err(err) => {
@@ -150,8 +180,8 @@ pub async fn run_scenario(
     } else {
         Vec::new()
     };
-    if !tickets.is_empty() || !findings.is_empty() {
-        let all = synthesize_tickets(tickets, &findings, &scenario);
+    if !llm_tickets.is_empty() || !auto_findings.is_empty() {
+        let all = synthesize_tickets(llm_tickets, &auto_findings, &scenario);
         ticket_count = all.len() as u64;
         crate::tickets::emit(
             &run_dir,
@@ -159,6 +189,14 @@ pub async fn run_scenario(
             crate::tickets::EmitOptions {
                 emit_github: options.emit_github,
                 gh_repo: options.gh_repo.clone(),
+                bundle: if driver.session_id.is_empty() {
+                    None
+                } else {
+                    Some(crate::tickets::BundleSource {
+                        config: config.clone(),
+                        session_id: driver.session_id.clone(),
+                    })
+                },
             },
         )?;
     }
@@ -168,30 +206,50 @@ pub async fn run_scenario(
         trace_event_count,
         frame_count,
         ticket_count,
-        findings,
+        findings: legacy_findings,
+        cost_micro_usd: total_cost_micro_usd,
     })
 }
 
 fn synthesize_tickets(
     mut from_llm: Vec<TicketDraft>,
-    findings: &[String],
+    findings: &[crate::findings::Finding],
     scenario: &Scenario,
 ) -> Vec<TicketDraft> {
-    for (idx, finding) in findings.iter().enumerate() {
+    for finding in findings {
         from_llm.push(TicketDraft {
-            id: format!("finding-{:02}", idx + 1),
-            title: format!("Expectation failed: {finding}"),
-            severity: "minor".into(),
-            category: "correctness".into(),
-            summary: finding.clone(),
-            repro: format!("Run scenario `{}`.", scenario.id),
-            evidence: Vec::new(),
+            id: finding.rule_id.clone(),
+            title: format!(
+                "[{}] {}",
+                finding.rule_id,
+                summarize_first_line(&finding.summary)
+            ),
+            severity: finding.severity.as_str().into(),
+            category: finding.category.clone(),
+            summary: finding.summary.clone(),
+            repro: format!(
+                "Run scenario `{}` and inspect the listed trace events.",
+                scenario.id
+            ),
+            evidence: finding
+                .evidence
+                .iter()
+                .map(|e| crate::tickets::EvidencePointer {
+                    trace_event: e.trace_event,
+                    frame: e.frame,
+                })
+                .collect(),
             suggested_fix: None,
         });
     }
     from_llm
 }
 
+fn summarize_first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(80).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_manifest(
     scenario: &Scenario,
     options: &RunOptions,
@@ -199,9 +257,13 @@ fn build_manifest(
     trace_event_count: u64,
     frame_count: u64,
     findings: &[String],
+    total_cost_micro_usd: u64,
+    per_turn_costs: &[(String, u64)],
+    provider_name: &str,
+    model: &str,
 ) -> Value {
     json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": {
             "id": scenario.id,
             "title": scenario.title,
@@ -212,20 +274,56 @@ fn build_manifest(
                 "kind": "local",
                 "path": path.display().to_string(),
             }),
+            crate::workspace::WorkspaceSource::Snapshot { from, sha, worktree } => json!({
+                "kind": "snapshot",
+                "from": from.display().to_string(),
+                "sha": sha,
+                "worktree": worktree,
+            }),
             crate::workspace::WorkspaceSource::Github { repo, sha } => json!({
                 "kind": "github",
                 "repo": repo,
                 "sha": sha,
             }),
         },
+        "provider": provider_name,
+        "model": model,
         "totals": {
             "trace_events": trace_event_count,
             "frames": frame_count,
             "findings": findings.len(),
+            "cost_micro_usd": total_cost_micro_usd,
+            "cost_display": crate::frames::format_cost_micro_usd(total_cost_micro_usd),
         },
+        "per_turn_costs": per_turn_costs
+            .iter()
+            .map(|(turn, micro)| json!({
+                "turn_id": turn,
+                "cost_micro_usd": micro,
+                "cost_display": crate::frames::format_cost_micro_usd(*micro),
+            }))
+            .collect::<Vec<_>>(),
         "findings": findings,
         "squeezy_version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+fn read_per_turn_costs(path: &Path) -> Result<Vec<(String, u64)>, EvalError> {
+    use std::io::{BufRead, BufReader};
+    let file =
+        std::fs::File::open(path).map_err(|err| EvalError::Io(format!("open {path:?}: {err}")))?;
+    let reader = BufReader::new(file);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|err| EvalError::Io(format!("read {path:?}: {err}")))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let frame: crate::frames::FrameRecord = serde_json::from_str(&line)
+            .map_err(|err| EvalError::Internal(format!("parse frame: {err}")))?;
+        out.push((frame.turn_id, frame.cost_micro_usd));
+    }
+    Ok(out)
 }
 
 fn read_line_count(path: &Path) -> Result<u64, EvalError> {
@@ -320,6 +418,13 @@ struct Driver {
     total_tool_calls: TokioMutex<u64>,
     tool_errors: TokioMutex<u64>,
     last_assistant_text: TokioMutex<String>,
+    provider_name: &'static str,
+    model: String,
+    /// Session id captured after `Agent::new`. Used by the bug-report
+    /// bundling path in `tickets::emit`.
+    #[allow(dead_code)]
+    session_id: String,
+    total_cost_micro_usd: TokioMutex<u64>,
 }
 
 impl Driver {
@@ -436,34 +541,40 @@ impl Driver {
                     },
                 )?;
             }
+            Action::InjectUserText { text, .. } => {
+                self.agent.queue_user_message(text.clone()).await;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status: format!("injected:{}", text.chars().take(60).collect::<String>()),
+                    },
+                )?;
+            }
         }
         Ok(())
     }
 
     async fn dispatch_slash_command(&self, command: &str) -> Result<String, EvalError> {
-        // First-cut slash command handling. We support the small set that
-        // is fully expressible through `Agent`'s public API today and
-        // record the rest as unsupported so triage can flag missing
-        // automation rather than silently noop.
         let trimmed = command.trim().trim_start_matches('/');
-        match trimmed.split_whitespace().next().unwrap_or("") {
-            "compact" => {
-                self.agent
-                    .compact_context_manual()
-                    .await
-                    .map_err(|err| EvalError::Internal(format!("compact_context_manual: {err}")))?;
-                Ok("compacted".into())
+        let (name, args) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
+        let outcome = self.agent.dispatch_command(name, args).await;
+        let status = match &outcome {
+            squeezy_agent::CommandOutcome::Compacted => "compacted".to_string(),
+            squeezy_agent::CommandOutcome::ModeChanged { mode, changed } => {
+                format!("mode_{mode}_changed={changed}")
             }
-            "plan" => {
-                self.agent.set_session_mode(SessionMode::Plan, "eval");
-                Ok("mode_plan".into())
+            squeezy_agent::CommandOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
+            squeezy_agent::CommandOutcome::JobsList { count } => format!("jobs_list:{count}"),
+            squeezy_agent::CommandOutcome::PermissionsList { count } => {
+                format!("permissions_list:{count}")
             }
-            "build" => {
-                self.agent.set_session_mode(SessionMode::Build, "eval");
-                Ok("mode_build".into())
+            squeezy_agent::CommandOutcome::Unsupported { command } => {
+                format!("unsupported_slash_command:{command}")
             }
-            other => Ok(format!("unsupported_slash_command:{other}")),
-        }
+            squeezy_agent::CommandOutcome::Error { message, .. } => format!("error:{message}"),
+        };
+        Ok(status)
     }
 
     fn apply_file_edit(
@@ -597,18 +708,34 @@ impl Driver {
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
                     received_tool_call = true;
                     *self.total_tool_calls.lock().await += 1;
-                    if !frame.tool_calls.contains(&call.name) {
-                        frame.tool_calls.push(call.name.clone());
-                    }
+                    // Push the per-call breadcrumb (name + args preview + hash).
+                    // Duplicates are intentionally kept so the auto-findings
+                    // rules can detect them at a glance.
+                    let summary = ToolCallSummary::from_call(&call.name, &call.arguments);
+                    frame.tool_calls.push(summary);
                     self.fire_on_tool_actions(&call.name).await?;
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ToolCallStarted { call: value },
                     )?;
+                    // Note: `wait_for: tool_call` is a *signal* only — we
+                    // no longer cancel the turn when the tool fires.
+                    // Scenarios that want to act mid-stream attach
+                    // `when.on_tool = "..."` to the action they want
+                    // dispatched concurrently; `fire_on_tool_actions`
+                    // above handles that path while the turn keeps
+                    // streaming to completion.
                     if let WaitFor::ToolCall { tool } = &wait_for
                         && &call.name == tool
                     {
-                        cancel.cancel();
+                        // Record that the gate tripped, then continue.
+                        self.capture.record(
+                            Some(format!("{turn_id:?}")),
+                            EvalEventKind::ActionStep {
+                                action: json!({"kind": "wait_for_signal"}),
+                                status: format!("tool_call_seen:{tool}"),
+                            },
+                        )?;
                     }
                 }
                 AgentEvent::ToolCallCompleted { turn_id, result } => {
@@ -620,6 +747,17 @@ impl Driver {
                     if matches!(status.as_str(), "Error" | "Cancelled") {
                         frame.tool_errors.push(result.tool_name.clone());
                         *self.tool_errors.lock().await += 1;
+                    }
+                    // Update the matching ToolCallSummary's status. Match by
+                    // tool name working backwards so the most recent entry
+                    // (the call we just completed) is the one we tag.
+                    if let Some(entry) = frame
+                        .tool_calls
+                        .iter_mut()
+                        .rev()
+                        .find(|c| c.name == result.tool_name && c.status.is_none())
+                    {
+                        entry.status = Some(status.to_ascii_lowercase());
                     }
                     let value = serde_json::to_value(&result).unwrap_or(Value::Null);
                     self.capture.record(
@@ -796,7 +934,13 @@ impl Driver {
                     frame.input_tokens = cost.input_tokens.unwrap_or(0);
                     frame.output_tokens = cost.output_tokens.unwrap_or(0);
                     frame.finish = FrameFinish::Completed;
+                    let cost_micro =
+                        squeezy_llm::estimate_cost(self.provider_name, &self.model, &cost)
+                            .unwrap_or(0);
+                    frame.cost_micro_usd = cost_micro;
+                    frame.cost_display = crate::frames::format_cost_micro_usd(cost_micro);
                     *self.total_input_tokens.lock().await += frame.input_tokens;
+                    *self.total_cost_micro_usd.lock().await += cost_micro;
                     let metrics_v = serde_json::to_value(&metrics).unwrap_or(Value::Null);
                     let cost_v = serde_json::to_value(&cost).unwrap_or(Value::Null);
                     self.capture.record(
@@ -856,6 +1000,12 @@ impl Driver {
         // Suppress unused warnings in modes where we don't yet branch on
         // these flags.
         let _ = (received_tool_call, &wait_for);
+        // Render the assistant markdown through the TUI's own pipeline so
+        // the frame carries both a structured Line/Span representation
+        // and an ANSI-escaped string a reviewer can replay.
+        let (styled, ansi) = crate::frames::render_styled(&frame.assistant_text);
+        frame.styled_lines = styled;
+        frame.ansi = ansi;
         self.frames.write(&frame)?;
         *self.wall_clock_seconds.lock().await = self.run_start.elapsed().as_secs();
         Ok(())
@@ -915,37 +1065,6 @@ impl Driver {
             };
         }
         (ToolApprovalDecision::Denied, "denied_no_action".into())
-    }
-
-    async fn evaluate_expectations(&self) -> Vec<String> {
-        let mut findings = Vec::new();
-        let assistant = self.last_assistant_text.lock().await.clone();
-        for required in &self.scenario.expect.final_text_contains {
-            if !assistant.contains(required) {
-                findings.push(format!(
-                    "final assistant output missing required text: {required:?}"
-                ));
-            }
-        }
-        if let Some(max_secs) = self.scenario.expect.max_wall_clock_seconds {
-            let wall = *self.wall_clock_seconds.lock().await;
-            if wall > max_secs {
-                findings.push(format!("wall clock {wall}s exceeded max {max_secs}s"));
-            }
-        }
-        if let Some(max_tok) = self.scenario.expect.max_input_tokens {
-            let total = *self.total_input_tokens.lock().await;
-            if total > max_tok {
-                findings.push(format!("input tokens {total} exceeded max {max_tok}"));
-            }
-        }
-        if self.scenario.expect.no_tool_errors {
-            let errs = *self.tool_errors.lock().await;
-            if errs > 0 {
-                findings.push(format!("encountered {errs} tool errors"));
-            }
-        }
-        findings
     }
 }
 

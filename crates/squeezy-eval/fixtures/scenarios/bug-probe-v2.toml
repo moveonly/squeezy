@@ -1,0 +1,74 @@
+id = "bug-probe-v2"
+title = "Probe sandbox, permission gating, edit flow, and graph confidence labels"
+description = """
+Second-generation probe scenario. Targets surfaces the original bug-probe
+did not exercise:
+
+- workspace.snapshot = true (per-run git worktree) — does the agent see
+  the snapshot, and does it clean up?
+- permission_mode = "ask" with an auto-approve for fs.write only — does
+  the agent route edit attempts through the approval path?
+- a navigation prompt that should be one grep deep, to confirm planner
+  cost has improved (or to reproduce the previous over-fetch finding).
+- a graph-confidence prompt where the model is asked to label its
+  evidence — surfaces whether the graph payloads actually carry the
+  promised confidence labels into the model.
+
+Runs against gpt-5.4-mini against a per-run snapshot of the squeezy repo.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "ask"
+
+# Probe A: cheap existence + nav. Confirms whether duplicate_tool_call
+# and high_tool_burst auto-findings still fire on the same question
+# shape that surfaced bug #2 and #3 last time.
+[[steps]]
+kind = "prompt"
+text = "List every public method on the `Agent` struct, one per line, just the names."
+
+# Probe B: pre-arm an approve action so a subsequent edit attempt
+# routes through the approval path. The approve filter intentionally
+# only matches the `fs.write` tool (or any squeezy edit tool); other
+# approvals fall through to deny so we see if anything unexpected
+# fires.
+[[steps]]
+kind = "action"
+action = "approve"
+
+[steps.match]
+tool = "fs.write"
+
+# Probe C: ask for a small, well-scoped edit. The point is to see
+# whether the agent actually attempts a file write, what approval it
+# requests, and whether it writes to the snapshot (not the live tree).
+[[steps]]
+kind = "prompt"
+text = "In the file `crates/squeezy-eval/README-PROBE.md`, write exactly three lines: `# probe`, an empty line, and `hello world`. Create the file if missing. Do not edit any other file."
+
+# Probe D: graph-confidence labels. Squeezy advertises exact_syntax,
+# import_resolved, candidate_set, etc. Ask the model to cite them.
+[[steps]]
+kind = "prompt"
+text = "How does `Agent::start_turn` get the `LlmProvider`? Cite each piece of evidence with one of squeezy's confidence labels (exact_syntax, import_resolved, candidate_set, external, unknown). If a label is unavailable, say `label_missing`."
+
+[expect]
+max_wall_clock_seconds = 240
+max_input_tokens = 200000
+max_tools_per_turn = 6
+
+[triage]
+enabled = true
+model = "gpt-5.4-mini"
+focus = """
+Look for: missing graph confidence labels in model output, sandbox
+workspace pollution back into the source tree, edit-flow defects
+(wrong path / missing approval / silent no-op), and any auto-findings
+flagged by the harness. Ignore generic stylistic suggestions.
+"""

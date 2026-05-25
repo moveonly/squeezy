@@ -1,0 +1,52 @@
+id = "concurrent-inject"
+title = "Fire inject_user_text the moment a tool call appears"
+description = """
+Demonstrates the mid-turn 'interrupting user' pattern. The first turn
+runs against the mock provider whose scripted tool_call triggers an
+on_tool inject action; the injected user text is appended to the
+conversation transcript so the second turn picks it up.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Show me how `Agent::start_turn` is wired."
+
+[[steps]]
+kind = "action"
+action = "inject_user_text"
+text = "Actually focus on `provider_name` instead — never mind start_turn."
+
+[steps.when]
+on_tool = "grep"
+
+[[steps]]
+kind = "prompt"
+text = "Did you see my follow-up?"
+
+[expect]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = "Sure — looking now."
+tool_calls = [{ name = "grep", arguments = { pattern = "start_turn" } }]
+input_tokens = 12
+output_tokens = 5
+
+[[mock.turns]]
+text = "Yes, I saw the follow-up: focusing on provider_name."
+input_tokens = 14
+output_tokens = 8
+
+[triage]
+enabled = false

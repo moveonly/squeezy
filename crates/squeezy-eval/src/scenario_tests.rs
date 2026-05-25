@@ -17,7 +17,7 @@ text = "hello?"
     assert_eq!(scenario.id, "smoke");
     assert_eq!(scenario.steps.len(), 1);
     match &scenario.workspace {
-        WorkspaceSpec::Local { path } => assert_eq!(path, &PathBuf::from("/tmp/repo")),
+        WorkspaceSpec::Local { path, .. } => assert_eq!(path, &PathBuf::from("/tmp/repo")),
         other => panic!("expected local workspace, got {other:?}"),
     }
 }
