@@ -4508,6 +4508,37 @@ fn status_details_render_via_segments_match_legacy_format() {
 }
 
 #[test]
+fn cost_segment_renders_cap_and_percent_when_configured() {
+    // When `max_session_cost_usd_micros` is set, the cost segment must show
+    // the spend, the cap, and the integer percent so the user can see where
+    // they stand without opening the /cost overlay.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = Some(500_000); // $0.50 cap
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(125_000); // $0.125 spent => 25%
+
+    let details = format_status_details(&app);
+    assert!(
+        details.contains("cost $0.125000 / $0.50 (25%)"),
+        "unexpected status: {details}"
+    );
+}
+
+#[test]
+fn cost_segment_renders_without_cap_when_unset() {
+    // When no cap is configured the segment must fall back to the legacy
+    // single-value format so existing log scrapers keep working.
+    let mut config = test_config(SessionMode::Build);
+    config.max_session_cost_usd_micros = None;
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.cost.estimated_usd_micros = Some(42);
+
+    let details = format_status_details(&app);
+    assert!(details.contains("cost $0.000042"), "{details}");
+    assert!(!details.contains(" / $"), "cap separator leaked: {details}");
+}
+
+#[test]
 fn status_segment_individually_returns_expected_text() {
     let app = test_app(SessionMode::Build);
     assert_eq!(

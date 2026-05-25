@@ -30,7 +30,7 @@ use squeezy_core::{
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context,
+    RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context_calibrated,
     fetch_ollama_context_window,
 };
 use squeezy_skills::{HelpAnswer, SqueezyHelp, matches_squeezy_help_input};
@@ -136,6 +136,7 @@ struct ConversationState {
     cost: CostSnapshot,
     metrics: SessionMetrics,
     redactions: u64,
+    token_calibration: squeezy_llm::TokenCalibration,
 }
 
 impl ConversationState {
@@ -153,6 +154,7 @@ impl ConversationState {
             cost: metadata.cost.clone(),
             metrics: metadata.metrics.clone(),
             redactions: metadata.redactions,
+            token_calibration: metadata.token_calibration.clone(),
         }
     }
 
@@ -1072,13 +1074,15 @@ pub struct Agent {
 impl Agent {
     pub fn new(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Self {
         let session_log = start_session_log(&config, provider.name());
-        Self::build(
-            config,
-            provider,
-            session_log,
-            ConversationState::default(),
-            None,
-        )
+        // Fresh sessions inherit the most-recent cross-session calibration so
+        // the first round's estimator isn't stuck on per-provider defaults.
+        // Missing or malformed files fall back to `TokenCalibration::default()`,
+        // which is what `ConversationState::default()` would carry anyway.
+        let conversation_state = ConversationState {
+            token_calibration: SessionStore::open(&config).load_global_calibration(),
+            ..ConversationState::default()
+        };
+        Self::build(config, provider, session_log, conversation_state, None)
     }
 
     pub fn resume(
@@ -1593,17 +1597,19 @@ impl Agent {
             transcript: transcript_shape(&state.transcript),
             conversation: conversation_shape(&state.conversation),
             attachments: attachment_shape(&state.context_attachments),
-            transmitted_request: estimate_request_context(
+            transmitted_request: estimate_request_context_calibrated(
                 self.provider.name(),
                 &self.config.model,
                 &transmitted_request,
                 context_window_override,
+                Some(&state.token_calibration),
             ),
-            full_history_request: estimate_request_context(
+            full_history_request: estimate_request_context_calibrated(
                 self.provider.name(),
                 &self.config.model,
                 &full_history_request,
                 context_window_override,
+                Some(&state.token_calibration),
             ),
         }
     }
@@ -3254,6 +3260,10 @@ impl TurnRuntime {
         let mut total_cost = CostSnapshot::default();
         let mut seen_tool_outputs = SeenToolOutputs::from_store(self.store.clone());
         let mut broker = CostBroker::new(&self.config);
+        broker.seed_session(
+            prior_state.cost.estimated_usd_micros.unwrap_or(0),
+            prior_state.token_calibration.clone(),
+        );
         let exploration_plan = self
             .config
             .exploration_compiler
@@ -3423,6 +3433,23 @@ impl TurnRuntime {
                 self.finish_cancelled_turn(&task_title).await;
                 return Ok(());
             }
+            if let Some(status) = broker.session_cap_reached() {
+                self.publish_terminal_task_state(
+                    TaskStateStatus::Failed,
+                    Some(format_cap_reached_reason(status)),
+                    &task_title,
+                )
+                .await;
+                let _ = self
+                    .tx
+                    .send(AgentEvent::Failed {
+                        turn_id: self.turn_id,
+                        error: SqueezyError::Agent(format_cap_reached_reason(status)),
+                    })
+                    .await;
+                self.finish_turn(&broker.metrics).await;
+                return Ok(());
+            }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
             let request = LlmRequest {
@@ -3448,6 +3475,7 @@ impl TurnRuntime {
                 store: self.config.store_responses,
             };
             let request_model = request.model.clone();
+            let request_input_bytes = llm_request_input_bytes(&request);
             self.record_replay_request(&request);
             let mut stream = self
                 .provider
@@ -3536,7 +3564,21 @@ impl TurnRuntime {
                             cost.estimated_usd_micros =
                                 estimate_cost(self.provider.name(), &request_model, &cost);
                         }
-                        broker.metrics.record_provider(&cost);
+                        let warning = broker.record_provider_cost(&cost);
+                        broker.calibration.record_sample(
+                            self.provider.name(),
+                            request_input_bytes,
+                            cost.input_tokens.unwrap_or(0),
+                        );
+                        if let Some(status) = warning {
+                            let _ = self
+                                .tx
+                                .send(AgentEvent::CostWarning {
+                                    turn_id: self.turn_id,
+                                    status,
+                                })
+                                .await;
+                        }
                         merge_cost(&mut total_cost, &cost);
                         completed_cost = cost;
                         response_id = id;
@@ -3570,6 +3612,7 @@ impl TurnRuntime {
                     cost: &total_cost,
                     metrics: &broker.metrics,
                     context_compaction: context_compaction.clone(),
+                    token_calibration: broker.calibration.clone(),
                 })
                 .await;
                 let context_estimate = estimate_context(&conversation);
@@ -3609,6 +3652,7 @@ impl TurnRuntime {
                     cost: &total_cost,
                     metrics: &broker.metrics,
                     context_compaction: context_compaction.clone(),
+                    token_calibration: broker.calibration.clone(),
                 })
                 .await;
                 let context_estimate = estimate_context(&conversation);
@@ -3855,6 +3899,7 @@ impl TurnRuntime {
             cost,
             metrics,
             context_compaction,
+            token_calibration,
         } = input;
         let mut state = self.conversation_state.lock().await;
         state.conversation = conversation.to_vec();
@@ -3875,16 +3920,24 @@ impl TurnRuntime {
         merge_cost(&mut state.cost, cost);
         state.metrics.merge_turn(metrics);
         state.redactions += metrics.redactions;
+        state.token_calibration = token_calibration.clone();
         if let Some(session) = &self.session_log {
             let _ = session.write_resume_state(&state.to_resume_state());
+            let calibration_for_metadata = state.token_calibration.clone();
             let _ = session.update_metadata(|metadata| {
                 metadata.cost = state.cost.clone();
                 metadata.metrics = state.metrics.clone();
                 metadata.redactions = state.redactions;
                 metadata.resume_available = true;
                 metadata.mode = load_session_mode(&self.session_mode);
+                metadata.token_calibration = calibration_for_metadata;
             });
         }
+        // Mirror the calibration into the cross-session file so brand-new
+        // sessions (no resume metadata yet) seed off a recent ratio rather
+        // than the per-provider defaults. Failures are silent — the global
+        // file is a warm-start cache, not a source of truth.
+        let _ = SessionStore::open(&self.config).save_global_calibration(&state.token_calibration);
         drop(state);
         let summary = self.current_task_summary().await.unwrap_or_else(|| {
             if assistant.content.trim().is_empty() {
@@ -4100,6 +4153,7 @@ struct TurnPersistInput<'a> {
     cost: &'a CostSnapshot,
     metrics: &'a TurnMetrics,
     context_compaction: ContextCompactionState,
+    token_calibration: squeezy_llm::TokenCalibration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6055,12 +6109,45 @@ async fn run_one_tool(
     result
 }
 
+/// Snapshot of session-level cost-cap state delivered with
+/// [`AgentEvent::CostWarning`] and [`AgentEvent::Failed`] when the broker
+/// crosses or reaches the configured cap. All values are USD micros (i.e.
+/// 1 USD = 1_000_000 micros) so callers stay in integer math; `percent`
+/// is `(spent / cap) * 100` clamped at 255 to avoid overflow on extreme
+/// overshoot.
+#[derive(Debug, Clone, Copy)]
+pub struct CostCapStatus {
+    pub spent_usd_micros: u64,
+    pub cap_usd_micros: u64,
+    pub percent: u8,
+}
+
 #[derive(Debug)]
 struct CostBroker {
     max_tool_calls: u64,
     max_bytes_read: u64,
     max_search_files: u64,
     metrics: TurnMetrics,
+    /// Cumulative observed provider cost for the entire session, in USD
+    /// micros. Seeded from the resumed conversation state and updated after
+    /// every provider response we record.
+    session_cost_usd_micros: u64,
+    /// Hard cap from `AppConfig.max_session_cost_usd_micros`. `None` (or a
+    /// zero cap) disables session-level gating.
+    max_session_cost_usd_micros: Option<u64>,
+    /// Percent of the cap at which the broker emits a single
+    /// `CostCapStatus` warning. Mirrors `AppConfig.cost_warn_percent`.
+    cost_warn_percent: u8,
+    /// One-shot latch so the warning event is emitted at most once per
+    /// broker (and therefore at most once per session: the main turn
+    /// broker is rebuilt with the cumulative session total each turn,
+    /// but `warn_emitted` follows from `session_cost_usd_micros` already
+    /// being above the threshold at construction).
+    warn_emitted: bool,
+    /// Per-token-byte calibration carried through the turn. Seeded from
+    /// the session metadata (or the global file) and snapshot back out
+    /// after every recorded provider response.
+    calibration: squeezy_llm::TokenCalibration,
 }
 
 impl CostBroker {
@@ -6070,6 +6157,69 @@ impl CostBroker {
             max_bytes_read: config.max_tool_bytes_read_per_turn,
             max_search_files: config.max_search_files_per_turn,
             metrics: TurnMetrics::default(),
+            session_cost_usd_micros: 0,
+            max_session_cost_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
+            cost_warn_percent: config.cost_warn_percent.clamp(1, 100),
+            warn_emitted: false,
+            calibration: squeezy_llm::TokenCalibration::default(),
+        }
+    }
+
+    /// Seed the running session cost from a resumed `CostSnapshot`. Pre-seeds
+    /// `warn_emitted` so a session that resumes already over the warning
+    /// threshold doesn't re-fire the warning on its first new turn.
+    fn seed_session(
+        &mut self,
+        session_cost_usd_micros: u64,
+        calibration: squeezy_llm::TokenCalibration,
+    ) {
+        self.session_cost_usd_micros = session_cost_usd_micros;
+        self.calibration = calibration;
+        if let Some(cap) = self.max_session_cost_usd_micros {
+            let threshold = warn_threshold_micros(cap, self.cost_warn_percent);
+            if self.session_cost_usd_micros >= threshold {
+                self.warn_emitted = true;
+            }
+        }
+    }
+
+    /// Records the provider-reported cost from a single LLM round. Adds
+    /// `estimated_usd_micros` to the running session total and returns
+    /// `Some(CostCapStatus)` the first time the session crosses
+    /// `cost_warn_percent` (or hits the cap), so the caller can publish a
+    /// transcript event.
+    fn record_provider_cost(&mut self, cost: &CostSnapshot) -> Option<CostCapStatus> {
+        self.metrics.record_provider(cost);
+        let delta = cost.estimated_usd_micros.unwrap_or(0);
+        self.session_cost_usd_micros = self.session_cost_usd_micros.saturating_add(delta);
+        let cap = self.max_session_cost_usd_micros?;
+        if self.warn_emitted {
+            return None;
+        }
+        let threshold = warn_threshold_micros(cap, self.cost_warn_percent);
+        if self.session_cost_usd_micros < threshold {
+            return None;
+        }
+        self.warn_emitted = true;
+        Some(CostCapStatus {
+            spent_usd_micros: self.session_cost_usd_micros,
+            cap_usd_micros: cap,
+            percent: cap_percent(self.session_cost_usd_micros, cap),
+        })
+    }
+
+    /// Returns `Some(status)` if the running session cost has reached or
+    /// exceeded the configured cap. Used to refuse the next provider round.
+    fn session_cap_reached(&self) -> Option<CostCapStatus> {
+        let cap = self.max_session_cost_usd_micros?;
+        if self.session_cost_usd_micros >= cap {
+            Some(CostCapStatus {
+                spent_usd_micros: self.session_cost_usd_micros,
+                cap_usd_micros: cap,
+                percent: cap_percent(self.session_cost_usd_micros, cap),
+            })
+        } else {
+            None
         }
     }
 
@@ -6148,6 +6298,55 @@ impl CostBroker {
             self.metrics.budget_denials += 1;
         }
     }
+}
+
+/// Approximate the byte size of an LLM request's input payload. Used to feed
+/// the token-calibration EMA: we cannot count provider tokens locally, but
+/// we can pair the bytes we sent with the input-token count the provider
+/// reports back. Counts instructions, every input item's text, and the
+/// serialized tool spec list so the ratio reflects everything we actually
+/// transmitted.
+fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
+    let mut total: u64 = request.instructions.len() as u64;
+    for item in &request.input {
+        total = total.saturating_add(match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len() as u64,
+            LlmInputItem::FunctionCallOutput { output, .. } => output.len() as u64,
+            LlmInputItem::FunctionCall { arguments, .. } => serde_json::to_vec(arguments)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
+        });
+    }
+    for spec in &request.tools {
+        total = total.saturating_add(
+            serde_json::to_vec(spec)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0),
+        );
+    }
+    total
+}
+
+fn format_cap_reached_reason(status: CostCapStatus) -> String {
+    format!(
+        "session cost cap reached: spent ${:.6} of ${:.6} ({}%)",
+        status.spent_usd_micros as f64 / 1_000_000.0,
+        status.cap_usd_micros as f64 / 1_000_000.0,
+        status.percent,
+    )
+}
+
+fn warn_threshold_micros(cap_usd_micros: u64, warn_percent: u8) -> u64 {
+    let percent = warn_percent.clamp(1, 100) as u128;
+    (cap_usd_micros as u128 * percent / 100).min(u64::MAX as u128) as u64
+}
+
+fn cap_percent(spent_usd_micros: u64, cap_usd_micros: u64) -> u8 {
+    if cap_usd_micros == 0 {
+        return 0;
+    }
+    let percent = (spent_usd_micros as u128 * 100) / cap_usd_micros as u128;
+    percent.min(255) as u8
 }
 
 fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
@@ -9059,6 +9258,14 @@ pub enum AgentEvent {
         /// TUI to update its context-budget indicator without needing a
         /// follow-up `context_estimate_snapshot()` call.
         context_estimate: ContextEstimate,
+    },
+    /// Emitted at most once per session, the first time the running provider
+    /// cost crosses `cost_warn_percent` of the configured
+    /// `max_session_cost_usd_micros` cap. The TUI renders a transcript
+    /// notice; non-TUI consumers (replay tooling, telemetry) can ignore it.
+    CostWarning {
+        turn_id: TurnId,
+        status: CostCapStatus,
     },
     Cancelled {
         turn_id: TurnId,

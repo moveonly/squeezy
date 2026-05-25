@@ -178,6 +178,57 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
 }
 
 #[test]
+fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
+    // The same request must produce fewer estimated input tokens when we hand
+    // in a calibration with a *higher* bytes/token ratio: the estimator
+    // divides bytes by the ratio, so a bigger ratio means fewer tokens. This
+    // is the contract rjr.105 relies on - a calibrated session that learns
+    // its provider packs more bytes per token shows a smaller projected
+    // input usage.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_OPENAI_MODEL.to_string(),
+        instructions: "a moderately long system prompt with enough text to estimate".to_string(),
+        input: vec![LlmInputItem::UserText(
+            "another moderately long user message with several words".to_string(),
+        )],
+        max_output_tokens: Some(128),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Vec::new(),
+        store: false,
+    };
+
+    let default_estimate =
+        estimate_request_context("openai", squeezy_core::DEFAULT_OPENAI_MODEL, &request, None);
+
+    // Seed a calibration claiming each token costs *eight* bytes - double
+    // the default 4.0 - so the estimator should report roughly half the
+    // input tokens.
+    let mut calibration = crate::tokens::TokenCalibration::default();
+    calibration.record_sample("openai", 8000, 1000);
+    let calibrated_estimate = estimate_request_context_calibrated(
+        "openai",
+        squeezy_core::DEFAULT_OPENAI_MODEL,
+        &request,
+        None,
+        Some(&calibration),
+    );
+
+    assert!(
+        calibrated_estimate.input_tokens < default_estimate.input_tokens,
+        "calibrated estimate ({}) must be smaller than default ({})",
+        calibrated_estimate.input_tokens,
+        default_estimate.input_tokens,
+    );
+    assert!(
+        calibrated_estimate.input_tokens > 0,
+        "calibrated estimate should still cover the structural overhead"
+    );
+}
+
+#[test]
 fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
     // The bundled registry now ships a fallback metadata path so unknown
     // model ids still get useful headroom/budget figures instead of empty

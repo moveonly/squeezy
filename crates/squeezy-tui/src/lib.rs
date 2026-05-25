@@ -585,6 +585,16 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     keep_rx = false;
                     break;
                 }
+                AgentEvent::CostWarning { status, .. } => {
+                    let notice = format!(
+                        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%)",
+                        status.spent_usd_micros as f64 / 1_000_000.0,
+                        status.cap_usd_micros as f64 / 1_000_000.0,
+                        status.percent
+                    );
+                    app.push_transcript_item(TranscriptItem::system(notice.clone()));
+                    app.push_log(notice);
+                }
                 AgentEvent::Cancelled { .. } => {
                     let mut message = "cancelled; edit prompt or retry".to_string();
                     if app.last_turn_had_edits {
@@ -7262,6 +7272,11 @@ struct TuiApp {
     exit_confirm_armed: bool,
     active_tool_calls: BTreeMap<String, ToolCall>,
     cost: squeezy_core::CostSnapshot,
+    /// Session-level cap in USD micros, sourced from
+    /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)
+    /// means the status bar renders the legacy `cost $X` segment
+    /// unchanged.
+    cost_cap_usd_micros: Option<u64>,
     metrics: squeezy_core::TurnMetrics,
     turn_rx: Option<mpsc::Receiver<AgentEvent>>,
     job_rx: Option<broadcast::Receiver<JobEvent>>,
@@ -7389,6 +7404,7 @@ impl TuiApp {
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
+            cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             metrics: squeezy_core::TurnMetrics::default(),
             turn_rx: None,
             job_rx: None,

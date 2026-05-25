@@ -49,6 +49,34 @@ impl SessionStore {
         &self.root
     }
 
+    /// Path to the cross-session token calibration file. Lives next to the
+    /// per-session directories so the same retention/cleanup story applies.
+    fn calibration_path(&self) -> PathBuf {
+        self.root.join("calibration.json")
+    }
+
+    /// Load the cross-session `TokenCalibration` if present. Missing or
+    /// malformed files yield `TokenCalibration::default()` rather than an
+    /// error: the calibration is a best-effort cache, not a source of truth.
+    pub fn load_global_calibration(&self) -> squeezy_llm::TokenCalibration {
+        let path = self.calibration_path();
+        if !path.exists() {
+            return squeezy_llm::TokenCalibration::default();
+        }
+        read_json(&path).unwrap_or_default()
+    }
+
+    /// Atomically persist the cross-session `TokenCalibration`. Errors are
+    /// returned to the caller but expected to be logged-and-ignored — a
+    /// failed write only costs us the next session's warm-start.
+    pub fn save_global_calibration(
+        &self,
+        calibration: &squeezy_llm::TokenCalibration,
+    ) -> Result<()> {
+        fs::create_dir_all(&self.root)?;
+        write_json(&self.calibration_path(), calibration)
+    }
+
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
         metadata.session_id = next_session_id();
         metadata.started_at_ms = now_ms();
@@ -765,7 +793,7 @@ impl SessionHandle {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionMetadata {
     pub session_id: String,
     pub started_at_ms: u64,
@@ -786,6 +814,12 @@ pub struct SessionMetadata {
     pub resume_available: bool,
     pub resume_unavailable_reason: Option<String>,
     pub event_count: u64,
+    /// EMA-calibrated bytes-per-token ratios learned from this session's
+    /// provider responses. Loaded on resume so the token estimator stays
+    /// warm across runs. `serde(default)` keeps older `metadata.json`
+    /// files compatible.
+    #[serde(default)]
+    pub token_calibration: squeezy_llm::TokenCalibration,
 }
 
 impl SessionMetadata {
@@ -1087,7 +1121,7 @@ impl SessionQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub metadata: SessionMetadata,
     pub events: Vec<SessionEvent>,

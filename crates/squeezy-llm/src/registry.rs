@@ -225,11 +225,28 @@ pub fn estimate_request_context(
     request: &LlmRequest,
     context_window_override: Option<u64>,
 ) -> RequestTokenEstimate {
+    estimate_request_context_calibrated(provider, model, request, context_window_override, None)
+}
+
+/// Variant of [`estimate_request_context`] that uses a caller-supplied
+/// [`TokenCalibration`] to convert bytes to tokens. When `calibration` is
+/// `None` we fall back to the provider's default bytes-per-token ratio, so
+/// the old behaviour is preserved exactly.
+pub fn estimate_request_context_calibrated(
+    provider: &str,
+    model: &str,
+    request: &LlmRequest,
+    context_window_override: Option<u64>,
+    calibration: Option<&crate::tokens::TokenCalibration>,
+) -> RequestTokenEstimate {
+    let bytes_per_token = calibration
+        .map(|c| c.bytes_per_token(provider))
+        .unwrap_or_else(|| crate::tokens::default_bytes_per_token(provider));
     let info = model_info_for(provider, model);
     let tokenizer = info
         .map(|entry| entry.tokenizer)
         .unwrap_or(TokenizerKind::OpenAiCompatible);
-    let input_tokens = estimate_request_input_tokens(request);
+    let input_tokens = estimate_request_input_tokens(request, bytes_per_token);
     let model_limits = info.and_then(|entry| entry.limits);
     let context_window_tokens =
         context_window_override.or(model_limits.map(|limits| limits.context_window_tokens));
@@ -345,13 +362,13 @@ fn estimate_tokens(tokens: u64, usd_micros_per_mtok: u64) -> u64 {
     tokens.saturating_mul(usd_micros_per_mtok) / 1_000_000
 }
 
-fn estimate_request_input_tokens(request: &LlmRequest) -> u64 {
-    let mut total = estimate_text_tokens(&request.instructions).saturating_add(8);
+fn estimate_request_input_tokens(request: &LlmRequest, bytes_per_token: f64) -> u64 {
+    let mut total = estimate_text_tokens(&request.instructions, bytes_per_token).saturating_add(8);
     if let Some(verbosity) = request.response_verbosity {
-        total = total.saturating_add(estimate_text_tokens(verbosity.as_str()) + 4);
+        total = total.saturating_add(estimate_text_tokens(verbosity.as_str(), bytes_per_token) + 4);
     }
     if let Some(effort) = request.reasoning_effort {
-        total = total.saturating_add(estimate_text_tokens(effort.as_str()) + 4);
+        total = total.saturating_add(estimate_text_tokens(effort.as_str(), bytes_per_token) + 4);
     }
     if request.previous_response_id.is_some() {
         total = total.saturating_add(8);
@@ -360,46 +377,53 @@ fn estimate_request_input_tokens(request: &LlmRequest) -> u64 {
         total = total.saturating_add(2);
     }
     for item in &request.input {
-        total = total.saturating_add(estimate_input_item_tokens(item));
+        total = total.saturating_add(estimate_input_item_tokens(item, bytes_per_token));
     }
     for tool in &request.tools {
         total = total.saturating_add(12);
-        total = total.saturating_add(estimate_text_tokens(&tool.name));
-        total = total.saturating_add(estimate_text_tokens(&tool.description));
-        total = total.saturating_add(estimate_json_tokens(&tool.parameters));
+        total = total.saturating_add(estimate_text_tokens(&tool.name, bytes_per_token));
+        total = total.saturating_add(estimate_text_tokens(&tool.description, bytes_per_token));
+        total = total.saturating_add(estimate_json_tokens(&tool.parameters, bytes_per_token));
     }
     total
 }
 
-fn estimate_input_item_tokens(item: &LlmInputItem) -> u64 {
+fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 {
     match item {
         LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => {
-            estimate_text_tokens(text).saturating_add(8)
+            estimate_text_tokens(text, bytes_per_token).saturating_add(8)
         }
         LlmInputItem::FunctionCall {
             call_id,
             name,
             arguments,
-        } => estimate_text_tokens(call_id)
-            .saturating_add(estimate_text_tokens(name))
-            .saturating_add(estimate_json_tokens(arguments))
+        } => estimate_text_tokens(call_id, bytes_per_token)
+            .saturating_add(estimate_text_tokens(name, bytes_per_token))
+            .saturating_add(estimate_json_tokens(arguments, bytes_per_token))
             .saturating_add(12),
-        LlmInputItem::FunctionCallOutput { call_id, output } => estimate_text_tokens(call_id)
-            .saturating_add(estimate_text_tokens(output))
-            .saturating_add(12),
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            estimate_text_tokens(call_id, bytes_per_token)
+                .saturating_add(estimate_text_tokens(output, bytes_per_token))
+                .saturating_add(12)
+        }
     }
 }
 
-fn estimate_json_tokens(value: &Value) -> u64 {
+fn estimate_json_tokens(value: &Value, bytes_per_token: f64) -> u64 {
     serde_json::to_string(value)
-        .map(|text| estimate_text_tokens(&text))
+        .map(|text| estimate_text_tokens(&text, bytes_per_token))
         .unwrap_or(0)
 }
 
-fn estimate_text_tokens(text: &str) -> u64 {
-    let chars = text.chars().count() as u64;
-    if chars == 0 {
+/// Convert a UTF-8 text blob into an approximate token count using the given
+/// bytes-per-token ratio. The ratio is provider-specific (and EMA-calibrated
+/// when a `TokenCalibration` is in play) so calibrated callers see closer
+/// estimates than the historical hard-coded `bytes / 4`.
+fn estimate_text_tokens(text: &str, bytes_per_token: f64) -> u64 {
+    if text.is_empty() {
         return 0;
     }
-    chars.div_ceil(4).max(1)
+    let bytes = text.len() as f64;
+    let estimate = (bytes / bytes_per_token.max(0.1)).ceil() as u64;
+    estimate.max(1)
 }

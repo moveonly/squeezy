@@ -20,6 +20,10 @@ mod openai;
 mod registry;
 mod retry;
 pub mod tokens;
+pub use tokens::{
+    DEFAULT_BYTES_PER_TOKEN, DEFAULT_EMA_ALPHA, ProviderCalibration, TokenCalibration,
+    default_bytes_per_token, estimate_tokens,
+};
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
@@ -33,8 +37,8 @@ pub use openai::OpenAiProvider;
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
     RequestTokenEstimate, TokenPricing, TokenizerKind, capabilities_for, estimate_cost,
-    estimate_request_context, model_info_for, models_for_provider, provider_from_config,
-    provider_name,
+    estimate_request_context, estimate_request_context_calibrated, model_info_for,
+    models_for_provider, provider_from_config, provider_name,
 };
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
