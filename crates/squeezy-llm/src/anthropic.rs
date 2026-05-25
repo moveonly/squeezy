@@ -72,19 +72,23 @@ impl AnthropicProvider {
             "stream": true,
         });
         if !request.tools.is_empty() {
-            body["tools"] = json!(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "name": tool.name,
-                            "description": tool.description,
-                            "input_schema": tool.parameters,
-                        })
+            let mut tool_values: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "input_schema": tool.parameters,
                     })
-                    .collect::<Vec<_>>()
-            );
+                })
+                .collect();
+            if prompt_caching
+                && let Some(obj) = tool_values.last_mut().and_then(Value::as_object_mut)
+            {
+                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+            }
+            body["tools"] = Value::Array(tool_values);
         }
         body
     }

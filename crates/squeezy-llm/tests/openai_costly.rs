@@ -28,18 +28,21 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         transport: ProviderTransportConfig::default(),
     })?;
     let request = LlmRequest {
-        model: env::var("SQUEEZY_COSTLY_MODEL")
-            .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string()),
-        instructions: "Reply with exactly: squeezy-ok".to_string(),
-        input: vec![LlmInputItem::UserText(
+        model: std::sync::Arc::from(
+            env::var("SQUEEZY_COSTLY_MODEL")
+                .unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string())
+                .as_str(),
+        ),
+        instructions: std::sync::Arc::from("Reply with exactly: squeezy-ok"),
+        input: std::sync::Arc::from(vec![LlmInputItem::UserText(
             "Reply with exactly: squeezy-ok".to_string(),
-        )],
+        )]),
         max_output_tokens: costly_max_output_tokens()?,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: std::sync::Arc::from(Vec::new()),
         store: false,
     };
 

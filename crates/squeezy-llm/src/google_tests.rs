@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::sync::Arc;
 
 use super::*;
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
@@ -22,20 +23,23 @@ fn stream_url_does_not_contain_api_key() {
 #[test]
 fn request_body_uses_generate_content_shape() {
     let request = LlmRequest {
-        model: "gemini-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "read_file".to_string(),
-            description: "read".to_string(),
-            parameters: json!({"type": "object"}),
-            strict: true,
-        }],
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            }
+            .into(),
+        ]),
         store: false,
     };
 
@@ -54,28 +58,30 @@ fn request_body_uses_generate_content_shape() {
 #[test]
 fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
-        model: "gemini-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
                 description: "write".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
-        ],
+            }
+            .into(),
+        ]),
         store: false,
     };
 
@@ -91,9 +97,9 @@ fn request_body_preserves_function_tool_order() {
 #[test]
 fn request_body_preserves_function_response_name() {
     let request = LlmRequest {
-        model: "gemini-test".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![
+        model: "gemini-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
             LlmInputItem::FunctionCall {
                 call_id: "call-1".to_string(),
                 name: "grep".to_string(),
@@ -103,13 +109,13 @@ fn request_body_preserves_function_response_name() {
                 call_id: "call-1".to_string(),
                 output: "match".to_string(),
             },
-        ],
+        ]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: false,
     };
 

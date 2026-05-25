@@ -1548,9 +1548,9 @@ async fn run_prompt(
         ));
     }
     let request = LlmRequest {
-        model: config.model.clone(),
-        instructions: redacted_instructions,
-        input: vec![LlmInputItem::UserText(redacted_prompt.clone())],
+        model: Arc::from(config.model.as_str()),
+        instructions: Arc::from(redacted_instructions),
+        input: Arc::from(vec![LlmInputItem::UserText(redacted_prompt.clone())]),
         max_output_tokens: config.max_output_tokens,
         response_verbosity: request_response_verbosity(&config, provider.name()),
         reasoning_effort: request_reasoning_effort(&config, provider.name()),
@@ -1558,7 +1558,7 @@ async fn run_prompt(
         cache_key: session
             .as_ref()
             .map(|session| format!("squeezy::{}", session.session_id())),
-        tools: Vec::new(),
+        tools: Arc::from(Vec::new()),
         store: config.store_responses,
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());

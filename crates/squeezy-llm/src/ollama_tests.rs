@@ -1,4 +1,5 @@
 use serde_json::json;
+use std::sync::Arc;
 
 use super::*;
 use crate::{LlmInputItem, LlmToolSpec};
@@ -6,20 +7,23 @@ use crate::{LlmInputItem, LlmToolSpec};
 #[test]
 fn request_body_uses_chat_stream_shape() {
     let request = LlmRequest {
-        model: "qwen3".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "qwen3".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: Some(16),
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![LlmToolSpec {
-            name: "grep".to_string(),
-            description: "search".to_string(),
-            parameters: json!({"type": "object"}),
-            strict: true,
-        }],
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "grep".to_string(),
+                description: "search".to_string(),
+                parameters: json!({"type": "object"}),
+                strict: true,
+            }
+            .into(),
+        ]),
         store: false,
     };
 
@@ -36,28 +40,30 @@ fn request_body_uses_chat_stream_shape() {
 #[test]
 fn request_body_preserves_function_tool_order() {
     let request = LlmRequest {
-        model: "qwen3".to_string(),
-        instructions: "be brief".to_string(),
-        input: vec![LlmInputItem::UserText("hello".to_string())],
+        model: "qwen3".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
         max_output_tokens: None,
         response_verbosity: None,
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
-        tools: vec![
+        tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
                 description: "write".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
+            }
+            .into(),
             LlmToolSpec {
                 name: "grep".to_string(),
                 description: "search".to_string(),
                 parameters: json!({"type": "object"}),
                 strict: true,
-            },
-        ],
+            }
+            .into(),
+        ]),
         store: false,
     };
 
