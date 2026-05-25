@@ -2772,7 +2772,7 @@ async fn ctrl_p_collapses_and_expands_task_panel() {
 }
 
 #[tokio::test]
-async fn esc_cancels_active_turn_and_requires_double_press_to_quit_when_idle() {
+async fn esc_cancels_active_turn_and_never_exits_when_idle() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     let (_tx, rx) = mpsc::channel(1);
@@ -2793,25 +2793,115 @@ async fn esc_cancels_active_turn_and_requires_double_press_to_quit_when_idle() {
 
     app.turn_rx = None;
     app.cancel = None;
-    let quit = handle_key(
-        &mut app,
-        &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
-    )
-    .await
-    .expect("idle esc");
-    assert!(!quit);
-    assert!(app.exit_armed);
-    assert!(format_status_tokens(&app).contains("Esc again to exit"));
+
+    for _ in 0..3 {
+        let quit = handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .await
+        .expect("idle esc");
+        assert!(!quit);
+        assert!(!app.exit_confirm_armed);
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_arms_exit_confirm_then_exits_on_second_press() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
 
     let quit = handle_key(
         &mut app,
         &mut agent,
-        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
     )
     .await
-    .expect("second idle esc");
+    .expect("first ctrl-c");
+    assert!(!quit);
+    assert!(app.exit_confirm_armed);
+    assert!(format_status_tokens(&app).contains("Ctrl+C or Y to exit"));
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("second ctrl-c");
     assert!(quit);
+}
+
+#[tokio::test]
+async fn ctrl_c_then_y_exits() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("first ctrl-c");
+    assert!(app.exit_confirm_armed);
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("y confirm");
+    assert!(quit);
+}
+
+#[tokio::test]
+async fn ctrl_c_then_other_key_disarms_and_keystroke_falls_through() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("first ctrl-c");
+    assert!(app.exit_confirm_armed);
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("letter");
+    assert!(!quit);
+    assert!(!app.exit_confirm_armed);
+    assert_eq!(app.input, "a");
+}
+
+#[tokio::test]
+async fn ctrl_c_during_turn_cancels_turn_and_does_not_arm_exit() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    let cancel = CancellationToken::new();
+    app.turn_rx = Some(rx);
+    app.cancel = Some(cancel.clone());
+
+    let quit = handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-c during turn");
+    assert!(!quit);
+    assert!(cancel.is_cancelled());
+    assert!(!app.exit_confirm_armed);
 }
 
 #[tokio::test]
@@ -2839,7 +2929,7 @@ async fn esc_cancels_pending_approval_without_active_turn() {
     );
     assert!(app.pending_approval.is_none());
     assert_eq!(app.status, "interrupting");
-    assert!(!app.exit_armed);
+    assert!(!app.exit_confirm_armed);
 }
 
 #[tokio::test]

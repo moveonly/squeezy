@@ -689,15 +689,30 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.code != KeyCode::Esc {
-        app.exit_armed = false;
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if request_turn_interrupt(app) {
+            app.exit_confirm_armed = false;
             return Ok(false);
         }
+        if app.exit_confirm_armed {
+            return Ok(true);
+        }
+        app.exit_confirm_armed = true;
+        app.status = "press Ctrl+C or Y to exit · any other key to cancel".to_string();
+        return Ok(false);
+    }
+
+    if app.exit_confirm_armed
+        && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'))
+        && key.modifiers.is_empty()
+    {
         return Ok(true);
+    }
+
+    if app.exit_confirm_armed && key.code != KeyCode::Esc {
+        app.exit_confirm_armed = false;
+        app.status = "exit cancelled".to_string();
+        // fall through — the keystroke still performs its normal action
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
@@ -826,14 +841,9 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     match key.code {
         KeyCode::Esc => {
-            if request_turn_interrupt(app) {
-                Ok(false)
-            } else if app.exit_armed {
-                Ok(true)
-            } else {
-                app.exit_armed = true;
-                Ok(false)
-            }
+            // ESC never exits; the pre-check above already handled in-flight
+            // turn/approval interrupts, so a bare ESC at this point is a no-op.
+            Ok(false)
         }
         // Scroll keys intentionally leave `app.status` alone so command
         // handlers can keep their latest state even though the footer stays
@@ -6319,9 +6329,8 @@ fn format_status_hints(app: &TuiApp) -> String {
     } else if app.cancel.is_some() {
         return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
             .to_string();
-    } else if app.exit_armed {
-        return "Esc again to exit · Enter send · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · /help"
-            .to_string();
+    } else if app.exit_confirm_armed {
+        return "Ctrl+C or Y to exit · any other key to cancel".to_string();
     }
     if app.alternate_scroll_enabled {
         "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
@@ -6660,7 +6669,7 @@ struct TuiApp {
     last_turn_duration: Option<Duration>,
     animation_tick: u64,
     animation_tick_rate: Duration,
-    exit_armed: bool,
+    exit_confirm_armed: bool,
     active_tool_calls: BTreeMap<String, ToolCall>,
     cost: squeezy_core::CostSnapshot,
     metrics: squeezy_core::TurnMetrics,
@@ -6771,7 +6780,7 @@ impl TuiApp {
             last_turn_duration: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
-            exit_armed: false,
+            exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             metrics: squeezy_core::TurnMetrics::default(),
