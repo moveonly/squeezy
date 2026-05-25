@@ -129,6 +129,453 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn proposed_plan_block_opens_post_plan_choice_prompt() {
+    let root = temp_workspace("plan_choice_prompt");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "<proposed_plan>\nstep 1\nstep 2\n</proposed_plan>".to_string(),
+    })
+    .await
+    .expect("send delta");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let pending = app
+        .pending_plan_choice
+        .as_ref()
+        .expect("prompt should be set after persist");
+    assert!(pending.plan_id.starts_with("plan-"));
+    assert!(
+        pending
+            .plan_path
+            .starts_with(root.join(proposed_plan::PLAN_DIR))
+    );
+    assert_eq!(pending.selection_index, 0);
+
+    let lines = approval_lines(&app);
+    let rendered: String = lines
+        .into_iter()
+        .flat_map(|line| line.spans.into_iter().map(|span| span.content.into_owned()))
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(rendered.contains("Plan ready"), "render: {rendered}");
+    assert!(rendered.contains("[e] Execute"));
+    assert!(rendered.contains("[c] Execute (clean)"));
+    assert!(rendered.contains("[r] Refine"));
+    assert!(rendered.contains("[d] Discard"));
+    assert!(rendered.contains("[v] View"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
+    let root = temp_workspace("plan_choice_execute");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-execute1".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id.clone());
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert!(app.pending_plan_choice.is_none());
+    // Execute auto-submits a "begin executing the plan" prompt, which both
+    // consumes the queued handoff (so the field clears) and starts a turn
+    // the TUI is now listening to.
+    assert!(
+        app.pending_plan_handoff.is_none(),
+        "handoff is consumed by the auto-submitted execute turn"
+    );
+    assert!(
+        app.turn_rx.is_some(),
+        "Execute must start a turn so the agent actually runs the plan"
+    );
+    assert_eq!(app.status, "starting turn");
+    let _ = plan_path;
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() {
+    let root = temp_workspace("plan_choice_clean");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-clean001".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id.clone());
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(
+        app.mode,
+        SessionMode::Build,
+        "clean execute still switches to Build"
+    );
+    assert!(app.pending_plan_choice.is_none());
+    assert!(
+        app.turn_rx.is_some(),
+        "clean execute must also start a turn"
+    );
+    // We don't assert successful compaction here — the test agent has no
+    // history to compact, so the agent returns the "not enough context"
+    // error. We just verify the path is exercised: a log entry mentions
+    // either the compaction success or the skip.
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(msg) if msg.contains("execute-clean") || msg.contains("compacted prior context")
+        )),
+        "expected an execute-clean log line; transcript={:?}",
+        app.transcript
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_discard_deletes_file_and_clears_handoff() {
+    let root = temp_workspace("plan_choice_discard");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-discard1".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id.clone());
+    app.pending_plan_handoff = Some(plan_path.clone());
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(!plan_path.exists(), "discard must delete the plan file");
+    assert!(app.pending_plan_choice.is_none());
+    assert!(app.current_plan_id.is_none());
+    assert!(app.pending_plan_handoff.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
+    let root = temp_workspace("plan_choice_view");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-view0001".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(plan_path.exists(), "view must not delete the plan file");
+    assert!(
+        app.pending_plan_choice.is_some(),
+        "View keeps the prompt open"
+    );
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(message) if message.contains(&plan_id)
+        )),
+        "expected a 'plan {plan_id} file:' log entry"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_refine_dismisses_prompt_without_changing_mode_or_file() {
+    let root = temp_workspace("plan_choice_refine");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-refine01".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id.clone());
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: plan_id.clone(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert!(app.pending_plan_choice.is_none());
+    assert!(plan_path.exists(), "refine must keep the plan file");
+    assert_eq!(app.mode, SessionMode::Plan);
+    assert_eq!(
+        app.current_plan_id.as_deref(),
+        Some(plan_id.as_str()),
+        "current_plan_id stays so the next refinement turn can find it"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_arrow_keys_move_selection_without_activating() {
+    let root = temp_workspace("plan_choice_arrows");
+    let plan_path = root.join("plan-x.md");
+    fs::write(&plan_path, "step\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: "plan-x".to_string(),
+        plan_path: plan_path.clone(),
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.pending_plan_choice.as_ref().unwrap().selection_index, 1);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert_eq!(app.pending_plan_choice.as_ref().unwrap().selection_index, 0);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_choice_shift_tab_falls_through_to_mode_toggle() {
+    let root = temp_workspace("plan_choice_shifttab");
+    let plan_path = root.join("plan-y.md");
+    fs::write(&plan_path, "step\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.pending_plan_choice = Some(PendingPlanChoice {
+        plan_id: "plan-y".to_string(),
+        plan_path,
+        selection_index: 0,
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert!(
+        app.pending_plan_choice.is_none(),
+        "mode switch supersedes the post-plan choice prompt"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
+    let root = temp_workspace("plan_handoff_queued");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-test12345678".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id);
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert_eq!(
+        app.pending_plan_handoff.as_deref(),
+        Some(plan_path.as_path())
+    );
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(message) if message.contains("plan attached for next Build turn")
+        )),
+        "expected handoff log entry; transcript={:?}",
+        app.transcript
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn plan_to_build_switch_skips_handoff_when_no_plan_file() {
+    let root = temp_workspace("plan_handoff_absent");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    // current_plan_id present but the file was deleted out from under us
+    app.current_plan_id = Some("plan-never-persisted".to_string());
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+
+    assert_eq!(app.mode, SessionMode::Build);
+    assert!(app.pending_plan_handoff.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn build_to_plan_switch_drops_pending_handoff() {
+    let root = temp_workspace("plan_handoff_dropped");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_id = "plan-test12345678".to_string();
+    let plan_path = plans_dir.join(format!("{plan_id}.md"));
+    fs::write(&plan_path, "step 1\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    app.current_plan_id = Some(plan_id);
+
+    switch_mode(&mut app, &agent, Some(SessionMode::Build), "test");
+    assert!(app.pending_plan_handoff.is_some());
+    switch_mode(&mut app, &agent, Some(SessionMode::Plan), "test");
+    assert!(app.pending_plan_handoff.is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn take_pending_plan_prefix_returns_labelled_contents_and_clears_field() {
+    let root = temp_workspace("plan_prefix_consume");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_path = plans_dir.join("plan-abc.md");
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.pending_plan_handoff = Some(plan_path.clone());
+
+    let prefix = take_pending_plan_prefix(&mut app).expect("prefix returned");
+    assert!(prefix.starts_with("[plan from previous session"));
+    assert!(prefix.contains("step 1\nstep 2"));
+    assert!(prefix.ends_with("[end plan]\n\n"));
+    assert!(app.pending_plan_handoff.is_none());
+
+    // A second consume drains nothing — the prefix is one-shot.
+    assert!(take_pending_plan_prefix(&mut app).is_none());
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn take_pending_plan_prefix_drops_handoff_when_file_missing() {
+    let root = temp_workspace("plan_prefix_missing");
+    let phantom = root.join(proposed_plan::PLAN_DIR).join("plan-gone.md");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.pending_plan_handoff = Some(phantom);
+
+    let prefix = take_pending_plan_prefix(&mut app);
+    assert!(prefix.is_none());
+    assert!(app.pending_plan_handoff.is_none());
+    assert!(
+        app.transcript.iter().any(|entry| matches!(
+            &entry.kind,
+            TranscriptEntryKind::Log(message) if message.contains("could not read plan file")
+        )),
+        "expected a recovery log line for the missing plan file; transcript={:?}",
+        app.transcript
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
 async fn slash_plan_with_trailing_space_still_switches_mode() {
     // Regression for the old Enter-time pre-intercept that compared the
     // trimmed input via `mode_command` and silently dropped `/plan ` (with
@@ -3763,8 +4210,10 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
 }
 
 #[tokio::test]
-async fn proposed_plan_block_renders_as_log_entry() {
-    let mut app = test_app(SessionMode::Plan);
+async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir() {
+    let root = temp_workspace("proposed_plan_persist");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
     for delta in [
@@ -3789,17 +4238,36 @@ async fn proposed_plan_block_renders_as_log_entry() {
         "proposed plan markers must not appear in the live assistant pane",
     );
     let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
-        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan:") => {
+        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan plan-") => {
             Some(message.clone())
         }
         _ => None,
     });
-    assert_eq!(
-        plan_log,
-        Some("proposed plan:\nstep 1\nstep 2".to_string()),
-        "expected exactly one proposed-plan log entry; transcript={:?}",
-        app.transcript
+    let log = plan_log.unwrap_or_else(|| {
+        panic!(
+            "expected a 'proposed plan plan-<id>' log entry; transcript={:?}",
+            app.transcript
+        )
+    });
+    assert!(
+        log.ends_with(":\nstep 1\nstep 2"),
+        "log should include the plan body verbatim; got: {log:?}"
     );
+
+    let plan_id = app
+        .current_plan_id
+        .as_ref()
+        .expect("current_plan_id should be set after persistence");
+    assert!(plan_id.starts_with("plan-"));
+    let path = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(format!("{plan_id}.md"));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("plan file exists"),
+        "step 1\nstep 2\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]

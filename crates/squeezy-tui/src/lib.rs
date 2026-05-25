@@ -341,12 +341,20 @@ async fn run_inner(
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
+    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root);
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
         agent.session_mode(),
         startup,
     );
+    if pruned > 0 {
+        app.push_log(format!(
+            "pruned {pruned} stale plan file(s) from {} (kept {} newest)",
+            proposed_plan::PLAN_DIR,
+            proposed_plan::PLAN_RETENTION_LIMIT
+        ));
+    }
     for item in initial_transcript {
         app.push_transcript_item(item);
     }
@@ -406,7 +414,24 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.pending_assistant.push_delta(&extracted.passthrough);
                     }
                     for plan_body in extracted.completed {
-                        app.push_log(format!("proposed plan:\n{plan_body}"));
+                        match proposed_plan::persist_plan(&app.workspace_root, &plan_body) {
+                            Ok((plan_id, path)) => {
+                                app.current_plan_id = Some(plan_id.clone());
+                                app.push_log(format!(
+                                    "proposed plan {plan_id} (saved to {}):\n{plan_body}",
+                                    compact_path(&path)
+                                ));
+                                app.pending_plan_choice = Some(PendingPlanChoice {
+                                    plan_id,
+                                    plan_path: path,
+                                    selection_index: 0,
+                                });
+                            }
+                            Err(err) => app.push_log(format!(
+                                "proposed plan (could not persist under {}: {err}):\n{plan_body}",
+                                proposed_plan::PLAN_DIR
+                            )),
+                        }
                     }
                     // Intentionally preserve `transcript_scroll_from_bottom`
                     // here: if the user paged up to read history we would
@@ -737,6 +762,155 @@ fn cancel_pending_request_user_input(app: &mut TuiApp) {
     }
 }
 
+async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    let Some(mut pending) = app.pending_plan_choice.take() else {
+        return false;
+    };
+    let len = PLAN_CHOICES.len();
+    let activate_index = match key.code {
+        KeyCode::Up => {
+            pending.selection_index = pending.selection_index.saturating_sub(1);
+            app.pending_plan_choice = Some(pending);
+            return true;
+        }
+        KeyCode::Down => {
+            pending.selection_index = (pending.selection_index + 1).min(len - 1);
+            app.pending_plan_choice = Some(pending);
+            return true;
+        }
+        KeyCode::Esc => {
+            // Dismiss without taking action; equivalent to "Refine" — the
+            // plan file stays, the prompt goes away, the user can type
+            // anything next.
+            app.status = "plan prompt dismissed; keep refining or switch with Shift+Tab".into();
+            return true;
+        }
+        KeyCode::BackTab => {
+            // Shift+Tab is the canonical mode toggle; let it fall through
+            // so a user who pressed it while the prompt was open still
+            // switches modes instead of being stuck.
+            app.pending_plan_choice = Some(pending);
+            return false;
+        }
+        KeyCode::Enter => Some(pending.selection_index.min(len - 1)),
+        KeyCode::Char(c) => {
+            let lower = c.to_ascii_lowercase();
+            PLAN_CHOICES
+                .iter()
+                .position(|option| option.shortcut == lower)
+        }
+        _ => None,
+    };
+    let Some(idx) = activate_index else {
+        app.pending_plan_choice = Some(pending);
+        return true;
+    };
+    apply_plan_choice(app, agent, &pending, idx).await;
+    true
+}
+
+async fn apply_plan_choice(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    pending: &PendingPlanChoice,
+    idx: usize,
+) {
+    let option = &PLAN_CHOICES[idx.min(PLAN_CHOICES.len() - 1)];
+    match option.action {
+        PlanChoiceAction::Execute => {
+            switch_mode(app, agent, Some(SessionMode::Build), "plan_choice_execute");
+            if app.mode != SessionMode::Build {
+                // Mode switch was refused (active turn, pending approval,
+                // …) — leave the queued handoff in place and let the user
+                // retry once the blocker clears.
+                return;
+            }
+            start_user_turn(
+                app,
+                agent,
+                "Begin executing the plan above, step by step.".to_string(),
+            );
+        }
+        PlanChoiceAction::ExecuteClean => {
+            // Compact the prior conversation so the agent doesn't replay
+            // the planning chatter on execution. The plan body still rides
+            // in via the handoff prefix queued by the mode switch, so the
+            // model retains the full plan even with an emptied transcript.
+            match agent.compact_context_manual().await {
+                Ok(report) => {
+                    app.context_compaction.last = Some(report.record.clone());
+                    app.context_compaction.generation = report.record.generation;
+                    app.context_compaction.summary = Some(report.summary.clone());
+                    app.context_compaction.history.push(report.record.clone());
+                    app.context_estimate = report.record.after.clone();
+                    app.context_compaction_nudge_shown = false;
+                    app.push_log(format!(
+                        "compacted prior context before executing plan {}",
+                        pending.plan_id
+                    ));
+                }
+                Err(err) => {
+                    // "not enough context to compact" is fine — common on a
+                    // fresh session and not a blocker for execution.
+                    app.push_log(format!(
+                        "execute-clean: skipped compaction ({err}); running plan"
+                    ));
+                }
+            }
+            switch_mode(
+                app,
+                agent,
+                Some(SessionMode::Build),
+                "plan_choice_execute_clean",
+            );
+            if app.mode != SessionMode::Build {
+                return;
+            }
+            start_user_turn(
+                app,
+                agent,
+                "Begin executing the plan above, step by step.".to_string(),
+            );
+        }
+        PlanChoiceAction::Refine => {
+            app.status = "stay in Plan; describe the refinement".into();
+        }
+        PlanChoiceAction::Discard => match std::fs::remove_file(&pending.plan_path) {
+            Ok(()) => {
+                app.push_log(format!(
+                    "plan {} discarded ({} deleted)",
+                    pending.plan_id,
+                    compact_path(&pending.plan_path)
+                ));
+                if app.current_plan_id.as_deref() == Some(pending.plan_id.as_str()) {
+                    app.current_plan_id = None;
+                }
+                if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
+                    app.pending_plan_handoff = None;
+                }
+            }
+            Err(err) => {
+                app.push_log(format!(
+                    "could not delete plan file {}: {err}",
+                    compact_path(&pending.plan_path)
+                ));
+            }
+        },
+        PlanChoiceAction::View => {
+            app.push_log(format!(
+                "plan {} file: {}",
+                pending.plan_id,
+                compact_path(&pending.plan_path)
+            ));
+            // Keep the prompt open so the user can pick another action
+            // after looking at the file.
+            let mut next = pending.clone();
+            next.selection_index = 0;
+            app.pending_plan_choice = Some(next);
+        }
+    }
+}
+
 fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     let Some(mut pending) = app.pending_request_user_input.take() else {
         return false;
@@ -1052,6 +1226,10 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if handle_plan_choice_key(app, agent, key).await {
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL)
         && (key.code == KeyCode::Char('j') || key.code == KeyCode::Enter)
     {
@@ -1266,30 +1444,7 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             app.cancelled_prompt = Some(input.clone());
             clear_input(app);
             push_input_history(app, input.clone());
-            // Apply any pending config swap before the request goes out so
-            // the running turn picks up the new model/provider. The TUI's
-            // app fields (verbosity etc.) are already updated by the
-            // Immediate-tier handler; this drain covers NextPrompt-tier.
-            if let Some(swap) = agent.drain_pending_swap() {
-                let note = swap
-                    .display_note
-                    .clone()
-                    .unwrap_or_else(|| "config applied".to_string());
-                app.app_notifications
-                    .push(format!("✓ applied: {note}"), NotifySeverity::Success);
-            }
-            let cancel = CancellationToken::new();
-            app.task_state = None;
-            app.task_panel_collapsed = false;
-            app.note_turn_started();
-            app.turn_rx = Some(agent.start_turn_with_response_verbosity(
-                input,
-                cancel.clone(),
-                app.response_verbosity,
-            ));
-            app.cancel = Some(cancel);
-            app.status = "starting turn".to_string();
-            app.turn_visual = TurnVisualState::Running;
+            start_user_turn(app, agent, input);
             Ok(false)
         }
         KeyCode::Backspace => {
@@ -3057,6 +3212,63 @@ fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
+/// Kick off a user-driven turn. Drains any pending config swap, consumes a
+/// queued plan handoff (prepending the plan body to `input`), and hands
+/// the resulting prompt to the agent. Used by the Enter key handler and
+/// by the post-plan Execute action so both paths share the same plan
+/// prefix and turn-state bookkeeping.
+fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
+    if let Some(swap) = agent.drain_pending_swap() {
+        let note = swap
+            .display_note
+            .clone()
+            .unwrap_or_else(|| "config applied".to_string());
+        app.app_notifications
+            .push(format!("✓ applied: {note}"), NotifySeverity::Success);
+    }
+    let cancel = CancellationToken::new();
+    app.task_state = None;
+    app.task_panel_collapsed = false;
+    app.note_turn_started();
+    let prefixed_input = match take_pending_plan_prefix(app) {
+        Some(prefix) => format!("{prefix}{input}"),
+        None => input,
+    };
+    app.turn_rx = Some(agent.start_turn_with_response_verbosity(
+        prefixed_input,
+        cancel.clone(),
+        app.response_verbosity,
+    ));
+    app.cancel = Some(cancel);
+    app.status = "starting turn".to_string();
+    app.turn_visual = TurnVisualState::Running;
+}
+
+/// If a Plan→Build switch queued a plan file for handoff, read it and
+/// return a labelled prefix to prepend to the next user input. Clears the
+/// pending field on success or non-recoverable failure so a stale handoff
+/// cannot leak across multiple turns. Returns `None` when nothing is
+/// queued.
+fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
+    let plan_path = app.pending_plan_handoff.take()?;
+    match std::fs::read_to_string(&plan_path) {
+        Ok(body) => {
+            let trimmed = body.trim_end();
+            Some(format!(
+                "[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
+                path = plan_path.display(),
+            ))
+        }
+        Err(err) => {
+            app.push_log(format!(
+                "could not read plan file {} for Build handoff: {err}",
+                compact_path(&plan_path)
+            ));
+            None
+        }
+    }
+}
+
 fn switch_mode(
     app: &mut TuiApp,
     agent: &Agent,
@@ -3080,9 +3292,35 @@ fn switch_mode(
         app.status = format!("already in {} mode", app.mode.as_str());
         return;
     }
+    let previous = app.mode;
     if agent.set_session_mode(target, source) {
         app.mode = target;
         app.status = format!("mode switched to {}", app.mode.as_str());
+        // A mode switch supersedes any post-plan choice prompt — the
+        // user's decision has been made by toggling the mode itself.
+        app.pending_plan_choice = None;
+        match (previous, target) {
+            (SessionMode::Plan, SessionMode::Build) => {
+                if let Some(plan_id) = app.current_plan_id.as_deref() {
+                    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, plan_id);
+                    if plan_path.exists() {
+                        app.pending_plan_handoff = Some(plan_path.clone());
+                        app.push_log(format!(
+                            "plan attached for next Build turn: {}",
+                            compact_path(&plan_path)
+                        ));
+                    }
+                }
+            }
+            (SessionMode::Build, SessionMode::Plan) => {
+                // A handoff queued by an earlier Plan→Build switch is no
+                // longer relevant once the user goes back to Plan; drop it
+                // so the next Build entry recomputes from the current
+                // plan file instead of attaching a stale path.
+                app.pending_plan_handoff = None;
+            }
+            _ => {}
+        }
     } else {
         // Agent saw no change (lock-free path is infallible, so this only
         // fires when the agent observed the same mode we requested). Resync
@@ -3517,6 +3755,48 @@ fn mcp_elicitation_response_preview(input: &str) -> String {
     } else {
         compact_text(trimmed, 160)
     }
+}
+
+fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'static>> {
+    let selected = pending.selection_index.min(PLAN_CHOICES.len() - 1);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "Plan ready",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {}", pending.plan_id),
+            Style::default().fg(QUIET),
+        ),
+    ])];
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            compact_path(&pending.plan_path),
+            Style::default().fg(Color::White),
+        ),
+    ]));
+    for (idx, option) in PLAN_CHOICES.iter().enumerate() {
+        let is_selected = idx == selected;
+        let marker = if is_selected { "› " } else { "  " };
+        let label_style = if is_selected {
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if is_selected { GOLD } else { QUIET }),
+            ),
+            Span::styled(
+                format!("[{}] {}", option.shortcut, option.label),
+                label_style,
+            ),
+            Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
+        ]));
+    }
+    lines
 }
 
 fn format_request_user_input_menu_lines(
@@ -4104,6 +4384,8 @@ fn approval_menu_height(app: &TuiApp) -> u16 {
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
             .len() as u16
+    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
+        format_plan_choice_menu_lines(pending).len() as u16
     } else {
         0
     }
@@ -4127,6 +4409,8 @@ fn approval_lines(app: &TuiApp) -> Vec<Line<'static>> {
         )
     } else if let Some(pending) = app.pending_request_user_input.as_ref() {
         format_request_user_input_menu_lines(&pending.request, pending.selection_index, &app.input)
+    } else if let Some(pending) = app.pending_plan_choice.as_ref() {
+        format_plan_choice_menu_lines(pending)
     } else {
         Vec::new()
     }
@@ -7495,6 +7779,20 @@ struct TuiApp {
     transcript_scroll_from_bottom: u16,
     pending_assistant: streaming::StreamingController,
     proposed_plan: proposed_plan::ProposedPlanExtractor,
+    workspace_root: PathBuf,
+    /// Plan id of the most recent `<proposed_plan>` block persisted under
+    /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
+    /// to identify which plan file is active without scanning the dir.
+    current_plan_id: Option<String>,
+    /// Path to a plan file that should be prepended as starting context to
+    /// the very next Build-mode turn. Set when the user switches Plan→Build
+    /// while a plan is active; consumed and cleared by the prompt-submit
+    /// handler.
+    pending_plan_handoff: Option<PathBuf>,
+    /// Interactive Execute/Refine/Discard/View prompt rendered right after a
+    /// `<proposed_plan>` block lands. Set once on persist; cleared by an
+    /// explicit user choice. Blocks other input while present.
+    pending_plan_choice: Option<PendingPlanChoice>,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -7629,6 +7927,10 @@ impl TuiApp {
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
+            workspace_root: config.workspace_root.clone(),
+            current_plan_id: None,
+            pending_plan_handoff: None,
+            pending_plan_choice: None,
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,
@@ -7945,6 +8247,65 @@ struct PendingRequestUserInput {
     response_tx: oneshot::Sender<RequestUserInputResponse>,
     selection_index: usize,
 }
+
+/// Interactive prompt that appears after a `<proposed_plan>` block lands
+/// and persists. Lets the user execute, refine, discard, or view the
+/// plan file without typing a slash command.
+#[derive(Debug, Clone)]
+struct PendingPlanChoice {
+    plan_id: String,
+    plan_path: PathBuf,
+    selection_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanChoiceAction {
+    Execute,
+    ExecuteClean,
+    Refine,
+    Discard,
+    View,
+}
+
+struct PlanChoiceOption {
+    action: PlanChoiceAction,
+    label: &'static str,
+    hint: &'static str,
+    shortcut: char,
+}
+
+const PLAN_CHOICES: &[PlanChoiceOption] = &[
+    PlanChoiceOption {
+        action: PlanChoiceAction::Execute,
+        label: "Execute",
+        hint: "switch to Build; keep history; run the plan",
+        shortcut: 'e',
+    },
+    PlanChoiceOption {
+        action: PlanChoiceAction::ExecuteClean,
+        label: "Execute (clean)",
+        hint: "compact prior chat to a summary, then run the plan",
+        shortcut: 'c',
+    },
+    PlanChoiceOption {
+        action: PlanChoiceAction::Refine,
+        label: "Refine",
+        hint: "stay in Plan; describe what to change",
+        shortcut: 'r',
+    },
+    PlanChoiceOption {
+        action: PlanChoiceAction::Discard,
+        label: "Discard",
+        hint: "delete the plan file and dismiss this prompt",
+        shortcut: 'd',
+    },
+    PlanChoiceOption {
+        action: PlanChoiceAction::View,
+        label: "View",
+        hint: "log the plan file path so you can open it externally",
+        shortcut: 'v',
+    },
+];
 
 fn exit_hint(session_id: Option<&str>) -> Option<String> {
     session_id.map(|session_id| {

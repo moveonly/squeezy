@@ -3307,8 +3307,11 @@ impl TurnRuntime {
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
-        let mode_instructions =
-            plan_mode::instructions_for_mode(&verbosity_instructions, active_mode);
+        let mode_instructions = plan_mode::instructions_for_mode(
+            &verbosity_instructions,
+            active_mode,
+            &self.config.workspace_root,
+        );
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
         // after a compaction has occurred. Inline it into the per-turn

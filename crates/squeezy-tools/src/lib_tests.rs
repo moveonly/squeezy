@@ -2306,6 +2306,79 @@ async fn plan_patch_binding_can_be_bypassed_with_confirm_outside_plan() {
 }
 
 #[tokio::test]
+async fn plan_patch_candidate_paths_are_included_in_neighborhood() {
+    let root = temp_workspace("plan_binding_candidate");
+    write_rust_crate(
+        &root,
+        "pub fn target() -> usize { 1 }\nfn caller() -> usize { target() }\n",
+    );
+    fs::write(root.join("stranger.txt"), "out\n").expect("write stranger");
+    let registry = registry_with_checkpoints(&root);
+
+    let plan = registry
+        .execute(
+            ToolCall {
+                call_id: "plan_candidate".to_string(),
+                name: "plan_patch".to_string(),
+                arguments: json!({
+                    "objective": "tweak target",
+                    "query": "target",
+                    "kind": "function",
+                    "candidate_paths": ["stranger.txt"],
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(plan.status, ToolStatus::Success);
+    if plan
+        .content
+        .get("graph_available")
+        .and_then(|v| v.as_bool())
+        == Some(false)
+    {
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    let plan_id = plan.content["plan_id"]
+        .as_str()
+        .expect("plan_id")
+        .to_string();
+
+    let actual_hash = sha256_hex(
+        fs::read(root.join("stranger.txt"))
+            .expect("read stranger")
+            .as_slice(),
+    );
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "apply_candidate".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "plan_id": plan_id,
+                    "patches": [{
+                        "path": "stranger.txt",
+                        "search": "out\n",
+                        "replace": "in\n",
+                        "expected_sha256": actual_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-plan-candidate".to_string(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("stranger.txt")).unwrap(),
+        "in\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn secret_name_checks_use_workspace_relative_paths() {
     let root = temp_workspace("secret_parent");
     fs::write(root.join("plain.txt"), "visible").expect("write plain");
