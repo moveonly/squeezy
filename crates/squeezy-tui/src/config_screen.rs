@@ -430,6 +430,107 @@ impl ConfigScreenState {
         }
         ((field.default)(), FieldSource::Default)
     }
+
+    /// Walk the full precedence chain (Local → Repo → User → Default),
+    /// returning the value and the tier that supplies it. Independent
+    /// of `self.scope` — this is the *running* effective value, not the
+    /// per-tab view. Env-shadowed fields short-circuit to the env value
+    /// and `FieldSource::Env`.
+    fn effective_value_full(&self, field: &FieldMeta) -> (FieldValue, FieldSource) {
+        self.effective_value_skipping(field, None)
+    }
+
+    /// Same as `effective_value_full`, but pretend the file behind
+    /// `skip` (if any) doesn't exist. Used by the Reset preview to
+    /// answer "what would this field display if I deleted that tier
+    /// file right now?"
+    fn effective_value_skipping(
+        &self,
+        field: &FieldMeta,
+        skip: Option<ConfigScope>,
+    ) -> (FieldValue, FieldSource) {
+        if let Some(var) = field.env_override
+            && std::env::var(var).is_ok()
+        {
+            return ((field.get)(&self.effective), FieldSource::Env);
+        }
+        let chain: &[(FieldSource, ConfigScope, &Option<squeezy_core::TierSource>)] = &[
+            (FieldSource::Repo, ConfigScope::Local, &self.sources.repo),
+            (
+                FieldSource::Project,
+                ConfigScope::Repo,
+                &self.sources.project,
+            ),
+            (FieldSource::User, ConfigScope::User, &self.sources.user),
+        ];
+        for (src, owns_scope, tier) in chain {
+            if Some(*owns_scope) == skip {
+                continue;
+            }
+            if let Some(t) = tier
+                && let Some(val) = tier_value_at_path(t, field)
+            {
+                return (val, *src);
+            }
+        }
+        ((field.default)(), FieldSource::Default)
+    }
+
+    /// Compute the list of fields whose effective value would change if
+    /// `scope`'s tier file were deleted right now. Used by the Reset
+    /// confirmation overlay so the user sees exactly which configured
+    /// values they're about to lose.
+    ///
+    /// Env-shadowed fields are skipped — reset can't move them.
+    /// Schema kinds we don't yet render in the screen
+    /// (`TableArray`, `ProviderSubTabs`) are also skipped because
+    /// `tier_value_at_path` returns `None` for them and the diff would
+    /// be lossy.
+    pub(crate) fn reset_preview(&self, scope: ConfigScope) -> Vec<ResetPreviewEntry> {
+        let mut out: Vec<ResetPreviewEntry> = Vec::new();
+        for section in CONFIG_SECTIONS {
+            if section.id == SectionId::Reset {
+                continue;
+            }
+            for field in section.fields {
+                if matches!(
+                    field.kind,
+                    FieldKind::TableArray { .. }
+                        | FieldKind::ProviderSubTabs
+                        | FieldKind::Secret { .. }
+                ) {
+                    continue;
+                }
+                let (before, before_src) = self.effective_value_full(field);
+                if before_src == FieldSource::Env {
+                    continue;
+                }
+                let (after, after_src) = self.effective_value_skipping(field, Some(scope));
+                if before != after {
+                    out.push(ResetPreviewEntry {
+                        section_label: section.label,
+                        field_label: field.label,
+                        before: before.as_display(),
+                        after: after.as_display(),
+                        after_source: after_src,
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// One row of the Reset preview shown inside the y/n confirmation.
+/// `after_source` lets the renderer attach the same `[inherited-…]`
+/// vocabulary used everywhere else.
+#[derive(Debug, Clone)]
+pub(crate) struct ResetPreviewEntry {
+    pub section_label: &'static str,
+    pub field_label: &'static str,
+    pub before: String,
+    pub after: String,
+    pub after_source: FieldSource,
 }
 
 /// Parse the `FieldValue` for `field.toml_path` out of a tier's
@@ -1324,6 +1425,21 @@ fn perform_reset(
     }
 }
 
+/// Human-readable name for a `ProviderConfig` variant. Used in the
+/// PendingConfigSwap display note so reset / provider-swap toasts read
+/// "openai → anthropic" instead of an opaque "provider switched".
+fn provider_variant_label(provider: &squeezy_core::ProviderConfig) -> &'static str {
+    use squeezy_core::ProviderConfig as P;
+    match provider {
+        P::OpenAi(_) => "openai",
+        P::Anthropic(_) => "anthropic",
+        P::Google(_) => "google",
+        P::AzureOpenAi(_) => "azure_openai",
+        P::Bedrock(_) => "bedrock",
+        P::Ollama(_) => "ollama",
+    }
+}
+
 /// Locate the `[model].model` `FieldMeta` in `CONFIG_SECTIONS`. Used by
 /// the provider-swap path to read the just-reset model id and to bind
 /// the secondary TOML write to the right `toml_path`.
@@ -1831,10 +1947,24 @@ fn apply_by_tier(
             } else {
                 None
             };
+            // When the change actually rebuilt the provider, name the
+            // new provider so the next-prompt apply notification reads
+            // "✓ applied: provider → anthropic" instead of the opaque
+            // "provider changed". For non-provider NextPrompt fields
+            // (model id, reasoning_effort, …) we still use the field
+            // label.
+            let display_note = if touches_provider {
+                format!(
+                    "provider → {}",
+                    provider_variant_label(&state.effective.provider)
+                )
+            } else {
+                format!("{} changed", field.label)
+            };
             agent.arm_config_swap(PendingConfigSwap {
                 config: state.effective.clone(),
                 provider: new_provider,
-                display_note: Some(format!("{} changed", field.label)),
+                display_note: Some(display_note),
             });
             if !silent {
                 notifications.push(
@@ -2013,8 +2143,9 @@ fn reload_sources_and_agent(
             return;
         }
     };
-    let provider_changed = std::mem::discriminant(&state.effective.provider)
-        != std::mem::discriminant(&new_cfg.provider);
+    let old_provider = provider_variant_label(&state.effective.provider);
+    let new_provider = provider_variant_label(&new_cfg.provider);
+    let provider_changed = old_provider != new_provider;
     state.effective = new_cfg.clone();
     if !provider_changed {
         agent.replace_config(new_cfg);
@@ -2027,7 +2158,9 @@ fn reload_sources_and_agent(
             agent.arm_config_swap(PendingConfigSwap {
                 config: new_cfg,
                 provider: Some(provider),
-                display_note: Some("provider switched (settings reset)".to_string()),
+                display_note: Some(format!(
+                    "provider {old_provider} → {new_provider} (applies on next prompt)"
+                )),
             });
         }
         Ok(Err(err)) => {
@@ -2151,12 +2284,27 @@ pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
 }
 
 fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
-    fn tab(label: &'static str, subtitle: &'static str, active: bool) -> Vec<Span<'static>> {
+    /// One tab cell: tier label, file subtitle, and a small dot when
+    /// the tier file actually exists on disk. The dot mirrors the
+    /// `[file present]` / `[no file]` indicator on the Reset section
+    /// so the user can tell at a glance which tabs are doing work.
+    fn tab(
+        label: &'static str,
+        subtitle: &'static str,
+        active: bool,
+        exists: bool,
+    ) -> Vec<Span<'static>> {
         let marker = if active { "▸ " } else { "  " };
         let label_style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
+        };
+        let dot = if exists { "●" } else { "○" };
+        let dot_style = if exists {
+            Style::default().fg(SUCCESS_GREEN)
+        } else {
+            Style::default().fg(QUIET)
         };
         vec![
             Span::styled(
@@ -2164,9 +2312,14 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
                 Style::default().fg(if active { GOLD } else { QUIET }),
             ),
             Span::styled(label, label_style),
+            Span::raw(" "),
+            Span::styled(dot, dot_style),
             Span::styled(format!(" {subtitle}"), Style::default().fg(QUIET)),
         ]
     }
+    let user_exists = std::fs::metadata(&state.sources.user_path_default).is_ok();
+    let repo_exists = std::fs::metadata(&state.sources.project_path_default).is_ok();
+    let local_exists = std::fs::metadata(&state.sources.repo_path_default).is_ok();
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(
         "  Config  ",
@@ -2177,6 +2330,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         "User",
         "~/.squeezy/settings.toml",
         state.scope == ConfigScope::User,
+        user_exists,
     ));
     spans.push(Span::styled(
         " ▸ ",
@@ -2186,6 +2340,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         "Repo",
         "./squeezy.toml (committed)",
         state.scope == ConfigScope::Repo,
+        repo_exists,
     ));
     spans.push(Span::styled(
         " ▸ ",
@@ -2195,9 +2350,10 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         "Local",
         "~/.squeezy/projects/<this>/settings.toml",
         state.scope == ConfigScope::Local,
+        local_exists,
     ));
     spans.push(Span::styled(
-        "    Local overrides Repo overrides User",
+        "    ● tier file exists · ○ not on disk · Local > Repo > User",
         Style::default().fg(QUIET),
     ));
     if state.dirty {
@@ -2300,51 +2456,111 @@ fn render_reset_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
     let scope = state.reset_confirm.expect("guarded by caller");
     let path = tier_path(state, scope);
     let exists = std::fs::metadata(&path).is_ok();
-    let lines = vec![
-        Line::from(vec![Span::styled(
-            "Reset confirmation",
-            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-        )]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::raw("  Delete the "),
-            Span::styled(
-                scope.label(),
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" settings file?"),
-        ]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("    path  ", Style::default().fg(QUIET)),
-            Span::raw(path.display().to_string()),
-        ]),
-        Line::from(vec![
-            Span::styled("    status ", Style::default().fg(QUIET)),
-            Span::styled(
-                if exists { "exists" } else { "(no file)" },
-                Style::default().fg(if exists { SUCCESS_GREEN } else { QUIET }),
-            ),
-        ]),
-        Line::raw(""),
-        Line::from(vec![Span::styled(
-            "  Other tabs are not touched. Inherited / default values then take over,\n  \
-             which may change values shown elsewhere — that's the point of a reset.",
+    let preview = if exists {
+        state.reset_preview(scope)
+    } else {
+        Vec::new()
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![Span::styled(
+        "Reset confirmation",
+        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::raw("  Delete the "),
+        Span::styled(
+            scope.label(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" settings file?"),
+    ]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("    path   ", Style::default().fg(QUIET)),
+        Span::raw(path.display().to_string()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("    status ", Style::default().fg(QUIET)),
+        Span::styled(
+            if exists { "exists" } else { "(no file)" },
+            Style::default().fg(if exists { SUCCESS_GREEN } else { QUIET }),
+        ),
+    ]));
+    lines.push(Line::raw(""));
+
+    if !exists {
+        lines.push(Line::from(Span::styled(
+            "  Nothing to delete — that tier file does not exist on disk. \
+             Confirming is harmless: the effective config doesn't change.",
             Style::default().fg(QUIET),
-        )]),
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-            Span::styled(" delete   ", Style::default().fg(QUIET)),
-            Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
-            Span::styled(" cancel   ", Style::default().fg(QUIET)),
-            Span::styled(
-                "Esc",
-                Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )));
+    } else if preview.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  The file exists, but every key in it matches the value that \
+             would still be effective after deletion (env override, identical \
+             higher-priority tier value, or the binary default). \
+             Confirming deletes the file without changing any displayed value.",
+            Style::default().fg(QUIET),
+        )));
+    } else {
+        let plural = if preview.len() == 1 { "" } else { "s" };
+        lines.push(Line::from(vec![Span::styled(
+            format!(
+                "  {} key{plural} will change effective value:",
+                preview.len()
             ),
-            Span::styled(" cancel", Style::default().fg(QUIET)),
-        ]),
-    ];
+            Style::default().fg(AMBER),
+        )]));
+        lines.push(Line::raw(""));
+        // Cap the list to a reasonable height so the confirm overlay doesn't
+        // overflow the pane on small terminals; a count of "and N more"
+        // keeps the user informed without scrolling.
+        let max_rows = 12usize;
+        for entry in preview.iter().take(max_rows) {
+            let after_label = inheritance_label(scope, entry.after_source);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    format!("{}.{}", entry.section_label, entry.field_label),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("       "),
+                Span::styled(entry.before.clone(), Style::default().fg(GOLD)),
+                Span::raw("  →  "),
+                Span::styled(entry.after.clone(), Style::default().fg(SUCCESS_GREEN)),
+                Span::raw(" "),
+                Span::styled(after_label, source_style(entry.after_source)),
+            ]));
+        }
+        if preview.len() > max_rows {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled(
+                format!("    … and {} more", preview.len() - max_rows),
+                Style::default().fg(QUIET),
+            )));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![Span::styled(
+        "  Other tabs are not touched. Ctrl+Z restores the deleted file.",
+        Style::default().fg(QUIET),
+    )]));
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("y", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+        Span::styled(" delete   ", Style::default().fg(QUIET)),
+        Span::styled("n", Style::default().fg(GOLD).add_modifier(Modifier::BOLD)),
+        Span::styled(" cancel   ", Style::default().fg(QUIET)),
+        Span::styled(
+            "Esc",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" cancel", Style::default().fg(QUIET)),
+    ]));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 

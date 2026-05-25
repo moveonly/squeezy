@@ -465,6 +465,41 @@ fn secret_entry_editor_inserts_and_backspaces_multibyte() {
     assert_eq!(entry.cursor, 0);
 }
 
+#[test]
+fn reset_preview_reports_changed_fields() {
+    use squeezy_core::{
+        TierSource,
+        config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId},
+    };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Permissions));
+    // Synthesize a User tier that flips `permissions.read` from the
+    // default `allow` to `deny`. The Reset preview for `User` must
+    // include this field (`deny` → `allow`).
+    let toml_text = "[permissions]\nread = \"deny\"\n";
+    state.sources.user = Some(TierSource {
+        path: std::path::PathBuf::from("/virtual/user.toml"),
+        doc: toml_text.parse().expect("valid toml"),
+    });
+    // Bring `state.effective` in line with the tier so before == "deny".
+    let perm_read = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "read")
+        .unwrap();
+    (perm_read.set)(&mut state.effective, FieldValue::Enum("deny")).unwrap();
+
+    let preview = state.reset_preview(ConfigScope::User);
+    let entry = preview
+        .iter()
+        .find(|e| e.field_label == "read")
+        .expect("preview should flag permissions.read as changing");
+    assert_eq!(entry.before, "deny");
+    assert_eq!(entry.after, "allow");
+}
+
 #[tokio::test]
 async fn reset_section_enter_arms_confirmation_and_n_cancels() {
     use squeezy_core::config_schema::SectionId as SId;

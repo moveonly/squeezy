@@ -58,17 +58,19 @@ fn dismiss_by_id_removes_item() {
 }
 
 #[test]
-fn adjacent_identical_messages_coalesce() {
+fn identical_messages_coalesce_even_when_non_adjacent() {
     let mut q = NotificationQueue::new();
     let first = q.push("✓ saved shell", Severity::Success);
+    q.push("✓ saved read", Severity::Success);
+    q.push("✓ saved web", Severity::Success);
+    // Re-push the first message after two intervening entries — it
+    // should still coalesce with the original, not create a fourth row.
     let again = q.push("✓ saved shell", Severity::Success);
-    assert_eq!(q.len(), 1, "identical adjacent pushes should coalesce");
+    assert_eq!(q.len(), 3, "duplicate push anywhere in the queue coalesces");
     assert_eq!(first, again, "coalesced push returns the original id");
-    // Different severity or message breaks the run.
+    // Same message but different severity still creates a new entry.
     q.push("✓ saved shell", Severity::Warn);
-    assert_eq!(q.len(), 2);
-    q.push("✓ saved read", Severity::Warn);
-    assert_eq!(q.len(), 3);
+    assert_eq!(q.len(), 4);
 }
 
 #[test]
