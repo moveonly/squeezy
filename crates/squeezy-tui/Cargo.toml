@@ -13,7 +13,9 @@ categories.workspace = true
 publish.workspace = true
 
 [dependencies]
+ansi-to-tui.workspace = true
 crossterm.workspace = true
+pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 squeezy-agent.workspace = true
@@ -24,5 +26,17 @@ squeezy-store.workspace = true
 squeezy-telemetry.workspace = true
 squeezy-tools.workspace = true
 squeezy-vcs.workspace = true
+supports-color.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tree-sitter.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-highlight.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true

@@ -33,6 +33,7 @@ categories = ["command-line-utilities", "development-tools"]
 publish = true
 
 [workspace.dependencies]
+ansi-to-tui = "8.0.1"
 async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
@@ -41,6 +42,7 @@ futures-util = "0.3"
 globset = "0.4"
 ignore = "0.4"
 libc = "0.2"
+pulldown-cmark = "0.13.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
 redb = "4.1"
@@ -49,6 +51,7 @@ rmcp = { version = "1.7", default-features = false, features = ["client", "trans
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+supports-color = "3.0.2"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = "0.7"
@@ -62,6 +65,7 @@ tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23.5"
 tree-sitter-cpp = "0.23"
 tree-sitter-go = "0.25"
+tree-sitter-highlight = "0.26.9"
 tree-sitter-java = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"

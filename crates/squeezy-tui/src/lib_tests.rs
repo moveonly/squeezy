@@ -1248,16 +1248,26 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "+new")
         .expect("add span");
-    assert_eq!(add_span.style.fg, Some(DIFF_ADD_FG));
-    assert_eq!(add_span.style.bg, Some(DIFF_ADD_BG));
+    assert_eq!(
+        add_span.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_ADD_FG,)
+        ))
+    );
+    assert_eq!(add_span.style.bg, None);
 
     let del_span = lines
         .iter()
         .flat_map(|line| line.spans.iter())
         .find(|span| span.content.as_ref() == "-old")
         .expect("delete span");
-    assert_eq!(del_span.style.fg, Some(DIFF_DEL_FG));
-    assert_eq!(del_span.style.bg, Some(DIFF_DEL_BG));
+    assert_eq!(
+        del_span.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_DEL_FG,)
+        ))
+    );
+    assert_eq!(del_span.style.bg, None);
 }
 
 #[test]
@@ -1311,7 +1321,7 @@ fn command_and_output_highlighters_style_key_parts() {
     );
 
     let ansi = ansi_spans("\u{1b}[32mok\u{1b}[0m error");
-    assert_eq!(ansi[0].style.fg, Some(SUCCESS_GREEN));
+    assert_eq!(ansi[0].style.fg, Some(Color::Green));
 
     let keyword = keyword_spans("public class Foo { return ok; }");
     assert!(
@@ -1319,6 +1329,121 @@ fn command_and_output_highlighters_style_key_parts() {
             .iter()
             .any(|span| span.content.as_ref() == "class" && span.style.fg == Some(GOLD)),
         "{keyword:?}"
+    );
+}
+
+#[test]
+fn ansi_passthrough_renders_colors() {
+    let line = render::ansi::ansi_to_line("\u{1b}[32mhello\u{1b}[0m world");
+
+    assert_eq!(line.spans[0].content.as_ref(), "hello");
+    assert_eq!(line.spans[0].style.fg, Some(Color::Green));
+}
+
+#[test]
+fn diff_render_colorizes_gutter() {
+    let file = squeezy_vcs::DiffFile {
+        path: "src/lib.rs".to_string(),
+        status: squeezy_vcs::DiffFileStatus::Modified,
+        code: "M".to_string(),
+        additions: 1,
+        deletions: 1,
+        binary: false,
+        hunks: vec![squeezy_vcs::DiffHunk {
+            old_start: 1,
+            old_lines: 2,
+            new_start: 1,
+            new_lines: 2,
+            start_line: 1,
+            end_line: 4,
+        }],
+        patch: Some("@@ -1,2 +1,2 @@\n context\n-old\n+new\n".to_string()),
+        patch_truncated: false,
+    };
+
+    let lines = render::diff::render_diff_file(&file);
+    let add = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "+new")
+        .expect("add span");
+    let del = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "-old")
+        .expect("delete span");
+
+    assert_eq!(
+        add.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_ADD_FG,)
+        ))
+    );
+    assert_eq!(
+        del.style.fg,
+        Some(render::palette::best_color(
+            render::palette::rgb_components(DIFF_DEL_FG,)
+        ))
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.spans[0].content.as_ref() == "2 ")
+    );
+}
+
+#[test]
+fn highlight_rust_code_block() {
+    let lines = render::highlight::highlight_code(Some("rust"), "fn foo() { /* comment */ 42 }");
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+
+    let keyword = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "fn")
+        .expect("keyword span");
+    let comment = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "/* comment */")
+        .expect("comment span");
+    let number = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "42")
+        .expect("number span");
+
+    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
+    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
+    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+}
+
+#[test]
+fn markdown_renders_heading_and_code() {
+    let lines = render::markdown::render_markdown("# Heading\n\n```rust\nfn foo() {}\n```");
+    let heading = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "Heading")
+        .expect("heading span");
+    let code_keyword = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "fn")
+        .expect("code keyword span");
+
+    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        code_keyword.style.fg,
+        Some(render::highlight::KEYWORD_COLOR)
+    );
+}
+
+#[test]
+fn palette_returns_ansi16_when_unsupported() {
+    assert_eq!(
+        render::palette::best_color_for_level((255, 0, 0), render::palette::ColorLevel::Ansi16),
+        Color::Red
     );
 }
 
