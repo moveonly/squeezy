@@ -8,11 +8,16 @@ Squeezy parses repositories and builds a persistent local semantic graph. The ag
 
 ## Install
 
-On macOS, install with Homebrew:
+One-line installer (macOS and Linux):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh
+```
+
+On macOS, Homebrew is also supported:
 
 ```sh
 brew install esqueezy/tap/squeezy
-squeezy --health
 ```
 
 Rust users can install with Cargo:

@@ -188,6 +188,46 @@ jobs:
           "$binary" --version
           "$binary" --help >/dev/null
 
+      - name: Smoke-test install.sh
+        shell: bash
+        run: |
+          sh -n install.sh
+
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            triple="x86_64-unknown-linux-musl"
+          else
+            triple="$(uname -m | grep -q arm64 && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
+          fi
+
+          mirror="$(mktemp -d)"
+          tag="v0.0.0-ci"
+          mkdir -p "$mirror/$tag" "$mirror/stage"
+          cp "${{ matrix.binary-path }}" "$mirror/stage/squeezy"
+          chmod +x "$mirror/stage/squeezy"
+          tar -C "$mirror/stage" -czf "$mirror/$tag/squeezy-${triple}.tar.gz" squeezy
+          shasum -a 256 "$mirror/$tag/squeezy-${triple}.tar.gz" \
+            > "$mirror/$tag/squeezy-${triple}.tar.gz.sha256"
+
+          target="$(mktemp -d)/bin"
+          SQUEEZY_INSTALL_DIR="$target" \
+            SQUEEZY_INSTALL_TAG="$tag" \
+            SQUEEZY_INSTALL_BASE_URL="file://$mirror" \
+            sh install.sh
+
+          test -x "$target/squeezy"
+          "$target/squeezy" --version
+
+          # Negative path: corrupt the checksum and confirm install fails.
+          echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  squeezy-${triple}.tar.gz" \
+            > "$mirror/$tag/squeezy-${triple}.tar.gz.sha256"
+          if SQUEEZY_INSTALL_DIR="$target" \
+               SQUEEZY_INSTALL_TAG="$tag" \
+               SQUEEZY_INSTALL_BASE_URL="file://$mirror" \
+               sh install.sh 2>/dev/null; then
+            echo "install.sh accepted a corrupt checksum" >&2
+            exit 1
+          fi
+
       - name: Package debug artifact
         shell: bash
         run: |
