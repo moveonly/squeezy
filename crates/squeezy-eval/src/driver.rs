@@ -170,7 +170,15 @@ pub async fn run_scenario(
     let mut ticket_count = 0u64;
     let triage_enabled = options.run_triage && scenario.triage.enabled;
     let llm_tickets = if triage_enabled {
-        match crate::triage::triage(&scenario, &config, &capture.path(), &frames.path()).await {
+        match crate::triage::triage(
+            &scenario,
+            &config,
+            &capture.path(),
+            &frames.path(),
+            &auto_findings,
+        )
+        .await
+        {
             Ok(drafts) => drafts,
             Err(err) => {
                 tracing::warn!(error = %err, "triage failed; continuing without tickets");

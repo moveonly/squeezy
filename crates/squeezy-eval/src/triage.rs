@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::Scenario;
 use crate::driver::EvalError;
+use crate::findings::Finding;
 use crate::tickets::TicketDraft;
 
 /// Cap on bytes from each artifact so we do not blow the model context.
@@ -24,6 +25,7 @@ pub async fn triage(
     config: &AppConfig,
     trace_path: &Path,
     frames_path: &Path,
+    auto_findings: &[Finding],
 ) -> Result<Vec<TicketDraft>, EvalError> {
     let trace_excerpt = tail_text(trace_path, ARTIFACT_BUDGET_BYTES)?;
     let frames_excerpt = tail_text(frames_path, ARTIFACT_BUDGET_BYTES)?;
@@ -37,6 +39,7 @@ pub async fn triage(
     let instructions = build_instructions(
         scenario.triage.focus.as_deref(),
         scenario.triage.extra_prompt.as_deref(),
+        auto_findings,
     );
     let user = format!(
         "Scenario id: {id}\nScenario title: {title}\n\n--- trace.jsonl tail ---\n{trace}\n\n--- frames.jsonl tail ---\n{frames}\n",
@@ -68,7 +71,11 @@ pub async fn triage(
     Ok(response.tickets)
 }
 
-fn build_instructions(focus: Option<&str>, extra: Option<&str>) -> String {
+fn build_instructions(
+    focus: Option<&str>,
+    extra: Option<&str>,
+    auto_findings: &[Finding],
+) -> String {
     let mut text = String::from(
         "You are a senior software-quality reviewer. You will receive the tail of a Squeezy QA \
          run: a JSONL event trace and per-turn assistant frames. Identify concrete bugs, perf \
@@ -84,6 +91,15 @@ fn build_instructions(focus: Option<&str>, extra: Option<&str>) -> String {
         text.push_str("\n\nFocus area: ");
         text.push_str(focus);
         text.push_str(". Drop findings unrelated to this surface area.");
+    }
+    if !auto_findings.is_empty() {
+        text.push_str(
+            "\n\nThe harness already flagged the following auto-findings — DO NOT re-report them \
+             or any restatement thereof. Only surface issues that are NOT already covered here:\n",
+        );
+        for f in auto_findings {
+            text.push_str(&format!("- [{}] {}\n", f.rule_id, f.summary));
+        }
     }
     if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
         text.push_str("\n\n");
