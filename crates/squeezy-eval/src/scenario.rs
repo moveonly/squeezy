@@ -223,6 +223,11 @@ pub struct Expect {
     /// Threshold for the `high_tool_burst` auto-finding. Defaults to 10.
     #[serde(default)]
     pub max_tools_per_turn: Option<u64>,
+    /// Threshold for the `expect_input_tokens_per_turn` auto-finding —
+    /// the per-turn equivalent of `max_input_tokens`. When omitted, the
+    /// rule does not fire.
+    #[serde(default)]
+    pub max_input_tokens_per_turn: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

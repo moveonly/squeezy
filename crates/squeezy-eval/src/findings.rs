@@ -437,6 +437,31 @@ impl Rule for ExpectationsAsFindings {
                 evidence: vec![],
             });
         }
+        if let Some(per_turn_cap) = scenario.expect.max_input_tokens_per_turn {
+            for event in &ctx.events {
+                let crate::capture::EvalEventKind::TurnCompleted { cost, .. } = &event.kind else {
+                    continue;
+                };
+                let Some(input) = cost.get("input_tokens").and_then(|v| v.as_u64()) else {
+                    continue;
+                };
+                if input > per_turn_cap {
+                    let turn = event.turn_id.clone().unwrap_or_default();
+                    out.push(Finding {
+                        rule_id: "expect_input_tokens_per_turn".into(),
+                        severity: Severity::Minor,
+                        category: "perf".into(),
+                        summary: format!(
+                            "Turn {turn}: input tokens {input} exceeded per-turn max {per_turn_cap}"
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(event.sequence),
+                            frame: None,
+                        }],
+                    });
+                }
+            }
+        }
         for required in &scenario.expect.final_text_contains {
             if !ctx.last_assistant_text.contains(required) {
                 out.push(Finding {
@@ -461,6 +486,497 @@ impl Rule for ExpectationsAsFindings {
     }
 }
 
+/// Detects when multiple graph-family tools fire in the same turn against
+/// overlapping query strings — the "duplicate ask, different tool name"
+/// pattern. `DuplicateToolCall` only catches byte-exact arg duplicates;
+/// this one catches semantic overlap that `args_sha256` would miss
+/// (e.g. `decl_search query=X` followed by `symbol_context query=X`).
+pub struct RedundantGraphLookup;
+impl Rule for RedundantGraphLookup {
+    fn rule_id(&self) -> &'static str {
+        "redundant_graph_lookup"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const GRAPH_TOOLS: &[&str] = &[
+            "definition_search",
+            "symbol_context",
+            "decl_search",
+            "downstream_flow",
+            "upstream_flow",
+        ];
+        let mut out = Vec::new();
+        for (turn, calls) in &ctx.tool_calls_by_turn {
+            // Group graph-family calls by extracted query string.
+            let mut by_query: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
+            for event in &ctx.events {
+                if event.turn_id.as_deref() != Some(turn) {
+                    continue;
+                }
+                let crate::capture::EvalEventKind::ToolCallStarted { call } = &event.kind else {
+                    continue;
+                };
+                let name = call
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !GRAPH_TOOLS.contains(&name) {
+                    continue;
+                }
+                let query = call
+                    .get("arguments")
+                    .and_then(|v| v.get("query"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if query.is_empty() {
+                    continue;
+                }
+                by_query
+                    .entry(query)
+                    .or_default()
+                    .push((name.to_string(), event.sequence));
+            }
+            for (query, hits) in by_query {
+                let mut distinct_tools: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
+                distinct_tools.sort();
+                distinct_tools.dedup();
+                if distinct_tools.len() >= 2 {
+                    out.push(Finding {
+                        rule_id: "redundant_graph_lookup".into(),
+                        severity: Severity::Minor,
+                        category: "perf".into(),
+                        summary: format!(
+                            "Turn {turn}: graph query {query:?} resolved via {} different tools \
+                             ({}) — likely redundant.",
+                            distinct_tools.len(),
+                            distinct_tools.join(", ")
+                        ),
+                        evidence: hits
+                            .into_iter()
+                            .map(|(_, seq)| EvidencePointer {
+                                trace_event: Some(seq),
+                                frame: None,
+                            })
+                            .collect(),
+                    });
+                }
+            }
+            // Silence unused-variable for explicit shadowing in some compilers.
+            let _ = calls;
+        }
+        out
+    }
+}
+
+/// Detects the "deep chain trace" pattern: a single turn fires ≥ 4
+/// `read_slice` or `grep` calls — the planner is following symbol edges
+/// hop-by-hop without a depth cap.
+pub struct DeepChainExpansion;
+impl Rule for DeepChainExpansion {
+    fn rule_id(&self) -> &'static str {
+        "deep_chain_expansion"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const CHAIN_TOOLS: &[&str] = &["read_slice", "grep"];
+        let mut out = Vec::new();
+        for (turn, calls) in &ctx.tool_calls_by_turn {
+            let mut hits: Vec<(String, u64)> = Vec::new();
+            for (name, _sha, seq) in calls {
+                if CHAIN_TOOLS.contains(&name.as_str()) {
+                    hits.push((name.clone(), *seq));
+                }
+            }
+            if hits.len() >= 4 {
+                out.push(Finding {
+                    rule_id: "deep_chain_expansion".into(),
+                    severity: Severity::Minor,
+                    category: "perf".into(),
+                    summary: format!(
+                        "Turn {turn}: planner fired {} chain-trace calls ({}). \
+                         Likely missing a depth cap on `from A to B` reasoning.",
+                        hits.len(),
+                        hits.iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    evidence: hits
+                        .into_iter()
+                        .take(8)
+                        .map(|(_, seq)| EvidencePointer {
+                            trace_event: Some(seq),
+                            frame: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Detects a heavy repo-wide tool (`repo_map`, `downstream_flow`, or
+/// `upstream_flow`) firing alongside a targeted `read_slice` in the same
+/// turn. The two together usually mean the planner asked the whole-repo
+/// question and the local question — only one is needed.
+pub struct HeavyAndTargetedRedundant;
+impl Rule for HeavyAndTargetedRedundant {
+    fn rule_id(&self) -> &'static str {
+        "heavy_and_targeted_redundant"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const HEAVY: &[&str] = &["repo_map", "downstream_flow", "upstream_flow"];
+        const TARGETED: &[&str] = &["read_slice"];
+        let mut out = Vec::new();
+        for (turn, calls) in &ctx.tool_calls_by_turn {
+            let heavy: Vec<&(String, String, u64)> = calls
+                .iter()
+                .filter(|(n, _, _)| HEAVY.contains(&n.as_str()))
+                .collect();
+            let targeted: Vec<&(String, String, u64)> = calls
+                .iter()
+                .filter(|(n, _, _)| TARGETED.contains(&n.as_str()))
+                .collect();
+            if !heavy.is_empty() && !targeted.is_empty() {
+                out.push(Finding {
+                    rule_id: "heavy_and_targeted_redundant".into(),
+                    severity: Severity::Minor,
+                    category: "perf".into(),
+                    summary: format!(
+                        "Turn {turn}: heavy repo-wide tool ({}) ran alongside targeted \
+                         read_slice ({} call(s)) — the planner likely asked the \
+                         whole-repo question when a single slice would have answered it.",
+                        heavy
+                            .iter()
+                            .map(|(n, _, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        targeted.len(),
+                    ),
+                    evidence: heavy
+                        .iter()
+                        .chain(targeted.iter())
+                        .take(8)
+                        .map(|(_, _, seq)| EvidencePointer {
+                            trace_event: Some(*seq),
+                            frame: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Detects "trivial answer over-fetch": a turn where the assistant
+/// emitted ≤ 20 output tokens but the planner fired ≥ 2 tool calls.
+/// Signals that the planner did not detect a one-word / one-sentence
+/// answer was possible and over-fetched evidence.
+pub struct TrivialAnswerOverFetch;
+impl Rule for TrivialAnswerOverFetch {
+    fn rule_id(&self) -> &'static str {
+        "trivial_answer_over_fetch"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            let crate::capture::EvalEventKind::TurnCompleted { cost, .. } = &event.kind else {
+                continue;
+            };
+            let Some(turn) = event.turn_id.as_deref() else {
+                continue;
+            };
+            let output_tokens = cost
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if output_tokens > 20 {
+                continue;
+            }
+            let tool_count = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if tool_count >= 2 {
+                out.push(Finding {
+                    rule_id: "trivial_answer_over_fetch".into(),
+                    severity: Severity::Minor,
+                    category: "perf".into(),
+                    summary: format!(
+                        "Turn {turn}: planner fired {tool_count} tool calls for an answer of \
+                         {output_tokens} output tokens. One direct definition_search would \
+                         likely suffice."
+                    ),
+                    evidence: ctx
+                        .tool_calls_by_turn
+                        .get(turn)
+                        .map(|v| {
+                            v.iter()
+                                .map(|(_, _, seq)| EvidencePointer {
+                                    trace_event: Some(*seq),
+                                    frame: None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Detects "ungrounded citation": a turn that fires zero tool calls but
+/// whose assistant_text contains a file-path-shaped substring (looks
+/// like `something/something.ext` or `path:line`). The agent answered
+/// with a specific citation without proving it via retrieval — a trust
+/// hazard even when the path happens to be right.
+pub struct UngroundedCitation;
+impl Rule for UngroundedCitation {
+    fn rule_id(&self) -> &'static str {
+        "ungrounded_citation"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        use std::collections::BTreeMap;
+        // Group assistant_delta by turn.
+        let mut text_per_turn: BTreeMap<String, String> = BTreeMap::new();
+        let mut completed_turns: BTreeMap<String, u64> = BTreeMap::new();
+        for event in &ctx.events {
+            match &event.kind {
+                crate::capture::EvalEventKind::AssistantDelta { delta } => {
+                    if let Some(turn) = &event.turn_id {
+                        text_per_turn
+                            .entry(turn.clone())
+                            .or_default()
+                            .push_str(delta);
+                    }
+                }
+                crate::capture::EvalEventKind::TurnCompleted { .. } => {
+                    if let Some(turn) = &event.turn_id {
+                        completed_turns.insert(turn.clone(), event.sequence);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for (turn, seq) in completed_turns {
+            let tool_count = ctx
+                .tool_calls_by_turn
+                .get(&turn)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if tool_count != 0 {
+                continue;
+            }
+            let text = text_per_turn.get(&turn).cloned().unwrap_or_default();
+            if looks_like_path_citation(&text) {
+                out.push(Finding {
+                    rule_id: "ungrounded_citation".into(),
+                    severity: Severity::Major,
+                    category: "correctness".into(),
+                    summary: format!(
+                        "Turn {turn}: fired 0 tool calls but emitted a file-path citation. \
+                         The agent did not retrieve evidence before answering."
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Heuristic — does the text contain a substring that looks like a
+/// `path/with/slashes.ext` file citation or `path:line` line citation?
+fn looks_like_path_citation(text: &str) -> bool {
+    // Quick filter: any `/` followed by something with a `.` (extension)
+    // or any `:line` style.
+    for token in
+        text.split(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';'))
+    {
+        let token = token.trim_matches('.');
+        if token.contains('/')
+            && let Some(dot) = token.rfind('.')
+            && dot > token.rfind('/').unwrap_or(0)
+            && token.len() - dot >= 2
+            && token.len() - dot <= 6
+            && token[dot + 1..].chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Detects "incomplete confidence labeling": the scenario prompt asked
+/// the model to cite each piece of evidence with a confidence label
+/// (`exact_syntax` / `import_resolved` / `candidate_set` / `external` /
+/// `unknown` / `label_missing`), but the assistant answer contains
+/// claims that look like evidence (bulleted items or numbered lists)
+/// without any label tag. Catches the partial-compliance pattern that
+/// shipped in PR #98's "fix" but still misses some claims.
+pub struct IncompleteConfidenceLabels;
+impl Rule for IncompleteConfidenceLabels {
+    fn rule_id(&self) -> &'static str {
+        "incomplete_confidence_labels"
+    }
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
+        // Only fire if at least one prompt mentioned confidence labels.
+        let prompts_mention = scenario
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                crate::scenario::Step::Prompt { text, .. } => Some(text),
+                _ => None,
+            })
+            .any(|t| t.contains("confidence label") || t.contains("exact_syntax"));
+        if !prompts_mention {
+            return vec![];
+        }
+
+        let label_tags = [
+            "exact_syntax",
+            "import_resolved",
+            "candidate_set",
+            "external",
+            "unknown",
+            "label_missing",
+        ];
+
+        let mut text_per_turn: std::collections::BTreeMap<String, String> = Default::default();
+        let mut completed_turns: std::collections::BTreeMap<String, u64> = Default::default();
+        for event in &ctx.events {
+            match &event.kind {
+                crate::capture::EvalEventKind::AssistantDelta { delta } => {
+                    if let Some(turn) = &event.turn_id {
+                        text_per_turn
+                            .entry(turn.clone())
+                            .or_default()
+                            .push_str(delta);
+                    }
+                }
+                crate::capture::EvalEventKind::TurnCompleted { .. } => {
+                    if let Some(turn) = &event.turn_id {
+                        completed_turns.insert(turn.clone(), event.sequence);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for (turn, seq) in completed_turns {
+            let text = text_per_turn.get(&turn).cloned().unwrap_or_default();
+            // Count claim-shaped lines: bulleted (- ...), numbered (1. ...),
+            // or backtick-quoted citations on their own line.
+            let claim_lines = text
+                .lines()
+                .filter(|l| {
+                    let l = l.trim_start();
+                    l.starts_with("- ")
+                        || l.starts_with("* ")
+                        || (l.len() >= 3
+                            && l.starts_with(|c: char| c.is_ascii_digit())
+                            && l.contains(". "))
+                })
+                .count();
+            if claim_lines < 2 {
+                continue;
+            }
+            let label_hits: usize = label_tags.iter().map(|tag| text.matches(tag).count()).sum();
+            // Allow a small slack — only flag when the gap is meaningful.
+            if claim_lines >= 2 && label_hits + 1 < claim_lines {
+                out.push(Finding {
+                    rule_id: "incomplete_confidence_labels".into(),
+                    severity: Severity::Major,
+                    category: "correctness".into(),
+                    summary: format!(
+                        "Turn {turn}: prompt asked for confidence labels on every claim, but \
+                         only {label_hits} label tag(s) found for {claim_lines} claim-shaped \
+                         lines. Partial compliance is a provenance hazard."
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Detects "exact_syntax without source evidence": the assistant tagged
+/// a claim `[exact_syntax]` (the strongest confidence label) but the
+/// turn never fired `read_slice` — the only tool that returns
+/// literal source bytes. Without reading the source, the best the
+/// model can honestly claim is `import_resolved` or `candidate_set`.
+pub struct ExactSyntaxWithoutSource;
+impl Rule for ExactSyntaxWithoutSource {
+    fn rule_id(&self) -> &'static str {
+        "exact_syntax_without_source"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut text_per_turn: std::collections::BTreeMap<String, String> = Default::default();
+        let mut completed_turns: std::collections::BTreeMap<String, u64> = Default::default();
+        for event in &ctx.events {
+            match &event.kind {
+                crate::capture::EvalEventKind::AssistantDelta { delta } => {
+                    if let Some(turn) = &event.turn_id {
+                        text_per_turn
+                            .entry(turn.clone())
+                            .or_default()
+                            .push_str(delta);
+                    }
+                }
+                crate::capture::EvalEventKind::TurnCompleted { .. } => {
+                    if let Some(turn) = &event.turn_id {
+                        completed_turns.insert(turn.clone(), event.sequence);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for (turn, seq) in completed_turns {
+            let text = text_per_turn.get(&turn).cloned().unwrap_or_default();
+            if !text.contains("exact_syntax") {
+                continue;
+            }
+            let fired_read_slice = ctx
+                .tool_calls_by_turn
+                .get(&turn)
+                .map(|v| v.iter().any(|(n, _, _)| n == "read_slice"))
+                .unwrap_or(false);
+            if fired_read_slice {
+                continue;
+            }
+            out.push(Finding {
+                rule_id: "exact_syntax_without_source".into(),
+                severity: Severity::Major,
+                category: "correctness".into(),
+                summary: format!(
+                    "Turn {turn}: assistant tagged a claim `[exact_syntax]` but the turn never \
+                     called `read_slice`. The strongest label honestly available without source \
+                     bytes is `import_resolved` or `candidate_set`."
+                ),
+                evidence: vec![EvidencePointer {
+                    trace_event: Some(seq),
+                    frame: None,
+                }],
+            });
+        }
+        out
+    }
+}
+
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(DuplicateToolCall),
@@ -469,6 +985,13 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(HighToolBurst),
         Box::new(UnsupportedSlashCommand),
         Box::new(ApprovalUnanswered),
+        Box::new(RedundantGraphLookup),
+        Box::new(DeepChainExpansion),
+        Box::new(HeavyAndTargetedRedundant),
+        Box::new(TrivialAnswerOverFetch),
+        Box::new(UngroundedCitation),
+        Box::new(IncompleteConfidenceLabels),
+        Box::new(ExactSyntaxWithoutSource),
         Box::new(ExpectationsAsFindings),
     ]
 }
