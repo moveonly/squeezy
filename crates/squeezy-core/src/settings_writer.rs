@@ -13,7 +13,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value, value};
 
 use crate::config_schema::SettingsPath;
 
@@ -72,6 +72,43 @@ pub enum EditOp {
     /// Removes the leaf. Preceding comments stay; the parent table is kept
     /// even if it becomes empty so user-written section headers survive.
     Unset,
+    /// Set a filesystem path leaf (serialized as a TOML string).
+    SetPath(PathBuf),
+    /// Upsert a keyed table entry — `[<table_path>.<key>]` — and apply
+    /// per-child edits inside it. Used for `[mcp.servers.<name>]`. If the
+    /// entry exists as an inline `{ ... }` value it is promoted to a full
+    /// table so nested edits don't lose sibling keys.
+    SetTableEntry {
+        table_path: SettingsPath,
+        key: String,
+        /// Per-child (key, op). Op `Unset` removes the child leaf.
+        fields: Vec<(&'static str, EditOp)>,
+    },
+    /// Remove `[<table_path>.<key>]` entirely. Parent table is kept so
+    /// surrounding section headers and comments survive.
+    RemoveTableEntry {
+        table_path: SettingsPath,
+        key: String,
+    },
+    /// Append one row to `[[<path>]]`. Each `(child_key, op)` populates the
+    /// new row. Creates the array of tables if missing.
+    AppendArrayOfTables {
+        path: SettingsPath,
+        fields: Vec<(&'static str, EditOp)>,
+    },
+    /// Remove the row from `[[<path>]]` whose `columns` slice equals
+    /// `values` (string equality on each named column). No-op if no row
+    /// matches.
+    RemoveArrayOfTablesByMatch {
+        path: SettingsPath,
+        predicate: ArrayOfTablesMatch,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ArrayOfTablesMatch {
+    pub columns: &'static [&'static str],
+    pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +136,9 @@ pub fn apply_edits(
     let mut applied = 0usize;
     let mut skipped = 0usize;
     for edit in edits {
-        if edit.path.is_empty() {
+        // Scalar ops use the outer `path`; structural ops (table entries,
+        // arrays of tables) encode their own path inside the op variant.
+        if edit.path.is_empty() && requires_outer_path(&edit.op) {
             return Err(WriterError::EmptyPath);
         }
         let changed = apply_one(&mut doc, edit);
@@ -117,6 +156,16 @@ pub fn apply_edits(
     })
 }
 
+fn requires_outer_path(op: &EditOp) -> bool {
+    !matches!(
+        op,
+        EditOp::SetTableEntry { .. }
+            | EditOp::RemoveTableEntry { .. }
+            | EditOp::AppendArrayOfTables { .. }
+            | EditOp::RemoveArrayOfTablesByMatch { .. }
+    )
+}
+
 fn load_document(path: &Path) -> Result<DocumentMut, WriterError> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(text.parse::<DocumentMut>()?),
@@ -126,13 +175,36 @@ fn load_document(path: &Path) -> Result<DocumentMut, WriterError> {
 }
 
 fn apply_one(doc: &mut DocumentMut, edit: &SettingsEdit) -> bool {
-    let (leaf, parents) = edit.path.split_last().expect("path empty check above");
-    let parent = descend_or_create_table(doc.as_table_mut(), parents);
     match &edit.op {
+        EditOp::SetTableEntry {
+            table_path,
+            key,
+            fields,
+        } => apply_set_table_entry(doc, table_path, key, fields),
+        EditOp::RemoveTableEntry { table_path, key } => {
+            apply_remove_table_entry(doc, table_path, key)
+        }
+        EditOp::AppendArrayOfTables { path, fields } => {
+            apply_append_array_of_tables(doc, path, fields)
+        }
+        EditOp::RemoveArrayOfTablesByMatch { path, predicate } => {
+            apply_remove_array_of_tables_by_match(doc, path, predicate)
+        }
+        _ => {
+            let (leaf, parents) = edit.path.split_last().expect("path empty check above");
+            apply_scalar(doc.as_table_mut(), parents, leaf, &edit.op)
+        }
+    }
+}
+
+fn apply_scalar(root: &mut Table, parents: &[&str], leaf: &str, op: &EditOp) -> bool {
+    let parent = descend_or_create_table(root, parents);
+    match op {
         EditOp::SetString(s) => set_leaf(parent, leaf, value(s.as_str())),
         EditOp::SetInteger(v) => set_leaf(parent, leaf, value(*v)),
         EditOp::SetFloat(v) => set_leaf(parent, leaf, value(*v)),
         EditOp::SetBool(v) => set_leaf(parent, leaf, value(*v)),
+        EditOp::SetPath(p) => set_leaf(parent, leaf, value(p.display().to_string().as_str())),
         EditOp::SetArrayOfStrings(items) => {
             let mut arr = Array::new();
             for item in items {
@@ -148,7 +220,129 @@ fn apply_one(doc: &mut DocumentMut, edit: &SettingsEdit) -> bool {
                 false
             }
         }
+        EditOp::SetTableEntry { .. }
+        | EditOp::RemoveTableEntry { .. }
+        | EditOp::AppendArrayOfTables { .. }
+        | EditOp::RemoveArrayOfTablesByMatch { .. } => unreachable!("dispatched in apply_one"),
     }
+}
+
+fn apply_set_table_entry(
+    doc: &mut DocumentMut,
+    table_path: SettingsPath,
+    key: &str,
+    fields: &[(&'static str, EditOp)],
+) -> bool {
+    let parent = descend_or_create_table(doc.as_table_mut(), table_path);
+    // Get-or-create the entry as a full table (promote from inline if needed).
+    if !parent.contains_key(key) {
+        parent.insert(key, Item::Table(Table::new()));
+    } else if let Some(Item::Value(Value::InlineTable(inline))) = parent.get(key) {
+        let mut promoted = Table::new();
+        for (k, v) in inline.iter() {
+            promoted.insert(k, Item::Value(v.clone()));
+        }
+        parent.insert(key, Item::Table(promoted));
+    }
+    let entry_table = parent
+        .get_mut(key)
+        .and_then(|item| match item {
+            Item::Table(t) => Some(t),
+            _ => None,
+        })
+        .expect("entry was just inserted/promoted as a table");
+
+    let mut changed_any = false;
+    for (child_key, child_op) in fields {
+        let changed = apply_scalar(entry_table, &[], child_key, child_op);
+        if changed {
+            changed_any = true;
+        }
+    }
+    changed_any
+}
+
+fn apply_remove_table_entry(doc: &mut DocumentMut, table_path: SettingsPath, key: &str) -> bool {
+    let parent = descend_or_create_table(doc.as_table_mut(), table_path);
+    if parent.contains_key(key) {
+        parent.remove(key);
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_append_array_of_tables(
+    doc: &mut DocumentMut,
+    path: SettingsPath,
+    fields: &[(&'static str, EditOp)],
+) -> bool {
+    let (leaf, parents) = path
+        .split_last()
+        .expect("AppendArrayOfTables requires a non-empty path");
+    let parent = descend_or_create_table(doc.as_table_mut(), parents);
+    if !parent.contains_key(leaf) {
+        parent.insert(leaf, Item::ArrayOfTables(ArrayOfTables::new()));
+    } else if !matches!(parent.get(leaf), Some(Item::ArrayOfTables(_))) {
+        // Existing key but not an array of tables — overwrite. Loses prior
+        // decor but this is a misuse case.
+        parent.insert(leaf, Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let aot = match parent.get_mut(leaf) {
+        Some(Item::ArrayOfTables(aot)) => aot,
+        _ => unreachable!("just inserted/promoted as array of tables"),
+    };
+    let mut new_row = Table::new();
+    for (child_key, child_op) in fields {
+        apply_scalar(&mut new_row, &[], child_key, child_op);
+    }
+    aot.push(new_row);
+    true
+}
+
+fn apply_remove_array_of_tables_by_match(
+    doc: &mut DocumentMut,
+    path: SettingsPath,
+    predicate: &ArrayOfTablesMatch,
+) -> bool {
+    let (leaf, parents) = path
+        .split_last()
+        .expect("RemoveArrayOfTablesByMatch requires a non-empty path");
+    let parent = descend_or_create_table(doc.as_table_mut(), parents);
+    let Some(Item::ArrayOfTables(aot)) = parent.get_mut(leaf) else {
+        return false;
+    };
+    let mut idx_to_remove: Option<usize> = None;
+    for (i, row) in aot.iter().enumerate() {
+        if row_matches(row, predicate) {
+            idx_to_remove = Some(i);
+            break;
+        }
+    }
+    match idx_to_remove {
+        Some(i) => {
+            aot.remove(i);
+            true
+        }
+        None => false,
+    }
+}
+
+fn row_matches(row: &Table, predicate: &ArrayOfTablesMatch) -> bool {
+    if predicate.columns.len() != predicate.values.len() {
+        return false;
+    }
+    for (col, expected) in predicate.columns.iter().zip(&predicate.values) {
+        let actual = row
+            .get(col)
+            .and_then(|item| item.as_value())
+            .and_then(Value::as_str);
+        match actual {
+            Some(s) if s == expected.as_str() => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn set_leaf(table: &mut Table, key: &str, new_item: Item) -> bool {
