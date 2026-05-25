@@ -211,7 +211,10 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash("/attachments", "list attached context"),
     slash("/copy", "copy last answer or transcript"),
-    slash_locked("/compact", "compact conversation context now"),
+    slash_locked(
+        "/compact",
+        "compact conversation context now (use '/compact undo' to restore)",
+    ),
     slash("/collapse", "collapse transcript entries"),
     slash("/expand", "expand transcript entries"),
     slash("/jobs", "list background jobs"),
@@ -1930,6 +1933,28 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/compact" => {
+            let subcommand = parts.next().map(str::trim).unwrap_or("");
+            if subcommand.eq_ignore_ascii_case("undo") {
+                match agent.compact_context_undo().await {
+                    Ok(Some(record)) => {
+                        app.context_compaction = agent.context_compaction_snapshot().await;
+                        app.context_estimate = agent.context_estimate_snapshot().await;
+                        app.status = format!(
+                            "undid compaction gen={} ({} item(s) restored)",
+                            record.generation, record.dropped_items,
+                        );
+                        app.push_log(format!(
+                            "context compaction undone gen={} items={}",
+                            record.generation, record.dropped_items,
+                        ));
+                    }
+                    Ok(None) => {
+                        app.status = "no compaction checkpoint to undo".to_string();
+                    }
+                    Err(error) => app.status = format!("compact undo failed: {error}"),
+                }
+                return true;
+            }
             match agent.compact_context_manual().await {
                 Ok(report) => {
                     app.context_compaction = agent.context_compaction_snapshot().await;

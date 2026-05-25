@@ -4725,6 +4725,8 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "notes_recall",
+            "notes_remember",
             "plan_patch",
             "read_file",
             "read_slice",
@@ -6376,4 +6378,91 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
         "",
         false,
     ));
+}
+
+#[tokio::test]
+async fn notes_remember_then_recall_round_trip() {
+    let root = temp_workspace("notes_round_trip");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store.clone());
+
+    let remember_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "decision",
+                    "text": "Prefer rg over grep for workspace search.",
+                    "tags": ["search", "tooling"],
+                    "source": "test-suite"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(remember_result.status, ToolStatus::Success);
+
+    let recall_result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_recall".to_string(),
+                name: "notes_recall".to_string(),
+                arguments: json!({ "query": "search" }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(recall_result.status, ToolStatus::Success);
+    let matches = recall_result.content["matches"]
+        .as_array()
+        .expect("matches array");
+    assert!(
+        matches
+            .iter()
+            .any(|item| item["text"].as_str().unwrap_or("").contains("Prefer rg")),
+        "recall should return the persisted decision: {recall_result:?}",
+    );
+}
+
+#[tokio::test]
+async fn notes_remember_rejects_unknown_kind() {
+    let root = temp_workspace("notes_invalid_kind");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_invalid".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "unsupported_kind",
+                    "text": "this should be rejected"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+}
+
+#[tokio::test]
+async fn notes_tools_fail_when_no_store_handle_available() {
+    let root = temp_workspace("notes_no_store");
+    let registry = registry_with_runtime_config(&root, ToolRuntimeConfig::default());
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_remember".to_string(),
+                name: "notes_remember".to_string(),
+                arguments: json!({
+                    "kind": "note",
+                    "text": "no store available"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
 }

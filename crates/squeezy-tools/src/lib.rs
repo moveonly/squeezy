@@ -47,7 +47,7 @@ pub use squeezy_mcp::{
     McpElicitationResponse, McpRefreshOutcome, McpServerStatus, McpStatusSnapshot,
 };
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
-use squeezy_store::SqueezyStore;
+use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
     CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffHunk, DiffMode, DiffOptions,
     DiffSnapshot, GitVcs, RollbackMode, RollbackTarget, WorkspaceSnapshot,
@@ -1291,6 +1291,8 @@ impl ToolRegistry {
             websearch_spec(),
             list_skills_spec(),
             load_skill_spec(),
+            notes_remember_spec(),
+            notes_recall_spec(),
         ];
         if !self.mcp.has_no_enabled_servers() {
             specs.extend([
@@ -2036,6 +2038,8 @@ impl ToolRegistry {
                 "mcp_read_resource" => self.execute_mcp_read_resource(&call, cancel).await,
                 "list_skills" => self.execute_list_skills(&call).await,
                 "load_skill" => self.execute_load_skill(&call).await,
+                "notes_remember" => self.execute_notes_remember(&call).await,
+                "notes_recall" => self.execute_notes_recall(&call).await,
                 _ => make_result(
                     &call,
                     ToolStatus::Error,
@@ -2627,6 +2631,107 @@ impl ToolRegistry {
             ToolCostHint::default(),
             None,
         )
+    }
+
+    async fn execute_notes_remember(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<NotesRememberArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(store) = self.state_store.as_deref() else {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "notes_remember requires the persistent store; no store handle available" }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let kind = match parse_observation_kind(&args.kind) {
+            Some(kind) => kind,
+            None => {
+                return tool_error(
+                    call,
+                    format!(
+                        "notes_remember: unknown kind {:?}; expected one of preference, decision, convention, dead_end, note",
+                        args.kind
+                    ),
+                );
+            }
+        };
+        let observation = Observation {
+            id: String::new(),
+            kind,
+            text: args.text,
+            tags: args.tags.unwrap_or_default(),
+            source: args.source.unwrap_or_default(),
+            created_unix_millis: 0,
+            updated_unix_millis: 0,
+        };
+        match store.put_observation(observation) {
+            Ok(stored) => make_result(
+                call,
+                ToolStatus::Success,
+                json!({
+                    "id": stored.id,
+                    "kind": format!("{:?}", stored.kind).to_ascii_lowercase(),
+                    "tags": stored.tags,
+                    "created_unix_millis": stored.created_unix_millis,
+                }),
+                ToolCostHint::default(),
+                None,
+            ),
+            Err(err) => tool_error(call, format!("notes_remember failed: {err}")),
+        }
+    }
+
+    async fn execute_notes_recall(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<NotesRecallArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(store) = self.state_store.as_deref() else {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "notes_recall requires the persistent store; no store handle available" }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let limit = args.limit.unwrap_or(5).clamp(1, 20) as usize;
+        let query = args.query.trim();
+        let lookup = if query.is_empty() {
+            store.list_recent_observations(limit)
+        } else {
+            store.search_observations(query, limit)
+        };
+        match lookup {
+            Ok(matches) => {
+                let items: Vec<Value> = matches
+                    .into_iter()
+                    .map(|obs| {
+                        json!({
+                            "id": obs.id,
+                            "kind": format!("{:?}", obs.kind).to_ascii_lowercase(),
+                            "text": obs.text,
+                            "tags": obs.tags,
+                            "source": obs.source,
+                            "created_unix_millis": obs.created_unix_millis,
+                            "updated_unix_millis": obs.updated_unix_millis,
+                        })
+                    })
+                    .collect();
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({ "matches": items }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, format!("notes_recall failed: {err}")),
+        }
     }
 
     async fn execute_graph_tool(&self, call: &ToolCall) -> ToolResult {
@@ -8631,6 +8736,34 @@ struct LoadSkillArgs {
 }
 
 #[derive(Debug, Deserialize)]
+struct NotesRememberArgs {
+    kind: String,
+    text: String,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NotesRecallArgs {
+    query: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "preference" => Some(ObservationKind::Preference),
+        "decision" => Some(ObservationKind::Decision),
+        "convention" => Some(ObservationKind::Convention),
+        "dead_end" | "dead-end" => Some(ObservationKind::DeadEnd),
+        "note" => Some(ObservationKind::Note),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct McpListResourcesArgs {
     server: String,
     cursor: Option<String>,
@@ -13348,6 +13481,42 @@ fn load_skill_spec() -> ToolSpec {
                 "name": {"type": "string", "description": "Exact skill name from list_skills."}
             },
             "required": ["name"]
+        }),
+    }
+}
+
+fn notes_remember_spec() -> ToolSpec {
+    ToolSpec {
+        name: "notes_remember".to_string(),
+        description: "Persist a durable note (decision, convention, dead-end, preference) into local storage for retrieval in this or any future session. Use sparingly: text >= 8 chars, capture only facts you would re-derive next session.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "kind": {"type": "string", "enum": ["preference", "decision", "convention", "dead_end", "note"]},
+                "text": {"type": "string", "minLength": 8, "maxLength": 4096},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional free-form tags for later recall (1-32 chars each)."},
+                "source": {"type": "string", "description": "Short label for where this came from, e.g. 'pr-72'."}
+            },
+            "required": ["kind", "text"]
+        }),
+    }
+}
+
+fn notes_recall_spec() -> ToolSpec {
+    ToolSpec {
+        name: "notes_recall".to_string(),
+        description: "Search persisted notes by free-text query (kind, text, tags, source). Returns up to `limit` recent matches sorted by recency. Use this before re-deriving a decision the previous session already recorded.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "description": "Free-text query. Empty string returns the most recent notes."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}
+            },
+            "required": ["query"]
         }),
     }
 }

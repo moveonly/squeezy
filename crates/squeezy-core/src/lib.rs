@@ -67,6 +67,20 @@ pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 6_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
+pub const DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES: usize = 16_384;
+pub const DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES: usize = 8_192;
+/// Trigger mid-turn compaction once the provider-reported total token usage
+/// reaches this fraction of `model_context_window` (out of 100).
+pub const DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT: u8 = 80;
+/// Max output tokens to request when the model-assisted compaction strategy
+/// is active.
+pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS: u32 = 500;
+/// Timeout for a single model-assisted compaction round-trip. On expiry the
+/// pipeline falls back to the extractive summary.
+pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
+/// When strategy = LayeredFallback, model-assist only kicks in once the
+/// dropped slice exceeds this many tokens; smaller slices stay extractive.
+pub const DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS: u32 = 4_000;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// Tools whose full JSON schema is always sent up-front in every request,
 /// independent of `[tools].lazy_schema_loading`.
@@ -689,8 +703,47 @@ impl AppConfig {
             self.context_compaction.recent_items
         ));
         output.push_str(&format!(
-            "compaction_max_summary_bytes = {}\n\n",
+            "compaction_max_summary_bytes = {}\n",
             self.context_compaction.max_summary_bytes
+        ));
+        output.push_str(&format!(
+            "repo_doc_max_bytes = {}\n",
+            self.context_compaction.repo_doc_max_bytes
+        ));
+        output.push_str(&format!(
+            "user_memory_max_bytes = {}\n",
+            self.context_compaction.user_memory_max_bytes
+        ));
+        output.push_str(&format!(
+            "enabled_mid_turn = {}\n",
+            self.context_compaction.enabled_mid_turn
+        ));
+        if let Some(window) = self.context_compaction.model_context_window {
+            output.push_str(&format!("model_context_window = {}\n", window));
+        }
+        output.push_str(&format!(
+            "threshold_percent = {}\n",
+            self.context_compaction.threshold_percent
+        ));
+        output.push_str(&format!(
+            "strategy = {}\n",
+            toml_string(self.context_compaction.strategy.as_str())
+        ));
+        if let Some(model) = &self.context_compaction.model_assisted_model {
+            output.push_str(&format!("model_assisted_model = {}\n", toml_string(model)));
+        }
+        output.push_str(&format!(
+            "model_assisted_max_output_tokens = {}\n",
+            self.context_compaction.model_assisted_max_output_tokens
+        ));
+        output.push_str(&format!(
+            "model_assisted_timeout_secs = {}\n",
+            self.context_compaction.model_assisted_timeout_secs
+        ));
+        output.push_str(&format!(
+            "layered_fallback_extractive_threshold_tokens = {}\n\n",
+            self.context_compaction
+                .layered_fallback_extractive_threshold_tokens
         ));
 
         output.push_str("[subagents]\n");
@@ -2256,6 +2309,16 @@ pub struct ContextCompactionSettings {
     pub compaction_min_items: Option<usize>,
     pub compaction_recent_items: Option<usize>,
     pub compaction_max_summary_bytes: Option<usize>,
+    pub repo_doc_max_bytes: Option<usize>,
+    pub user_memory_max_bytes: Option<usize>,
+    pub enabled_mid_turn: Option<bool>,
+    pub model_context_window: Option<u64>,
+    pub threshold_percent: Option<u8>,
+    pub strategy: Option<CompactionStrategy>,
+    pub model_assisted_model: Option<String>,
+    pub model_assisted_max_output_tokens: Option<u32>,
+    pub model_assisted_timeout_secs: Option<u64>,
+    pub layered_fallback_extractive_threshold_tokens: Option<u32>,
 }
 
 impl ContextCompactionSettings {
@@ -2268,6 +2331,16 @@ impl ContextCompactionSettings {
                 "compaction_min_items",
                 "compaction_recent_items",
                 "compaction_max_summary_bytes",
+                "repo_doc_max_bytes",
+                "user_memory_max_bytes",
+                "enabled_mid_turn",
+                "model_context_window",
+                "threshold_percent",
+                "strategy",
+                "model_assisted_model",
+                "model_assisted_max_output_tokens",
+                "model_assisted_timeout_secs",
+                "layered_fallback_extractive_threshold_tokens",
             ],
             source,
             path,
@@ -2303,6 +2376,72 @@ impl ContextCompactionSettings {
                 source,
                 &field(path, "compaction_max_summary_bytes"),
             )?,
+            repo_doc_max_bytes: usize_value(
+                table,
+                "repo_doc_max_bytes",
+                source,
+                &field(path, "repo_doc_max_bytes"),
+            )?,
+            user_memory_max_bytes: usize_value(
+                table,
+                "user_memory_max_bytes",
+                source,
+                &field(path, "user_memory_max_bytes"),
+            )?,
+            enabled_mid_turn: bool_value(
+                table,
+                "enabled_mid_turn",
+                source,
+                &field(path, "enabled_mid_turn"),
+            )?,
+            model_context_window: u64_value(
+                table,
+                "model_context_window",
+                source,
+                &field(path, "model_context_window"),
+            )?,
+            threshold_percent: u8_value(
+                table,
+                "threshold_percent",
+                source,
+                &field(path, "threshold_percent"),
+            )?,
+            strategy: {
+                let raw = string_value(table, "strategy", source, &field(path, "strategy"))?;
+                match raw {
+                    None => None,
+                    Some(value) => Some(CompactionStrategy::parse(&value).ok_or_else(|| {
+                        SqueezyError::Config(format!(
+                            "{source}: {}: expected one of extractive | model_assisted | layered_fallback",
+                            field(path, "strategy")
+                        ))
+                    })?),
+                }
+            },
+            model_assisted_model: string_value(
+                table,
+                "model_assisted_model",
+                source,
+                &field(path, "model_assisted_model"),
+            )?,
+            model_assisted_max_output_tokens: u32_value(
+                table,
+                "model_assisted_max_output_tokens",
+                source,
+                &field(path, "model_assisted_max_output_tokens"),
+            )?,
+            model_assisted_timeout_secs: u64_value(
+                table,
+                "model_assisted_timeout_secs",
+                source,
+                &field(path, "model_assisted_timeout_secs"),
+            )?,
+            layered_fallback_extractive_threshold_tokens: u32_value(
+                table,
+                "layered_fallback_extractive_threshold_tokens",
+                source,
+                &field(path, "layered_fallback_extractive_threshold_tokens"),
+            )?,
         })
     }
 
@@ -2320,6 +2459,25 @@ impl ContextCompactionSettings {
         replace_if_some(
             &mut self.compaction_max_summary_bytes,
             next.compaction_max_summary_bytes,
+        );
+        replace_if_some(&mut self.repo_doc_max_bytes, next.repo_doc_max_bytes);
+        replace_if_some(&mut self.user_memory_max_bytes, next.user_memory_max_bytes);
+        replace_if_some(&mut self.enabled_mid_turn, next.enabled_mid_turn);
+        replace_if_some(&mut self.model_context_window, next.model_context_window);
+        replace_if_some(&mut self.threshold_percent, next.threshold_percent);
+        replace_if_some(&mut self.strategy, next.strategy);
+        replace_if_some(&mut self.model_assisted_model, next.model_assisted_model);
+        replace_if_some(
+            &mut self.model_assisted_max_output_tokens,
+            next.model_assisted_max_output_tokens,
+        );
+        replace_if_some(
+            &mut self.model_assisted_timeout_secs,
+            next.model_assisted_timeout_secs,
+        );
+        replace_if_some(
+            &mut self.layered_fallback_extractive_threshold_tokens,
+            next.layered_fallback_extractive_threshold_tokens,
         );
     }
 }
@@ -2498,6 +2656,38 @@ impl Default for SubagentConfig {
     }
 }
 
+/// How the compaction summary is produced. Default is `Extractive`, which
+/// preserves the historical deterministic / no-model-call behavior. The two
+/// other variants opt into model-assisted summarization with strict
+/// extractive fallback on error / timeout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionStrategy {
+    #[default]
+    Extractive,
+    ModelAssisted,
+    LayeredFallback,
+}
+
+impl CompactionStrategy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "extractive" => Some(Self::Extractive),
+            "model_assisted" | "model-assisted" => Some(Self::ModelAssisted),
+            "layered_fallback" | "layered-fallback" => Some(Self::LayeredFallback),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Extractive => "extractive",
+            Self::ModelAssisted => "model_assisted",
+            Self::LayeredFallback => "layered_fallback",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextCompactionConfig {
     pub enabled: bool,
@@ -2505,6 +2695,35 @@ pub struct ContextCompactionConfig {
     pub min_items: usize,
     pub recent_items: usize,
     pub max_summary_bytes: usize,
+    /// Maximum bytes of concatenated AGENTS.md content stitched into the
+    /// base instructions at session start. 0 disables ingestion.
+    pub repo_doc_max_bytes: usize,
+    /// Maximum bytes of `~/.squeezy/memory.md` stitched into the base
+    /// instructions at session start. 0 disables ingestion.
+    pub user_memory_max_bytes: usize,
+    /// When true, the turn loop re-checks token usage between LLM events and
+    /// triggers compaction once usage crosses `threshold_percent` of
+    /// `model_context_window`. Defaults to true; the trigger only fires
+    /// when `model_context_window` is also set.
+    pub enabled_mid_turn: bool,
+    /// Configured token budget for the active model. When `None`, mid-turn
+    /// compaction stays dormant and the post-turn auto trigger is the only
+    /// path. Squeezy does not auto-detect this per-provider yet.
+    pub model_context_window: Option<u64>,
+    /// Fraction of `model_context_window` (0..=100) at which mid-turn
+    /// compaction fires. Capped to 100 on read.
+    pub threshold_percent: u8,
+    /// Summary generation strategy. Default `Extractive` preserves current
+    /// behavior; other variants opt-in to model-assisted summarization with
+    /// extractive fallback.
+    pub strategy: CompactionStrategy,
+    /// Cheap model id used for model-assisted compaction. Required when
+    /// `strategy != Extractive`; the path falls back to extractive if unset
+    /// or if the provider rejects the model.
+    pub model_assisted_model: Option<String>,
+    pub model_assisted_max_output_tokens: u32,
+    pub model_assisted_timeout_secs: u64,
+    pub layered_fallback_extractive_threshold_tokens: u32,
 }
 
 impl ContextCompactionConfig {
@@ -2541,8 +2760,67 @@ impl ContextCompactionConfig {
                     .compaction_max_summary_bytes
                     .unwrap_or(DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES),
             ),
+            repo_doc_max_bytes: parse_usize(
+                get_var("SQUEEZY_CONTEXT_REPO_DOC_MAX_BYTES"),
+                settings
+                    .repo_doc_max_bytes
+                    .unwrap_or(DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES),
+            ),
+            user_memory_max_bytes: parse_usize(
+                get_var("SQUEEZY_CONTEXT_USER_MEMORY_MAX_BYTES"),
+                settings
+                    .user_memory_max_bytes
+                    .unwrap_or(DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES),
+            ),
+            enabled_mid_turn: get_var("SQUEEZY_CONTEXT_COMPACTION_ENABLED_MID_TURN")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.enabled_mid_turn.unwrap_or(true)),
+            model_context_window: get_var("SQUEEZY_CONTEXT_MODEL_CONTEXT_WINDOW")
+                .as_deref()
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .or(settings.model_context_window),
+            threshold_percent: clamp_percent(
+                get_var("SQUEEZY_CONTEXT_COMPACTION_THRESHOLD_PERCENT")
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<u8>().ok())
+                    .or(settings.threshold_percent)
+                    .unwrap_or(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT),
+            ),
+            strategy: get_var("SQUEEZY_CONTEXT_COMPACTION_STRATEGY")
+                .as_deref()
+                .and_then(CompactionStrategy::parse)
+                .or(settings.strategy)
+                .unwrap_or_default(),
+            model_assisted_model: get_var("SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_MODEL")
+                .or_else(|| settings.model_assisted_model.clone()),
+            model_assisted_max_output_tokens: get_var(
+                "SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS",
+            )
+            .as_deref()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .or(settings.model_assisted_max_output_tokens)
+            .unwrap_or(DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS),
+            model_assisted_timeout_secs: get_var(
+                "SQUEEZY_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS",
+            )
+            .as_deref()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .or(settings.model_assisted_timeout_secs)
+            .unwrap_or(DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS),
+            layered_fallback_extractive_threshold_tokens: get_var(
+                "SQUEEZY_CONTEXT_COMPACTION_LAYERED_FALLBACK_THRESHOLD_TOKENS",
+            )
+            .as_deref()
+            .and_then(|raw| raw.parse::<u32>().ok())
+            .or(settings.layered_fallback_extractive_threshold_tokens)
+            .unwrap_or(DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS),
         }
     }
+}
+
+fn clamp_percent(value: u8) -> u8 {
+    value.min(100)
 }
 
 impl Default for ContextCompactionConfig {
@@ -2553,6 +2831,18 @@ impl Default for ContextCompactionConfig {
             min_items: DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS,
             recent_items: DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS,
             max_summary_bytes: DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES,
+            repo_doc_max_bytes: DEFAULT_CONTEXT_REPO_DOC_MAX_BYTES,
+            user_memory_max_bytes: DEFAULT_CONTEXT_USER_MEMORY_MAX_BYTES,
+            enabled_mid_turn: true,
+            model_context_window: None,
+            threshold_percent: DEFAULT_CONTEXT_COMPACTION_THRESHOLD_PERCENT,
+            strategy: CompactionStrategy::default(),
+            model_assisted_model: None,
+            model_assisted_max_output_tokens:
+                DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_MAX_OUTPUT_TOKENS,
+            model_assisted_timeout_secs: DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
+            layered_fallback_extractive_threshold_tokens:
+                DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
         }
     }
 }
@@ -4965,6 +5255,16 @@ pub fn user_settings_template() -> &'static str {
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
+# repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
+# model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
+# threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
+# strategy = "extractive"                          # extractive | model_assisted | layered_fallback
+# model_assisted_model = "gpt-5-nano"              # cheap model used when strategy != "extractive"
+# model_assisted_max_output_tokens = 500
+# model_assisted_timeout_secs = 30
+# layered_fallback_extractive_threshold_tokens = 4000
 
 [subagents]
 # enabled = true
@@ -5140,6 +5440,16 @@ pub fn project_settings_template() -> &'static str {
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
+# repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
+# model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
+# threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
+# strategy = "extractive"                          # extractive | model_assisted | layered_fallback
+# model_assisted_model = "gpt-5-nano"              # cheap model used when strategy != "extractive"
+# model_assisted_max_output_tokens = 500
+# model_assisted_timeout_secs = 30
+# layered_fallback_extractive_threshold_tokens = 4000
 
 [subagents]
 # enabled = true
@@ -5652,6 +5962,18 @@ fn usize_value(
         Some(value) => {
             let integer = positive_integer(value, source, path)?;
             usize::try_from(integer)
+                .map(Some)
+                .map_err(|_| SqueezyError::Config(format!("{source}: {path}: value is too large")))
+        }
+    }
+}
+
+fn u8_value(table: &toml::value::Table, key: &str, source: &str, path: &str) -> Result<Option<u8>> {
+    match table.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let integer = positive_integer(value, source, path)?;
+            u8::try_from(integer)
                 .map(Some)
                 .map_err(|_| SqueezyError::Config(format!("{source}: {path}: value is too large")))
         }
@@ -6480,6 +6802,12 @@ pub struct ContextCompactionRecord {
     pub after: ContextEstimate,
     pub dropped_items: usize,
     pub summary_bytes: usize,
+    /// Stable id of the pre-compaction snapshot persisted in
+    /// `compaction_checkpoints`. Populated when the agent had a `SqueezyStore`
+    /// handle at compaction time; `None` for sessions without persistence or
+    /// when the checkpoint write itself failed (non-fatal).
+    #[serde(default)]
+    pub replacement_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
