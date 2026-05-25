@@ -3150,6 +3150,108 @@ fn graph_records_only_real_maven_dependencies() {
     );
 }
 
+#[test]
+fn candidate_set_call_edge_emits_ids() {
+    let mut parser = LanguageParser::new().unwrap();
+    let source = python_record(
+        "src/dispatch.py",
+        r#"
+class Alpha:
+    def do_thing(self):
+        return 1
+
+class Beta:
+    def do_thing(self):
+        return 2
+
+def caller(obj):
+    return obj.do_thing()
+"#,
+    );
+    let parsed = parser
+        .parse_source(&source, fs::read_to_string(&source.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let candidate_edges: Vec<&GraphEdge> = graph
+        .edges
+        .iter()
+        .filter(|edge| edge.target_text.contains("do_thing"))
+        .filter(|edge| edge.confidence == Confidence::CandidateSet)
+        .collect();
+    assert!(
+        !candidate_edges.is_empty(),
+        "expected at least one CandidateSet edge for `do_thing` (edges: {:?})",
+        graph
+            .edges
+            .iter()
+            .filter(|e| e.target_text.contains("do_thing"))
+            .map(|e| (&e.target_text, e.confidence, e.candidates.len()))
+            .collect::<Vec<_>>(),
+    );
+    let edge = candidate_edges[0];
+    assert_eq!(
+        edge.candidates.len(),
+        2,
+        "expected both `do_thing` methods to appear as candidates, got {} ({:?})",
+        edge.candidates.len(),
+        edge.candidates,
+    );
+    for id in &edge.candidates {
+        let sym = graph.symbols.get(id).expect("candidate id resolves");
+        assert_eq!(sym.name, "do_thing");
+        assert_eq!(sym.kind, SymbolKind::Method);
+    }
+}
+
+#[test]
+fn candidate_set_truncated_to_max_edge_candidates() {
+    let mut parser = LanguageParser::new().unwrap();
+    let mut classes = String::new();
+    for i in 0..12 {
+        classes.push_str(&format!(
+            "class Cls{i}:\n    def shared(self):\n        return {i}\n\n"
+        ));
+    }
+    classes.push_str("def caller(obj):\n    return obj.shared()\n");
+    let source = python_record("src/dispatch_big.py", &classes);
+    let parsed = parser
+        .parse_source(&source, fs::read_to_string(&source.path).unwrap())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    let edge = graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.target_text.contains("shared") && edge.confidence == Confidence::CandidateSet
+        })
+        .expect("expected CandidateSet edge for `shared`");
+    assert!(
+        edge.candidates.len() <= MAX_EDGE_CANDIDATES,
+        "candidates cap exceeded: {} > {}",
+        edge.candidates.len(),
+        MAX_EDGE_CANDIDATES,
+    );
+    assert_eq!(edge.candidates.len(), MAX_EDGE_CANDIDATES);
+}
+
+#[test]
+fn graph_edge_deserializes_without_candidates_field() {
+    let stored = serde_json::json!({
+        "from": "file:src/x.rs",
+        "to": null,
+        "target_text": "thing",
+        "kind": "Calls",
+        "span": null,
+        "confidence": "CandidateSet",
+        "freshness": "Fresh",
+        "provenance": {"source": "test", "reason": "fixture"}
+    });
+    let edge: GraphEdge = serde_json::from_value(stored).expect("legacy edge JSON deserializes");
+    assert!(edge.candidates.is_empty());
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);

@@ -81,11 +81,21 @@ impl SemanticGraph {
                         .unwrap_or(false)
                 });
             }
-            let (to, confidence) = match candidates.as_slice() {
-                [only] if !import.is_glob => (Some(only.clone()), Confidence::ImportResolved),
-                [] if import.is_glob => (None, Confidence::CandidateSet),
-                [] => (None, Confidence::External),
-                _ => (None, Confidence::CandidateSet),
+            let (to, confidence, edge_candidates) = match candidates.as_slice() {
+                [only] if !import.is_glob => {
+                    (Some(only.clone()), Confidence::ImportResolved, Vec::new())
+                }
+                [] if import.is_glob => (None, Confidence::CandidateSet, Vec::new()),
+                [] => (None, Confidence::External, Vec::new()),
+                _ => (
+                    None,
+                    Confidence::CandidateSet,
+                    candidates
+                        .iter()
+                        .take(MAX_EDGE_CANDIDATES)
+                        .cloned()
+                        .collect(),
+                ),
             };
             self.edges.push(GraphEdge {
                 from,
@@ -100,6 +110,7 @@ impl SemanticGraph {
                 confidence,
                 freshness: Freshness::Fresh,
                 provenance: import.provenance.clone(),
+                candidates: edge_candidates,
             });
         }
     }
@@ -111,7 +122,7 @@ impl SemanticGraph {
                 .caller_id
                 .clone()
                 .unwrap_or_else(|| file_symbol_id.clone());
-            let (to, confidence, rank_reason) = self.resolve_call(call, &from);
+            let (to, confidence, rank_reason, edge_candidates) = self.resolve_call(call, &from);
             self.edges.push(GraphEdge {
                 from,
                 to,
@@ -124,6 +135,7 @@ impl SemanticGraph {
                     call.provenance.source.clone(),
                     format!("{}; rank={rank_reason}", call.provenance.reason),
                 ),
+                candidates: edge_candidates,
             });
         }
     }
@@ -155,6 +167,7 @@ impl SemanticGraph {
                 confidence,
                 freshness: Freshness::Fresh,
                 provenance: reference.provenance.clone(),
+                candidates: Vec::new(),
             });
         }
     }
@@ -176,7 +189,7 @@ impl SemanticGraph {
         &self,
         call: &ParsedCall,
         caller_id: &SymbolId,
-    ) -> (Option<SymbolId>, Confidence, &'static str) {
+    ) -> (Option<SymbolId>, Confidence, &'static str, Vec<SymbolId>) {
         if call.kind == ParsedCallKind::Macro {
             let candidates = self
                 .symbols_by_name_or_scan(&call.name)
@@ -189,16 +202,31 @@ impl SemanticGraph {
                 })
                 .collect::<Vec<_>>();
             return match candidates.as_slice() {
-                [only] => (Some(only.clone()), Confidence::ExactSyntax, "macro exact"),
-                [] => (None, Confidence::MacroOpaque, "macro opaque"),
-                _ => (None, Confidence::CandidateSet, "macro candidate set"),
+                [only] => (
+                    Some(only.clone()),
+                    Confidence::ExactSyntax,
+                    "macro exact",
+                    Vec::new(),
+                ),
+                [] => (None, Confidence::MacroOpaque, "macro opaque", Vec::new()),
+                _ => (
+                    None,
+                    Confidence::CandidateSet,
+                    "macro candidate set",
+                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                ),
             };
         }
 
         if call.kind == ParsedCallKind::Direct
             && let Some(callee) = self.import_alias_direct_call(caller_id, call)
         {
-            return (Some(callee), Confidence::ImportResolved, "import alias");
+            return (
+                Some(callee),
+                Confidence::ImportResolved,
+                "import alias",
+                Vec::new(),
+            );
         }
 
         let is_base_call =
@@ -208,7 +236,12 @@ impl SemanticGraph {
             && !is_base_call
             && let Some(callee) = self.same_impl_method(caller_id, &call.name)
         {
-            return (Some(callee), Confidence::ExactSyntax, "same class or impl");
+            return (
+                Some(callee),
+                Confidence::ExactSyntax,
+                "same class or impl",
+                Vec::new(),
+            );
         }
 
         if call.kind == ParsedCallKind::Direct
@@ -216,13 +249,23 @@ impl SemanticGraph {
             && !call.target_text.contains("::")
             && let Some(callee) = self.same_class_direct_call(caller_id, &call.name)
         {
-            return (Some(callee), Confidence::ExactSyntax, "same class");
+            return (
+                Some(callee),
+                Confidence::ExactSyntax,
+                "same class",
+                Vec::new(),
+            );
         }
 
         if call.kind == ParsedCallKind::Method
             && let Some(callee) = self.inherited_python_method(caller_id, call)
         {
-            return (Some(callee), Confidence::Heuristic, "inherited class");
+            return (
+                Some(callee),
+                Confidence::Heuristic,
+                "inherited class",
+                Vec::new(),
+            );
         }
 
         let candidates = self
@@ -245,63 +288,124 @@ impl SemanticGraph {
             .collect::<Vec<_>>();
 
         if let Some(id) = self.qualified_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::Heuristic, "qualified syntax");
+            return (
+                Some(id),
+                Confidence::Heuristic,
+                "qualified syntax",
+                Vec::new(),
+            );
         }
 
         if call.kind == ParsedCallKind::Method {
             if let Some(id) = self.java_static_imported_method(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "java static import");
+                return (
+                    Some(id),
+                    Confidence::ImportResolved,
+                    "java static import",
+                    Vec::new(),
+                );
             }
             if let Some(id) = self.java_receiver_field_method(caller_id, call) {
-                return (Some(id), Confidence::Heuristic, "java field receiver");
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "java field receiver",
+                    Vec::new(),
+                );
             }
             if let Some(id) = self.python_receiver_alias_method(caller_id, call) {
-                return (Some(id), Confidence::Heuristic, "constructor alias");
+                return (
+                    Some(id),
+                    Confidence::Heuristic,
+                    "constructor alias",
+                    Vec::new(),
+                );
             }
             if let Some(id) = self.python_module_qualified_call(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "imported module");
+                return (
+                    Some(id),
+                    Confidence::ImportResolved,
+                    "imported module",
+                    Vec::new(),
+                );
             }
             if let Some(id) = self.go_package_qualified_call(&candidates, caller_id, call) {
-                return (Some(id), Confidence::ImportResolved, "go package import");
+                return (
+                    Some(id),
+                    Confidence::ImportResolved,
+                    "go package import",
+                    Vec::new(),
+                );
             }
             return match candidates.as_slice() {
-                [] => (None, Confidence::External, "method external"),
-                _ => (None, Confidence::CandidateSet, "method candidate set"),
+                [] => (None, Confidence::External, "method external", Vec::new()),
+                _ => (
+                    None,
+                    Confidence::CandidateSet,
+                    "method candidate set",
+                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                ),
             };
         }
 
         if call.receiver.is_some() {
             return match candidates.as_slice() {
-                [] => (None, Confidence::External, "receiver external"),
-                _ => (None, Confidence::CandidateSet, "receiver candidate set"),
+                [] => (None, Confidence::External, "receiver external", Vec::new()),
+                _ => (
+                    None,
+                    Confidence::CandidateSet,
+                    "receiver candidate set",
+                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                ),
             };
         }
 
         if let Some(id) = self.same_file_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ExactSyntax, "same file");
+            return (Some(id), Confidence::ExactSyntax, "same file", Vec::new());
         }
         if let Some(id) = self.imported_direct_call(&candidates, caller_id, call) {
-            return (Some(id), Confidence::ImportResolved, "explicit import");
+            return (
+                Some(id),
+                Confidence::ImportResolved,
+                "explicit import",
+                Vec::new(),
+            );
         }
         if self.unresolved_js_ts_imported_direct_call(caller_id, call) {
             return match candidates.as_slice() {
-                [] => (None, Confidence::External, "unresolved imported symbol"),
+                [] => (
+                    None,
+                    Confidence::External,
+                    "unresolved imported symbol",
+                    Vec::new(),
+                ),
                 _ => (
                     None,
                     Confidence::CandidateSet,
                     "unresolved imported symbol candidate set",
+                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
                 ),
             };
         }
         if let Some(id) = self.c_family_include_direct_call(&candidates, caller_id) {
-            return (Some(id), Confidence::ImportResolved, "include directive");
+            return (
+                Some(id),
+                Confidence::ImportResolved,
+                "include directive",
+                Vec::new(),
+            );
         }
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
-            return (Some(id), Confidence::Heuristic, "package local");
+            return (Some(id), Confidence::Heuristic, "package local", Vec::new());
         }
         match candidates.as_slice() {
-            [] => (None, Confidence::External, "external"),
-            _ => (None, Confidence::CandidateSet, "candidate set"),
+            [] => (None, Confidence::External, "external", Vec::new()),
+            _ => (
+                None,
+                Confidence::CandidateSet,
+                "candidate set",
+                candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+            ),
         }
     }
 

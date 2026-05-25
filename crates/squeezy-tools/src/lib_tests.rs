@@ -5520,7 +5520,11 @@ async fn graph_navigation_tools_return_unsupported_language_fallback() {
     assert_eq!(result.status, ToolStatus::Success);
     assert_eq!(
         result.content["fallback"]["status"].as_str(),
-        Some("unsupported_language")
+        Some("no_graph_evidence")
+    );
+    assert_eq!(
+        result.content["fallback"]["reason"].as_str(),
+        Some("path_unsupported")
     );
     assert_eq!(
         result.content["fallback"]["suggested_tools"][0]["tool"].as_str(),
@@ -5728,6 +5732,347 @@ pub fn caller_d() { target(); }
         Some(2)
     );
     assert!(upstream.cost_hint.truncated);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_emits_confidence_distribution() {
+    let root = temp_workspace("graph_confidence_distribution");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+pub fn gamma() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let distribution = &result.cost_hint.confidence_distribution;
+    assert!(
+        !distribution.is_empty(),
+        "decl_search must populate confidence_distribution"
+    );
+    let total: u32 = distribution.values().copied().sum();
+    let returned = result.content["returned_matches"].as_u64().unwrap();
+    assert_eq!(
+        total as u64, returned,
+        "distribution counts must sum to returned_matches"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_resolves_fuzzy_symbol_query() {
+    let root = temp_workspace("graph_fuzzy_symbol");
+    write_rust_crate(
+        &root,
+        r#"
+pub struct GraphManager;
+pub struct PageRenderer;
+pub fn unrelated() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_symbol".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "graphmgr"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    assert!(
+        packets
+            .iter()
+            .any(|packet| packet["symbol"]["name"].as_str() == Some("GraphManager")),
+        "fuzzy `graphmgr` query must resolve to `GraphManager`, got {packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_path_filter_accepts_fuzzy_path_token() {
+    let root = temp_workspace("graph_fuzzy_path");
+    write_rust_crate(&root, "pub fn entry() {}\n");
+    fs::create_dir_all(root.join("crates/squeezy-graph/src")).expect("create graph dirs");
+    fs::write(
+        root.join("crates/squeezy-graph/src/lib.rs"),
+        "pub fn open() {}\n",
+    )
+    .expect("graph src");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "fuzzy_path".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "open", "path": "squeezy_graph"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("decl_search packets array");
+    assert!(
+        packets.iter().any(|packet| packet["symbol"]["path"]
+            .as_str()
+            .map(|p| p.contains("squeezy-graph"))
+            .unwrap_or(false)),
+        "fuzzy `path: squeezy_graph` must match `squeezy-graph`, got {packets:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_emits_grep_fallback_for_supported_path() {
+    let root = temp_workspace("graph_zero_hit_supported");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_supported".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({
+                    "query": "no_such_symbol",
+                    "path": "src/lib.rs",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["status"].as_str(), Some("no_graph_evidence"));
+    assert_eq!(
+        fallback["reason"].as_str(),
+        Some("supported_language_no_match")
+    );
+    assert_eq!(fallback["path"].as_str(), Some("src/lib.rs"));
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("src/lib.rs"));
+    assert_eq!(
+        grep["arguments"]["pattern"].as_str(),
+        Some("no_such_symbol")
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_no_path_scope() {
+    let root = temp_workspace("graph_zero_hit_no_path");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_no_path".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_unique_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let fallback = &result.content["fallback"];
+    assert_eq!(fallback["reason"].as_str(), Some("no_path_scope"));
+    assert!(fallback["path"].is_null());
+    let tools = fallback["suggested_tools"]
+        .as_array()
+        .expect("suggested_tools array");
+    let grep = tools
+        .iter()
+        .find(|tool| tool["tool"].as_str() == Some("grep"))
+        .expect("grep entry");
+    assert_eq!(grep["arguments"]["path"].as_str(), Some("."));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_zero_hit_regex_escapes_query() {
+    let root = temp_workspace("graph_zero_hit_regex");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "zero_regex".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "foo.bar()"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let pattern = result.content["fallback"]["suggested_tools"][0]["arguments"]["pattern"]
+        .as_str()
+        .expect("pattern string");
+    assert!(
+        pattern.contains(r"\."),
+        "regex metacharacters must be escaped; got {pattern:?}"
+    );
+    assert!(
+        pattern.contains(r"\(") && pattern.contains(r"\)"),
+        "parentheses must be escaped; got {pattern:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_non_empty_packets_keeps_null_fallback() {
+    let root = temp_workspace("graph_fallback_null_when_hits");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "non_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(
+        result.content["fallback"].is_null(),
+        "fallback must be null when graph returned packets, got {}",
+        result.content["fallback"]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_distribution_absent_when_no_matches() {
+    let root = temp_workspace("graph_confidence_distribution_empty");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.cost_hint.confidence_distribution.is_empty());
+    let cost_hint_json = serde_json::to_value(&result.cost_hint).expect("cost_hint serialises");
+    assert!(
+        cost_hint_json.get("confidence_distribution").is_none(),
+        "empty distribution must be skipped in serialised cost_hint, got {cost_hint_json}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn downstream_flow_surfaces_candidate_set_on_ambiguous_call() {
+    let root = temp_workspace("graph_candidate_set_packet");
+    fs::write(
+        root.join("dispatch.py"),
+        r#"class Alpha:
+    def do_thing(self):
+        return 1
+
+class Beta:
+    def do_thing(self):
+        return 2
+
+def caller(obj):
+    return obj.do_thing()
+"#,
+    )
+    .expect("write python source");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let downstream = registry
+        .execute(
+            ToolCall {
+                call_id: "candidate_downstream".to_string(),
+                name: "downstream_flow".to_string(),
+                arguments: json!({"query": "caller", "max_depth": 1}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(downstream.status, ToolStatus::Success);
+    let packets = downstream.content["packets"]
+        .as_array()
+        .expect("downstream packets");
+    let candidate_packet = packets
+        .iter()
+        .find(|packet| packet["edge"]["confidence"].as_str() == Some("CandidateSet"))
+        .unwrap_or_else(|| panic!("expected at least one CandidateSet packet: {packets:?}"));
+    let candidates = candidate_packet["candidates"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("CandidateSet packet must include candidates: {candidate_packet}")
+        });
+    assert_eq!(candidates.len(), 2);
+    for entry in candidates {
+        assert_eq!(entry["name"].as_str(), Some("do_thing"));
+    }
+    let fanout = candidate_packet["next_action"]["fanout"]
+        .as_array()
+        .expect("candidate set packet must carry a read_slice fanout");
+    assert!(
+        !fanout.is_empty(),
+        "fanout must contain at least one read_slice candidate"
+    );
+    for entry in fanout {
+        assert_eq!(entry["tool"].as_str(), Some("read_slice"));
+        assert!(entry["arguments"]["path"].as_str().is_some());
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -6823,6 +7168,53 @@ fn shell_sandbox_runtime_unavailable_ignores_direct_backend() {
         "",
         false,
     ));
+}
+
+#[test]
+fn grep_spec_promotes_graph_first() {
+    let description = grep_spec().description;
+    for marker in [
+        "decl_search",
+        "reference_search",
+        "symbol_context",
+        "graph returned zero packets",
+    ] {
+        assert!(
+            description.contains(marker),
+            "grep_spec must mention `{marker}`; got: {description}"
+        );
+    }
+    for family in squeezy_core::LanguageFamily::all() {
+        assert!(
+            description.contains(family.display_name()),
+            "grep_spec must name `{}` from LanguageFamily::all(); got: {description}",
+            family.display_name(),
+        );
+    }
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/grep_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn glob_spec_promotes_graph_first() {
+    let description = glob_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("graph returned zero packets"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/glob_spec_description.txt").trim();
+    assert_eq!(description.trim(), golden);
+}
+
+#[test]
+fn read_file_spec_promotes_graph_first() {
+    let description = read_file_spec().description;
+    assert!(description.contains("decl_search"));
+    assert!(description.contains("symbol_context"));
+    let golden =
+        include_str!("../tests/artifacts/tool-spec-descriptions/read_file_spec_description.txt")
+            .trim();
+    assert_eq!(description.trim(), golden);
 }
 
 #[tokio::test]

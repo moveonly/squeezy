@@ -231,6 +231,53 @@ pub struct ToolCostHint {
     pub output_bytes: u64,
     pub redactions: u64,
     pub truncated: bool,
+    /// Per-`Confidence`-variant counts across the returned packets. Empty
+    /// for tools that do not surface graph confidence (grep, glob,
+    /// read_file, etc.); populated by graph-anchored tools so the model
+    /// can reason about result quality without re-walking every packet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub confidence_distribution: BTreeMap<String, u32>,
+}
+
+impl ToolCostHint {
+    /// Build a `confidence_distribution` from an iterator of
+    /// `squeezy_core::Confidence` values. Zero-count buckets are omitted.
+    pub fn confidence_distribution_from(
+        confidences: impl IntoIterator<Item = Confidence>,
+    ) -> BTreeMap<String, u32> {
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        for c in confidences {
+            *map.entry(c.id().to_string()).or_insert(0) += 1;
+        }
+        map
+    }
+
+    /// Build a `confidence_distribution` by reading the `confidence`
+    /// field from each packet JSON value. Useful for traversal-shaped
+    /// tools (upstream/downstream flow) that already have packets in
+    /// hand. Unknown values are skipped.
+    pub fn confidence_distribution_from_packets(packets: &[Value]) -> BTreeMap<String, u32> {
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        for packet in packets {
+            let Some(debug_label) = packet.get("confidence").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(c) = confidence_from_debug_label(debug_label) {
+                *map.entry(c.id().to_string()).or_insert(0) += 1;
+            }
+        }
+        map
+    }
+}
+
+/// Map a `{:?}`-formatted `Confidence` (`"ExactSyntax"`, `"Heuristic"`,
+/// …) back to the typed variant. Returns `None` for strings that don't
+/// match a known variant.
+fn confidence_from_debug_label(label: &str) -> Option<Confidence> {
+    Confidence::ALL
+        .iter()
+        .copied()
+        .find(|c| format!("{c:?}") == label)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2940,14 +2987,22 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| symbol_packet(graph, symbol, "decl_search", symbol_next_action(symbol)))
             .collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(selected.iter().map(|s| s.confidence));
         let mut payload = graph_payload("decl_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert("kind".to_string(), json!(args.kind));
         payload.insert("language".to_string(), json!(args.language));
+        let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                args.query.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("total_matches".to_string(), json!(symbols.len()));
@@ -2965,6 +3020,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: selected.len() as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3008,13 +3064,19 @@ impl ToolRegistry {
                 )
             })
             .collect::<Vec<_>>();
+        let packet_count = packets.len();
         let mut payload = graph_payload("definition_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), args.query.as_deref()),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                args.query.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("truncated".to_string(), json!(truncated));
         make_result(
@@ -3070,13 +3132,22 @@ impl ToolRegistry {
             .cloned()
             .collect::<Vec<_>>();
         let packets = selected.iter().map(reference_packet).collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(selected.iter().map(|hit| hit.confidence));
+        let query_text = args.text.clone().or_else(|| args.query.clone());
+        let packet_count = packets.len();
         let mut payload = graph_payload("reference_search", manager, refresh);
         payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert("text".to_string(), json!(args.text.or(args.query)));
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, args.path.as_deref(), None),
+            graph_zero_hit_fallback(
+                graph,
+                args.path.as_deref(),
+                query_text.as_deref(),
+                packet_count,
+            ),
         );
         payload.insert("offset".to_string(), json!(offset));
         payload.insert("truncated".to_string(), json!(truncated));
@@ -3087,6 +3158,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: selected.len() as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3129,6 +3201,7 @@ impl ToolRegistry {
             }
         }
         let truncated = overflowed;
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
@@ -3142,6 +3215,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: packet_count as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3203,6 +3277,7 @@ impl ToolRegistry {
             }
         }
         let truncated = overflowed;
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("downstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
@@ -3216,6 +3291,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: packet_count as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3266,6 +3342,8 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| symbol_context_packet(graph, symbol, max_references))
             .collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(symbols.iter().map(|s| s.confidence));
         let mut payload = graph_payload("symbol_context", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert(
@@ -3273,10 +3351,11 @@ impl ToolRegistry {
             json!(diff_mode_str(args.mode.unwrap_or_default())),
         );
         payload.insert("diff_only".to_string(), json!(diff_only));
+        let packet_count = packets.len();
         payload.insert("packets".to_string(), json!(packets));
         payload.insert(
             "fallback".to_string(),
-            unsupported_fallback_for_path(graph, path_filter, Some(&args.query)),
+            graph_zero_hit_fallback(graph, path_filter, Some(&args.query), packet_count),
         );
         payload.insert("truncated".to_string(), json!(false));
         make_result(
@@ -3285,6 +3364,7 @@ impl ToolRegistry {
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3490,7 +3570,7 @@ impl ToolRegistry {
         let baseline_requested = ctx.args.diff_baseline.unwrap_or_default();
         if baseline_requested == DiffReadBaseline::LastReceipt {
             match self.read_slice_last_receipt_diff(ctx) {
-                LastReceiptDiffOutcome::Result(result) => return result,
+                LastReceiptDiffOutcome::Result(result) => return *result,
                 LastReceiptDiffOutcome::Fallback(reason) => {
                     return self.read_slice_git_diff(
                         ctx,
@@ -3828,7 +3908,7 @@ impl ToolRegistry {
                 cost.clone(),
                 DiffNextActionKind::ReadSlice,
             );
-            return LastReceiptDiffOutcome::Result(make_result(
+            return LastReceiptDiffOutcome::Result(Box::new(make_result(
                 call,
                 ToolStatus::Success,
                 json!({
@@ -3854,7 +3934,7 @@ impl ToolRegistry {
                 }),
                 cost,
                 Some(content_sha256.clone()),
-            ));
+            )));
         }
 
         let bytes = match read_range(path, offset as u64, limit) {
@@ -3961,7 +4041,7 @@ impl ToolRegistry {
             cost,
             Some(content_sha256.clone()),
         );
-        LastReceiptDiffOutcome::Result(result)
+        LastReceiptDiffOutcome::Result(Box::new(result))
     }
 
     fn graph_context_for_snapshot(
@@ -9505,7 +9585,13 @@ fn symbol_matches_path_filter(symbol: &GraphSymbol, filter: Option<&str>) -> boo
         return true;
     };
     let path = symbol.file_id.0.as_str();
-    path == filter || path.ends_with(&format!("/{filter}"))
+    if path == filter || path.ends_with(&format!("/{filter}")) {
+        return true;
+    }
+    // Append fuzzy path matching as a fallback so casual queries like
+    // `path: "graph_mgr"` resolve to `crates/squeezy-graph/src/lib.rs`.
+    // Suffix matching above keeps precedence; fuzzy only rescues misses.
+    squeezy_rank::fuzzy::fuzzy_path_score(path, filter).is_some()
 }
 
 fn diff_file_json(file: &DiffFile) -> Value {
@@ -9541,7 +9627,7 @@ fn diff_read_baseline_str(baseline: DiffReadBaseline) -> &'static str {
 }
 
 enum LastReceiptDiffOutcome {
-    Result(ToolResult),
+    Result(Box<ToolResult>),
     Fallback(&'static str),
 }
 
@@ -11035,6 +11121,35 @@ fn graph_symbol_search(
         .filter(|symbol| symbol_matches_path_filter(symbol, path))
         .filter(|symbol| language_matches(graph, symbol, language))
         .collect::<Vec<_>>();
+
+    // Fuzzy widening: when the trigram-anchored candidate pool is empty
+    // but a query was provided, run a fuzzy subsequence scan over all
+    // symbols so casual queries (`graphmgr → GraphManager`) still
+    // resolve. This only runs on a miss so high-confidence behaviour is
+    // unchanged.
+    if symbols.is_empty()
+        && let Some(query) = query
+    {
+        symbols = graph
+            .symbols
+            .values()
+            .filter(|symbol| symbol_matches_kind_filter(symbol.kind, kind_filter))
+            .filter(|symbol| symbol_matches_visibility_filter(symbol, visibility))
+            .filter(|symbol| symbol_matches_attribute_filter(symbol, attribute))
+            .filter(|symbol| symbol_matches_path_filter(symbol, path))
+            .filter(|symbol| language_matches(graph, symbol, language))
+            .filter(|symbol| {
+                let view = squeezy_rank::GraphSymbolView {
+                    name: symbol.name.as_str(),
+                    signature: symbol.signature.as_str(),
+                };
+                squeezy_rank::symbol_rank::rank_symbol(view, query).0
+                    != squeezy_rank::symbol_rank::RankTier::NoMatch
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+    }
+
     symbols.sort_by(|left, right| {
         query
             .map(|query| symbol_rank(left, query).cmp(&symbol_rank(right, query)))
@@ -11091,15 +11206,17 @@ fn resolve_definition_candidates(
 }
 
 fn symbol_rank(symbol: &GraphSymbol, query: &str) -> usize {
-    if symbol.name == query {
-        0
-    } else if symbol.name.eq_ignore_ascii_case(query) {
-        1
-    } else if symbol.signature.contains(query) {
-        2
-    } else {
-        3
-    }
+    // Preserve the historical exact > case-insensitive > signature-substring
+    // ordering. `squeezy_rank` adds two extra tiers (token-bag, fuzzy) that
+    // recover near-miss queries like `graphmgr → GraphManager` without
+    // changing the relative ordering of existing high-confidence hits.
+    let view = squeezy_rank::GraphSymbolView {
+        name: symbol.name.as_str(),
+        signature: symbol.signature.as_str(),
+    };
+    squeezy_rank::symbol_rank::rank_symbol(view, query)
+        .0
+        .as_usize()
 }
 
 fn parse_symbol_kind(value: &str) -> Option<SymbolKind> {
@@ -11194,32 +11311,69 @@ fn unsupported_file_samples(graph: &squeezy_graph::SemanticGraph, limit: usize) 
         .collect()
 }
 
-fn unsupported_fallback_for_path(
+/// Structured zero-result fallback for graph-anchored tools.
+///
+/// Returns `Value::Null` when the tool has at least one result packet
+/// (callers always pass `packet_count`; the empty case is the only one
+/// that needs a fallback). When `packet_count == 0`, emits an
+/// `evidence-packet-shaped` object with:
+/// - `status`: `"no_graph_evidence"`
+/// - `reason`: one of `supported_language_no_match`, `path_unsupported`,
+///   `path_unknown`, `no_path_scope`
+/// - `path` / `language` (nullable)
+/// - `suggested_tools`: a regex-escaped `grep` invocation plus a
+///   `decl_search` retry shape
+fn graph_zero_hit_fallback(
     graph: &squeezy_graph::SemanticGraph,
     path: Option<&str>,
     query: Option<&str>,
+    packet_count: usize,
 ) -> Value {
-    let Some(path) = path else {
+    if packet_count > 0 {
         return Value::Null;
+    }
+    let (path_value, language_value, reason) = match path {
+        Some(path) => {
+            let file = graph.files.values().find(|file| {
+                file.relative_path == path || file.relative_path.ends_with(&format!("/{path}"))
+            });
+            match file {
+                Some(file) => {
+                    let reason = match file.language {
+                        LanguageKind::Unsupported => "path_unsupported",
+                        LanguageKind::Unknown => "path_unknown",
+                        _ => "supported_language_no_match",
+                    };
+                    (
+                        Value::String(file.relative_path.clone()),
+                        Value::String(file.language.display_name().to_string()),
+                        reason,
+                    )
+                }
+                None => (Value::String(path.to_string()), Value::Null, "path_unknown"),
+            }
+        }
+        None => (Value::Null, Value::Null, "no_path_scope"),
     };
-    graph
-        .files
-        .values()
-        .find(|file| file.relative_path == path || file.relative_path.ends_with(&format!("/{path}")))
-        .filter(|file| matches!(file.language, LanguageKind::Unsupported | LanguageKind::Unknown))
-        .map(|file| {
-            json!({
-                "status": graph_status_for_language(file.language),
-                "path": file.relative_path,
-                "language": file.language.display_name(),
-                "reason": "semantic graph does not claim navigation confidence for this file",
-                "suggested_tools": [
-                    {"tool": "grep", "arguments": {"pattern": query.unwrap_or("<query>"), "path": file.relative_path}},
-                    {"tool": "read_file", "arguments": {"path": file.relative_path, "limit": DEFAULT_READ_LIMIT}}
-                ]
-            })
-        })
-        .unwrap_or(Value::Null)
+    let grep_path = match &path_value {
+        Value::String(p) => p.clone(),
+        _ => ".".to_string(),
+    };
+    let grep_pattern = match query {
+        Some(q) if !q.is_empty() => regex::escape(q),
+        _ => "<query>".to_string(),
+    };
+    let decl_query = query.unwrap_or("<query>").to_string();
+    json!({
+        "status": "no_graph_evidence",
+        "reason": reason,
+        "path": path_value,
+        "language": language_value,
+        "suggested_tools": [
+            {"tool": "grep", "arguments": {"pattern": grep_pattern, "path": grep_path}},
+            {"tool": "decl_search", "arguments": {"query": decl_query, "kind": null}}
+        ]
+    })
 }
 
 fn graph_status_for_language(language: LanguageKind) -> &'static str {
@@ -11403,7 +11557,12 @@ fn reference_matches_path(hit: &ReferenceHit, filter: &str) -> bool {
     path == filter || path.ends_with(&format!("/{filter}"))
 }
 
-fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
+fn call_edge_packet(
+    graph: &squeezy_graph::SemanticGraph,
+    hit: &CallEdgeHit,
+    tool: &str,
+    upstream: bool,
+) -> Value {
     let actor = if upstream {
         hit.caller.as_ref()
     } else {
@@ -11441,6 +11600,41 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             Some(span),
         )
     });
+    let next_action = if hit.edge.candidates.is_empty() {
+        json!({
+            "tool": "read_slice",
+            "arguments": hit.edge.span.map(|span| json!({
+                "path": hit.caller.as_ref().map(|symbol| symbol.file_id.0.clone()).unwrap_or_default(),
+                "start_byte": span.start_byte,
+                "end_byte": span.end_byte
+            })).unwrap_or_else(|| json!({})),
+            "reason": "read the exact call site"
+        })
+    } else {
+        let fanout: Vec<Value> = hit
+            .edge
+            .candidates
+            .iter()
+            .take(CANDIDATE_FANOUT_LIMIT)
+            .filter_map(|id| graph.symbols.get(id))
+            .map(|sym| {
+                json!({
+                    "tool": "read_slice",
+                    "arguments": {
+                        "path": sym.file_id.0,
+                        "start_byte": sym.span.start_byte,
+                        "end_byte": sym.span.end_byte,
+                    },
+                    "symbol_id": sym.id.0,
+                })
+            })
+            .collect();
+        json!({
+            "tool": "read_slice",
+            "fanout": fanout,
+            "reason": "candidate set: read each candidate's declaration to disambiguate"
+        })
+    };
     let mut packet = evidence_packet(
         claim,
         span.into_iter().collect(),
@@ -11451,15 +11645,7 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             matches_returned: 1,
             ..ToolCostHint::default()
         },
-        json!({
-            "tool": "read_slice",
-            "arguments": hit.edge.span.map(|span| json!({
-                "path": hit.caller.as_ref().map(|symbol| symbol.file_id.0.clone()).unwrap_or_default(),
-                "start_byte": span.start_byte,
-                "end_byte": span.end_byte
-            })).unwrap_or_else(|| json!({})),
-            "reason": "read the exact call site"
-        }),
+        next_action,
     );
     if let Some(object) = packet.as_object_mut() {
         object.insert("tool".to_string(), json!(tool));
@@ -11472,9 +11658,24 @@ fn call_edge_packet(hit: &CallEdgeHit, tool: &str, upstream: bool) -> Value {
             "callee".to_string(),
             json!(hit.callee.as_ref().map(symbol_summary_json)),
         );
+        if !hit.edge.candidates.is_empty() {
+            let candidate_objects: Vec<Value> = hit
+                .edge
+                .candidates
+                .iter()
+                .filter_map(|id| graph.symbols.get(id))
+                .map(symbol_summary_json)
+                .collect();
+            object.insert("candidates".to_string(), json!(candidate_objects));
+        }
     }
     packet
 }
+
+/// Maximum number of candidate symbols that get a dedicated `read_slice`
+/// entry in the `fanout` next-action. The full list is preserved in the
+/// `candidates` field of the packet.
+const CANDIDATE_FANOUT_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 enum CallDirection {
@@ -11557,7 +11758,8 @@ fn bfs_call_packets(
                     overflowed,
                 };
             }
-            let mut packet = call_edge_packet(&hit, direction.tool(), direction.is_upstream());
+            let mut packet =
+                call_edge_packet(graph, &hit, direction.tool(), direction.is_upstream());
             if let Some(object) = packet.as_object_mut() {
                 object.insert("depth".to_string(), json!(next_depth));
             }
@@ -11736,7 +11938,7 @@ fn symbol_summary_json(symbol: &GraphSymbol) -> Value {
 }
 
 fn edge_json(edge: &GraphEdge) -> Value {
-    json!({
+    let mut value = json!({
         "from": edge.from.0,
         "to": edge.to.as_ref().map(|id| id.0.clone()),
         "target_text": edge.target_text,
@@ -11745,7 +11947,21 @@ fn edge_json(edge: &GraphEdge) -> Value {
         "confidence": format!("{:?}", edge.confidence),
         "freshness": format!("{:?}", edge.freshness),
         "provenance": provenance_json(edge.provenance.clone()),
-    })
+    });
+    if !edge.candidates.is_empty()
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "candidates".to_string(),
+            json!(
+                edge.candidates
+                    .iter()
+                    .map(|id| id.0.clone())
+                    .collect::<Vec<_>>()
+            ),
+        );
+    }
+    value
 }
 
 fn hierarchy_node_json(graph: &squeezy_graph::SemanticGraph, node: &HierarchyNode) -> Value {
@@ -14028,10 +14244,39 @@ fn diff_context_spec() -> ToolSpec {
     }
 }
 
+/// Comma-joined list of supported language families, generated from
+/// `squeezy_core::LanguageFamily::all()` so the prose stays in sync when
+/// new families are added.
+fn supported_language_list() -> String {
+    let names: Vec<&'static str> = squeezy_core::LanguageFamily::all()
+        .iter()
+        .map(|family| family.display_name())
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [only] => only.to_string(),
+        [head @ .., last] => format!("{}, and {}", head.join(", "), last),
+    }
+}
+
+/// Preamble that promotes graph-anchored tools (`decl_search`,
+/// `reference_search`, `symbol_context`) over the lexical fallbacks
+/// (`grep`, `glob`, `read_file`). The language list is built from
+/// `LanguageFamily::all()` at runtime.
+fn graph_first_preamble(fallback_tool: &str) -> String {
+    format!(
+        "Prefer `decl_search`, `reference_search`, or `symbol_context` first for symbol-shaped queries in {languages} files. Use `{fallback_tool}` for free-form text, unsupported languages, or after the graph returned zero packets.",
+        languages = supported_language_list(),
+    )
+}
+
 fn grep_spec() -> ToolSpec {
     ToolSpec {
         name: "grep".to_string(),
-        description: "Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.".to_string(),
+        description: format!(
+            "{preamble} Search text files under a workspace path. Respects .gitignore by default; set include_ignored=true only when ignored files are intentionally needed. Use output_mode=count or files_with_matches for broad exploration before reading content.",
+            preamble = graph_first_preamble("grep"),
+        ),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
@@ -14057,7 +14302,10 @@ fn grep_spec() -> ToolSpec {
 fn glob_spec() -> ToolSpec {
     ToolSpec {
         name: "glob".to_string(),
-        description: "List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.".to_string(),
+        description: format!(
+            "{preamble} List workspace file paths matching a glob without reading file contents. Respects .gitignore by default; set include_ignored=true only when ignored paths are intentionally needed.",
+            preamble = graph_first_preamble("glob"),
+        ),
         capability: PermissionCapability::Search,
         parameters: json!({
             "type": "object",
@@ -14078,7 +14326,10 @@ fn glob_spec() -> ToolSpec {
 fn read_file_spec() -> ToolSpec {
     ToolSpec {
         name: "read_file".to_string(),
-        description: "Read a bounded byte slice from one workspace file and return its sha256 receipt. Use grep first when locating unknown files.".to_string(),
+        description: format!(
+            "{preamble} Read a bounded byte slice from one workspace file and return its sha256 receipt. Use `read_file` once the graph (or a free-form `grep`) has produced a path and span.",
+            preamble = graph_first_preamble("read_file"),
+        ),
         capability: PermissionCapability::Read,
         parameters: json!({
             "type": "object",

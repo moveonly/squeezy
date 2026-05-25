@@ -93,6 +93,7 @@ squeezy-harness = { path = "crates/squeezy-harness", version = "=0.1.0" }
 squeezy-llm = { path = "crates/squeezy-llm", version = "=0.1.0" }
 squeezy-mcp = { path = "crates/squeezy-mcp", version = "=0.1.0" }
 squeezy-parse = { path = "crates/squeezy-parse", version = "=0.1.0" }
+squeezy-rank = { path = "crates/squeezy-rank", version = "=0.1.0" }
 squeezy-skills = { path = "crates/squeezy-skills", version = "=0.1.0" }
 squeezy-store = { path = "crates/squeezy-store", version = "=0.1.0" }
 squeezy-telemetry = { path = "crates/squeezy-telemetry", version = "=0.1.0" }

@@ -3394,6 +3394,7 @@ dependencies = [
 name = "squeezy-rank"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "squeezy-core",
 ]
 
@@ -3449,6 +3450,7 @@ dependencies = [
  "squeezy-core",
  "squeezy-graph",
  "squeezy-mcp",
+ "squeezy-rank",
  "squeezy-skills",
  "squeezy-store",
  "squeezy-vcs",
