@@ -143,6 +143,7 @@ pub enum DiffFileStatus {
     Added,
     Deleted,
     Modified,
+    Renamed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +180,8 @@ pub struct CheckpointRecord {
 pub struct CheckpointFile {
     pub path: String,
     pub status: DiffFileStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<String>,
     pub before_sha256: Option<String>,
     pub after_sha256: Option<String>,
     pub additions: u64,
@@ -193,6 +196,15 @@ pub struct SkippedCheckpointFile {
     pub path: String,
     pub reason: String,
     pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnifiedDiffOutcome {
+    pub applied: bool,
+    pub stdout: String,
+    pub stderr: String,
+    pub conflicted_paths: Vec<String>,
+    pub skipped_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +381,81 @@ impl GitVcs {
             truncated,
             errors,
         }
+    }
+
+    /// Run `git apply --check --3way` against the user worktree to see whether
+    /// the given unified-diff body would apply cleanly. No files are mutated.
+    pub fn preflight_unified_diff(&self, diff: &str) -> Result<UnifiedDiffOutcome> {
+        self.run_unified_diff(diff, true)
+    }
+
+    /// Run `git apply --3way` against the user worktree. Mutates the worktree
+    /// if the diff applies. The caller is responsible for sha256-gating and
+    /// checkpoint tracking around this call.
+    pub fn apply_unified_diff(&self, diff: &str) -> Result<UnifiedDiffOutcome> {
+        self.run_unified_diff(diff, false)
+    }
+
+    fn run_unified_diff(&self, diff: &str, preflight: bool) -> Result<UnifiedDiffOutcome> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        // `--3way` falls back to a three-way merge when blob hashes are present
+        // in the diff; `--ignore-whitespace` lets the same body apply against a
+        // worktree that has accumulated minor whitespace drift — the typical
+        // case this fallback is meant to recover.
+        let mut args: Vec<&str> = vec!["apply", "--3way", "--ignore-whitespace"];
+        if preflight {
+            args.push("--check");
+        }
+        let mut child = Command::new("git")
+            .args(&args)
+            .current_dir(&self.root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| SqueezyError::Tool(format!("failed to spawn git apply: {err}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| SqueezyError::Tool("git apply stdin unavailable".to_string()))?;
+            stdin
+                .write_all(diff.as_bytes())
+                .map_err(|err| SqueezyError::Tool(format!("write to git apply: {err}")))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|err| SqueezyError::Tool(format!("git apply wait failed: {err}")))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let applied = output.status.success();
+        let mut conflicted_paths: Vec<String> = Vec::new();
+        let mut skipped_paths: Vec<String> = Vec::new();
+        for line in stderr.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("error: ")
+                && let Some(path) = rest.split(':').next()
+            {
+                skipped_paths.push(path.trim().to_string());
+            }
+            if let Some(rest) = trimmed.strip_prefix("CONFLICT (")
+                && let Some(path) = rest.split_once("): ").map(|(_, p)| p.trim().to_string())
+            {
+                conflicted_paths.push(path);
+            }
+        }
+        conflicted_paths.sort();
+        conflicted_paths.dedup();
+        skipped_paths.sort();
+        skipped_paths.dedup();
+        Ok(UnifiedDiffOutcome {
+            applied,
+            stdout,
+            stderr,
+            conflicted_paths,
+            skipped_paths,
+        })
     }
 
     fn vcs_info(&self, git_root: &Path, mode: DiffMode, errors: &mut Vec<String>) -> VcsInfo {
@@ -860,10 +947,13 @@ impl CheckpointStore {
         let large_after_set: BTreeSet<&str> =
             large_after.iter().map(|file| file.path.as_str()).collect();
         let mut statuses = BTreeMap::<String, DiffFileStatus>::new();
+        // `from_for_new` maps a rename's destination path to its source path so the
+        // CheckpointFile entry can record both ends in a single row.
+        let mut from_for_new = BTreeMap::<String, String>::new();
         let output = self.git_vec(vec![
             "diff".to_string(),
             "--no-ext-diff".to_string(),
-            "--no-renames".to_string(),
+            "--find-renames".to_string(),
             "--name-status".to_string(),
             "-z".to_string(),
             before_tree.to_string(),
@@ -873,8 +963,21 @@ impl CheckpointStore {
         ])?;
         let fields = nul_fields(&output.stdout);
         let mut index = 0usize;
-        while index + 1 < fields.len() {
+        while index < fields.len() {
             let code = fields[index].clone();
+            // Rename / copy records emit three fields: `R\d+`, old_path, new_path.
+            // Everything else is two fields.
+            if (code.starts_with('R') || code.starts_with('C')) && index + 2 < fields.len() {
+                let old_path = fields[index + 1].clone();
+                let new_path = fields[index + 2].clone();
+                statuses.insert(new_path.clone(), DiffFileStatus::Renamed);
+                from_for_new.insert(new_path, old_path);
+                index += 3;
+                continue;
+            }
+            if index + 1 >= fields.len() {
+                break;
+            }
             let path = fields[index + 1].clone();
             statuses.insert(path, status_kind(&code));
             index += 2;
@@ -910,12 +1013,32 @@ impl CheckpointStore {
                 deletions: 0,
                 binary: false,
             });
-            let patch = self.diff_patch(before_tree, after_tree, &path)?;
-            let before = self.blob_bytes(before_tree, &path).ok();
+            let from_path = from_for_new.get(&path).cloned();
+            // For renames the "before" blob lives at the source path in the
+            // before_tree, while the "after" blob is at the destination in the
+            // after_tree.
+            let before_lookup = from_path.as_deref().unwrap_or(path.as_str());
+            let before = self.blob_bytes(before_tree, before_lookup).ok();
             let after = self.blob_bytes(after_tree, &path).ok();
+            let patch = match status {
+                DiffFileStatus::Renamed => match (&from_path, &before, &after) {
+                    (Some(_old), Some(_), Some(_)) => self
+                        .diff_patch_renamed(before_tree, after_tree, before_lookup, &path)
+                        .unwrap_or_else(|_| Patch {
+                            text: String::new(),
+                            truncated: false,
+                        }),
+                    _ => Patch {
+                        text: String::new(),
+                        truncated: false,
+                    },
+                },
+                _ => self.diff_patch(before_tree, after_tree, &path)?,
+            };
             files.push(CheckpointFile {
                 path,
                 status,
+                from_path,
                 before_sha256: before.as_deref().map(sha256_hex),
                 after_sha256: after.as_deref().map(sha256_hex),
                 additions: stat.additions,
@@ -982,6 +1105,26 @@ impl CheckpointStore {
                 continue;
             }
             let path = self.root.join(&file.path);
+
+            if file.status == DiffFileStatus::Renamed {
+                // Reverse a rename: remove the new path, restore the source path
+                // (whose original content is at `from_path` in the before tree).
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                }
+                result.deleted_files.push(file.path.clone());
+                if let Some(from_path) = file.from_path.as_deref()
+                    && let Ok(bytes) = self.blob_bytes(&record.before_tree, from_path)
+                {
+                    let restore_path = self.root.join(from_path);
+                    if let Some(parent) = restore_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(&restore_path, bytes)?;
+                    result.restored_files.push(from_path.to_string());
+                }
+                continue;
+            }
 
             match self.blob_bytes(&record.before_tree, &file.path) {
                 Ok(bytes) => {
@@ -1061,6 +1204,12 @@ impl CheckpointStore {
             self.git_raw(["config", "core.autocrlf", "false"])?;
             self.git_raw(["config", "core.fsmonitor", "false"])?;
             self.git_raw(["config", "core.quotepath", "false"])?;
+            // The shadow repo must not trigger user-configured hooks, GPG signing,
+            // or commit-graph regeneration: those are tied to the user's worktree
+            // semantics, not Squeezy's internal checkpoint book-keeping.
+            self.git_raw(["config", "core.hooksPath", hooks_off_value()])?;
+            self.git_raw(["config", "commit.gpgsign", "false"])?;
+            self.git_raw(["config", "core.commitGraph", "false"])?;
         }
         if !exclude_path.exists() {
             if let Some(parent) = exclude_path.parent() {
@@ -1189,6 +1338,31 @@ impl CheckpointStore {
             file.write_all(b"\n")?;
         }
         Ok(())
+    }
+
+    fn diff_patch_renamed(
+        &self,
+        before_tree: &str,
+        after_tree: &str,
+        from_path: &str,
+        to_path: &str,
+    ) -> Result<Patch> {
+        let output = self.git_vec_allow_status(
+            vec![
+                "diff".to_string(),
+                "--patch".to_string(),
+                "--no-ext-diff".to_string(),
+                "--find-renames".to_string(),
+                "--unified=3".to_string(),
+                before_tree.to_string(),
+                after_tree.to_string(),
+                "--".to_string(),
+                from_path.to_string(),
+                to_path.to_string(),
+            ],
+            &[0],
+        )?;
+        Ok(capped_patch(output.stdout, DEFAULT_MAX_PATCH_BYTES))
     }
 
     fn diff_patch(&self, before_tree: &str, after_tree: &str, path: &str) -> Result<Patch> {
@@ -1347,6 +1521,10 @@ fn checkpoint_id() -> String {
 
 fn checkpoint_ref(id: &str, side: &str) -> String {
     format!("refs/squeezy/checkpoints/{id}/{side}")
+}
+
+fn hooks_off_value() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
 fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {

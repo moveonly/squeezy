@@ -4610,3 +4610,71 @@ fn slash_parameter_hint_appears_in_render() {
         "expected parameter hint to render: {output}"
     );
 }
+
+#[test]
+fn json_patch_preview_parser_emits_events_per_patch() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    let payload = r#"{"patches":[{"path":"a.txt","search":"foo","replace":"bar","expected_sha256":"deadbeef"},{"path":"b.txt","search":"baz","replace":"qux","expected_sha256":"cafebabe"}],"plan_id":"P1"}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let mut events = Vec::new();
+    // Feed byte-by-byte to mirror the worst-case streaming cadence.
+    for byte in payload.bytes() {
+        let chunk = [byte];
+        events.extend(parser.push_delta(std::str::from_utf8(&chunk).unwrap()));
+    }
+    events.extend(parser.finish());
+
+    let patch_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, PatchPreviewEvent::Patch { .. }))
+        .collect();
+    assert_eq!(patch_events.len(), 2, "events: {events:?}");
+    match &patch_events[0] {
+        PatchPreviewEvent::Patch {
+            index,
+            path,
+            search_hash,
+            replace_hash,
+        } => {
+            assert_eq!(*index, 0);
+            assert_eq!(path, "a.txt");
+            assert!(!search_hash.is_empty());
+            assert!(!replace_hash.is_empty());
+            assert_ne!(search_hash, replace_hash);
+        }
+        _ => panic!("expected patch event"),
+    }
+    let complete = events
+        .iter()
+        .find(|e| matches!(e, PatchPreviewEvent::Complete { .. }))
+        .expect("complete event");
+    if let PatchPreviewEvent::Complete { count } = complete {
+        assert_eq!(*count, 2);
+    }
+}
+
+#[test]
+fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
+    use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+    // `search` contains an escaped double-quote — the parser must not let it
+    // close the surrounding string literal early.
+    let payload = r#"{"patches":[{"path":"a.rs","search":"println!(\"hi\");","replace":"println!(\"hello\");","expected_sha256":"x"}]}"#;
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let events = parser.push_delta(payload);
+    let patches: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            PatchPreviewEvent::Patch { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        patches,
+        vec!["a.rs".to_string()],
+        "should emit exactly one patch, got events: {events:?}"
+    );
+}

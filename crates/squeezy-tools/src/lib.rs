@@ -557,7 +557,19 @@ pub struct ToolRegistry {
     /// with their `parameters: Value` blobs every time. The cache is
     /// invalidated whenever MCP refresh changes the external tool set.
     cached_specs: Arc<StdMutex<Option<Arc<Vec<ToolSpec>>>>>,
+    /// Plans registered by `plan_patch` and consulted by `apply_patch` to enforce
+    /// the model's stated semantic neighborhood. Keyed by `plan_id`; entries
+    /// expire after [`PATCH_PLAN_TTL`].
+    patch_plans: Arc<StdMutex<HashMap<String, PatchPlan>>>,
 }
+
+#[derive(Debug, Clone)]
+struct PatchPlan {
+    neighborhood: BTreeSet<String>,
+    expires_at_ms: u128,
+}
+
+const PATCH_PLAN_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Default)]
 struct DiffSnapshotCache {
@@ -1018,6 +1030,7 @@ impl ToolRegistry {
                 state_store.clone(),
             )),
             cached_specs: Arc::new(StdMutex::new(None)),
+            patch_plans: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -1061,6 +1074,7 @@ impl ToolRegistry {
             shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
             cached_specs: Arc::new(StdMutex::new(None)),
+            patch_plans: Arc::new(StdMutex::new(HashMap::new())),
         })
     }
 
@@ -2558,6 +2572,7 @@ impl ToolRegistry {
         neighborhood.extend(owner_paths.iter().cloned());
 
         let plan_id = patch_plan_id(&call.arguments, &neighborhood);
+        self.register_patch_plan(&plan_id, &neighborhood);
         let owners = codeowner_matches(&self.root, &neighborhood);
         let locality = patch_locality_json(&candidate_paths, &neighborhood);
         let mut payload = graph_payload("plan_patch", manager, &refresh);
@@ -4760,7 +4775,29 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        if args.patches.is_empty() {
+        if !args.patches.is_empty() && !args.operations.is_empty() {
+            return tool_error(
+                call,
+                "apply_patch accepts either `patches` (legacy) or `operations`, not both",
+            );
+        }
+        let raw_ops: Vec<ApplyPatchOperation> = if !args.operations.is_empty() {
+            args.operations.clone()
+        } else {
+            args.patches
+                .iter()
+                .cloned()
+                .map(|patch| ApplyPatchOperation::SearchReplace {
+                    path: patch.path,
+                    search: patch.search,
+                    replace: patch.replace,
+                    expected_sha256: patch.expected_sha256,
+                    allow_multiple: patch.allow_multiple,
+                    fallback: patch.fallback,
+                })
+                .collect()
+        };
+        if raw_ops.is_empty() {
             return make_result(
                 call,
                 ToolStatus::Error,
@@ -4769,7 +4806,7 @@ impl ToolRegistry {
                 None,
             );
         }
-        if args.patches.len() > MAX_PATCH_BLOCKS {
+        if raw_ops.len() > MAX_PATCH_BLOCKS {
             return make_result(
                 call,
                 ToolStatus::Error,
@@ -4783,209 +4820,146 @@ impl ToolRegistry {
 
         let dry_run = args.dry_run.unwrap_or(false);
         let impact_paths = normalized_path_set(args.impact_paths.as_deref().unwrap_or(&[]));
-        let patch_paths = normalized_path_set(
-            &args
-                .patches
-                .iter()
-                .map(|patch| patch.path.clone())
-                .collect::<Vec<_>>(),
-        );
+        // Collect every workspace-relative path each op touches (for locality,
+        // plan-binding, and secret-path checks).
+        let touched_paths: Vec<String> = raw_ops
+            .iter()
+            .flat_map(|op| match op {
+                ApplyPatchOperation::SearchReplace { path, .. }
+                | ApplyPatchOperation::CreateFile { path, .. }
+                | ApplyPatchOperation::DeleteFile { path, .. } => vec![path.clone()],
+                ApplyPatchOperation::MoveFile { from, to, .. } => vec![from.clone(), to.clone()],
+            })
+            .collect();
+        let patch_paths = normalized_path_set(&touched_paths);
         let locality = patch_locality_json(&patch_paths, &impact_paths);
         let warnings = patch_locality_warnings(&patch_paths, &impact_paths);
-        let mut files: BTreeMap<String, PatchFileState> = BTreeMap::new();
-        let mut operations = Vec::new();
 
-        for (index, patch) in args.patches.iter().enumerate() {
-            if let Err(err) =
-                safety::assess_write_path(&patch.path, &self.root, &self.shell_sandbox)
-            {
+        // Plan-binding (F84): every touched path must intersect the plan's
+        // neighborhood, unless the caller explicitly opts out.
+        if let Some(plan_id) = args.plan_id.as_deref()
+            && let Some(plan) = self.lookup_patch_plan(plan_id)
+            && !args.confirm_outside_plan
+        {
+            let outside: Vec<String> = patch_paths
+                .iter()
+                .filter(|path| !plan.neighborhood.contains(*path))
+                .cloned()
+                .collect();
+            if !outside.is_empty() {
                 return make_result(
                     call,
-                    ToolStatus::Denied,
+                    ToolStatus::Stale,
                     json!({
-                        "error": err.message(),
-                        "path": patch.path,
-                        "reason": err.code(),
-                        "permission_denied": true,
-                        "policy_denied": true,
+                        "error": format!(
+                            "patch escapes plan_id {plan_id} neighborhood; pass confirm_outside_plan=true to override"
+                        ),
+                        "plan_id": plan_id,
+                        "outside_paths": outside,
+                        "neighborhood": plan.neighborhood.iter().cloned().collect::<Vec<_>>(),
                     }),
                     ToolCostHint::default(),
                     None,
                 );
             }
-            if patch.search.is_empty() {
-                return make_result(
-                    call,
-                    ToolStatus::Error,
-                    json!({
-                        "error": "search text must not be empty",
-                        "patch_index": index,
-                        "path": patch.path,
-                    }),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
-            let path = match self.resolve_existing(&patch.path) {
-                Ok(path) => path,
-                Err(err) => {
+        }
+
+        // Sandbox + secret + protected-metadata block — applied per-op so the
+        // legacy patches[] and new operations[] shapes share one safety floor.
+        for op in &raw_ops {
+            let op_paths: Vec<String> = match op {
+                ApplyPatchOperation::SearchReplace { path, .. }
+                | ApplyPatchOperation::CreateFile { path, .. }
+                | ApplyPatchOperation::DeleteFile { path, .. } => vec![path.clone()],
+                ApplyPatchOperation::MoveFile { from, to, .. } => {
+                    vec![from.clone(), to.clone()]
+                }
+            };
+            for rel in &op_paths {
+                if let Err(err) = safety::assess_write_path(rel, &self.root, &self.shell_sandbox) {
                     return make_result(
                         call,
-                        ToolStatus::Error,
+                        ToolStatus::Denied,
                         json!({
-                            "error": format!("search-replace patches require an existing file: {err}"),
-                            "path": patch.path,
+                            "error": err.message(),
+                            "path": rel,
+                            "reason": err.code(),
+                            "permission_denied": true,
+                            "policy_denied": true,
                         }),
                         ToolCostHint::default(),
                         None,
                     );
                 }
-            };
-            let rel = self.relative(&path).to_string_lossy().replace('\\', "/");
-            if is_secret_path(Path::new(&rel))
-                || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                let absolute = self.root.join(rel);
+                if is_secret_path(Path::new(rel))
+                    || safety::path_targets_protected_metadata(
+                        &absolute,
+                        &self.root,
+                        &self.shell_sandbox,
+                    )
                     .is_some()
-            {
-                return make_result(
-                    call,
-                    ToolStatus::Denied,
-                    json!({
-                        "error": "refusing to patch a likely secret or protected metadata file",
-                        "path": rel,
-                        "permission_denied": true,
-                        "policy_denied": true,
-                    }),
-                    ToolCostHint::default(),
-                    None,
-                );
-            }
-            let state = match files.entry(rel.clone()) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    let before = match fs::read_to_string(&path) {
-                        Ok(content) => content,
-                        Err(err) => {
-                            return tool_error(
-                                call,
-                                format!("failed to read text file {rel}: {err}"),
-                            );
-                        }
-                    };
-                    let before_sha256 = sha256_hex(before.as_bytes());
-                    entry.insert(PatchFileState {
-                        path,
-                        before: before.clone(),
-                        current: before,
-                        before_sha256,
-                    })
-                }
-            };
-            match patch.expected_sha256.as_deref() {
-                Some(expected) if expected == state.before_sha256 => {}
-                Some(_) => {
+                {
                     return make_result(
                         call,
-                        ToolStatus::Stale,
+                        ToolStatus::Denied,
                         json!({
-                            "error": "expected_sha256 does not match current file",
+                            "error": "refusing to patch a likely secret or protected metadata file",
                             "path": rel,
-                            "current_sha256": state.before_sha256,
+                            "permission_denied": true,
+                            "policy_denied": true,
                         }),
                         ToolCostHint::default(),
-                        Some(state.before_sha256.clone()),
-                    );
-                }
-                None => {
-                    return make_result(
-                        call,
-                        ToolStatus::Stale,
-                        json!({
-                            "error": "expected_sha256 is required for search-replace patches",
-                            "path": rel,
-                            "current_sha256": state.before_sha256,
-                        }),
-                        ToolCostHint::default(),
-                        Some(state.before_sha256.clone()),
+                        None,
                     );
                 }
             }
-
-            let matches = state.current.match_indices(&patch.search).count();
-            if matches == 0 {
-                return make_result(
-                    call,
-                    ToolStatus::Stale,
-                    json!({
-                        "error": "search text was not found",
-                        "path": rel,
-                        "patch_index": index,
-                    }),
-                    ToolCostHint::default(),
-                    Some(state.before_sha256.clone()),
-                );
-            }
-            let allow_multiple = patch.allow_multiple.unwrap_or(false);
-            if matches > 1 && !allow_multiple {
-                return make_result(
-                    call,
-                    ToolStatus::Stale,
-                    json!({
-                        "error": "search text matched more than once; narrow the search text or set allow_multiple=true to replace all matches",
-                        "path": rel,
-                        "patch_index": index,
-                        "matches": matches,
-                        "match_contexts": patch_match_contexts(&state.current, &patch.search, 5),
-                    }),
-                    ToolCostHint::default(),
-                    Some(state.before_sha256.clone()),
-                );
-            }
-
-            let before_len = state.current.len();
-            state.current = if allow_multiple {
-                state.current.replace(&patch.search, &patch.replace)
-            } else {
-                state.current.replacen(&patch.search, &patch.replace, 1)
-            };
-            let after_len = state.current.len();
-            operations.push(json!({
-                "patch_index": index,
-                "path": rel,
-                "matches": matches,
-                "allow_multiple": allow_multiple,
-                "bytes_delta": after_len as i64 - before_len as i64,
-                "preview": {
-                    "search": truncate_text(&patch.search, PATCH_SNIPPET_MAX_CHARS),
-                    "replace": truncate_text(&patch.replace, PATCH_SNIPPET_MAX_CHARS),
-                }
-            }));
         }
 
-        let mut changed_files = Vec::new();
-        let mut bytes_read = 0u64;
-        let mut bytes_written = 0u64;
-        for (rel, state) in &files {
-            bytes_read += state.before.len() as u64;
-            bytes_written += state.current.len() as u64;
-            changed_files.push(json!({
-                "path": rel,
-                "before_sha256": state.before_sha256,
-                "after_sha256": sha256_hex(state.current.as_bytes()),
-                "bytes_before": state.before.len(),
-                "bytes_after": state.current.len(),
-                "changed": state.before != state.current,
-            }));
+        // Capture the checkpoint snapshot before validation. The
+        // `unified_diff` fallback (F89) shells out to `git apply` during
+        // validation, which mutates the worktree directly — without an
+        // up-front snapshot the post-mutation tree would be both the
+        // "before" and "after" and no checkpoint would record the change.
+        let checkpoint_before = if dry_run {
+            None
+        } else {
+            match self.track_checkpoint_tree() {
+                Ok(snapshot) => snapshot,
+                Err(err) => return tool_error(call, err),
+            }
+        };
+
+        // Stage every op in memory. We materialise the final intended state for
+        // each file path so the write phase can be a simple "write final
+        // contents" loop, and so dry-run can preview without touching disk.
+        let mut staged = StagedApply::default();
+        let mut preview_ops = Vec::new();
+        for (index, op) in raw_ops.iter().enumerate() {
+            match self.stage_apply_patch_op(call, index, op, &mut staged, &mut preview_ops) {
+                Ok(()) => {}
+                Err(result) => return result,
+            }
         }
+
+        let changed_files = staged.changed_files_json();
+        let bytes_read = staged.bytes_read();
+        let bytes_written = staged.bytes_written();
 
         if dry_run {
             let content = json!({
                 "dry_run": true,
                 "plan_id": args.plan_id,
                 "patch_format": "search_replace",
-                "operations": operations,
+                "operations": preview_ops,
                 "files": changed_files,
                 "locality": locality,
                 "warnings": warnings,
+                "applied_delta": {
+                    "exact": true,
+                    "operations": staged
+                        .delta_preview_json(false)
+                },
             });
             return make_result(
                 call,
@@ -5000,35 +4974,39 @@ impl ToolRegistry {
             );
         }
 
-        let checkpoint_before = match self.track_checkpoint_tree() {
-            Ok(snapshot) => snapshot,
-            Err(err) => return tool_error(call, err),
-        };
-        let mut write_failure: Option<(String, String)> = None;
-        for state in files.values() {
-            if state.before == state.current {
+        let mut applied_delta = Vec::with_capacity(staged.ops.len());
+        let mut write_failure: Option<(String, String, usize)> = None;
+        let mut written: BTreeSet<usize> = BTreeSet::new();
+        for (idx, op) in staged.ops.iter().enumerate() {
+            if write_failure.is_some() {
+                applied_delta.push(op.delta_json_with_index("skipped", idx));
                 continue;
             }
-            if let Err(err) = fs::write(&state.path, state.current.as_bytes()) {
-                let rel = self
-                    .relative(&state.path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                write_failure = Some((rel, err.to_string()));
-                break;
+            match op.apply(&staged.files, &mut written) {
+                Ok(()) => applied_delta.push(op.delta_json_with_index("applied", idx)),
+                Err(err) => {
+                    applied_delta.push(op.delta_json_with_index("failed", idx));
+                    write_failure = Some((op.primary_path().to_string(), err.to_string(), idx));
+                }
             }
         }
         self.invalidate_diff_cache();
-        if let Some((failed_path, error)) = write_failure {
+        let exact_delta = write_failure.is_none();
+
+        if let Some((failed_path, error, _idx)) = write_failure {
             let mut error_content = json!({
-                "error": format!("failed to write {failed_path}: {error}"),
+                "error": format!("failed to apply op at {failed_path}: {error}"),
                 "failed_path": failed_path,
                 "plan_id": args.plan_id,
                 "patch_format": "search_replace",
-                "operations": operations,
+                "operations": preview_ops,
                 "files": changed_files,
                 "locality": locality,
                 "warnings": warnings,
+                "applied_delta": {
+                    "exact": exact_delta,
+                    "operations": applied_delta,
+                },
             });
             self.append_checkpoint_to_content(
                 &mut error_content,
@@ -5054,10 +5032,14 @@ impl ToolRegistry {
             "dry_run": false,
             "plan_id": args.plan_id,
             "patch_format": "search_replace",
-            "operations": operations,
+            "operations": preview_ops,
             "files": changed_files,
             "locality": locality,
             "warnings": warnings,
+            "applied_delta": {
+                "exact": exact_delta,
+                "operations": applied_delta,
+            },
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -5078,6 +5060,477 @@ impl ToolRegistry {
             },
             None,
         )
+    }
+
+    /// Validate a single operation and append it to the staged plan. On any
+    /// validation failure, the returned `Err` is the final tool result the
+    /// caller should return verbatim — no writes have happened yet.
+    #[allow(clippy::result_large_err)]
+    fn stage_apply_patch_op(
+        &self,
+        call: &ToolCall,
+        index: usize,
+        op: &ApplyPatchOperation,
+        staged: &mut StagedApply,
+        preview_ops: &mut Vec<Value>,
+    ) -> std::result::Result<(), ToolResult> {
+        match op {
+            ApplyPatchOperation::SearchReplace {
+                path,
+                search,
+                replace,
+                expected_sha256,
+                allow_multiple,
+                fallback,
+            } => {
+                if search.is_empty() {
+                    return Err(make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({
+                            "error": "search text must not be empty",
+                            "patch_index": index,
+                            "path": path,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    ));
+                }
+                let abs_path = self.resolve_existing(path).map_err(|err| {
+                    make_result(
+                        call,
+                        ToolStatus::Error,
+                        json!({
+                            "error": format!("search-replace patches require an existing file: {err}"),
+                            "path": path,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    )
+                })?;
+                let rel = self
+                    .relative(&abs_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+
+                let file_idx = staged
+                    .ensure_search_replace(&rel, &abs_path)
+                    .map_err(|err| {
+                        tool_error(call, format!("failed to read text file {rel}: {err}"))
+                    })?;
+                let state = &mut staged.files[file_idx];
+                let before_sha256 = state.before_sha256.clone();
+                match expected_sha256.as_deref() {
+                    Some(expected) if expected == before_sha256 => {}
+                    Some(_) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 does not match current file",
+                                "path": rel,
+                                "current_sha256": before_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                    None => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 is required for search-replace patches",
+                                "path": rel,
+                                "current_sha256": before_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                }
+                let matches = state.current.match_indices(search.as_str()).count();
+                if matches == 0 {
+                    // Optional unified-diff fallback (F89): the search body is
+                    // a unified diff; preflight against the live worktree, and
+                    // if it would apply, materialise the result by reading the
+                    // file after a real `git apply --3way`. The sha256 gate
+                    // remains in place because we still recompute hashes.
+                    if matches!(fallback, Some(SearchReplaceFallback::UnifiedDiff)) {
+                        match self.vcs.apply_unified_diff(search) {
+                            Ok(outcome) if outcome.applied => {
+                                // Re-read after git apply mutated the file in
+                                // place; treat as authoritative new content.
+                                let new_contents = match fs::read_to_string(&abs_path) {
+                                    Ok(text) => text,
+                                    Err(err) => {
+                                        return Err(tool_error(
+                                            call,
+                                            format!(
+                                                "unified-diff fallback applied but file unreadable: {err}"
+                                            ),
+                                        ));
+                                    }
+                                };
+                                state.current = new_contents;
+                                preview_ops.push(json!({
+                                    "patch_index": index,
+                                    "kind": "search_replace",
+                                    "path": rel,
+                                    "fallback": "unified_diff",
+                                    "applied_via": "git_apply_3way",
+                                }));
+                                return Ok(());
+                            }
+                            Ok(outcome) => {
+                                return Err(make_result(
+                                    call,
+                                    ToolStatus::Stale,
+                                    json!({
+                                        "error": "unified-diff fallback could not apply cleanly",
+                                        "path": rel,
+                                        "patch_index": index,
+                                        "conflicted_paths": outcome.conflicted_paths,
+                                        "skipped_paths": outcome.skipped_paths,
+                                        "stderr": outcome.stderr,
+                                    }),
+                                    ToolCostHint::default(),
+                                    Some(before_sha256),
+                                ));
+                            }
+                            Err(err) => {
+                                return Err(make_result(
+                                    call,
+                                    ToolStatus::Stale,
+                                    json!({
+                                        "error": format!(
+                                            "unified-diff fallback invocation failed: {err}"
+                                        ),
+                                        "path": rel,
+                                        "patch_index": index,
+                                    }),
+                                    ToolCostHint::default(),
+                                    Some(before_sha256),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "search text was not found",
+                            "path": rel,
+                            "patch_index": index,
+                        }),
+                        ToolCostHint::default(),
+                        Some(before_sha256),
+                    ));
+                }
+                let allow_multi = allow_multiple.unwrap_or(false);
+                if matches > 1 && !allow_multi {
+                    return Err(make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "search text matched more than once; narrow the search text or set allow_multiple=true to replace all matches",
+                            "path": rel,
+                            "patch_index": index,
+                            "matches": matches,
+                            "match_contexts": patch_match_contexts(&state.current, search, 5),
+                        }),
+                        ToolCostHint::default(),
+                        Some(before_sha256),
+                    ));
+                }
+                let before_len = state.current.len();
+                state.current = if allow_multi {
+                    state.current.replace(search.as_str(), replace.as_str())
+                } else {
+                    state.current.replacen(search.as_str(), replace.as_str(), 1)
+                };
+                let after_len = state.current.len();
+                preview_ops.push(json!({
+                    "patch_index": index,
+                    "kind": "search_replace",
+                    "path": rel,
+                    "matches": matches,
+                    "allow_multiple": allow_multi,
+                    "bytes_delta": after_len as i64 - before_len as i64,
+                    "preview": {
+                        "search": truncate_text(search, PATCH_SNIPPET_MAX_CHARS),
+                        "replace": truncate_text(replace, PATCH_SNIPPET_MAX_CHARS),
+                    }
+                }));
+                Ok(())
+            }
+            ApplyPatchOperation::CreateFile {
+                path,
+                contents,
+                expected_absent,
+            } => {
+                let abs_path = match self.resolve_for_write(path) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Error,
+                            json!({
+                                "error": format!("invalid create_file path: {err}"),
+                                "path": path,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        ));
+                    }
+                };
+                let rel = self
+                    .relative(&abs_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let expect_absent = expected_absent.unwrap_or(true);
+                if expect_absent && abs_path.exists() {
+                    return Err(make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "create_file target already exists",
+                            "path": rel,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    ));
+                }
+                staged.push_create(rel.clone(), abs_path, contents.clone());
+                preview_ops.push(json!({
+                    "patch_index": index,
+                    "kind": "create_file",
+                    "path": rel,
+                    "bytes_after": contents.len(),
+                }));
+                Ok(())
+            }
+            ApplyPatchOperation::DeleteFile {
+                path,
+                expected_sha256,
+            } => {
+                let abs_path = match self.resolve_existing(path) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Error,
+                            json!({
+                                "error": format!("delete_file target missing: {err}"),
+                                "path": path,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        ));
+                    }
+                };
+                let rel = self
+                    .relative(&abs_path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let existing = match fs::read(&abs_path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        return Err(tool_error(
+                            call,
+                            format!("failed to read delete target {rel}: {err}"),
+                        ));
+                    }
+                };
+                let current_sha256 = sha256_hex(&existing);
+                match expected_sha256.as_deref() {
+                    Some(expected) if expected == current_sha256 => {}
+                    Some(_) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 does not match current file",
+                                "path": rel,
+                                "current_sha256": current_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(current_sha256),
+                        ));
+                    }
+                    None => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 is required for delete_file",
+                                "path": rel,
+                                "current_sha256": current_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(current_sha256),
+                        ));
+                    }
+                }
+                staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
+                preview_ops.push(json!({
+                    "patch_index": index,
+                    "kind": "delete_file",
+                    "path": rel,
+                }));
+                Ok(())
+            }
+            ApplyPatchOperation::MoveFile {
+                from,
+                to,
+                expected_sha256,
+                post_replace,
+            } => {
+                let abs_from = match self.resolve_existing(from) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Error,
+                            json!({
+                                "error": format!("move_file source missing: {err}"),
+                                "path": from,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        ));
+                    }
+                };
+                let abs_to = match self.resolve_for_write(to) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Error,
+                            json!({
+                                "error": format!("invalid move_file destination: {err}"),
+                                "path": to,
+                            }),
+                            ToolCostHint::default(),
+                            None,
+                        ));
+                    }
+                };
+                let rel_from = self
+                    .relative(&abs_from)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let rel_to = self.relative(&abs_to).to_string_lossy().replace('\\', "/");
+                if abs_to.exists() {
+                    return Err(make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "move_file destination already exists",
+                            "from": rel_from,
+                            "to": rel_to,
+                        }),
+                        ToolCostHint::default(),
+                        None,
+                    ));
+                }
+                let contents = match fs::read_to_string(&abs_from) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        return Err(tool_error(
+                            call,
+                            format!("failed to read move source {rel_from}: {err}"),
+                        ));
+                    }
+                };
+                let before_sha256 = sha256_hex(contents.as_bytes());
+                match expected_sha256.as_deref() {
+                    Some(expected) if expected == before_sha256 => {}
+                    Some(_) => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 does not match source",
+                                "path": rel_from,
+                                "current_sha256": before_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                    None => {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "expected_sha256 is required for move_file",
+                                "path": rel_from,
+                                "current_sha256": before_sha256,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                }
+                let mut final_contents = contents.clone();
+                if let Some(post) = post_replace {
+                    let matches = final_contents.match_indices(post.search.as_str()).count();
+                    if matches == 0 {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "post_replace.search text was not found in move source",
+                                "from": rel_from,
+                                "to": rel_to,
+                                "patch_index": index,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                    let allow_multi = post.allow_multiple.unwrap_or(false);
+                    if matches > 1 && !allow_multi {
+                        return Err(make_result(
+                            call,
+                            ToolStatus::Stale,
+                            json!({
+                                "error": "post_replace.search matched more than once; narrow it or set allow_multiple=true",
+                                "from": rel_from,
+                                "to": rel_to,
+                                "patch_index": index,
+                                "matches": matches,
+                            }),
+                            ToolCostHint::default(),
+                            Some(before_sha256),
+                        ));
+                    }
+                    final_contents = if allow_multi {
+                        final_contents.replace(post.search.as_str(), post.replace.as_str())
+                    } else {
+                        final_contents.replacen(post.search.as_str(), post.replace.as_str(), 1)
+                    };
+                }
+                staged.push_move(
+                    rel_from.clone(),
+                    abs_from,
+                    rel_to.clone(),
+                    abs_to,
+                    contents,
+                    final_contents,
+                    before_sha256,
+                );
+                preview_ops.push(json!({
+                    "patch_index": index,
+                    "kind": "move_file",
+                    "from": rel_from,
+                    "to": rel_to,
+                    "post_replace": post_replace.is_some(),
+                }));
+                Ok(())
+            }
+        }
     }
 
     async fn execute_verify(
@@ -6285,6 +6738,30 @@ impl ToolRegistry {
             .as_ref()
             .map(|checkpoints| checkpoints.track_tree())
             .transpose()
+    }
+
+    fn register_patch_plan(&self, plan_id: &str, neighborhood: &BTreeSet<String>) {
+        let now = unix_timestamp_millis(SystemTime::now());
+        let expires_at_ms = now.saturating_add(PATCH_PLAN_TTL.as_millis());
+        let Ok(mut plans) = self.patch_plans.lock() else {
+            return;
+        };
+        // Purge expired entries on insert to keep the map bounded.
+        plans.retain(|_, plan| plan.expires_at_ms > now);
+        plans.insert(
+            plan_id.to_string(),
+            PatchPlan {
+                neighborhood: neighborhood.clone(),
+                expires_at_ms,
+            },
+        );
+    }
+
+    fn lookup_patch_plan(&self, plan_id: &str) -> Option<PatchPlan> {
+        let now = unix_timestamp_millis(SystemTime::now());
+        let mut plans = self.patch_plans.lock().ok()?;
+        plans.retain(|_, plan| plan.expires_at_ms > now);
+        plans.get(plan_id).cloned()
     }
 
     fn append_checkpoint_to_content(
@@ -8784,18 +9261,71 @@ struct WriteFileArgs {
 
 #[derive(Debug, Deserialize)]
 struct ApplyPatchArgs {
+    #[serde(default)]
     patches: Vec<SearchReplacePatch>,
+    #[serde(default)]
+    operations: Vec<ApplyPatchOperation>,
     impact_paths: Option<Vec<String>>,
     plan_id: Option<String>,
     dry_run: Option<bool>,
+    #[serde(default)]
+    confirm_outside_plan: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct SearchReplacePatch {
     path: String,
     search: String,
     replace: String,
     expected_sha256: Option<String>,
+    allow_multiple: Option<bool>,
+    #[serde(default)]
+    fallback: Option<SearchReplaceFallback>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SearchReplaceFallback {
+    UnifiedDiff,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ApplyPatchOperation {
+    SearchReplace {
+        path: String,
+        search: String,
+        replace: String,
+        expected_sha256: Option<String>,
+        #[serde(default)]
+        allow_multiple: Option<bool>,
+        #[serde(default)]
+        fallback: Option<SearchReplaceFallback>,
+    },
+    CreateFile {
+        path: String,
+        contents: String,
+        #[serde(default)]
+        expected_absent: Option<bool>,
+    },
+    DeleteFile {
+        path: String,
+        expected_sha256: Option<String>,
+    },
+    MoveFile {
+        from: String,
+        to: String,
+        expected_sha256: Option<String>,
+        #[serde(default)]
+        post_replace: Option<PostMoveReplace>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct PostMoveReplace {
+    search: String,
+    replace: String,
+    #[serde(default)]
     allow_multiple: Option<bool>,
 }
 
@@ -8997,6 +9527,7 @@ fn diff_status_str(status: DiffFileStatus) -> &'static str {
         DiffFileStatus::Added => "added",
         DiffFileStatus::Deleted => "deleted",
         DiffFileStatus::Modified => "modified",
+        DiffFileStatus::Renamed => "renamed",
     }
 }
 
@@ -9319,9 +9850,324 @@ fn window_line_offset(path: &Path, offset: usize) -> std::result::Result<u32, st
 #[derive(Debug)]
 struct PatchFileState {
     path: PathBuf,
+    rel: String,
     before: String,
     current: String,
     before_sha256: String,
+}
+
+/// Pending changes accumulated during validation. Each entry corresponds to a
+/// single op the model issued; the final `apply_*` methods on `StagedOp` are
+/// what actually mutate disk during the commit phase.
+#[derive(Debug, Default)]
+struct StagedApply {
+    files: Vec<PatchFileState>,
+    file_index: BTreeMap<String, usize>,
+    ops: Vec<StagedOp>,
+}
+
+#[derive(Debug)]
+enum StagedOp {
+    SearchReplace {
+        rel: String,
+        file_index: usize,
+    },
+    CreateFile {
+        rel: String,
+        abs_path: PathBuf,
+        contents: String,
+    },
+    DeleteFile {
+        rel: String,
+        abs_path: PathBuf,
+        before_sha256: String,
+        before_len: usize,
+    },
+    MoveFile {
+        rel_from: String,
+        abs_from: PathBuf,
+        rel_to: String,
+        abs_to: PathBuf,
+        before_contents: String,
+        after_contents: String,
+        before_sha256: String,
+    },
+}
+
+impl StagedApply {
+    fn ensure_search_replace(&mut self, rel: &str, abs_path: &Path) -> std::io::Result<usize> {
+        if let Some(&idx) = self.file_index.get(rel) {
+            // Re-use the existing file entry, and only push a fresh op so the
+            // apply phase still tracks each search/replace as a distinct op
+            // for `applied_delta`. The op's file_index points into `files`.
+            self.ops.push(StagedOp::SearchReplace {
+                rel: rel.to_string(),
+                file_index: idx,
+            });
+            return Ok(idx);
+        }
+        let before = fs::read_to_string(abs_path)?;
+        let before_sha256 = sha256_hex(before.as_bytes());
+        self.files.push(PatchFileState {
+            path: abs_path.to_path_buf(),
+            rel: rel.to_string(),
+            before: before.clone(),
+            current: before,
+            before_sha256,
+        });
+        let idx = self.files.len() - 1;
+        self.file_index.insert(rel.to_string(), idx);
+        self.ops.push(StagedOp::SearchReplace {
+            rel: rel.to_string(),
+            file_index: idx,
+        });
+        Ok(idx)
+    }
+
+    fn push_create(&mut self, rel: String, abs_path: PathBuf, contents: String) {
+        self.ops.push(StagedOp::CreateFile {
+            rel,
+            abs_path,
+            contents,
+        });
+    }
+
+    fn push_delete(
+        &mut self,
+        rel: String,
+        abs_path: PathBuf,
+        before_sha256: String,
+        before_len: usize,
+    ) {
+        self.ops.push(StagedOp::DeleteFile {
+            rel,
+            abs_path,
+            before_sha256,
+            before_len,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_move(
+        &mut self,
+        rel_from: String,
+        abs_from: PathBuf,
+        rel_to: String,
+        abs_to: PathBuf,
+        before_contents: String,
+        after_contents: String,
+        before_sha256: String,
+    ) {
+        self.ops.push(StagedOp::MoveFile {
+            rel_from,
+            abs_from,
+            rel_to,
+            abs_to,
+            before_contents,
+            after_contents,
+            before_sha256,
+        });
+    }
+
+    fn bytes_read(&self) -> u64 {
+        let from_files: u64 = self.files.iter().map(|f| f.before.len() as u64).sum();
+        let from_ops: u64 = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                StagedOp::DeleteFile { before_len, .. } => *before_len as u64,
+                StagedOp::MoveFile {
+                    before_contents, ..
+                } => before_contents.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        from_files + from_ops
+    }
+
+    fn bytes_written(&self) -> u64 {
+        let from_files: u64 = self.files.iter().map(|f| f.current.len() as u64).sum();
+        let from_ops: u64 = self
+            .ops
+            .iter()
+            .map(|op| match op {
+                StagedOp::CreateFile { contents, .. } => contents.len() as u64,
+                StagedOp::MoveFile { after_contents, .. } => after_contents.len() as u64,
+                _ => 0,
+            })
+            .sum();
+        from_files + from_ops
+    }
+
+    fn changed_files_json(&self) -> Vec<Value> {
+        let mut out = Vec::new();
+        for state in &self.files {
+            out.push(json!({
+                "path": state.rel,
+                "before_sha256": state.before_sha256,
+                "after_sha256": sha256_hex(state.current.as_bytes()),
+                "bytes_before": state.before.len(),
+                "bytes_after": state.current.len(),
+                "changed": state.before != state.current,
+            }));
+        }
+        for op in &self.ops {
+            match op {
+                StagedOp::CreateFile { rel, contents, .. } => out.push(json!({
+                    "path": rel,
+                    "before_sha256": Value::Null,
+                    "after_sha256": sha256_hex(contents.as_bytes()),
+                    "bytes_before": 0,
+                    "bytes_after": contents.len(),
+                    "changed": true,
+                })),
+                StagedOp::DeleteFile {
+                    rel,
+                    before_sha256,
+                    before_len,
+                    ..
+                } => out.push(json!({
+                    "path": rel,
+                    "before_sha256": before_sha256,
+                    "after_sha256": Value::Null,
+                    "bytes_before": before_len,
+                    "bytes_after": 0,
+                    "changed": true,
+                })),
+                StagedOp::MoveFile {
+                    rel_from,
+                    rel_to,
+                    before_contents,
+                    after_contents,
+                    before_sha256,
+                    ..
+                } => out.push(json!({
+                    "path": rel_to,
+                    "from_path": rel_from,
+                    "before_sha256": before_sha256,
+                    "after_sha256": sha256_hex(after_contents.as_bytes()),
+                    "bytes_before": before_contents.len(),
+                    "bytes_after": after_contents.len(),
+                    "changed": true,
+                })),
+                StagedOp::SearchReplace { .. } => {}
+            }
+        }
+        out
+    }
+
+    fn delta_preview_json(&self, _applied: bool) -> Vec<Value> {
+        self.ops
+            .iter()
+            .enumerate()
+            .map(|(idx, op)| op.delta_json_with_index("staged", idx))
+            .collect()
+    }
+}
+
+impl StagedOp {
+    fn primary_path(&self) -> &str {
+        match self {
+            StagedOp::SearchReplace { rel, .. } => rel,
+            StagedOp::CreateFile { rel, .. } => rel,
+            StagedOp::DeleteFile { rel, .. } => rel,
+            StagedOp::MoveFile { rel_to, .. } => rel_to,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            StagedOp::SearchReplace { .. } => "search_replace",
+            StagedOp::CreateFile { .. } => "create_file",
+            StagedOp::DeleteFile { .. } => "delete_file",
+            StagedOp::MoveFile { .. } => "move_file",
+        }
+    }
+
+    fn delta_json_with_index(&self, status: &str, index_hint: usize) -> Value {
+        let mut value = json!({
+            "kind": self.kind(),
+            "status": status,
+            "path": self.primary_path(),
+        });
+        if index_hint != usize::MAX
+            && let Some(obj) = value.as_object_mut()
+        {
+            obj.insert("patch_index".to_string(), json!(index_hint));
+        }
+        if let Some(obj) = value.as_object_mut() {
+            match self {
+                StagedOp::SearchReplace { .. } => {}
+                StagedOp::CreateFile { contents, .. } => {
+                    obj.insert(
+                        "after_sha256".to_string(),
+                        json!(sha256_hex(contents.as_bytes())),
+                    );
+                }
+                StagedOp::DeleteFile { before_sha256, .. } => {
+                    obj.insert("before_sha256".to_string(), json!(before_sha256));
+                }
+                StagedOp::MoveFile {
+                    rel_from,
+                    before_sha256,
+                    after_contents,
+                    ..
+                } => {
+                    obj.insert("from_path".to_string(), json!(rel_from));
+                    obj.insert("before_sha256".to_string(), json!(before_sha256));
+                    obj.insert(
+                        "after_sha256".to_string(),
+                        json!(sha256_hex(after_contents.as_bytes())),
+                    );
+                }
+            }
+        }
+        value
+    }
+
+    fn apply(
+        &self,
+        files: &[PatchFileState],
+        written: &mut BTreeSet<usize>,
+    ) -> std::io::Result<()> {
+        match self {
+            StagedOp::SearchReplace { file_index, .. } => {
+                if written.contains(file_index) {
+                    return Ok(());
+                }
+                let state = &files[*file_index];
+                if state.before == state.current {
+                    written.insert(*file_index);
+                    return Ok(());
+                }
+                fs::write(&state.path, state.current.as_bytes())?;
+                written.insert(*file_index);
+                Ok(())
+            }
+            StagedOp::CreateFile {
+                abs_path, contents, ..
+            } => {
+                if let Some(parent) = abs_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(abs_path, contents.as_bytes())
+            }
+            StagedOp::DeleteFile { abs_path, .. } => fs::remove_file(abs_path),
+            StagedOp::MoveFile {
+                abs_from,
+                abs_to,
+                after_contents,
+                ..
+            } => {
+                if let Some(parent) = abs_to.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(abs_to, after_contents.as_bytes())?;
+                fs::remove_file(abs_from)?;
+                Ok(())
+            }
+        }
+    }
 }
 
 fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {
@@ -13545,9 +14391,78 @@ fn plan_patch_spec() -> ToolSpec {
 }
 
 fn apply_patch_spec() -> ToolSpec {
+    let search_replace_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
+            "search": {"type": "string", "description": "Exact current text to replace."},
+            "replace": {"type": "string", "description": "Replacement text. Pass an empty string to delete the matched range."},
+            "expected_sha256": {"type": "string", "description": "sha256 of the file as currently on disk (from read_file/read_slice). The same on-disk hash is used for every patch block that targets the file in a single call; do not pass the post-patch hash for later blocks."},
+            "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."},
+            "fallback": {"type": "string", "enum": ["unified_diff"], "description": "Optional opt-in fallback when search misses: treat search as a unified-diff body and apply via git apply --3way."}
+        },
+        "required": ["path", "search", "replace", "expected_sha256"]
+    });
+    let create_file_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"const": "create_file"},
+            "path": {"type": "string", "description": "Workspace-relative new file path."},
+            "contents": {"type": "string", "description": "Initial file contents."},
+            "expected_absent": {"type": "boolean", "description": "Reject if the file already exists. Default true."}
+        },
+        "required": ["kind", "path", "contents"]
+    });
+    let delete_file_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"const": "delete_file"},
+            "path": {"type": "string", "description": "Workspace-relative path to delete."},
+            "expected_sha256": {"type": "string", "description": "sha256 of the file as currently on disk."}
+        },
+        "required": ["kind", "path", "expected_sha256"]
+    });
+    let move_file_item = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "kind": {"const": "move_file"},
+            "from": {"type": "string", "description": "Source workspace-relative path."},
+            "to": {"type": "string", "description": "Destination workspace-relative path. Must not exist."},
+            "expected_sha256": {"type": "string", "description": "sha256 of the source file as currently on disk."},
+            "post_replace": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "search": {"type": "string"},
+                    "replace": {"type": "string"},
+                    "allow_multiple": {"type": "boolean"}
+                },
+                "required": ["search", "replace"]
+            }
+        },
+        "required": ["kind", "from", "to", "expected_sha256"]
+    });
+    let search_replace_op = {
+        let mut value = search_replace_item.clone();
+        if let Some(obj) = value.as_object_mut()
+            && let Some(props) = obj.get_mut("properties").and_then(|p| p.as_object_mut())
+        {
+            props.insert("kind".to_string(), json!({"const": "search_replace"}));
+        }
+        if let Some(obj) = value.as_object_mut()
+            && let Some(req) = obj.get_mut("required").and_then(|r| r.as_array_mut())
+        {
+            req.insert(0, json!("kind"));
+        }
+        value
+    };
     ToolSpec {
         name: "apply_patch".to_string(),
-        description: "Apply exact search-replace patch blocks to existing workspace files after preview, stale-content checks, locality scoring, and checkpoint creation.".to_string(),
+        description: "Apply edits to the workspace as a sequence of typed operations (search_replace, create_file, delete_file, move_file). Pass either `patches` (legacy search-replace only) or `operations`, not both. Each op is sha256-gated where applicable and a single checkpoint is recorded per call.".to_string(),
         capability: PermissionCapability::Edit,
         parameters: json!({
             "type": "object",
@@ -13555,26 +14470,30 @@ fn apply_patch_spec() -> ToolSpec {
             "properties": {
                 "patches": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": MAX_PATCH_BLOCKS,
+                    "description": "Legacy shape: list of search-replace blocks (equivalent to `operations` entries with kind=search_replace).",
+                    "items": search_replace_item
+                },
+                "operations": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": MAX_PATCH_BLOCKS,
+                    "description": "Typed multi-op sequence. Each op selects one of search_replace, create_file, delete_file, move_file.",
                     "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "properties": {
-                            "path": {"type": "string", "description": "Workspace-relative path to an existing file."},
-                            "search": {"type": "string", "description": "Exact current text to replace."},
-                            "replace": {"type": "string", "description": "Replacement text. Pass an empty string to delete the matched range."},
-                            "expected_sha256": {"type": "string", "description": "sha256 of the file as currently on disk (from read_file/read_slice). The same on-disk hash is used for every patch block that targets the file in a single call; do not pass the post-patch hash for later blocks."},
-                            "allow_multiple": {"type": "boolean", "description": "When true, replace every occurrence of search. Default false requires exactly one match."}
-                        },
-                        "required": ["path", "search", "replace", "expected_sha256"]
+                        "oneOf": [
+                            search_replace_op,
+                            create_file_item,
+                            delete_file_item,
+                            move_file_item
+                        ]
                     }
                 },
                 "impact_paths": {"type": "array", "items": {"type": "string"}, "description": "Impacted neighborhood paths from plan_patch; outside paths emit warnings."},
-                "plan_id": {"type": "string", "description": "Plan id returned by plan_patch."},
+                "plan_id": {"type": "string", "description": "Plan id returned by plan_patch. When present, every touched path must lie inside the plan neighborhood unless confirm_outside_plan is true."},
+                "confirm_outside_plan": {"type": "boolean", "description": "Set true to bypass plan-binding when a touched path is outside the plan neighborhood."},
                 "dry_run": {"type": "boolean", "description": "Preview validation and replacement metadata without writing files. Default false."}
-            },
-            "required": ["patches"]
+            }
         }),
     }
 }
