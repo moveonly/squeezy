@@ -1,0 +1,26 @@
+id = "live-openai-smoke"
+title = "Live smoke against OpenAI gpt-5.4-mini"
+description = """
+End-to-end live smoke: one quick navigation prompt against the squeezy
+repo using gpt-5.4-mini to keep cost low. Requires OPENAI_API_KEY.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+model = "gpt-5.4-mini"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Name the file that defines the `Agent` struct, and one nearby pub fn on it."
+
+[expect]
+final_text_contains = ["squeezy-agent"]
+max_wall_clock_seconds = 90
+no_tool_errors = false
+
+[triage]
+enabled = false
