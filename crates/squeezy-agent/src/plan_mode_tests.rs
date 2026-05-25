@@ -34,10 +34,12 @@ fn build_mode_returns_base_verbatim() {
 }
 
 #[test]
-fn plan_mode_instructions_are_concise() {
+fn plan_mode_instructions_within_budget() {
+    // The 3-phase prompt is intentionally heavier than v2's one-liner, but
+    // still well under Codex's 4.5KB plan.md. 3500 chars is the cap.
     assert!(
-        PLAN_MODE_INSTRUCTIONS.len() <= 700,
-        "PLAN_MODE_INSTRUCTIONS length {} > 700",
+        PLAN_MODE_INSTRUCTIONS.len() <= 3500,
+        "PLAN_MODE_INSTRUCTIONS length {} > 3500",
         PLAN_MODE_INSTRUCTIONS.len()
     );
 }
@@ -53,6 +55,26 @@ fn plan_mode_tells_user_how_to_execute() {
     assert!(
         PLAN_MODE_INSTRUCTIONS.contains("Shift+Tab"),
         "PLAN_MODE_INSTRUCTIONS must reference Shift+Tab to unblock execute requests"
+    );
+}
+
+#[test]
+fn plan_mode_uses_three_phase_structure() {
+    for phase in ["PHASE 1", "PHASE 2", "PHASE 3"] {
+        assert!(
+            PLAN_MODE_INSTRUCTIONS.contains(phase),
+            "PLAN_MODE_INSTRUCTIONS missing structural label `{phase}`"
+        );
+    }
+}
+
+#[test]
+fn plan_mode_instructs_exploration_before_questions() {
+    // Codex's failure mode at v2: model asks before reading anything.
+    // The prompt must explicitly steer toward exploration first.
+    assert!(
+        PLAN_MODE_INSTRUCTIONS.contains("Read/Search"),
+        "PLAN_MODE_INSTRUCTIONS must mention the Read/Search exploration pass"
     );
 }
 

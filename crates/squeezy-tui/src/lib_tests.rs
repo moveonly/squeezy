@@ -201,19 +201,25 @@ async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
 
     assert_eq!(app.mode, SessionMode::Build);
     assert!(app.pending_plan_choice.is_none());
-    // Execute auto-submits a "begin executing the plan" prompt, which both
-    // consumes the queued handoff (so the field clears) and starts a turn
-    // the TUI is now listening to.
-    assert!(
-        app.pending_plan_handoff.is_none(),
-        "handoff is consumed by the auto-submitted execute turn"
+    // Execute auto-submits a "begin executing the plan" prompt. Under
+    // per-turn re-attach (issue 16), the handoff stays set across turns
+    // — the body is delivered on turn 1, then the lighter marker on
+    // turns 2+, until a successful apply_patch clears it. The counter
+    // advancing to 1 is the proof the body went out.
+    assert_eq!(
+        app.pending_plan_handoff.as_deref(),
+        Some(plan_path.as_path()),
+        "handoff persists for per-turn re-attach"
+    );
+    assert_eq!(
+        app.plan_handoff_turns_seen, 1,
+        "first auto-submitted turn should consume the body once"
     );
     assert!(
         app.turn_rx.is_some(),
         "Execute must start a turn so the agent actually runs the plan"
     );
     assert_eq!(app.status, "starting turn");
-    let _ = plan_path;
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -528,8 +534,8 @@ async fn build_to_plan_switch_drops_pending_handoff() {
 }
 
 #[tokio::test]
-async fn take_pending_plan_prefix_returns_labelled_contents_and_clears_field() {
-    let root = temp_workspace("plan_prefix_consume");
+async fn take_pending_plan_prefix_turn_one_returns_full_body() {
+    let root = temp_workspace("plan_prefix_turn_one");
     let plans_dir = root.join(proposed_plan::PLAN_DIR);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_path = plans_dir.join("plan-abc.md");
@@ -538,15 +544,55 @@ async fn take_pending_plan_prefix_returns_labelled_contents_and_clears_field() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
     app.pending_plan_handoff = Some(plan_path.clone());
+    app.plan_handoff_turns_seen = 0;
 
     let prefix = take_pending_plan_prefix(&mut app).expect("prefix returned");
     assert!(prefix.starts_with("[plan from previous session"));
     assert!(prefix.contains("step 1\nstep 2"));
     assert!(prefix.ends_with("[end plan]\n\n"));
-    assert!(app.pending_plan_handoff.is_none());
+    // Per-turn re-attach: handoff is NOT cleared, but counter advances.
+    assert_eq!(
+        app.pending_plan_handoff.as_deref(),
+        Some(plan_path.as_path())
+    );
+    assert_eq!(app.plan_handoff_turns_seen, 1);
 
-    // A second consume drains nothing — the prefix is one-shot.
-    assert!(take_pending_plan_prefix(&mut app).is_none());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn take_pending_plan_prefix_subsequent_turns_return_short_marker() {
+    let root = temp_workspace("plan_prefix_marker");
+    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plan_path = plans_dir.join("plan-abc.md");
+    fs::write(&plan_path, "step 1\nstep 2\n").expect("write plan");
+
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    app.pending_plan_handoff = Some(plan_path.clone());
+    // Simulate having already seen turn 1.
+    app.plan_handoff_turns_seen = 1;
+
+    let prefix = take_pending_plan_prefix(&mut app).expect("marker returned");
+    assert!(
+        prefix.contains("plan still in effect"),
+        "marker should announce continued effect; got: {prefix:?}"
+    );
+    assert!(
+        !prefix.contains("step 1"),
+        "marker must not re-include the plan body"
+    );
+    assert!(
+        prefix.contains(&plan_path.display().to_string()),
+        "marker should reference the plan path; got: {prefix:?}"
+    );
+    // Handoff still set so later turns keep getting the marker until an
+    // apply_patch (or mode switch) clears it.
+    assert_eq!(
+        app.pending_plan_handoff.as_deref(),
+        Some(plan_path.as_path())
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

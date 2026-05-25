@@ -1,7 +1,19 @@
 use super::{
-    PLAN_DIR, PLAN_RETENTION_LIMIT, ProposedPlanExtractor, persist_plan, plan_file_for,
-    plan_id_for, prune_plan_dir,
+    BUILD_PLAN_STILL_IN_EFFECT_FORMAT, PLAN_DIR, PLAN_RETENTION_LIMIT, ProposedPlanExtractor,
+    persist_plan, plan_file_for, plan_id_for, prune_plan_dir,
 };
+
+#[test]
+fn build_plan_still_in_effect_template_has_path_placeholder() {
+    assert!(
+        BUILD_PLAN_STILL_IN_EFFECT_FORMAT.contains("{path}"),
+        "BUILD_PLAN_STILL_IN_EFFECT_FORMAT must embed a {{path}} placeholder so the TUI can substitute the active plan file"
+    );
+    assert!(
+        BUILD_PLAN_STILL_IN_EFFECT_FORMAT.contains("plan still in effect"),
+        "BUILD_PLAN_STILL_IN_EFFECT_FORMAT must keep the recognisable marker"
+    );
+}
 
 #[test]
 fn passthrough_when_no_block() {

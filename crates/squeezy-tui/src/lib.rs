@@ -471,6 +471,15 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         && matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
                     {
                         app.last_turn_had_edits = true;
+                        // First successful edit after a Plan→Build handoff
+                        // means the plan is "in motion" — re-attaching it
+                        // on later Build turns is just noise. Clear the
+                        // handoff so the marker stops firing (issue 16).
+                        if app.mode == SessionMode::Build && app.pending_plan_handoff.is_some() {
+                            app.pending_plan_handoff = None;
+                            app.plan_handoff_turns_seen = 0;
+                            app.push_log("plan handoff cleared: plan is in motion".to_string());
+                        }
                     }
                     let call = app.active_tool_calls.remove(&result.call_id);
                     app.refresh_active_tool_name();
@@ -926,6 +935,7 @@ async fn apply_plan_choice(
                 }
                 if app.pending_plan_handoff.as_deref() == Some(pending.plan_path.as_path()) {
                     app.pending_plan_handoff = None;
+                    app.plan_handoff_turns_seen = 0;
                 }
             }
             Err(err) => {
@@ -3306,16 +3316,26 @@ fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
     app.turn_visual = TurnVisualState::Running;
 }
 
-/// If a Plan→Build switch queued a plan file for handoff, read it and
-/// return a labelled prefix to prepend to the next user input. Clears the
-/// pending field on success or non-recoverable failure so a stale handoff
-/// cannot leak across multiple turns. Returns `None` when nothing is
-/// queued.
+/// If a Plan→Build handoff is queued, return the prefix to prepend to the
+/// next user input. Turn 0 (the first call after Plan→Build) returns the
+/// full plan body so the model receives it verbatim; turns 1+ return a
+/// short `[plan still in effect — <path>]` marker so the plan continues
+/// to anchor the conversation without re-paying body tokens each turn
+/// (issue 16). The handoff is cleared automatically when the file is
+/// missing; routine clears (Build→Plan, discard, successful apply_patch)
+/// happen elsewhere.
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
-    let plan_path = app.pending_plan_handoff.take()?;
+    let plan_path = app.pending_plan_handoff.clone()?;
+    if app.plan_handoff_turns_seen > 0 {
+        // Subsequent turns: lightweight marker.
+        let marker = proposed_plan::BUILD_PLAN_STILL_IN_EFFECT_FORMAT
+            .replace("{path}", &plan_path.display().to_string());
+        return Some(marker);
+    }
     match std::fs::read_to_string(&plan_path) {
         Ok(body) => {
             let trimmed = body.trim_end();
+            app.plan_handoff_turns_seen = app.plan_handoff_turns_seen.saturating_add(1);
             Some(format!(
                 "[plan from previous session — {path}]\n{trimmed}\n[end plan]\n\n",
                 path = plan_path.display(),
@@ -3326,6 +3346,8 @@ fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
                 "could not read plan file {} for Build handoff: {err}",
                 compact_path(&plan_path)
             ));
+            app.pending_plan_handoff = None;
+            app.plan_handoff_turns_seen = 0;
             None
         }
     }
@@ -3367,6 +3389,9 @@ fn switch_mode(
                     let plan_path = proposed_plan::plan_file_for(&app.workspace_root, plan_id);
                     if plan_path.exists() {
                         app.pending_plan_handoff = Some(plan_path.clone());
+                        // Fresh handoff: next Build turn gets the full plan
+                        // body; turns 2+ get the lighter marker.
+                        app.plan_handoff_turns_seen = 0;
                         app.push_log(format!(
                             "plan attached for next Build turn: {}",
                             compact_path(&plan_path)
@@ -3380,6 +3405,7 @@ fn switch_mode(
                 // so the next Build entry recomputes from the current
                 // plan file instead of attaching a stale path.
                 app.pending_plan_handoff = None;
+                app.plan_handoff_turns_seen = 0;
             }
             _ => {}
         }
@@ -7862,11 +7888,18 @@ struct TuiApp {
     /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
     /// to identify which plan file is active without scanning the dir.
     current_plan_id: Option<String>,
-    /// Path to a plan file that should be prepended as starting context to
-    /// the very next Build-mode turn. Set when the user switches Plan→Build
-    /// while a plan is active; consumed and cleared by the prompt-submit
-    /// handler.
+    /// Path to a plan file that should be re-attached to upcoming Build-mode
+    /// turns. Set when the user switches Plan→Build while a plan is active.
+    /// Cleared on Build→Plan switch, on plan discard, and on the first
+    /// successful apply_patch / write_file in Build mode (the plan is "in
+    /// motion" — re-attaching it from there is just noise).
     pending_plan_handoff: Option<PathBuf>,
+    /// Number of Build-mode turns since the current `pending_plan_handoff`
+    /// was queued. Turn 0 receives the full plan body as a prefix; turns
+    /// 1+ receive a lighter `[plan still in effect — <path>]` marker so
+    /// the model is reminded the plan applies without re-paying the
+    /// body's tokens on every turn (issue 16).
+    plan_handoff_turns_seen: u32,
     /// Interactive Execute/Refine/Discard/View prompt rendered right after a
     /// `<proposed_plan>` block lands. Set once on persist; cleared by an
     /// explicit user choice. Blocks other input while present.
@@ -8008,6 +8041,7 @@ impl TuiApp {
             workspace_root: config.workspace_root.clone(),
             current_plan_id: None,
             pending_plan_handoff: None,
+            plan_handoff_turns_seen: 0,
             pending_plan_choice: None,
             task_state: None,
             mcp_status: None,

@@ -19,6 +19,14 @@ use std::path::{Path, PathBuf};
 pub(crate) const OPEN_TAG: &str = "<proposed_plan>";
 pub(crate) const CLOSE_TAG: &str = "</proposed_plan>";
 
+/// Short marker prepended to Build-mode turns 2+ after a Plan→Build
+/// handoff, while the same plan is still in effect. The full plan body
+/// goes in on turn 1 (see `take_pending_plan_prefix` in `lib.rs`); from
+/// turn 2 onward we only re-state existence so the model is reminded the
+/// plan still applies without re-paying the body's tokens each turn.
+/// `{path}` is replaced at use site with the active plan path.
+pub(crate) const BUILD_PLAN_STILL_IN_EFFECT_FORMAT: &str = "[plan still in effect — {path}]\n\n";
+
 /// Workspace-relative directory where proposed plans are persisted as
 /// markdown. Each plan body lives at `<dir>/<plan_id>.md`. Persisting
 /// per-plan-id avoids collisions when multiple sessions run against the
