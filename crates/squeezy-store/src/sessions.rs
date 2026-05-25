@@ -22,6 +22,9 @@ use squeezy_core::{
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
+/// Subdirectory under the session root that holds archived sessions.
+/// Sibling to live session ids; never used as a session id itself.
+pub const ARCHIVED_SUBDIR: &str = "archived";
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -109,6 +112,11 @@ impl SessionStore {
             if !entry.file_type()?.is_dir() {
                 continue;
             }
+            // Skip the `archived/` subdir; it isn't a session, just a
+            // sibling tree that holds the archived ones.
+            if entry.file_name() == ARCHIVED_SUBDIR {
+                continue;
+            }
             let path = entry.path().join("metadata.json");
             let Ok(text) = fs::read_to_string(path) else {
                 continue;
@@ -120,8 +128,92 @@ impl SessionStore {
                 sessions.push(metadata);
             }
         }
+        if query.include_archived || matches!(query.status, Some(SessionStatus::Archived)) {
+            let archived_root = self.root.join(ARCHIVED_SUBDIR);
+            if archived_root.exists() {
+                for entry in fs::read_dir(&archived_root)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let path = entry.path().join("metadata.json");
+                    let Ok(text) = fs::read_to_string(path) else {
+                        continue;
+                    };
+                    let Ok(metadata) = serde_json::from_str::<SessionMetadata>(&text) else {
+                        continue;
+                    };
+                    if query.matches(&metadata) {
+                        sessions.push(metadata);
+                    }
+                }
+            }
+        }
         sessions.sort_by_key(|session| std::cmp::Reverse(session.started_at_ms));
         Ok(sessions)
+    }
+
+    /// Move a session out of the live root into `archived/<id>/` and flip
+    /// its metadata status to `Archived`. Archived sessions are excluded
+    /// from `list` (unless `include_archived` is true) and skipped by
+    /// `cleanup` retention sweeps. The on-disk session id is preserved so
+    /// `unarchive_session` is symmetric.
+    pub fn archive_session(&self, session_id: &str) -> Result<()> {
+        let src = self.session_dir(session_id);
+        if !src.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "archive_session: session {session_id} not found at {}",
+                src.display()
+            )));
+        }
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        fs::create_dir_all(&archived_root)?;
+        let dest = archived_root.join(session_id);
+        if dest.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "archive_session: archived session already exists at {}",
+                dest.display()
+            )));
+        }
+        fs::rename(&src, &dest)?;
+        let metadata_path = dest.join("metadata.json");
+        if let Ok(text) = fs::read_to_string(&metadata_path)
+            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+        {
+            metadata.status = SessionStatus::Archived;
+            if metadata.ended_at_ms.is_none() {
+                metadata.ended_at_ms = Some(now_ms());
+            }
+            let _ = write_json(&metadata_path, &metadata);
+        }
+        Ok(())
+    }
+
+    /// Reverse of [`archive_session`]. Moves the session back to the live
+    /// root and restores the metadata status to `Completed`.
+    pub fn unarchive_session(&self, session_id: &str) -> Result<()> {
+        let src = self.root.join(ARCHIVED_SUBDIR).join(session_id);
+        if !src.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "unarchive_session: archived session {session_id} not found"
+            )));
+        }
+        let dest = self.session_dir(session_id);
+        if dest.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "unarchive_session: a live session already exists at {}",
+                dest.display()
+            )));
+        }
+        fs::rename(&src, &dest)?;
+        let metadata_path = dest.join("metadata.json");
+        if let Ok(text) = fs::read_to_string(&metadata_path)
+            && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
+        {
+            metadata.status = SessionStatus::Completed;
+            let _ = write_json(&metadata_path, &metadata);
+        }
+        Ok(())
     }
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
@@ -187,6 +279,12 @@ impl SessionStore {
                 continue;
             }
             let is_explicit = explicit.contains(metadata.session_id.as_str());
+            // Archived sessions are explicit user keepers: skip them in
+            // every retention sweep, even when listed in `ids`. Callers
+            // that want to permanently delete must unarchive first.
+            if matches!(metadata.status, SessionStatus::Archived) {
+                continue;
+            }
             // Never sweep a `Running` session through retention alone: it may
             // belong to a long-lived process whose `ended_at_ms` simply isn't
             // set yet. Explicit ids still win so users can force-remove a
@@ -572,6 +670,54 @@ impl SessionHandle {
         read_json(&self.dir().join("resume_state.json"))
     }
 
+    /// Replay `events.jsonl` to reconstruct a `SessionResumeState`. Used as
+    /// the fallback when `resume_state.json` is missing or marks the session
+    /// non-resumable but the event log on disk is intact. Walks newest-to-
+    /// oldest first to find the most recent `ContextCompacted` event that
+    /// carries a `conversation` snapshot; replay starts from that snapshot
+    /// (snap-to-checkpoint) and forward-applies only the newer events. When
+    /// no checkpoint is found, replay starts from an empty conversation.
+    pub fn replay_resume_state(&self) -> Result<SessionResumeState> {
+        let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
+        let mut conversation: Vec<ResumeItem> = Vec::new();
+        let mut transcript: Vec<TranscriptItem> = Vec::new();
+        for (idx, event) in events.iter().enumerate().rev() {
+            if let Some(SessionEventKind::ContextCompacted {
+                conversation: snapshot,
+                ..
+            }) = SessionEventKind::try_from_event(event)
+                && !snapshot.is_empty()
+            {
+                conversation = snapshot;
+                // Replay only events with index > idx, in chronological
+                // order — events at idx or earlier are subsumed by the
+                // checkpoint snapshot.
+                for forward in events.iter().skip(idx + 1) {
+                    apply_event_to_replay(forward, &mut conversation, &mut transcript);
+                }
+                return Ok(SessionResumeState {
+                    resume_available: true,
+                    previous_response_id: None,
+                    conversation,
+                    transcript,
+                    context_attachments: self.context_attachments().unwrap_or_default(),
+                    context_compaction: ContextCompactionState::default(),
+                });
+            }
+        }
+        for event in &events {
+            apply_event_to_replay(event, &mut conversation, &mut transcript);
+        }
+        Ok(SessionResumeState {
+            resume_available: true,
+            previous_response_id: None,
+            conversation,
+            transcript,
+            context_attachments: self.context_attachments().unwrap_or_default(),
+            context_compaction: ContextCompactionState::default(),
+        })
+    }
+
     pub fn write_context_attachment(
         &self,
         attachment: &ContextAttachment,
@@ -667,6 +813,7 @@ impl SessionMetadata {
 pub enum SessionStatus {
     #[default]
     Running,
+    Archived,
     Completed,
     Cancelled,
     Failed,
@@ -677,6 +824,7 @@ impl SessionStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Archived => "archived",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
@@ -760,6 +908,87 @@ impl SessionEvent {
     }
 }
 
+/// Typed view over `SessionEvent` for the well-known event kinds Squeezy
+/// emits. Producers continue to write `SessionEvent { kind: String, payload }`
+/// freely; this enum is reader-only so adding new kinds upstream never
+/// breaks replay. Unknown kinds round-trip via `SessionEventKind::Unknown`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionEventKind {
+    UserMessage {
+        text: String,
+    },
+    AssistantCompleted {
+        #[serde(default)]
+        text: String,
+        #[serde(default)]
+        response_id: Option<String>,
+    },
+    ToolCall {
+        #[serde(default)]
+        call_id: String,
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        arguments: Value,
+    },
+    ToolResult {
+        #[serde(default)]
+        output: Value,
+    },
+    ContextCompacted {
+        #[serde(default)]
+        record: Value,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        replacement_id: Option<String>,
+        /// Pre-compaction conversation snapshot. Populated when the
+        /// producer wants replay to snap to this checkpoint instead of
+        /// linear-replaying older events.
+        #[serde(default)]
+        conversation: Vec<ResumeItem>,
+    },
+    Cancelled,
+    Failed {
+        #[serde(default)]
+        error: String,
+    },
+    SessionResumed,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SessionEventKind {
+    /// Parse a free-form `SessionEvent` into the typed view. Returns
+    /// `None` if the discriminator + payload do not match any known
+    /// variant; the caller can then skip the event without erroring.
+    /// When the payload omits a `text` field for `user_message` /
+    /// `assistant_completed`, the event's `summary` is used as a
+    /// best-effort substitute — Squeezy's existing producers carry the
+    /// user / assistant text in `summary`, not `payload`.
+    pub fn try_from_event(event: &SessionEvent) -> Option<Self> {
+        let mut object = serde_json::Map::new();
+        object.insert("kind".to_string(), Value::String(event.kind.clone()));
+        if let Value::Object(payload) = &event.payload {
+            for (key, value) in payload {
+                if key == "kind" {
+                    continue;
+                }
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        let needs_text = matches!(event.kind.as_str(), "user_message" | "assistant_completed");
+        if needs_text
+            && !object.contains_key("text")
+            && let Some(summary) = &event.summary
+        {
+            object.insert("text".to_string(), Value::String(summary.clone()));
+        }
+        serde_json::from_value(Value::Object(object)).ok()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResumeState {
     pub resume_available: bool,
@@ -803,6 +1032,10 @@ pub struct SessionQuery {
     pub model: Option<String>,
     pub status: Option<SessionStatus>,
     pub query: Option<String>,
+    /// When false (default), `list` and `cleanup` skip sessions in the
+    /// `archived/` subdir even if `status` does not explicitly exclude
+    /// `Archived`. Set to true to include archived sessions in results.
+    pub include_archived: bool,
 }
 
 impl SessionQuery {
@@ -934,6 +1167,66 @@ fn attachment_file_stem(id: &str) -> Result<&str> {
     Err(SqueezyError::Agent(format!(
         "invalid context attachment id {id:?}"
     )))
+}
+
+fn apply_event_to_replay(
+    event: &SessionEvent,
+    conversation: &mut Vec<ResumeItem>,
+    transcript: &mut Vec<TranscriptItem>,
+) {
+    let Some(typed) = SessionEventKind::try_from_event(event) else {
+        return;
+    };
+    match typed {
+        SessionEventKind::UserMessage { text } => {
+            conversation.push(ResumeItem::UserText { text: text.clone() });
+            transcript.push(TranscriptItem::user(text));
+        }
+        SessionEventKind::AssistantCompleted { text, .. } => {
+            if text.is_empty() {
+                return;
+            }
+            conversation.push(ResumeItem::AssistantText { text: text.clone() });
+            transcript.push(TranscriptItem::assistant(text));
+        }
+        SessionEventKind::ToolCall {
+            call_id,
+            tool,
+            arguments,
+        } => {
+            if call_id.is_empty() {
+                return;
+            }
+            conversation.push(ResumeItem::FunctionCall {
+                call_id,
+                name: tool,
+                arguments,
+            });
+        }
+        SessionEventKind::ToolResult { output } => {
+            let Some(call_id) = output.get("call_id").and_then(Value::as_str) else {
+                return;
+            };
+            let body = output
+                .get("output")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| output.to_string());
+            conversation.push(ResumeItem::FunctionCallOutput {
+                call_id: call_id.to_string(),
+                output: body,
+            });
+        }
+        // Compaction events are handled by the snap-to-checkpoint path in
+        // `replay_resume_state`; appearing here means a checkpoint with
+        // no `conversation` field, so we treat it as a no-op and let the
+        // linear replay continue.
+        SessionEventKind::ContextCompacted { .. } => {}
+        SessionEventKind::Cancelled
+        | SessionEventKind::Failed { .. }
+        | SessionEventKind::SessionResumed
+        | SessionEventKind::Unknown => {}
+    }
 }
 
 fn read_jsonl(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {

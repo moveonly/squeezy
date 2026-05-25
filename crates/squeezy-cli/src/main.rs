@@ -208,6 +208,10 @@ enum SessionsCommand {
         #[arg(long = "id")]
         ids: Vec<String>,
     },
+    #[command(about = "Soft-archive a session so it survives retention sweeps")]
+    Archive { id: String },
+    #[command(about = "Restore a previously archived session into the live root")]
+    Unarchive { id: String },
 }
 
 #[derive(Debug, Args)]
@@ -226,10 +230,15 @@ struct SessionListArgs {
     provider: Option<String>,
     #[arg(long)]
     model: Option<String>,
-    #[arg(long, help = "running, completed, cancelled, failed, or truncated")]
+    #[arg(
+        long,
+        help = "running, archived, completed, cancelled, failed, or truncated"
+    )]
     status: Option<String>,
     #[arg(long)]
     query: Option<String>,
+    #[arg(long, help = "Include archived sessions (excluded by default)")]
+    include_archived: bool,
 }
 
 #[derive(Debug, Args)]
@@ -880,6 +889,16 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             Ok(())
         }
+        SessionsCommand::Archive { id } => {
+            store.archive_session(id)?;
+            println!("archived {id}");
+            Ok(())
+        }
+        SessionsCommand::Unarchive { id } => {
+            store.unarchive_session(id)?;
+            println!("unarchived {id}");
+            Ok(())
+        }
     }
 }
 
@@ -1466,18 +1485,20 @@ fn session_query_from_args(args: &SessionListArgs) -> squeezy_core::Result<Sessi
             .map(parse_session_status)
             .transpose()?,
         query: args.query.clone(),
+        include_archived: args.include_archived,
     })
 }
 
 fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
     match value.trim().to_ascii_lowercase().as_str() {
         "running" => Ok(SessionStatus::Running),
+        "archived" => Ok(SessionStatus::Archived),
         "completed" => Ok(SessionStatus::Completed),
         "cancelled" | "canceled" => Ok(SessionStatus::Cancelled),
         "failed" => Ok(SessionStatus::Failed),
         "truncated" => Ok(SessionStatus::Truncated),
         _ => Err(SqueezyError::Config(format!(
-            "invalid session status {value:?}; expected running, completed, cancelled, failed, or truncated"
+            "invalid session status {value:?}; expected running, archived, completed, cancelled, failed, or truncated"
         ))),
     }
 }

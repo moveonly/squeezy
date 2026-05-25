@@ -11,9 +11,11 @@ use futures_core::Stream;
 use futures_util::stream;
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, ContextAttachmentKind, PermissionAction, PermissionCapability, PermissionMode,
-    PermissionPolicy, PermissionRequest, PermissionRisk, PermissionRuleSource, Result,
-    SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig, SubagentConfig, TaskStateStatus,
+    AppConfig, CompactionStrategy, ContextAttachmentKind, ContextCompactionConfig,
+    ContextCompactionState, ContextCompactionTrigger, CostSnapshot, PermissionAction,
+    PermissionCapability, PermissionMode, PermissionPolicy, PermissionRequest, PermissionRisk,
+    PermissionRuleSource, Result, SessionLogConfig, SessionMode, ShellSandboxMode, SkillsConfig,
+    SubagentConfig, TaskStateStatus,
 };
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
@@ -2550,4 +2552,415 @@ fn write_skill(dir: &Path, name: &str, triggers: &[&str]) {
         ),
     )
     .expect("write skill");
+}
+
+#[test]
+fn ingest_agents_md_walks_from_repo_root_to_cwd() {
+    let root = temp_workspace("ingest_agents_md");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    fs::write(root.join("AGENTS.md"), "root-level convention").expect("write root AGENTS.md");
+    let nested = root.join("crates").join("alpha");
+    fs::create_dir_all(&nested).expect("create nested dir");
+    fs::write(nested.join("AGENTS.md"), "nested crate rule").expect("write nested AGENTS.md");
+    let combined = super::ingest_agents_md(&nested, 16_384).expect("ingest");
+    assert!(combined.contains("root-level convention"));
+    assert!(combined.contains("nested crate rule"));
+    let root_idx = combined
+        .find("root-level convention")
+        .expect("root present");
+    let nested_idx = combined.find("nested crate rule").expect("nested present");
+    assert!(root_idx < nested_idx, "root-first ordering: {combined:?}");
+}
+
+#[test]
+fn ingest_agents_md_returns_none_when_absent() {
+    let root = temp_workspace("ingest_agents_md_absent");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    assert!(super::ingest_agents_md(&root, 16_384).is_none());
+}
+
+#[test]
+fn ingest_agents_md_disabled_when_max_bytes_zero() {
+    let root = temp_workspace("ingest_agents_md_disabled");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    fs::write(root.join("AGENTS.md"), "ignored").expect("write");
+    assert!(super::ingest_agents_md(&root, 0).is_none());
+}
+
+#[test]
+fn ingest_agents_md_truncates_at_byte_cap() {
+    let root = temp_workspace("ingest_agents_md_truncate");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let body = "x".repeat(1_000);
+    fs::write(root.join("AGENTS.md"), &body).expect("write");
+    let combined = super::ingest_agents_md(&root, 64).expect("ingest");
+    assert!(combined.len() <= 64 + "\n[truncated]".len());
+    assert!(combined.ends_with("[truncated]"));
+}
+
+#[test]
+fn ingest_user_memory_reads_from_home_squeezy() {
+    let home = temp_workspace("ingest_user_memory");
+    fs::create_dir_all(home.join(".squeezy")).expect("mkdir .squeezy");
+    fs::write(
+        home.join(".squeezy").join("memory.md"),
+        "user-level preference body",
+    )
+    .expect("write memory.md");
+    let previous = std::env::var_os("HOME");
+    // SAFETY: tests run single-threaded by default in this crate; the
+    // surrounding nextest configuration also isolates env mutations.
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let result = super::ingest_user_memory(8_192);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    let body = result.expect("memory present");
+    assert!(body.contains("user-level preference body"));
+}
+
+#[test]
+fn ingest_user_memory_returns_none_when_missing() {
+    let home = temp_workspace("ingest_user_memory_missing");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let result = super::ingest_user_memory(8_192);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(result.is_none());
+}
+
+fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
+    let mut items = Vec::new();
+    for n in 0..16 {
+        items.push(LlmInputItem::UserText(format!(
+            "user message {n} with a moderate amount of context to keep tokens nontrivial",
+        )));
+        items.push(LlmInputItem::AssistantText(format!(
+            "assistant reply {n} also containing enough text to estimate as real tokens",
+        )));
+    }
+    items
+}
+
+fn config_with_mid_turn(window: u64, threshold: u8) -> AppConfig {
+    AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled_mid_turn: true,
+            model_context_window: Some(window),
+            threshold_percent: threshold,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    }
+}
+
+#[test]
+fn mid_turn_compaction_skips_when_disabled() {
+    let mut config = config_with_mid_turn(100_000, 80);
+    config.context_compaction.enabled_mid_turn = false;
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        Some(90_000),
+    );
+    assert!(report.is_none());
+}
+
+#[test]
+fn mid_turn_compaction_skips_without_window() {
+    let mut config = config_with_mid_turn(100_000, 80);
+    config.context_compaction.model_context_window = None;
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        Some(90_000),
+    );
+    assert!(report.is_none());
+}
+
+#[test]
+fn mid_turn_compaction_skips_below_threshold() {
+    let config = config_with_mid_turn(100_000, 80);
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        Some(50_000),
+    );
+    assert!(report.is_none());
+}
+
+#[test]
+fn mid_turn_compaction_fires_at_threshold() {
+    let config = config_with_mid_turn(100_000, 80);
+    let mut conversation = mid_turn_test_conversation();
+    let original_len = conversation.len();
+    let mut state = ContextCompactionState::default();
+    let report = super::maybe_compact_mid_turn(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        Some(80_001),
+    )
+    .expect("mid-turn compaction should fire");
+    assert!(matches!(
+        report.record.trigger,
+        ContextCompactionTrigger::Auto
+    ));
+    assert!(
+        conversation.len() < original_len,
+        "conversation should shrink after compaction: {} -> {}",
+        original_len,
+        conversation.len(),
+    );
+    assert!(state.last.is_some(), "history should record the run");
+}
+
+#[test]
+fn total_tokens_from_cost_sums_present_fields() {
+    let cost = CostSnapshot {
+        input_tokens: Some(1_000),
+        output_tokens: Some(2_000),
+        reasoning_output_tokens: Some(500),
+        ..CostSnapshot::default()
+    };
+    assert_eq!(super::total_tokens_from_cost(&cost), Some(3_500));
+}
+
+#[test]
+fn total_tokens_from_cost_returns_none_when_no_fields() {
+    let cost = CostSnapshot::default();
+    assert!(super::total_tokens_from_cost(&cost).is_none());
+}
+
+#[test]
+fn compaction_strategy_default_is_extractive() {
+    assert_eq!(
+        CompactionStrategy::default(),
+        CompactionStrategy::Extractive
+    );
+}
+
+#[test]
+fn compaction_strategy_parse_round_trip() {
+    for variant in [
+        CompactionStrategy::Extractive,
+        CompactionStrategy::ModelAssisted,
+        CompactionStrategy::LayeredFallback,
+    ] {
+        assert_eq!(CompactionStrategy::parse(variant.as_str()), Some(variant));
+    }
+}
+
+#[tokio::test]
+async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_times_out() {
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 1,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider: Arc<dyn LlmProvider> = Arc::new(HangingProvider::new());
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("compaction should fire even when model assist times out");
+    assert!(
+        report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "summary should fall back to extractive output, got: {}",
+        report.summary,
+    );
+}
+
+#[test]
+fn compaction_summary_includes_recent_observations() {
+    use squeezy_store::{Observation, ObservationKind, SqueezyStore};
+
+    let root = temp_workspace("compaction_observations");
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    store
+        .put_observation(Observation::new(
+            ObservationKind::Decision,
+            "Always batch redb writes inside a single transaction.",
+            "test-suite",
+        ))
+        .expect("put observation");
+
+    let config = AppConfig::default();
+    let summary = super::build_compaction_summary(
+        1,
+        &ContextCompactionState::default(),
+        &[],
+        &[],
+        Some(&store),
+        &config,
+    );
+    assert!(
+        summary.contains("Prior decisions and notes"),
+        "summary should mention notes_recall block: {summary}",
+    );
+    assert!(
+        summary.contains("Always batch redb writes"),
+        "summary should include the stored decision text: {summary}",
+    );
+}
+
+#[test]
+fn compaction_persists_checkpoint_and_stamps_replacement_id() {
+    use squeezy_store::SqueezyStore;
+
+    let root = temp_workspace("compact_checkpoint");
+    let store = SqueezyStore::open(&root, None).expect("open store");
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let original_len = conversation.len();
+    let mut state = ContextCompactionState::default();
+    let report = super::compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        Some(&store),
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .expect("compaction");
+    assert!(conversation.len() < original_len);
+    let replacement_id = report
+        .record
+        .replacement_id
+        .clone()
+        .expect("replacement_id stamped");
+    let checkpoint = store
+        .get_compaction_checkpoint(&replacement_id)
+        .expect("get checkpoint")
+        .expect("checkpoint present");
+    assert_eq!(checkpoint.items.len(), report.record.dropped_items);
+}
+
+#[test]
+fn compaction_without_store_leaves_replacement_id_none() {
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let report = super::compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .expect("compaction");
+    assert!(report.record.replacement_id.is_none());
+}
+
+#[tokio::test]
+async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: None,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(Vec::new()));
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("compaction should still produce extractive output");
+    assert!(
+        report
+            .summary
+            .contains("Squeezy compacted conversation context")
+    );
 }

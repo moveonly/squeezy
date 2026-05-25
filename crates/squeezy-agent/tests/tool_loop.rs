@@ -2117,6 +2117,7 @@ async fn automatic_context_compaction_replaces_old_raw_history() {
         min_items: 3,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let old_prompt = format!("first prompt {}", "raw-old-context ".repeat(400));
     let agent = Agent::new(config, provider.clone());
@@ -2222,6 +2223,7 @@ async fn manual_context_compaction_preserves_pins_in_resume_state() {
         min_items: 99,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider);
 
@@ -2299,6 +2301,7 @@ async fn auto_compaction_does_not_orphan_function_call_output() {
         min_items: 3,
         recent_items: 2,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider.clone());
 
@@ -2361,6 +2364,7 @@ async fn pinned_context_is_visible_to_model_before_compaction() {
         min_items: 1_000,
         recent_items: 1,
         max_summary_bytes: 1_200,
+        ..ContextCompactionConfig::default()
     };
     let agent = Agent::new(config, provider.clone());
 
