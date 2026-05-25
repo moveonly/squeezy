@@ -17,6 +17,30 @@ fn definition_prompt_compiles_to_graph_first_tools() {
 }
 
 #[test]
+fn list_methods_prompt_issues_single_symbol_context_call() {
+    let plan = compile_exploration_plan("list methods on Widget").expect("plan");
+
+    assert_eq!(plan.intent, ExplorationIntent::MethodListing);
+    assert_eq!(plan.query.as_deref(), Some("Widget"));
+    assert_eq!(
+        plan.calls
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["symbol_context"],
+        "list-methods should not fan out to flow/definition tools"
+    );
+    assert!(plan.guard_raw_reads);
+}
+
+#[test]
+fn what_methods_does_have_phrasing_also_compiles_to_method_listing() {
+    let plan = compile_exploration_plan("what methods does Widget have?").expect("plan");
+    assert_eq!(plan.intent, ExplorationIntent::MethodListing);
+    assert_eq!(plan.query.as_deref(), Some("Widget"));
+}
+
+#[test]
 fn callers_prompt_uses_upstream_flow() {
     let plan = compile_exploration_plan("Who calls Runner::run?").expect("plan");
 

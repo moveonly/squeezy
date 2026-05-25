@@ -9,6 +9,7 @@ pub(crate) enum ExplorationIntent {
     RouteDiscovery,
     TestPairing,
     RepoMap,
+    MethodListing,
 }
 
 impl ExplorationIntent {
@@ -20,6 +21,7 @@ impl ExplorationIntent {
             Self::RouteDiscovery => "route_discovery",
             Self::TestPairing => "test_pairing",
             Self::RepoMap => "repo_map",
+            Self::MethodListing => "method_listing",
         }
     }
 }
@@ -188,6 +190,26 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
         });
     }
 
+    if method_listing_intent(&lowered)
+        && let Some(query) = symbolic_query.clone()
+    {
+        // A "list methods on Foo" question is satisfied by a single
+        // symbol_context call: it returns the matching type plus its
+        // declared methods and short reference snippets. Pre-issuing more
+        // tools (definition_search + upstream_flow + downstream_flow + ...)
+        // burns rounds and adds no new information.
+        return Some(ExplorationPlan {
+            intent: ExplorationIntent::MethodListing,
+            query: Some(query.clone()),
+            calls: vec![tool_call(
+                "planner_symbol_context",
+                "symbol_context",
+                json!({"query": query, "max_results": 8, "max_references": 4}),
+            )],
+            guard_raw_reads: true,
+        });
+    }
+
     if definition_intent(&lowered)
         && let Some(query) = symbolic_query
     {
@@ -281,6 +303,20 @@ fn route_intent(input: &str) -> bool {
         || input.contains("dependency path")
         || input.contains("how does")
         || input.contains("reach")
+}
+
+fn method_listing_intent(input: &str) -> bool {
+    input.contains("methods on")
+        || input.contains("methods of")
+        || input.contains("methods for")
+        || input.contains("list methods")
+        || input.contains("list the methods")
+        || input.contains("what methods")
+        || input.contains("which methods")
+        || input.contains("members of")
+        || input.contains("members on")
+        || input.contains("api of")
+        || input.contains("api for")
 }
 
 fn test_pairing_intent(input: &str) -> bool {
