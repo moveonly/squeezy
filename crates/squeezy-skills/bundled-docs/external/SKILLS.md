@@ -1,6 +1,6 @@
 # Skills
 
-Squeezy skills are local `SKILL.md` directories that add specialized instructions only when activated. Inactive skills are discovered as metadata and do not add their descriptions or bodies to provider requests.
+Squeezy skills are local `SKILL.md` directories that add specialized instructions only when activated. Squeezy may advertise a small metadata-only catalog at session start, but inactive skill bodies are not added to provider requests.
 
 ## Layout
 
@@ -60,21 +60,42 @@ The user skill directories can be changed with `SQUEEZY_SKILLS_USER_DIR` and `SQ
 [skills]
 user_dir = "/path/to/squeezy-skills"
 compat_user_dir = "/path/to/agent-skills"
+active_budget_chars = 4000
+active_body_cap_chars = 16000
+preamble_enabled = true
+preamble_budget_chars = 800
+
+[[skills.config]]
+name = "noisy-project-skill"
+enabled = false
+
+[[skills.config]]
+path = "/path/to/project/.squeezy/skills/specific-skill"
+enabled = true
 ```
+
+`active_budget_chars` caps the rendered `<active_skills>` bundle for a turn. `active_body_cap_chars` replaces very large individual skill bodies with a compact stub and a `load_skill` hint. `preamble_enabled` controls the session-start metadata catalog; `preamble_budget_chars` caps that catalog.
+
+`[[skills.config]]` entries enable or disable a skill by exact `name` or by skill directory / `SKILL.md` `path`. Use exactly one selector per entry. Entries are applied in order after discovery, so later matches win.
 
 An example skill ships in `tests/artifacts/skills/rust-code-navigation/SKILL.md`.
 
 ## Activation
 
-Skills can activate in three ways:
+Skills can activate in four ways:
 
 - Explicit user command: `/skill rust-code-navigation inspect this symbol` (a tab between `/skill` and the skill name also works)
 - Trigger match: a configured trigger appears in the user task as a word-boundary substring, case-insensitively. For example, the trigger `rust` matches `Rust here` but not `trust this`.
 - Model request: the model calls `list_skills`, then `load_skill`
+- Implicit shell use: running a script under `<skill>/scripts/` or reading that skill's `SKILL.md` with ordinary shell readers can activate the skill for the next model request in the same turn.
 
 Loaded skill bodies are cached for the lifetime of the process so repeat activations within a session do not re-read the SKILL.md from disk.
 
 Loading a skill only injects instructions. It does not grant tools, bypass approvals, execute shell snippets, or change the session permission policy.
+
+Triggers are intentional Squeezy behavior: they let project skills activate from ordinary task phrasing without requiring users to remember exact skill names. Future mention syntax, if added, should be additive and must not replace `triggers:`.
+
+If two discovered skills with the same name have the same precedence, Squeezy logs a warning and skips trigger activation for that name. Use `/skill <name> ...` or `load_skill` to select the exposed skill explicitly.
 
 ## Built-In Squeezy Help
 

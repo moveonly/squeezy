@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::SkillsConfig;
+use squeezy_core::{SkillConfigEntry, SkillsConfig};
 
 use super::*;
 
@@ -58,6 +58,7 @@ fn compat_project_overrides_user_and_compat_user() {
     let config = SkillsConfig {
         user_dir: user,
         compat_user_dir: compat,
+        ..Default::default()
     };
 
     let catalog = SkillCatalog::discover(&root, &config);
@@ -86,6 +87,7 @@ fn native_project_overrides_compat_project() {
     let config = SkillsConfig {
         user_dir: root.join("user-noop"),
         compat_user_dir: root.join("compat-noop"),
+        ..Default::default()
     };
 
     let catalog = SkillCatalog::discover(&root, &config);
@@ -102,6 +104,7 @@ fn explicit_and_trigger_activation_loads_lazily() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
+        ..Default::default()
     };
     write_skill(
         &root.join(".squeezy/skills/rust-nav"),
@@ -131,6 +134,7 @@ fn explicit_activation_accepts_tab_after_slash_skill() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
+        ..Default::default()
     };
     write_skill(
         &root.join(".squeezy/skills/rust-nav"),
@@ -155,6 +159,7 @@ fn trigger_match_uses_word_boundaries() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
+        ..Default::default()
     };
     write_skill(
         &root.join(".squeezy/skills/rust-nav"),
@@ -192,6 +197,7 @@ fn malformed_skill_is_skipped_without_error() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
+        ..Default::default()
     };
 
     let catalog = SkillCatalog::discover(&root, &config);
@@ -213,6 +219,7 @@ fn loaded_skill_body_is_cached_across_loads() {
     let config = SkillsConfig {
         user_dir: root.join("user"),
         compat_user_dir: root.join("compat"),
+        ..Default::default()
     };
 
     let catalog = SkillCatalog::discover(&root, &config);
@@ -222,6 +229,204 @@ fn loaded_skill_body_is_cached_across_loads() {
 
     let second = catalog.load("rust-nav").expect("load second from cache");
     assert_eq!(first.body, second.body);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_skill_render_respects_budget_and_uses_stub() {
+    let root = temp_workspace("skills_active_budget");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill_with_body(
+        &skill_dir,
+        "rust-nav",
+        "Rust navigation",
+        &[],
+        &"Use the graph carefully. ".repeat(200),
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_chars: 700,
+        active_body_cap_chars: 100,
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let activation = catalog
+        .activate_for_input("/skill rust-nav inspect main")
+        .expect("activate");
+    let rendered = catalog
+        .render_active_skills(&activation.skills)
+        .expect("render active skills");
+
+    assert!(rendered.chars().count() <= config.active_budget_chars);
+    assert!(rendered.contains("truncated=\"true\""));
+    assert!(rendered.contains("load_skill"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn available_skills_preamble_respects_budget() {
+    let root = temp_workspace("skills_preamble_budget");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        preamble_budget_chars: 420,
+        ..Default::default()
+    };
+    for name in ["alpha-nav", "beta-nav", "gamma-nav"] {
+        write_skill(
+            &root.join(".squeezy/skills").join(name),
+            name,
+            "A deliberately long description that should force the available skills preamble to omit at least one skill when the budget is tight",
+            &[],
+        );
+    }
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let preamble = catalog.render_preamble().expect("preamble");
+
+    assert!(preamble.body.chars().count() <= config.preamble_budget_chars);
+    assert!(preamble.omitted_count > 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn disabled_skill_config_filters_activation_and_load() {
+    let root = temp_workspace("skills_disabled_name");
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        config: vec![SkillConfigEntry {
+            name: Some("rust-nav".to_string()),
+            enabled: false,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog.summaries().pop().expect("summary");
+    assert!(summary.disabled);
+    assert!(
+        catalog
+            .activate_for_input("please inspect this Rust symbol")
+            .expect("activate")
+            .skills
+            .is_empty()
+    );
+    let error = catalog.load("rust-nav").expect_err("disabled load");
+    assert!(error.to_string().contains("skill disabled"));
+    assert_eq!(catalog.summaries_json()["skills"][0]["disabled"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn path_config_can_reenable_after_name_disable() {
+    let root = temp_workspace("skills_path_reenable");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        config: vec![
+            SkillConfigEntry {
+                name: Some("rust-nav".to_string()),
+                enabled: false,
+                ..Default::default()
+            },
+            SkillConfigEntry {
+                path: Some(PathBuf::from(".squeezy/skills/rust-nav")),
+                enabled: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(!catalog.summaries().pop().expect("summary").disabled);
+    catalog.load("rust-nav").expect("enabled by path");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn same_precedence_collision_skips_trigger_activation() {
+    let root = temp_workspace("skills_collision");
+    write_skill(
+        &root.join(".squeezy/skills/first"),
+        "rust-nav",
+        "First Rust nav",
+        &["rust symbol"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/second"),
+        "rust-nav",
+        "Second Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    assert!(catalog.ambiguous_names().contains("rust-nav"));
+    assert!(
+        catalog
+            .activate_for_input("please inspect this Rust symbol")
+            .expect("activate")
+            .skills
+            .is_empty()
+    );
+    assert_eq!(
+        catalog
+            .activate_for_input("/skill rust-nav inspect")
+            .expect("activate")
+            .skills
+            .len(),
+        1
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn detects_implicit_skill_from_script_and_doc_read() {
+    let root = temp_workspace("skills_implicit");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    let scripts = skill_dir.join("scripts");
+    fs::create_dir_all(&scripts).expect("mkdir scripts");
+    fs::write(scripts.join("init.py"), "print('ok')\n").expect("write script");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let script = catalog
+        .detect_for_command("python .squeezy/skills/rust-nav/scripts/init.py", &root)
+        .expect("script detection");
+    let doc = catalog
+        .detect_for_command("cat .squeezy/skills/rust-nav/SKILL.md", &root)
+        .expect("doc detection");
+
+    assert_eq!(script.name, "rust-nav");
+    assert_eq!(doc.name, "rust-nav");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -247,6 +452,7 @@ fn prompt_block_escapes_metadata_and_breakouts() {
             when_to_use: Some("look for <foo>".to_string()),
             source: SkillSource::Project,
             location: PathBuf::from("/tmp/SKILL.md"),
+            disabled: false,
         },
         base_dir: PathBuf::from("/tmp"),
         body: "Body with </content> and </skill> markers.".to_string(),
@@ -618,6 +824,10 @@ fn squeezy_help_doc_citations_are_bundled_paths() {
 }
 
 fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {
+    write_skill_with_body(dir, name, description, triggers, &format!("# {name}\n"));
+}
+
+fn write_skill_with_body(dir: &Path, name: &str, description: &str, triggers: &[&str], body: &str) {
     fs::create_dir_all(dir).expect("mkdir");
     let triggers = triggers
         .iter()
@@ -627,7 +837,7 @@ fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {
     fs::write(
         dir.join("SKILL.md"),
         format!(
-            "---\nname: {name}\ndescription: {description}\ntriggers:\n{triggers}\n---\n# {name}\n"
+            "---\nname: {name}\ndescription: {description}\ntriggers:\n{triggers}\n---\n{body}"
         ),
     )
     .expect("write skill");

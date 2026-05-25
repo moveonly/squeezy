@@ -51,6 +51,10 @@ The crate layout separates:
 
 Committed implementation documentation belongs in `docs/`. Personal notes, design motivation, reference research, and uncommitted decision thinking belong outside this repository.
 
+Skill architecture scope is documented in `docs/internal/SKILLS_SCOPE.md`.
+Keep skills as local filesystem instruction bundles; do not add marketplace,
+remote plugin, or extension-runtime surfaces without updating that guardrail.
+
 Integration-test fixtures and reusable test artifacts belong under the owning crate's `tests/artifacts/` directory. If a fixture is crate-specific, keep it inside that crate (e.g. `crates/squeezy-tools/tests/artifacts/`). Do not add top-level `examples/` directories or a workspace-level `tests/artifacts/` for crate-specific fixtures.
 
 ## Test Layout

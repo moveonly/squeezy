@@ -14,10 +14,13 @@ publish.workspace = true
 
 [dependencies]
 futures-util.workspace = true
+libc.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 squeezy-core.workspace = true
+squeezy-store.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

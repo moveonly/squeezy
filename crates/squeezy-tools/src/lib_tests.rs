@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use squeezy_core::{GraphConfig, SkillsConfig};
+use squeezy_core::{GraphConfig, SkillConfigEntry, SkillsConfig};
 use squeezy_store::{SqueezyStore, StoredReadSnapshot};
 use tokio_util::sync::CancellationToken;
 
@@ -4687,6 +4687,7 @@ async fn skill_tools_list_metadata_and_load_body() {
         SkillsConfig {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
+            ..Default::default()
         },
         &GraphConfig::default(),
         squeezy_core::ShellSandboxConfig::default(),
@@ -4725,6 +4726,116 @@ async fn skill_tools_list_metadata_and_load_body() {
         loaded.content["content"]
             .as_str()
             .is_some_and(|content| content.contains("Use graph tools"))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn disabled_skill_is_listed_but_not_loaded() {
+    let root = temp_workspace("skill_tools_disabled");
+    write_skill(&root.join(".agents/skills/rust-nav"), "rust-nav");
+    let registry = ToolRegistry::new_with_configs_and_skills(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+            config: vec![SkillConfigEntry {
+                name: Some("rust-nav".to_string()),
+                enabled: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        &GraphConfig::default(),
+        squeezy_core::ShellSandboxConfig::default(),
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry");
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "list_skills".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    assert_eq!(list.content["skills"][0]["disabled"], true);
+
+    let loaded = registry
+        .execute(
+            ToolCall {
+                call_id: "call_2".to_string(),
+                name: "load_skill".to_string(),
+                arguments: json!({"name": "rust-nav"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(loaded.status, ToolStatus::Error);
+    assert!(
+        loaded.content["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("skill disabled"))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_result_records_implicit_skill_activation() {
+    let root = temp_workspace("skill_tools_implicit_shell");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav");
+    let scripts = skill_dir.join("scripts");
+    fs::create_dir_all(&scripts).expect("mkdir scripts");
+    fs::write(scripts.join("init.sh"), "printf ok\n").expect("write script");
+    let registry = ToolRegistry::new_with_configs_and_skills(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        SkillsConfig {
+            user_dir: root.join("user-skills"),
+            compat_user_dir: root.join("compat-skills"),
+            ..Default::default()
+        },
+        &GraphConfig::default(),
+        squeezy_core::ShellSandboxConfig {
+            mode: squeezy_core::ShellSandboxMode::Off,
+            ..Default::default()
+        },
+        ToolRegistryRuntime::default(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "sh .squeezy/skills/rust-nav/scripts/init.sh",
+                    "description": "run skill script"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        result.content["implicit_skill_activation"]["name"],
+        "rust-nav"
+    );
+    assert_eq!(
+        result.content["implicit_skill_activation"]["source"],
+        "implicit"
     );
 
     let _ = fs::remove_dir_all(root);

@@ -7,12 +7,15 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use squeezy_core::{Result, SkillsConfig, SqueezyError};
+use squeezy_core::{Result, SkillConfigEntry, SkillsConfig, SqueezyError};
 use tracing::warn;
 
 pub mod help;
+pub mod implicit;
+pub mod render;
 
 pub use help::{HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, matches_squeezy_help_input};
+pub use render::SkillPreambleRender;
 
 const SKILL_FILE: &str = "SKILL.md";
 const PROJECT_SKILLS_DIR: &str = ".squeezy/skills";
@@ -28,7 +31,7 @@ pub enum SkillSource {
 }
 
 impl SkillSource {
-    const fn precedence(self) -> u8 {
+    pub(crate) const fn precedence(self) -> u8 {
         match self {
             Self::CompatUser => 0,
             Self::User => 1,
@@ -37,7 +40,7 @@ impl SkillSource {
         }
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::CompatUser => "compat_user",
             Self::User => "user",
@@ -54,6 +57,7 @@ pub struct SkillSummary {
     pub when_to_use: Option<String>,
     pub source: SkillSource,
     pub location: PathBuf,
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +75,7 @@ impl LoadedSkill {
             when_to_use,
             source,
             location,
+            disabled: _,
         } = &self.summary;
         let when_to_use = when_to_use
             .as_ref()
@@ -95,10 +100,34 @@ struct SkillEntry {
     triggers: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SkillCatalog {
     skills: BTreeMap<String, SkillEntry>,
     cache: Mutex<BTreeMap<String, LoadedSkill>>,
+    ambiguous_names: BTreeSet<String>,
+    implicit_by_scripts_dir: BTreeMap<PathBuf, String>,
+    implicit_by_doc_path: BTreeMap<PathBuf, String>,
+    active_budget_chars: usize,
+    active_body_cap_chars: usize,
+    preamble_enabled: bool,
+    preamble_budget_chars: usize,
+}
+
+impl Default for SkillCatalog {
+    fn default() -> Self {
+        let defaults = SkillsConfig::default();
+        Self {
+            skills: BTreeMap::new(),
+            cache: Mutex::new(BTreeMap::new()),
+            ambiguous_names: BTreeSet::new(),
+            implicit_by_scripts_dir: BTreeMap::new(),
+            implicit_by_doc_path: BTreeMap::new(),
+            active_budget_chars: defaults.active_budget_chars,
+            active_body_cap_chars: defaults.active_body_cap_chars,
+            preamble_enabled: defaults.preamble_enabled,
+            preamble_budget_chars: defaults.preamble_budget_chars,
+        }
+    }
 }
 
 impl SkillCatalog {
@@ -107,7 +136,13 @@ impl SkillCatalog {
     }
 
     pub fn discover(workspace_root: &Path, config: &SkillsConfig) -> Self {
-        let mut catalog = Self::default();
+        let mut catalog = Self {
+            active_budget_chars: config.active_budget_chars,
+            active_body_cap_chars: config.active_body_cap_chars,
+            preamble_enabled: config.preamble_enabled,
+            preamble_budget_chars: config.preamble_budget_chars,
+            ..Self::default()
+        };
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
         catalog.discover_dir(&config.user_dir, SkillSource::User);
         catalog.discover_dir(
@@ -118,6 +153,8 @@ impl SkillCatalog {
             &workspace_root.join(PROJECT_SKILLS_DIR),
             SkillSource::Project,
         );
+        catalog.apply_config_rules(workspace_root, &config.config);
+        catalog.rebuild_implicit_indexes();
         catalog
     }
 
@@ -139,6 +176,7 @@ impl SkillCatalog {
                         "when_to_use": summary.when_to_use,
                         "source": summary.source.as_str(),
                         "location": summary.location,
+                        "disabled": summary.disabled,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -154,6 +192,9 @@ impl SkillCatalog {
         let Some(entry) = self.skills.get(name) else {
             return Err(SqueezyError::Tool(format!("skill not found: {name}")));
         };
+        if entry.summary.disabled {
+            return Err(SqueezyError::Tool(format!("skill disabled: {name}")));
+        }
         let content = fs::read_to_string(&entry.summary.location)?;
         let (_metadata, body) = parse_skill_file(&content).map_err(SqueezyError::Tool)?;
         let loaded = LoadedSkill {
@@ -177,6 +218,9 @@ impl SkillCatalog {
 
         let lowered = task.to_ascii_lowercase();
         for entry in self.skills.values() {
+            if entry.summary.disabled || self.ambiguous_names.contains(&entry.summary.name) {
+                continue;
+            }
             if entry
                 .triggers
                 .iter()
@@ -197,6 +241,39 @@ impl SkillCatalog {
             task_input: task,
             skills: loaded,
         })
+    }
+
+    pub fn render_active_skills(&self, skills: &[LoadedSkill]) -> Option<String> {
+        render::render_active_skills(skills, self.active_budget_chars, self.active_body_cap_chars)
+    }
+
+    pub fn render_preamble(&self) -> Option<SkillPreambleRender> {
+        self.preamble_enabled
+            .then(|| {
+                render::render_skill_preamble(
+                    &self
+                        .summaries()
+                        .into_iter()
+                        .filter(|summary| !summary.disabled)
+                        .collect::<Vec<_>>(),
+                    self.preamble_budget_chars,
+                )
+            })
+            .flatten()
+    }
+
+    pub fn ambiguous_names(&self) -> &BTreeSet<String> {
+        &self.ambiguous_names
+    }
+
+    pub fn detect_for_command(&self, command: &str, workdir: &Path) -> Option<SkillSummary> {
+        implicit::detect_for_command(
+            command,
+            workdir,
+            &self.implicit_by_scripts_dir,
+            &self.implicit_by_doc_path,
+            &self.skills,
+        )
     }
 
     fn discover_dir(&mut self, dir: &Path, source: SkillSource) {
@@ -285,6 +362,7 @@ impl SkillCatalog {
                 when_to_use: metadata.when_to_use,
                 source,
                 location: skill_path,
+                disabled: false,
             };
             self.insert(SkillEntry {
                 summary,
@@ -298,12 +376,82 @@ impl SkillCatalog {
         match self.skills.get(&entry.summary.name) {
             Some(existing)
                 if existing.summary.source.precedence() > entry.summary.source.precedence() => {}
-            _ => {
+            Some(existing)
+                if existing.summary.source.precedence() == entry.summary.source.precedence() =>
+            {
+                warn!(
+                    target: "squeezy_skills",
+                    name = %entry.summary.name,
+                    existing = %existing.summary.location.display(),
+                    incoming = %entry.summary.location.display(),
+                    "same-precedence skill name collision; trigger activation will require explicit selection"
+                );
+                self.ambiguous_names.insert(entry.summary.name.clone());
                 if let Ok(mut cache) = self.cache.lock() {
                     cache.remove(&entry.summary.name);
                 }
                 self.skills.insert(entry.summary.name.clone(), entry);
             }
+            _ => {
+                self.ambiguous_names.remove(&entry.summary.name);
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.remove(&entry.summary.name);
+                }
+                self.skills.insert(entry.summary.name.clone(), entry);
+            }
+        }
+    }
+
+    fn apply_config_rules(&mut self, workspace_root: &Path, rules: &[SkillConfigEntry]) {
+        for rule in rules {
+            match (rule.name.as_ref(), rule.path.as_ref()) {
+                (Some(_), Some(_)) | (None, None) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        name = ?rule.name,
+                        path = ?rule.path,
+                        "ignoring skill config entry with invalid selector"
+                    );
+                    continue;
+                }
+                (Some(name), None) => {
+                    if let Some(entry) = self.skills.get_mut(name) {
+                        entry.summary.disabled = !rule.enabled;
+                        if let Ok(mut cache) = self.cache.lock() {
+                            cache.remove(name);
+                        }
+                    }
+                }
+                (None, Some(path)) => {
+                    let selector = config_selector_path(workspace_root, path);
+                    for entry in self.skills.values_mut() {
+                        if skill_path_matches(&selector, entry) {
+                            entry.summary.disabled = !rule.enabled;
+                            if let Ok(mut cache) = self.cache.lock() {
+                                cache.remove(&entry.summary.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn rebuild_implicit_indexes(&mut self) {
+        self.implicit_by_scripts_dir.clear();
+        self.implicit_by_doc_path.clear();
+        for entry in self.skills.values() {
+            if entry.summary.disabled {
+                continue;
+            }
+            self.implicit_by_doc_path.insert(
+                implicit::normalize_path(&entry.summary.location),
+                entry.summary.name.clone(),
+            );
+            self.implicit_by_scripts_dir.insert(
+                implicit::normalize_path(&entry.base_dir.join("scripts")),
+                entry.summary.name.clone(),
+            );
         }
     }
 }
@@ -318,6 +466,13 @@ impl Clone for SkillCatalog {
         Self {
             skills: self.skills.clone(),
             cache: Mutex::new(cache),
+            ambiguous_names: self.ambiguous_names.clone(),
+            implicit_by_scripts_dir: self.implicit_by_scripts_dir.clone(),
+            implicit_by_doc_path: self.implicit_by_doc_path.clone(),
+            active_budget_chars: self.active_budget_chars,
+            active_body_cap_chars: self.active_body_cap_chars,
+            preamble_enabled: self.preamble_enabled,
+            preamble_budget_chars: self.preamble_budget_chars,
         }
     }
 }
@@ -500,7 +655,21 @@ fn is_word_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn xml_escape(value: &str) -> String {
+fn config_selector_path(workspace_root: &Path, selector: &Path) -> PathBuf {
+    if selector.is_absolute() {
+        implicit::normalize_path(selector)
+    } else {
+        implicit::normalize_path(&workspace_root.join(selector))
+    }
+}
+
+fn skill_path_matches(selector: &Path, entry: &SkillEntry) -> bool {
+    let location = implicit::normalize_path(&entry.summary.location);
+    let base_dir = implicit::normalize_path(&entry.base_dir);
+    selector == location || selector == base_dir
+}
+
+pub(crate) fn xml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
         match ch {
@@ -514,7 +683,7 @@ fn xml_escape(value: &str) -> String {
     out
 }
 
-fn escape_body_breakouts(body: &str) -> String {
+pub(crate) fn escape_body_breakouts(body: &str) -> String {
     body.replace("</content>", "<\\/content>")
         .replace("</skill>", "<\\/skill>")
 }

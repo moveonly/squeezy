@@ -828,28 +828,39 @@ async fn slash_context_keeps_percentages_unknown_without_model_limits() {
 }
 
 #[tokio::test]
-async fn multiline_paste_inserts_into_prompt_at_cursor() {
+async fn multiline_paste_becomes_attached_context() {
     let root = temp_workspace("tui_paste");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
-    set_input(&mut app, "ask  now".to_string());
-    app.input_cursor = 4;
     handle_paste(
         &mut app,
         &mut agent,
-        "first line\r\nsecond line\rthird line".to_string(),
+        "2026-05-24 ERROR failed\r\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\r".to_string(),
     )
     .await
     .expect("handle paste");
 
-    assert_eq!(app.input, "ask first line\nsecond line\nthird line now");
-    assert_eq!(
-        app.input_cursor,
-        "ask first line\nsecond line\nthird line".len()
+    assert_eq!(app.attachments.len(), 1);
+    assert!(app.status.contains("attached paste"), "{}", app.status);
+    assert!(
+        !app.attachments[0]
+            .preview
+            .contains("sk-abcdefghijklmnopqrstuvwxyz")
     );
-    assert!(app.attachments.is_empty());
+    assert!(
+        app.attachments[0]
+            .preview
+            .contains("2026-05-24 ERROR failed"),
+        "{}",
+        app.attachments[0].preview
+    );
+    let rendered = render_to_string(&app, 100, 20);
+    assert!(
+        rendered.contains(&app.attachments[0].id),
+        "attachment should render: {rendered}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }

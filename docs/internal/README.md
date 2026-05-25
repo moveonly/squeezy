@@ -11,6 +11,8 @@ development conventions.
   results.
 - [Validation harness](VALIDATION_HARNESS.md): deterministic task harness and
   live provider smoke runners.
+- [Skills scope](SKILLS_SCOPE.md): guardrails for local skill roots and
+  non-goals around marketplaces, plugin runtimes, and extension APIs.
 - [Test layout](TEST_LAYOUT.md): source/test file conventions enforced by
   `scripts/check_test_layout.py`.
 - [Telemetry worker](TELEMETRY_WORKER.md): Cloudflare Worker deployment and

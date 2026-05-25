@@ -1170,6 +1170,8 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
     while rx.recv().await.is_some() {}
 
     let request = provider.requests().pop().expect("request");
+    assert!(request.instructions.contains("<available_skills>"));
+    assert!(request.instructions.contains("rust-nav"));
     assert!(!request.instructions.contains("<active_skills>"));
     assert!(!request.instructions.contains("Rust Nav"));
 
@@ -1440,6 +1442,69 @@ async fn trigger_skill_activation_injects_body() {
     let request = provider.requests().pop().expect("request");
     assert!(request.instructions.contains("<active_skills>"));
     assert!(request.instructions.contains("# Rust Nav"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_implicit_skill_activation_reaches_next_model_request() {
+    let root = temp_workspace("agent_skill_implicit_shell");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", &[]);
+    let scripts = skill_dir.join("scripts");
+    fs::create_dir_all(&scripts).expect("mkdir scripts");
+    fs::write(scripts.join("init.sh"), "printf ok\n").expect("write script");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "sh .squeezy/skills/rust-nav/scripts/init.sh",
+                    "description": "run skill script",
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ok".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_with_skill_dirs(&root);
+    config.permissions.shell = PermissionMode::Allow;
+    config.permissions.shell_sandbox = squeezy_core::ShellSandboxConfig {
+        mode: ShellSandboxMode::Off,
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn("run setup".to_string(), CancellationToken::new());
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event {
+            shell_result = Some(result);
+        }
+    }
+
+    let shell_result = shell_result.expect("shell result");
+    assert_eq!(
+        shell_result.content["implicit_skill_activation"]["name"],
+        "rust-nav"
+    );
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].instructions.contains("# Rust Nav"));
+    assert!(requests[1].instructions.contains("<active_skills>"));
+    assert!(requests[1].instructions.contains("# Rust Nav"));
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2317,6 +2382,7 @@ fn config_with_skill_dirs(root: &Path) -> AppConfig {
         skills: SkillsConfig {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
+            ..Default::default()
         },
         ..Default::default()
     }

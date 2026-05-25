@@ -428,6 +428,56 @@ compat_user_dir = "~/.agents/skills"
 }
 
 #[test]
+fn config_reads_skill_budgets_preamble_and_overrides() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+user_dir = "/custom/squeezy-skills"
+compat_user_dir = "/custom/agent-skills"
+active_budget_chars = 1234
+active_body_cap_chars = 5678
+preamble_enabled = false
+preamble_budget_chars = 321
+
+[[skills.config]]
+name = "rust-nav"
+enabled = false
+
+[[skills.config]]
+path = "/project/.squeezy/skills/rust-nav"
+enabled = true
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(config.skills.active_budget_chars, 1234);
+    assert_eq!(config.skills.active_body_cap_chars, 5678);
+    assert!(!config.skills.preamble_enabled);
+    assert_eq!(config.skills.preamble_budget_chars, 321);
+    assert_eq!(config.skills.config.len(), 2);
+    assert_eq!(config.skills.config[0].name.as_deref(), Some("rust-nav"));
+    assert!(!config.skills.config[0].enabled);
+    assert_eq!(
+        config.skills.config[1].path.as_deref(),
+        Some(Path::new("/project/.squeezy/skills/rust-nav"))
+    );
+    assert!(config.skills.config[1].enabled);
+
+    let inspect = config.inspect_redacted();
+    let round_tripped =
+        SettingsFile::from_toml_str(&inspect, "round-trip").expect("inspect parses");
+    let round_tripped_config = AppConfig::from_settings_and_env_vars(round_tripped, |_| None);
+    assert_eq!(
+        round_tripped_config.skills.active_budget_chars,
+        config.skills.active_budget_chars
+    );
+    assert_eq!(round_tripped_config.skills.config, config.skills.config);
+}
+
+#[test]
 fn config_can_select_anthropic_provider_defaults() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),

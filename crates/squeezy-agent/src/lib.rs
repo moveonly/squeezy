@@ -46,6 +46,7 @@ use squeezy_telemetry::{
     ToolTelemetryReport, prepare_feedback,
 };
 use squeezy_tools::{
+    McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
     ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
@@ -986,7 +987,7 @@ impl Agent {
     }
 
     fn build(
-        config: AppConfig,
+        mut config: AppConfig,
         provider: Arc<dyn LlmProvider>,
         session_log: Option<SessionHandle>,
         conversation_state: ConversationState,
@@ -1054,6 +1055,36 @@ impl Agent {
             )
             .expect("current directory must be a valid tool root")
         });
+        if let Some(preamble) = tools.skills_preamble() {
+            if preamble.omitted_count > 0 {
+                log_session_event(
+                    session_log.as_ref(),
+                    &redactor,
+                    "skills_preamble_truncated",
+                    None,
+                    Some(format!(
+                        "{} skill(s) omitted from available skills preamble",
+                        preamble.omitted_count
+                    )),
+                    json!({ "omitted_count": preamble.omitted_count }),
+                );
+            }
+            config.instructions = format!("{}\n\n{}", config.instructions, preamble.body);
+        }
+        let ambiguous_skills = tools.ambiguous_skill_names();
+        if !ambiguous_skills.is_empty() {
+            log_session_event(
+                session_log.as_ref(),
+                &redactor,
+                "skills_warning",
+                None,
+                Some(format!(
+                    "{} ambiguous skill name(s) require explicit selection",
+                    ambiguous_skills.len()
+                )),
+                json!({ "ambiguous_names": ambiguous_skills }),
+            );
+        }
         let initial_session_mode = config.session_mode;
         let session_metrics = Arc::new(Mutex::new(conversation_state.metrics.clone()));
         let next_attachment_id = next_attachment_counter(&conversation_state.context_attachments);
@@ -1863,6 +1894,7 @@ impl Agent {
                 cancel.clone(),
                 session_log.clone(),
                 redactor.clone(),
+                tx.clone(),
                 turn_id,
             );
 
@@ -2294,11 +2326,26 @@ fn refresh_mcp_tools_in_background(
     cancel: CancellationToken,
     session_log: Option<SessionHandle>,
     redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
     turn_id: TurnId,
 ) {
     tokio::spawn(async move {
-        let mcp_errors = tools.refresh_mcp_tools(cancel).await;
-        for error in mcp_errors {
+        let outcome = tools.refresh_mcp_tools(cancel).await;
+        log_session_event(
+            session_log.as_ref(),
+            &redactor,
+            "mcp_status_updated",
+            Some(turn_id),
+            None,
+            serde_json::to_value(&outcome.status).unwrap_or_else(|_| json!({})),
+        );
+        let _ = tx
+            .send(AgentEvent::McpStatusUpdated {
+                turn_id,
+                snapshot: outcome.status.clone(),
+            })
+            .await;
+        for error in outcome.errors {
             log_session_event(
                 session_log.as_ref(),
                 &redactor,
@@ -2582,7 +2629,12 @@ impl TurnRuntime {
         // them once so the cost is not paid (or double-counted) per round.
         let redacted_instructions = self.redactor.redact(&raw_instructions);
         broker.metrics.redactions += redacted_instructions.redactions;
-        let request_instructions = redacted_instructions.text;
+        let mut request_instructions = redacted_instructions.text;
+        let mut active_skill_names = activation
+            .skills
+            .iter()
+            .map(|skill| skill.summary.name.clone())
+            .collect::<BTreeSet<_>>();
         // Holding a single stream redactor across rounds keeps the tail
         // buffer alive so a secret straddling a tool-call boundary is
         // still redacted before being released downstream.
@@ -2673,6 +2725,14 @@ impl TurnRuntime {
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
                 self.finish_cancelled_turn(&task_title).await;
                 return Ok(());
+            }
+            if self.append_implicit_skill_instructions(
+                &results,
+                &mut active_skill_names,
+                &mut request_instructions,
+                &mut broker.metrics,
+            ) {
+                previous_response_id = None;
             }
             // The planner is advisory: once the preflight block has executed,
             // the model has the planner outputs (success or not) in context, so
@@ -2966,6 +3026,12 @@ impl TurnRuntime {
             if let Some(reason) = loop_guard.observe_round(&tool_calls, &results) {
                 return Err(SqueezyError::Agent(reason));
             }
+            let implicit_instructions_added = self.append_implicit_skill_instructions(
+                &results,
+                &mut active_skill_names,
+                &mut request_instructions,
+                &mut broker.metrics,
+            );
             let results = seen_tool_outputs.prepare_results(results);
             let results = pack_tool_results(results, self.config.max_tool_result_bytes_per_round);
             self.record_replay_tool_results(&tool_calls, &results);
@@ -3001,7 +3067,11 @@ impl TurnRuntime {
             }
 
             if self.config.store_responses {
-                previous_response_id = response_id;
+                previous_response_id = if implicit_instructions_added {
+                    None
+                } else {
+                    response_id
+                };
                 next_input = outputs;
             } else {
                 previous_response_id = None;
@@ -3015,6 +3085,61 @@ impl TurnRuntime {
         Err(SqueezyError::Agent(format!(
             "stopped after {MAX_TOOL_ROUNDS} tool rounds{suffix}"
         )))
+    }
+
+    fn append_implicit_skill_instructions(
+        &self,
+        results: &[ToolResult],
+        active_skill_names: &mut BTreeSet<String>,
+        request_instructions: &mut String,
+        metrics: &mut TurnMetrics,
+    ) -> bool {
+        let names = implicit_skill_names(results, active_skill_names);
+        if names.is_empty() {
+            return false;
+        }
+
+        let mut loaded = Vec::new();
+        for name in names {
+            match self.tools.load_skill_for_instructions(&name) {
+                Ok(skill) => {
+                    active_skill_names.insert(name);
+                    loaded.push(skill);
+                }
+                Err(error) => {
+                    self.log_event(
+                        "skill_activation_failed",
+                        Some(self.turn_id),
+                        Some(format!("implicit skill activation failed: {name}")),
+                        json!({
+                            "name": name,
+                            "source": "implicit",
+                            "error": error.to_string(),
+                        }),
+                    );
+                }
+            }
+        }
+        let Some(block) = self.tools.format_active_skills(&loaded) else {
+            return false;
+        };
+        let redacted = self.redactor.redact(&block);
+        metrics.redactions += redacted.redactions;
+        request_instructions.push_str("\n\n");
+        request_instructions.push_str(&redacted.text);
+        self.log_event(
+            "skill_activation",
+            Some(self.turn_id),
+            Some(format!("{} implicit skill(s) activated", loaded.len())),
+            json!({
+                "source": "implicit",
+                "skills": loaded
+                    .iter()
+                    .map(|skill| skill.summary.name.clone())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        true
     }
 
     async fn finish_turn(&self, metrics: &TurnMetrics) {
@@ -3336,6 +3461,51 @@ struct ToolExecutionContext<'a> {
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
+}
+
+struct McpElicitationHandlerScope<'a> {
+    tools: &'a ToolRegistry,
+}
+
+impl Drop for McpElicitationHandlerScope<'_> {
+    fn drop(&mut self) {
+        self.tools.set_mcp_elicitation_handler(None);
+    }
+}
+
+fn install_mcp_elicitation_handler<'a>(
+    context: &'a ToolExecutionContext<'_>,
+) -> McpElicitationHandlerScope<'a> {
+    let turn_id = context.turn_id;
+    let tx = context.tx.clone();
+    let cancel = context.cancel.clone();
+    let handler: McpElicitationHandler = Arc::new(move |request| {
+        let tx = tx.clone();
+        let cancel = cancel.clone();
+        Box::pin(async move {
+            let (response_tx, response_rx) = oneshot::channel();
+            let send_request = tx.send(AgentEvent::McpElicitationRequested {
+                turn_id,
+                request,
+                response_tx,
+            });
+            let send_result = tokio::select! {
+                _ = cancel.cancelled() => return McpElicitationResponse::cancel(),
+                result = send_request => result,
+            };
+            if send_result.is_err() {
+                return McpElicitationResponse::decline();
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => McpElicitationResponse::cancel(),
+                response = response_rx => response.unwrap_or_else(|_| McpElicitationResponse::decline()),
+            }
+        })
+    });
+    context.tools.set_mcp_elicitation_handler(Some(handler));
+    McpElicitationHandlerScope {
+        tools: context.tools,
+    }
 }
 
 async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
@@ -4364,6 +4534,7 @@ async fn execute_tool_calls(
     context: ToolExecutionContext<'_>,
     broker: &mut CostBroker,
 ) -> Vec<ToolResult> {
+    let _mcp_elicitation_handler = install_mcp_elicitation_handler(&context);
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut recorded = vec![false; calls.len()];
@@ -6279,8 +6450,39 @@ fn job_status_for_tool_status(status: ToolStatus) -> JobStatus {
     }
 }
 
+fn implicit_skill_names(
+    results: &[ToolResult],
+    active_skill_names: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut names = Vec::new();
+    for result in results {
+        let Some(name) = result
+            .content
+            .get("implicit_skill_activation")
+            .and_then(|value| value.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if active_skill_names.contains(name) || !seen.insert(name.to_string()) {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names
+}
+
 fn tool_result_summary(result: &ToolResult) -> String {
     let mut parts = vec![format!("{} {:?}", result.tool_name, result.status)];
+    if let Some(name) = result
+        .content
+        .get("implicit_skill_activation")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+    {
+        parts.push(format!("implicit_skill={name}"));
+    }
     if let Some(exit_code) = result.content.get("exit_code").and_then(Value::as_i64) {
         parts.push(format!("exit={exit_code}"));
     }
@@ -7179,6 +7381,15 @@ pub enum AgentEvent {
     TaskStateUpdated {
         turn_id: TurnId,
         snapshot: TaskStateSnapshot,
+    },
+    McpStatusUpdated {
+        turn_id: TurnId,
+        snapshot: McpStatusSnapshot,
+    },
+    McpElicitationRequested {
+        turn_id: TurnId,
+        request: McpElicitationRequest,
+        response_tx: oneshot::Sender<McpElicitationResponse>,
     },
     JobUpdated {
         job: JobSnapshot,
