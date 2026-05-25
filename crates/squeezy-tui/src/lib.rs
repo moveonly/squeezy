@@ -53,7 +53,13 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod approval;
+mod history;
+mod mention;
+mod overlay;
 mod render;
+mod status;
+mod streaming;
 
 use render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
@@ -150,142 +156,98 @@ impl Command for DisableModifyOtherKeys {
 struct SlashCommand {
     name: &'static str,
     description: &'static str,
+    available_during_task: bool,
+    parameter_hint: Option<&'static str>,
+}
+
+const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task: true,
+        parameter_hint: None,
+    }
+}
+
+const fn slash_locked(name: &'static str, description: &'static str) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task: false,
+        parameter_hint: None,
+    }
+}
+
+const fn slash_args(
+    name: &'static str,
+    description: &'static str,
+    available_during_task: bool,
+    parameter_hint: &'static str,
+) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task,
+        parameter_hint: Some(parameter_hint),
+    }
 }
 
 const SLASH_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        name: "/help",
-        description: "show local Squeezy help topics",
-    },
-    SlashCommand {
-        name: "/model",
-        description: "show current provider and model",
-    },
-    SlashCommand {
-        name: "/permissions",
-        description: "show current permission policy",
-    },
-    SlashCommand {
-        name: "/plan",
-        description: "switch to Plan mode",
-    },
-    SlashCommand {
-        name: "/build",
-        description: "switch to Build mode",
-    },
-    SlashCommand {
-        name: "/cost",
-        description: "show token and cost accounting",
-    },
-    SlashCommand {
-        name: "/context",
-        description: "show context budget and compaction state",
-    },
-    SlashCommand {
-        name: "/attach",
-        description: "attach a file as prompt context",
-    },
-    SlashCommand {
-        name: "/attachments",
-        description: "list attached context",
-    },
-    SlashCommand {
-        name: "/copy",
-        description: "copy last answer or transcript",
-    },
-    SlashCommand {
-        name: "/compact",
-        description: "compact conversation context now",
-    },
-    SlashCommand {
-        name: "/collapse",
-        description: "collapse transcript entries",
-    },
-    SlashCommand {
-        name: "/expand",
-        description: "expand transcript entries",
-    },
-    SlashCommand {
-        name: "/jobs",
-        description: "list background jobs",
-    },
-    SlashCommand {
-        name: "/job",
-        description: "show a background job",
-    },
-    SlashCommand {
-        name: "/job-cancel",
-        description: "cancel a background job",
-    },
-    SlashCommand {
-        name: "/pin",
-        description: "pin transcript context",
-    },
-    SlashCommand {
-        name: "/pins",
-        description: "list pinned context",
-    },
-    SlashCommand {
-        name: "/unpin",
-        description: "remove pinned context",
-    },
-    SlashCommand {
-        name: "/feedback",
-        description: "preview or send product feedback",
-    },
-    SlashCommand {
-        name: "/report",
-        description: "preview or send a bug report",
-    },
-    SlashCommand {
-        name: "/sessions",
-        description: "list recent sessions",
-    },
-    SlashCommand {
-        name: "/session",
-        description: "show a saved session",
-    },
-    SlashCommand {
-        name: "/resume",
-        description: "resume a saved session",
-    },
-    SlashCommand {
-        name: "/session-export",
-        description: "export a saved session",
-    },
-    SlashCommand {
-        name: "/session-cleanup",
-        description: "remove old sessions",
-    },
-    SlashCommand {
-        name: "/checkpoints",
-        description: "list local checkpoints",
-    },
-    SlashCommand {
-        name: "/checkpoint",
-        description: "show a local checkpoint",
-    },
-    SlashCommand {
-        name: "/undo",
-        description: "undo the latest checkpoint",
-    },
-    SlashCommand {
-        name: "/revert-turn",
-        description: "revert a turn checkpoint",
-    },
-    SlashCommand {
-        name: "/verbosity",
-        description: "set answer verbosity",
-    },
-    SlashCommand {
-        name: "/tool-verbosity",
-        description: "set tool output verbosity",
-    },
-    SlashCommand {
-        name: "/detach",
-        description: "remove attached context",
-    },
+    slash("/help", "show local Squeezy help topics"),
+    slash("/model", "show current provider and model"),
+    slash("/permissions", "show current permission policy"),
+    slash_locked("/plan", "switch to Plan mode"),
+    slash_locked("/build", "switch to Build mode"),
+    slash("/cost", "show token and cost accounting"),
+    slash("/context", "show context budget and compaction state"),
+    slash_args(
+        "/attach",
+        "attach a file as prompt context",
+        false,
+        "<path>",
+    ),
+    slash("/attachments", "list attached context"),
+    slash("/copy", "copy last answer or transcript"),
+    slash_locked("/compact", "compact conversation context now"),
+    slash("/collapse", "collapse transcript entries"),
+    slash("/expand", "expand transcript entries"),
+    slash("/jobs", "list background jobs"),
+    slash_args("/job", "show a background job", true, "<id>"),
+    slash_args("/job-cancel", "cancel a background job", true, "<id>"),
+    slash_args("/pin", "pin transcript context", false, "<id>"),
+    slash("/pins", "list pinned context"),
+    slash_args("/unpin", "remove pinned context", false, "<id>"),
+    slash("/feedback", "preview or send product feedback"),
+    slash("/report", "preview or send a bug report"),
+    slash("/sessions", "list recent sessions"),
+    slash_args("/session", "show a saved session", true, "<id>"),
+    slash_args("/resume", "resume a saved session", false, "<id>"),
+    slash_args("/session-export", "export a saved session", false, "<id>"),
+    slash_locked("/session-cleanup", "remove old sessions"),
+    slash("/checkpoints", "list local checkpoints"),
+    slash_args("/checkpoint", "show a local checkpoint", true, "<id>"),
+    slash_locked("/undo", "undo the latest checkpoint"),
+    slash_locked("/revert-turn", "revert a turn checkpoint"),
+    slash_args(
+        "/verbosity",
+        "set answer verbosity",
+        false,
+        "quiet|normal|verbose",
+    ),
+    slash_args(
+        "/tool-verbosity",
+        "set tool output verbosity",
+        false,
+        "quiet|normal|verbose",
+    ),
+    slash_args("/detach", "remove attached context", false, "<id>"),
 ];
+
+impl SlashCommand {
+    fn is_dimmed(&self, task_in_progress: bool) -> bool {
+        task_in_progress && !self.available_during_task
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StartupProfile {
@@ -409,7 +371,7 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.note_turn_started();
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
-                    app.pending_assistant.push_str(&delta);
+                    app.pending_assistant.push_delta(&delta);
                     // Intentionally preserve `transcript_scroll_from_bottom`
                     // here: if the user paged up to read history we would
                     // otherwise yank them back to the bottom on every delta.
@@ -839,6 +801,14 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    if app.overlay.is_some() && handle_overlay_key(app, key) {
+        return Ok(false);
+    }
+
+    if app.mention_popup.is_some() && handle_mention_popup_key(app, key) {
+        return Ok(false);
+    }
+
     match key.code {
         KeyCode::Esc => {
             // ESC never exits; the pre-check above already handled in-flight
@@ -1066,6 +1036,131 @@ fn note_input_edited(app: &mut TuiApp) {
     app.input_history_draft.clear();
     app.selected_entry = None;
     clamp_slash_menu_index(app);
+    refresh_mention_popup(app);
+}
+
+fn refresh_mention_popup(app: &mut TuiApp) {
+    let Some(query) = mention::detect_mention(&app.input, app.input_cursor) else {
+        app.mention_popup = None;
+        return;
+    };
+    if app.workspace_files.is_none() {
+        let root = std::path::Path::new(&app.directory).to_path_buf();
+        let files = mention::load_workspace_files(&root);
+        app.workspace_files = Some(Arc::new(files));
+    }
+    let matches = app
+        .workspace_files
+        .as_ref()
+        .map(|files| mention::rank_files(&query.query, files))
+        .unwrap_or_default();
+    if matches.is_empty() {
+        app.mention_popup = None;
+        return;
+    }
+    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches));
+}
+
+fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    let Some(overlay) = app.overlay.as_mut() else {
+        return false;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = None;
+            app.status = "overlay cancelled".to_string();
+            true
+        }
+        KeyCode::Up => {
+            overlay.move_up();
+            true
+        }
+        KeyCode::Down => {
+            overlay.move_down();
+            true
+        }
+        KeyCode::Enter => {
+            apply_overlay_selection(app);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn apply_overlay_selection(app: &mut TuiApp) {
+    let Some(overlay) = app.overlay.take() else {
+        return;
+    };
+    match overlay {
+        overlay::Overlay::Model(picker) => {
+            if let Some(entry) = picker.selected() {
+                let provider = entry.provider;
+                let id = entry.id;
+                app.provider_name = provider;
+                app.model = id.to_string();
+                app.status = format!("selected model {provider}:{id}");
+                app.push_transcript_item(TranscriptItem::system(format!(
+                    "Model set to {provider}:{id} (restart the session to apply)"
+                )));
+            }
+        }
+        overlay::Overlay::Verbosity(picker) => {
+            if let Some(entry) = picker.selected() {
+                app.response_verbosity = entry.0;
+                app.status = format!("response verbosity {}", entry.0.as_str());
+            }
+        }
+        overlay::Overlay::ToolVerbosity(picker) => {
+            if let Some(entry) = picker.selected() {
+                app.tool_output_verbosity = entry.0;
+                app.status = format!("tool output verbosity {}", entry.0.as_str());
+            }
+        }
+        overlay::Overlay::Permissions(_) => {
+            app.status = "permission overlay closed".to_string();
+        }
+    }
+}
+
+fn handle_mention_popup_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.mention_popup.is_none() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.mention_popup = None;
+            true
+        }
+        KeyCode::Up => {
+            if let Some(popup) = app.mention_popup.as_mut() {
+                popup.move_up();
+            }
+            true
+        }
+        KeyCode::Down => {
+            if let Some(popup) = app.mention_popup.as_mut() {
+                popup.move_down();
+            }
+            true
+        }
+        KeyCode::Tab | KeyCode::Enter => apply_mention_popup(app),
+        _ => false,
+    }
+}
+
+fn apply_mention_popup(app: &mut TuiApp) -> bool {
+    let popup = match app.mention_popup.as_ref() {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => return false,
+    };
+    if let Some((new_input, new_cursor)) = popup.apply(&app.input) {
+        app.input = new_input;
+        app.input_cursor = new_cursor;
+        app.mention_popup = None;
+        clamp_slash_menu_index(app);
+        return true;
+    }
+    false
 }
 
 fn clear_input(app: &mut TuiApp) {
@@ -1466,6 +1561,13 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         .strip_prefix(command)
         .map(str::trim)
         .unwrap_or_default();
+    if let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == command)
+        && !spec.available_during_task
+        && turn_in_progress(app)
+    {
+        app.status = format!("{command} unavailable during turn");
+        return true;
+    }
     match command {
         "/cost" => {
             let snapshot = agent.session_accounting_snapshot().await;
@@ -1485,10 +1587,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/model" => {
             app.status = "model settings".to_string();
-            app.push_transcript_item(TranscriptItem::system(format!(
-                "Model\nprovider={}\nmodel={}\nchange=exit and run `squeezy --no-default`, or start with `--provider <id> --model <id>`",
-                app.provider_name, app.model
-            )));
+            app.overlay = Some(overlay::build_model_overlay(app.provider_name, &app.model));
             return true;
         }
         "/permissions" => {
@@ -1641,29 +1740,33 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/verbosity" => {
-            let Some(value) = parts.next() else {
+            if let Some(value) = parts.next() {
+                if let Some(verbosity) = parse_response_verbosity(value) {
+                    app.response_verbosity = verbosity;
+                    app.status = format!("response verbosity {}", verbosity.as_str());
+                    return true;
+                }
                 app.status = "usage: /verbosity concise|normal|verbose".to_string();
                 return true;
-            };
-            let Some(verbosity) = parse_response_verbosity(value) else {
-                app.status = "usage: /verbosity concise|normal|verbose".to_string();
-                return true;
-            };
-            app.response_verbosity = verbosity;
-            app.status = format!("response verbosity {}", verbosity.as_str());
+            }
+            app.overlay = Some(overlay::build_verbosity_overlay(app.response_verbosity));
+            app.status = "select response verbosity".to_string();
             return true;
         }
         "/tool-verbosity" => {
-            let Some(value) = parts.next() else {
+            if let Some(value) = parts.next() {
+                if let Some(verbosity) = parse_tool_output_verbosity(value) {
+                    app.tool_output_verbosity = verbosity;
+                    app.status = format!("tool output verbosity {}", verbosity.as_str());
+                    return true;
+                }
                 app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
                 return true;
-            };
-            let Some(verbosity) = parse_tool_output_verbosity(value) else {
-                app.status = "usage: /tool-verbosity compact|normal|verbose".to_string();
-                return true;
-            };
-            app.tool_output_verbosity = verbosity;
-            app.status = format!("tool output verbosity {}", verbosity.as_str());
+            }
+            app.overlay = Some(overlay::build_tool_verbosity_overlay(
+                app.tool_output_verbosity,
+            ));
+            app.status = "select tool output verbosity".to_string();
             return true;
         }
         "/jobs" => {
@@ -2373,8 +2476,8 @@ fn copy_to_clipboard(app: &mut TuiApp, target: ClipboardTarget) {
 fn clipboard_text(app: &TuiApp, target: ClipboardTarget) -> Option<String> {
     match target {
         ClipboardTarget::LastAssistant => {
-            if !app.pending_assistant.trim().is_empty() {
-                return Some(app.pending_assistant.clone());
+            if !app.pending_assistant.trim_is_empty() {
+                return Some(app.pending_assistant.text());
             }
             app.transcript
                 .iter()
@@ -2398,7 +2501,7 @@ fn transcript_plain_text(app: &TuiApp) -> String {
         lines.extend(item.plain_text_lines());
     }
     if !app.pending_assistant.is_empty() {
-        lines.push(format!("assistant: {}", app.pending_assistant));
+        lines.push(format!("assistant: {}", app.pending_assistant.text()));
     }
     lines.join("\n")
 }
@@ -2971,34 +3074,7 @@ fn format_approval_menu_lines(
     request: &ToolApprovalRequest,
     selected: usize,
 ) -> Vec<Line<'static>> {
-    let permission = &request.permission;
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "Approval needed",
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" · {} · {}", request.tool_name, permission.risk.as_str()),
-            Style::default().fg(QUIET),
-        ),
-    ])];
-    if let Some(command) = permission.metadata.get("command") {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(command.clone(), Style::default().fg(Color::White)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(permission.target.clone(), Style::default().fg(Color::White)),
-        ]));
-    }
-    if let Some(cwd) = permission.metadata.get("cwd") {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("cwd {cwd}"), Style::default().fg(QUIET)),
-        ]));
-    }
+    let mut lines = approval::render_preview(request);
     for (index, option) in approval_options().iter().enumerate() {
         let is_selected = index == selected.min(approval_options().len() - 1);
         let marker = if is_selected { "› " } else { "  " };
@@ -3198,24 +3274,78 @@ fn should_show_task_panel(app: &TuiApp) -> bool {
             .is_some_and(|snapshot| snapshot.status != squeezy_core::TaskStateStatus::Completed)
 }
 
-fn task_panel_height(_app: &TuiApp) -> u16 {
-    1
+fn task_panel_height(app: &TuiApp) -> u16 {
+    if turn_in_progress(app) && working_detail_line(app).is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let line = if turn_in_progress(app) {
-        working_line(app)
+    let mut lines = if turn_in_progress(app) {
+        let mut rows = vec![working_line(app)];
+        if let Some(detail) = working_detail_line(app) {
+            rows.push(detail);
+        }
+        rows
     } else if let Some(duration) = app.last_turn_duration {
-        worked_divider_line(duration, area.width)
+        vec![worked_divider_line(duration, area.width)]
     } else if let Some(snapshot) = app.task_state.as_ref() {
-        compact_task_state_line(snapshot)
+        vec![compact_task_state_line(snapshot)]
     } else {
-        working_line(app)
+        vec![working_line(app)]
     };
-    let paragraph = Paragraph::new(vec![line])
+    if lines.len() < area.height as usize {
+        // Pad so the bottom row doesn't shift when the detail goes away.
+        while lines.len() < area.height as usize {
+            lines.push(Line::from(""));
+        }
+    }
+    let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+/// Detail row rendered below the spinner when there is something
+/// actionable to show. Returns `None` when the spinner alone suffices —
+/// keeps the working cell single-row in the common case.
+fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
+    // Highest priority: MCP startup in progress.
+    if let Some(snapshot) = app.mcp_status.as_ref() {
+        let mut starting = 0usize;
+        let mut total = 0usize;
+        let mut ready = 0usize;
+        for status in snapshot.per_server.values() {
+            total += 1;
+            match status {
+                McpServerStatus::Starting => starting += 1,
+                McpServerStatus::Ready { .. } => ready += 1,
+                _ => {}
+            }
+        }
+        if starting > 0 && total > 0 {
+            let text = format!("    ↳ mcp: starting {ready}/{total} servers");
+            return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+        }
+    }
+
+    // Otherwise: count of additional queued tools beyond the visible one.
+    let visible_tools = app
+        .active_tool_calls
+        .values()
+        .filter(|call| !is_control_tool_name(&call.name))
+        .count();
+    if visible_tools > 1 {
+        let extra = visible_tools - 1;
+        let text = format!(
+            "    ↳ +{extra} more tool call{} queued",
+            if extra == 1 { "" } else { "s" }
+        );
+        return Some(Line::from(Span::styled(text, Style::default().fg(QUIET))));
+    }
+    None
 }
 
 fn turn_in_progress(app: &TuiApp) -> bool {
@@ -3721,10 +3851,11 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
 }
 
 fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {
-    if app.pending_assistant.trim().is_empty() {
+    if app.pending_assistant.trim_is_empty() {
         return None;
     }
-    let content = assistant_content_without_repeated_tool_output(app, &app.pending_assistant);
+    let text = app.pending_assistant.text();
+    let content = assistant_content_without_repeated_tool_output(app, &text);
     (!content.trim().is_empty()).then_some(content)
 }
 
@@ -6035,10 +6166,29 @@ fn truncate_bytes(text: &str, limit: usize) -> String {
 }
 
 fn input_panel_height(app: &TuiApp, width: u16) -> u16 {
+    let overlay_lines = app
+        .overlay
+        .as_ref()
+        .map(|o| o.render_lines().len())
+        .unwrap_or(0);
+    let mention_lines = app
+        .mention_popup
+        .as_ref()
+        .map(|p| p.matches.len().min(5))
+        .unwrap_or(0);
+    let suggestion_lines = if overlay_lines == 0 && mention_lines == 0 {
+        slash_suggestions(&app.input).len()
+    } else {
+        0
+    };
+    let popup_height = overlay_lines + mention_lines;
+    let max_height = (PROMPT_MAX_HEIGHT as usize).max(popup_height + PROMPT_MIN_HEIGHT as usize);
     prompt_visual_line_count(&app.input, width)
         .saturating_add(2)
-        .saturating_add(slash_suggestions(&app.input).len())
-        .clamp(PROMPT_MIN_HEIGHT as usize, PROMPT_MAX_HEIGHT as usize) as u16
+        .saturating_add(overlay_lines)
+        .saturating_add(mention_lines)
+        .saturating_add(suggestion_lines)
+        .clamp(PROMPT_MIN_HEIGHT as usize, max_height) as u16
 }
 
 fn prompt_visual_line_count(input: &str, width: u16) -> usize {
@@ -6138,6 +6288,7 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .max(12);
+    let task_active = turn_in_progress(app);
     visible
         .iter()
         .enumerate()
@@ -6148,21 +6299,52 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 == app
                     .slash_menu_index
                     .min(suggestions.len().saturating_sub(1));
+            let dimmed = command.is_dimmed(task_active);
             let marker = if selected { "› " } else { "  " };
             let command_padding =
                 " ".repeat(command_width.saturating_sub(command.name.chars().count()) + 2);
-            Line::from(vec![
+            let name_color = if dimmed {
+                QUIET
+            } else if selected {
+                GOLD
+            } else {
+                AMBER
+            };
+            let mut name_style = Style::default().fg(name_color);
+            if dimmed {
+                name_style = name_style.add_modifier(Modifier::DIM);
+            }
+            let mut description_style = Style::default().fg(QUIET);
+            if dimmed {
+                description_style = description_style.add_modifier(Modifier::DIM);
+            }
+            let mut spans = vec![
                 Span::styled(
                     marker,
                     Style::default().fg(if selected { GOLD } else { QUIET }),
                 ),
-                Span::styled(
-                    command.name,
-                    Style::default().fg(if selected { GOLD } else { AMBER }),
-                ),
+                Span::styled(command.name, name_style),
                 Span::styled(command_padding, Style::default().fg(QUIET)),
-                Span::styled(command.description, Style::default().fg(QUIET)),
-            ])
+                Span::styled(command.description, description_style),
+            ];
+            if let Some(hint) = command.parameter_hint {
+                let hint_text = format!(" {hint}");
+                spans.push(Span::styled(
+                    hint_text,
+                    Style::default()
+                        .fg(QUIET)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            if dimmed {
+                spans.push(Span::styled(
+                    "  (unavailable during turn)",
+                    Style::default()
+                        .fg(QUIET)
+                        .add_modifier(Modifier::DIM | Modifier::ITALIC),
+                ));
+            }
+            Line::from(spans)
         })
         .collect()
 }
@@ -6186,9 +6368,22 @@ fn visible_slash_suggestions(suggestions: &[SlashCommand], selected: usize) -> &
 }
 
 fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let suggestion_lines = slash_suggestion_lines(app);
-    let prompt_height = area.height.saturating_sub(suggestion_lines.len() as u16);
+    let overlay_lines = overlay_picker_lines(app);
+    let mention_lines = if overlay_lines.is_empty() {
+        mention_popup_lines(app)
+    } else {
+        Vec::new()
+    };
+    let suggestion_lines = if overlay_lines.is_empty() && mention_lines.is_empty() {
+        slash_suggestion_lines(app)
+    } else {
+        Vec::new()
+    };
+    let overlay_height = overlay_lines.len() + mention_lines.len() + suggestion_lines.len();
+    let prompt_height = area.height.saturating_sub(overlay_height as u16);
     let mut lines = prompt_input_lines(app, prompt_height);
+    lines.extend(overlay_lines);
+    lines.extend(mention_lines);
     lines.extend(suggestion_lines);
     let scroll = lines.len().saturating_sub(area.height as usize) as u16;
     let paragraph = Paragraph::new(lines)
@@ -6196,6 +6391,45 @@ fn render_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
+}
+
+fn overlay_picker_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    app.overlay
+        .as_ref()
+        .map(|o| o.render_lines())
+        .unwrap_or_default()
+}
+
+fn mention_popup_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    let Some(popup) = app.mention_popup.as_ref() else {
+        return Vec::new();
+    };
+    if popup.is_empty() {
+        return Vec::new();
+    }
+    popup
+        .matches
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(index, path)| {
+            let selected = index == popup.selected;
+            let marker = if selected { "› " } else { "  " };
+            let display = path.display().to_string();
+            let style = if selected {
+                Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(if selected { GOLD } else { QUIET }),
+                ),
+                Span::styled(display, style),
+            ])
+        })
+        .collect()
 }
 
 fn format_status_overview_line(app: &TuiApp, width: u16) -> Line<'static> {
@@ -6284,33 +6518,7 @@ fn format_status_context(app: &TuiApp) -> String {
 }
 
 fn format_status_details(app: &TuiApp) -> String {
-    format!(
-        "{}  repo {}  sandbox {}  telemetry {}  mcp {}  cost {}  tok {}/{}{}  ctx {}  pins {}  compact {}  tools {}  budget {}  cfg {}  read {}B  receipts {}  redactions {}  cached {}  cache_write {}",
-        app.permissions.compact(),
-        app.repo.detail(),
-        app.permissions.sandbox,
-        app.telemetry.as_str(),
-        format_mcp_status(app),
-        format_cost(&app.cost),
-        format_optional_u64(app.cost.input_tokens),
-        format_optional_u64(app.cost.output_tokens),
-        reasoning_status_fragment(app),
-        app.context_estimate.estimated_tokens,
-        app.context_compaction.pinned.len(),
-        app.context_compaction.generation,
-        app.metrics.tool_calls,
-        if app.metrics.budget_denials == 0 {
-            "ok".to_string()
-        } else {
-            format!("denied:{}", app.metrics.budget_denials)
-        },
-        app.config_sources,
-        app.metrics.bytes_read,
-        app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits,
-        app.metrics.redactions,
-        format_optional_u64(app.cost.cached_input_tokens),
-        format_optional_u64(app.cost.cache_write_input_tokens),
-    )
+    status::render_status_details(app)
 }
 
 fn format_status_hints(app: &TuiApp) -> String {
@@ -6650,6 +6858,9 @@ struct TuiApp {
     input_history_index: Option<usize>,
     input_history_draft: String,
     slash_menu_index: usize,
+    mention_popup: Option<mention::MentionPopup>,
+    workspace_files: Option<Arc<Vec<PathBuf>>>,
+    overlay: Option<overlay::Overlay>,
     alternate_scroll_enabled: bool,
     attachments: Vec<ContextAttachment>,
     context_compaction: ContextCompactionState,
@@ -6658,7 +6869,7 @@ struct TuiApp {
     selected_entry: Option<usize>,
     next_entry_id: u64,
     transcript_scroll_from_bottom: u16,
-    pending_assistant: String,
+    pending_assistant: streaming::StreamingController,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -6760,6 +6971,9 @@ impl TuiApp {
             input_history_index: None,
             input_history_draft: String::new(),
             slash_menu_index: 0,
+            mention_popup: None,
+            workspace_files: None,
+            overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
@@ -6769,7 +6983,7 @@ impl TuiApp {
             selected_entry: None,
             next_entry_id,
             transcript_scroll_from_bottom: 0,
-            pending_assistant: String::new(),
+            pending_assistant: streaming::StreamingController::new(),
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,

@@ -2305,7 +2305,7 @@ fn failed_assistant_marker_uses_error_color() {
 #[test]
 fn pending_assistant_uses_rotating_coin_marker() {
     let mut app = test_app(SessionMode::Build);
-    app.pending_assistant = "streaming".to_string();
+    app.pending_assistant.push_delta("streaming");
     app.turn_visual = TurnVisualState::Running;
     app.animation_tick = 4;
 
@@ -3302,7 +3302,7 @@ async fn assistant_delta_preserves_scroll_offset_in_history() {
         app.transcript_scroll_from_bottom, 8,
         "history scroll must survive incoming deltas",
     );
-    assert_eq!(app.pending_assistant, "streamed");
+    assert_eq!(app.pending_assistant.text(), "streamed");
 }
 
 #[tokio::test]
@@ -3537,7 +3537,8 @@ async fn pending_assistant_suppresses_streaming_duplicate_shell_output_fence() {
         "stderr": "",
     });
     app.push_tool_result_with_call(result, Some(call));
-    app.pending_assistant = format!("Here is the report:\n\n```text\n{stdout}");
+    app.pending_assistant
+        .push_delta(&format!("Here is the report:\n\n```text\n{stdout}"));
 
     let rendered = render_to_string(&app, 140, 24);
 
@@ -3926,4 +3927,351 @@ fn sample_attachment(id: &str) -> ContextAttachment {
             .to_string(),
         truncated: true,
     }
+}
+
+// ---- F41: model/verbosity overlay ----
+
+#[tokio::test]
+async fn slash_model_opens_overlay_with_registry_entries() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/model").await;
+    assert!(ran, "/model should execute");
+    assert!(app.overlay.is_some(), "overlay should be set");
+
+    let rendered = render_inline_to_string(&app, 120, 24);
+    assert!(
+        rendered.contains("Select model"),
+        "header missing: {rendered}"
+    );
+    // Some registry entry's id should appear.
+    let mut found = false;
+    for model in squeezy_llm::MODEL_REGISTRY.iter() {
+        if rendered.contains(model.id) {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "no model id appeared in overlay: {rendered}");
+}
+
+#[tokio::test]
+async fn slash_verbosity_opens_overlay_without_arg() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let ran = handle_slash_command(&mut app, &mut agent, "/verbosity").await;
+    assert!(ran);
+    let rendered = render_inline_to_string(&app, 120, 24);
+    assert!(rendered.contains("Select response verbosity"), "{rendered}");
+}
+
+#[tokio::test]
+async fn overlay_enter_applies_verbosity_selection() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.response_verbosity = ResponseVerbosity::Normal;
+    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
+    assert!(app.overlay.is_some());
+    // The default index is "normal" — move down once to verbose.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+    assert!(app.overlay.is_none(), "overlay should close after Enter");
+    assert_eq!(app.response_verbosity, ResponseVerbosity::Verbose);
+}
+
+#[tokio::test]
+async fn overlay_esc_cancels_without_change() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let original = app.response_verbosity;
+    handle_slash_command(&mut app, &mut agent, "/verbosity").await;
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(app.overlay.is_none());
+    assert_eq!(app.response_verbosity, original);
+}
+
+// ---- F37: @-mention composer ----
+
+#[test]
+fn mention_popup_opens_after_typing_at_word() {
+    let mut app = test_app(SessionMode::Build);
+    // Seed workspace files so the popup doesn't trigger a real crawl.
+    app.workspace_files = Some(Arc::new(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+        PathBuf::from("docs/readme.md"),
+    ]));
+
+    insert_input_text(&mut app, "@graph");
+    let popup = app
+        .mention_popup
+        .as_ref()
+        .expect("popup should open after @graph");
+    assert_eq!(popup.query, "graph");
+    assert!(!popup.is_empty());
+    assert!(popup.matches[0].to_string_lossy().contains("squeezy-graph"),);
+}
+
+#[tokio::test]
+async fn mention_popup_inserts_path_on_enter() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
+        "crates/squeezy-graph/src/lib.rs",
+    )]));
+
+    insert_input_text(&mut app, "@graph");
+    assert!(app.mention_popup.is_some());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("enter");
+
+    assert!(app.mention_popup.is_none());
+    assert_eq!(app.input, "crates/squeezy-graph/src/lib.rs ");
+}
+
+#[tokio::test]
+async fn mention_popup_escapes_on_esc() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
+        "crates/squeezy-graph/src/lib.rs",
+    )]));
+
+    insert_input_text(&mut app, "@graph");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("esc");
+    assert!(app.mention_popup.is_none());
+    assert_eq!(app.input, "@graph");
+}
+
+// ---- F40: working row details ----
+
+#[test]
+fn working_panel_height_is_one_without_detail() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new()); // turn in progress
+    assert!(turn_in_progress(&app));
+    assert_eq!(task_panel_height(&app), 1);
+    assert!(working_detail_line(&app).is_none());
+}
+
+#[test]
+fn working_panel_grows_to_two_rows_when_mcp_starting() {
+    // McpStatusSnapshot/McpServerStatus are re-exported from squeezy_tools.
+    let mut per_server = std::collections::BTreeMap::new();
+    per_server.insert("alpha".to_string(), McpServerStatus::Starting);
+    per_server.insert(
+        "beta".to_string(),
+        McpServerStatus::Ready {
+            tools_count: 3,
+            cached: false,
+        },
+    );
+
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    app.mcp_status = Some(McpStatusSnapshot {
+        per_server,
+        generated_unix_millis: 0,
+    });
+
+    assert_eq!(task_panel_height(&app), 2);
+    let detail = working_detail_line(&app).expect("expected mcp detail line");
+    let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("starting"), "got: {text}");
+    assert!(text.contains("/2"), "got: {text}");
+}
+
+#[test]
+fn working_detail_summarises_extra_queued_tools() {
+    use squeezy_tools::ToolCall;
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    app.active_tool_calls.insert(
+        "a".to_string(),
+        ToolCall {
+            call_id: "a".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+        },
+    );
+    app.active_tool_calls.insert(
+        "b".to_string(),
+        ToolCall {
+            call_id: "b".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "pwd"}),
+        },
+    );
+
+    let detail = working_detail_line(&app).expect("queued summary");
+    let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(text.contains("+1 more tool call queued"), "got: {text}");
+}
+
+// ---- F38: status segment composition ----
+
+#[test]
+fn status_details_render_via_segments_match_legacy_format() {
+    let app = test_app(SessionMode::Build);
+    let details = format_status_details(&app);
+    // Each segment must appear with its label so downstream consumers
+    // (CLI status verbose, logs) keep parsing.
+    for needle in [
+        "repo ",
+        "sandbox ",
+        "telemetry ",
+        "mcp ",
+        "cost ",
+        "tok ",
+        "ctx ",
+        "pins ",
+        "compact ",
+        "tools ",
+        "budget ",
+        "cfg ",
+        "read ",
+        "receipts ",
+        "redactions ",
+        "cached ",
+        "cache_write ",
+    ] {
+        assert!(
+            details.contains(needle),
+            "missing segment label {needle:?} in: {details}"
+        );
+    }
+}
+
+#[test]
+fn status_segment_individually_returns_expected_text() {
+    let app = test_app(SessionMode::Build);
+    assert_eq!(
+        super::status::segments::sandbox(&app),
+        Some(format!("sandbox {}", app.permissions.sandbox))
+    );
+    assert!(
+        super::status::segments::tools(&app)
+            .as_deref()
+            .map(|s| s.starts_with("tools "))
+            .unwrap_or(false)
+    );
+}
+
+// ---- F39: slash command capabilities ----
+
+#[test]
+fn slash_commands_have_documented_capability_for_every_entry() {
+    // Sanity-check that every slash command has been classified.
+    let mutating = [
+        "/plan",
+        "/build",
+        "/compact",
+        "/attach",
+        "/detach",
+        "/pin",
+        "/unpin",
+        "/resume",
+        "/session-export",
+        "/session-cleanup",
+        "/undo",
+        "/revert-turn",
+        "/verbosity",
+        "/tool-verbosity",
+    ];
+    for command in SLASH_COMMANDS {
+        let expected_dim = mutating.contains(&command.name);
+        assert_eq!(
+            command.available_during_task, !expected_dim,
+            "{} availability mismatch",
+            command.name
+        );
+    }
+}
+
+#[test]
+fn slash_compact_unavailable_during_turn_renders_dim_hint() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+    set_input(&mut app, "/compact".to_string());
+
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("/compact"),
+        "expected /compact in output: {output}"
+    );
+    assert!(
+        output.contains("unavailable during turn"),
+        "expected unavailable hint: {output}"
+    );
+}
+
+#[tokio::test]
+async fn slash_compact_during_turn_short_circuits_dispatcher() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/compact").await;
+    assert!(ran, "command should be recognised");
+    assert!(
+        app.status.contains("unavailable during turn"),
+        "status should reflect block: {}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn slash_help_is_allowed_during_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.cancel = Some(CancellationToken::new());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/help").await;
+    assert!(ran, "help should execute");
+    assert!(
+        !app.status.contains("unavailable during turn"),
+        "help should be allowed: {}",
+        app.status
+    );
+}
+
+#[test]
+fn slash_parameter_hint_appears_in_render() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/verbosity".to_string());
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("quiet|normal|verbose"),
+        "expected parameter hint to render: {output}"
+    );
 }
