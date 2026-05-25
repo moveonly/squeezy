@@ -29,9 +29,15 @@ fn read_keychain_password(service: &str, account: &str) -> std::result::Result<S
     String::from_utf8(password).map_err(|err| err.to_string())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn read_keychain_password(service: &str, account: &str) -> std::result::Result<String, String> {
+    let entry = keyring::Entry::new(service, account).map_err(|err| err.to_string())?;
+    entry.get_password().map_err(|err| err.to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn read_keychain_password(_service: &str, _account: &str) -> std::result::Result<String, String> {
-    Err("keychain fallback is only available on macOS".to_string())
+    Err("keychain fallback is only available on macOS and Windows".to_string())
 }
 
 #[cfg(test)]

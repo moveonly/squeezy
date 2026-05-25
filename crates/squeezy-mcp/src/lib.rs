@@ -1518,7 +1518,29 @@ fn terminate_process_group(pid: u32) {
     });
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn terminate_process_group(pid: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+
+    // Windows has no process-group / signal equivalent. The MCP transport
+    // spawns a single stdio server child; TerminateProcess on its PID is
+    // the closest analog to the Unix SIGKILL-on-pgid path. Grandchildren
+    // spawned by the server are not transitively killed — a Job Object
+    // wrapper would be needed for that, which `squeezy-tools::win_job`
+    // provides for shell sandboxing but is intentionally not adopted here
+    // because MCP stdio servers are typically single-process.
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, FALSE, pid) };
+    if handle.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = TerminateProcess(handle, 1);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_process_group(_pid: u32) {}
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # Contributing
 
-Squeezy is implemented in Rust and targets macOS and Linux first. The foundation workspace uses Rust 2024.
+Squeezy is implemented in Rust and targets macOS, Linux, and Windows (x86_64). The foundation workspace uses Rust 2024.
 
 Contributor-facing architecture, validation, benchmark, and deployment notes
 live in [`docs/internal/`](docs/internal/). User-facing product docs live in
@@ -26,6 +26,14 @@ On Debian/Ubuntu Linux, install the packages needed for the static musl release 
 sudo apt-get install musl-tools file binutils
 rustup target add x86_64-unknown-linux-musl
 ```
+
+On Windows (x86_64), install Visual Studio Build Tools with the "Desktop
+development with C++" workload (required for the MSVC linker) and Rust
+via rustup. `cargo nextest`, `cargo deny`, and `cargo clippy` work
+unchanged. `actionlint`, `typos`, `gitleaks`, the coverage step, and the
+`install.sh` smoke test only run on the macOS CI matrix entry. The Linux
+`musl-tools`, `readelf`, and `file` invariants do not apply. Run shell
+commands through Git Bash (`shell: bash` in CI) or PowerShell.
 
 For coverage, install `cargo-llvm-cov`:
 

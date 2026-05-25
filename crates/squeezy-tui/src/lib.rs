@@ -110,9 +110,10 @@ impl Command for EnableAlternateScroll {
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "alternate scroll is only supported through ANSI escape sequences",
-        ))
+        // Modern Windows Terminal and ConPTY honour the ANSI form via
+        // `is_ansi_code_supported() == true`. Legacy consoles ignore alternate
+        // scroll mode entirely, so a winapi no-op is the right fallback.
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -131,9 +132,7 @@ impl Command for DisableAlternateScroll {
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "alternate scroll is only supported through ANSI escape sequences",
-        ))
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -152,9 +151,7 @@ impl Command for DisableModifyOtherKeys {
 
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
-        Err(io::Error::other(
-            "modifyOtherKeys reset is only supported through ANSI escape sequences",
-        ))
+        Ok(())
     }
 
     #[cfg(windows)]

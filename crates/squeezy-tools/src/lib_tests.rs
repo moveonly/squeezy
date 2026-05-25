@@ -3221,7 +3221,7 @@ async fn shell_checkpoint_surfaces_coverage_warnings_inline() {
         "expected outside-workspace warning, got {warnings:?}"
     );
 
-    let _ = std::fs::remove_file("/tmp/squeezy-inline-warning-test");
+    let _ = std::fs::remove_file(std::env::temp_dir().join("squeezy-inline-warning-test"));
     let _ = fs::remove_dir_all(root);
 }
 

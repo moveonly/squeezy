@@ -43,6 +43,10 @@ jobs:
             os: ubuntu-22.04
             archive: squeezy-x86_64-unknown-linux-musl.tar.gz
             binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            archive: squeezy-x86_64-pc-windows-msvc.zip
+            binary-path: target/x86_64-pc-windows-msvc/release/squeezy.exe
 
     steps:
       - name: Validate release tag
@@ -144,10 +148,23 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/package
-          cp "${{ matrix.binary-path }}" dist/package/squeezy
-          chmod +x dist/package/squeezy
-          tar -C dist/package -czf "dist/${{ matrix.archive }}" squeezy
-          shasum -a 256 "dist/${{ matrix.archive }}" > "dist/${{ matrix.archive }}.sha256"
+          target="${{ matrix.target }}"
+          archive="${{ matrix.archive }}"
+          binary="${{ matrix.binary-path }}"
+          case "$target" in
+            *-windows-*)
+              cp "$binary" "dist/package/squeezy.exe"
+              powershell -Command "Compress-Archive -Path dist/package/squeezy.exe -DestinationPath dist/$archive -Force"
+              sha=$(powershell -Command "(Get-FileHash -Algorithm SHA256 dist/$archive).Hash.ToLower()")
+              printf '%s  %s\n' "$sha" "$archive" > "dist/$archive.sha256"
+              ;;
+            *)
+              cp "$binary" dist/package/squeezy
+              chmod +x dist/package/squeezy
+              tar -C dist/package -czf "dist/$archive" squeezy
+              shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+              ;;
+          esac
 
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -242,3 +259,64 @@ jobs:
           git add Formula/squeezy.rb
           git commit -m "Update squeezy to ${RELEASE_TAG}"
           git push
+
+  update-winget:
+    name: Update winget manifest
+    needs: publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      WINGET_PKGS_TOKEN: ${{ secrets.WINGET_PKGS_TOKEN }}
+      WINGET_FORK_REPOSITORY: esqueezy/winget-pkgs
+
+    steps:
+      - name: Skip without token
+        if: ${{ env.WINGET_PKGS_TOKEN == '' }}
+        run: echo "WINGET_PKGS_TOKEN is not configured; skipping winget manifest update."
+
+      - name: Checkout Squeezy
+        if: ${{ env.WINGET_PKGS_TOKEN != '' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Download release archives
+        if: ${{ env.WINGET_PKGS_TOKEN != '' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: release-assets
+
+      - name: Checkout winget-pkgs fork
+        if: ${{ env.WINGET_PKGS_TOKEN != '' }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.WINGET_FORK_REPOSITORY }}
+          token: ${{ env.WINGET_PKGS_TOKEN }}
+          path: winget-pkgs-fork
+
+      - name: Update manifest
+        if: ${{ env.WINGET_PKGS_TOKEN != '' }}
+        run: scripts/update_winget_manifest.sh "$RELEASE_TAG" release-assets winget-pkgs-fork
+
+      - name: Commit and push manifest update
+        if: ${{ env.WINGET_PKGS_TOKEN != '' }}
+        shell: bash
+        run: |
+          cd winget-pkgs-fork
+          version="${RELEASE_TAG#v}"
+          manifest_dir="manifests/e/esqueezy/Squeezy/$version"
+          if git diff --quiet -- "$manifest_dir"; then
+            echo "winget manifest for $RELEASE_TAG is already up to date."
+            exit 0
+          fi
+
+          branch="squeezy-${version}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add "$manifest_dir"
+          git commit -m "Add esqueezy.Squeezy ${version}"
+          git push -u origin "$branch"
+          echo "Pushed $branch to $WINGET_FORK_REPOSITORY. Open a PR against microsoft/winget-pkgs manually for the first release; subsequent releases can use 'gh pr create' once the bot has access."

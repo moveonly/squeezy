@@ -5129,25 +5129,43 @@ impl TuiSettings {
 }
 
 pub fn default_settings_path() -> PathBuf {
-    env::var_os("SQUEEZY_SETTINGS_PATH")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".squeezy/settings.toml"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".squeezy/settings.toml"))
+    if let Some(custom) = env::var_os("SQUEEZY_SETTINGS_PATH") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("settings.toml") {
+        return home;
+    }
+    if let Some(config) = dirs::config_dir() {
+        return config.join("squeezy").join("settings.toml");
+    }
+    PathBuf::from(".squeezy/settings.toml")
 }
 
 pub fn default_projects_dir() -> PathBuf {
-    env::var_os("SQUEEZY_PROJECTS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".squeezy/projects"))
-        })
-        .unwrap_or_else(|| PathBuf::from(".squeezy/projects"))
+    if let Some(custom) = env::var_os("SQUEEZY_PROJECTS_DIR") {
+        return PathBuf::from(custom);
+    }
+    if let Some(home) = home_squeezy_subpath("projects") {
+        return home;
+    }
+    if let Some(config) = dirs::config_dir() {
+        return config.join("squeezy").join("projects");
+    }
+    PathBuf::from(".squeezy/projects")
+}
+
+fn home_squeezy_subpath(name: &str) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".squeezy").join(name))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 pub fn repo_settings_id(root: impl AsRef<Path>) -> String {

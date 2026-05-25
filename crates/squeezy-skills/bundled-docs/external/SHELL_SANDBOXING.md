@@ -71,6 +71,19 @@ Sensitive paths are denied on top of the default deny, and network is denied
 unless the command is classified as network and the user sets
 `network = "allow_when_approved"`.
 
+On **Windows**, Squeezy launches shell commands directly (PowerShell 7
+preferred, then Windows PowerShell, then `cmd.exe`, configurable via
+`SQUEEZY_SHELL`) and binds the child plus every descendant into a Win32
+Job Object created with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. This gives
+reliable process-tree termination on timeout or cancellation, the
+Windows analog of `setpgid` + SIGKILL on a Unix process group. It does
+not provide filesystem or network isolation: the audit record reports
+`filesystem = "best_effort_unavailable"` and `network =
+"denied_best_effort"` (or whatever the configured policy was, with a
+`fallback_reason` flag clarifying it is never enforced). `mode =
+"required"` therefore denies the command pre-spawn on Windows; use `mode
+= "best_effort"` or `mode = "external"`.
+
 On **Linux**, Squeezy uses a direct syscall backend. The pre-spawn probe checks
 `/proc/sys/kernel/unprivileged_userns_clone` and `/proc/self/ns/user`. When
 namespacing is available, the spawned shell calls

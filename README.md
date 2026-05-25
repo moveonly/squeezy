@@ -34,9 +34,9 @@ Rust users can install with Cargo:
 cargo install squeezy --locked
 ```
 
-Tagged releases also publish macOS Intel, macOS Apple Silicon, and Linux
-x86_64 musl archives. Full install, first-run, upgrade, and uninstall
-instructions are in [`docs/external/INSTALL.md`](docs/external/INSTALL.md).
+Tagged releases also publish macOS Intel, macOS Apple Silicon, Linux x86_64
+musl, and Windows x86_64 archives. Full install, first-run, upgrade, and
+uninstall instructions are in [`docs/external/INSTALL.md`](docs/external/INSTALL.md).
 
 ## Quickstart
 

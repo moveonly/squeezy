@@ -1,11 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{self, IsTerminal, Read, Write},
-    net::Shutdown,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand};
 use futures_util::StreamExt;
@@ -298,7 +299,7 @@ async fn main() -> squeezy_core::Result<()> {
         }
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
-        Some(Command::Ask(args)) => return handle_ask_command(args),
+        Some(Command::Ask(args)) => return handle_ask_command(args).await,
         Some(Command::Auth { command }) => return handle_auth_command(command),
         Some(Command::Doctor(args)) => {
             let report = doctor::run(args)?;
@@ -664,26 +665,27 @@ fn update_mcp_settings(
     Ok(())
 }
 
-fn handle_ask_command(args: &AskArgs) -> squeezy_core::Result<()> {
+async fn handle_ask_command(args: &AskArgs) -> squeezy_core::Result<()> {
     const ASK_SOCKET_ENV: &str = "SQUEEZY_ASK_SOCKET";
-    let socket = env::var(ASK_SOCKET_ENV).map_err(|_| {
+    let socket = env::var_os(ASK_SOCKET_ENV).ok_or_else(|| {
         SqueezyError::Permission(format!(
             "{ASK_SOCKET_ENV} is not set; this command must run inside a Squeezy shell session"
         ))
     })?;
-    let mut stream = std::os::unix::net::UnixStream::connect(&socket)?;
+    let endpoint = squeezy_tools::IpcEndpoint::from_env_value(&socket);
+    let mut stream = squeezy_tools::IpcStream::connect(&endpoint).await?;
     let request = serde_json::json!({
         "command": args.command,
         "justification": args.justification,
     });
     let request = serde_json::to_string(&request)
         .map_err(|err| SqueezyError::Parse(format!("invalid ask request: {err}")))?;
-    stream.write_all(request.as_bytes())?;
-    stream.shutdown(Shutdown::Write)?;
+    stream.write_all(request.as_bytes()).await?;
+    stream.shutdown().await?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
-    let response: serde_json::Value = serde_json::from_str(&response)
+    let mut response_bytes = Vec::new();
+    stream.read_to_end(&mut response_bytes).await?;
+    let response: serde_json::Value = serde_json::from_slice(&response_bytes)
         .map_err(|err| SqueezyError::Parse(format!("invalid ask response: {err}")))?;
     if response
         .get("allow")

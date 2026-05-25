@@ -5,7 +5,6 @@ use std::{
     fs::{self, OpenOptions},
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::FromRawFd,
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -15,6 +14,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 
 use futures_util::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -57,7 +59,6 @@ use squeezy_workspace::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{UnixListener, UnixStream},
     process::Command,
     sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
     time,
@@ -65,12 +66,25 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
+mod ipc;
 mod safety;
 mod schema;
+mod shell_output;
+mod shell_program;
 mod truncate;
+#[cfg(windows)]
+mod win_job;
+mod windows_cmd;
 
+use ipc::IpcListener;
+pub use ipc::{IpcEndpoint, IpcStream};
 use schema::compact_tool_parameters;
+use shell_output::{insert_content_field, shape_shell_output};
+use shell_program::ShellProgram;
 use truncate::truncate_middle_bytes;
+#[cfg(windows)]
+use win_job::ShellJob;
+use windows_cmd::is_destructive_windows_segment;
 
 const DEFAULT_MAX_FILES: usize = 10_000;
 const DEFAULT_MAX_BYTES_PER_FILE: usize = 1_000_000;
@@ -829,9 +843,10 @@ impl ShellSandboxPlan {
         config: &ShellSandboxConfig,
         fallback_reason: Option<String>,
     ) -> Self {
+        let shell = ShellProgram::for_command(command);
         Self {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
+            program: shell.program,
+            args: shell.args,
             backend: "none",
             mode: mode.as_str(),
             network: "not_enforced",
@@ -846,9 +861,10 @@ impl ShellSandboxPlan {
     }
 
     fn external(command: &str, config: &ShellSandboxConfig) -> Self {
+        let shell = ShellProgram::for_command(command);
         Self {
-            program: "sh".to_string(),
-            args: vec!["-lc".to_string(), command.to_string()],
+            program: shell.program,
+            args: shell.args,
             backend: "external",
             mode: ShellSandboxMode::External.as_str(),
             network: "external",
@@ -6278,16 +6294,30 @@ impl ToolRegistry {
             .current_dir(workdir)
             .kill_on_drop(true);
         let pty_master = if tty {
-            let pty = open_shell_pty().map_err(ShellRunError::Io)?;
-            command
-                .stdin(Stdio::from(
-                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                ))
-                .stdout(Stdio::from(
-                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                ))
-                .stderr(Stdio::from(pty.slave));
-            Some(pty.master)
+            #[cfg(unix)]
+            {
+                let pty = open_shell_pty().map_err(ShellRunError::Io)?;
+                command
+                    .stdin(Stdio::from(
+                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                    ))
+                    .stdout(Stdio::from(
+                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                    ))
+                    .stderr(Stdio::from(pty.slave));
+                Some(pty.master)
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows: ConPTY is not yet wired up; degrade to non-TTY
+                // pipes. The shell still runs with the requested sandbox
+                // backend, just without an allocated controlling terminal.
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                None
+            }
         } else {
             command
                 .stdin(Stdio::null())
@@ -6310,7 +6340,7 @@ impl ToolRegistry {
             .await
             {
                 Ok(server) => {
-                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.path());
+                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.env_value());
                     command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
                     preserved_env.push(SQUEEZY_ASK_SOCKET_ENV.to_string());
                     preserved_env.push(SQUEEZY_ASK_CALL_ID_ENV.to_string());
@@ -6330,6 +6360,20 @@ impl ToolRegistry {
                 )));
             }
             Err(err) => return Err(ShellRunError::Io(err)),
+        };
+        // Windows analog to Unix process groups: a Job Object created with
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE kills every descendant when
+        // either `terminate(...)` is called or the handle drops at
+        // function exit.
+        #[cfg(windows)]
+        let shell_job: Option<ShellJob> = match ShellJob::new() {
+            Ok(job) => {
+                if let Some(pid) = child.id() {
+                    let _ = job.assign_process(pid);
+                }
+                Some(job)
+            }
+            Err(_) => None,
         };
 
         let stdout_capture = ShellStreamCapture::default();
@@ -6356,6 +6400,10 @@ impl ToolRegistry {
         let status = tokio::select! {
             _ = cancel.cancelled() => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                #[cfg(windows)]
+                if let Some(job) = shell_job.as_ref() {
+                    let _ = job.terminate(1);
+                }
                 stdout_task.abort();
                 stderr_task.abort();
                 drop(ask_server);
@@ -6369,6 +6417,10 @@ impl ToolRegistry {
             Ok(Ok(status)) => Some(status),
             Err(_) => {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
+                #[cfg(windows)]
+                if let Some(job) = shell_job.as_ref() {
+                    let _ = job.terminate(1);
+                }
                 None
             }
             Ok(Err(err)) => return Err(ShellRunError::Io(err)),
@@ -6891,467 +6943,6 @@ impl ToolRegistry {
         self.output_store
             .maybe_spill(enforce_web_quote_limit(result))
     }
-}
-
-fn insert_content_field(content: &mut Value, key: &str, value: Value) {
-    if let Some(object) = content.as_object_mut() {
-        object.insert(key.to_string(), value);
-    }
-}
-
-#[derive(Debug)]
-struct ShapedShellOutput {
-    stdout: String,
-    stderr: String,
-    family: &'static str,
-    kind: &'static str,
-    fallback_reason: Option<String>,
-}
-
-fn shape_shell_output(
-    command: &str,
-    stdout: &str,
-    stderr: &str,
-    truncated: bool,
-    exit_code: Option<i32>,
-) -> ShapedShellOutput {
-    let family = shell_output_family(command);
-    if let Some((stdout, stderr)) = structured_shell_output(family, stdout, stderr) {
-        return ShapedShellOutput {
-            stdout,
-            stderr,
-            family,
-            kind: "structured",
-            fallback_reason: None,
-        };
-    }
-
-    let fallback_reason = structured_family(family)
-        .then(|| format!("{family} structured output was unavailable or could not be parsed"));
-    ShapedShellOutput {
-        stdout: shape_unstructured_stream(stdout, truncated, exit_code),
-        stderr: shape_unstructured_stream(stderr, truncated, exit_code),
-        family,
-        kind: if fallback_reason.is_some() {
-            "raw_passthrough_shaped"
-        } else {
-            "line_shaper"
-        },
-        fallback_reason,
-    }
-}
-
-fn shell_output_family(command: &str) -> &'static str {
-    let command = collapse_whitespace(command);
-    let segments = shell_segments(&command);
-    let prefixes = segments
-        .iter()
-        .map(|segment| shell_command_prefix(segment))
-        .collect::<Vec<_>>();
-    if prefixes.iter().any(|prefix| prefix == "cargo nextest") {
-        "nextest"
-    } else if prefixes.iter().any(|prefix| prefix.starts_with("cargo ")) {
-        "cargo"
-    } else if prefixes.iter().any(|prefix| prefix == "rustc") {
-        "rustc"
-    } else if prefixes.iter().any(|prefix| prefix == "pytest") {
-        "pytest"
-    } else if prefixes.iter().any(|prefix| prefix == "jest")
-        || segments
-            .iter()
-            .any(|segment| shell_segment_contains_command(segment, "jest"))
-    {
-        "jest"
-    } else if prefixes.iter().any(|prefix| prefix == "vitest")
-        || segments
-            .iter()
-            .any(|segment| shell_segment_contains_command(segment, "vitest"))
-    {
-        "vitest"
-    } else {
-        "shell"
-    }
-}
-
-fn shell_segment_contains_command(segment: &str, command: &str) -> bool {
-    segment.split_whitespace().any(|word| {
-        let word = word.trim_matches(|ch| matches!(ch, '\'' | '"' | '(' | ')' | ';'));
-        word == command || word.ends_with(&format!("/{command}"))
-    })
-}
-
-fn structured_family(family: &str) -> bool {
-    matches!(
-        family,
-        "cargo" | "rustc" | "nextest" | "pytest" | "jest" | "vitest"
-    )
-}
-
-fn structured_shell_output(family: &str, stdout: &str, stderr: &str) -> Option<(String, String)> {
-    match family {
-        "cargo" | "rustc" => parse_cargo_or_rustc_json(stdout, stderr),
-        "nextest" => parse_nextest_json(stdout, stderr),
-        "pytest" | "jest" | "vitest" => parse_test_report_json(stdout, stderr, family),
-        _ => None,
-    }
-}
-
-fn parse_cargo_or_rustc_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
-    let mut kept = Vec::new();
-    let mut plain_lines = Vec::new();
-    let mut parsed = 0usize;
-    let mut finished = None;
-    for line in stdout.lines().chain(stderr.lines()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            // Cargo emits libtest's plain-text harness output (e.g. "test result:
-            // FAILED.", panic backtraces, "FAILED" markers) interleaved with the
-            // JSON stream. Preserve those signal lines so shaped output still
-            // surfaces test failures.
-            if libtest_signal_line(line) {
-                plain_lines.push(trim_shaped_block(line.trim_end(), 4_000));
-            }
-            continue;
-        };
-        parsed += 1;
-        match value.get("reason").and_then(Value::as_str) {
-            Some("compiler-message") => {
-                let Some(message) = value.get("message") else {
-                    continue;
-                };
-                let level = message
-                    .get("level")
-                    .and_then(Value::as_str)
-                    .unwrap_or("note");
-                if !matches!(level, "error" | "warning" | "failure-note") {
-                    continue;
-                }
-                let text = message
-                    .get("rendered")
-                    .and_then(Value::as_str)
-                    .or_else(|| message.get("message").and_then(Value::as_str))
-                    .unwrap_or("");
-                if !text.trim().is_empty() {
-                    kept.push(trim_shaped_block(text, 4_000));
-                }
-            }
-            Some("build-finished") => {
-                finished = value
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .map(|success| format!("build-finished success={success}"));
-            }
-            _ => {}
-        }
-        if value.get("reason").is_none()
-            && let Some(level) = value.get("level").and_then(Value::as_str)
-            && matches!(level, "error" | "warning")
-        {
-            let text = value
-                .get("rendered")
-                .and_then(Value::as_str)
-                .or_else(|| value.get("message").and_then(Value::as_str))
-                .unwrap_or("");
-            if !text.trim().is_empty() {
-                kept.push(trim_shaped_block(text, 4_000));
-            }
-        }
-    }
-    // Only claim structured output when at least one JSON line actually
-    // parsed. Plain libtest text on its own should fall through to the
-    // unstructured shaper, which preserves dedupe markers and noise accounting.
-    if parsed == 0 {
-        return None;
-    }
-    if let Some(finished) = finished {
-        kept.push(finished);
-    }
-    kept.extend(plain_lines);
-    Some((join_shaped_lines(kept), String::new()))
-}
-
-fn libtest_signal_line(line: &str) -> bool {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("test result:")
-        || lower.starts_with("failures:")
-        || lower.starts_with("thread '") && lower.contains("panicked")
-        || lower.starts_with("panicked at")
-        || lower.contains(" ... failed")
-        || lower.starts_with("error: test failed")
-        || lower.starts_with("error: ")
-        || lower.starts_with("warning: ")
-        || lower.starts_with("---- ") && lower.contains(" stdout ----")
-}
-
-fn parse_nextest_json(stdout: &str, stderr: &str) -> Option<(String, String)> {
-    let mut kept = Vec::new();
-    let mut parsed = 0usize;
-    let mut total = 0usize;
-    let mut passed = 0usize;
-    let mut failed = 0usize;
-    let mut skipped = 0usize;
-    let mut last_summary: Option<Value> = None;
-    for line in stdout.lines().chain(stderr.lines()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        parsed += 1;
-        let event = value
-            .get("type")
-            .or_else(|| value.get("event"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let status = value.get("status").and_then(Value::as_str).unwrap_or("");
-        let status_lower = status.to_ascii_lowercase();
-        let event_lower = event.to_ascii_lowercase();
-        let is_per_test_finish = event_lower.contains("test")
-            && (event_lower.contains("finish") || event_lower.contains("complete"));
-        if is_per_test_finish || !status.is_empty() {
-            total += 1;
-            if status_lower.contains("pass") || status_lower == "ok" {
-                passed += 1;
-            } else if status_lower.contains("fail") || status_lower.contains("error") {
-                failed += 1;
-            } else if status_lower.contains("skip") || status_lower.contains("ignore") {
-                skipped += 1;
-            }
-        }
-        if event_lower.contains("summary") || event_lower.contains("run-finished") {
-            last_summary = Some(value.clone());
-        }
-        if line_has_signal(event) || line_has_signal(status) || value_contains_signal(&value) {
-            kept.push(trim_shaped_block(&value.to_string(), 4_000));
-        }
-    }
-    if parsed == 0 {
-        return None;
-    }
-    let mut summary_parts = vec!["family=nextest".to_string()];
-    if total > 0 {
-        summary_parts.push(format!(
-            "total={total} passed={passed} failed={failed} skipped={skipped}"
-        ));
-    }
-    if let Some(summary) = last_summary {
-        summary_parts.push(trim_shaped_block(&summary.to_string(), 4_000));
-    }
-    kept.insert(0, summary_parts.join(" "));
-    Some((join_shaped_lines(kept), String::new()))
-}
-
-fn parse_test_report_json(stdout: &str, stderr: &str, family: &str) -> Option<(String, String)> {
-    // jest/pytest/vitest emit a single JSON document on either stdout or
-    // stderr. Combining them with a newline produces invalid JSON when both
-    // streams have content (e.g. npm warnings on stderr alongside a real
-    // report on stdout), so try each stream individually.
-    let value = parse_first_valid_json(stdout).or_else(|| parse_first_valid_json(stderr))?;
-    let mut kept = Vec::new();
-    collect_json_signal_lines(&value, "$", &mut kept);
-    let summary = json_test_summary(&value, family);
-    if !summary.is_empty() {
-        kept.insert(0, summary);
-    }
-    Some((join_shaped_lines(kept), String::new()))
-}
-
-fn parse_first_valid_json(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-        return Some(value);
-    }
-    // Fall back to scanning for the first line that parses as JSON, so a
-    // header line ("Running tests...") or trailer doesn't defeat the parser.
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find_map(|line| serde_json::from_str::<Value>(line).ok())
-}
-
-fn json_test_summary(value: &Value, family: &str) -> String {
-    let mut parts = vec![format!("family={family}")];
-    for key in [
-        "success",
-        "numFailedTests",
-        "numPassedTests",
-        "numTotalTests",
-        "failed",
-        "passed",
-        "total",
-        "exitCode",
-    ] {
-        if let Some(value) = value.get(key)
-            && (value.is_boolean() || value.is_number() || value.is_string())
-        {
-            parts.push(format!("{key}={value}"));
-        }
-    }
-    if parts.len() == 1 {
-        String::new()
-    } else {
-        parts.join(" ")
-    }
-}
-
-fn collect_json_signal_lines(value: &Value, path: &str, kept: &mut Vec<String>) {
-    match value {
-        Value::String(text) if line_has_signal(text) => {
-            kept.push(trim_shaped_block(&format!("{path}: {text}"), 4_000));
-        }
-        Value::Array(items) => {
-            for (index, item) in items.iter().enumerate() {
-                collect_json_signal_lines(item, &format!("{path}[{index}]"), kept);
-            }
-        }
-        Value::Object(entries) => {
-            for (key, value) in entries {
-                let next = format!("{path}.{key}");
-                if line_has_signal(key) && value.is_string() {
-                    kept.push(trim_shaped_block(&format!("{next}: {value}"), 4_000));
-                }
-                collect_json_signal_lines(value, &next, kept);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn value_contains_signal(value: &Value) -> bool {
-    match value {
-        Value::String(text) => line_has_signal(text),
-        Value::Array(items) => items.iter().any(value_contains_signal),
-        Value::Object(entries) => entries
-            .iter()
-            .any(|(key, value)| line_has_signal(key) || value_contains_signal(value)),
-        _ => false,
-    }
-}
-
-fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>) -> String {
-    if text.trim().is_empty() {
-        return String::new();
-    }
-    const HEAD_BUDGET: usize = 20;
-    const TAIL_BUDGET: usize = 20;
-    let mut head: Vec<String> = Vec::new();
-    let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_BUDGET);
-    let mut signal_lines: Vec<String> = Vec::new();
-    let mut dropped = 0usize;
-    let mut last_emitted: String = String::new();
-    let mut repeats = 0usize;
-    let flush_repeats =
-        |target: &mut Vec<String>, repeats: &mut usize, tail: &mut VecDeque<String>| {
-            if *repeats == 0 {
-                return;
-            }
-            let line = format!("[repeated previous line {} more times]", *repeats);
-            if target.len() < HEAD_BUDGET {
-                target.push(line);
-            } else {
-                if tail.len() == TAIL_BUDGET {
-                    tail.pop_front();
-                }
-                tail.push_back(line);
-            }
-            *repeats = 0;
-        };
-    for line in text.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.is_empty() || line_is_noise(trimmed) {
-            dropped += 1;
-            continue;
-        }
-        if trimmed == last_emitted.as_str() {
-            repeats += 1;
-            dropped += 1;
-            continue;
-        }
-        flush_repeats(&mut head, &mut repeats, &mut tail);
-        last_emitted = trimmed.to_string();
-        let shaped = trim_shaped_block(trimmed, 2_000);
-        if line_has_signal(trimmed) {
-            signal_lines.push(shaped);
-        } else if head.len() < HEAD_BUDGET {
-            head.push(shaped);
-        } else {
-            if tail.len() == TAIL_BUDGET {
-                tail.pop_front();
-                dropped += 1;
-            }
-            tail.push_back(shaped);
-        }
-    }
-    flush_repeats(&mut head, &mut repeats, &mut tail);
-
-    let mut kept = head;
-    if !signal_lines.is_empty() {
-        kept.extend(signal_lines);
-    }
-    if !tail.is_empty() {
-        kept.extend(tail);
-    }
-    if dropped > 0 {
-        kept.push(format!("[dropped {dropped} low-signal lines]"));
-    }
-    if truncated {
-        kept.push("[raw stream was truncated]".to_string());
-    }
-    if let Some(exit_code) = exit_code
-        && exit_code != 0
-        && !kept.iter().any(|line| line.contains("exit_code="))
-    {
-        kept.push(format!("exit_code={exit_code}"));
-    }
-    join_shaped_lines(kept)
-}
-
-fn line_is_noise(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.starts_with("downloading ")
-        || lower.starts_with("downloaded ")
-        || lower.starts_with("compiling ")
-        || lower.starts_with("checking ")
-        || lower.starts_with("building ")
-        || lower.starts_with("fresh ")
-        || lower.starts_with("running ")
-        || lower.contains("[          ]")
-        || lower.contains("[==========]")
-        || lower.contains("[----------]")
-}
-
-fn line_has_signal(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("error")
-        || lower.contains("warning")
-        || lower.contains("fail")
-        || lower.contains("panic")
-        || lower.contains("status")
-        || lower.contains("exit")
-        || lower.contains("passed")
-        || lower.contains("test result")
-        || lower.starts_with("finished ")
-}
-
-fn trim_shaped_block(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.trim().to_string();
-    }
-    let mut output = text.chars().take(max_chars).collect::<String>();
-    output.push_str("\n[truncated shaped block]");
-    output
-}
-
-fn join_shaped_lines(lines: Vec<String>) -> String {
-    lines
-        .into_iter()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn checkpoint_status_label(status: ToolStatus) -> &'static str {
@@ -8818,6 +8409,9 @@ fn is_destructive_shell_segment(segment: &str) -> bool {
         return true;
     }
     if shell_segment_has_destructive_redirect(segment) {
+        return true;
+    }
+    if is_destructive_windows_segment(segment) {
         return true;
     }
     false
@@ -12832,7 +12426,38 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        if required {
+            return Err(
+                "required shell sandbox unavailable on windows: filesystem and network isolation are not provided; use mode = \"best_effort\" or mode = \"external\""
+                    .to_string(),
+            );
+        }
+        let shell = ShellProgram::for_command(command);
+        return Ok(ShellSandboxPlan {
+            program: shell.program,
+            args: shell.args,
+            backend: "windows-job-object",
+            mode: config.mode.as_str(),
+            network: if network == "denied" {
+                "denied_best_effort"
+            } else {
+                network
+            },
+            filesystem: "best_effort_unavailable",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: Some(
+                "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
+            ),
+        });
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         if required {
             return Err(format!(
@@ -12842,12 +12467,23 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    Ok(ShellSandboxPlan::direct_with_fallback(
-        command,
-        config.mode,
-        config,
-        fallback_reason,
-    ))
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(ShellSandboxPlan::direct_with_fallback(
+            command,
+            config.mode,
+            config,
+            fallback_reason,
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Unreachable: the Windows arm above always returns. This branch
+        // exists only so the function has a tail expression of the right
+        // type for non-Windows targets without the compiler flagging
+        // unreachable_code on Windows.
+        unreachable!()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -13291,11 +12927,13 @@ fn shell_sandbox_runtime_unavailable_with_probe(
     }
 }
 
+#[cfg(unix)]
 struct ShellPty {
     master: fs::File,
     slave: fs::File,
 }
 
+#[cfg(unix)]
 fn open_shell_pty() -> std::io::Result<ShellPty> {
     let mut master = -1;
     let mut slave = -1;
@@ -13318,7 +12956,7 @@ fn open_shell_pty() -> std::io::Result<ShellPty> {
 }
 
 struct ShellAskServer {
-    path: PathBuf,
+    endpoint: IpcEndpoint,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -13331,15 +12969,21 @@ impl ShellAskServer {
         approver: ShellAskApprover,
         cancel: CancellationToken,
     ) -> std::io::Result<Self> {
-        let run_dir = root.join(".squeezy").join("run");
-        fs::create_dir_all(&run_dir)?;
-        let root_path = run_dir.join(format!("shell-{}.sock", sanitize_shell_call_id(call_id)));
-        let (path, listener) = match bind_shell_ask_listener(&root_path) {
-            Ok(bound) => bound,
-            Err(err) if unix_socket_path_too_long(&err) => {
+        let sanitized = sanitize_shell_call_id(call_id);
+        #[cfg(unix)]
+        {
+            let run_dir = root.join(".squeezy").join("run");
+            fs::create_dir_all(&run_dir)?;
+        }
+        let primary = IpcEndpoint::for_shell_ask(root, &sanitized);
+        let (endpoint, listener) = match IpcListener::bind(&primary) {
+            Ok(listener) => (primary, listener),
+            #[cfg(unix)]
+            Err(err) if ipc::is_path_too_long(&err) => {
                 let digest = sha256_hex(format!("{}:{call_id}", root.display()));
-                let short = PathBuf::from("/tmp").join(format!("squeezy-{}.sock", &digest[..16]));
-                bind_shell_ask_listener(&short)?
+                let fallback = IpcEndpoint::unix_short_fallback(&digest[..16]);
+                let listener = IpcListener::bind(&fallback)?;
+                (fallback, listener)
             }
             Err(err) => return Err(err),
         };
@@ -13350,27 +12994,22 @@ impl ShellAskServer {
             shell_ask_server_loop(listener, call_id, parent_command, workdir, approver, cancel)
                 .await;
         });
-        Ok(Self { path, task })
+        Ok(Self { endpoint, task })
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    fn env_value(&self) -> std::ffi::OsString {
+        self.endpoint.as_env_value()
     }
-}
-
-fn bind_shell_ask_listener(path: &Path) -> std::io::Result<(PathBuf, UnixListener)> {
-    let _ = fs::remove_file(path);
-    UnixListener::bind(path).map(|listener| (path.to_path_buf(), listener))
-}
-
-fn unix_socket_path_too_long(err: &std::io::Error) -> bool {
-    err.to_string().contains("SUN_LEN") || err.raw_os_error() == Some(libc::ENAMETOOLONG)
 }
 
 impl Drop for ShellAskServer {
     fn drop(&mut self) {
         self.task.abort();
-        let _ = fs::remove_file(&self.path);
+        // Synchronously remove the Unix sock so callers that observe the
+        // path immediately after server-drop see it gone. Tokio's task
+        // abort is async — relying on `IpcListener::Drop` inside the
+        // spawned future races with the assertion. No-op on Windows.
+        self.endpoint.remove_local_artifacts();
     }
 }
 
@@ -13381,7 +13020,7 @@ struct ShellAskWireRequest {
 }
 
 async fn shell_ask_server_loop(
-    listener: UnixListener,
+    listener: IpcListener,
     call_id: String,
     parent_command: String,
     workdir: PathBuf,
@@ -13393,7 +13032,7 @@ async fn shell_ask_server_loop(
             _ = cancel.cancelled() => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted else {
+        let Ok(stream) = accepted else {
             break;
         };
         let request_call_id = call_id.clone();
@@ -13414,7 +13053,7 @@ async fn shell_ask_server_loop(
 }
 
 async fn handle_shell_ask_client(
-    mut stream: UnixStream,
+    mut stream: IpcStream,
     call_id: String,
     parent_command: String,
     workdir: PathBuf,
@@ -13480,6 +13119,10 @@ fn configure_shell_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
     }
 }
 
@@ -13792,6 +13435,7 @@ fn linux_unshare_supported() -> bool {
 }
 
 async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64) {
+    #[cfg(unix)]
     if let Some(pid) = child.id() {
         kill_process_group(pid, libc::SIGTERM);
         if time::timeout(Duration::from_millis(grace_ms), child.wait())
@@ -13802,18 +13446,17 @@ async fn terminate_shell_child(child: &mut tokio::process::Child, grace_ms: u64)
         }
         kill_process_group(pid, libc::SIGKILL);
     }
+    #[cfg(not(unix))]
+    let _ = grace_ms;
     let _ = child.kill().await;
     let _ = child.wait().await;
 }
 
+#[cfg(unix)]
 fn kill_process_group(pid: u32, signal: libc::c_int) {
-    #[cfg(unix)]
     unsafe {
         let _ = libc::kill(-(pid as libc::pid_t), signal);
     }
-
-    #[cfg(not(unix))]
-    let _ = (pid, signal);
 }
 
 fn apply_shell_environment_policy(

@@ -1,10 +1,11 @@
 # Installation
 
-Squeezy v0 supports macOS and Linux. The fastest path on any supported
-platform is the one-line installer; Homebrew, Cargo, and GitHub release
-archives are also supported.
+Squeezy v0 supports macOS, Linux, and Windows (x86_64). On macOS and
+Linux the fastest path is the one-line installer; on Windows it is
+Winget. Homebrew, Cargo, and direct GitHub release archives work on every
+platform.
 
-## One-line installer
+## One-line installer (macOS and Linux)
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh
@@ -15,7 +16,18 @@ archive plus its SHA-256 sidecar, verifies the checksum, and installs the
 `squeezy` binary into `$HOME/.local/bin` (override with
 `SQUEEZY_INSTALL_DIR`). If that directory is not on your `PATH`, the
 installer prints the line to add. Pin a specific release with
-`SQUEEZY_INSTALL_TAG=v0.1.2`.
+`SQUEEZY_INSTALL_TAG=v0.1.2`. The script is POSIX-shell only; Windows
+users should use Winget or the manual zip install.
+
+## Winget (Windows)
+
+```powershell
+winget install esqueezy.Squeezy
+squeezy doctor
+```
+
+Winget installs the Windows x86_64 archive into the per-user portable apps
+directory and creates a `squeezy` command alias on PATH.
 
 ## Homebrew
 
@@ -55,6 +67,7 @@ Tagged releases publish prebuilt archives and SHA-256 checksum files:
 - `squeezy-aarch64-apple-darwin.tar.gz` for Apple Silicon macOS
 - `squeezy-x86_64-apple-darwin.tar.gz` for Intel macOS
 - `squeezy-x86_64-unknown-linux-musl.tar.gz` for Linux x86_64
+- `squeezy-x86_64-pc-windows-msvc.zip` for Windows x86_64
 
 Download the archive for your platform from
 `https://github.com/esqueezy/squeezy/releases`, verify the checksum, then put
@@ -68,6 +81,25 @@ squeezy doctor
 ```
 
 Replace the archive name with the Intel macOS or Linux archive when needed.
+
+On Windows, expand the zip and add the install location to `PATH`:
+
+```powershell
+Expand-Archive -Path squeezy-x86_64-pc-windows-msvc.zip `
+  -DestinationPath $env:LOCALAPPDATA\Programs\squeezy
+[Environment]::SetEnvironmentVariable(
+  "Path",
+  "$env:Path;$env:LOCALAPPDATA\Programs\squeezy",
+  "User"
+)
+squeezy doctor
+```
+
+The Windows release archive is currently unsigned. Windows SmartScreen may
+display a "Windows protected your PC" warning the first time the binary is
+launched; click "More info" → "Run anyway" once and the prompt won't
+repeat for that binary. Code-signing the release artifact is on the
+roadmap.
 
 ## First Run
 
@@ -98,6 +130,10 @@ brew update && brew upgrade squeezy
 cargo install squeezy --locked --force
 ```
 
+```powershell
+winget upgrade esqueezy.Squeezy
+```
+
 For GitHub release archives, download the newer archive and replace the binary
 on your `PATH`.
 
@@ -116,16 +152,31 @@ Cargo:
 cargo uninstall squeezy
 ```
 
+Winget:
+
+```powershell
+winget uninstall esqueezy.Squeezy
+```
+
 Manual archive install:
 
 ```sh
 rm /usr/local/bin/squeezy
 ```
 
-Squeezy stores user settings and local runtime state under `~/.squeezy`. Remove
-that directory only if you also want to delete settings, sessions, caches,
-reports, and local repo profiles:
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Programs\squeezy"
+```
+
+Squeezy stores user settings and local runtime state under `~/.squeezy` on
+Unix and `%APPDATA%\squeezy` on Windows. Remove that directory only if you
+also want to delete settings, sessions, caches, reports, and local repo
+profiles:
 
 ```sh
 rm -rf ~/.squeezy
+```
+
+```powershell
+Remove-Item -Recurse -Force "$env:APPDATA\squeezy"
 ```
