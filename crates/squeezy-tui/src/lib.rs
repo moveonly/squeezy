@@ -52,26 +52,21 @@ use squeezy_vcs::{DiffMode, DiffOptions, GitVcs, VcsKind};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod render;
+
+use render::palette::{
+    AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
+    WORKING_SHIMMER_HIGHLIGHT, blend_color,
+};
+#[cfg(test)]
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+
 const INLINE_PASTE_MAX_BYTES: usize = 512;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
 const SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES: usize = 80;
-const AMBER: Color = Color::Rgb(252, 211, 77);
-const GOLD: Color = Color::Rgb(254, 240, 138);
-const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
-const SUCCESS_GREEN: Color = Color::Rgb(22, 101, 52);
-const MODE_BUILD_GREEN: Color = Color::Rgb(34, 117, 64);
-const ERROR_RED: Color = Color::Rgb(248, 113, 113);
-const QUIET: Color = Color::DarkGray;
-const PROMPT_BG: Color = Color::Rgb(31, 31, 35);
-const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
-const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
-const DIFF_ADD_BG: Color = Color::Rgb(14, 36, 24);
-const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
-const DIFF_DEL_BG: Color = Color::Rgb(63, 28, 28);
-const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
@@ -3011,44 +3006,6 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
         .collect()
 }
 
-fn blend_color(base: Color, highlight: Color, intensity: f32) -> Color {
-    let (base_r, base_g, base_b) = rgb_components(base);
-    let (hi_r, hi_g, hi_b) = rgb_components(highlight);
-    let t = intensity.clamp(0.0, 1.0);
-    Color::Rgb(
-        blend_channel(base_r, hi_r, t),
-        blend_channel(base_g, hi_g, t),
-        blend_channel(base_b, hi_b, t),
-    )
-}
-
-fn blend_channel(base: u8, highlight: u8, intensity: f32) -> u8 {
-    (base as f32 + (highlight as f32 - base as f32) * intensity).round() as u8
-}
-
-fn rgb_components(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        Color::Black => (0, 0, 0),
-        Color::Red => (255, 0, 0),
-        Color::Green => (0, 128, 0),
-        Color::Yellow => (255, 255, 0),
-        Color::Blue => (0, 0, 255),
-        Color::Magenta => (255, 0, 255),
-        Color::Cyan => (0, 255, 255),
-        Color::Gray => (128, 128, 128),
-        Color::DarkGray => (80, 80, 80),
-        Color::LightRed => (255, 128, 128),
-        Color::LightGreen => (128, 255, 128),
-        Color::LightYellow => (255, 255, 128),
-        Color::LightBlue => (128, 128, 255),
-        Color::LightMagenta => (255, 128, 255),
-        Color::LightCyan => (128, 255, 255),
-        Color::White => (255, 255, 255),
-        Color::Indexed(_) | Color::Reset => (255, 255, 255),
-    }
-}
-
 fn current_turn_duration(app: &TuiApp) -> Duration {
     app.turn_started_at
         .map(|started_at| started_at.elapsed())
@@ -4102,17 +4059,22 @@ fn assistant_text_lines(
     if content.is_empty() {
         return vec![assistant_line(selected, status, "", content_style)];
     }
-    content
-        .split('\n')
+    render::markdown::render_markdown(content)
+        .into_iter()
         .enumerate()
-        .map(|(index, line)| {
+        .map(|(index, mut line)| {
+            for span in &mut line.spans {
+                span.style = content_style.patch(span.style);
+            }
             if index == 0 {
-                assistant_line(selected, status.clone(), line.to_string(), content_style)
+                let marker = if selected { "> " } else { "  " };
+                let mut spans = vec![Span::raw(marker), status.clone(), Span::raw(" ")];
+                spans.extend(line.spans);
+                Line::from(spans)
             } else {
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(line.to_string(), content_style),
-                ])
+                let mut spans = vec![Span::raw("    ")];
+                spans.extend(line.spans);
+                Line::from(spans)
             }
         })
         .collect()
@@ -4899,8 +4861,45 @@ fn expanded_diff_context_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static
             format!("changed {files} files, +{additions} -{deletions}"),
         ));
     }
-    lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+    let diff_files = diff_context_files(tool);
+    if diff_files.is_empty() {
+        lines.extend(path_detail_lines(&tool.result.content["files"], "path", 6));
+    } else {
+        for file in diff_files {
+            let mut summary = format!("file {}", file.path);
+            if file.additions > 0 || file.deletions > 0 {
+                summary.push_str(&format!(" +{} -{}", file.additions, file.deletions));
+            }
+            if file.patch_truncated {
+                summary.push_str(" · diff truncated");
+            }
+            lines.push(detail_line(false, QUIET, summary));
+            if file
+                .patch
+                .as_ref()
+                .is_some_and(|patch| !patch.trim().is_empty())
+            {
+                lines.extend(
+                    render::diff::render_diff_file(&file)
+                        .into_iter()
+                        .map(detail_rendered_line),
+                );
+            }
+        }
+    }
     lines
+}
+
+fn diff_context_files(tool: &ToolTranscript) -> Vec<squeezy_vcs::DiffFile> {
+    tool.result.content["files"]
+        .as_array()
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| serde_json::from_value(file.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn expanded_plan_patch_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
@@ -5096,67 +5095,17 @@ fn expanded_generic_tool_detail_lines(
 }
 
 fn render_diff_patch_preview_lines(patch: &str, limit: usize) -> Vec<Line<'static>> {
-    let lines = filtered_diff_lines(patch);
-    if lines.is_empty() {
-        return Vec::new();
-    }
-    head_tail_lines(&lines.join("\n"), limit)
+    render::diff::render_patch_preview_lines(patch, limit)
         .into_iter()
-        .map(|line| {
-            if line.truncated_marker {
-                detail_line(false, QUIET, line.text)
-            } else {
-                diff_detail_line(&line.text)
-            }
-        })
+        .map(detail_rendered_line)
         .collect()
 }
 
 fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
-    filtered_diff_lines(patch)
+    render::diff::render_patch_full_lines(patch)
         .into_iter()
-        .map(|line| diff_detail_line(&line))
+        .map(detail_rendered_line)
         .collect()
-}
-
-fn filtered_diff_lines(patch: &str) -> Vec<String> {
-    patch
-        .lines()
-        .filter(|line| !is_diff_metadata_line(line))
-        .map(str::to_string)
-        .collect()
-}
-
-fn is_diff_metadata_line(line: &str) -> bool {
-    line.starts_with("diff --git ")
-        || line.starts_with("index ")
-        || line.starts_with("--- ")
-        || line.starts_with("+++ ")
-}
-
-fn diff_detail_line(content: &str) -> Line<'static> {
-    detail_spans_line(diff_output_spans(content))
-}
-
-fn diff_output_spans(line: &str) -> Vec<Span<'static>> {
-    let style = if line.starts_with("@@") {
-        Style::default()
-            .fg(DIFF_HUNK_FG)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('+') {
-        Style::default()
-            .fg(DIFF_ADD_FG)
-            .bg(DIFF_ADD_BG)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with('-') {
-        Style::default()
-            .fg(DIFF_DEL_FG)
-            .bg(DIFF_DEL_BG)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    vec![Span::styled(line.to_string(), style)]
 }
 
 fn output_block_lines(
@@ -5244,6 +5193,18 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
+fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(
+            "└ ",
+            Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(line.spans);
+    Line::from(spans)
+}
+
 fn command_spans(command: &str) -> Vec<Span<'static>> {
     let tokens = command
         .split_whitespace()
@@ -5297,65 +5258,11 @@ fn styled_output_spans(line: &str) -> Vec<Span<'static>> {
 }
 
 fn ansi_spans(line: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut style = Style::default();
-    let mut buffer = String::new();
-    let mut chars = line.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            let mut code = String::new();
-            for next in chars.by_ref() {
-                if next == 'm' {
-                    break;
-                }
-                code.push(next);
-            }
-            if !buffer.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buffer), style));
-            }
-            apply_sgr_codes(&mut style, &code);
-        } else {
-            buffer.push(ch);
-        }
-    }
-    if !buffer.is_empty() {
-        spans.push(Span::styled(buffer, style));
-    }
+    let mut spans = render::ansi::ansi_to_line(line).spans;
     if spans.is_empty() {
         spans.push(Span::raw(""));
     }
     spans
-}
-
-fn apply_sgr_codes(style: &mut Style, code: &str) {
-    let codes = if code.is_empty() { "0" } else { code };
-    for part in codes.split(';') {
-        let Ok(value) = part.parse::<u16>() else {
-            continue;
-        };
-        match value {
-            0 => *style = Style::default(),
-            1 => *style = style.add_modifier(Modifier::BOLD),
-            30 => *style = style.fg(Color::Black),
-            31 => *style = style.fg(Color::Red),
-            32 => *style = style.fg(SUCCESS_GREEN),
-            33 => *style = style.fg(Color::Yellow),
-            34 => *style = style.fg(Color::Blue),
-            35 => *style = style.fg(Color::Magenta),
-            36 => *style = style.fg(Color::Cyan),
-            37 => *style = style.fg(Color::White),
-            90 => *style = style.fg(Color::DarkGray),
-            91 => *style = style.fg(Color::LightRed),
-            92 => *style = style.fg(SUCCESS_GREEN),
-            93 => *style = style.fg(Color::LightYellow),
-            94 => *style = style.fg(Color::LightBlue),
-            95 => *style = style.fg(Color::LightMagenta),
-            96 => *style = style.fg(Color::LightCyan),
-            97 => *style = style.fg(Color::White),
-            _ => {}
-        }
-    }
 }
 
 fn keyword_spans(line: &str) -> Vec<Span<'static>> {
@@ -5647,9 +5554,22 @@ fn preview_tool_result(result: &ToolResult, verbosity: ToolOutputVerbosity) -> S
         ToolOutputVerbosity::Normal => TOOL_PREVIEW_NORMAL_BYTES,
         ToolOutputVerbosity::Verbose => TOOL_PREVIEW_VERBOSE_BYTES,
     };
-    let text = serde_json::to_string_pretty(&result.content)
-        .unwrap_or_else(|_| result.content.to_string());
+    let text = tool_result_output_text(result).unwrap_or_else(|| {
+        serde_json::to_string_pretty(&result.content).unwrap_or_else(|_| result.content.to_string())
+    });
     truncate_bytes(&text, limit)
+}
+
+fn tool_result_output_text(result: &ToolResult) -> Option<String> {
+    let stdout = string_arg(&result.content, "stdout").unwrap_or_default();
+    let stderr = string_arg(&result.content, "stderr").unwrap_or_default();
+    let output = match (!stdout.trim().is_empty(), !stderr.trim().is_empty()) {
+        (true, true) => format!("{stdout}\n{stderr}"),
+        (true, false) => stdout,
+        (false, true) => stderr,
+        (false, false) => string_arg(&result.content, "output").unwrap_or_default(),
+    };
+    (!output.trim().is_empty()).then_some(output)
 }
 
 fn status_color(status: ToolStatus) -> Color {
