@@ -96,3 +96,76 @@ fn space_toggles_bool_field() {
     // hermetic we only assert the in-memory effective config flipped.
     assert_ne!(state.effective.telemetry.enabled, before);
 }
+
+#[test]
+fn string_list_editor_round_trips_via_commit() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId as SId};
+    // Find the Graph section and its languages field.
+    let graph = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Graph)
+        .expect("Graph section registered");
+    let lang_field = graph
+        .fields
+        .iter()
+        .find(|f| f.label == "languages")
+        .expect("languages field");
+    assert!(matches!(lang_field.kind, FieldKind::StringList { .. }));
+
+    // Open the editor with a baseline value, then simulate Enter on the
+    // comma-separated text. Asserts the commit path produces StringList.
+    let initial = (lang_field.get)(&AppConfig::default());
+    assert!(matches!(initial, FieldValue::StringList(_)));
+
+    let mut editor = open_editor_for(lang_field, FieldValue::StringList(vec!["rust".into()]));
+    // Append " , python" then commit.
+    let extra = [',', ' ', 'p', 'y', 't', 'h', 'o', 'n'];
+    for ch in extra {
+        let outcome = handle_editor_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+        assert!(matches!(outcome, EditorOutcome::KeepEditing));
+    }
+    let commit = handle_editor_key(
+        &mut editor,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let items = match commit {
+        EditorOutcome::Commit(FieldValue::StringList(items)) => items,
+        other => panic!("expected StringList commit, got {:?}", other),
+    };
+    assert_eq!(items, vec!["rust".to_string(), "python".to_string()]);
+}
+
+#[test]
+fn path_editor_commits_pathbuf() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue, SectionId as SId};
+    let cache = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Cache)
+        .expect("Cache section registered");
+    let root = cache
+        .fields
+        .iter()
+        .find(|f| f.label == "root")
+        .expect("root field");
+    assert!(matches!(root.kind, FieldKind::Path { .. }));
+
+    let mut editor = open_editor_for(root, FieldValue::Path(std::path::PathBuf::new()));
+    for ch in ['/', 't', 'm', 'p', '/', 'c'] {
+        let _ = handle_editor_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::empty()),
+        );
+    }
+    let commit = handle_editor_key(
+        &mut editor,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    let p = match commit {
+        EditorOutcome::Commit(FieldValue::Path(p)) => p,
+        other => panic!("expected Path commit, got {:?}", other),
+    };
+    assert_eq!(p, std::path::PathBuf::from("/tmp/c"));
+}

@@ -91,6 +91,17 @@ pub(crate) enum FieldEditor {
         draft: String,
         cursor: usize,
     },
+    /// Comma-separated list editor — commits as `FieldValue::StringList`.
+    /// Trailing/leading whitespace and empty items are trimmed.
+    StringList {
+        draft: String,
+        cursor: usize,
+    },
+    /// Filesystem path editor — commits as `FieldValue::Path`.
+    Path {
+        draft: String,
+        cursor: usize,
+    },
 }
 
 impl ConfigScreenState {
@@ -256,7 +267,8 @@ pub(crate) fn handle_key(
     }
 }
 
-enum EditorOutcome {
+#[derive(Debug)]
+pub(crate) enum EditorOutcome {
     KeepEditing,
     Commit(FieldValue),
     Cancel,
@@ -324,23 +336,34 @@ fn open_editor_for(field: &FieldMeta, current: FieldValue) -> FieldEditor {
             draft: String::new(),
             cursor: 0,
         },
-        // New kinds (StringList / Path / Secret / ProviderSubTabs / TableArray)
-        // get dedicated editors in commits 4 and 5. Until then, fall back to
-        // a placeholder text editor so the section can still render.
-        (FieldKind::StringList { .. }, FieldValue::StringList(items)) => FieldEditor::Text {
-            draft: items.join(", "),
+        (FieldKind::StringList { .. }, FieldValue::StringList(items)) => {
+            let draft = items.join(", ");
+            FieldEditor::StringList {
+                cursor: draft.chars().count(),
+                draft,
+            }
+        }
+        (FieldKind::StringList { .. }, _) => FieldEditor::StringList {
+            draft: String::new(),
             cursor: 0,
         },
-        (FieldKind::Path { .. }, FieldValue::Path(p)) => FieldEditor::Text {
-            draft: p.display().to_string(),
+        (FieldKind::Path { .. }, FieldValue::Path(p)) => {
+            let draft = p.display().to_string();
+            FieldEditor::Path {
+                cursor: draft.chars().count(),
+                draft,
+            }
+        }
+        (FieldKind::Path { .. }, _) => FieldEditor::Path {
+            draft: String::new(),
             cursor: 0,
         },
+        // Secret / ProviderSubTabs / TableArray drop into dedicated sub-modes
+        // (Secret entry, provider sub-tabs, table-array editor) in commit 5.
+        // Until then, opening one is a no-op handled by `handle_key` — we
+        // shouldn't have reached `open_editor_for` for these kinds.
         (
-            FieldKind::StringList { .. }
-            | FieldKind::Path { .. }
-            | FieldKind::Secret { .. }
-            | FieldKind::ProviderSubTabs
-            | FieldKind::TableArray { .. },
+            FieldKind::Secret { .. } | FieldKind::ProviderSubTabs | FieldKind::TableArray { .. },
             _,
         ) => FieldEditor::Text {
             draft: String::new(),
@@ -424,6 +447,17 @@ fn handle_editor_key(editor: &mut FieldEditor, key: KeyEvent) -> EditorOutcome {
             KeyCode::Enter => EditorOutcome::Commit(FieldValue::Bool(*v)),
             _ => EditorOutcome::KeepEditing,
         },
+        FieldEditor::StringList { draft, cursor } => text_editor_key(draft, cursor, key, |d| {
+            let items: Vec<String> = d
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            EditorOutcome::Commit(FieldValue::StringList(items))
+        }),
+        FieldEditor::Path { draft, cursor } => text_editor_key(draft, cursor, key, |d| {
+            EditorOutcome::Commit(FieldValue::Path(std::path::PathBuf::from(d.trim())))
+        }),
     }
 }
 
@@ -1023,6 +1057,26 @@ fn render_editor_lines(editor: &FieldEditor) -> Vec<Line<'static>> {
                 Line::from(spans),
                 Line::from(Span::styled(
                     "Space / ← / → to toggle · Enter to commit · Esc to cancel",
+                    Style::default().fg(QUIET),
+                )),
+            ]
+        }
+        FieldEditor::StringList { draft, cursor } => {
+            let _ = cursor;
+            vec![
+                Line::from(Span::raw(format!("  {draft}"))),
+                Line::from(Span::styled(
+                    "comma-separated · Enter to commit · Esc to cancel",
+                    Style::default().fg(QUIET),
+                )),
+            ]
+        }
+        FieldEditor::Path { draft, cursor } => {
+            let _ = cursor;
+            vec![
+                Line::from(Span::raw(format!("  {draft}"))),
+                Line::from(Span::styled(
+                    "filesystem path · Enter to commit · Esc to cancel",
                     Style::default().fg(QUIET),
                 )),
             ]
