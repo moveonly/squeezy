@@ -10,6 +10,11 @@ fn turn_id_displays_stably() {
 }
 
 #[test]
+fn default_instructions_do_not_reference_hidden_task_state_tool() {
+    assert!(!DEFAULT_INSTRUCTIONS.contains("update_task_state"));
+}
+
+#[test]
 fn transcript_constructors_set_roles() {
     assert_eq!(TranscriptItem::user("hello").role, Role::User);
     assert_eq!(TranscriptItem::assistant("hi").role, Role::Assistant);

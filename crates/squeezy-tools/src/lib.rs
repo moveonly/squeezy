@@ -470,6 +470,7 @@ pub struct ToolRegistry {
     crawl_options: Arc<CrawlOptions>,
     compiled_policy: Arc<CompiledIndexingPolicy>,
     shell_sandbox: Arc<ShellSandboxConfig>,
+    shell_sandbox_health: Arc<ShellSandboxHealth>,
     shell_audit: Arc<ShellAuditStore>,
     mcp: Arc<McpClientRegistry>,
 }
@@ -494,6 +495,7 @@ struct CachedDiffSnapshot {
 
 const SHELL_AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const SHELL_AUDIT_RETAINED_ROTATIONS: usize = 4;
+const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Append-only JSONL store for shell audit records.
 ///
@@ -564,6 +566,50 @@ impl ShellAuditStore {
             .unwrap_or_default();
         name.push(format!(".{index}"));
         self.path.with_file_name(name)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ShellSandboxBackendStatus {
+    Available,
+    Unavailable(String),
+}
+
+#[derive(Debug, Default)]
+struct ShellSandboxHealth {
+    backends: StdMutex<HashMap<&'static str, ShellSandboxBackendStatus>>,
+}
+
+impl ShellSandboxHealth {
+    fn status(&self, backend: &'static str) -> Option<ShellSandboxBackendStatus> {
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(backend)
+            .cloned()
+    }
+
+    fn mark_available(&self, backend: &'static str) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(backend, ShellSandboxBackendStatus::Available);
+    }
+
+    fn mark_unavailable(&self, backend: &'static str, reason: impl Into<String>) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                backend,
+                ShellSandboxBackendStatus::Unavailable(reason.into()),
+            );
     }
 }
 
@@ -839,6 +885,7 @@ impl ToolRegistry {
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
             shell_sandbox: Arc::new(config.shell_sandbox),
+            shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             mcp: Arc::new(McpClientRegistry::new(config.mcp_servers)),
         })
@@ -879,6 +926,7 @@ impl ToolRegistry {
             crawl_options: Arc::new(crawl_options),
             compiled_policy,
             shell_sandbox: Arc::new(ShellSandboxConfig::default()),
+            shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
         })
@@ -927,7 +975,15 @@ impl ToolRegistry {
                 &self.shell_sandbox,
             )),
             ShellSandboxMode::BestEffort | ShellSandboxMode::Required => {
-                prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)
+                let plan =
+                    prepare_shell_sandbox_plan(command, analysis, &self.root, &self.shell_sandbox)?;
+                apply_shell_sandbox_backend_health(
+                    command,
+                    &self.shell_sandbox,
+                    &self.shell_sandbox_health,
+                    plan,
+                    shell_sandbox_backend_probe_failure,
+                )
             }
         }
     }
@@ -4746,7 +4802,7 @@ impl ToolRegistry {
             }
             Err(ShellRunError::Io(err)) => return tool_error(call, err),
         };
-        if let Some(reason) = shell_sandbox_direct_fallback_reason(&sandbox_plan, &run) {
+        if let Some(reason) = shell_sandbox_best_effort_fallback_reason(&sandbox_plan, &run) {
             let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
             self.audit_shell(
                 call,
@@ -4762,6 +4818,8 @@ impl ToolRegistry {
                 &run.stdout_bytes,
                 &run.stderr_bytes,
             );
+            self.shell_sandbox_health
+                .mark_unavailable(sandbox_plan.backend, reason.clone());
             sandbox_plan = ShellSandboxPlan::direct_with_fallback(
                 &args.command,
                 self.shell_sandbox.mode,
@@ -4843,6 +4901,8 @@ impl ToolRegistry {
                 "required shell sandbox backend {} failed at runtime",
                 sandbox_plan.backend
             );
+            self.shell_sandbox_health
+                .mark_unavailable(sandbox_plan.backend, reason.clone());
             self.audit_shell(
                 call,
                 &args,
@@ -10302,6 +10362,34 @@ fn shell_sandbox_direct_fallback_reason(
     ))
 }
 
+fn shell_sandbox_best_effort_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    shell_sandbox_direct_fallback_reason(sandbox_plan, run)
+        .or_else(|| shell_sandbox_runtime_fallback_reason(sandbox_plan, run))
+}
+
+fn shell_sandbox_runtime_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    let stderr = String::from_utf8_lossy(&run.stderr_bytes);
+    if shell_sandbox_runtime_unavailable(sandbox_plan, exit_code, &stderr) {
+        return Some(format!(
+            "shell sandbox backend {} failed at runtime; retried without OS sandbox because mode is best_effort",
+            sandbox_plan.backend
+        ));
+    }
+
+    None
+}
+
 fn tool_arg_error(call: &ToolCall, err: serde_json::Error) -> ToolResult {
     make_result(
         call,
@@ -10383,6 +10471,156 @@ fn prepare_shell_sandbox_plan(
         linux_unshare_supported(),
         linux_landlock_supported(),
     )
+}
+
+fn apply_shell_sandbox_backend_health(
+    command: &str,
+    config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
+    plan: ShellSandboxPlan,
+    probe_failure: impl FnOnce(&ShellSandboxPlan, Duration) -> Option<String>,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    let backend = plan.backend;
+    if backend == "none" {
+        return Ok(plan);
+    }
+
+    match health.status(backend) {
+        Some(ShellSandboxBackendStatus::Available) => return Ok(plan),
+        Some(ShellSandboxBackendStatus::Unavailable(reason)) => {
+            return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+        }
+        None => {}
+    }
+
+    if let Some(reason) = probe_failure(&plan, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT) {
+        health.mark_unavailable(backend, reason.clone());
+        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+    }
+
+    health.mark_available(backend);
+    Ok(plan)
+}
+
+fn shell_sandbox_backend_unavailable_plan(
+    command: &str,
+    config: &ShellSandboxConfig,
+    backend: &'static str,
+    reason: &str,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    if config.mode == ShellSandboxMode::Required {
+        return Err(format!(
+            "required shell sandbox backend {backend} unavailable: {reason}"
+        ));
+    }
+
+    Ok(ShellSandboxPlan::direct_with_fallback(
+        command,
+        config.mode,
+        config,
+        Some(shell_sandbox_backend_disabled_reason(backend, reason)),
+    ))
+}
+
+fn shell_sandbox_backend_disabled_reason(backend: &'static str, reason: &str) -> String {
+    format!(
+        "shell sandbox backend {backend} disabled after health check failure: {reason}; running without OS sandbox because mode is best_effort"
+    )
+}
+
+fn shell_sandbox_backend_probe_failure(
+    plan: &ShellSandboxPlan,
+    timeout: Duration,
+) -> Option<String> {
+    match plan.backend {
+        "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout),
+        // Linux support is already probed before this point via unshare and
+        // Landlock capability checks; a second process probe would add latency
+        // without exercising the same pre_exec path.
+        "linux-direct-syscalls" => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_sandbox_plan_probe_failure(plan: &ShellSandboxPlan, timeout: Duration) -> Option<String> {
+    let mut args = plan.args.clone();
+    let Some(command_arg) = args.last_mut() else {
+        return Some(format!(
+            "shell sandbox backend {} probe could not build command",
+            plan.backend
+        ));
+    };
+    *command_arg = "true".to_string();
+
+    let mut child = match std::process::Command::new(&plan.program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return Some(format!(
+                "shell sandbox backend {} probe failed to start: {err}",
+                plan.backend
+            ));
+        }
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return None,
+            Ok(Some(status)) => {
+                return Some(shell_sandbox_backend_probe_status_reason(
+                    plan.backend,
+                    &status,
+                ));
+            }
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!(
+                    "shell sandbox backend {} probe timed out after {} ms",
+                    plan.backend,
+                    timeout.as_millis()
+                ));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Some(format!(
+                    "shell sandbox backend {} probe wait failed: {err}",
+                    plan.backend
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_sandbox_plan_probe_failure(
+    _plan: &ShellSandboxPlan,
+    _timeout: Duration,
+) -> Option<String> {
+    None
+}
+
+fn shell_sandbox_backend_probe_status_reason(
+    backend: &'static str,
+    status: &std::process::ExitStatus,
+) -> String {
+    if let Some(code) = status.code() {
+        return format!("shell sandbox backend {backend} probe exited with code {code}");
+    }
+    if let Some(signal) = shell_exit_signal(Some(status)) {
+        return format!("shell sandbox backend {backend} probe terminated by signal {signal}");
+    }
+    format!("shell sandbox backend {backend} probe ended without an exit code")
 }
 
 #[allow(unused_variables)]

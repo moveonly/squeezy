@@ -5261,6 +5261,142 @@ fn shell_best_effort_falls_back_when_sandbox_dies_without_output() {
 }
 
 #[test]
+fn shell_sandbox_backend_health_skips_probe_after_best_effort_failure() {
+    let health = ShellSandboxHealth::default();
+    health.mark_unavailable("macos-sandbox-exec", "probe exited with code 71");
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let probed = std::cell::Cell::new(false);
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| {
+            probed.set(true);
+            None
+        },
+    )
+    .expect("best effort direct fallback");
+
+    assert!(!probed.get(), "cached failure should skip the probe");
+    assert_eq!(plan.backend, "none");
+    assert!(
+        plan.fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("probe exited with code 71")),
+        "{:?}",
+        plan.fallback_reason
+    );
+}
+
+#[test]
+fn shell_sandbox_backend_health_fails_closed_for_required_mode() {
+    let health = ShellSandboxHealth::default();
+    health.mark_unavailable("macos-sandbox-exec", "probe exited with code 71");
+    let config = sandbox_config(
+        ShellSandboxMode::Required,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let probed = std::cell::Cell::new(false);
+
+    let err = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", true),
+        |_, _| {
+            probed.set(true);
+            None
+        },
+    )
+    .expect_err("required mode fails closed");
+
+    assert!(!probed.get(), "cached failure should skip the probe");
+    assert!(err.contains("required shell sandbox backend macos-sandbox-exec unavailable"));
+    assert!(err.contains("probe exited with code 71"));
+}
+
+#[test]
+fn shell_sandbox_backend_health_caches_probe_failure() {
+    let health = ShellSandboxHealth::default();
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| Some("probe timed out after 500 ms".to_string()),
+    )
+    .expect("best effort direct fallback");
+
+    assert_eq!(plan.backend, "none");
+    assert!(
+        matches!(
+            health.status("macos-sandbox-exec"),
+            Some(ShellSandboxBackendStatus::Unavailable(reason))
+                if reason.contains("probe timed out")
+        ),
+        "{:?}",
+        health.status("macos-sandbox-exec")
+    );
+}
+
+#[test]
+fn shell_sandbox_backend_health_caches_probe_success() {
+    let health = ShellSandboxHealth::default();
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+
+    let plan = apply_shell_sandbox_backend_health(
+        "printf ok",
+        &config,
+        &health,
+        fake_sandbox_plan("macos-sandbox-exec", false),
+        |_, _| None,
+    )
+    .expect("healthy backend");
+
+    assert_eq!(plan.backend, "macos-sandbox-exec");
+    assert!(matches!(
+        health.status("macos-sandbox-exec"),
+        Some(ShellSandboxBackendStatus::Available)
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let plan = fake_sandbox_plan("macos-sandbox-exec", false);
+    let run = ShellRunOutcome {
+        exit_status: Some(std::process::ExitStatus::from_raw(71 << 8)),
+        timed_out: false,
+        stdout_bytes: Vec::new(),
+        stdout_truncated: false,
+        stderr_bytes: b"sandbox_apply: Operation not permitted".to_vec(),
+        stderr_truncated: false,
+        preserved_env: Vec::new(),
+    };
+
+    let reason = shell_sandbox_best_effort_fallback_reason(&plan, &run)
+        .expect("best effort runtime fallback reason");
+
+    assert!(reason.contains("failed at runtime"), "{reason}");
+    assert!(reason.contains("best_effort"), "{reason}");
+}
+
+#[test]
 fn shell_sandbox_runtime_unavailable_detects_macos_exit_71_with_sandbox_apply() {
     let plan = fake_sandbox_plan("macos-sandbox-exec", true);
 
