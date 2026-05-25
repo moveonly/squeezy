@@ -98,6 +98,11 @@ pub struct DirtyRange {
     pub end_line: u32,
 }
 
+/// Maximum number of candidate symbols retained on a `Confidence::CandidateSet`
+/// edge. Caps the per-edge payload so token budgets stay predictable when
+/// rendered into evidence packets.
+pub const MAX_EDGE_CANDIDATES: usize = 8;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphEdge {
     pub from: SymbolId,
@@ -108,6 +113,11 @@ pub struct GraphEdge {
     pub confidence: Confidence,
     pub freshness: Freshness,
     pub provenance: Provenance,
+    /// For `Confidence::CandidateSet` edges, the disambiguation set the graph
+    /// already enumerated during resolution. Empty for every other
+    /// confidence. Capped at [`MAX_EDGE_CANDIDATES`] entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidates: Vec<SymbolId>,
 }
 
 /// Provenance metadata for a batch of cargo-derived facts.
@@ -898,6 +908,7 @@ impl SemanticGraph {
                 confidence: Confidence::ExactSyntax,
                 freshness: symbol.freshness,
                 provenance: Provenance::new("squeezy-graph", "contains edge from parser hierarchy"),
+                candidates: Vec::new(),
             });
             self.symbols.insert(symbol.id.clone(), symbol);
         }

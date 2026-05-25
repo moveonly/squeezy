@@ -25,10 +25,18 @@ impl SemanticGraph {
             for base in bases {
                 let candidates =
                     self.csharp_type_candidates_for_name_in_file(&symbol.file_id, &base);
-                let (to, confidence) = match candidates.as_slice() {
-                    [only] => (Some(only.clone()), Confidence::Heuristic),
-                    [] => (None, Confidence::External),
-                    _ => (None, Confidence::CandidateSet),
+                let (to, confidence, edge_candidates) = match candidates.as_slice() {
+                    [only] => (Some(only.clone()), Confidence::Heuristic, Vec::new()),
+                    [] => (None, Confidence::External, Vec::new()),
+                    _ => (
+                        None,
+                        Confidence::CandidateSet,
+                        candidates
+                            .iter()
+                            .take(MAX_EDGE_CANDIDATES)
+                            .cloned()
+                            .collect(),
+                    ),
                 };
                 let kind = to
                     .as_ref()
@@ -50,6 +58,7 @@ impl SemanticGraph {
                     confidence,
                     freshness: Freshness::Fresh,
                     provenance: Provenance::new("tree-sitter-c-sharp", "base type edge"),
+                    candidates: edge_candidates,
                 });
             }
         }
@@ -87,6 +96,7 @@ impl SemanticGraph {
                     confidence: Confidence::ExactSyntax,
                     freshness: Freshness::Fresh,
                     provenance: Provenance::new("tree-sitter-c-sharp", "partial type identity"),
+                    candidates: Vec::new(),
                 });
             }
         }
