@@ -351,17 +351,35 @@ async fn run_inner(
     } else {
         (Agent::new(config.clone(), provider), Vec::new())
     };
-    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root);
+    // One-shot migration of pre-v3 flat-layout plan files into a
+    // legacy subdir; safe to run unconditionally (no-op when nothing
+    // needs moving). Per-session pruning runs below once we know the
+    // session id.
+    let migrated = proposed_plan::migrate_legacy_plans(&config.workspace_root);
+    let session_id_for_plans = agent.session_id();
+    let plans_session_owned = session_id_for_plans
+        .clone()
+        .unwrap_or_else(|| proposed_plan::FALLBACK_SESSION_ID.to_string());
+    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root, &plans_session_owned);
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
         agent.session_mode(),
         startup,
     );
+    app.session_id = session_id_for_plans;
+    if migrated > 0 {
+        app.push_log(format!(
+            "migrated {migrated} legacy plan file(s) to {}/{}",
+            proposed_plan::PLAN_DIR,
+            proposed_plan::LEGACY_PLAN_DIR
+        ));
+    }
     if pruned > 0 {
         app.push_log(format!(
-            "pruned {pruned} stale plan file(s) from {} (kept {} newest)",
+            "pruned {pruned} stale plan file(s) from {}/{} (kept {} newest)",
             proposed_plan::PLAN_DIR,
+            plans_session_owned,
             proposed_plan::PLAN_RETENTION_LIMIT
         ));
     }
@@ -424,7 +442,22 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.pending_assistant.push_delta(&extracted.passthrough);
                     }
                     for plan_body in extracted.completed {
-                        match proposed_plan::persist_plan(&app.workspace_root, &plan_body) {
+                        let sid = app.plan_session_id().to_string();
+                        let meta = proposed_plan::PlanMeta {
+                            // A non-None `current_plan_id` at the time
+                            // a fresh block lands means this body is a
+                            // refinement of the active plan, not a
+                            // first-time draft. Captured for the styled
+                            // card / diff renderer (PR-F).
+                            parent_plan_id: app.current_plan_id.clone(),
+                            model: Some(app.model.clone()),
+                        };
+                        match proposed_plan::persist_plan(
+                            &app.workspace_root,
+                            &sid,
+                            &plan_body,
+                            &meta,
+                        ) {
                             Ok((plan_id, path)) => {
                                 app.current_plan_id = Some(plan_id.clone());
                                 app.push_log(format!(
@@ -438,8 +471,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                                 });
                             }
                             Err(err) => app.push_log(format!(
-                                "proposed plan (could not persist under {}: {err}):\n{plan_body}",
-                                proposed_plan::PLAN_DIR
+                                "proposed plan (could not persist under {}/{}: {err}):\n{plan_body}",
+                                proposed_plan::PLAN_DIR,
+                                sid
                             )),
                         }
                     }
@@ -489,8 +523,9 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         if app.mode == SessionMode::Plan
                             && let Some(plan_id) = app.current_plan_id.clone()
                         {
+                            let sid = app.plan_session_id().to_string();
                             let plan_path =
-                                proposed_plan::plan_file_for(&app.workspace_root, &plan_id);
+                                proposed_plan::plan_file_for(&app.workspace_root, &sid, &plan_id);
                             if plan_path.exists() {
                                 app.push_log(format!(
                                     "plan {plan_id} refined in place (apply_patch)"
@@ -3408,7 +3443,9 @@ fn switch_mode(
         match (previous, target) {
             (SessionMode::Plan, SessionMode::Build) => {
                 if let Some(plan_id) = app.current_plan_id.as_deref() {
-                    let plan_path = proposed_plan::plan_file_for(&app.workspace_root, plan_id);
+                    let sid = app.plan_session_id().to_string();
+                    let plan_path =
+                        proposed_plan::plan_file_for(&app.workspace_root, &sid, plan_id);
                     if plan_path.exists() {
                         app.pending_plan_handoff = Some(plan_path.clone());
                         // Fresh handoff: next Build turn gets the full plan
@@ -7906,6 +7943,13 @@ struct TuiApp {
     pending_assistant: streaming::StreamingController,
     proposed_plan: proposed_plan::ProposedPlanExtractor,
     workspace_root: PathBuf,
+    /// Session id assigned by the agent. Plan-mode IO (persist, prune,
+    /// resolve-active) is scoped under
+    /// `<workspace_root>/.squeezy/plans/<session_id>/` so concurrent
+    /// sessions cannot see each other's plans. `None` until the agent
+    /// hands one back; in that window plan IO falls back to
+    /// [`proposed_plan::FALLBACK_SESSION_ID`].
+    session_id: Option<String>,
     /// Plan id of the most recent `<proposed_plan>` block persisted under
     /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
     /// to identify which plan file is active without scanning the dir.
@@ -7971,6 +8015,16 @@ struct TuiApp {
 }
 
 impl TuiApp {
+    /// Session id to use for plan IO. Falls back to
+    /// [`proposed_plan::FALLBACK_SESSION_ID`] when the agent has not yet
+    /// handed one back so plan-mode IO can still proceed during the
+    /// pre-first-turn window.
+    fn plan_session_id(&self) -> &str {
+        self.session_id
+            .as_deref()
+            .unwrap_or(proposed_plan::FALLBACK_SESSION_ID)
+    }
+
     fn new(
         provider_name: &'static str,
         config: &AppConfig,
@@ -8061,6 +8115,7 @@ impl TuiApp {
             pending_assistant: streaming::StreamingController::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
+            session_id: None,
             current_plan_id: None,
             pending_plan_handoff: None,
             plan_handoff_turns_seen: 0,

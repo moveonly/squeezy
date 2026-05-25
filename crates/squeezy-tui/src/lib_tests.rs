@@ -175,7 +175,9 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
 #[tokio::test]
 async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
     let root = temp_workspace("plan_choice_execute");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-execute1".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -227,7 +229,9 @@ async fn plan_choice_execute_toggles_to_build_mode_and_queues_handoff() {
 #[tokio::test]
 async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() {
     let root = temp_workspace("plan_choice_clean");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-clean001".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -280,7 +284,9 @@ async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() 
 #[tokio::test]
 async fn plan_choice_discard_deletes_file_and_clears_handoff() {
     let root = temp_workspace("plan_choice_discard");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-discard1".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -316,7 +322,9 @@ async fn plan_choice_discard_deletes_file_and_clears_handoff() {
 #[tokio::test]
 async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
     let root = temp_workspace("plan_choice_view");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-view0001".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -358,7 +366,9 @@ async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
 #[tokio::test]
 async fn plan_choice_refine_dismisses_prompt_without_changing_mode_or_file() {
     let root = temp_workspace("plan_choice_refine");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-refine01".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -464,7 +474,9 @@ async fn plan_choice_shift_tab_falls_through_to_mode_toggle() {
 #[tokio::test]
 async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
     let root = temp_workspace("plan_handoff_queued");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-test12345678".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -514,7 +526,9 @@ async fn plan_to_build_switch_skips_handoff_when_no_plan_file() {
 #[tokio::test]
 async fn build_to_plan_switch_drops_pending_handoff() {
     let root = temp_workspace("plan_handoff_dropped");
-    let plans_dir = root.join(proposed_plan::PLAN_DIR);
+    let plans_dir = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID);
     fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let plan_id = "plan-test12345678".to_string();
     let plan_path = plans_dir.join(format!("{plan_id}.md"));
@@ -4379,11 +4393,18 @@ async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir()
         .as_ref()
         .expect("current_plan_id should be set after persistence");
     assert!(plan_id.starts_with("plan-"));
+    // After PR-D the layout is per-session:
+    // <workspace>/.squeezy/plans/<session_id>/<plan_id>.md. Test-mode
+    // sessions have no agent-assigned session id, so the TUI falls back
+    // to [`proposed_plan::FALLBACK_SESSION_ID`].
     let path = root
         .join(proposed_plan::PLAN_DIR)
+        .join(proposed_plan::FALLBACK_SESSION_ID)
         .join(format!("{plan_id}.md"));
+    // The file on disk wraps the body in YAML front-matter (PR-D); use
+    // the public helper to strip it before comparing.
     assert_eq!(
-        std::fs::read_to_string(&path).expect("plan file exists"),
+        proposed_plan::read_plan_body(&path).expect("plan file exists"),
         "step 1\nstep 2\n"
     );
 

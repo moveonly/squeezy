@@ -1,10 +1,14 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use squeezy_core::SessionMode;
 
-use super::{PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode, latest_plan_path};
+use super::{
+    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode, latest_plan_path,
+};
+
+const TEST_SESSION_ID: &str = "test-sess-abc";
 
 fn empty_workspace(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -16,10 +20,16 @@ fn empty_workspace(name: &str) -> PathBuf {
     root
 }
 
+fn session_plans_dir(root: &Path, sid: &str) -> PathBuf {
+    let dir = root.join(PLAN_DIR).join(sid);
+    fs::create_dir_all(&dir).expect("mkdir session plans");
+    dir
+}
+
 #[test]
 fn plan_mode_appends_overlay() {
     let root = empty_workspace("appends_overlay");
-    let out = instructions_for_mode("base", SessionMode::Plan, &root);
+    let out = instructions_for_mode("base", SessionMode::Plan, &root, Some(TEST_SESSION_ID));
     assert!(out.starts_with("base"));
     assert!(out.contains(PLAN_MODE_INSTRUCTIONS));
     let _ = fs::remove_dir_all(&root);
@@ -28,7 +38,12 @@ fn plan_mode_appends_overlay() {
 #[test]
 fn build_mode_returns_base_verbatim() {
     let root = empty_workspace("build_verbatim");
-    let out = instructions_for_mode("base instructions", SessionMode::Build, &root);
+    let out = instructions_for_mode(
+        "base instructions",
+        SessionMode::Build,
+        &root,
+        Some(TEST_SESSION_ID),
+    );
     assert_eq!(out, "base instructions");
     let _ = fs::remove_dir_all(&root);
 }
@@ -81,12 +96,11 @@ fn plan_mode_instructs_exploration_before_questions() {
 #[test]
 fn refinement_hint_added_when_plan_file_present() {
     let root = empty_workspace("hint_present");
-    let plans_dir = root.join(PLAN_DIR);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
     let plan_file = plans_dir.join("plan-abc123.md");
     fs::write(&plan_file, "step 1\n").expect("write plan");
 
-    let out = instructions_for_mode("base", SessionMode::Plan, &root);
+    let out = instructions_for_mode("base", SessionMode::Plan, &root, Some(TEST_SESSION_ID));
     assert!(out.contains("Active plan file:"));
     assert!(out.contains(plan_file.to_str().expect("utf-8")));
     assert!(out.contains("read this file first with read_file"));
@@ -96,23 +110,37 @@ fn refinement_hint_added_when_plan_file_present() {
 #[test]
 fn refinement_hint_absent_when_no_plan_files() {
     let root = empty_workspace("hint_absent");
-    let out = instructions_for_mode("base", SessionMode::Plan, &root);
+    let out = instructions_for_mode("base", SessionMode::Plan, &root, Some(TEST_SESSION_ID));
     assert!(!out.contains("Active plan file:"));
     let _ = fs::remove_dir_all(&root);
 }
 
 #[test]
-fn latest_plan_path_picks_newest_by_mtime() {
-    let root = empty_workspace("latest_by_mtime");
-    let plans_dir = root.join(PLAN_DIR);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+fn latest_plan_path_prefers_current_pointer_over_mtime() {
+    let root = empty_workspace("latest_pointer_first");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    let older = plans_dir.join("plan-pointed.md");
+    let newer = plans_dir.join("plan-newer.md");
+    fs::write(&older, "pointed body").expect("write older");
+    fs::write(&newer, "newer body").expect("write newer");
+
+    // Pointer aims at the OLDER file even though NEWER has the newer mtime.
+    fs::write(plans_dir.join(CURRENT_POINTER_FILE), "plan-pointed\n").expect("write pointer");
+
+    let picked = latest_plan_path(&root, Some(TEST_SESSION_ID)).expect("latest exists");
+    assert_eq!(picked, older, "pointer must win over mtime fallback");
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn latest_plan_path_falls_back_to_mtime_when_pointer_missing() {
+    let root = empty_workspace("latest_by_mtime_fallback");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
     let older = plans_dir.join("plan-old.md");
     let newer = plans_dir.join("plan-new.md");
     fs::write(&older, "old").expect("write older");
     fs::write(&newer, "new").expect("write newer");
-    // Drive mtimes explicitly so the test does not rely on the OS clock's
-    // resolution between two write calls (some filesystems quantise to a
-    // second or more).
     let now = SystemTime::now();
     fs::File::options()
         .write(true)
@@ -126,7 +154,7 @@ fn latest_plan_path_picks_newest_by_mtime() {
         .expect("open newer")
         .set_modified(now)
         .expect("set newer mtime");
-    let picked = latest_plan_path(&root).expect("latest exists");
+    let picked = latest_plan_path(&root, Some(TEST_SESSION_ID)).expect("latest exists");
     assert_eq!(picked, newer);
     let _ = fs::remove_dir_all(&root);
 }
@@ -134,10 +162,33 @@ fn latest_plan_path_picks_newest_by_mtime() {
 #[test]
 fn latest_plan_path_ignores_non_markdown_files() {
     let root = empty_workspace("ignore_non_md");
-    let plans_dir = root.join(PLAN_DIR);
-    fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
     fs::write(plans_dir.join("README"), "not a plan").expect("write readme");
     fs::write(plans_dir.join("notes.txt"), "not a plan").expect("write notes");
-    assert!(latest_plan_path(&root).is_none());
+    assert!(latest_plan_path(&root, Some(TEST_SESSION_ID)).is_none());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn latest_plan_path_isolates_sessions() {
+    let root = empty_workspace("session_isolation");
+    let sid_a = "sess-a";
+    let sid_b = "sess-b";
+    let plans_a = session_plans_dir(&root, sid_a);
+    let _ = session_plans_dir(&root, sid_b);
+    fs::write(plans_a.join("plan-a.md"), "from a").expect("write a");
+    // sid_b has nothing; latest_plan_path(b) must be None even though
+    // sid_a has a plan file.
+    assert!(latest_plan_path(&root, Some(sid_a)).is_some());
+    assert!(latest_plan_path(&root, Some(sid_b)).is_none());
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn latest_plan_path_returns_none_without_session_id() {
+    let root = empty_workspace("no_session_id");
+    let plans_dir = session_plans_dir(&root, TEST_SESSION_ID);
+    fs::write(plans_dir.join("plan-z.md"), "body").expect("write");
+    assert!(latest_plan_path(&root, None).is_none());
     let _ = fs::remove_dir_all(&root);
 }

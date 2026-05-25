@@ -3561,6 +3561,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "similar",
  "squeezy-agent",
  "squeezy-core",
  "squeezy-llm",

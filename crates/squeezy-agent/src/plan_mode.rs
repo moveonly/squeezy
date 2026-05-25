@@ -14,10 +14,16 @@ use std::time::SystemTime;
 
 use squeezy_core::SessionMode;
 
-/// Workspace-relative directory the TUI writes proposed plans into. The
-/// agent uses this to locate the active plan file for refinement turns.
-/// Kept in sync with `crates/squeezy-tui/src/proposed_plan.rs::PLAN_DIR`.
+/// Workspace-relative directory the TUI writes proposed plans into. Per
+/// session the layout is `<PLAN_DIR>/<session_id>/<plan_id>.md`; the
+/// agent looks up the active plan via the session's `current` pointer
+/// file with an mtime-scan fallback. Kept in sync with
+/// `crates/squeezy-tui/src/proposed_plan.rs::PLAN_DIR`.
 pub(crate) const PLAN_DIR: &str = ".squeezy/plans";
+
+/// File name (inside a per-session subdir) that holds the id of the
+/// active plan. Mirrors `proposed_plan::CURRENT_POINTER_FILE`.
+pub(crate) const CURRENT_POINTER_FILE: &str = "current";
 
 /// Plan-mode behavioural overlay. Three-phase nudge modelled on Codex's
 /// `plan.md`; condensed to keep token cost low while still steering the
@@ -40,17 +46,19 @@ fn refinement_hint(plan_path: &Path) -> String {
 /// Compose per-turn instructions for the active session mode.
 /// Build mode returns the base instructions verbatim so existing behaviour
 /// is unchanged; Plan mode appends [`PLAN_MODE_INSTRUCTIONS`] plus an
-/// optional refinement hint pointing at the most recently persisted plan
-/// file under `<workspace>/.squeezy/plans/`.
+/// optional refinement hint pointing at the active plan file for the
+/// current session (looked up via the `current` pointer with mtime
+/// fallback).
 pub(crate) fn instructions_for_mode(
     base: &str,
     mode: SessionMode,
     workspace_root: &Path,
+    session_id: Option<&str>,
 ) -> String {
     match mode {
         SessionMode::Plan => {
             let mut out = format!("{base}\n\n{PLAN_MODE_INSTRUCTIONS}");
-            if let Some(plan_path) = latest_plan_path(workspace_root) {
+            if let Some(plan_path) = latest_plan_path(workspace_root, session_id) {
                 out.push_str(&refinement_hint(&plan_path));
             }
             out
@@ -60,11 +68,15 @@ pub(crate) fn instructions_for_mode(
 }
 
 /// Whether the model should be allowed to edit the active plan file from
-/// inside Plan mode. True only when the session is in Plan mode AND a
-/// plan file already exists on disk for this workspace (no point exposing
+/// inside Plan mode. True only when the session is in Plan mode AND an
+/// active plan file already exists for this session (no point exposing
 /// `apply_patch` when there is nothing yet to refine).
-pub(crate) fn plan_edit_allowed_in_workspace(mode: SessionMode, workspace_root: &Path) -> bool {
-    mode == SessionMode::Plan && latest_plan_path(workspace_root).is_some()
+pub(crate) fn plan_edit_allowed_in_workspace(
+    mode: SessionMode,
+    workspace_root: &Path,
+    session_id: Option<&str>,
+) -> bool {
+    mode == SessionMode::Plan && latest_plan_path(workspace_root, session_id).is_some()
 }
 
 /// Exact-match check used by the runtime permission gate to grant Plan
@@ -83,11 +95,26 @@ pub(crate) fn is_active_plan_path(target: &Path, active: &Path) -> bool {
     target_canon == active_canon
 }
 
-/// Newest `.md` file under `<workspace>/.squeezy/plans/`, by mtime. Returns
-/// `None` when the directory does not exist or holds no plan files.
-pub(crate) fn latest_plan_path(workspace_root: &Path) -> Option<PathBuf> {
-    let dir = workspace_root.join(PLAN_DIR);
-    let entries = std::fs::read_dir(&dir).ok()?;
+/// Active plan file path for a session, preferring the session's
+/// `current` pointer (single source of truth, issue 17) and falling
+/// back to mtime scan when the pointer is missing (resume / first-run
+/// scenarios). Returns `None` when nothing is on disk.
+pub(crate) fn latest_plan_path(workspace_root: &Path, session_id: Option<&str>) -> Option<PathBuf> {
+    let session_id = session_id?;
+    let session_dir = workspace_root.join(PLAN_DIR).join(session_id);
+    // Pointer first.
+    let pointer = session_dir.join(CURRENT_POINTER_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&pointer) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let candidate = session_dir.join(format!("{trimmed}.md"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Mtime fallback.
+    let entries = std::fs::read_dir(&session_dir).ok()?;
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in entries.flatten() {
         let path = entry.path();

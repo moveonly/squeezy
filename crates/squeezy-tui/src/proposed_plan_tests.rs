@@ -1,7 +1,16 @@
 use super::{
-    BUILD_PLAN_STILL_IN_EFFECT_FORMAT, PLAN_DIR, PLAN_RETENTION_LIMIT, ProposedPlanExtractor,
-    persist_plan, plan_file_for, plan_id_for, prune_plan_dir,
+    BUILD_PLAN_STILL_IN_EFFECT_FORMAT, CURRENT_POINTER_FILE, LEGACY_PLAN_DIR, PLAN_DIR,
+    PLAN_RETENTION_LIMIT, PlanMeta, ProposedPlanExtractor, current_pointer_for,
+    migrate_legacy_plans, persist_plan, plan_file_for, plan_id_for, prune_plan_dir,
+    read_current_plan_id, read_plan_body, session_plan_dir, strip_front_matter,
 };
+
+const TEST_SESSION_ID: &str = "test-sess-tui";
+const OTHER_SESSION_ID: &str = "test-sess-other";
+
+fn empty_meta() -> PlanMeta {
+    PlanMeta::default()
+}
 
 #[test]
 fn build_plan_still_in_effect_template_has_path_placeholder() {
@@ -94,44 +103,85 @@ fn fresh_workspace(name: &str) -> std::path::PathBuf {
 }
 
 #[test]
-fn persist_plan_writes_per_plan_id_under_dot_squeezy_plans() {
+fn persist_plan_writes_per_plan_id_under_session_dir() {
     let root = fresh_workspace("persist_per_id");
-    let (plan_id, path) = persist_plan(&root, "step 1\nstep 2").expect("persist plan");
+    let (plan_id, path) = persist_plan(&root, TEST_SESSION_ID, "step 1\nstep 2", &empty_meta())
+        .expect("persist plan");
     assert_eq!(plan_id, plan_id_for("step 1\nstep 2"));
     assert!(plan_id.starts_with("plan-"));
-    assert_eq!(path, plan_file_for(&root, &plan_id));
-    assert!(path.starts_with(root.join(PLAN_DIR)));
-    let on_disk = std::fs::read_to_string(&path).expect("read plan");
-    assert_eq!(on_disk, "step 1\nstep 2\n");
+    assert_eq!(path, plan_file_for(&root, TEST_SESSION_ID, &plan_id));
+    assert!(path.starts_with(root.join(PLAN_DIR).join(TEST_SESSION_ID)));
+    let body = read_plan_body(&path).expect("read plan body");
+    assert_eq!(body, "step 1\nstep 2\n");
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn persist_plan_distinct_bodies_produce_distinct_files() {
     let root = fresh_workspace("persist_distinct");
-    let (id_a, path_a) = persist_plan(&root, "first").expect("persist first");
-    let (id_b, path_b) = persist_plan(&root, "second").expect("persist second");
+    let (id_a, path_a) =
+        persist_plan(&root, TEST_SESSION_ID, "first", &empty_meta()).expect("persist first");
+    let (id_b, path_b) =
+        persist_plan(&root, TEST_SESSION_ID, "second", &empty_meta()).expect("persist second");
     assert_ne!(id_a, id_b, "different bodies must mint different plan ids");
     assert_ne!(path_a, path_b);
-    assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "first\n");
-    assert_eq!(std::fs::read_to_string(&path_b).unwrap(), "second\n");
+    assert_eq!(read_plan_body(&path_a).unwrap(), "first\n");
+    assert_eq!(read_plan_body(&path_b).unwrap(), "second\n");
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn persist_plan_identical_body_reuses_plan_id() {
     let root = fresh_workspace("persist_reuse");
-    let (id_a, path_a) = persist_plan(&root, "same body").expect("persist a");
-    let (id_b, path_b) = persist_plan(&root, "same body").expect("persist b");
+    let (id_a, path_a) =
+        persist_plan(&root, TEST_SESSION_ID, "same body", &empty_meta()).expect("persist a");
+    let (id_b, path_b) =
+        persist_plan(&root, TEST_SESSION_ID, "same body", &empty_meta()).expect("persist b");
     assert_eq!(id_a, id_b);
     assert_eq!(path_a, path_b);
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
+fn persist_plan_updates_current_pointer() {
+    let root = fresh_workspace("persist_pointer");
+    let (id_a, _) =
+        persist_plan(&root, TEST_SESSION_ID, "alpha", &empty_meta()).expect("persist a");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id_a.as_str()),
+        "current pointer must follow the most recent persist"
+    );
+    let (id_b, _) = persist_plan(&root, TEST_SESSION_ID, "beta", &empty_meta()).expect("persist b");
+    assert_ne!(id_a, id_b);
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some(id_b.as_str()),
+        "subsequent persist must repoint the current pointer"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persist_plan_isolates_sessions() {
+    let root = fresh_workspace("session_isolation");
+    let (id_a, path_a) =
+        persist_plan(&root, TEST_SESSION_ID, "same body", &empty_meta()).expect("persist a");
+    let (id_b, path_b) =
+        persist_plan(&root, OTHER_SESSION_ID, "same body", &empty_meta()).expect("persist b");
+    // Body-derived id collides; per-session subdirs must keep the files
+    // apart on disk so concurrent sessions never see each other's plans.
+    assert_eq!(id_a, id_b);
+    assert_ne!(path_a, path_b);
+    assert!(path_a.starts_with(session_plan_dir(&root, TEST_SESSION_ID)));
+    assert!(path_b.starts_with(session_plan_dir(&root, OTHER_SESSION_ID)));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn prune_plan_dir_keeps_newest_within_retention_limit() {
     let root = fresh_workspace("prune_caps_dir");
-    let plans_dir = root.join(PLAN_DIR);
+    let plans_dir = session_plan_dir(&root, TEST_SESSION_ID);
     std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
     let total = PLAN_RETENTION_LIMIT + 5;
     let now = std::time::SystemTime::now();
@@ -150,7 +200,7 @@ fn prune_plan_dir_keeps_newest_within_retention_limit() {
             newest_paths.push(path);
         }
     }
-    let deleted = prune_plan_dir(&root);
+    let deleted = prune_plan_dir(&root, TEST_SESSION_ID);
     assert_eq!(deleted, total - PLAN_RETENTION_LIMIT);
     let remaining: Vec<_> = std::fs::read_dir(&plans_dir)
         .expect("read plans")
@@ -165,14 +215,37 @@ fn prune_plan_dir_keeps_newest_within_retention_limit() {
 }
 
 #[test]
+fn prune_plan_dir_does_not_touch_sibling_sessions() {
+    let root = fresh_workspace("prune_scopes_to_session");
+    let plans_a = session_plan_dir(&root, TEST_SESSION_ID);
+    let plans_b = session_plan_dir(&root, OTHER_SESSION_ID);
+    std::fs::create_dir_all(&plans_a).expect("mkdir a");
+    std::fs::create_dir_all(&plans_b).expect("mkdir b");
+    for idx in 0..(PLAN_RETENTION_LIMIT + 2) {
+        std::fs::write(plans_a.join(format!("plan-{idx:04}.md")), "body").expect("write a");
+    }
+    // Sibling session has just a single plan; pruning A must not touch
+    // anything in B.
+    std::fs::write(plans_b.join("plan-keep.md"), "body b").expect("write b");
+
+    let deleted = prune_plan_dir(&root, TEST_SESSION_ID);
+    assert!(deleted >= 2, "prune must remove the extras in session A");
+    assert!(
+        plans_b.join("plan-keep.md").exists(),
+        "sibling session must be untouched"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn prune_plan_dir_noops_when_under_limit() {
     let root = fresh_workspace("prune_under_limit");
-    let plans_dir = root.join(PLAN_DIR);
+    let plans_dir = session_plan_dir(&root, TEST_SESSION_ID);
     std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
     for idx in 0..3 {
         std::fs::write(plans_dir.join(format!("plan-{idx}.md")), "body").expect("write");
     }
-    assert_eq!(prune_plan_dir(&root), 0);
+    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID), 0);
     let count = std::fs::read_dir(&plans_dir).expect("read").count();
     assert_eq!(count, 3);
     let _ = std::fs::remove_dir_all(&root);
@@ -181,8 +254,186 @@ fn prune_plan_dir_noops_when_under_limit() {
 #[test]
 fn prune_plan_dir_noops_when_dir_missing() {
     let root = fresh_workspace("prune_missing");
-    assert_eq!(prune_plan_dir(&root), 0);
+    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID), 0);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_current_plan_id_returns_none_without_pointer() {
+    let root = fresh_workspace("pointer_missing");
+    let _ = session_plan_dir(&root, TEST_SESSION_ID); // just for path calc
+    assert!(read_current_plan_id(&root, TEST_SESSION_ID).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn read_current_plan_id_trims_whitespace_and_rejects_empty() {
+    let root = fresh_workspace("pointer_trim");
+    let plans_dir = session_plan_dir(&root, TEST_SESSION_ID);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir");
+    let pointer = current_pointer_for(&root, TEST_SESSION_ID);
+    std::fs::write(&pointer, "  plan-foo123\n\n").expect("write pointer");
+    assert_eq!(
+        read_current_plan_id(&root, TEST_SESSION_ID).as_deref(),
+        Some("plan-foo123")
+    );
+    std::fs::write(&pointer, "   \n").expect("rewrite pointer");
+    assert!(read_current_plan_id(&root, TEST_SESSION_ID).is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn current_pointer_file_constant_is_stable() {
+    // Locked to "current" so the agent-side mirror constant in
+    // crates/squeezy-agent/src/plan_mode.rs cannot drift silently.
+    assert_eq!(CURRENT_POINTER_FILE, "current");
+}
+
+#[test]
+fn migrate_legacy_plans_moves_top_level_md_files_only() {
+    let root = fresh_workspace("legacy_migrate");
+    let plans_dir = root.join(PLAN_DIR);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    // Two flat-layout plans (pre-v3 shape).
+    std::fs::write(plans_dir.join("plan-a.md"), "legacy a").expect("write a");
+    std::fs::write(plans_dir.join("plan-b.md"), "legacy b").expect("write b");
+    // A session subdir with a plan: must NOT be moved.
+    let session_dir = plans_dir.join(TEST_SESSION_ID);
+    std::fs::create_dir_all(&session_dir).expect("mkdir session");
+    std::fs::write(session_dir.join("plan-keep.md"), "keep").expect("write keep");
+    // A non-markdown junk file at top level: must NOT be moved.
+    std::fs::write(plans_dir.join("README"), "ignore").expect("write readme");
+
+    let moved = migrate_legacy_plans(&root);
+    assert_eq!(moved, 2);
+
+    let legacy = plans_dir.join(LEGACY_PLAN_DIR);
+    assert!(legacy.join("plan-a.md").exists());
+    assert!(legacy.join("plan-b.md").exists());
+    assert!(!plans_dir.join("plan-a.md").exists());
+    assert!(!plans_dir.join("plan-b.md").exists());
+    assert!(session_dir.join("plan-keep.md").exists());
+    assert!(plans_dir.join("README").exists());
+
+    // Second run is a no-op (nothing left at top level).
+    assert_eq!(migrate_legacy_plans(&root), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn migrate_legacy_plans_noops_when_dir_missing() {
+    let root = fresh_workspace("legacy_missing");
+    assert_eq!(migrate_legacy_plans(&root), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persist_plan_writes_yaml_front_matter() {
+    let root = fresh_workspace("front_matter_round_trip");
+    let body = "Context: minor doc tweak.\n\n1. Edit README\n2. Verify links";
+    let meta = PlanMeta {
+        parent_plan_id: Some("plan-parent01".to_string()),
+        model: Some("gpt-5-codex".to_string()),
+    };
+    let (plan_id, path) =
+        persist_plan(&root, TEST_SESSION_ID, body, &meta).expect("persist with meta");
+
+    let raw = std::fs::read_to_string(&path).expect("read raw");
+    assert!(raw.starts_with("---\n"), "front-matter must open with ---");
+    assert!(
+        raw.contains(&format!("plan_id: {plan_id}\n")),
+        "plan id must appear in front-matter: {raw}"
+    );
+    assert!(
+        raw.contains(&format!("session_id: {TEST_SESSION_ID}\n")),
+        "session id must appear in front-matter: {raw}"
+    );
+    assert!(
+        raw.contains("parent_plan_id: plan-parent01\n"),
+        "parent_plan_id must round-trip"
+    );
+    assert!(
+        raw.contains("model: gpt-5-codex\n"),
+        "model must round-trip"
+    );
+    assert!(raw.contains("created: "), "created timestamp must be set");
+    // Objective is YAML-quoted because the body's first line contains
+    // a colon (`Context: …`), which would otherwise be parsed as a
+    // nested key. The quoted form still embeds the prefix verbatim.
+    assert!(
+        raw.contains("objective: 'Context: minor doc tweak.'"),
+        "objective must derive from the first non-empty line: {raw}"
+    );
+
+    // The body is recoverable via the strip helper.
+    let body_only = read_plan_body(&path).expect("read body");
+    assert_eq!(body_only, format!("{body}\n"));
+}
+
+#[test]
+fn persist_plan_omits_parent_and_model_when_unset() {
+    let root = fresh_workspace("front_matter_minimal");
+    let (_, path) =
+        persist_plan(&root, TEST_SESSION_ID, "single step", &empty_meta()).expect("persist plain");
+    let raw = std::fs::read_to_string(&path).expect("read raw");
+    assert!(!raw.contains("parent_plan_id"));
+    assert!(!raw.contains("model:"));
+    assert!(raw.contains("plan_id: "));
+    assert!(raw.contains("session_id: "));
+}
+
+#[test]
+fn strip_front_matter_returns_body_only() {
+    let input = "---\nplan_id: plan-x\nsession_id: s\n---\nthe body\n";
+    assert_eq!(strip_front_matter(input), "the body\n");
+}
+
+#[test]
+fn strip_front_matter_handles_missing_block() {
+    let input = "no front matter here\nsecond line\n";
+    assert_eq!(strip_front_matter(input), input);
+}
+
+#[test]
+fn strip_front_matter_handles_truncated_block() {
+    // Open marker but no closer — must not panic and must not chew bytes.
+    let input = "---\nplan_id: plan-x\nstill open";
+    assert_eq!(strip_front_matter(input), input);
+}
+
+#[test]
+fn objective_derives_from_first_meaningful_line() {
+    let root = fresh_workspace("objective_derivation");
+    let body = "\n\n# Heading\n- [ ] Pick a font and validate readability across themes.\n";
+    let (_, path) =
+        persist_plan(&root, TEST_SESSION_ID, body, &empty_meta()).expect("persist with heading");
+    let raw = std::fs::read_to_string(&path).expect("read raw");
+    assert!(
+        raw.contains("objective: Heading"),
+        "heading text should be picked, marker stripped: {raw}"
+    );
+}
+
+#[test]
+fn objective_truncates_to_80_chars_with_ellipsis() {
+    let root = fresh_workspace("objective_truncate");
+    let long_line = "x".repeat(120);
+    let (_, path) =
+        persist_plan(&root, TEST_SESSION_ID, &long_line, &empty_meta()).expect("persist long line");
+    let raw = std::fs::read_to_string(&path).expect("read raw");
+    assert!(
+        raw.contains("objective: ") && raw.contains('…'),
+        "long objective must be ellipsised: {raw}"
+    );
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("objective: ") {
+            // 80 visible chars + ellipsis. Use char count, not byte count.
+            assert!(
+                rest.chars().count() <= 81,
+                "objective must cap at 80 chars + ellipsis: {rest:?}"
+            );
+        }
+    }
 }
 
 #[test]

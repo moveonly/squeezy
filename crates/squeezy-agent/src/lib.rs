@@ -1703,8 +1703,12 @@ impl Agent {
         let request_instructions = self.redactor.redact(&raw_instructions).text;
         let mut all_tool_specs = core_control_tools(&self.config.subagents, mode);
         all_tool_specs.extend(self.tools.specs().iter().cloned().map(advertised_tool));
-        let plan_edit_allowed =
-            plan_mode::plan_edit_allowed_in_workspace(mode, &self.config.workspace_root);
+        let session_id_for_plan_mode = self.session_id();
+        let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+            mode,
+            &self.config.workspace_root,
+            session_id_for_plan_mode.as_deref(),
+        );
         LlmRequest {
             model: Arc::from(self.config.model.as_str()),
             instructions: Arc::from(instructions_with_tool_index(
@@ -3120,6 +3124,18 @@ struct TurnRuntime {
     subagents: SubagentRegistry,
 }
 
+impl TurnRuntime {
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). `None` when the session
+    /// has not yet been assigned an id (pre-first-turn window) or has
+    /// no log handle (replay/test scenarios).
+    fn session_id(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
+    }
+}
+
 fn request_response_verbosity(
     config: &AppConfig,
     provider_name: &str,
@@ -3312,10 +3328,12 @@ impl TurnRuntime {
         // here tells the model *why* its toolbox shrank and what the
         // expected output contract (`<proposed_plan>`) looks like.
         let active_mode = load_session_mode(&self.session_mode);
+        let session_id_for_plan_mode = self.session_id();
         let mode_instructions = plan_mode::instructions_for_mode(
             &verbosity_instructions,
             active_mode,
             &self.config.workspace_root,
+            session_id_for_plan_mode.as_deref(),
         );
         let mut prior_state = self.conversation_state.lock().await.clone();
         // Pinned context must reach the model on every turn, not only
@@ -3607,8 +3625,11 @@ impl TurnRuntime {
             }
             let active_mode = load_session_mode(&self.session_mode);
             let loaded_tool_schemas = self.loaded_tool_schemas.lock().await.clone();
-            let plan_edit_allowed =
-                plan_mode::plan_edit_allowed_in_workspace(active_mode, &self.config.workspace_root);
+            let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+                active_mode,
+                &self.config.workspace_root,
+                self.session_id().as_deref(),
+            );
             let mode_slot = active_mode as usize;
             if instructions_cache[mode_slot].is_none() {
                 instructions_cache[mode_slot] = Some(instructions_with_tool_index(
@@ -4434,6 +4455,18 @@ struct ToolExecutionContext<'a> {
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
 }
 
+impl ToolExecutionContext<'_> {
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). `None` when the session
+    /// has not yet been assigned an id (pre-first-turn window) or has no
+    /// log handle (in-memory test scenarios).
+    fn session_id_for_plan_mode(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
+    }
+}
+
 struct McpElicitationHandlerScope<'a> {
     tools: &'a ToolRegistry,
 }
@@ -4513,6 +4546,15 @@ impl PermissionDecisionContext {
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
         }
+    }
+
+    /// Session id derived from the session log handle, used by plan-mode
+    /// path-scoped write exception (issue 17). Mirrors
+    /// `ToolExecutionContext::session_id_for_plan_mode`.
+    fn session_id_for_plan_mode(&self) -> Option<String> {
+        self.session_log
+            .as_ref()
+            .map(|handle| handle.session_id().to_string())
     }
 }
 
@@ -4696,8 +4738,12 @@ async fn handle_load_tool_schema_call(
     };
 
     let active_mode = load_session_mode(&context.session_mode);
-    let plan_edit_allowed =
-        plan_mode::plan_edit_allowed_in_workspace(active_mode, &context.config.workspace_root);
+    let session_id_for_plan_mode = context.session_id_for_plan_mode();
+    let plan_edit_allowed = plan_mode::plan_edit_allowed_in_workspace(
+        active_mode,
+        &context.config.workspace_root,
+        session_id_for_plan_mode.as_deref(),
+    );
     if mode_refuses_capability(active_mode, tool.capability, plan_edit_allowed) {
         return control_tool_result(
             call,
@@ -6820,7 +6866,11 @@ async fn permission_decision_for_request(
     request: PermissionRequest,
 ) -> ApprovalDecision {
     let active_mode = load_session_mode(&context.session_mode);
-    let active_plan = plan_mode::latest_plan_path(&context.config.workspace_root);
+    let session_id_for_plan_mode = context.session_id_for_plan_mode();
+    let active_plan = plan_mode::latest_plan_path(
+        &context.config.workspace_root,
+        session_id_for_plan_mode.as_deref(),
+    );
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
         return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
