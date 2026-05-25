@@ -12467,12 +12467,23 @@ fn prepare_shell_sandbox_plan_with_probe(
         }
     }
 
-    Ok(ShellSandboxPlan::direct_with_fallback(
-        command,
-        config.mode,
-        config,
-        fallback_reason,
-    ))
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(ShellSandboxPlan::direct_with_fallback(
+            command,
+            config.mode,
+            config,
+            fallback_reason,
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Unreachable: the Windows arm above always returns. This branch
+        // exists only so the function has a tail expression of the right
+        // type for non-Windows targets without the compiler flagging
+        // unreachable_code on Windows.
+        unreachable!()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -13108,6 +13119,10 @@ fn configure_shell_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
     }
 }
 
