@@ -11,8 +11,8 @@
 
 use squeezy_core::SessionMode;
 
-/// Plan-mode behavioural overlay. Kept ≤500 chars by design.
-pub(crate) const PLAN_MODE_INSTRUCTIONS: &str = "Plan mode: investigate non-mutatively (Read/Search tools only), ask clarifying multi-choice questions via the request_user_input tool when the spec is ambiguous, and finish with a single <proposed_plan>...</proposed_plan> block listing the agreed steps. Do not edit files, run shells, or call mutating tools — those are off the table in this mode.";
+/// Plan-mode behavioural overlay. Kept ≤700 chars by design.
+pub(crate) const PLAN_MODE_INSTRUCTIONS: &str = "Plan mode: investigate non-mutatively (Read/Search tools only), ask clarifying multi-choice questions via the request_user_input tool when the spec is ambiguous, and finish with a single <proposed_plan>...</proposed_plan> block listing the agreed steps. Do not edit files, run shells, or call mutating tools — those are off the table in this mode. If the user asks to execute, run, or apply the plan, do not attempt the edits; instead tell them to press Shift+Tab to switch to Build mode (the same prompt then runs in Build) or to refine the plan further.";
 
 /// Compose per-turn instructions for the active session mode. Build mode
 /// returns the base instructions verbatim so existing behaviour is

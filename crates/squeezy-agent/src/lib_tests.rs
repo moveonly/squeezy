@@ -3360,6 +3360,183 @@ fn compaction_without_store_leaves_replacement_id_none() {
     assert!(report.record.replacement_id.is_none());
 }
 
+#[test]
+fn compaction_drops_orphan_function_call_outputs_from_interleaved_parallel_calls() {
+    // Parallel tool calls produce `[FC(A), FC(B), FCO(A), FCO(B)]`. If the
+    // compaction split lands between the two calls, recent starts with
+    // `FC(B)` and snap_compaction_split stops there — leaving `FCO(A)` as
+    // an orphan in the recent slice whose declaring `FC(A)` was dropped
+    // into `older`. The next provider request would then carry a bare
+    // `function_call_output` and OpenAI would 400 the turn.
+    let mut conversation = vec![
+        LlmInputItem::UserText("seed user message".to_string()),
+        LlmInputItem::AssistantText("seed assistant reply".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_A".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "foo"}),
+        },
+        LlmInputItem::FunctionCall {
+            call_id: "call_B".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "bar"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_A".to_string(),
+            output: "foo result".to_string(),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_B".to_string(),
+            output: "bar result".to_string(),
+        },
+        LlmInputItem::AssistantText("post-tools reply".to_string()),
+    ];
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            recent_items: 4,
+            min_items: 1,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut state = ContextCompactionState::default();
+    let report = super::compact_conversation(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .expect("compaction should run");
+
+    let kept_call_ids: std::collections::BTreeSet<&str> = conversation
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for item in &conversation {
+        if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+            assert!(
+                kept_call_ids.contains(call_id.as_str()),
+                "orphan function_call_output survived compaction: call_id={call_id} \
+                 conversation={conversation:?}"
+            );
+        }
+    }
+    // The summary itself should land at the head.
+    assert!(matches!(
+        conversation.first(),
+        Some(LlmInputItem::UserText(_))
+    ));
+    assert!(report.record.dropped_items >= 3);
+}
+
+#[test]
+fn mark_intra_batch_duplicates_stamps_hint_on_second_identical_call() {
+    let tools = ToolRegistry::new("/tmp").expect("registry");
+    let make_call = |call_id: &str, pattern: &str| ToolCall {
+        call_id: call_id.to_string(),
+        name: "grep".to_string(),
+        arguments: serde_json::json!({"pattern": pattern}),
+    };
+    let make_result = |call: &ToolCall| ToolResult {
+        call_id: call.call_id.clone(),
+        tool_name: call.name.clone(),
+        status: ToolStatus::Success,
+        content: serde_json::json!({"matches": []}),
+        cost_hint: ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: String::new(),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let calls = vec![
+        make_call("g1", "\\bfn make_widget\\b"),
+        make_call("g2", "\\bfn make_widget\\b"),
+        make_call("g3", "\\bfn make_widget\\b"),
+        make_call("g4", "different"),
+    ];
+    let mut results: Vec<ToolResult> = calls.iter().map(make_result).collect();
+
+    super::mark_intra_batch_duplicates(&calls, &mut results, &tools);
+
+    assert!(
+        results[0].content.get("duplicate_of").is_none(),
+        "first call must not be marked"
+    );
+    assert_eq!(
+        results[1]
+            .content
+            .get("duplicate_of")
+            .and_then(Value::as_str),
+        Some("g1"),
+        "second call should be marked as duplicate of first"
+    );
+    assert_eq!(
+        results[2]
+            .content
+            .get("duplicate_of")
+            .and_then(Value::as_str),
+        Some("g1"),
+        "third call should also be marked as duplicate of first"
+    );
+    assert!(
+        results[3].content.get("duplicate_of").is_none(),
+        "different args must not be marked"
+    );
+    assert!(results[1].content.get("hint").is_some());
+}
+
+#[test]
+fn redact_llm_input_items_drops_orphan_function_call_outputs_defensively() {
+    // Even if a bug elsewhere (or a state loaded from an older squeezy
+    // session) leaves an orphan in the conversation, the request build
+    // path must scrub it before we hand the input to the provider —
+    // otherwise OpenAI 400s the turn and the failure is sticky.
+    let redactor = squeezy_core::Redactor::default();
+    let input = vec![
+        LlmInputItem::UserText("hi".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_keep".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_keep".to_string(),
+            output: "ok".to_string(),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_orphan".to_string(),
+            output: "lingering output from a dropped call".to_string(),
+        },
+    ];
+
+    let prepared = super::redact_llm_input_items(input, &redactor);
+
+    let call_ids: std::collections::BTreeSet<&str> = prepared
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    for item in &prepared {
+        if let LlmInputItem::FunctionCallOutput { call_id, .. } = item {
+            assert!(
+                call_ids.contains(call_id.as_str()),
+                "orphan output reached provider input: call_id={call_id}"
+            );
+        }
+    }
+    assert_eq!(prepared.len(), 3, "only the orphan should be removed");
+}
+
 #[tokio::test]
 async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
     use squeezy_core::Redactor;

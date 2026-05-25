@@ -37,18 +37,35 @@ pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
 pub const DEFAULT_MAX_TOOL_RESULT_BYTES_PER_ROUND: usize = 50_000;
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 pub const DEFAULT_MAX_PARALLEL_TOOLS: usize = 8;
-pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 64;
-pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 20_000_000;
-pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 50_000;
+// Per-turn aggregate budgets. None of the three peer agents (codex,
+// CC, opencode) bound aggregate tool calls, bytes read, or
+// files enumerated across a turn — every cap they have is per single
+// tool invocation. These defaults are sized so they never bind in
+// realistic use; users who want strict cost caps can set tighter
+// values in `squeezy.toml`. Kept finite (rather than `u64::MAX`) so
+// the inspect output remains TOML-roundtrippable.
+pub const DEFAULT_MAX_TOOL_CALLS_PER_TURN: u64 = 10_000;
+pub const DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN: u64 = 1_000_000_000;
+pub const DEFAULT_MAX_SEARCH_FILES_PER_TURN: u64 = 1_000_000;
 pub const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_PROVIDER_REQUEST_MAX_RETRIES: u8 = 4;
 pub const DEFAULT_PROVIDER_STREAM_MAX_RETRIES: u8 = 5;
 pub const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 24;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 8_388_608;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 2_000;
-pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 4;
+// Per-subagent-invocation budgets. No peer agent has any equivalent —
+// codex, CC, and opencode bound work per single tool call,
+// not per subagent run. Sized so they never bind in realistic use;
+// the subagent's natural exit is the model emitting a final answer
+// with no tool calls.
+pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
+// Emergency belt on subagent model rounds — matches CC's
+// `forkSubagent.maxTurns = 200`, the only concrete cap any peer
+// sets on a full subagent. Above this the cost broker, cancellation
+// token, and per-tool-call truncations should already have caught
+// any runaway.
+pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
 pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 1_200;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
@@ -65,7 +82,13 @@ pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
-pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 6_000;
+// Absolute fallback for the per-turn compaction trigger when
+// `model_context_window` is not set in `squeezy.toml`. Modern models
+// run with 128k+ context windows; the percent-of-context path (which
+// peer agents use, ~90%) is the right shape and should take over once
+// the window is auto-derived from `model_info_for`. This fallback is
+// only the safety net for the unknown-model case.
+pub const DEFAULT_CONTEXT_COMPACTION_ESTIMATED_TOKENS: u64 = 60_000;
 pub const DEFAULT_CONTEXT_COMPACTION_MIN_ITEMS: usize = 16;
 pub const DEFAULT_CONTEXT_COMPACTION_RECENT_ITEMS: usize = 6;
 pub const DEFAULT_CONTEXT_COMPACTION_MAX_SUMMARY_BYTES: usize = 12_000;
@@ -5253,7 +5276,7 @@ pub fn user_settings_template() -> &'static str {
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 6000
+# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
@@ -5438,7 +5461,7 @@ pub fn project_settings_template() -> &'static str {
 
 [context]
 # compaction_enabled = true
-# compaction_estimated_tokens = 6000
+# compaction_estimated_tokens = 60000
 # compaction_min_items = 16
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
@@ -7819,7 +7842,7 @@ fn normalize_task_text(text: String, limit: usize) -> String {
     output
 }
 
-pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call.";
+pub const DEFAULT_INSTRUCTIONS: &str = "You are Squeezy, a cost-aware coding agent. Keep responses concise, explicit, and grounded in workspace evidence. Prefer semantic graph tools such as repo_map, definition_search, symbol_context, reference_search, and read_slice before grep/read_file on supported code. Use websearch for web discovery and webfetch for retrieving a specific URL when web tools are available. Treat websearch and webfetch results as remote documentation evidence, cite source URLs from their citation metadata when relying on them, and keep remote docs distinct from local code or graph facts. Do not invent URLs. If a tool call is denied, do not retry the same call. Do not issue duplicate tool calls — if you need the same result you already have, refer to the earlier output instead of re-running the call. For simple existence checks (e.g. \"does function X exist?\"), a single grep or definition_search is usually enough.";
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]

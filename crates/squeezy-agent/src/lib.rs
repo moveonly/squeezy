@@ -69,7 +69,11 @@ use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
-const MAX_TOOL_ROUNDS: usize = 32;
+// Emergency belt on tool rounds per turn — codex and opencode loop
+// unbounded; CC only caps explicit-purpose subagents (its
+// `forkSubagent` uses 200). 200 keeps a true safety ceiling without
+// truncating legitimate long-running exploration.
+const MAX_TOOL_ROUNDS: usize = 200;
 const MAX_CONTROL_ONLY_TOOL_ROUNDS: usize = 2;
 const LOCAL_SHELL_TIMEOUT_MS: u64 = 10_000;
 const LOCAL_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -4967,7 +4971,10 @@ async fn run_subagent(
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;
-    config.max_tool_result_bytes_per_round = config.max_tool_result_bytes_per_round.min(24_000);
+    // Subagent inherits the parent's per-round result-bytes cap directly.
+    // The previous `.min(24_000)` halved the budget for a subagent that
+    // already had fewer tool calls to spend; no peer agent applies a
+    // smaller per-result cap to subagents than to the parent.
     let model = subagent_model_for_kind(parent.provider.name(), &config, kind);
     config.model = model.clone();
 
@@ -6013,13 +6020,55 @@ async fn execute_tool_calls(
     }
     flush_parallel_batch(&context, broker, &mut results, &mut parallel_batch).await;
 
-    collect_recorded_results(
+    let mut out = collect_recorded_results(
         results,
         recorded,
         broker,
         context.config,
         &context.telemetry,
-    )
+    );
+    mark_intra_batch_duplicates(&calls, &mut out, context.tools);
+    out
+}
+
+/// Stamp a `duplicate_of` hint onto any tool result whose call has the
+/// same `(tool_name, args_sha256)` as an earlier call in the same batch,
+/// for tools where re-running can only produce the same answer
+/// (`is_parallel_safe`). The execution still happens — flipping that to
+/// a real skip needs to thread through cancellation, event emission,
+/// and broker accounting — but the marker gives the model immediate
+/// feedback so it stops issuing the same grep three times in a row.
+fn mark_intra_batch_duplicates(
+    calls: &[ToolCall],
+    results: &mut [ToolResult],
+    tools: &ToolRegistry,
+) {
+    let mut first_by_key: BTreeMap<(String, String), String> = BTreeMap::new();
+    for (call, result) in calls.iter().zip(results.iter_mut()) {
+        if !tools.is_parallel_safe(call) {
+            continue;
+        }
+        let Some(args_sha) = tool_call_args_sha256(call) else {
+            continue;
+        };
+        let key = (call.name.clone(), args_sha);
+        match first_by_key.entry(key) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(call.call_id.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(slot) => {
+                if let Some(obj) = result.content.as_object_mut() {
+                    obj.insert("duplicate_of".to_string(), json!(slot.get().clone()));
+                    obj.entry("hint").or_insert_with(|| {
+                        json!(
+                            "This call is identical to an earlier call in the same response. \
+                             Do not issue duplicate tool calls; reuse the earlier output."
+                        )
+                    });
+                }
+            }
+        }
+    }
 }
 
 async fn replay_tool_calls(
@@ -7890,15 +7939,20 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
 }
 
 /// Normalize a vector of `LlmInputItem`s so every entry satisfies the
-/// "already redacted" invariant. Used to upgrade conversation state
-/// loaded from a resume tape that may pre-date the insertion-time
-/// redaction policy. Cost is `O(n)` allocation-free for entries that
-/// already match the invariant.
+/// "already redacted" invariant and the conversation does not contain
+/// any orphan `FunctionCallOutput` whose declaring `FunctionCall` is
+/// missing. Used to upgrade conversation state loaded from a resume
+/// tape that may pre-date either invariant (insertion-time redaction
+/// or compaction's orphan-drop). The orphan check is a last-resort
+/// safety net: OpenAI 400s the whole turn with *"No tool call found
+/// for function call output with call_id …"* if an orphan reaches the
+/// provider, and the failure is sticky.
 fn redact_llm_input_items(input: Vec<LlmInputItem>, redactor: &Redactor) -> Vec<LlmInputItem> {
-    input
+    let redacted: Vec<LlmInputItem> = input
         .into_iter()
         .map(|item| redact_input_item(item, redactor))
-        .collect()
+        .collect();
+    drop_orphan_function_call_outputs(redacted)
 }
 
 /// Scrub the user/UI-facing surfaces of a `PermissionRequest` so an approval
@@ -8465,6 +8519,13 @@ fn compact_conversation(
     let recent = conversation[split..].to_vec();
     let generation = state.generation.saturating_add(1);
     let summary = build_compaction_summary(generation, state, &older, attachments, store, config);
+    // `snap_compaction_split` handles *consecutive* leading orphan outputs,
+    // but parallel tool calls produce a `[FC(A), FC(B), FCO(A), FCO(B)]`
+    // shape. If the split lands between the two calls, snap stops at the
+    // leading `FC(B)` and `FCO(A)` survives in `recent` as an orphan whose
+    // declaring `FC(A)` is in the dropped `older` slice. Drop any such
+    // orphan outputs before they reach the next provider request.
+    let recent = drop_orphan_function_call_outputs(recent);
     let mut compacted = Vec::with_capacity(recent.len() + 1);
     compacted.push(LlmInputItem::UserText(summary.clone()));
     compacted.extend(recent);
@@ -8566,6 +8627,29 @@ fn snap_compaction_split(conversation: &[LlmInputItem], initial_split: usize) ->
         }
     }
     split
+}
+
+/// Drop any `FunctionCallOutput` whose `call_id` is not declared by a
+/// `FunctionCall` somewhere in `items`. Used post-compaction to ensure
+/// the kept slice cannot reference a tool call that lived only in the
+/// summarized older slice. Order is preserved.
+fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
+    use std::collections::BTreeSet;
+    let declared: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    items
+        .iter()
+        .filter(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => declared.contains(call_id.as_str()),
+            _ => true,
+        })
+        .cloned()
+        .collect()
 }
 
 fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
