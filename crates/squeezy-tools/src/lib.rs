@@ -65,6 +65,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
+// Wired into the shell-ask permission server and the `squeezy ask` CLI in
+// the next commits; declared here so the abstraction lands as its own
+// subject.
+#[allow(dead_code)]
+mod ipc;
 mod safety;
 mod schema;
 mod truncate;
