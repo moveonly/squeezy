@@ -231,6 +231,53 @@ pub struct ToolCostHint {
     pub output_bytes: u64,
     pub redactions: u64,
     pub truncated: bool,
+    /// Per-`Confidence`-variant counts across the returned packets. Empty
+    /// for tools that do not surface graph confidence (grep, glob,
+    /// read_file, etc.); populated by graph-anchored tools so the model
+    /// can reason about result quality without re-walking every packet.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub confidence_distribution: BTreeMap<String, u32>,
+}
+
+impl ToolCostHint {
+    /// Build a `confidence_distribution` from an iterator of
+    /// `squeezy_core::Confidence` values. Zero-count buckets are omitted.
+    pub fn confidence_distribution_from(
+        confidences: impl IntoIterator<Item = Confidence>,
+    ) -> BTreeMap<String, u32> {
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        for c in confidences {
+            *map.entry(c.id().to_string()).or_insert(0) += 1;
+        }
+        map
+    }
+
+    /// Build a `confidence_distribution` by reading the `confidence`
+    /// field from each packet JSON value. Useful for traversal-shaped
+    /// tools (upstream/downstream flow) that already have packets in
+    /// hand. Unknown values are skipped.
+    pub fn confidence_distribution_from_packets(packets: &[Value]) -> BTreeMap<String, u32> {
+        let mut map: BTreeMap<String, u32> = BTreeMap::new();
+        for packet in packets {
+            let Some(debug_label) = packet.get("confidence").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Some(c) = confidence_from_debug_label(debug_label) {
+                *map.entry(c.id().to_string()).or_insert(0) += 1;
+            }
+        }
+        map
+    }
+}
+
+/// Map a `{:?}`-formatted `Confidence` (`"ExactSyntax"`, `"Heuristic"`,
+/// …) back to the typed variant. Returns `None` for strings that don't
+/// match a known variant.
+fn confidence_from_debug_label(label: &str) -> Option<Confidence> {
+    Confidence::ALL
+        .iter()
+        .copied()
+        .find(|c| format!("{c:?}") == label)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2820,6 +2867,8 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| symbol_packet(graph, symbol, "decl_search", symbol_next_action(symbol)))
             .collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(selected.iter().map(|s| s.confidence));
         let mut payload = graph_payload("decl_search", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert("kind".to_string(), json!(args.kind));
@@ -2845,6 +2894,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: selected.len() as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -2950,6 +3000,8 @@ impl ToolRegistry {
             .cloned()
             .collect::<Vec<_>>();
         let packets = selected.iter().map(reference_packet).collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(selected.iter().map(|hit| hit.confidence));
         let mut payload = graph_payload("reference_search", manager, refresh);
         payload.insert("symbol_id".to_string(), json!(args.symbol_id));
         payload.insert("text".to_string(), json!(args.text.or(args.query)));
@@ -2967,6 +3019,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: selected.len() as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3009,6 +3062,7 @@ impl ToolRegistry {
             }
         }
         let truncated = overflowed;
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("upstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
@@ -3022,6 +3076,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: packet_count as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3083,6 +3138,7 @@ impl ToolRegistry {
             }
         }
         let truncated = overflowed;
+        let confidence_distribution = ToolCostHint::confidence_distribution_from_packets(&packets);
         let mut payload = graph_payload("downstream_flow", manager, refresh);
         payload.insert("symbol".to_string(), symbol_json(graph, &symbol));
         payload.insert("max_depth".to_string(), json!(max_depth));
@@ -3096,6 +3152,7 @@ impl ToolRegistry {
             ToolCostHint {
                 matches_returned: packet_count as u64,
                 truncated,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,
@@ -3146,6 +3203,8 @@ impl ToolRegistry {
             .iter()
             .map(|symbol| symbol_context_packet(graph, symbol, max_references))
             .collect::<Vec<_>>();
+        let confidence_distribution =
+            ToolCostHint::confidence_distribution_from(symbols.iter().map(|s| s.confidence));
         let mut payload = graph_payload("symbol_context", manager, refresh);
         payload.insert("query".to_string(), json!(args.query));
         payload.insert(
@@ -3165,6 +3224,7 @@ impl ToolRegistry {
             Value::Object(payload),
             ToolCostHint {
                 matches_returned: symbols.len() as u64,
+                confidence_distribution,
                 ..ToolCostHint::default()
             },
             None,

@@ -5286,6 +5286,72 @@ pub fn caller_d() { target(); }
 }
 
 #[tokio::test]
+async fn decl_search_emits_confidence_distribution() {
+    let root = temp_workspace("graph_confidence_distribution");
+    write_rust_crate(
+        &root,
+        r#"
+pub fn alpha() {}
+pub fn beta() {}
+pub fn gamma() {}
+"#,
+    );
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "alpha"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    let distribution = &result.cost_hint.confidence_distribution;
+    assert!(
+        !distribution.is_empty(),
+        "decl_search must populate confidence_distribution"
+    );
+    let total: u32 = distribution.values().copied().sum();
+    let returned = result.content["returned_matches"].as_u64().unwrap();
+    assert_eq!(
+        total as u64, returned,
+        "distribution counts must sum to returned_matches"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn decl_search_distribution_absent_when_no_matches() {
+    let root = temp_workspace("graph_confidence_distribution_empty");
+    write_rust_crate(&root, "pub fn alpha() {}\n");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "decl_distribution_empty".to_string(),
+                name: "decl_search".to_string(),
+                arguments: json!({"query": "no_such_symbol_unique_xyzzy"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.cost_hint.confidence_distribution.is_empty());
+    let cost_hint_json = serde_json::to_value(&result.cost_hint).expect("cost_hint serialises");
+    assert!(
+        cost_hint_json.get("confidence_distribution").is_none(),
+        "empty distribution must be skipped in serialised cost_hint, got {cost_hint_json}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn skill_tools_list_metadata_and_load_body() {
     let root = temp_workspace("skill_tools");
     write_skill(&root.join(".agents/skills/rust-nav"), "rust-nav");

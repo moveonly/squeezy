@@ -7062,6 +7062,39 @@ pub enum Confidence {
     Partial,
 }
 
+impl Confidence {
+    /// Every variant in declaration order. Use this for iteration when
+    /// building distributions or summarising packets.
+    pub const ALL: [Self; 10] = [
+        Self::ExactSyntax,
+        Self::ImportResolved,
+        Self::Heuristic,
+        Self::CandidateSet,
+        Self::External,
+        Self::MacroOpaque,
+        Self::ConditionalUnknown,
+        Self::Unsupported,
+        Self::Stale,
+        Self::Partial,
+    ];
+
+    /// Stable snake_case identifier suitable for JSON map keys.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ExactSyntax => "exact_syntax",
+            Self::ImportResolved => "import_resolved",
+            Self::Heuristic => "heuristic",
+            Self::CandidateSet => "candidate_set",
+            Self::External => "external",
+            Self::MacroOpaque => "macro_opaque",
+            Self::ConditionalUnknown => "conditional_unknown",
+            Self::Unsupported => "unsupported",
+            Self::Stale => "stale",
+            Self::Partial => "partial",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Freshness {
     Fresh,
