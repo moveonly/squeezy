@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use serde_json::Value;
+use squeezy_tools::human_label_for_call;
 
 use crate::capture::{EvalEvent, EvalEventKind};
 use crate::driver::EvalError;
@@ -186,16 +187,17 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out, "_(turn cancelled)_");
                 let _ = writeln!(out);
             }
-            EvalEventKind::ToolCallStarted { call } => {
+            EvalEventKind::ToolCallStarted { call, origin } => {
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
-                let args = call
+                let label = call
                     .get("arguments")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-                    .unwrap_or_default();
+                    .map(|args| human_label_for_call(name, args))
+                    .unwrap_or_else(|| name.to_string());
                 let _ = writeln!(
                     out,
-                    "🔧 **tool:** `{name}({args})`",
-                    args = trim_oneline(&args, TOOL_ARG_PREVIEW_CHARS).replace('`', "ʼ")
+                    "{icon} **{label}**",
+                    icon = icon_for_origin(origin),
+                    label = trim_oneline(&label, TOOL_ARG_PREVIEW_CHARS).replace('`', "ʼ")
                 );
             }
             EvalEventKind::ToolCallCompleted { result } => {
@@ -258,6 +260,24 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 }
                 let _ = writeln!(out, "➤ **{kind}:** {}", trim_oneline(status, 200));
                 let _ = writeln!(out);
+            }
+            EvalEventKind::CostUpdate {
+                tool_count,
+                input_tokens,
+                micro_usd,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "💰 _running this turn:_ {} in · {} (after {} tool(s))",
+                    format_token_count(*input_tokens),
+                    format_micro_usd(*micro_usd),
+                    tool_count
+                );
+                let _ = writeln!(out);
+            }
+            EvalEventKind::ToolProgress { .. } => {
+                // Heartbeats are noise in a post-run timeline; the
+                // ToolCallCompleted event carries the final duration.
             }
             EvalEventKind::TaskStateUpdated { .. }
             | EvalEventKind::SubagentEvent { .. }
@@ -357,6 +377,33 @@ fn short_turn(t: &str) -> String {
         return rest.to_string();
     }
     t.to_string()
+}
+
+fn icon_for_origin(origin: &str) -> &'static str {
+    match origin {
+        "planner" => "🧭",
+        "subagent" => "🤖",
+        _ => "🔧",
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_micro_usd(micro: u64) -> String {
+    let dollars = micro as f64 / 1_000_000.0;
+    if dollars < 0.01 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.3}")
+    }
 }
 
 fn trim_oneline(s: &str, max: usize) -> String {

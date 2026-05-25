@@ -670,7 +670,9 @@ async fn run_agent_with_config(
             | AgentEvent::SubagentFailed { .. }
             | AgentEvent::AiReviewerTripped { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
-            AgentEvent::CostWarning { .. } => {}
+            AgentEvent::CostWarning { .. }
+            | AgentEvent::CostUpdate { .. }
+            | AgentEvent::ToolProgress { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

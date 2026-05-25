@@ -2507,6 +2507,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
     };
     let context = ToolExecutionContext {
         turn_id: TurnId::new(1),
+        origin: ToolOrigin::Model,
         provider,
         tools: &tools,
         jobs: &jobs,
@@ -3876,4 +3877,33 @@ async fn build_mode_instructions_omit_plan_overlay() {
         !instructions.contains(PLAN_MODE_INSTRUCTIONS),
         "Build-mode request must not include Plan overlay: {instructions}"
     );
+}
+
+#[test]
+fn progress_snapshot_fires_at_stride_multiples() {
+    let mut broker = CostBroker::new(&AppConfig::default());
+    // Simulate 7 completed tool calls (4 success, 2 errors, 1 denial) and
+    // a running provider cost so the snapshot carries non-zero numbers.
+    broker.metrics.tool_successes = 4;
+    broker.metrics.tool_errors = 2;
+    broker.metrics.tool_denials = 1;
+    broker.metrics.provider.input_tokens = Some(12_500);
+    broker.metrics.provider.estimated_usd_micros = Some(2_500);
+
+    assert!(broker.progress_snapshot_if_due(3).is_none(), "7 % 3 ≠ 0");
+    broker.metrics.tool_successes = 5; // total now 8
+    assert!(broker.progress_snapshot_if_due(3).is_none(), "8 % 3 ≠ 0");
+    broker.metrics.tool_successes = 6; // total now 9
+    let snap = broker
+        .progress_snapshot_if_due(3)
+        .expect("stride boundary at 9 tool calls");
+    assert_eq!(snap.tool_count, 9);
+    assert_eq!(snap.input_tokens, 12_500);
+    assert_eq!(snap.micro_usd, 2_500);
+}
+
+#[test]
+fn progress_snapshot_returns_none_before_any_calls() {
+    let broker = CostBroker::new(&AppConfig::default());
+    assert!(broker.progress_snapshot_if_due(3).is_none());
 }

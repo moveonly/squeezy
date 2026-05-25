@@ -228,6 +228,153 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// Render a one-phrase English description of a tool call from its name
+/// and arguments. Pure function — the same `(name, args)` always produces
+/// the same string, so the live printer and post-run view can render
+/// identical labels without round-tripping anything through the result.
+///
+/// Falls back to the tool name when no specific template applies; never
+/// returns an empty string.
+pub fn human_label_for_call(name: &str, args: &Value) -> String {
+    let s = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let n = |key: &str| args.get(key).and_then(Value::as_u64);
+    let qualify_path = |label: &mut String| {
+        if let Some(path) = s("path") {
+            label.push_str(" in `");
+            label.push_str(&path);
+            label.push('`');
+        }
+    };
+    let display_symbol = |key: &str| -> Option<String> {
+        // Symbol ids like `crate::module::Type::method` — render as-is;
+        // they are already human-readable. Fall back to the raw value.
+        s(key)
+    };
+    match name {
+        "definition_search" => {
+            let query = s("query").unwrap_or_else(|| "?".to_string());
+            let mut label = String::from("looking up ");
+            if let Some(kind) = s("kind") {
+                label.push_str(&kind);
+                label.push(' ');
+            }
+            label.push('`');
+            label.push_str(&query);
+            label.push('`');
+            qualify_path(&mut label);
+            label
+        }
+        "symbol_context" => {
+            let query = s("query").unwrap_or_else(|| "?".to_string());
+            let mut label = format!("getting context for `{query}`");
+            qualify_path(&mut label);
+            label
+        }
+        "decl_search" => {
+            let kind = s("kind").unwrap_or_else(|| "any".to_string());
+            let query = s("query")
+                .map(|q| format!(" matching `{q}`"))
+                .unwrap_or_default();
+            let mut label = format!("searching {kind} declarations{query}");
+            qualify_path(&mut label);
+            label
+        }
+        "reference_search" => {
+            let target = display_symbol("symbol_id")
+                .or_else(|| s("query"))
+                .unwrap_or_else(|| "?".to_string());
+            let mut label = format!("finding references to `{target}`");
+            qualify_path(&mut label);
+            label
+        }
+        "downstream_flow" => {
+            let q = s("query").unwrap_or_else(|| "?".to_string());
+            format!("tracing flow downstream from `{q}`")
+        }
+        "upstream_flow" => {
+            let q = s("query").unwrap_or_else(|| "?".to_string());
+            format!("tracing flow upstream from `{q}`")
+        }
+        "hierarchy" => {
+            let q = s("query").unwrap_or_else(|| "?".to_string());
+            format!("walking the call hierarchy of `{q}`")
+        }
+        "repo_map" => match n("max_depth") {
+            Some(d) => format!("building a repo map (depth {d})"),
+            None => "building a repo map".to_string(),
+        },
+        "read_slice" => {
+            if let Some(symbol) = display_symbol("symbol_id") {
+                let span = s("span_kind").unwrap_or_else(|| "slice".to_string());
+                format!("reading {span} of `{symbol}`")
+            } else if let Some(path) = s("path") {
+                match (n("start_line"), n("end_line")) {
+                    (Some(start), Some(end)) => format!("reading `{path}:{start}-{end}`"),
+                    (Some(start), None) => format!("reading `{path}` from line {start}"),
+                    _ => format!("reading `{path}`"),
+                }
+            } else {
+                "reading a slice".to_string()
+            }
+        }
+        "read_file" => match s("path") {
+            Some(path) => format!("reading `{path}`"),
+            None => "reading a file".to_string(),
+        },
+        "grep" => {
+            let pat = s("pattern")
+                .or_else(|| s("query"))
+                .unwrap_or_else(|| "?".to_string());
+            let mut label = format!("grepping for `{pat}`");
+            qualify_path(&mut label);
+            label
+        }
+        "glob" => {
+            let pat = s("pattern").unwrap_or_else(|| "?".to_string());
+            format!("globbing for `{pat}`")
+        }
+        "shell" | "verify" => match s("command") {
+            Some(cmd) => format!("running `{cmd}`"),
+            None => format!("running {name}"),
+        },
+        "websearch" => match s("query") {
+            Some(q) => format!("searching the web for `{q}`"),
+            None => "searching the web".to_string(),
+        },
+        "webfetch" => match s("url") {
+            Some(u) => format!("fetching `{u}`"),
+            None => "fetching a URL".to_string(),
+        },
+        "plan_patch" => match s("objective") {
+            Some(o) => format!("planning a patch for `{o}`"),
+            None => "planning a patch".to_string(),
+        },
+        "apply_patch" => "applying a patch".to_string(),
+        "write_file" => match s("path") {
+            Some(p) => format!("writing `{p}`"),
+            None => "writing a file".to_string(),
+        },
+        "read_tool_output" => "expanding earlier tool output".to_string(),
+        "diff_context" => "gathering diff context".to_string(),
+        "checkpoint_list" => "listing checkpoints".to_string(),
+        "checkpoint_show" => "inspecting a checkpoint".to_string(),
+        "checkpoint_undo" => "undoing to a checkpoint".to_string(),
+        "checkpoint_revert" => "reverting to a checkpoint".to_string(),
+        "list_skills" => "listing skills".to_string(),
+        "load_skill" => match s("name") {
+            Some(n) => format!("loading skill `{n}`"),
+            None => "loading a skill".to_string(),
+        },
+        _ => name.to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     Success,

@@ -2841,6 +2841,7 @@ async fn complete_local_tool_turn(
         vec![call],
         ToolExecutionContext {
             turn_id,
+            origin: ToolOrigin::Model,
             provider,
             tools: &tools,
             jobs: &jobs,
@@ -3492,6 +3493,7 @@ impl TurnRuntime {
                     planned_calls.clone(),
                     ToolExecutionContext {
                         turn_id: self.turn_id,
+                        origin: ToolOrigin::Planner,
                         provider: self.provider.clone(),
                         tools: &self.tools,
                         jobs: &self.jobs,
@@ -3853,6 +3855,7 @@ impl TurnRuntime {
                     tool_calls.clone(),
                     ToolExecutionContext {
                         turn_id: self.turn_id,
+                        origin: ToolOrigin::Model,
                         provider: self.provider.clone(),
                         tools: &self.tools,
                         jobs: &self.jobs,
@@ -4378,9 +4381,30 @@ fn merge_concurrent_pins(compaction: &mut ContextCompactionState, latest_pins: &
     }
 }
 
+/// Who initiated a tool call. Surfaced on `AgentEvent::ToolCallStarted`
+/// so the TUI and `squeezy-eval` can render distinct icons (planner
+/// preflight vs. the model's own dispatch) and so legibility rules
+/// like `redundant_graph_lookup` can attribute hits correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOrigin {
+    /// Pre-LLM exploration plan executed before the model sees the
+    /// prompt. The user never asked for these directly; we ran them to
+    /// seed receipts.
+    Planner,
+    /// Tools the model itself requested during its response.
+    #[default]
+    Model,
+    /// Tools executed inside a subagent. Currently emitted only for
+    /// completeness — the parent surfaces a `SubagentStarted` event for
+    /// the actual dispatch.
+    Subagent,
+}
+
 #[derive(Clone)]
 struct ToolExecutionContext<'a> {
     turn_id: TurnId,
+    origin: ToolOrigin,
     provider: Arc<dyn LlmProvider>,
     tools: &'a ToolRegistry,
     jobs: &'a JobRegistry,
@@ -5202,6 +5226,7 @@ async fn run_subagent_loop(
                     approved,
                     ToolExecutionContext {
                         turn_id: parent.turn_id,
+                        origin: ToolOrigin::Subagent,
                         provider: parent.provider.clone(),
                         tools: parent.tools,
                         jobs: local_jobs,
@@ -5737,7 +5762,7 @@ async fn execute_tool_calls(
     for (index, call) in calls.iter().enumerate() {
         if context.cancel.is_cancelled() {
             let result = ToolResult::cancelled(call);
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5767,7 +5792,7 @@ async fn execute_tool_calls(
         }
         if call.name == REQUEST_USER_INPUT_TOOL_NAME {
             let result = handle_request_user_input_call(&context, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5781,7 +5806,7 @@ async fn execute_tool_calls(
         }
         if has_invalid_tool_arguments(call) {
             let result = invalid_tool_arguments_result(call);
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5859,7 +5884,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5885,7 +5910,7 @@ async fn execute_tool_calls(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5911,7 +5936,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5933,7 +5958,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -5967,7 +5992,7 @@ async fn execute_tool_calls(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -5991,7 +6016,7 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 results[index] = Some(result);
                 recorded[index] = true;
                 continue;
@@ -6010,13 +6035,13 @@ async fn execute_tool_calls(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 results[index] = Some(result);
                 recorded[index] = true;
                 continue;
             }
             let result = run_one_tool(context.clone(), tool_sequence, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
             recorded[index] = true;
         }
@@ -6087,9 +6112,10 @@ async fn replay_tool_calls(
             .send(AgentEvent::ToolCallStarted {
                 turn_id,
                 call: call.clone(),
+                origin: ToolOrigin::Model,
             })
             .await;
-        broker.record_executed_result(result);
+        record_and_emit_progress(broker, result, &tx, turn_id).await;
         let _ = tx
             .send(AgentEvent::ToolCallCompleted {
                 turn_id,
@@ -6137,7 +6163,7 @@ async fn flush_parallel_batch(
                 &result,
                 Duration::ZERO,
             );
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallCompleted {
@@ -6162,7 +6188,7 @@ async fn flush_parallel_batch(
                     &result,
                     Duration::ZERO,
                 );
-                broker.record_executed_result(&result);
+                record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
                 let _ = context
                     .tx
                     .send(AgentEvent::ToolCallCompleted {
@@ -6174,7 +6200,7 @@ async fn flush_parallel_batch(
                 continue;
             }
             let result = run_one_tool(context.clone(), tool_sequence, call).await;
-            broker.record_executed_result(&result);
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             results[index] = Some(result);
         }
         return;
@@ -6193,7 +6219,7 @@ async fn flush_parallel_batch(
         .await;
 
     for (index, result) in completions {
-        broker.record_executed_result(&result);
+        record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
         results[index] = Some(result);
     }
 }
@@ -6260,6 +6286,7 @@ async fn run_one_tool(
         .send(AgentEvent::ToolCallStarted {
             turn_id: context.turn_id,
             call: redact_tool_call(call.clone(), &context.redactor),
+            origin: context.origin,
         })
         .await;
     let started = Instant::now();
@@ -6272,18 +6299,38 @@ async fn run_one_tool(
     // tool registry, so paired-SHA telemetry (F06) can hash its arguments
     // when emitting the completion event.
     let call_for_telemetry = call.clone();
-    let result = context
-        .tools
-        .execute_for_group_with_options(
-            call,
-            tracked_job
-                .as_ref()
-                .map(|(_, cancel)| cancel.clone())
-                .unwrap_or_else(|| context.cancel.clone()),
-            context.turn_id.to_string(),
-            ToolExecutionOptions { shell_ask_approver },
-        )
-        .await;
+    let progress_call_id = call_for_telemetry.call_id.clone();
+    let progress_tool_name = call_for_telemetry.name.clone();
+    let exec_future = context.tools.execute_for_group_with_options(
+        call,
+        tracked_job
+            .as_ref()
+            .map(|(_, cancel)| cancel.clone())
+            .unwrap_or_else(|| context.cancel.clone()),
+        context.turn_id.to_string(),
+        ToolExecutionOptions { shell_ask_approver },
+    );
+    tokio::pin!(exec_future);
+    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+    // `interval` fires immediately on first poll; skip that tick so the
+    // heartbeat only fires once the tool has actually been running.
+    progress_ticker.tick().await;
+    let result = loop {
+        tokio::select! {
+            r = &mut exec_future => break r,
+            _ = progress_ticker.tick() => {
+                let _ = context
+                    .tx
+                    .send(AgentEvent::ToolProgress {
+                        turn_id: context.turn_id,
+                        call_id: progress_call_id.clone(),
+                        tool_name: progress_tool_name.clone(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    })
+                    .await;
+            }
+        }
+    };
     record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);
@@ -6344,6 +6391,61 @@ pub struct CostCapStatus {
     pub spent_usd_micros: u64,
     pub cap_usd_micros: u64,
     pub percent: u8,
+}
+
+/// Per-turn running cost+tool-count snapshot emitted via
+/// `AgentEvent::CostUpdate` so a user watching a live transcript can see
+/// expense accumulating before the turn footer arrives.
+#[derive(Debug, Clone, Copy)]
+struct CostProgressSnapshot {
+    tool_count: u64,
+    input_tokens: u64,
+    micro_usd: u64,
+}
+
+/// Number of *completed* tool calls between successive
+/// `AgentEvent::CostUpdate` emissions within a single turn.
+const COST_UPDATE_STRIDE: u64 = 3;
+
+/// How often a still-running tool call emits an
+/// `AgentEvent::ToolProgress` heartbeat. A user staring at a
+/// terminal needs feedback within roughly a second to feel the
+/// agent is alive but stable.
+const TOOL_PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Emit an `AgentEvent::CostUpdate` if the broker has just crossed a
+/// `COST_UPDATE_STRIDE`-sized boundary. Call this immediately after
+/// `broker.record_executed_result(...)` at every tool-completion site.
+async fn maybe_emit_cost_update(
+    broker: &CostBroker,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    if let Some(snap) = broker.progress_snapshot_if_due(COST_UPDATE_STRIDE) {
+        let _ = tx
+            .send(AgentEvent::CostUpdate {
+                turn_id,
+                tool_count: snap.tool_count,
+                input_tokens: snap.input_tokens,
+                micro_usd: snap.micro_usd,
+            })
+            .await;
+    }
+}
+
+/// Record an executed tool result and emit a progress callout if the
+/// stride boundary was crossed. Replaces direct calls to
+/// `broker.record_executed_result` at tool-completion sites so the
+/// progress event fires for every completion path (success, denial,
+/// budget refusal, cancellation).
+async fn record_and_emit_progress(
+    broker: &mut CostBroker,
+    result: &ToolResult,
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+) {
+    broker.record_executed_result(result);
+    maybe_emit_cost_update(broker, tx, turn_id).await;
 }
 
 #[derive(Debug)]
@@ -6503,6 +6605,27 @@ impl CostBroker {
         if is_budget_denied(result) {
             self.metrics.budget_denials += 1;
         }
+    }
+
+    /// Snapshot the running per-turn progress when the executed-tool count
+    /// is at a stride multiple, so callers can emit a single
+    /// `AgentEvent::CostUpdate`. Returning `None` keeps the per-tool
+    /// hot-path cheap and prevents firing on every call.
+    fn progress_snapshot_if_due(&self, stride: u64) -> Option<CostProgressSnapshot> {
+        let total = self
+            .metrics
+            .tool_successes
+            .saturating_add(self.metrics.tool_errors)
+            .saturating_add(self.metrics.tool_denials)
+            .saturating_add(self.metrics.tool_cancellations);
+        if stride == 0 || total == 0 || !total.is_multiple_of(stride) {
+            return None;
+        }
+        Some(CostProgressSnapshot {
+            tool_count: total,
+            input_tokens: self.metrics.provider.input_tokens.unwrap_or(0),
+            micro_usd: self.metrics.provider.estimated_usd_micros.unwrap_or(0),
+        })
     }
 
     fn record_model_result(&mut self, result: &ToolResult) {
@@ -9503,6 +9626,10 @@ pub enum AgentEvent {
     ToolCallStarted {
         turn_id: TurnId,
         call: ToolCall,
+        /// Whether the call comes from the planner preflight, the model
+        /// itself, or a subagent. Lets transcript renderers swap icons
+        /// (🧭 / 🔧 / 🤖) and lets findings attribute hits correctly.
+        origin: ToolOrigin,
     },
     ToolCallCompleted {
         turn_id: TurnId,
@@ -9580,6 +9707,26 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Per-turn progress callout emitted every few tool calls so a user
+    /// watching a live transcript can see cost accumulating before the
+    /// turn finishes. Carries the turn's running input-token count and
+    /// estimated USD-micro cost so far; consumers (eval, TUI) render
+    /// it inline.
+    CostUpdate {
+        turn_id: TurnId,
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
+    },
+    /// Periodic heartbeat while a single tool call is still running.
+    /// Emitted on a fixed interval (see `TOOL_PROGRESS_INTERVAL`) so a
+    /// watcher can tell a long-running tool apart from a hung one.
+    ToolProgress {
+        turn_id: TurnId,
+        call_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
     },
     Cancelled {
         turn_id: TurnId,

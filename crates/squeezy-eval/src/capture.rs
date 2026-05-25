@@ -50,6 +50,11 @@ pub enum EvalEventKind {
     },
     ToolCallStarted {
         call: Value,
+        /// `"planner"`, `"model"`, or `"subagent"` — set from
+        /// `squeezy_agent::ToolOrigin`. Defaults to `"model"` when
+        /// reading older traces written before the field existed.
+        #[serde(default = "default_tool_origin")]
+        origin: String,
     },
     ToolCallCompleted {
         result: Value,
@@ -88,9 +93,26 @@ pub enum EvalEventKind {
         severity: String,
         summary: String,
     },
+    /// Per-turn cost progress emitted by squeezy every few tool calls.
+    CostUpdate {
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
+    },
+    /// Heartbeat for an in-flight tool call. Lets the live printer
+    /// reassure a watcher that a slow tool is still running.
+    ToolProgress {
+        call_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
+    },
 }
 
 pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;
+
+fn default_tool_origin() -> String {
+    "model".to_string()
+}
 
 /// Append-only JSONL trace writer.
 pub struct Capture {

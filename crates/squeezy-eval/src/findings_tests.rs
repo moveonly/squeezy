@@ -26,7 +26,7 @@ fn ctx_from_events(events: Vec<EvalEvent>) -> TraceContext {
     for event in &events {
         match &event.kind {
             EvalEventKind::TurnStarted => turn_count += 1,
-            EvalEventKind::ToolCallStarted { call } => {
+            EvalEventKind::ToolCallStarted { call, .. } => {
                 let turn = event.turn_id.clone().unwrap_or_default();
                 let name = call
                     .get("name")
@@ -88,6 +88,7 @@ fn tool_call(seq: u64, turn: &str, name: &str, args: serde_json::Value) -> EvalE
         turn_id: Some(turn.to_string()),
         kind: EvalEventKind::ToolCallStarted {
             call: serde_json::json!({"name": name, "arguments": args}),
+            origin: "model".to_string(),
         },
     }
 }

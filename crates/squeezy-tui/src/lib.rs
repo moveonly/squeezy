@@ -627,6 +627,35 @@ async fn drain_agent_events(app: &mut TuiApp) {
                     app.push_transcript_item(TranscriptItem::system(notice.clone()));
                     app.push_log(notice);
                 }
+                AgentEvent::CostUpdate {
+                    tool_count,
+                    input_tokens,
+                    micro_usd,
+                    ..
+                } => {
+                    // Surface progressive per-turn cost in the log only; the
+                    // transcript stays clean since the turn footer already
+                    // reports the final totals.
+                    app.push_log(format!(
+                        "running this turn: {} input tokens · ${:.4} (after {} tools)",
+                        input_tokens,
+                        micro_usd as f64 / 1_000_000.0,
+                        tool_count
+                    ));
+                }
+                AgentEvent::ToolProgress {
+                    tool_name,
+                    elapsed_ms,
+                    ..
+                } => {
+                    // The "running tool" line in the status bar is driven
+                    // by the active-tool tracker; log a heartbeat so the
+                    // event isn't silently dropped.
+                    app.push_log(format!(
+                        "{tool_name} still running ({:.1}s)",
+                        elapsed_ms as f64 / 1000.0
+                    ));
+                }
                 AgentEvent::Cancelled { .. } => {
                     let mut message = "cancelled; edit prompt or retry".to_string();
                     if app.last_turn_had_edits {

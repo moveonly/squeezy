@@ -105,7 +105,7 @@ impl TraceContext {
             last_ts = Some(event.ts_unix_ms);
             match &event.kind {
                 EvalEventKind::TurnStarted => turn_count += 1,
-                EvalEventKind::ToolCallStarted { call } => {
+                EvalEventKind::ToolCallStarted { call, .. } => {
                     let turn = event.turn_id.clone().unwrap_or_default();
                     let name = call
                         .get("name")
@@ -512,7 +512,8 @@ impl Rule for RedundantGraphLookup {
                 if event.turn_id.as_deref() != Some(turn) {
                     continue;
                 }
-                let crate::capture::EvalEventKind::ToolCallStarted { call } = &event.kind else {
+                let crate::capture::EvalEventKind::ToolCallStarted { call, .. } = &event.kind
+                else {
                     continue;
                 };
                 let name = call

@@ -25,6 +25,7 @@ squeezy-agent.workspace = true
 squeezy-core.workspace = true
 squeezy-llm.workspace = true
 squeezy-store.workspace = true
+squeezy-tools.workspace = true
 squeezy-tui.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -7392,3 +7392,84 @@ async fn notes_tools_fail_when_no_store_handle_available() {
         .await;
     assert_eq!(result.status, ToolStatus::Error);
 }
+
+#[test]
+fn human_label_renders_one_phrase_for_known_tools() {
+    let cases: &[(&str, Value, &str)] = &[
+        (
+            "definition_search",
+            json!({"kind": "struct", "query": "Error", "path": "src/lib.rs"}),
+            "looking up struct `Error` in `src/lib.rs`",
+        ),
+        (
+            "symbol_context",
+            json!({"query": "Squeezy::run"}),
+            "getting context for `Squeezy::run`",
+        ),
+        (
+            "reference_search",
+            json!({"symbol_id": "crate::foo::Bar"}),
+            "finding references to `crate::foo::Bar`",
+        ),
+        (
+            "reference_search",
+            json!({"query": "Bar"}),
+            "finding references to `Bar`",
+        ),
+        (
+            "downstream_flow",
+            json!({"query": "from_path", "max_depth": 3}),
+            "tracing flow downstream from `from_path`",
+        ),
+        (
+            "upstream_flow",
+            json!({"query": "from_path"}),
+            "tracing flow upstream from `from_path`",
+        ),
+        (
+            "repo_map",
+            json!({"max_depth": 4}),
+            "building a repo map (depth 4)",
+        ),
+        (
+            "read_slice",
+            json!({"symbol_id": "Foo::bar", "span_kind": "body"}),
+            "reading body of `Foo::bar`",
+        ),
+        (
+            "read_slice",
+            json!({"path": "src/lib.rs", "start_line": 10, "end_line": 20}),
+            "reading `src/lib.rs:10-20`",
+        ),
+        (
+            "grep",
+            json!({"pattern": "TODO", "path": "src/"}),
+            "grepping for `TODO` in `src/`",
+        ),
+        (
+            "glob",
+            json!({"pattern": "**/*.rs"}),
+            "globbing for `**/*.rs`",
+        ),
+        (
+            "shell",
+            json!({"command": "cargo test"}),
+            "running `cargo test`",
+        ),
+        (
+            "websearch",
+            json!({"query": "rust async drop"}),
+            "searching the web for `rust async drop`",
+        ),
+    ];
+    for (name, args, expected) in cases {
+        let got = crate::human_label_for_call(name, args);
+        assert_eq!(&got, expected, "label for `{name}`");
+    }
+}
+
+#[test]
+fn human_label_falls_back_to_tool_name_when_no_template() {
+    let label = crate::human_label_for_call("brand_new_tool", &json!({"x": 1}));
+    assert_eq!(label, "brand_new_tool");
+}

@@ -9,7 +9,9 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
+use squeezy_agent::{
+    Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision, ToolOrigin,
+};
 use squeezy_core::{AppConfig, PermissionMode, SessionMode};
 use squeezy_llm::provider_from_config;
 
@@ -748,7 +750,11 @@ impl Driver {
                         },
                     )?;
                 }
-                AgentEvent::ToolCallStarted { turn_id, call } => {
+                AgentEvent::ToolCallStarted {
+                    turn_id,
+                    call,
+                    origin,
+                } => {
                     let turn_str = format!("{turn_id:?}");
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
                     received_tool_call = true;
@@ -761,7 +767,10 @@ impl Driver {
                     self.fire_on_tool_actions(&call.name).await?;
                     self.capture.record(
                         Some(turn_str),
-                        EvalEventKind::ToolCallStarted { call: value },
+                        EvalEventKind::ToolCallStarted {
+                            call: value,
+                            origin: origin_label(origin).to_string(),
+                        },
                     )?;
                     // Note: `wait_for: tool_call` is a *signal* only — we
                     // no longer cancel the turn when the tool fires.
@@ -968,6 +977,38 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::CostUpdate {
+                    turn_id,
+                    tool_count,
+                    input_tokens,
+                    micro_usd,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::CostUpdate {
+                            tool_count,
+                            input_tokens,
+                            micro_usd,
+                        },
+                    )?;
+                }
+                AgentEvent::ToolProgress {
+                    turn_id,
+                    call_id,
+                    tool_name,
+                    elapsed_ms,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ToolProgress {
+                            call_id,
+                            tool_name,
+                            elapsed_ms,
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
                     cost,
@@ -1127,6 +1168,14 @@ fn approval_matches(action: &Action, tool_name: &str) -> bool {
 
 fn action_to_value(action: &Action) -> Value {
     serde_json::to_value(action).unwrap_or(Value::Null)
+}
+
+fn origin_label(origin: ToolOrigin) -> &'static str {
+    match origin {
+        ToolOrigin::Planner => "planner",
+        ToolOrigin::Model => "model",
+        ToolOrigin::Subagent => "subagent",
+    }
 }
 
 fn transcript_text(item: &squeezy_core::TranscriptItem) -> String {

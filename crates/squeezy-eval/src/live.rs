@@ -17,6 +17,7 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use serde_json::Value;
+use squeezy_tools::human_label_for_call;
 
 use crate::capture::EvalEventKind;
 use crate::scenario::{Action, Step};
@@ -100,17 +101,18 @@ impl LivePrinter {
                 let _ = g.writer.write_all(delta.as_bytes());
                 let _ = g.writer.flush();
             }
-            EvalEventKind::ToolCallStarted { call } => {
+            EvalEventKind::ToolCallStarted { call, origin } => {
                 g.finish_assistant_chunk_inplace();
                 let name = call.get("name").and_then(Value::as_str).unwrap_or("?");
-                let args = call
+                let label = call
                     .get("arguments")
-                    .map(|v| serde_json::to_string(v).unwrap_or_default())
-                    .unwrap_or_default();
+                    .map(|args| human_label_for_call(name, args))
+                    .unwrap_or_else(|| name.to_string());
                 let _ = writeln!(
                     g.writer,
-                    "  🔧 {name}({args})",
-                    args = trim_oneline(&args, TOOL_ARG_PREVIEW_CHARS)
+                    "  {icon} {label}",
+                    icon = icon_for_origin(origin),
+                    label = trim_oneline(&label, TOOL_ARG_PREVIEW_CHARS)
                 );
                 let _ = g.writer.flush();
             }
@@ -194,6 +196,34 @@ impl LivePrinter {
                 );
                 let _ = g.writer.flush();
             }
+            EvalEventKind::ToolProgress {
+                tool_name,
+                elapsed_ms,
+                ..
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "     ⌛ {tool_name} still running ({elapsed:.1}s)",
+                    elapsed = *elapsed_ms as f64 / 1000.0
+                );
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::CostUpdate {
+                tool_count,
+                input_tokens,
+                micro_usd,
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  💰 running this turn: {} in · {} (after {} tools)",
+                    format_token_count(*input_tokens),
+                    format_micro_usd(*micro_usd),
+                    tool_count
+                );
+                let _ = g.writer.flush();
+            }
             _ => {}
         }
     }
@@ -245,6 +275,37 @@ fn describe_action(action: &Action) -> String {
         Action::InjectUserText { text, .. } => {
             format!("inject_user_text: {}", trim_oneline(text, 80))
         }
+    }
+}
+
+/// Pick the leading icon for a tool-call line based on who initiated it.
+/// Planner preflight runs before the model sees the prompt, so a compass
+/// fits; subagent calls travel through a different dispatch and use the
+/// robot face the TUI already associates with them.
+fn icon_for_origin(origin: &str) -> &'static str {
+    match origin {
+        "planner" => "🧭",
+        "subagent" => "🤖",
+        _ => "🔧",
+    }
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.0}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_micro_usd(micro: u64) -> String {
+    let dollars = micro as f64 / 1_000_000.0;
+    if dollars < 0.01 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.3}")
     }
 }
 
