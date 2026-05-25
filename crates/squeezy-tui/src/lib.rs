@@ -409,7 +409,19 @@ async fn drain_agent_events(app: &mut TuiApp) {
                         app.pending_assistant.push_delta(&extracted.passthrough);
                     }
                     for plan_body in extracted.completed {
-                        app.push_log(format!("proposed plan:\n{plan_body}"));
+                        match proposed_plan::persist_plan(&app.workspace_root, &plan_body) {
+                            Ok((plan_id, path)) => {
+                                app.current_plan_id = Some(plan_id.clone());
+                                app.push_log(format!(
+                                    "proposed plan {plan_id} (saved to {}):\n{plan_body}",
+                                    compact_path(&path)
+                                ));
+                            }
+                            Err(err) => app.push_log(format!(
+                                "proposed plan (could not persist under {}: {err}):\n{plan_body}",
+                                proposed_plan::PLAN_DIR
+                            )),
+                        }
                     }
                     // Intentionally preserve `transcript_scroll_from_bottom`
                     // here: if the user paged up to read history we would
@@ -7498,6 +7510,11 @@ struct TuiApp {
     transcript_scroll_from_bottom: u16,
     pending_assistant: streaming::StreamingController,
     proposed_plan: proposed_plan::ProposedPlanExtractor,
+    workspace_root: PathBuf,
+    /// Plan id of the most recent `<proposed_plan>` block persisted under
+    /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
+    /// to identify which plan file is active without scanning the dir.
+    current_plan_id: Option<String>,
     task_state: Option<TaskStateSnapshot>,
     mcp_status: Option<McpStatusSnapshot>,
     task_panel_collapsed: bool,
@@ -7632,6 +7649,8 @@ impl TuiApp {
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
+            workspace_root: config.workspace_root.clone(),
+            current_plan_id: None,
             task_state: None,
             mcp_status: None,
             task_panel_collapsed: false,

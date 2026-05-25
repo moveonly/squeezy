@@ -11,8 +11,55 @@
 //! should still flow into the live assistant pane, plus any fully closed
 //! plan blocks that should be promoted to log entries.
 
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+
 pub(crate) const OPEN_TAG: &str = "<proposed_plan>";
 pub(crate) const CLOSE_TAG: &str = "</proposed_plan>";
+
+/// Workspace-relative directory where proposed plans are persisted as
+/// markdown. Each plan body lives at `<dir>/<plan_id>.md`. Persisting
+/// per-plan-id avoids collisions when multiple sessions run against the
+/// same workspace and lets the agent iterate on a specific plan rather
+/// than overwriting whatever happened to be there.
+pub(crate) const PLAN_DIR: &str = ".squeezy/plans";
+
+/// Stable, body-derived identifier so an unchanged plan reuses its file
+/// and a refined plan lands at a new path. 12 hex chars is plenty for
+/// per-workspace uniqueness; the `plan-` prefix matches the convention
+/// the `plan_patch` tool already uses elsewhere in the codebase.
+pub(crate) fn plan_id_for(body: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.trim().as_bytes());
+    let digest = hasher.finalize();
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("plan-{}", &hex[..12])
+}
+
+pub(crate) fn plan_file_for(workspace_root: &Path, plan_id: &str) -> PathBuf {
+    workspace_root.join(PLAN_DIR).join(format!("{plan_id}.md"))
+}
+
+/// Persist a proposed plan body as `<workspace>/.squeezy/plans/<plan_id>.md`.
+/// Returns the plan id and the absolute path. The body is written verbatim
+/// (no front-matter) with a trailing newline so the file round-trips
+/// cleanly through editors and through `read_file` / `apply_patch`.
+pub(crate) fn persist_plan(workspace_root: &Path, body: &str) -> io::Result<(String, PathBuf)> {
+    let plan_id = plan_id_for(body);
+    let path = plan_file_for(workspace_root, &plan_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut contents = body.trim_end().to_string();
+    contents.push('\n');
+    fs::write(&path, contents)?;
+    Ok((plan_id, path))
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ProposedPlanExtractor {

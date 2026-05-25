@@ -1,4 +1,4 @@
-use super::ProposedPlanExtractor;
+use super::{PLAN_DIR, ProposedPlanExtractor, persist_plan, plan_file_for, plan_id_for};
 
 #[test]
 fn passthrough_when_no_block() {
@@ -66,4 +66,49 @@ fn handles_block_with_no_inner_newlines() {
     let out = p.feed("a<proposed_plan>plan body</proposed_plan>b");
     assert_eq!(out.passthrough, "ab");
     assert_eq!(out.completed, vec!["plan body".to_string()]);
+}
+
+fn fresh_workspace(name: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root = std::env::temp_dir().join(format!("squeezy_plan_{name}_{nonce}"));
+    std::fs::create_dir_all(&root).expect("mkdir workspace");
+    root
+}
+
+#[test]
+fn persist_plan_writes_per_plan_id_under_dot_squeezy_plans() {
+    let root = fresh_workspace("persist_per_id");
+    let (plan_id, path) = persist_plan(&root, "step 1\nstep 2").expect("persist plan");
+    assert_eq!(plan_id, plan_id_for("step 1\nstep 2"));
+    assert!(plan_id.starts_with("plan-"));
+    assert_eq!(path, plan_file_for(&root, &plan_id));
+    assert!(path.starts_with(root.join(PLAN_DIR)));
+    let on_disk = std::fs::read_to_string(&path).expect("read plan");
+    assert_eq!(on_disk, "step 1\nstep 2\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persist_plan_distinct_bodies_produce_distinct_files() {
+    let root = fresh_workspace("persist_distinct");
+    let (id_a, path_a) = persist_plan(&root, "first").expect("persist first");
+    let (id_b, path_b) = persist_plan(&root, "second").expect("persist second");
+    assert_ne!(id_a, id_b, "different bodies must mint different plan ids");
+    assert_ne!(path_a, path_b);
+    assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "first\n");
+    assert_eq!(std::fs::read_to_string(&path_b).unwrap(), "second\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn persist_plan_identical_body_reuses_plan_id() {
+    let root = fresh_workspace("persist_reuse");
+    let (id_a, path_a) = persist_plan(&root, "same body").expect("persist a");
+    let (id_b, path_b) = persist_plan(&root, "same body").expect("persist b");
+    assert_eq!(id_a, id_b);
+    assert_eq!(path_a, path_b);
+    let _ = std::fs::remove_dir_all(&root);
 }

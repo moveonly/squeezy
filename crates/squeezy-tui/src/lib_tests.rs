@@ -3763,8 +3763,10 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
 }
 
 #[tokio::test]
-async fn proposed_plan_block_renders_as_log_entry() {
-    let mut app = test_app(SessionMode::Plan);
+async fn proposed_plan_block_renders_as_log_entry_and_persists_under_plans_dir() {
+    let root = temp_workspace("proposed_plan_persist");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
     let (tx, rx) = mpsc::channel(8);
     app.turn_rx = Some(rx);
     for delta in [
@@ -3789,17 +3791,36 @@ async fn proposed_plan_block_renders_as_log_entry() {
         "proposed plan markers must not appear in the live assistant pane",
     );
     let plan_log = app.transcript.iter().find_map(|entry| match &entry.kind {
-        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan:") => {
+        TranscriptEntryKind::Log(message) if message.starts_with("proposed plan plan-") => {
             Some(message.clone())
         }
         _ => None,
     });
-    assert_eq!(
-        plan_log,
-        Some("proposed plan:\nstep 1\nstep 2".to_string()),
-        "expected exactly one proposed-plan log entry; transcript={:?}",
-        app.transcript
+    let log = plan_log.unwrap_or_else(|| {
+        panic!(
+            "expected a 'proposed plan plan-<id>' log entry; transcript={:?}",
+            app.transcript
+        )
+    });
+    assert!(
+        log.ends_with(":\nstep 1\nstep 2"),
+        "log should include the plan body verbatim; got: {log:?}"
     );
+
+    let plan_id = app
+        .current_plan_id
+        .as_ref()
+        .expect("current_plan_id should be set after persistence");
+    assert!(plan_id.starts_with("plan-"));
+    let path = root
+        .join(proposed_plan::PLAN_DIR)
+        .join(format!("{plan_id}.md"));
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("plan file exists"),
+        "step 1\nstep 2\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
