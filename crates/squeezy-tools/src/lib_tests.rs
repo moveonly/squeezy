@@ -623,6 +623,163 @@ async fn read_file_returns_bounded_content_and_hash() {
 }
 
 #[tokio::test]
+async fn read_file_returns_dedup_stub_when_unchanged_since_last_receipt() {
+    let root = temp_workspace("read_file_dedup_unchanged");
+    // Use a multi-KB body so the audit's "stub output < full output / 10"
+    // ratio is meaningful — the stub is a small fixed-size JSON object.
+    let body = "x".repeat(20_000);
+    fs::write(root.join("sample.txt"), &body).expect("write sample");
+
+    // First call: no snapshot exists, full payload returned.
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store(&root, Arc::clone(&store));
+    let first = registry
+        .execute(
+            ToolCall {
+                call_id: "first_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": body.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(first.status, ToolStatus::Success);
+    assert!(first.content.get("dedup").is_none());
+    assert!(first.cost_hint.output_bytes >= body.len() as u64);
+
+    // Manually persist the snapshot the agent normally would after a read.
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: first.call_id.clone(),
+            stable_output_sha256: first.receipt.output_sha256.clone(),
+            content_sha256: first.receipt.content_sha256.clone(),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: body.clone(),
+            model_output_bytes: first.cost_hint.output_bytes as usize,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+
+    // Second call with same args: dedup stub.
+    let second = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": body.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(second.status, ToolStatus::Success);
+    assert_eq!(second.content["dedup"], true);
+    assert_eq!(second.content["receipt_stub"], true);
+    assert_eq!(second.content["unchanged"], true);
+    assert_eq!(second.content["same_as_call_id"], "first_read");
+    assert_eq!(second.content["bytes_returned"], 0);
+    assert!(
+        second.cost_hint.output_bytes * 10 < first.cost_hint.output_bytes,
+        "dedup stub output_bytes {} not <10x smaller than full payload {}",
+        second.cost_hint.output_bytes,
+        first.cost_hint.output_bytes
+    );
+    assert_eq!(second.receipt.content_sha256, first.receipt.content_sha256);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_does_not_dedup_when_content_changed() {
+    let root = temp_workspace("read_file_dedup_changed");
+    let prior = "alpha\nbeta\ngamma\n";
+    let current = "alpha\nDELTA\ngamma\n";
+    fs::write(root.join("sample.txt"), current).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(prior.as_bytes())),
+            start_byte: 0,
+            end_byte: prior.len() as u64,
+            content: prior.to_string(),
+            model_output_bytes: 256,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "limit": current.len()}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("dedup").is_none());
+    assert_eq!(result.content["content"], current);
+    assert_eq!(
+        result.receipt.content_sha256,
+        Some(sha256_hex(current.as_bytes()))
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_does_not_dedup_when_window_differs() {
+    let root = temp_workspace("read_file_dedup_window");
+    let body = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    // Prior snapshot covered bytes [0, 5) only ("alpha").
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "prior_read".to_string(),
+            stable_output_sha256: "prior-output".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: 5,
+            content: "alpha".to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store(&root, store);
+
+    // Request a different window: bytes [6, 10) ("beta").
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "second_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "sample.txt", "offset": 6, "limit": 4}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert!(result.content.get("dedup").is_none());
+    assert_eq!(result.content["content"], "beta");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn diff_context_reports_changed_file_and_dirty_symbol() {
     let root = temp_workspace("diff_context");
     write_rust_crate(
@@ -3201,7 +3358,11 @@ async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
         &root,
         ToolOutputConfig {
             spill_threshold_bytes: 100,
-            preview_bytes: 512,
+            // Preview cap large enough to fit the full shaped-shell JSON
+            // wrapper so this test exercises the spill+rehydrate roundtrip
+            // rather than preview-truncation behavior (covered separately in
+            // truncate tests).
+            preview_bytes: 2_048,
             retention_days: 1,
             output_dir: None,
         },
@@ -3626,7 +3787,10 @@ async fn websearch_returns_citations_cache_receipt_and_redacted_quote() {
             ToolCall {
                 call_id: "call_1".to_string(),
                 name: "websearch".to_string(),
-                arguments: json!({"query": "rust book", "output_byte_cap": 90}),
+                // Cap large enough to fit the full redacted text so this test
+                // verifies redaction behavior without depending on whether the
+                // marker survives middle-truncation.
+                arguments: json!({"query": "rust book", "output_byte_cap": 200}),
             },
             CancellationToken::new(),
         )
@@ -3991,6 +4155,64 @@ async fn webfetch_quote_limit_is_enforced_after_redaction() {
 }
 
 #[tokio::test]
+async fn webfetch_quote_keeps_tail_under_byte_cap() {
+    // F02 acceptance: middle-truncate preserves tail signal so the model can
+    // still see the end of a fetched document (article summary, error footer,
+    // last paragraph) even after a small byte cap.
+    let root = temp_workspace("webfetch_keeps_tail");
+    let mut body = String::with_capacity(100_000);
+    body.push_str("[[HEAD_SIGNAL]] ");
+    for _ in 0..2_000 {
+        body.push_str("filler ");
+    }
+    body.push_str(" [[TAIL_SIGNAL]]");
+    assert!(body.len() >= 100_000 / 8); // confirm sufficiently large
+
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_get_response(ok_response("text/plain", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig::default(),
+        http,
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_tail".to_string(),
+                name: "webfetch".to_string(),
+                arguments: json!({
+                    "url": "https://example.com/article",
+                    "output_byte_cap": 1_024,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let content = result.content["content"].as_str().expect("content");
+    assert!(
+        content.len() <= 1_024,
+        "content len {} > cap",
+        content.len()
+    );
+    assert!(
+        content.contains("[[TAIL_SIGNAL]]"),
+        "tail signal missing from middle-truncated content: {content:?}"
+    );
+    assert!(
+        content.contains("[[HEAD_SIGNAL]]"),
+        "head signal missing from middle-truncated content: {content:?}"
+    );
+    assert!(result.content["quote_truncated"].as_bool().unwrap_or(false));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn webfetch_html_format_returns_raw_html() {
     let root = temp_workspace("webfetch_html_format");
     let html = "<html><body>Hello <b>world</b></body></html>";
@@ -4349,8 +4571,8 @@ fn tool_specs_are_sorted_by_name() {
 
     let names = registry
         .specs()
-        .into_iter()
-        .map(|spec| spec.name)
+        .iter()
+        .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -4385,9 +4607,9 @@ fn tool_specs_are_sorted_by_name() {
 
     let checkpoint_names = registry_with_checkpoints(&root)
         .specs()
-        .into_iter()
+        .iter()
         .filter(|spec| spec.name.starts_with("checkpoint_"))
-        .map(|spec| spec.name)
+        .map(|spec| spec.name.clone())
         .collect::<Vec<_>>();
     assert_eq!(
         checkpoint_names,
@@ -4397,6 +4619,33 @@ fn tool_specs_are_sorted_by_name() {
             "checkpoint_show",
             "checkpoint_undo"
         ]
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn tool_registry_specs_returns_same_arc_until_refresh() {
+    // F04: per-turn `specs()` must reuse the same allocation across calls
+    // and only rebuild when MCP refresh invalidates the cache.
+    let root = temp_workspace("specs_arc_cache");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let first = registry.specs();
+    let second = registry.specs();
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "specs() did not reuse the cached Arc across consecutive calls"
+    );
+
+    // Refreshing MCP (no servers configured here, so this is a no-op refresh)
+    // should invalidate the cache so the next call returns a freshly-built
+    // Arc.
+    let _ = registry.refresh_mcp_tools(CancellationToken::new()).await;
+    let third = registry.specs();
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "specs() reused stale Arc after refresh_mcp_tools"
     );
 
     let _ = fs::remove_dir_all(root);

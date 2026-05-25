@@ -537,6 +537,9 @@ impl TelemetryEvent {
                 bytes_read: Some(report.cost.bytes_read),
                 output_bytes: Some(report.cost.output_bytes),
                 matches_returned: Some(report.cost.matches_returned),
+                args_sha256: report.args_sha256.map(str::to_string),
+                output_sha256: report.output_sha256.map(str::to_string),
+                content_sha256: report.content_sha256.map(str::to_string),
                 ..TelemetryProperties::default()
             },
         }
@@ -668,6 +671,21 @@ pub struct TelemetryProperties {
     pub status: Option<OutcomeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ErrorKind>,
+    /// SHA-256 of the canonical JSON arguments the model sent into this tool
+    /// call. Paired with `output_sha256` and `content_sha256`, lets offline
+    /// replay/dedup tooling answer "did we already pay for this exact call?"
+    /// without re-executing the tool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args_sha256: Option<String>,
+    /// SHA-256 of the serialized model-visible tool output (stable across
+    /// non-spilled runs of the same call).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_sha256: Option<String>,
+    /// SHA-256 of the underlying file/document content the tool read, when
+    /// applicable (e.g. `read_file`, `read_slice`, `webfetch`). `None` for
+    /// tools that don't surface a content hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
 }
 
 impl TelemetryProperties {
@@ -738,6 +756,12 @@ pub struct ToolTelemetryReport<'a> {
     pub status: ToolStatusKind,
     pub duration: Duration,
     pub cost: ToolCostProperties,
+    /// F06: paired-SHA trace fields. Each is `Option<&str>` so existing
+    /// emission sites that haven't been threaded yet keep compiling without
+    /// supplying placeholder hashes.
+    pub args_sha256: Option<&'a str>,
+    pub output_sha256: Option<&'a str>,
+    pub content_sha256: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
