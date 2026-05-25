@@ -512,6 +512,7 @@ squeezy-eval run <scenario.toml> [--workspace-override <path>]
 
 squeezy-eval list [<dir>]                       # ls bundled or directory scenarios
 squeezy-eval replay <trace.jsonl>               # one-line summary of a recorded trace
+squeezy-eval view <run-dir>                     # chronological markdown transcript of a run
 squeezy-eval diff <run-a> <run-b> [--format markdown|json]
 squeezy-eval check <dir> [--fail-on findings,expectations,errors]
                           [--junit <path>]
@@ -532,6 +533,15 @@ Flags:
   out (provider not configured, IO error, etc.). Default is
   `expectations,errors`.
 - `--junit <path>`: write a JUnit XML summary; one `<testcase>` per scenario.
+
+### `view` output
+
+`squeezy-eval view <run-dir>` prints a markdown transcript that interleaves
+user prompts, assistant deltas, tool calls (with arg preview + status +
+byte counts), approvals, slash commands, findings, and per-turn cost so
+you can follow exactly what the agent did without parsing `trace.jsonl`
+by hand. Suitable for piping into a terminal pager or pasting into a PR
+comment.
 
 ---
 

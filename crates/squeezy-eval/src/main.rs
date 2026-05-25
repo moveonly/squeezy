@@ -46,6 +46,11 @@ enum Command {
         /// Path to a `trace.jsonl` produced by a previous run.
         trace: PathBuf,
     },
+    /// Render a run directory as a chronological markdown transcript.
+    View {
+        /// Run directory containing `trace.jsonl` + `frames.jsonl` + `run.json`.
+        run: PathBuf,
+    },
     /// Compare two run directories and print a markdown or JSON delta.
     Diff {
         /// First run directory (the baseline).
@@ -88,6 +93,7 @@ async fn main() -> ExitCode {
         } => run_cmd(scenario, workspace_override, no_triage, emit, gh_repo, out).await,
         Command::List { dir } => list_cmd(dir),
         Command::Replay { trace } => replay_cmd(trace),
+        Command::View { run } => view_cmd(run),
         Command::Diff { a, b, format } => diff_cmd(a, b, format),
         Command::Check {
             dir,
@@ -223,5 +229,11 @@ fn diff_cmd(a: PathBuf, b: PathBuf, format: String) -> Result<(), squeezy_eval::
     let fmt = squeezy_eval::diff::DiffFormat::parse(&format);
     let report = squeezy_eval::diff::diff_runs(&a, &b, fmt)?;
     print!("{report}");
+    Ok(())
+}
+
+fn view_cmd(run: PathBuf) -> Result<(), squeezy_eval::driver::EvalError> {
+    let rendered = squeezy_eval::view::render(&run)?;
+    print!("{rendered}");
     Ok(())
 }
