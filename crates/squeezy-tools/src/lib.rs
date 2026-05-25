@@ -5,7 +5,6 @@ use std::{
     fs::{self, OpenOptions},
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
-    os::fd::FromRawFd,
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -15,6 +14,9 @@ use std::{
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 
 use futures_util::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -6280,16 +6282,30 @@ impl ToolRegistry {
             .current_dir(workdir)
             .kill_on_drop(true);
         let pty_master = if tty {
-            let pty = open_shell_pty().map_err(ShellRunError::Io)?;
-            command
-                .stdin(Stdio::from(
-                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                ))
-                .stdout(Stdio::from(
-                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
-                ))
-                .stderr(Stdio::from(pty.slave));
-            Some(pty.master)
+            #[cfg(unix)]
+            {
+                let pty = open_shell_pty().map_err(ShellRunError::Io)?;
+                command
+                    .stdin(Stdio::from(
+                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                    ))
+                    .stdout(Stdio::from(
+                        pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                    ))
+                    .stderr(Stdio::from(pty.slave));
+                Some(pty.master)
+            }
+            #[cfg(not(unix))]
+            {
+                // Windows: ConPTY is not yet wired up; degrade to non-TTY
+                // pipes. The shell still runs with the requested sandbox
+                // backend, just without an allocated controlling terminal.
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                None
+            }
         } else {
             command
                 .stdin(Stdio::null())
@@ -13293,11 +13309,13 @@ fn shell_sandbox_runtime_unavailable_with_probe(
     }
 }
 
+#[cfg(unix)]
 struct ShellPty {
     master: fs::File,
     slave: fs::File,
 }
 
+#[cfg(unix)]
 fn open_shell_pty() -> std::io::Result<ShellPty> {
     let mut master = -1;
     let mut slave = -1;
