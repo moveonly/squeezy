@@ -48,7 +48,8 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ToolCall, ToolCostHint, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ToolCall, ToolCostHint,
+    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
     ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
 };
 use tokio::{
@@ -3734,6 +3735,39 @@ fn install_mcp_elicitation_handler<'a>(
     }
 }
 
+#[derive(Clone)]
+struct PermissionDecisionContext {
+    turn_id: TurnId,
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    config: AppConfig,
+    redactor: Arc<Redactor>,
+    tx: mpsc::Sender<AgentEvent>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    session_mode: Arc<AtomicU8>,
+    session_log: Option<SessionHandle>,
+}
+
+impl PermissionDecisionContext {
+    fn from_tool_context(context: &ToolExecutionContext<'_>) -> Self {
+        Self {
+            turn_id: context.turn_id,
+            provider: context.provider.clone(),
+            tools: context.tools.clone(),
+            config: context.config.clone(),
+            redactor: context.redactor.clone(),
+            tx: context.tx.clone(),
+            cancel: context.cancel.clone(),
+            approval_ids: context.approval_ids.clone(),
+            session_rules: context.session_rules.clone(),
+            session_mode: context.session_mode.clone(),
+            session_log: context.session_log.clone(),
+        }
+    }
+}
+
 async fn handle_task_state_call(context: &ToolExecutionContext<'_>, call: &ToolCall) -> ToolResult {
     let snapshot = match serde_json::from_value::<TaskStateSnapshot>(call.arguments.clone()) {
         Ok(snapshot) => snapshot.normalized(),
@@ -5202,15 +5236,21 @@ async fn run_one_tool(
         })
         .await;
     let started = Instant::now();
+    let shell_ask_approver = if call.name == "shell" {
+        Some(shell_ask_approver_for_context(&context))
+    } else {
+        None
+    };
     let result = context
         .tools
-        .execute_for_group(
+        .execute_for_group_with_options(
             call,
             tracked_job
                 .as_ref()
                 .map(|(_, cancel)| cancel.clone())
                 .unwrap_or_else(|| context.cancel.clone()),
             context.turn_id.to_string(),
+            ToolExecutionOptions { shell_ask_approver },
         )
         .await;
     record_exploration_tool_result(&context, &result).await;
@@ -5443,7 +5483,16 @@ async fn permission_decision(
     if is_direct_user_shell_call(call) {
         return ApprovalDecision::Approved;
     }
-    let request = context.tools.permission_request(call);
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    let request = runtime.tools.permission_request(call);
+    permission_decision_for_request(&runtime, call, request).await
+}
+
+async fn permission_decision_for_request(
+    context: &PermissionDecisionContext,
+    call: &ToolCall,
+    request: PermissionRequest,
+) -> ApprovalDecision {
     let active_mode = load_session_mode(&context.session_mode);
     if let Some(verdict) = mode_permission_verdict(active_mode, &request) {
         log_permission_verdict(&request, &verdict);
@@ -5454,10 +5503,10 @@ async fn permission_decision(
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
-    if should_classify_shell(context.config, context.provider.name(), &request, &verdict)
+    if should_classify_shell(&context.config, context.provider.name(), &request, &verdict)
         && let Some(classifier) = classify_ambiguous_shell(
             context.provider.clone(),
-            context.config,
+            &context.config,
             &request,
             context.cancel.clone(),
         )
@@ -5598,6 +5647,32 @@ async fn permission_decision(
             }
         }
     }
+}
+
+fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAskApprover {
+    let runtime = PermissionDecisionContext::from_tool_context(context);
+    Arc::new(move |request: ShellAskRequest| {
+        let runtime = runtime.clone();
+        Box::pin(async move {
+            let synthetic_call = ToolCall {
+                call_id: format!("{}:ask", request.call_id),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": request.command,
+                    "workdir": request.workdir.display().to_string(),
+                    "description": request.justification,
+                }),
+            };
+            let permission = runtime.tools.permission_request(&synthetic_call);
+            match permission_decision_for_request(&runtime, &synthetic_call, permission).await {
+                ApprovalDecision::Approved => ShellAskDecision::allow(),
+                ApprovalDecision::Denied(reason) => ShellAskDecision::deny(reason),
+                ApprovalDecision::Cancelled => {
+                    ShellAskDecision::deny("in-flight permission request was cancelled")
+                }
+            }
+        })
+    })
 }
 
 fn is_direct_user_shell_call(call: &ToolCall) -> bool {
@@ -5861,7 +5936,7 @@ fn permission_denied_reason(request: &PermissionRequest, reason: &str) -> String
 /// failure is logged but never bubbled to the caller, since the current call
 /// has already been resolved by the approval response.
 fn install_persistent_rule(
-    context: &ToolExecutionContext<'_>,
+    context: &PermissionDecisionContext,
     request: &PermissionRequest,
     source: PermissionRuleSource,
     action: PermissionAction,
@@ -5888,7 +5963,7 @@ fn install_persistent_rule(
         }
     }
 
-    let path = match persistence_path_for(context.config, source) {
+    let path = match persistence_path_for(&context.config, source) {
         Some(path) => path,
         None => return,
     };

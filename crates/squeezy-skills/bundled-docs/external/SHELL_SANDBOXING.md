@@ -27,11 +27,25 @@ The current implementation:
   `env BAR=v cmd`, `nohup cmd`, `nice -n N cmd`, `timeout N cmd`,
   `xargs ... cmd`, `sudo cmd`, etc.) so destructive/network/compiler
   classification fires on the inner argv, not just the wrapper.
-- Treats parse errors, command substitutions, shell expansions, heredocs, and
-  other dynamic shell constructs conservatively (capability `Shell`,
-  `dynamic = true`).
+- Treats parse errors, command substitutions, shell expansions, and other
+  dynamic shell constructs conservatively (capability `Shell`,
+  `dynamic = true`), while simple heredoc-attached commands keep their argv
+  prefix for policy matching.
+- Closes stdin for non-TTY shell runs so tools cannot accidentally read from
+  the agent terminal; `tty = true` attaches the process to a PTY and captures
+  PTY output as stdout.
+- Splits the retained output budget between stdout and stderr, then rebalances
+  unused capacity so a noisy stream cannot starve the other one.
 - Runs shell commands in their own process group and terminates the whole group
   on timeout or cancellation (`SIGTERM`, then `SIGKILL` after `kill_grace_ms`).
+- Bounds output drain after process exit or termination so inherited pipes from
+  grandchildren cannot hang the tool call.
+- Serializes shell calls per canonical workdir and caps total in-flight shell
+  executions.
+- Exposes `SQUEEZY_ASK_SOCKET` and `squeezy ask --command ... --justification ...`
+  to shell children when the host allows the local Unix socket hook; approved
+  requests let the running shell continue but do not change the already-applied
+  OS sandbox.
 - Applies an allowlisted environment via `env_clear` + per-name preservation,
   and never returns environment values in approvals or tool results.
 - Blocks command strings that reference configured sensitive path patterns
@@ -152,7 +166,10 @@ explicit deny rules for sensitive paths inside allowed roots.
 For process cleanup, Squeezy creates a process group for the shell command. On
 timeout or cancellation it sends `SIGTERM`, waits for `kill_grace_ms`, then
 sends `SIGKILL` to the process group. This prevents a shell wrapper from leaving
-grandchildren running after the tool call ends.
+grandchildren running after the tool call ends. Output readers also have a
+bounded drain window after process exit or termination; if a descendant keeps a
+pipe open, Squeezy returns the bytes captured so far and marks the stream
+truncated.
 
 ## Audit Records
 

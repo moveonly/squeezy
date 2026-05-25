@@ -333,9 +333,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   compact "approval pending" banner. Shell execution is policy-first: commands
   must run inside the workspace, use bounded timeout/output caps, and launch
   with an allowlisted environment whose values are never shown in approvals
-  or tool output. The command classifier is parser-backed by
-  `tree-sitter-bash`; parse errors, shell expansions, and command
-  substitutions stay conservative. Common verification commands such as
+  or tool output. Non-TTY shell runs close stdin; `tty = true` attaches a PTY
+  for commands that need terminal semantics. The command classifier is
+  parser-backed by `tree-sitter-bash`; parse errors, shell expansions, and
+  command substitutions stay conservative, while simple heredoc-attached
+  commands keep their argv prefix. Common verification commands such as
   `cargo test`, `cargo check`, `cargo clippy`, and `cargo fmt` classify as
   `compiler` so projects can allow them without broadly allowing arbitrary
   shell. Wrappers like `sh -c "X"`, `bash -lc "Y"`, `env BAR=v cmd`,

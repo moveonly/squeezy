@@ -230,11 +230,33 @@ fn shell_parser_respects_quoted_operators_and_marks_dynamic_commands() {
     let quoted_segments = shell_segments("printf 'a;b' && cargo test");
     assert_eq!(quoted_segments, ["printf 'a;b'", "cargo test"]);
 
+    let pipe_segments = shell_segments("rg needle | xargs rm -rf target || printf 'a|b'");
+    assert_eq!(
+        pipe_segments,
+        ["rg needle", "xargs rm -rf target", "printf 'a|b'"]
+    );
+
     let dynamic = analyze_shell_command("echo $(cat file)");
     assert!(dynamic.parser_backed);
     assert!(dynamic.dynamic);
     assert_eq!(dynamic.capability, PermissionCapability::Shell);
     assert_eq!(dynamic.rule_target, "shell:*");
+
+    let destructive_pipeline = analyze_shell_command("rg needle | xargs rm -rf target");
+    assert_eq!(
+        destructive_pipeline.capability,
+        PermissionCapability::Destructive
+    );
+    assert!(destructive_pipeline.destructive);
+}
+
+#[test]
+fn heredoc_prefix_is_classified_as_command() {
+    let analysis = analyze_shell_command("python3 <<'PY'\nprint('hi')\nPY\n");
+    assert!(analysis.parser_backed);
+    assert!(!analysis.dynamic);
+    assert_eq!(analysis.rule_target, "python3:*");
+    assert_eq!(analysis.risk, PermissionRisk::Medium);
 }
 
 #[test]
@@ -2906,6 +2928,207 @@ async fn shell_output_cap_is_enforced_while_command_runs() {
     let stdout_len = result.content["stdout"].as_str().expect("stdout").len();
     let stderr_len = result.content["stderr"].as_str().expect("stderr").len();
     assert!(stdout_len + stderr_len <= 1024);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_non_tty_closes_stdin_by_default() {
+    let root = temp_workspace("shell_stdin_null");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_stdin".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "if read line; then printf got; else printf eof; fi",
+                    "output_mode": "raw",
+                    "description": "check stdin policy"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "eof");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_tty_attaches_stdout_to_terminal() {
+    let root = temp_workspace("shell_tty");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let pipe = registry
+        .execute(
+            ToolCall {
+                call_id: "call_pipe".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "if test -t 1; then printf tty; else printf pipe; fi",
+                    "output_mode": "raw",
+                    "description": "check pipe mode"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(pipe.status, ToolStatus::Success);
+    assert_eq!(pipe.content["stdout"], "pipe");
+
+    let tty = registry
+        .execute(
+            ToolCall {
+                call_id: "call_tty".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "if test -t 1; then printf tty; else printf pipe; fi",
+                    "tty": true,
+                    "output_mode": "raw",
+                    "description": "check tty mode"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(tty.status, ToolStatus::Success);
+    assert_eq!(tty.content["stdout"], "tty");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_drain_timeout_returns_partial_output_from_open_grandchild_pipe() {
+    let root = temp_workspace("shell_drain_timeout");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let started = std::time::Instant::now();
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_drain".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf head; sleep 5 &",
+                    "timeout_ms": 10_000,
+                    "output_mode": "raw",
+                    "description": "check output drain timeout"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "open inherited pipe must be bounded by drain timeout"
+    );
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["stdout"], "head");
+    assert_eq!(result.content["truncated"], true);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_stream_budget_preserves_stdout_and_stderr() {
+    let root = temp_workspace("shell_stream_budget");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_split".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "i=0; while [ $i -lt 300 ]; do printf 'stdout line %04d\\n' \"$i\"; printf 'stderr line %04d\\n' \"$i\" >&2; i=$((i+1)); done",
+                    "output_byte_cap": 4096,
+                    "output_mode": "raw",
+                    "description": "check split stream budget"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let stdout = result.content["stdout"].as_str().expect("stdout");
+    let stderr = result.content["stderr"].as_str().expect("stderr");
+    assert!(stdout.len() >= 1000, "stdout too small: {}", stdout.len());
+    assert!(stderr.len() >= 1000, "stderr too small: {}", stderr.len());
+    assert!(stdout.len() + stderr.len() <= 4096);
+    assert_eq!(result.content["truncated"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_exposes_in_flight_ask_socket_when_approver_is_present() {
+    let root = temp_workspace("shell_ask_socket");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let approver: ShellAskApprover = Arc::new(|_| Box::pin(async { ShellAskDecision::allow() }));
+
+    let result = registry
+        .execute_for_group_with_options(
+            ToolCall {
+                call_id: "call_ask_socket".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf '%s' \"$SQUEEZY_ASK_SOCKET\"",
+                    "output_mode": "raw",
+                    "description": "check ask socket env"
+                }),
+            },
+            CancellationToken::new(),
+            "test".to_string(),
+            ToolExecutionOptions {
+                shell_ask_approver: Some(approver),
+            },
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let socket = result.content["stdout"].as_str().expect("socket path");
+    if socket.is_empty() {
+        let _ = fs::remove_dir_all(root);
+        return;
+    }
+    assert!(socket.ends_with(".sock"), "{socket}");
+    assert!(
+        !Path::new(socket).exists(),
+        "ask socket should be removed after shell completion"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn parallel_shell_calls_serialize_per_workdir() {
+    let root = temp_workspace("shell_parallel_isolation");
+    let registry = Arc::new(registry_with_shell_sandbox_off(&root));
+    let command = "printf s >> order.txt; sleep 1; printf e >> order.txt";
+    let call = |id: &str| ToolCall {
+        call_id: id.to_string(),
+        name: "shell".to_string(),
+        arguments: json!({
+            "command": command,
+            "output_mode": "raw",
+            "description": "check per-workdir shell serialization"
+        }),
+    };
+
+    let left_registry = registry.clone();
+    let right_registry = registry.clone();
+    let (left, right) = tokio::join!(
+        left_registry.execute(call("left"), CancellationToken::new()),
+        right_registry.execute(call("right"), CancellationToken::new()),
+    );
+
+    assert_eq!(left.status, ToolStatus::Success);
+    assert_eq!(right.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(root.join("order.txt")).unwrap(), "sese");
 
     let _ = fs::remove_dir_all(root);
 }

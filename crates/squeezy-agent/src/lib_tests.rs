@@ -2140,6 +2140,64 @@ fn registry_specs_carry_capability_aligned_with_permission_request() {
     }
 }
 
+#[tokio::test]
+async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy() {
+    let root = temp_workspace("agent_shell_ask_policy");
+    let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new(Vec::new()));
+    let tools = ToolRegistry::new(&root).expect("registry");
+    let jobs = JobRegistry::new();
+    let (tx, _rx) = mpsc::channel(4);
+    let advertised = Vec::<AdvertisedTool>::new();
+
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Deny,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let context = ToolExecutionContext {
+        turn_id: TurnId::new(1),
+        provider,
+        tools: &tools,
+        jobs: &jobs,
+        config: &config,
+        telemetry: TelemetryClient::disabled(),
+        redactor: Arc::new(Redactor::default()),
+        tx,
+        cancel: CancellationToken::new(),
+        approval_ids: Arc::new(AtomicU64::new(1)),
+        session_rules: Arc::new(RwLock::new(Vec::new())),
+        session_mode: Arc::new(AtomicU8::new(SessionMode::Build.to_u8())),
+        session_log: None,
+        task_state: Arc::new(tokio::sync::Mutex::new(None)),
+        all_tool_specs: &advertised,
+        loaded_tool_schemas: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        exploration_state: Arc::new(tokio::sync::Mutex::new(ExplorationTurnState::from_plan(
+            None,
+        ))),
+    };
+
+    let approver = shell_ask_approver_for_context(&context);
+    let decision = approver(ShellAskRequest {
+        call_id: "shell_parent".to_string(),
+        parent_command: "script.sh".to_string(),
+        command: "rm -rf target".to_string(),
+        justification: "nested cleanup".to_string(),
+        workdir: root.clone(),
+    })
+    .await;
+
+    assert!(!decision.allow);
+    assert!(
+        !decision.reason.is_empty(),
+        "denied in-flight ask should carry the policy reason",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn persistence_guard_refuses_allow_on_destructive_capability() {
     let request = PermissionRequest {

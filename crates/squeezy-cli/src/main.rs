@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
+    net::Shutdown,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -86,6 +87,16 @@ enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    #[command(about = "Ask the running Squeezy shell session for an in-flight permission decision")]
+    Ask(AskArgs),
+}
+
+#[derive(Debug, Args)]
+struct AskArgs {
+    #[arg(long, help = "Shell command or capability that needs approval")]
+    command: String,
+    #[arg(long, help = "Why the running shell step needs this approval")]
+    justification: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -262,6 +273,7 @@ async fn main() -> squeezy_core::Result<()> {
         }
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
+        Some(Command::Ask(args)) => return handle_ask_command(args),
         None => {}
     }
 
@@ -629,6 +641,44 @@ fn update_mcp_settings(
     fs::write(&path, doc.to_string())?;
     println!("updated {}", path.display());
     Ok(())
+}
+
+fn handle_ask_command(args: &AskArgs) -> squeezy_core::Result<()> {
+    const ASK_SOCKET_ENV: &str = "SQUEEZY_ASK_SOCKET";
+    let socket = env::var(ASK_SOCKET_ENV).map_err(|_| {
+        SqueezyError::Permission(format!(
+            "{ASK_SOCKET_ENV} is not set; this command must run inside a Squeezy shell session"
+        ))
+    })?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket)?;
+    let request = serde_json::json!({
+        "command": args.command,
+        "justification": args.justification,
+    });
+    let request = serde_json::to_string(&request)
+        .map_err(|err| SqueezyError::Parse(format!("invalid ask request: {err}")))?;
+    stream.write_all(request.as_bytes())?;
+    stream.shutdown(Shutdown::Write)?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let response: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|err| SqueezyError::Parse(format!("invalid ask response: {err}")))?;
+    if response
+        .get("allow")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        println!("approved");
+        Ok(())
+    } else {
+        let reason = response
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("in-flight permission denied")
+            .to_string();
+        Err(SqueezyError::Permission(reason))
+    }
 }
 
 fn mcp_settings_path(config: &AppConfig, scope: &McpConfigScope) -> PathBuf {

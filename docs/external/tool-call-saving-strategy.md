@@ -63,6 +63,9 @@ model-facing tool output compact enough to be useful.
   a different spill handle.
 - **Verify-loop output shaping.** `shell` and `verify` default to compact
   shaped output, with an `output_mode="raw"` override for exact stdout/stderr.
+  Shell capture reserves budget for both stdout and stderr, then rebalances
+  unused capacity, so a noisy progress stream does not starve diagnostics from
+  the other stream.
   Squeezy-owned Rust verification commands request Cargo JSON output where
   supported and parse it into warnings, errors, failures, and exit summaries.
   Cargo JSON output is interleaved with libtest's plain-text harness lines, so

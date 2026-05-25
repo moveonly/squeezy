@@ -5,10 +5,14 @@ use std::{
     fs::{self, OpenOptions},
     future::Future,
     io::{Read, Seek, SeekFrom, Write},
+    os::fd::FromRawFd,
     path::{Component, Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -51,7 +55,13 @@ use squeezy_vcs::{
 use squeezy_workspace::{
     CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexCoverage, IndexingPolicy,
 };
-use tokio::{io::AsyncReadExt, process::Command, sync::Mutex, time};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{UnixListener, UnixStream},
+    process::Command,
+    sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore},
+    time,
+};
 use tokio_util::sync::CancellationToken;
 use tree_sitter::{Node, Parser};
 
@@ -64,6 +74,8 @@ const DEFAULT_READ_LIMIT: usize = 32_000;
 const MAX_READ_LIMIT: usize = 128_000;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const MAX_SHELL_TIMEOUT_MS: u64 = 120_000;
+const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
+const MAX_INFLIGHT_SHELLS: usize = 4;
 const VERIFY_SHELL_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_SHELL_OUTPUT_BYTE_CAP: usize = 32_000;
 const MAX_SHELL_OUTPUT_BYTE_CAP: usize = 128_000;
@@ -120,6 +132,48 @@ impl ToolRegistryRuntime {
             redactor,
         }
     }
+}
+
+pub const SQUEEZY_ASK_SOCKET_ENV: &str = "SQUEEZY_ASK_SOCKET";
+pub const SQUEEZY_ASK_CALL_ID_ENV: &str = "SQUEEZY_ASK_CALL_ID";
+
+pub type ShellAskFuture = Pin<Box<dyn Future<Output = ShellAskDecision> + Send>>;
+pub type ShellAskApprover = Arc<dyn Fn(ShellAskRequest) -> ShellAskFuture + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellAskRequest {
+    pub call_id: String,
+    pub parent_command: String,
+    pub command: String,
+    pub justification: String,
+    pub workdir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellAskDecision {
+    pub allow: bool,
+    pub reason: String,
+}
+
+impl ShellAskDecision {
+    pub fn allow() -> Self {
+        Self {
+            allow: true,
+            reason: "approved".to_string(),
+        }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self {
+            allow: false,
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ToolExecutionOptions {
+    pub shell_ask_approver: Option<ShellAskApprover>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -478,6 +532,8 @@ pub struct ToolRegistry {
     shell_sandbox: Arc<ShellSandboxConfig>,
     shell_sandbox_health: Arc<ShellSandboxHealth>,
     shell_audit: Arc<ShellAuditStore>,
+    shell_workdir_locks: Arc<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>>,
+    shell_inflight: Arc<Semaphore>,
     mcp: Arc<McpClientRegistry>,
 }
 
@@ -645,6 +701,23 @@ struct ShellRunOutcome {
     stderr_bytes: Vec<u8>,
     stderr_truncated: bool,
     preserved_env: Vec<String>,
+}
+
+struct ShellRunRequest<'a> {
+    sandbox_plan: &'a ShellSandboxPlan,
+    workdir: &'a Path,
+    timeout_ms: u64,
+    output_cap: usize,
+    tty: bool,
+    cancel: &'a CancellationToken,
+    call: &'a ToolCall,
+    command_text: &'a str,
+    shell_ask_approver: Option<ShellAskApprover>,
+}
+
+struct ShellExecutionGuard {
+    _permit: OwnedSemaphorePermit,
+    _workdir: OwnedMutexGuard<()>,
 }
 
 enum ShellRunError {
@@ -899,6 +972,8 @@ impl ToolRegistry {
             shell_sandbox: Arc::new(config.shell_sandbox),
             shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
+            shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
+            shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
             mcp: Arc::new(McpClientRegistry::new_with_store(
                 config.mcp_servers,
                 state_store.clone(),
@@ -942,6 +1017,8 @@ impl ToolRegistry {
             shell_sandbox: Arc::new(ShellSandboxConfig::default()),
             shell_sandbox_health: Arc::new(ShellSandboxHealth::default()),
             shell_audit: Arc::new(shell_audit),
+            shell_workdir_locks: Arc::new(StdMutex::new(HashMap::new())),
+            shell_inflight: Arc::new(Semaphore::new(MAX_INFLIGHT_SHELLS)),
             mcp: Arc::new(McpClientRegistry::new(BTreeMap::new())),
         })
     }
@@ -1058,6 +1135,31 @@ impl ToolRegistry {
             },
         });
         let _ = self.shell_audit.append(&entry);
+    }
+
+    async fn shell_execution_guard(&self, workdir: &Path) -> std::io::Result<ShellExecutionGuard> {
+        let permit = self
+            .shell_inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| std::io::Error::other("shell execution limiter is closed"))?;
+        let key = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        let lock = {
+            let mut locks = self
+                .shell_workdir_locks
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let workdir = lock.lock_owned().await;
+        Ok(ShellExecutionGuard {
+            _permit: permit,
+            _workdir: workdir,
+        })
     }
 
     /// Cheap permission-scope predicate. Looks only at the user-supplied
@@ -1312,6 +1414,13 @@ impl ToolRegistry {
                     },
                 );
                 metadata.insert("destructive".to_string(), analysis.destructive.to_string());
+                metadata.insert(
+                    "tty".to_string(),
+                    args.as_ref()
+                        .map(|args| args.tty)
+                        .unwrap_or(false)
+                        .to_string(),
+                );
                 metadata.insert(
                     "parser_backed".to_string(),
                     analysis.parser_backed.to_string(),
@@ -1796,6 +1905,17 @@ impl ToolRegistry {
         cancel: CancellationToken,
         group_id: String,
     ) -> ToolResult {
+        self.execute_for_group_with_options(call, cancel, group_id, ToolExecutionOptions::default())
+            .await
+    }
+
+    pub async fn execute_for_group_with_options(
+        &self,
+        call: ToolCall,
+        cancel: CancellationToken,
+        group_id: String,
+        options: ToolExecutionOptions,
+    ) -> ToolResult {
         if cancel.is_cancelled() {
             return ToolResult::cancelled(&call);
         }
@@ -1824,7 +1944,10 @@ impl ToolRegistry {
                 }
                 "verify" => self.execute_verify(&call, cancel, &group_id).await,
                 "write_file" => self.execute_write_file(&call, &group_id).await,
-                "shell" => self.execute_shell(&call, cancel, &group_id).await,
+                "shell" => {
+                    self.execute_shell(&call, cancel, &group_id, options.shell_ask_approver.clone())
+                        .await
+                }
                 "webfetch" => self.execute_webfetch(&call, cancel).await,
                 "websearch" => self.execute_websearch(&call, cancel).await,
                 "mcp_list_resources" => self.execute_mcp_list_resources(&call, cancel).await,
@@ -4348,7 +4471,7 @@ impl ToolRegistry {
                 "output_mode": "raw",
             }),
         };
-        self.execute_shell_capped(&shell_call, cancel, timeout_ms, group_id)
+        self.execute_shell_capped(&shell_call, cancel, timeout_ms, group_id, None)
             .await
     }
 
@@ -4371,7 +4494,7 @@ impl ToolRegistry {
             }),
         };
         let result = self
-            .execute_shell_capped(&call, cancel, 10_000, group_id)
+            .execute_shell_capped(&call, cancel, 10_000, group_id, None)
             .await;
         (result.status == ToolStatus::Success)
             .then(|| shell_stdout(&result).trim().to_string())
@@ -4768,7 +4891,7 @@ impl ToolRegistry {
             }),
         };
         let shell_result = self
-            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id)
+            .execute_shell_capped(&shell_call, cancel, VERIFY_SHELL_TIMEOUT_MS, group_id, None)
             .await;
         let mut content = shell_result.content;
         if let Some(object) = content.as_object_mut() {
@@ -4864,9 +4987,16 @@ impl ToolRegistry {
         call: &ToolCall,
         cancel: CancellationToken,
         group_id: &str,
+        shell_ask_approver: Option<ShellAskApprover>,
     ) -> ToolResult {
-        self.execute_shell_capped(call, cancel, MAX_SHELL_TIMEOUT_MS, group_id)
-            .await
+        self.execute_shell_capped(
+            call,
+            cancel,
+            MAX_SHELL_TIMEOUT_MS,
+            group_id,
+            shell_ask_approver,
+        )
+        .await
     }
 
     async fn execute_shell_capped(
@@ -4875,6 +5005,7 @@ impl ToolRegistry {
         cancel: CancellationToken,
         max_timeout_ms: u64,
         group_id: &str,
+        shell_ask_approver: Option<ShellAskApprover>,
     ) -> ToolResult {
         let args = match serde_json::from_value::<ShellArgs>(call.arguments.clone()) {
             Ok(args) => args,
@@ -4906,6 +5037,10 @@ impl ToolRegistry {
             }
         };
         let implicit_skill = self.skills.detect_for_command(&args.command, &workdir);
+        let _shell_guard = match self.shell_execution_guard(&workdir).await {
+            Ok(guard) => guard,
+            Err(err) => return tool_error(call, err),
+        };
         let timeout_ms = args
             .timeout_ms
             .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS)
@@ -4974,7 +5109,17 @@ impl ToolRegistry {
         };
 
         let mut run = match self
-            .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+            .run_shell_plan(ShellRunRequest {
+                sandbox_plan: &sandbox_plan,
+                workdir: &workdir,
+                timeout_ms,
+                output_cap,
+                tty: args.tty,
+                cancel: &cancel,
+                call,
+                command_text: &args.command,
+                shell_ask_approver: shell_ask_approver.clone(),
+            })
             .await
         {
             Ok(run) => run,
@@ -5039,7 +5184,17 @@ impl ToolRegistry {
                 Some(reason),
             );
             run = match self
-                .run_shell_plan(&sandbox_plan, &workdir, timeout_ms, output_cap, &cancel)
+                .run_shell_plan(ShellRunRequest {
+                    sandbox_plan: &sandbox_plan,
+                    workdir: &workdir,
+                    timeout_ms,
+                    output_cap,
+                    tty: args.tty,
+                    cancel: &cancel,
+                    call,
+                    command_text: &args.command,
+                    shell_ask_approver: shell_ask_approver.clone(),
+                })
                 .await
             {
                 Ok(run) => run,
@@ -5179,6 +5334,7 @@ impl ToolRegistry {
                 "parser_backed": analysis.parser_backed,
                 "dynamic": analysis.dynamic,
                 "direct_user_shell": direct_user_shell,
+                "tty": args.tty,
                 "timeout_ms": timeout_ms,
                 "output_byte_cap": output_cap,
             },
@@ -5245,22 +5401,68 @@ impl ToolRegistry {
 
     async fn run_shell_plan(
         &self,
-        sandbox_plan: &ShellSandboxPlan,
-        workdir: &Path,
-        timeout_ms: u64,
-        output_cap: usize,
-        cancel: &CancellationToken,
+        request: ShellRunRequest<'_>,
     ) -> std::result::Result<ShellRunOutcome, ShellRunError> {
+        let ShellRunRequest {
+            sandbox_plan,
+            workdir,
+            timeout_ms,
+            output_cap,
+            tty,
+            cancel,
+            call,
+            command_text,
+            shell_ask_approver,
+        } = request;
         let mut command = Command::new(&sandbox_plan.program);
         command
             .args(&sandbox_plan.args)
             .current_dir(workdir)
-            .kill_on_drop(true)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .kill_on_drop(true);
+        let pty_master = if tty {
+            let pty = open_shell_pty().map_err(ShellRunError::Io)?;
+            command
+                .stdin(Stdio::from(
+                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                ))
+                .stdout(Stdio::from(
+                    pty.slave.try_clone().map_err(ShellRunError::Io)?,
+                ))
+                .stderr(Stdio::from(pty.slave));
+            Some(pty.master)
+        } else {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            None
+        };
         configure_shell_process_group(&mut command);
         configure_linux_shell_sandbox(&mut command, sandbox_plan);
-        let preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+        let mut preserved_env = apply_shell_environment_policy(&mut command, &self.shell_sandbox);
+        let ask_server = if let Some(approver) = shell_ask_approver {
+            match ShellAskServer::start(
+                &self.root,
+                &call.call_id,
+                command_text,
+                workdir,
+                approver,
+                cancel.clone(),
+            )
+            .await
+            {
+                Ok(server) => {
+                    command.env(SQUEEZY_ASK_SOCKET_ENV, server.path());
+                    command.env(SQUEEZY_ASK_CALL_ID_ENV, &call.call_id);
+                    preserved_env.push(SQUEEZY_ASK_SOCKET_ENV.to_string());
+                    preserved_env.push(SQUEEZY_ASK_CALL_ID_ENV.to_string());
+                    Some(server)
+                }
+                Err(_err) => None,
+            }
+        } else {
+            None
+        };
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(err) if sandbox_plan.required => {
@@ -5272,14 +5474,25 @@ impl ToolRegistry {
             Err(err) => return Err(ShellRunError::Io(err)),
         };
 
-        let remaining_output_bytes = Arc::new(Mutex::new(output_cap));
-        let stdout_task = tokio::spawn(read_limited_pipe(
-            child.stdout.take(),
-            remaining_output_bytes.clone(),
-        ));
+        let stdout_capture = ShellStreamCapture::default();
+        let stderr_capture = ShellStreamCapture::default();
+        let stdout_task = if let Some(master) = pty_master {
+            tokio::spawn(read_limited_pipe(
+                Some(tokio::fs::File::from_std(master)),
+                output_cap,
+                stdout_capture.clone(),
+            ))
+        } else {
+            tokio::spawn(read_limited_pipe(
+                child.stdout.take(),
+                output_cap,
+                stdout_capture.clone(),
+            ))
+        };
         let stderr_task = tokio::spawn(read_limited_pipe(
             child.stderr.take(),
-            remaining_output_bytes,
+            output_cap,
+            stderr_capture.clone(),
         ));
 
         let status = tokio::select! {
@@ -5287,6 +5500,7 @@ impl ToolRegistry {
                 terminate_shell_child(&mut child, self.shell_sandbox.kill_grace_ms).await;
                 stdout_task.abort();
                 stderr_task.abort();
+                drop(ask_server);
                 return Err(ShellRunError::Cancelled);
             }
             result = time::timeout(Duration::from_millis(timeout_ms), child.wait()) => result,
@@ -5302,12 +5516,21 @@ impl ToolRegistry {
             Ok(Err(err)) => return Err(ShellRunError::Io(err)),
         };
 
-        let (stdout_bytes, stdout_truncated) = join_limited_pipe(stdout_task)
-            .await
-            .map_err(ShellRunError::Io)?;
-        let (stderr_bytes, stderr_truncated) = join_limited_pipe(stderr_task)
-            .await
-            .map_err(ShellRunError::Io)?;
+        let drain_timeout = Duration::from_millis(IO_DRAIN_TIMEOUT_MS);
+        let (stdout_result, stderr_result) = tokio::join!(
+            drain_or_abort(stdout_task, stdout_capture, drain_timeout),
+            drain_or_abort(stderr_task, stderr_capture, drain_timeout),
+        );
+        let (stdout_bytes, stdout_truncated) = stdout_result.map_err(ShellRunError::Io)?;
+        let (stderr_bytes, stderr_truncated) = stderr_result.map_err(ShellRunError::Io)?;
+        let (stdout_bytes, stdout_truncated, stderr_bytes, stderr_truncated) = split_shell_output(
+            stdout_bytes,
+            stdout_truncated,
+            stderr_bytes,
+            stderr_truncated,
+            output_cap,
+        );
+        drop(ask_server);
 
         Ok(ShellRunOutcome {
             exit_status,
@@ -6901,6 +7124,7 @@ struct ShellPermissionAnalysis {
 struct ParsedShellCommand {
     segments: Vec<String>,
     dynamic: bool,
+    heredoc_prefix: bool,
 }
 
 fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
@@ -6924,9 +7148,10 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     }) {
         return hit;
     }
-    let parsed = parse_shell_command(&normalized);
+    let parsed = parse_shell_command(command);
     let parser_backed = parsed.is_some();
     let dynamic = parsed.as_ref().is_some_and(|parsed| parsed.dynamic);
+    let heredoc_prefix = parsed.as_ref().is_some_and(|parsed| parsed.heredoc_prefix);
     let raw_segments = parsed
         .as_ref()
         .map(|parsed| parsed.segments.clone())
@@ -7049,7 +7274,11 @@ fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
     } else {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
-            risk: PermissionRisk::High,
+            risk: if heredoc_prefix {
+                PermissionRisk::Medium
+            } else {
+                PermissionRisk::High
+            },
             rule_target: format!("{first}:*"),
             network: false,
             destructive: false,
@@ -7372,16 +7601,29 @@ fn parse_shell_command(command: &str) -> Option<ParsedShellCommand> {
     let tree = parser.parse(command, None)?;
     let root = tree.root_node();
     let mut segments = Vec::new();
-    collect_shell_command_nodes(root, command.as_bytes(), &mut segments);
+    let heredoc_prefix = shell_heredoc_prefix(root, command);
+    let heredoc_prefix_command = heredoc_prefix.as_ref().map(|words| words.join(" "));
+    let ignore_heredoc_dynamic = heredoc_prefix.is_some();
+    if let Some(prefix_command) = heredoc_prefix_command.as_ref() {
+        segments.push(prefix_command.to_owned());
+    } else {
+        collect_shell_command_nodes(root, command.as_bytes(), &mut segments);
+    }
+    let dynamic = if let Some(prefix_command) = heredoc_prefix_command.as_deref() {
+        root.has_error() || shell_text_is_dynamic(prefix_command)
+    } else {
+        root.has_error()
+            || shell_tree_contains_dynamic(root, false)
+            || shell_text_is_dynamic(command)
+    };
     Some(ParsedShellCommand {
         segments: if segments.is_empty() {
             shell_segments(command)
         } else {
             segments
         },
-        dynamic: root.has_error()
-            || shell_tree_contains_dynamic(root)
-            || shell_text_is_dynamic(command),
+        dynamic,
+        heredoc_prefix: ignore_heredoc_dynamic,
     })
 }
 
@@ -7401,7 +7643,106 @@ fn collect_shell_command_nodes(node: Node<'_>, bytes: &[u8], segments: &mut Vec<
     }
 }
 
-fn shell_tree_contains_dynamic(node: Node<'_>) -> bool {
+fn shell_heredoc_prefix(root: Node<'_>, src: &str) -> Option<Vec<String>> {
+    if root.has_error() {
+        return None;
+    }
+    if !has_named_descendant_kind(root, "heredoc_redirect")
+        && !has_named_descendant_kind(root, "herestring_redirect")
+    {
+        return None;
+    }
+    if has_named_descendant_kind(root, "file_redirect") {
+        return None;
+    }
+    let command_node = find_single_command_node(root)?;
+    parse_heredoc_command_words(command_node, src)
+}
+
+fn parse_heredoc_command_words(cmd: Node<'_>, src: &str) -> Option<Vec<String>> {
+    if cmd.kind() != "command" {
+        return None;
+    }
+
+    let mut words = Vec::new();
+    let mut cursor = cmd.walk();
+    for child in cmd.named_children(&mut cursor) {
+        match child.kind() {
+            "command_name" => {
+                let word_node = child.named_child(0)?;
+                if !matches!(word_node.kind(), "word" | "number")
+                    || !is_literal_word_or_number(word_node)
+                {
+                    return None;
+                }
+                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+            }
+            "word" | "number" => {
+                if !is_literal_word_or_number(child) {
+                    return None;
+                }
+                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
+            }
+            "comment" => {}
+            kind if is_allowed_heredoc_attachment_kind(kind) => {}
+            _ => return None,
+        }
+    }
+    if words.is_empty() { None } else { Some(words) }
+}
+
+fn is_literal_word_or_number(node: Node<'_>) -> bool {
+    if !matches!(node.kind(), "word" | "number") {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).next().is_none()
+}
+
+fn is_allowed_heredoc_attachment_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "heredoc_body"
+            | "simple_heredoc_body"
+            | "heredoc_redirect"
+            | "herestring_redirect"
+            | "redirected_statement"
+    )
+}
+
+fn find_single_command_node(root: Node<'_>) -> Option<Node<'_>> {
+    let mut stack = vec![root];
+    let mut single_command = None;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "command" {
+            if single_command.is_some() {
+                return None;
+            }
+            single_command = Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    single_command
+}
+
+fn has_named_descendant_kind(node: Node<'_>, kind: &str) -> bool {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == kind {
+            return true;
+        }
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn shell_tree_contains_dynamic(node: Node<'_>, ignore_heredoc_redirect: bool) -> bool {
     if matches!(
         node.kind(),
         "command_substitution"
@@ -7409,12 +7750,13 @@ fn shell_tree_contains_dynamic(node: Node<'_>) -> bool {
             | "expansion"
             | "simple_expansion"
             | "subscript"
-            | "heredoc_redirect"
-    ) {
+    ) || (!ignore_heredoc_redirect && node.kind() == "heredoc_redirect")
+    {
         return true;
     }
     let mut cursor = node.walk();
-    node.children(&mut cursor).any(shell_tree_contains_dynamic)
+    node.children(&mut cursor)
+        .any(|child| shell_tree_contains_dynamic(child, ignore_heredoc_redirect))
 }
 
 fn shell_text_is_dynamic(command: &str) -> bool {
@@ -7484,6 +7826,10 @@ fn shell_segments(command: &str) -> Vec<String> {
             }
             (None, '|') if chars.peek() == Some(&'|') => {
                 let _ = chars.next();
+                push_shell_segment(&mut segments, &mut current);
+                continue;
+            }
+            (None, '|') => {
                 push_shell_segment(&mut segments, &mut current);
                 continue;
             }
@@ -8071,6 +8417,8 @@ struct ShellArgs {
     output_byte_cap: Option<usize>,
     output_mode: Option<OutputMode>,
     description: Option<String>,
+    #[serde(default)]
+    tty: bool,
     #[serde(default)]
     direct_user_shell: bool,
 }
@@ -11393,6 +11741,191 @@ fn shell_sandbox_runtime_unavailable_with_probe(
     }
 }
 
+struct ShellPty {
+    master: fs::File,
+    slave: fs::File,
+}
+
+fn open_shell_pty() -> std::io::Result<ShellPty> {
+    let mut master = -1;
+    let mut slave = -1;
+    let result = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(ShellPty {
+        master: unsafe { fs::File::from_raw_fd(master) },
+        slave: unsafe { fs::File::from_raw_fd(slave) },
+    })
+}
+
+struct ShellAskServer {
+    path: PathBuf,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ShellAskServer {
+    async fn start(
+        root: &Path,
+        call_id: &str,
+        parent_command: &str,
+        workdir: &Path,
+        approver: ShellAskApprover,
+        cancel: CancellationToken,
+    ) -> std::io::Result<Self> {
+        let run_dir = root.join(".squeezy").join("run");
+        fs::create_dir_all(&run_dir)?;
+        let root_path = run_dir.join(format!("shell-{}.sock", sanitize_shell_call_id(call_id)));
+        let (path, listener) = match bind_shell_ask_listener(&root_path) {
+            Ok(bound) => bound,
+            Err(err) if unix_socket_path_too_long(&err) => {
+                let digest = sha256_hex(format!("{}:{call_id}", root.display()));
+                let short = PathBuf::from("/tmp").join(format!("squeezy-{}.sock", &digest[..16]));
+                bind_shell_ask_listener(&short)?
+            }
+            Err(err) => return Err(err),
+        };
+        let call_id = call_id.to_string();
+        let parent_command = parent_command.to_string();
+        let workdir = workdir.to_path_buf();
+        let task = tokio::spawn(async move {
+            shell_ask_server_loop(listener, call_id, parent_command, workdir, approver, cancel)
+                .await;
+        });
+        Ok(Self { path, task })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn bind_shell_ask_listener(path: &Path) -> std::io::Result<(PathBuf, UnixListener)> {
+    let _ = fs::remove_file(path);
+    UnixListener::bind(path).map(|listener| (path.to_path_buf(), listener))
+}
+
+fn unix_socket_path_too_long(err: &std::io::Error) -> bool {
+    err.to_string().contains("SUN_LEN") || err.raw_os_error() == Some(libc::ENAMETOOLONG)
+}
+
+impl Drop for ShellAskServer {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ShellAskWireRequest {
+    command: String,
+    justification: String,
+}
+
+async fn shell_ask_server_loop(
+    listener: UnixListener,
+    call_id: String,
+    parent_command: String,
+    workdir: PathBuf,
+    approver: ShellAskApprover,
+    cancel: CancellationToken,
+) {
+    loop {
+        let accepted = tokio::select! {
+            _ = cancel.cancelled() => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, _)) = accepted else {
+            break;
+        };
+        let request_call_id = call_id.clone();
+        let request_parent = parent_command.clone();
+        let request_workdir = workdir.clone();
+        let request_approver = approver.clone();
+        tokio::spawn(async move {
+            let _ = handle_shell_ask_client(
+                stream,
+                request_call_id,
+                request_parent,
+                request_workdir,
+                request_approver,
+            )
+            .await;
+        });
+    }
+}
+
+async fn handle_shell_ask_client(
+    mut stream: UnixStream,
+    call_id: String,
+    parent_command: String,
+    workdir: PathBuf,
+    approver: ShellAskApprover,
+) -> std::io::Result<()> {
+    const MAX_ASK_REQUEST_BYTES: usize = 16 * 1024;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 1024];
+    loop {
+        let count = stream.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() > MAX_ASK_REQUEST_BYTES {
+            let response = ShellAskDecision::deny("in-flight permission request is too large");
+            stream
+                .write_all(&serde_json::to_vec(&response).map_err(std::io::Error::other)?)
+                .await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    }
+
+    let decision = match serde_json::from_slice::<ShellAskWireRequest>(&bytes) {
+        Ok(wire) if !wire.command.trim().is_empty() => {
+            approver(ShellAskRequest {
+                call_id,
+                parent_command,
+                command: wire.command,
+                justification: wire.justification,
+                workdir,
+            })
+            .await
+        }
+        Ok(_) => ShellAskDecision::deny("in-flight permission command must not be empty"),
+        Err(err) => ShellAskDecision::deny(format!("invalid in-flight permission request: {err}")),
+    };
+    stream
+        .write_all(&serde_json::to_vec(&decision).map_err(std::io::Error::other)?)
+        .await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+fn sanitize_shell_call_id(call_id: &str) -> String {
+    let mut out = String::new();
+    for ch in call_id.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "call".to_string()
+    } else {
+        out
+    }
+}
+
 fn configure_shell_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
@@ -11840,45 +12373,117 @@ fn file_len(path: &Path) -> std::result::Result<u64, std::io::Error> {
     Ok(fs::metadata(path)?.len())
 }
 
+#[derive(Clone, Default)]
+struct ShellStreamCapture {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    truncated: Arc<AtomicBool>,
+}
+
+impl ShellStreamCapture {
+    async fn append(&self, chunk: &[u8], cap: usize) {
+        let mut bytes = self.bytes.lock().await;
+        let keep = chunk.len().min(cap.saturating_sub(bytes.len()));
+        if keep > 0 {
+            bytes.extend_from_slice(&chunk[..keep]);
+        }
+        if keep < chunk.len() {
+            self.truncated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn mark_truncated(&self) {
+        self.truncated.store(true, Ordering::Relaxed);
+    }
+
+    async fn snapshot(&self) -> (Vec<u8>, bool) {
+        (
+            self.bytes.lock().await.clone(),
+            self.truncated.load(Ordering::Relaxed),
+        )
+    }
+}
+
 async fn read_limited_pipe<R>(
     mut reader: Option<R>,
-    remaining_bytes: Arc<Mutex<usize>>,
-) -> std::result::Result<(Vec<u8>, bool), std::io::Error>
+    cap: usize,
+    capture: ShellStreamCapture,
+) -> std::result::Result<(), std::io::Error>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let Some(mut reader) = reader.take() else {
-        return Ok((Vec::new(), false));
+        return Ok(());
     };
-    let mut output = Vec::new();
     let mut buffer = vec![0u8; 8192];
-    let mut truncated = false;
 
     loop {
-        let count = reader.read(&mut buffer).await?;
+        let count = match reader.read(&mut buffer).await {
+            Ok(count) => count,
+            Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+            Err(err) => return Err(err),
+        };
         if count == 0 {
             break;
         }
-        let mut remaining = remaining_bytes.lock().await;
-        let keep = count.min(*remaining);
-        if keep > 0 {
-            output.extend_from_slice(&buffer[..keep]);
-            *remaining -= keep;
-        }
-        if keep < count {
-            truncated = true;
-        }
+        capture.append(&buffer[..count], cap).await;
     }
 
-    Ok((output, truncated))
+    Ok(())
 }
 
-async fn join_limited_pipe(
-    handle: tokio::task::JoinHandle<std::result::Result<(Vec<u8>, bool), std::io::Error>>,
+async fn drain_or_abort(
+    mut handle: tokio::task::JoinHandle<std::result::Result<(), std::io::Error>>,
+    capture: ShellStreamCapture,
+    timeout: Duration,
 ) -> std::result::Result<(Vec<u8>, bool), std::io::Error> {
-    handle
-        .await
-        .map_err(|err| std::io::Error::other(format!("shell output reader failed: {err}")))?
+    match time::timeout(timeout, &mut handle).await {
+        Ok(joined) => {
+            joined.map_err(|err| {
+                std::io::Error::other(format!("shell output reader failed: {err}"))
+            })??;
+        }
+        Err(_) => {
+            handle.abort();
+            capture.mark_truncated();
+        }
+    }
+    Ok(capture.snapshot().await)
+}
+
+fn split_shell_output(
+    stdout: Vec<u8>,
+    stdout_truncated: bool,
+    stderr: Vec<u8>,
+    stderr_truncated: bool,
+    output_cap: usize,
+) -> (Vec<u8>, bool, Vec<u8>, bool) {
+    if output_cap == 0 || stdout.len().saturating_add(stderr.len()) <= output_cap {
+        return (stdout, stdout_truncated, stderr, stderr_truncated);
+    }
+
+    let stdout_floor = if output_cap >= 24 * 1024 {
+        (output_cap / 3).max(8 * 1024)
+    } else {
+        (output_cap / 3).max(1)
+    }
+    .min(output_cap);
+    let mut stdout_take = stdout.len().min(stdout_floor);
+    let mut stderr_take = stderr.len().min(output_cap.saturating_sub(stdout_take));
+    let mut remaining = output_cap.saturating_sub(stdout_take + stderr_take);
+    let extra_stdout = remaining.min(stdout.len().saturating_sub(stdout_take));
+    stdout_take += extra_stdout;
+    remaining = remaining.saturating_sub(extra_stdout);
+    let extra_stderr = remaining.min(stderr.len().saturating_sub(stderr_take));
+    stderr_take += extra_stderr;
+
+    let final_stdout_truncated = stdout_truncated || stdout_take < stdout.len();
+    let final_stderr_truncated = stderr_truncated || stderr_take < stderr.len();
+    (
+        stdout[..stdout_take].to_vec(),
+        final_stdout_truncated,
+        stderr[..stderr_take].to_vec(),
+        final_stderr_truncated,
+    )
 }
 
 fn contains_skipped_dir(path: &Path) -> bool {
@@ -12505,6 +13110,7 @@ fn shell_spec() -> ToolSpec {
                 "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS},
                 "output_byte_cap": {"type": "integer", "minimum": 1, "maximum": 128000},
                 "output_mode": {"type": "string", "enum": ["shaped", "raw"], "description": "Return compact shaped output or raw stdout/stderr. Default shaped."},
+                "tty": {"type": "boolean", "description": "Attach the command to a pseudo-terminal. Default false."},
                 "description": {"type": "string", "description": "Short reason this command is needed."}
             },
             "required": ["command", "description"]
