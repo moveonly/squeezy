@@ -608,6 +608,21 @@ impl SessionHandle {
         self.event_writer.flush()
     }
 
+    /// Typed convenience wrapper for [`append_event`]. Producers that want
+    /// compile-time guarantees that the kind discriminator and payload
+    /// shape stay in sync can construct a [`SessionEventKind`] and let the
+    /// store serialise it. The on-disk format is identical to the
+    /// string-tagged path so readers (replay, bug-report, telemetry) do
+    /// not need to special-case typed appends.
+    pub fn append_typed_event(
+        &self,
+        kind: SessionEventKind,
+        turn_id: Option<String>,
+        summary: Option<String>,
+    ) -> Result<()> {
+        self.append_event(SessionEvent::from_typed(kind, turn_id, summary))
+    }
+
     pub fn append_event(&self, event: SessionEvent) -> Result<()> {
         let event_kind = event.kind.clone();
         let event_summary = event.summary.clone();
@@ -940,12 +955,54 @@ impl SessionEvent {
             payload,
         }
     }
+
+    /// Build a `SessionEvent` from a typed [`SessionEventKind`]. The kind
+    /// discriminator and payload fields are serialised in the same wire
+    /// shape that the string-tagged constructor produces, so existing
+    /// readers (`try_from_event`, replay, bug-report redaction) round-trip
+    /// without change. The `text` field of `UserMessage` /
+    /// `AssistantCompleted` is also mirrored into `summary` when no
+    /// explicit summary is supplied so discovery surfaces keep working.
+    pub fn from_typed(
+        kind: SessionEventKind,
+        turn_id: Option<String>,
+        summary: Option<String>,
+    ) -> Self {
+        let discriminator = kind.discriminator().to_string();
+        let value = serde_json::to_value(&kind).unwrap_or(Value::Null);
+        let mut payload = match value {
+            Value::Object(mut map) => {
+                map.remove("kind");
+                Value::Object(map)
+            }
+            other => other,
+        };
+        if !matches!(payload, Value::Object(_)) {
+            payload = json!({});
+        }
+        let summary = summary.or_else(|| match &kind {
+            SessionEventKind::UserMessage { text } => Some(text.clone()),
+            SessionEventKind::AssistantCompleted { text, .. } if !text.is_empty() => {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        Self {
+            ts_unix_ms: now_ms(),
+            kind: discriminator,
+            turn_id,
+            summary,
+            payload,
+        }
+    }
 }
 
 /// Typed view over `SessionEvent` for the well-known event kinds Squeezy
-/// emits. Producers continue to write `SessionEvent { kind: String, payload }`
-/// freely; this enum is reader-only so adding new kinds upstream never
-/// breaks replay. Unknown kinds round-trip via `SessionEventKind::Unknown`.
+/// emits. The variants double as a typed *append* API via
+/// [`SessionEvent::from_typed`] / [`SessionHandle::append_typed_event`] and
+/// as the typed *read* view via [`SessionEventKind::try_from_event`]. The
+/// `#[serde(other)] Unknown` arm keeps replay safe even when older sessions
+/// carry kinds we have since renamed or retired.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
@@ -983,6 +1040,25 @@ pub enum SessionEventKind {
         #[serde(default)]
         conversation: Vec<ResumeItem>,
     },
+    ApprovalRequested {
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        payload: Value,
+    },
+    ApprovalDecided {
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        decision: String,
+        #[serde(default)]
+        payload: Value,
+    },
+    SessionStarted,
+    SessionEnded {
+        #[serde(default)]
+        status: String,
+    },
     Cancelled,
     Failed {
         #[serde(default)]
@@ -994,6 +1070,27 @@ pub enum SessionEventKind {
 }
 
 impl SessionEventKind {
+    /// Free-form string discriminator that matches what Squeezy already
+    /// writes into `SessionEvent::kind`. Centralising the mapping keeps
+    /// typed producers and the existing string-tagged producers consistent.
+    pub fn discriminator(&self) -> &'static str {
+        match self {
+            Self::UserMessage { .. } => "user_message",
+            Self::AssistantCompleted { .. } => "assistant_completed",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+            Self::ContextCompacted { .. } => "context_compacted",
+            Self::ApprovalRequested { .. } => "approval_requested",
+            Self::ApprovalDecided { .. } => "approval_decided",
+            Self::SessionStarted => "session_started",
+            Self::SessionEnded { .. } => "session_ended",
+            Self::Cancelled => "cancelled",
+            Self::Failed { .. } => "failed",
+            Self::SessionResumed => "session_resumed",
+            Self::Unknown => "unknown",
+        }
+    }
+
     /// Parse a free-form `SessionEvent` into the typed view. Returns
     /// `None` if the discriminator + payload do not match any known
     /// variant; the caller can then skip the event without erroring.
@@ -1259,7 +1356,15 @@ fn apply_event_to_replay(
         // no `conversation` field, so we treat it as a no-op and let the
         // linear replay continue.
         SessionEventKind::ContextCompacted { .. } => {}
-        SessionEventKind::Cancelled
+        // Approval and session-lifecycle events are bookkeeping rather
+        // than conversation items; they do not modify the resume state's
+        // conversation/transcript but still need to be enumerated so the
+        // match is exhaustive (catches future kinds at compile time).
+        SessionEventKind::ApprovalRequested { .. }
+        | SessionEventKind::ApprovalDecided { .. }
+        | SessionEventKind::SessionStarted
+        | SessionEventKind::SessionEnded { .. }
+        | SessionEventKind::Cancelled
         | SessionEventKind::Failed { .. }
         | SessionEventKind::SessionResumed
         | SessionEventKind::Unknown => {}

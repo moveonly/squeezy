@@ -37,9 +37,10 @@ use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
-    SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent, SessionReplayEventKind,
-    SessionReplayTape, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
+    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionEventKind,
+    SessionHandle, SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent,
+    SessionReplayEventKind, SessionReplayTape, SessionResumeState, SessionStatus, SessionStore,
+    SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -1148,12 +1149,11 @@ impl Agent {
             metadata.ended_at_ms = None;
             metadata.resume_available = true;
         });
-        let _ = handle.append_event(SessionEvent::new(
-            "session_resumed",
+        let _ = handle.append_typed_event(
+            SessionEventKind::SessionResumed,
             None,
             Some("session resumed".to_string()),
-            json!({}),
-        ));
+        );
         Ok((agent, transcript))
     }
 
