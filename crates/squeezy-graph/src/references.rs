@@ -56,12 +56,30 @@ impl SemanticGraph {
     ) -> Vec<usize> {
         let mut indexes = BTreeSet::new();
         indexes.extend(self.reference_candidate_indexes(&symbol.name));
-        for alias in self
-            .imports
+        // The `imports_by_alias_target` inverted index keys aliased imports by
+        // `last_path_segment(import.path)`. For every non-glob aliased import
+        // that resolves to `symbol`, the import's leaf equals `symbol.name`,
+        // so a single hash lookup yields the candidate set. Glob aliased
+        // imports live in `wildcard_aliased_imports` and are scanned as a
+        // separate (small) bucket.
+        let by_target = self
+            .imports_by_alias_target
+            .get(&symbol.name)
+            .map(|indexes| indexes.as_slice())
+            .unwrap_or(&[]);
+        for index in by_target
             .iter()
-            .filter(|import| self.import_matches_symbol(import, symbol))
-            .filter_map(|import| import.alias.as_deref())
+            .chain(self.wildcard_aliased_imports.iter())
         {
+            let Some(import) = self.imports.get(*index) else {
+                continue;
+            };
+            let Some(alias) = import.alias.as_deref() else {
+                continue;
+            };
+            if !self.import_matches_symbol(import, symbol) {
+                continue;
+            }
             indexes.extend(self.reference_candidate_indexes(alias));
         }
         indexes.into_iter().collect()

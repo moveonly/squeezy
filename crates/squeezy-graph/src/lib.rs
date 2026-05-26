@@ -349,6 +349,17 @@ pub struct SemanticGraph {
     /// import shares a file with the caller, so resolving an alias or
     /// reference no longer needs to scan every import in the workspace.
     imports_by_file: HashMap<FileId, Vec<usize>>,
+    /// Aliased imports grouped by the last path segment of the import (the
+    /// target symbol name). `reference_candidate_indexes_for_symbol` only
+    /// pulls aliases from imports whose target leaf equals the symbol's
+    /// name, so this turns a workspace-wide import scan into an O(matches)
+    /// hash lookup. Glob aliased imports (whose leaf would be `*`) live in
+    /// `wildcard_aliased_imports` instead.
+    imports_by_alias_target: HashMap<String, Vec<usize>>,
+    /// Aliased imports whose path leaf is a wildcard (e.g. JS/TS
+    /// `import * as M from 'mod'`). These do not bucket by target name, so
+    /// they are scanned alongside the by-target hit list.
+    wildcard_aliased_imports: Vec<usize>,
     java_package_by_file: HashMap<FileId, Vec<String>>,
     js_ts_resolver: JsTsResolver,
 }
@@ -403,6 +414,8 @@ impl SemanticGraph {
             edges_by_from: HashMap::new(),
             edges_by_to: HashMap::new(),
             imports_by_file: HashMap::new(),
+            imports_by_alias_target: HashMap::new(),
+            wildcard_aliased_imports: Vec::new(),
             java_package_by_file: HashMap::new(),
             js_ts_resolver: JsTsResolver::default(),
         }
@@ -1299,6 +1312,8 @@ impl SemanticGraph {
 
     fn rebuild_import_indexes(&mut self) {
         self.imports_by_file.clear();
+        self.imports_by_alias_target.clear();
+        self.wildcard_aliased_imports.clear();
         self.java_package_by_file.clear();
         for (index, import) in self.imports.iter().enumerate() {
             self.imports_by_file
@@ -1311,6 +1326,21 @@ impl SemanticGraph {
                     self.java_package_by_file
                         .insert(import.file_id.clone(), segments);
                 }
+                // Java package markers never name a target symbol; they live
+                // only in the by-file index. Skip both alias-target buckets.
+                continue;
+            }
+            if import.alias.is_none() {
+                continue;
+            }
+            let leaf = last_path_segment(&import.path);
+            if leaf == "*" || leaf.is_empty() {
+                self.wildcard_aliased_imports.push(index);
+            } else {
+                self.imports_by_alias_target
+                    .entry(leaf)
+                    .or_default()
+                    .push(index);
             }
         }
     }

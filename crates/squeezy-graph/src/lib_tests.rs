@@ -3431,6 +3431,153 @@ fn graph_edge_deserializes_without_candidates_field() {
     assert!(edge.candidates.is_empty());
 }
 
+#[test]
+fn aliased_import_lookup_uses_inverted_index_keyed_by_target_leaf() {
+    // Build a workspace where most aliased imports target unrelated symbols.
+    // The inverted index must bucket aliased imports by
+    // `last_path_segment(import.path)`, so a lookup for `Wanted` touches only
+    // the imports whose path leaf is `Wanted` — not every import in the graph.
+    let mut parser = LanguageParser::new().unwrap();
+    let mut sources = Vec::new();
+    sources.push(record(
+        "src/lib.rs",
+        r#"
+pub mod target {
+    pub struct Wanted;
+}
+"#,
+    ));
+    // 200 unrelated aliased imports keyed by their own distinct target leaves.
+    for i in 0..200 {
+        sources.push(record(
+            &format!("src/noise_{i}.rs"),
+            &format!(
+                "use crate::target::Other{i} as Alias{i};\nfn _use_{i}() {{ let _ = Alias{i}; }}\n"
+            ),
+        ));
+    }
+    // One aliased import that actually targets `Wanted`.
+    sources.push(record(
+        "src/use_wanted.rs",
+        r#"
+use crate::target::Wanted as Aliased;
+fn touch() {
+    let _ = Aliased;
+}
+"#,
+    ));
+
+    let parsed = sources
+        .into_iter()
+        .map(|record| parser.parse_record(&record).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    // Correctness: the alias `Aliased` resolves back to `Wanted` via the
+    // inverted index path inside `reference_candidate_indexes_for_symbol`.
+    let wanted = graph
+        .find_symbol_by_name("Wanted")
+        .pop()
+        .expect("Wanted symbol");
+    let refs = graph.references_to_symbol(&wanted.id);
+    assert!(
+        refs.iter().any(|hit| hit.reference.text == "Aliased"),
+        "references_to_symbol(Wanted) must surface the `Aliased` reference \
+         via the inverted alias index; got {:?}",
+        refs.iter().map(|h| &h.reference.text).collect::<Vec<_>>(),
+    );
+    assert!(
+        refs.iter().any(|hit| hit.reference.text == "Wanted"),
+        "references_to_symbol(Wanted) must still surface the direct `Wanted` \
+         reference inside the `use` statement; got {:?}",
+        refs.iter().map(|h| &h.reference.text).collect::<Vec<_>>(),
+    );
+
+    // Sub-linear lookup: the inverted index bucket for `Wanted` contains at
+    // most a handful of imports, not the 200+ unrelated ones. The full
+    // `imports` vec has 201 entries.
+    assert!(
+        graph.imports.len() >= 200,
+        "fixture should produce at least 200 imports; got {}",
+        graph.imports.len(),
+    );
+    let wanted_bucket = graph
+        .imports_by_alias_target
+        .get("Wanted")
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    assert_eq!(
+        wanted_bucket.len(),
+        1,
+        "expected only the `Wanted` aliased import to land in its bucket; \
+         got {} entries",
+        wanted_bucket.len(),
+    );
+    // The noisy aliased imports must NOT spill into the `Wanted` bucket, even
+    // though they share the same module prefix.
+    for index in wanted_bucket {
+        let import = &graph.imports[*index];
+        assert!(
+            import.path.ends_with("Wanted"),
+            "unrelated import {:?} leaked into the `Wanted` bucket",
+            import.path,
+        );
+    }
+
+    // No wildcard aliased imports exist in this Rust fixture; the bucket
+    // stays empty (Rust glob imports are not aliased).
+    assert!(
+        graph.wildcard_aliased_imports.is_empty(),
+        "Rust glob imports are never aliased, so the wildcard bucket should \
+         stay empty; got {} entries",
+        graph.wildcard_aliased_imports.len(),
+    );
+}
+
+#[test]
+fn js_ts_namespace_import_lands_in_wildcard_aliased_bucket() {
+    // JS/TS `import * as M from 'mod'` produces an aliased glob import whose
+    // path leaf is `*`. These cannot be keyed by target name, so the index
+    // must route them to `wildcard_aliased_imports` and still consult that
+    // bucket on every symbol lookup.
+    let mut parser = LanguageParser::new().unwrap();
+    let package = unsupported_record(
+        "package.json",
+        r#"{"name":"ns-case","exports":{".":"./src/helpers.ts"}}"#,
+    );
+    let helpers = ts_record(
+        "src/helpers.ts",
+        "export function helper() { return 1; }\n",
+    );
+    let app = ts_record(
+        "src/app.ts",
+        r#"
+import * as Mod from "ns-case";
+
+export function start() {
+    return Mod.helper();
+}
+"#,
+    );
+    let parsed = vec![package, helpers, app]
+        .into_iter()
+        .map(|record| parser.parse_record(&record).unwrap())
+        .collect::<Vec<_>>();
+    let graph = SemanticGraph::from_parsed(parsed);
+
+    assert!(
+        !graph.wildcard_aliased_imports.is_empty(),
+        "JS/TS namespace import (`import * as Mod`) should land in the \
+         wildcard aliased bucket; got {} entries",
+        graph.wildcard_aliased_imports.len(),
+    );
+    // The wildcard bucket must NOT pollute the target-keyed buckets.
+    assert!(
+        !graph.imports_by_alias_target.contains_key("*"),
+        "wildcard imports must not be keyed by `*` in the target index",
+    );
+}
+
 fn record(relative_path: &str, source: &str) -> FileRecord {
     let root = temp_root("graph-record");
     let path = root.join(relative_path);
