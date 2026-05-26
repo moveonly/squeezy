@@ -4199,7 +4199,7 @@ pub(crate) fn dedupe_assistant_repeated_tool_output(
 }
 
 fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -> String {
-    let mut content = content.to_string();
+    let mut content = normalize_fence_boundaries(content);
     let outputs = recent_shell_tool_outputs(app);
     for output in &outputs {
         if let Some(stripped) = strip_repeated_fenced_tool_output(&content, output) {
@@ -4213,6 +4213,32 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
         return String::new();
     }
     content
+}
+
+/// Insert a newline before any ```` ``` ```` that's glued to non-whitespace
+/// on the same line. Models occasionally emit `"prose.```text\nbody\n```"`
+/// without breaking the line before the opening fence; the fence-aware
+/// dedup helpers below scan line-by-line and would miss the duplicate.
+fn normalize_fence_boundaries(content: &str) -> String {
+    const FENCE: &str = "```";
+    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(FENCE.as_bytes()) {
+            let preceded_by_break = matches!(out.chars().last(), None | Some('\n'));
+            if !preceded_by_break {
+                out.push('\n');
+            }
+            out.push_str(FENCE);
+            i += FENCE.len();
+            continue;
+        }
+        let ch = content[i..].chars().next().expect("non-empty");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {

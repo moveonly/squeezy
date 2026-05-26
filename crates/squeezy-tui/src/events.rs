@@ -300,8 +300,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         status.cap_usd_micros as f64 / 1_000_000.0,
                         status.percent
                     );
-                    app.push_transcript_item(TranscriptItem::system(notice.clone()));
-                    app.push_log(notice);
+                    app.push_transcript_item(TranscriptItem::system(notice));
                 }
                 AgentEvent::CostUpdate {
                     tool_count,
@@ -433,14 +432,16 @@ pub(crate) fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
     ));
 }
 
-/// Flush any straggler bytes held by the `<proposed_plan>` extractor at
-/// turn boundaries. Unterminated blocks are folded back into the
-/// transcript so the user can see what the model attempted; the extractor
-/// itself is rebuilt fresh for the next turn.
+/// Reset the `<proposed_plan>` extractor at a turn boundary. The
+/// agent's Completed message is the single rendered artifact for the
+/// turn — re-injecting leftover bytes from an unterminated block here
+/// duplicated content that the assistant message already contained. If
+/// the extractor was still inside an open block we log an advisory so
+/// the model-output bug is visible without polluting the transcript.
 pub(crate) fn finalize_proposed_plan(app: &mut TuiApp) {
     let leftover = app.proposed_plan.finalize();
     if !leftover.is_empty() {
-        app.pending_assistant.push_delta(&leftover);
+        app.push_log("ignored unterminated <proposed_plan> block from the model".to_string());
     }
     app.proposed_plan = proposed_plan::ProposedPlanExtractor::new();
 }

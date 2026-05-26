@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
-use squeezy_agent::{JobKind, JobStatus};
+use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
@@ -168,6 +168,116 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
     assert!(rendered.contains("[r] Refine"));
     assert!(rendered.contains("[d] Discard"));
     assert!(rendered.contains("[v] View"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn completed_transcript_is_plan_free_after_stream_extraction() {
+    let root = temp_workspace("completed_plan_free");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "intro narration <proposed_plan>\nstep 1\nstep 2\n</proposed_plan> tail narration"
+            .to_string(),
+    })
+    .await
+    .expect("send delta");
+    // The agent strips the block before constructing the Completed
+    // TranscriptItem; this mirrors that behaviour. If the TUI ever
+    // regresses to re-injecting the block (e.g. via leftover) the
+    // assertion below catches it.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("intro narration  tail narration".to_string()),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let plan_cards = app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
+        .count();
+    assert_eq!(plan_cards, 1, "expected exactly one plan card");
+
+    for entry in &app.transcript {
+        if let TranscriptEntryKind::Message(item) = &entry.kind {
+            assert!(
+                !item.content.contains("<proposed_plan>"),
+                "transcript message must not contain raw proposed_plan markup: {:?}",
+                item.content
+            );
+            assert!(
+                !item.content.contains("step 1"),
+                "transcript message must not contain plan body: {:?}",
+                item.content
+            );
+        }
+    }
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "pending_assistant must be empty after Completed; held {:?}",
+        app.pending_assistant.text()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
+    let root = temp_workspace("unterminated_no_duplicate");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "intro <proposed_plan>\nstep 1\nstep 2 (no close tag)".to_string(),
+    })
+    .await
+    .expect("send delta");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("intro".to_string()),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "unterminated block must not leak back into pending_assistant: {:?}",
+        app.pending_assistant.text()
+    );
+    for entry in &app.transcript {
+        if let TranscriptEntryKind::Message(item) = &entry.kind {
+            assert!(
+                !item.content.contains("<proposed_plan>"),
+                "transcript must not surface the raw open tag: {:?}",
+                item.content
+            );
+            assert!(
+                !item.content.contains("step 1"),
+                "transcript must not surface body of unterminated block: {:?}",
+                item.content
+            );
+        }
+    }
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -5982,6 +6092,86 @@ fn json_patch_preview_parser_emits_events_per_patch() {
     if let PatchPreviewEvent::Complete { count } = complete {
         assert_eq!(*count, 2);
     }
+}
+
+#[tokio::test]
+async fn cost_warning_event_renders_exactly_once() {
+    // CostWarning previously pushed the same notice into both the
+    // transcript and the log pane; both render in the same stream so the
+    // line appeared twice back-to-back. Now the system transcript entry
+    // is the single source of truth.
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::CostWarning {
+        turn_id: TurnId::new(1),
+        status: CostCapStatus {
+            spent_usd_micros: 80_000,
+            cap_usd_micros: 100_000,
+            percent: 80,
+        },
+    })
+    .await
+    .expect("send cost warning");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let needle = "session cost crossed warning threshold";
+    let occurrences = app
+        .transcript
+        .iter()
+        .filter(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => item.content.contains(needle),
+            TranscriptEntryKind::Log(message) => message.contains(needle),
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "CostWarning must render exactly once; transcript: {:?}",
+        app.transcript
+    );
+}
+
+#[test]
+fn assistant_repeated_shell_output_dedups_even_with_glued_fence() {
+    // Real-world regression: the model emitted the opening fence glued to
+    // the prose ("...metadata.```text") rather than on its own line. The
+    // fence-aware dedup scanned line-by-line and missed the duplicate, so
+    // the entire `ls -la` body was rendered both in the tool card and
+    // again inside the assistant message. `normalize_fence_boundaries`
+    // breaks the fence onto its own line before the strip helpers run.
+    let mut app = test_app(SessionMode::Build);
+    let body = "total 328\ndrwxr-xr-x@  32 abbassabra  staff   1024 May 26 17:05 .\ndrwxr-xr-x@   3 abbassabra  staff     96 May 23 01:01 .cargo\n-rw-r--r--@   1 abbassabra  staff    892 May 23 01:01 .gitignore\n-rw-r--r--@   1 abbassabra  staff   3252 May 23 01:01 AGENTS.md\n-rw-r--r--@   1 abbassabra  staff  89483 May 23 01:01 Cargo.lock\ndrwxr-xr-x@  42 abbassabra  staff   1344 May 23 01:01 src";
+    let mut result = sample_tool_result("shell", "");
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "exit_code": 0,
+        "stdout": body,
+        "stderr": "",
+    });
+    app.push_tool_result(result);
+
+    let assistant =
+        format!("I'll list the repository root with detailed file metadata.```text\n{body}\n```");
+    let item = TranscriptItem::assistant(assistant.clone());
+    let deduped = super::dedupe_assistant_repeated_tool_output(&app, item)
+        .expect("deduped item should remain (intro prose survives)");
+    assert!(
+        !deduped.content.contains("total 328"),
+        "shell body must not appear inside the assistant message after dedup; got:\n{}",
+        deduped.content
+    );
+    assert!(
+        !deduped.content.contains("AGENTS.md"),
+        "shell body must not survive dedup; got:\n{}",
+        deduped.content
+    );
+    assert!(
+        deduped.content.contains("detailed file metadata"),
+        "intro prose should survive: {}",
+        deduped.content
+    );
 }
 
 #[test]

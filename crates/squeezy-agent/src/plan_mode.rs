@@ -21,6 +21,14 @@ use squeezy_core::SessionMode;
 /// `crates/squeezy-tui/src/proposed_plan.rs::PLAN_DIR`.
 pub(crate) const PLAN_DIR: &str = ".squeezy/plans";
 
+/// Opening delimiter for the proposed-plan block the model emits at the
+/// end of a Plan-mode turn. Single source of truth shared with the TUI
+/// extractor; both crates must agree exactly on the spelling.
+pub const PROPOSED_PLAN_OPEN_TAG: &str = "<proposed_plan>";
+
+/// Closing delimiter for the proposed-plan block.
+pub const PROPOSED_PLAN_CLOSE_TAG: &str = "</proposed_plan>";
+
 /// File name (inside a per-session subdir) that holds the id of the
 /// active plan. Mirrors `proposed_plan::CURRENT_POINTER_FILE`.
 pub(crate) const CURRENT_POINTER_FILE: &str = "current";
@@ -131,6 +139,54 @@ pub(crate) fn latest_plan_path(workspace_root: &Path, session_id: Option<&str>) 
         }
     }
     newest.map(|(_, path)| path)
+}
+
+/// Remove every `<proposed_plan>...</proposed_plan>` block (and any
+/// trailing unterminated open-tag tail) from an assistant message. The
+/// structured Plan card is the canonical visualization for those bodies;
+/// keeping the raw markup in the displayed/persisted transcript renders
+/// the plan twice. Whitespace immediately surrounding a removed block is
+/// collapsed so the residual prose reads naturally.
+pub fn strip_proposed_plan_blocks(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut remaining = input;
+    loop {
+        let Some(open_idx) = remaining.find(PROPOSED_PLAN_OPEN_TAG) else {
+            out.push_str(remaining);
+            break;
+        };
+        out.push_str(&remaining[..open_idx]);
+        let after_open = &remaining[open_idx + PROPOSED_PLAN_OPEN_TAG.len()..];
+        match after_open.find(PROPOSED_PLAN_CLOSE_TAG) {
+            Some(close_idx) => {
+                remaining = &after_open[close_idx + PROPOSED_PLAN_CLOSE_TAG.len()..];
+            }
+            None => break,
+        }
+    }
+    collapse_block_seam(&out)
+}
+
+/// Trim surrounding whitespace and collapse the run of blank lines a
+/// removed block leaves behind into at most one blank line. Cheap, no
+/// regex, walks the string twice.
+fn collapse_block_seam(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    let mut blank_run = 0usize;
+    for line in trimmed.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body.trim().is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                out.push_str(line);
+            }
+        } else {
+            blank_run = 0;
+            out.push_str(line);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
