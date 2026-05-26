@@ -29,7 +29,7 @@ mod keys;
 mod render;
 mod save;
 
-pub(crate) use keys::handle_key;
+pub(crate) use keys::{handle_key, handle_paste};
 pub(crate) use render::render;
 pub(crate) use save::{
     clear_scope_override, clear_scope_override_silent, discard_all_session_writes, perform_reset,
