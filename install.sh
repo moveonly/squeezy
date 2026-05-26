@@ -13,6 +13,10 @@
 #                         https://github.com/esqueezy/squeezy/releases/download.
 #                         Mainly useful for CI smoke tests against a local
 #                         file:// mirror.
+#   SQUEEZY_GPG_KEY_PATH  Path to the Squeezy release public key. When this
+#                         file is present and gpg is installed, the release
+#                         archive's .asc signature is verified after the
+#                         SHA256 check. Defaults to $HOME/.squeezy/release-key.gpg.
 
 set -eu
 
@@ -23,6 +27,7 @@ LATEST_API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 INSTALL_DIR="${SQUEEZY_INSTALL_DIR:-$HOME/.local/bin}"
 TAG="${SQUEEZY_INSTALL_TAG:-}"
 BASE_URL="${SQUEEZY_INSTALL_BASE_URL:-$DEFAULT_BASE_URL}"
+GPG_KEY_PATH="${SQUEEZY_GPG_KEY_PATH:-$HOME/.squeezy/release-key.gpg}"
 
 err() {
   printf 'install.sh: %s\n' "$*" >&2
@@ -105,6 +110,7 @@ tag="$(resolve_tag)"
 archive="squeezy-${target}.tar.gz"
 archive_url="${BASE_URL}/${tag}/${archive}"
 checksum_url="${archive_url}.sha256"
+signature_url="${archive_url}.asc"
 
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t squeezy-install)"
 cleanup() { rm -rf "$tmpdir"; }
@@ -124,6 +130,25 @@ if [ "$expected" != "$actual" ]; then
   err "checksum mismatch for $archive (expected $expected, got $actual)"
 fi
 info "checksum ok"
+
+if ! have gpg; then
+  info "(skipping GPG verify -- gpg not installed)"
+elif [ ! -f "$GPG_KEY_PATH" ]; then
+  info "(skipping GPG verify -- no public key found at $GPG_KEY_PATH)"
+elif fetch "$signature_url" "$tmpdir/$archive.asc" 2>/dev/null; then
+  gpg_home="$tmpdir/gnupg"
+  mkdir -p "$gpg_home"
+  chmod 700 "$gpg_home"
+  if gpg --homedir "$gpg_home" --batch --quiet --import "$GPG_KEY_PATH" \
+      && gpg --homedir "$gpg_home" --batch --verify \
+           "$tmpdir/$archive.asc" "$tmpdir/$archive" >/dev/null 2>&1; then
+    info "signature OK"
+  else
+    err "GPG signature verification failed for $archive"
+  fi
+else
+  info "(skipping GPG verify -- no .asc signature published for $tag)"
+fi
 
 tar -xzf "$tmpdir/$archive" -C "$tmpdir"
 if [ ! -f "$tmpdir/squeezy" ]; then
