@@ -11,10 +11,10 @@ export type MatrixRow = {
 };
 
 export const productPosition = {
-  eyebrow: "Local-first coding agent · Rust, Python, Java, Go, C/C++, C#, JS/TS",
+  eyebrow: "Local-first coding agent",
   title: "Understand the repo before you ask the model.",
   lead:
-    "Squeezy is a terminal coding agent that builds a local semantic graph of your codebase, then answers navigation, reference, and impact questions from that graph instead of from paid model context. Bring your own provider: OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, or Ollama."
+    "Squeezy is a terminal coding agent that builds a local semantic graph of your codebase, then answers navigation, reference, and impact questions from that graph instead of from paid model context."
 };
 
 export const homepageCards: FactCard[] = [
