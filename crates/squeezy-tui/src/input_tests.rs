@@ -150,4 +150,50 @@ fn capability_badge_labels_are_stable() {
         let label = capability_badge_label(cap);
         assert!(!label.is_empty(), "{cap:?} produced an empty badge");
     }
+#[test]
+fn slash_suggestions_match_substring_not_just_prefix() {
+    // Substring after `/` should match — `/com` resolves `/compact`.
+    let names = slash_suggestions("/com")
+        .into_iter()
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"/compact"),
+        "expected /compact in {names:?}"
+    );
+
+    // A non-prefix subsequence still resolves (`atc` → `/attach`).
+    let names = slash_suggestions("/atc")
+        .into_iter()
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"/attach"), "expected /attach in {names:?}");
+}
+
+#[test]
+fn slash_suggestions_orders_prefix_matches_before_fuzzy_matches() {
+    // `/co` should list prefix matches (`/cost`, `/copy`, `/collapse`,
+    // `/compact`, `/config`, `/context`) before subsequence-only hits.
+    let names = slash_suggestions("/co")
+        .into_iter()
+        .map(|cmd| cmd.name)
+        .collect::<Vec<_>>();
+    let first_six: Vec<&str> = names.iter().take(6).copied().collect();
+    let mut expected = vec![
+        "/collapse",
+        "/compact",
+        "/config",
+        "/context",
+        "/copy",
+        "/cost",
+    ];
+    expected.sort();
+    let mut got = first_six.clone();
+    got.sort();
+    assert_eq!(got, expected, "first six should be /co* prefix hits");
+}
+
+#[test]
+fn slash_suggestions_returns_no_matches_for_unrelated_input() {
+    assert!(slash_suggestions("/zzz").is_empty());
 }

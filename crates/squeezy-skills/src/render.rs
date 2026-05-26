@@ -228,7 +228,7 @@ pub fn render_active_skills_with_metrics(
         let body_chars = char_count(&skill.body);
         if body_chars > body_cap_chars {
             body_cap_truncated[index] = true;
-            blocks.push(render_stub(skill, "body_cap"));
+            blocks.push(render_stub(skill, "body_cap", STUB_DESCRIPTION_MAX_CHARS));
         } else {
             blocks.push(skill.prompt_block());
         }
@@ -244,14 +244,14 @@ pub fn render_active_skills_with_metrics(
 
     let mut fitted = Vec::new();
     let mut included_is_stub = Vec::<bool>::new();
-    for (skill, block) in skills.iter().zip(blocks) {
-        let starts_as_stub = block_contains_stub(&block);
+    for (index, (skill, block)) in skills.iter().zip(blocks).enumerate() {
+        let starts_as_stub = body_cap_truncated[index];
         let candidates = if starts_as_stub {
             vec![(block, true)]
         } else {
             vec![
                 (block, false),
-                (render_stub(skill, "aggregate_budget"), true),
+                (render_stub(skill, "aggregate_budget", 0), true),
             ]
         };
         let mut inserted = false;

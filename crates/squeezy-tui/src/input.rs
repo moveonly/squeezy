@@ -792,14 +792,24 @@ pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
     if !is_slash_completion_input(input) {
         return Vec::new();
     }
-    let prefix = input.trim();
-    let mut suggestions = SLASH_COMMANDS
+    let needle = input.trim();
+    // Bare `/` lists every command, ordered alphabetically by name.
+    if needle == "/" {
+        let mut suggestions = SLASH_COMMANDS.to_vec();
+        suggestions.sort_by(|left, right| left.name.cmp(right.name));
+        return suggestions;
+    }
+    let mut scored: Vec<(SlashCommand, i32)> = SLASH_COMMANDS
         .iter()
         .copied()
-        .filter(|command| command.name.starts_with(prefix))
-        .collect::<Vec<_>>();
-    suggestions.sort_by(|left, right| left.name.cmp(right.name));
-    suggestions
+        .filter_map(|command| {
+            squeezy_rank::fuzzy_score(command.name, needle).map(|score| (command, score))
+        })
+        .collect();
+    // Prefix/contiguous hits sort first via the negative bonuses in
+    // `fuzzy_score`; ties broken alphabetically for stable rendering.
+    scored.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.name.cmp(right.0.name)));
+    scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
 pub(crate) fn is_slash_completion_input(input: &str) -> bool {
