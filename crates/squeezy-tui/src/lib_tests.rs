@@ -4749,6 +4749,9 @@ fn test_config(mode: SessionMode) -> AppConfig {
             ..Default::default()
         },
         config_sources: vec!["defaults".to_string()],
+        // See `test_agent`: keep the test fixture off the real workspace so
+        // `Agent::new` / `TuiApp::new` don't crawl the repo on every test.
+        workspace_root: temp_workspace("config"),
         ..Default::default()
     }
 }
