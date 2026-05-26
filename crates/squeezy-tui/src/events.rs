@@ -36,18 +36,35 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.note_turn_started();
                 }
                 AgentEvent::ReasoningDelta { delta, .. } => {
-                    if app.show_reasoning_usage {
-                        app.pending_reasoning.push_str(&delta);
-                    }
+                    // Always accumulate, even when show_reasoning_usage is
+                    // off: the live render gates on the toggle separately,
+                    // and the ReasoningSegment handler uses this buffer as a
+                    // fallback when the provider's reasoning payload arrives
+                    // with an empty summary (OpenAI's standard case — text
+                    // streams via reasoning_text.delta events only, and
+                    // response.output_item.done ships summary = []).
+                    app.pending_reasoning.push_str(&delta);
                 }
-                AgentEvent::ReasoningSegment { snapshot, .. } => {
+                AgentEvent::ReasoningSegment { mut snapshot, .. } => {
                     // Each reasoning block ends with its own segment event.
-                    // Drop the live "thinking..." buffer (the next block will
-                    // start fresh) and persist the segment as its own
-                    // collapsible transcript entry so the user can still
-                    // read it after tools or text move on.
-                    app.pending_reasoning.clear();
-                    if app.show_reasoning_usage && !snapshot.display_text.trim().is_empty() {
+                    // OpenAI's payload arrives with an empty summary in the
+                    // common case; fall back to the live streamed buffer so
+                    // the persisted transcript entry isn't blank.
+                    if snapshot.display_text.trim().is_empty()
+                        && !app.pending_reasoning.trim().is_empty()
+                    {
+                        snapshot.display_text = std::mem::take(&mut app.pending_reasoning);
+                    } else {
+                        app.pending_reasoning.clear();
+                    }
+                    // Always persist to the transcript. The agent loop
+                    // already records reasoning into the conversation
+                    // history (LlmInputItem::Reasoning) independent of UI
+                    // state; this transcript entry is the *display* record.
+                    // Rendering gates on `show_reasoning_usage`, so toggling
+                    // the option off hides the entry without dropping the
+                    // data — flipping it back on reveals historical blocks.
+                    if !snapshot.display_text.trim().is_empty() {
                         app.push_reasoning_segment(snapshot);
                     }
                 }
@@ -112,7 +129,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     if is_control_tool_name(&call.name) {
                         app.status = "planning".to_string();
                     } else {
-                        app.status = format!("running {}", tool_call_label(&call));
+                        let label = tool_call_label(&call);
+                        app.status = format!("running {label}");
+                        // Surface in-flight tool work in the transcript so a
+                        // long-running call is visible while it runs, not
+                        // only after ToolCallCompleted lands. The result
+                        // entry appears below this log line on completion.
+                        app.push_log(format!("→ {label}"));
                         app.remember_active_tool_call(call);
                     }
                 }
