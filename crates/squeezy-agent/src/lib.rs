@@ -6444,55 +6444,32 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
-        if call.name == DELEGATE_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Delegate,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == EXPLORE_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Explore,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == DELEGATE_PLAN_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Plan,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == DELEGATE_REVIEW_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Review,
-                    broker,
-                ))
-                .await,
-            );
+        let subagent_kind = match call.name.as_str() {
+            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
+            EXPLORE_TOOL_NAME => Some(SubagentKind::Explore),
+            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
+            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
+            _ => None,
+        };
+        if let Some(kind) = subagent_kind {
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallStarted {
+                    turn_id: context.turn_id,
+                    call: redact_tool_call(call.clone(), &context.redactor),
+                    origin: context.origin,
+                })
+                .await;
+            let result = Box::pin(handle_subagent_call(&context, call, kind, broker)).await;
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
