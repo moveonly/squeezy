@@ -1650,6 +1650,53 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
 }
 
 #[tokio::test]
+async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
+    // Reasoning models burn many tokens before emitting visible content. The
+    // DocHelp path *must not* inherit the tool-summary cap (sized for
+    // Explore/Delegate synopses) — otherwise the OpenAI Responses API errors
+    // with `response.incomplete: max_output_tokens` and the help turn falls
+    // back to the unsupported message. See the comment on
+    // `DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS`.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_doc_help_budget".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
+    // Construct a config where `max_summary_tokens` is deliberately tiny so
+    // we can prove DocHelp does *not* read its budget from that knob. If
+    // DocHelp ever silently regresses to the summary cap, this assertion
+    // fires loudly.
+    let mut config = AppConfig::default();
+    config.subagents.max_summary_tokens = 800;
+    let agent = Agent::new(config, provider.clone());
+
+    let mut rx = agent.start_turn(
+        "/help changing the model".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "exactly one doc-help subagent request");
+    let request = &requests[0];
+    let max_output = request
+        .max_output_tokens
+        .expect("doc-help subagent must set max_output_tokens");
+    assert!(
+        max_output >= squeezy_core::DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS,
+        "doc-help budget {max_output} must be >= DOC_HELP floor {}",
+        squeezy_core::DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS
+    );
+    assert_ne!(
+        max_output, 800,
+        "doc-help must not read its budget from subagents.max_summary_tokens",
+    );
+}
+
+#[tokio::test]
 async fn bang_command_completes_locally_without_provider_request() {
     let root = temp_workspace("agent_local_bang");
     fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");

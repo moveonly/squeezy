@@ -35,7 +35,8 @@ use ratatui::{
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
+    PendingConfigSwap, RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision,
+    ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
@@ -66,6 +67,7 @@ mod overlay;
 mod proposed_plan;
 mod render;
 mod resume_picker;
+mod settings_watcher;
 mod status;
 mod streaming;
 mod streaming_patch;
@@ -342,9 +344,19 @@ async fn run_inner(
     }
     terminal.set_exit_hint(exit_hint(agent.session_id().as_deref()));
 
+    let mut settings_watcher = settings_watcher::SettingsWatcher::new();
+    // Poll mtimes roughly once per second; tick_rate defaults to 50ms.
+    let settings_poll_every = (1000 / config.tick_rate.as_millis().max(1) as u64).max(1);
+
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
         app.app_notifications.tick();
+        if app.animation_tick.is_multiple_of(settings_poll_every)
+            && app.config_screen.is_none()
+            && settings_watcher.poll()
+        {
+            apply_external_settings_reload(&mut app, &mut agent);
+        }
         terminal.draw_app(&mut app)?;
 
         drain_job_events(&mut app);
@@ -562,6 +574,71 @@ async fn apply_plan_choice(
             let mut next = pending.clone();
             next.selection_index = 0;
             app.pending_plan_choice = Some(next);
+        }
+    }
+}
+
+/// External `settings.toml` edit observed by `SettingsWatcher` — rebuild the
+/// effective `AppConfig` and apply it to the agent. Provider-identical edits
+/// (every knob except provider variant) snap immediately via
+/// `Agent::replace_config`; a provider switch is armed as a `NextPrompt`
+/// swap so an in-flight turn keeps talking to the client it started with.
+///
+/// Read errors are surfaced as a notification but do not interrupt the
+/// session — the most common cause is mid-write (the editor truncating the
+/// file before re-writing) and the next poll will see the finished file.
+fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
+    use crate::notification::Severity;
+
+    let new_cfg = match AppConfig::from_env_and_settings() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            app.app_notifications
+                .push(format!("settings reload failed: {err}"), Severity::Warn);
+            return;
+        }
+    };
+    let old_provider = agent.provider_name();
+    let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
+    if old_provider == new_provider {
+        agent.replace_config(new_cfg);
+        app.app_notifications
+            .push("settings reloaded from disk".to_string(), Severity::Info);
+        return;
+    }
+    let provider_cfg = new_cfg.provider.clone();
+    let handle = std::thread::spawn(move || squeezy_llm::provider_from_config(&provider_cfg));
+    match handle.join() {
+        Ok(Ok(provider)) => {
+            agent.arm_config_swap(PendingConfigSwap {
+                config: new_cfg,
+                provider: Some(provider),
+                display_note: Some(format!(
+                    "provider {old_provider} → {new_provider} (applies on next prompt)"
+                )),
+            });
+            app.app_notifications.push(
+                format!(
+                    "settings reloaded — provider {old_provider} → {new_provider} arms on next prompt"
+                ),
+                Severity::Info,
+            );
+        }
+        Ok(Err(err)) => {
+            agent.replace_config(new_cfg);
+            app.app_notifications.push(
+                format!(
+                    "settings reloaded, but the new {new_provider} client failed to build: {err}"
+                ),
+                Severity::Error,
+            );
+        }
+        Err(_) => {
+            agent.replace_config(new_cfg);
+            app.app_notifications.push(
+                "settings reloaded, but the provider client thread panicked".to_string(),
+                Severity::Error,
+            );
         }
     }
 }
@@ -4163,14 +4240,34 @@ fn user_prompt_content_line(marker: &'static str, line: &str, width: Option<u16>
     let padding = user_prompt_surface_width(marker, width)
         .map(|surface_width| " ".repeat(surface_width.saturating_sub(text_width)))
         .unwrap_or_default();
-    Line::from(vec![
-        user_prompt_marker_span(marker),
-        Span::styled(
+    let mut spans = vec![user_prompt_marker_span(marker)];
+    // First content line of a user message can carry a `/<command>` prefix.
+    // We keep the rest of the line in white so multi-word prompts like
+    // `/help changing the model` stay legible while the recognised command
+    // pops in amber.
+    let slash_len = (marker == "> ")
+        .then(|| input::match_slash_command_prefix(line))
+        .flatten();
+    if let Some(len) = slash_len {
+        let (prefix, rest) = line.split_at(len);
+        spans.push(Span::styled(
+            prefix.to_string(),
+            Style::default().fg(AMBER).bg(PROMPT_BG),
+        ));
+        if !rest.is_empty() {
+            spans.push(Span::styled(
+                rest.to_string(),
+                Style::default().fg(Color::White).bg(PROMPT_BG),
+            ));
+        }
+    } else {
+        spans.push(Span::styled(
             line.to_string(),
             Style::default().fg(Color::White).bg(PROMPT_BG),
-        ),
-        Span::styled(padding, Style::default().bg(PROMPT_BG)),
-    ])
+        ));
+    }
+    spans.push(Span::styled(padding, Style::default().bg(PROMPT_BG)));
+    Line::from(spans)
 }
 
 fn user_prompt_surface_width(marker: &str, width: Option<u16>) -> Option<usize> {
@@ -6191,6 +6288,11 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
     }
     let cursor = input_cursor(app);
     let parts = app.input.split('\n').collect::<Vec<_>>();
+    // Slash highlight only applies to the first line of input — slash
+    // commands are always at the start of a prompt, never embedded later.
+    let slash_len = parts
+        .first()
+        .and_then(|first| input::match_slash_command_prefix(first));
     let mut line_start = 0usize;
     parts
         .iter()
@@ -6210,32 +6312,72 @@ fn prompt_input_content_lines(app: &TuiApp) -> Vec<Line<'static>> {
             };
             let mut spans = prefix;
             let line_end = line_start + line.len();
+            let slash_split = if index == 0 { slash_len } else { None };
+            let style_text_at = |abs_offset: usize| -> Style {
+                let base = Style::default().bg(PROMPT_BG);
+                match slash_split {
+                    Some(len) if abs_offset < len => base.fg(AMBER),
+                    _ => base.fg(Color::White),
+                }
+            };
             if cursor >= line_start && cursor <= line_end {
                 let split_at = cursor.saturating_sub(line_start).min(line.len());
                 let (before, after) = line.split_at(split_at);
                 if !before.is_empty() {
-                    spans.push(Span::styled(
-                        before.to_string(),
-                        Style::default().fg(Color::White).bg(PROMPT_BG),
-                    ));
+                    push_styled_segments(
+                        &mut spans,
+                        before,
+                        line_start,
+                        slash_split,
+                        style_text_at,
+                    );
                 }
                 spans.push(prompt_cursor_span());
                 if !after.is_empty() {
-                    spans.push(Span::styled(
-                        after.to_string(),
-                        Style::default().fg(Color::White).bg(PROMPT_BG),
-                    ));
+                    let after_start = line_start + split_at;
+                    push_styled_segments(
+                        &mut spans,
+                        after,
+                        after_start,
+                        slash_split,
+                        style_text_at,
+                    );
                 }
             } else {
-                spans.push(Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::White).bg(PROMPT_BG),
-                ));
+                push_styled_segments(&mut spans, line, line_start, slash_split, style_text_at);
             }
             line_start = line_end.saturating_add(1);
             Line::from(spans)
         })
         .collect()
+}
+
+/// Push one or two styled spans for `chunk`, splitting on the slash
+/// boundary when the chunk straddles it so the amber prefix and the white
+/// rest remain visually distinct on the live input row.
+fn push_styled_segments(
+    spans: &mut Vec<Span<'static>>,
+    chunk: &str,
+    chunk_start: usize,
+    slash_split: Option<usize>,
+    style_text_at: impl Fn(usize) -> Style,
+) {
+    let chunk_end = chunk_start + chunk.len();
+    if let Some(split) = slash_split
+        && chunk_start < split
+        && split < chunk_end
+    {
+        let local = split - chunk_start;
+        let (head, tail) = chunk.split_at(local);
+        if !head.is_empty() {
+            spans.push(Span::styled(head.to_string(), style_text_at(chunk_start)));
+        }
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail.to_string(), style_text_at(split)));
+        }
+        return;
+    }
+    spans.push(Span::styled(chunk.to_string(), style_text_at(chunk_start)));
 }
 
 fn prompt_blank_line() -> Line<'static> {
