@@ -82,6 +82,7 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
+pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 
 // Emergency belt on tool rounds per turn — codex and opencode loop
 // unbounded; CC only caps explicit-purpose subagents (its
@@ -4009,13 +4010,22 @@ impl TurnRuntime {
                     self.record_replay_model_text_delta(&tail);
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                let raw_assistant_text = std::mem::take(&mut assistant_message);
                 // Reasoning blobs and segment events have already been pushed
                 // by the `LlmEvent::ReasoningDone` arm above; only the
                 // assistant text remains.
+                //
+                // Conversation state keeps the raw text (including any
+                // `<proposed_plan>` block) so the model retains its own
+                // prior plan when refining next turn. The displayed and
+                // persisted transcript drops the block — the structured
+                // Plan card is the canonical visualization.
                 conversation.push(redact_input_item(
-                    LlmInputItem::AssistantText(message.content.clone()),
+                    LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
+                ));
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &raw_assistant_text,
                 ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -4055,10 +4065,13 @@ impl TurnRuntime {
                 }
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                let raw_assistant_text = std::mem::take(&mut assistant_message);
                 conversation.push(redact_input_item(
-                    LlmInputItem::AssistantText(message.content.clone()),
+                    LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
+                ));
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &raw_assistant_text,
                 ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
