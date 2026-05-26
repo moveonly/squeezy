@@ -42,12 +42,6 @@ pub(crate) fn render_diff_file(file: &DiffFile) -> Vec<Line<'static>> {
     render_patch(patch)
 }
 
-pub(crate) fn render_patch_preview_lines(patch: &str, limit: usize) -> Vec<Line<'static>> {
-    let lines = parse_patch(patch);
-    let lines = head_tail(lines, limit);
-    render_parsed_lines(&lines)
-}
-
 pub(crate) fn render_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
     render_patch(patch)
 }
@@ -218,32 +212,6 @@ fn is_diff_metadata_line(line: &str) -> bool {
         || line.starts_with("index ")
         || line.starts_with("--- ")
         || line.starts_with("+++ ")
-}
-
-fn head_tail(mut lines: Vec<DiffLine>, limit: usize) -> Vec<DiffLine> {
-    if lines.len() <= limit {
-        return lines;
-    }
-    let head = limit / 2;
-    let tail = limit.saturating_sub(head).saturating_sub(1);
-    let omitted = lines.len().saturating_sub(head + tail);
-    let mut preview = lines.drain(..head).collect::<Vec<_>>();
-    preview.push(DiffLine {
-        kind: DiffLineKind::Hunk,
-        old: None,
-        new: None,
-        content: format!("... +{omitted} lines (Ctrl-E to expand)"),
-    });
-    preview.extend(
-        lines
-            .into_iter()
-            .rev()
-            .take(tail)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev(),
-    );
-    preview
 }
 
 fn decimal_width(value: u32) -> usize {
