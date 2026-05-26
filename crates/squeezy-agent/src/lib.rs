@@ -3655,7 +3655,13 @@ impl TurnRuntime {
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
         if self.cancel.is_cancelled() {
-            self.finish_cancelled_turn(&task_title).await;
+            self.finish_cancelled_turn(
+                &task_title,
+                &total_cost,
+                &broker.metrics,
+                &broker.calibration,
+            )
+            .await;
             return Ok(());
         }
 
@@ -3724,7 +3730,13 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             if self.append_implicit_skill_instructions(
@@ -3786,7 +3798,13 @@ impl TurnRuntime {
         let mut instructions_cache: [Option<String>; 2] = [None, None];
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             if let Some(status) = broker.session_cap_reached() {
@@ -3794,6 +3812,13 @@ impl TurnRuntime {
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
                     &task_title,
+                )
+                .await;
+                self.persist_turn_accounting(
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                    false,
                 )
                 .await;
                 let _ = self
@@ -3861,7 +3886,13 @@ impl TurnRuntime {
                     .await?
             {
                 if self.cancel.is_cancelled() {
-                    self.finish_cancelled_turn(&task_title).await;
+                    self.finish_cancelled_turn(
+                        &task_title,
+                        &total_cost,
+                        &broker.metrics,
+                        &broker.calibration,
+                    )
+                    .await;
                     return Ok(());
                 }
                 match event {
@@ -3957,7 +3988,13 @@ impl TurnRuntime {
                         break;
                     }
                     LlmEvent::Cancelled => {
-                        self.finish_cancelled_turn(&task_title).await;
+                        self.finish_cancelled_turn(
+                            &task_title,
+                            &total_cost,
+                            &broker.metrics,
+                            &broker.calibration,
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
@@ -4093,7 +4130,13 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             last_tool_round_summary = tool_round_failure_summary(&results);
@@ -4285,44 +4328,26 @@ impl TurnRuntime {
             context_compaction,
             token_calibration,
         } = input;
-        let mut state = self.conversation_state.lock().await;
-        state.conversation = conversation.to_vec();
-        state.previous_response_id = if self.config.store_responses {
-            response_id.clone()
-        } else {
-            None
-        };
-        state.transcript.push(user);
-        state.transcript.push(assistant.clone());
-        // Pins added concurrently to this turn (via /pin) are pushed into
-        // `state.context_compaction.pinned` under the same lock. Merge them
-        // into the locally tracked compaction state so the pre-turn clone
-        // does not silently clobber a pin landed mid-turn.
-        let mut merged_compaction = context_compaction;
-        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
-        state.context_compaction = merged_compaction;
-        merge_cost(&mut state.cost, cost);
-        state.metrics.merge_turn(metrics);
-        state.redactions += metrics.redactions;
-        state.token_calibration = token_calibration.clone();
-        if let Some(session) = &self.session_log {
-            let _ = session.write_resume_state(&state.to_resume_state());
-            let calibration_for_metadata = state.token_calibration.clone();
-            let _ = session.update_metadata(|metadata| {
-                metadata.cost = state.cost.clone();
-                metadata.metrics = state.metrics.clone();
-                metadata.redactions = state.redactions;
-                metadata.resume_available = true;
-                metadata.mode = load_session_mode(&self.session_mode);
-                metadata.token_calibration = calibration_for_metadata;
-            });
+        {
+            let mut state = self.conversation_state.lock().await;
+            state.conversation = conversation.to_vec();
+            state.previous_response_id = if self.config.store_responses {
+                response_id.clone()
+            } else {
+                None
+            };
+            state.transcript.push(user);
+            state.transcript.push(assistant.clone());
+            // Pins added concurrently to this turn (via /pin) are pushed into
+            // `state.context_compaction.pinned` under the same lock. Merge them
+            // into the locally tracked compaction state so the pre-turn clone
+            // does not silently clobber a pin landed mid-turn.
+            let mut merged_compaction = context_compaction;
+            merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+            state.context_compaction = merged_compaction;
         }
-        // Mirror the calibration into the cross-session file so brand-new
-        // sessions (no resume metadata yet) seed off a recent ratio rather
-        // than the per-provider defaults. Failures are silent — the global
-        // file is a warm-start cache, not a source of truth.
-        let _ = SessionStore::open(&self.config).save_global_calibration(&state.token_calibration);
-        drop(state);
+        self.persist_turn_accounting(cost, metrics, &token_calibration, true)
+            .await;
         let summary = self.current_task_summary().await.unwrap_or_else(|| {
             if assistant.content.trim().is_empty() {
                 "assistant completed".to_string()
@@ -4377,7 +4402,60 @@ impl TurnRuntime {
         .await;
     }
 
-    async fn finish_cancelled_turn(&self, task_title: &str) {
+    /// Merge per-turn cost/metrics/redactions and the latest token
+    /// calibration into the conversation state and mirror them into the
+    /// session metadata file.
+    ///
+    /// `mark_resume_available` is only `true` on the success path: a
+    /// cancelled or failed turn must not flip the resume flag, since the
+    /// conversation slice was not advanced. `previous_response_id` is left
+    /// alone for the same reason — the provider-side response chain must
+    /// not jump past a turn we never persisted.
+    async fn persist_turn_accounting(
+        &self,
+        cost: &CostSnapshot,
+        metrics: &TurnMetrics,
+        token_calibration: &squeezy_llm::TokenCalibration,
+        mark_resume_available: bool,
+    ) {
+        let calibration_for_global = {
+            let mut state = self.conversation_state.lock().await;
+            merge_cost(&mut state.cost, cost);
+            state.metrics.merge_turn(metrics);
+            state.redactions += metrics.redactions;
+            state.token_calibration = token_calibration.clone();
+            if let Some(session) = &self.session_log {
+                let _ = session.write_resume_state(&state.to_resume_state());
+                let calibration_for_metadata = state.token_calibration.clone();
+                let _ = session.update_metadata(|metadata| {
+                    metadata.cost = state.cost.clone();
+                    metadata.metrics = state.metrics.clone();
+                    metadata.redactions = state.redactions;
+                    if mark_resume_available {
+                        metadata.resume_available = true;
+                    }
+                    metadata.mode = load_session_mode(&self.session_mode);
+                    metadata.token_calibration = calibration_for_metadata;
+                });
+            }
+            state.token_calibration.clone()
+        };
+        // Mirror the calibration into the cross-session file so brand-new
+        // sessions (no resume metadata yet) seed off a recent ratio rather
+        // than the per-provider defaults. Failures are silent — the global
+        // file is a warm-start cache, not a source of truth.
+        let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
+    }
+
+    async fn finish_cancelled_turn(
+        &self,
+        task_title: &str,
+        cost: &CostSnapshot,
+        metrics: &TurnMetrics,
+        token_calibration: &squeezy_llm::TokenCalibration,
+    ) {
+        self.persist_turn_accounting(cost, metrics, token_calibration, false)
+            .await;
         self.publish_terminal_task_state(
             TaskStateStatus::Cancelled,
             Some("turn cancelled".to_string()),

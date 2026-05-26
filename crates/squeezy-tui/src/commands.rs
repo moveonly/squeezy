@@ -36,56 +36,99 @@ pub(crate) fn parse_report_preview_args(
 pub(crate) fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> String {
     let cost = &snapshot.cost;
     let metrics = &snapshot.metrics;
-    format!(
-        "Cost accounting\n\
-session={}\n\
-provider={} model={} mode={}\n\
-estimated_usd={} (estimated from provider-reported usage and local pricing metadata)\n\
-provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
-tools calls={} successes={} errors={} denials={} cancellations={} budget_denials={}\n\
-subagents calls={} failures={} estimated_usd={} input={} output={} tool_calls={} budget_denials={}\n\
-receipts stub_hits={} negative_stub_hits={} total_hits={}\n\
-spills writes={} reads={}\n\
-io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={} subagent_bytes_read={} subagent_files_scanned={} subagent_model_output_bytes={}\n\
-redactions={}\n\
-accuracy=provider token counters are provider-reported when available; USD is an estimate, not a billing authority.",
-        snapshot.session_id.as_deref().unwrap_or("-"),
+    let mut lines: Vec<String> = Vec::with_capacity(12);
+    lines.push("Cost accounting".to_string());
+    lines.push(format!(
+        "session={}",
+        snapshot.session_id.as_deref().unwrap_or("-")
+    ));
+    lines.push(format!(
+        "provider={} model={} mode={}",
         snapshot.provider,
         snapshot.model,
         snapshot.mode.as_str(),
+    ));
+    lines.push(format!(
+        "estimated_usd={} (estimated from provider-reported usage and local pricing metadata)",
         format_cost(cost),
+    ));
+    lines.push(format!(
+        "provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}",
         format_optional_u64(cost.input_tokens),
         format_optional_u64(cost.output_tokens),
         format_optional_u64(cost.reasoning_output_tokens),
         format_optional_u64(cost.cached_input_tokens),
         format_optional_u64(cost.cache_write_input_tokens),
-        metrics.tool_calls,
-        metrics.tool_successes,
-        metrics.tool_errors,
-        metrics.tool_denials,
-        metrics.tool_cancellations,
-        metrics.budget_denials,
-        metrics.subagent_calls,
-        metrics.subagent_failures,
-        format_cost(&metrics.subagent_provider),
-        format_optional_u64(metrics.subagent_provider.input_tokens),
-        format_optional_u64(metrics.subagent_provider.output_tokens),
-        metrics.subagent_tool_calls,
-        metrics.subagent_budget_denials,
-        metrics.receipt_stub_hits,
-        metrics.negative_receipt_hits,
-        metrics.receipt_stub_hits + metrics.negative_receipt_hits,
-        metrics.spill_writes,
-        metrics.spill_reads,
-        metrics.bytes_read,
-        metrics.files_scanned,
-        metrics.matches_returned,
-        metrics.model_output_bytes,
-        metrics.subagent_bytes_read,
-        metrics.subagent_files_scanned,
-        metrics.subagent_model_output_bytes,
-        snapshot.redactions,
-    )
+    ));
+    let tool_activity = metrics.tool_calls
+        + metrics.tool_successes
+        + metrics.tool_errors
+        + metrics.tool_denials
+        + metrics.tool_cancellations
+        + metrics.budget_denials;
+    if tool_activity > 0 {
+        lines.push(format!(
+            "tools calls={} successes={} errors={} denials={} cancellations={} budget_denials={}",
+            metrics.tool_calls,
+            metrics.tool_successes,
+            metrics.tool_errors,
+            metrics.tool_denials,
+            metrics.tool_cancellations,
+            metrics.budget_denials,
+        ));
+    }
+    if metrics.subagent_calls > 0 {
+        lines.push(format!(
+            "subagents calls={} failures={} estimated_usd={} input={} output={} tool_calls={} budget_denials={}",
+            metrics.subagent_calls,
+            metrics.subagent_failures,
+            format_cost(&metrics.subagent_provider),
+            format_optional_u64(metrics.subagent_provider.input_tokens),
+            format_optional_u64(metrics.subagent_provider.output_tokens),
+            metrics.subagent_tool_calls,
+            metrics.subagent_budget_denials,
+        ));
+    }
+    let receipt_total = metrics.receipt_stub_hits + metrics.negative_receipt_hits;
+    if receipt_total > 0 {
+        lines.push(format!(
+            "receipts stub_hits={} negative_stub_hits={} total_hits={}",
+            metrics.receipt_stub_hits, metrics.negative_receipt_hits, receipt_total,
+        ));
+    }
+    if metrics.spill_writes + metrics.spill_reads > 0 {
+        lines.push(format!(
+            "spills writes={} reads={}",
+            metrics.spill_writes, metrics.spill_reads,
+        ));
+    }
+    let io_activity = metrics.bytes_read
+        + metrics.files_scanned
+        + metrics.matches_returned
+        + metrics.model_output_bytes
+        + metrics.subagent_bytes_read
+        + metrics.subagent_files_scanned
+        + metrics.subagent_model_output_bytes;
+    if io_activity > 0 {
+        lines.push(format!(
+            "io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={} subagent_bytes_read={} subagent_files_scanned={} subagent_model_output_bytes={}",
+            metrics.bytes_read,
+            metrics.files_scanned,
+            metrics.matches_returned,
+            metrics.model_output_bytes,
+            metrics.subagent_bytes_read,
+            metrics.subagent_files_scanned,
+            metrics.subagent_model_output_bytes,
+        ));
+    }
+    if snapshot.redactions > 0 {
+        lines.push(format!("redactions={}", snapshot.redactions));
+    }
+    lines.push(
+        "accuracy=provider token counters are provider-reported when available; USD is an estimate, not a billing authority."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 pub(crate) fn format_context_command(snapshot: &SessionAccountingSnapshot) -> String {

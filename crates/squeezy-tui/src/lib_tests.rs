@@ -1709,8 +1709,89 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
         output.contains("provider_tokens input=- output=-"),
         "{output}"
     );
-    assert!(output.contains("tools calls=0"), "{output}");
+    // Empty buckets are suppressed so a fresh session is a short report,
+    // not a wall of zero-valued counters.
+    assert!(!output.contains("tools calls="), "{output}");
+    assert!(!output.contains("subagents calls="), "{output}");
+    assert!(!output.contains("receipts stub_hits="), "{output}");
+    assert!(!output.contains("spills writes="), "{output}");
+    assert!(!output.contains("\nio bytes_read="), "{output}");
+    assert!(!output.contains("\nredactions="), "{output}");
     assert!(app.jobs.is_empty());
+}
+
+#[test]
+fn format_cost_command_renders_active_buckets() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+
+    let metrics = SessionMetrics {
+        tool_calls: 4,
+        tool_successes: 3,
+        tool_errors: 1,
+        bytes_read: 12_345,
+        subagent_calls: 1,
+        subagent_provider: CostSnapshot {
+            input_tokens: Some(900),
+            output_tokens: Some(120),
+            estimated_usd_micros: Some(7_500),
+            ..CostSnapshot::default()
+        },
+        receipt_stub_hits: 2,
+        spill_writes: 1,
+        ..SessionMetrics::default()
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-1".to_string()),
+        provider: "scripted",
+        model: "gpt-5.5".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            estimated_usd_micros: Some(415_300),
+            ..CostSnapshot::default()
+        },
+        metrics,
+        redactions: 2,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+    };
+
+    let output = commands::format_cost_command(&snapshot);
+    assert!(output.contains("estimated_usd=$0.415300"), "{output}");
+    assert!(output.contains("provider_tokens input=1200"), "{output}");
+    assert!(
+        output.contains("tools calls=4 successes=3 errors=1"),
+        "{output}"
+    );
+    assert!(output.contains("subagents calls=1"), "{output}");
+    assert!(output.contains("receipts stub_hits=2"), "{output}");
+    assert!(output.contains("spills writes=1"), "{output}");
+    assert!(output.contains("io bytes_read=12345"), "{output}");
+    assert!(output.contains("redactions=2"), "{output}");
 }
 
 #[tokio::test]
