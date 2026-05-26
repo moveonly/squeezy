@@ -3417,6 +3417,146 @@ fn compaction_strategy_parse_round_trip() {
     }
 }
 
+/// Provider that scripts the parent's first round (a `delegate` tool call),
+/// scripts the subagent's first round (a rejected tool call + cost), and then
+/// returns a pending stream for every subsequent stream — so the subagent's
+/// second round hangs and the wall-clock timeout fires.
+struct SubagentTimeoutProvider {
+    calls: Mutex<usize>,
+}
+
+impl SubagentTimeoutProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl LlmProvider for SubagentTimeoutProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut calls = self.calls.lock().expect("calls");
+        *calls += 1;
+        let n = *calls;
+        drop(calls);
+        match n {
+            1 => {
+                let events = vec![
+                    Ok(LlmEvent::Started),
+                    Ok(LlmEvent::ToolCall(LlmToolCall {
+                        call_id: "del_1".to_string(),
+                        name: "delegate".to_string(),
+                        arguments: json!({"prompt": "hang please"}),
+                    })),
+                    Ok(LlmEvent::Completed {
+                        response_id: Some("resp_parent_1".to_string()),
+                        cost: CostSnapshot::default(),
+                    }),
+                ];
+                let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+                    Box::pin(stream::iter(events));
+                stream
+            }
+            2 => {
+                // Subagent's first round: drive a tool call we will reject so
+                // the loop continues past the empty-tool-calls fast path, and
+                // ship a non-zero cost so partial metrics are observable when
+                // the wall-clock timer fires in the next round.
+                let events = vec![
+                    Ok(LlmEvent::Started),
+                    Ok(LlmEvent::ToolCall(LlmToolCall {
+                        call_id: "sub_1".to_string(),
+                        name: "definitely_not_a_real_tool".to_string(),
+                        arguments: json!({}),
+                    })),
+                    Ok(LlmEvent::Completed {
+                        response_id: Some("resp_sub_1".to_string()),
+                        cost: CostSnapshot {
+                            input_tokens: Some(42),
+                            output_tokens: Some(7),
+                            estimated_usd_micros: Some(1_234),
+                            ..CostSnapshot::default()
+                        },
+                    }),
+                ];
+                let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+                    Box::pin(stream::iter(events));
+                stream
+            }
+            _ => Box::pin(stream::pending()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn subagent_wall_clock_timeout_terminates_with_partial_metrics() {
+    let provider = Arc::new(SubagentTimeoutProvider::new());
+    let mut config = AppConfig::default();
+    // 1s budget keeps the test fast while staying well above scheduler noise.
+    config.subagents.max_runtime_secs = Some(1);
+    let agent = Agent::new(config, provider.clone());
+
+    let cancel = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let mut rx = agent.start_turn("delegate to the void".to_string(), cancel.clone());
+    let mut saw_timeout = false;
+    let mut subagent_metrics = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::SubagentFailed {
+            agent,
+            error,
+            metrics,
+            ..
+        } = event
+        {
+            assert_eq!(agent, "delegate");
+            assert!(
+                error.contains("wall-clock") || error.contains("timed_out"),
+                "timeout error should be self-describing: {error}"
+            );
+            subagent_metrics = Some(metrics);
+            saw_timeout = true;
+            cancel.cancel();
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    // Drain any tail events without blocking the test on the parent's
+    // post-cancel teardown.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+
+    assert!(
+        saw_timeout,
+        "expected SubagentFailed for the timed-out delegate"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "timeout fired in {elapsed:?}, expected <2.5s"
+    );
+    let metrics = subagent_metrics.expect("metrics captured");
+    // Partial cost from round 1 must survive the timeout. If we accidentally
+    // returned `TurnMetrics::default()`, every counter below would be zero.
+    // `SubagentFailed.metrics` carries the subagent's own TurnMetrics, so
+    // the spent tokens land on `provider` (the parent later folds them into
+    // its own `subagent_provider` via `merge_subagent_tool_metrics`).
+    assert_eq!(
+        metrics.provider.input_tokens,
+        Some(42),
+        "partial provider cost dropped on timeout: {metrics:?}"
+    );
+    assert!(
+        metrics.model_output_bytes > 0,
+        "model_output_bytes from the rejected tool result should be preserved: {metrics:?}"
+    );
+}
+
 #[tokio::test]
 async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_times_out() {
     use squeezy_core::Redactor;

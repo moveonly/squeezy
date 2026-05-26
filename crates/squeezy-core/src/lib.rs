@@ -106,6 +106,14 @@ pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
 // token, and per-tool-call truncations should already have caught
 // any runaway.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
+// Wall-clock ceiling for a single subagent run. None of the per-call
+// budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
+// time, so a slow model stream or a chain of slow tool calls can pin the
+// parent indefinitely without ever tripping them. 300s sits well above the
+// median Explore/Plan/Review run while still guaranteeing the parent's turn
+// loop reclaims control on the order of minutes. Set to `0` in TOML or
+// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
+pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 300;
 // Generous default that absorbs reasoning-model overhead. The previous 1_200
 // silently broke any subagent run under a reasoning model with effort >= medium:
 // reasoning alone burns several thousand tokens before the model can emit a
@@ -849,9 +857,13 @@ impl AppConfig {
             self.subagents.max_model_rounds
         ));
         output.push_str(&format!(
-            "max_summary_tokens = {}\n\n",
+            "max_summary_tokens = {}\n",
             self.subagents.max_summary_tokens
         ));
+        match self.subagents.max_runtime_secs {
+            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n\n")),
+            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n\n"),
+        }
 
         output.push_str("[budgets]\n");
         output.push_str(&format!(
@@ -2847,6 +2859,7 @@ pub struct SubagentSettings {
     pub max_search_files_per_call: Option<u64>,
     pub max_model_rounds: Option<usize>,
     pub max_summary_tokens: Option<u32>,
+    pub max_runtime_secs: Option<u64>,
 }
 
 impl SubagentSettings {
@@ -2862,6 +2875,7 @@ impl SubagentSettings {
                 "max_search_files_per_call",
                 "max_model_rounds",
                 "max_summary_tokens",
+                "max_runtime_secs",
             ],
             source,
             path,
@@ -2910,6 +2924,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_summary_tokens"),
             )?,
+            max_runtime_secs: u64_value(
+                table,
+                "max_runtime_secs",
+                source,
+                &field(path, "max_runtime_secs"),
+            )?,
         })
     }
 
@@ -2931,6 +2951,7 @@ impl SubagentSettings {
         );
         replace_if_some(&mut self.max_model_rounds, next.max_model_rounds);
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
+        replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
     }
 }
 
@@ -2944,6 +2965,10 @@ pub struct SubagentConfig {
     pub max_search_files_per_call: u64,
     pub max_model_rounds: usize,
     pub max_summary_tokens: u32,
+    /// Wall-clock cap on a single subagent run. `None` (set via TOML
+    /// `max_runtime_secs = 0` or `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0`)
+    /// disables the timeout entirely; cancellation and round caps remain.
+    pub max_runtime_secs: Option<u64>,
 }
 
 impl SubagentConfig {
@@ -2992,6 +3017,13 @@ impl SubagentConfig {
                 .filter(|value| *value > 0)
                 .or(settings.max_summary_tokens)
                 .unwrap_or(DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS),
+            max_runtime_secs: {
+                let raw = get_var("SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or(settings.max_runtime_secs)
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS);
+                if raw == 0 { None } else { Some(raw) }
+            },
         }
     }
 }
@@ -3007,6 +3039,7 @@ impl Default for SubagentConfig {
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+            max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
         }
     }
 }

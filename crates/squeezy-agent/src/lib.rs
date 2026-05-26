@@ -5509,6 +5509,99 @@ async fn run_subagent_loop(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
+    let runtime_budget = config.subagents.max_runtime_secs.map(Duration::from_secs);
+    let Some(budget) = runtime_budget else {
+        return run_subagent_rounds(
+            parent,
+            config,
+            tool_specs,
+            allowed_tools,
+            allowed_tool_names,
+            instructions,
+            hidden_tx,
+            local_jobs,
+            local_task_state,
+            local_loaded_schemas,
+            local_mode,
+            local_exploration,
+            seen_outputs,
+            broker,
+            assistant_stream,
+            assistant_message,
+            conversation,
+            supporting_receipts,
+            model,
+        )
+        .await;
+    };
+    let loop_model = model.clone();
+    let timed = tokio::time::timeout(
+        budget,
+        run_subagent_rounds(
+            parent,
+            config,
+            tool_specs,
+            allowed_tools,
+            allowed_tool_names,
+            instructions,
+            hidden_tx,
+            local_jobs,
+            local_task_state,
+            local_loaded_schemas,
+            local_mode,
+            local_exploration,
+            seen_outputs,
+            broker,
+            assistant_stream,
+            assistant_message,
+            conversation,
+            supporting_receipts,
+            loop_model,
+        ),
+    )
+    .await;
+    match timed {
+        Ok(execution) => execution,
+        Err(_) => {
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            SubagentExecution {
+                status: ToolStatus::Error,
+                summary: String::new(),
+                status_label: "timed_out",
+                error: Some(format!(
+                    "subagent exceeded {}s wall-clock budget",
+                    budget.as_secs()
+                )),
+                metrics: broker.metrics.clone(),
+                supporting_receipts: std::mem::take(supporting_receipts),
+                model,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_rounds(
+    parent: &ToolExecutionContext<'_>,
+    config: &AppConfig,
+    tool_specs: &[Arc<LlmToolSpec>],
+    allowed_tools: &[AdvertisedTool],
+    allowed_tool_names: &BTreeSet<String>,
+    instructions: &str,
+    hidden_tx: &mpsc::Sender<AgentEvent>,
+    local_jobs: &JobRegistry,
+    local_task_state: &Arc<Mutex<Option<TaskStateSnapshot>>>,
+    local_loaded_schemas: &Arc<Mutex<Vec<String>>>,
+    local_mode: &Arc<AtomicU8>,
+    local_exploration: &Arc<Mutex<ExplorationTurnState>>,
+    seen_outputs: &mut SeenToolOutputs,
+    broker: &mut CostBroker,
+    assistant_stream: &mut StreamRedactor,
+    assistant_message: &mut String,
+    conversation: &mut Vec<LlmInputItem>,
+    supporting_receipts: &mut Vec<Value>,
+    model: String,
+) -> SubagentExecution {
     for _round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
         let llm_request = LlmRequest {
