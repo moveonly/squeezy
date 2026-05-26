@@ -233,6 +233,50 @@ pub struct UnifiedDiffOutcome {
     pub skipped_paths: Vec<String>,
 }
 
+/// Kind of `apply_patch` operation surfaced to a preview consumer.
+///
+/// Mirrors the op tags accepted by the `apply_patch` tool so the preview
+/// stream stays meaningful even when the consumer never sees the full
+/// argument payload. Tag values match the `ApplyPatchOperation` JSON shape
+/// in `squeezy-tools` so the TUI can render a single label for both
+/// streamed previews and post-apply receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchOpKind {
+    SearchReplace,
+    CreateFile,
+    DeleteFile,
+    MoveFile,
+}
+
+/// One streamed preview item produced by [`preview_patch_stream`].
+///
+/// Each entry stands for a single op the model has fully described in the
+/// JSON tool-arg payload so far. Hashes are sha256 hex digests of the raw
+/// `search`/`replace`/`contents` bytes — emitting hashes instead of payload
+/// text keeps the preview channel cheap when an op rewrites a large block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchOpPreview {
+    /// Zero-based op index in the payload order.
+    pub index: usize,
+    pub kind: PatchOpKind,
+    /// Primary path: the file being mutated for in-place ops, or the
+    /// destination path for `MoveFile`.
+    pub path: String,
+    /// Source path for `MoveFile`. `None` for every other op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<String>,
+    /// sha256 of the `search` body for `SearchReplace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_hash: Option<String>,
+    /// sha256 of the `replace` body for `SearchReplace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_hash: Option<String>,
+    /// sha256 of the `contents` body for `CreateFile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointJournal {
     pub checkpoints: Vec<CheckpointRecord>,
@@ -1722,6 +1766,138 @@ fn capped_patch(bytes: Vec<u8>, max_bytes: usize) -> Patch {
         String::from_utf8_lossy(&bytes).to_string()
     };
     Patch { text, truncated }
+}
+
+/// Walk an `apply_patch` JSON payload and emit one [`PatchOpPreview`] per op
+/// in payload order.
+///
+/// Used by the TUI to render an incremental preview while the model is still
+/// streaming tool-arg tokens: callers feed the fully-parsed payload (or a
+/// snapshot of the partial payload that has reached a `{...}` boundary) and
+/// the closure is invoked synchronously once per op the walker recognises.
+/// `sink` is the stream surface — collect, throttle, or push onto a channel
+/// from inside the closure. Returns the number of ops emitted.
+///
+/// The payload is the same JSON shape `apply_patch` itself consumes. Both
+/// the multi-op `operations` array (preferred) and the legacy `patches`
+/// array of search/replace blocks are recognised. Unknown fields are
+/// ignored so a partial JSON snapshot that omits optional keys still
+/// produces a usable preview. Returns `Err` only when the payload is not
+/// parseable as JSON.
+pub fn preview_patch_stream<F>(payload: &str, mut sink: F) -> Result<usize>
+where
+    F: FnMut(PatchOpPreview),
+{
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|err| SqueezyError::Tool(format!("apply_patch payload not valid JSON: {err}")))?;
+    let mut index = 0usize;
+    if let Some(operations) = value.get("operations").and_then(|ops| ops.as_array()) {
+        for op in operations {
+            if let Some(preview) = op_preview_from_operation(index, op) {
+                sink(preview);
+                index += 1;
+            }
+        }
+    }
+    if let Some(patches) = value.get("patches").and_then(|patches| patches.as_array()) {
+        for patch in patches {
+            if let Some(preview) = op_preview_from_search_replace(index, patch) {
+                sink(preview);
+                index += 1;
+            }
+        }
+    }
+    Ok(index)
+}
+
+fn op_preview_from_operation(index: usize, op: &serde_json::Value) -> Option<PatchOpPreview> {
+    let kind = op.get("kind").and_then(|kind| kind.as_str())?;
+    match kind {
+        "search_replace" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::SearchReplace,
+                path,
+                from_path: None,
+                search_hash: op
+                    .get("search")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+                replace_hash: op
+                    .get("replace")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+                contents_hash: None,
+            })
+        }
+        "create_file" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::CreateFile,
+                path,
+                from_path: None,
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: op
+                    .get("contents")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+            })
+        }
+        "delete_file" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::DeleteFile,
+                path,
+                from_path: None,
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: None,
+            })
+        }
+        "move_file" => {
+            let from = op.get("from").and_then(|from| from.as_str())?.to_string();
+            let to = op.get("to").and_then(|to| to.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::MoveFile,
+                path: to,
+                from_path: Some(from),
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn op_preview_from_search_replace(
+    index: usize,
+    patch: &serde_json::Value,
+) -> Option<PatchOpPreview> {
+    let path = patch
+        .get("path")
+        .and_then(|path| path.as_str())?
+        .to_string();
+    Some(PatchOpPreview {
+        index,
+        kind: PatchOpKind::SearchReplace,
+        path,
+        from_path: None,
+        search_hash: patch
+            .get("search")
+            .and_then(|value| value.as_str())
+            .map(|text| sha256_hex(text.as_bytes())),
+        replace_hash: patch
+            .get("replace")
+            .and_then(|value| value.as_str())
+            .map(|text| sha256_hex(text.as_bytes())),
+        contents_hash: None,
+    })
 }
 
 pub fn parse_patch_hunks(patch: &str) -> Vec<DiffHunk> {
