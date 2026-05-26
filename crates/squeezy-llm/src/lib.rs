@@ -70,6 +70,11 @@ pub struct LlmRequest {
     pub store: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<LlmOutputSchema>,
+    /// When `Some(false)`, force the OpenAI Responses API to issue tool
+    /// calls serially. `None` leaves the OpenAI default (parallel) in
+    /// place. Only the OpenAI provider currently reads this; other
+    /// providers ignore it.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl LlmRequest {
@@ -91,6 +96,7 @@ impl LlmRequest {
             tools: Arc::from(Vec::new()),
             store: false,
             output_schema: None,
+            parallel_tool_calls: None,
         }
     }
 }

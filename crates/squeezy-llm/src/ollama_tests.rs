@@ -26,6 +26,7 @@ fn request_body_uses_chat_stream_shape() {
         ]),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -67,6 +68,7 @@ fn request_body_preserves_function_tool_order() {
         ]),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OllamaProvider::request_body(&request);

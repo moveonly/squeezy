@@ -140,6 +140,15 @@ impl OpenAiProvider {
                     .collect::<Vec<_>>()
             );
         }
+        if let Some(parallel) = request.parallel_tool_calls {
+            // OpenAI's Responses API defaults to parallel tool calls; only
+            // forward an explicit override when the caller opts out
+            // (`Some(false)`) so the request body stays compact for the
+            // common case.
+            if !parallel {
+                body["parallel_tool_calls"] = json!(false);
+            }
+        }
         body
     }
 }

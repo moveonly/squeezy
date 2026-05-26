@@ -30,6 +30,7 @@ fn request_body_uses_messages_streaming_shape() {
         ]),
         store: true,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -77,6 +78,7 @@ fn request_body_preserves_function_tool_order() {
         ]),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -99,6 +101,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -131,6 +134,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -170,6 +174,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -230,6 +235,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         ]),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -264,6 +270,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         ]),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -288,6 +295,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
