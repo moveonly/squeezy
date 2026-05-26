@@ -5649,6 +5649,7 @@ async fn run_subagent_loop(
                 metrics: broker.metrics.clone(),
                 supporting_receipts: std::mem::take(supporting_receipts),
                 model,
+                structured_output: None,
             }
         }
     }

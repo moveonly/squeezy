@@ -1016,7 +1016,9 @@ impl Driver {
                         },
                     )?;
                 }
-                AgentEvent::ReasoningDelta { .. } | AgentEvent::ReasoningSegment { .. } => {}
+                AgentEvent::ReasoningDelta { .. }
+                | AgentEvent::ReasoningSegment { .. }
+                | AgentEvent::ShellSandboxBestEffortFallback { .. } => {}
                 AgentEvent::Completed {
                     turn_id,
                     cost,
