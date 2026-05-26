@@ -610,34 +610,19 @@ fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Opt
 
 /// Inheritance badge label shown next to the field's value.
 ///
-/// The vocabulary is intentionally uniform across tabs:
-///   - `[env]`                — overridden by an environment variable.
-///   - `[inherited-default]`  — falls through to the binary defaults.
-///   - `[inherited-<tier>]`   — falls through to a higher-precedence tier.
-///   - empty string           — the value lives in the active tab's file.
-///
-/// We deliberately render no badge when the value is owned by the active
-/// tab: the tab strip at the top already says which tier you're editing,
-/// and repeating "user" on every row in the User tab is pure visual
-/// noise. The other badges remain informative because they signal a
-/// value that comes from somewhere other than the file you're looking at.
-pub(crate) fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
+/// Returns `[env]` when the running value is dictated by an environment
+/// variable — the only case worth surfacing inline, because env-shadowed
+/// fields are inert in the editor and Enter / Space refuses to write
+/// them. Every other source (own tier, inherited tier, binary default)
+/// is rendered without a trailing badge: the displayed value is the
+/// effective one, the tier the user is editing is already visible in
+/// the tab strip, and badges like "repo" or "[inherited-default]" turn
+/// out to be noise that the user has to mentally filter on every row.
+pub(crate) fn inheritance_label(_active: ConfigScope, source: FieldSource) -> String {
     if source == FieldSource::Env {
-        return "[env]".to_string();
-    }
-    if source == FieldSource::Default {
-        return "[inherited-default]".to_string();
-    }
-    let scope_of_source = match source {
-        FieldSource::User => ConfigScope::User,
-        FieldSource::Project => ConfigScope::Repo,
-        FieldSource::Repo => ConfigScope::Local,
-        FieldSource::Env | FieldSource::Default => unreachable!(),
-    };
-    if scope_of_source == active {
-        String::new()
+        "[env]".to_string()
     } else {
-        format!("[inherited-{}]", scope_of_source.label().to_lowercase())
+        String::new()
     }
 }
 
