@@ -182,22 +182,10 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
 
 fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Status, String)) {
     match provider {
-        ProviderConfig::OpenAi(c) => (
-            "openai",
-            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
-        ),
-        ProviderConfig::Anthropic(c) => (
-            "anthropic",
-            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
-        ),
-        ProviderConfig::Google(c) => (
-            "google",
-            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
-        ),
-        ProviderConfig::AzureOpenAi(c) => (
-            "azure_openai",
-            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
-        ),
+        ProviderConfig::OpenAi(c) => ("openai", env_check(&c.api_key_env)),
+        ProviderConfig::Anthropic(c) => ("anthropic", env_check(&c.api_key_env)),
+        ProviderConfig::Google(c) => ("google", env_check(&c.api_key_env)),
+        ProviderConfig::AzureOpenAi(c) => ("azure_openai", env_check(&c.api_key_env)),
         ProviderConfig::Bedrock(c) => (
             "bedrock",
             (
@@ -212,26 +200,19 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 format!("base_url={} (no API key required)", c.base_url),
             ),
         ),
-        ProviderConfig::OpenAiCompatible(c) => (
-            c.preset.as_str(),
-            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
-        ),
+        ProviderConfig::OpenAiCompatible(c) => (c.preset.as_str(), env_check(&c.api_key_env)),
     }
 }
 
-fn env_check(env_name: &str, keychain: Option<&str>) -> (Status, String) {
+fn env_check(env_name: &str) -> (Status, String) {
     if env::var(env_name).is_ok() {
         return (Status::Ok, format!("{env_name} is set"));
     }
-    if let Some(keychain) = keychain {
-        return (
-            Status::Warn,
-            format!("{env_name} not set; will try keychain entry {keychain}"),
-        );
-    }
     (
         Status::Warn,
-        format!("{env_name} not set (set it before starting a session)"),
+        format!(
+            "{env_name} not set; set it or save it via the TUI config screen to the OS keychain"
+        ),
     )
 }
 

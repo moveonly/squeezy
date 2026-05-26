@@ -35,7 +35,6 @@ async fn vertex_chat_completions_streaming_costly() -> Result<()> {
     let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
         preset: PRESET,
         api_key_env: API_KEY_ENV.to_string(),
-        api_key_keychain: None,
         base_url,
         extra_headers: BTreeMap::new(),
         transport: ProviderTransportConfig::default(),

@@ -12,7 +12,7 @@ fn env_check_reports_ok_when_var_set() {
     unsafe {
         env::set_var("SQUEEZY_DOCTOR_TEST_KEY", "1");
     }
-    let (status, detail) = env_check("SQUEEZY_DOCTOR_TEST_KEY", None);
+    let (status, detail) = env_check("SQUEEZY_DOCTOR_TEST_KEY");
     unsafe {
         env::remove_var("SQUEEZY_DOCTOR_TEST_KEY");
     }
@@ -21,23 +21,12 @@ fn env_check_reports_ok_when_var_set() {
 }
 
 #[test]
-fn env_check_warns_when_unset_with_keychain_fallback() {
+fn env_check_warns_when_unset() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     unsafe {
         env::remove_var("SQUEEZY_DOCTOR_TEST_MISSING");
     }
-    let (status, detail) = env_check("SQUEEZY_DOCTOR_TEST_MISSING", Some("squeezy:test"));
-    assert_eq!(status, Status::Warn);
-    assert!(detail.contains("keychain"));
-}
-
-#[test]
-fn env_check_warns_when_unset_without_keychain() {
-    let _guard = ENV_LOCK.lock().expect("env lock");
-    unsafe {
-        env::remove_var("SQUEEZY_DOCTOR_TEST_MISSING2");
-    }
-    let (status, _) = env_check("SQUEEZY_DOCTOR_TEST_MISSING2", None);
+    let (status, _) = env_check("SQUEEZY_DOCTOR_TEST_MISSING");
     assert_eq!(status, Status::Warn);
 }
 
