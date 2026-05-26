@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     io::{self, Write},
     path::PathBuf,
@@ -4951,6 +4951,45 @@ struct EditChangedFile {
     patch_truncated: bool,
 }
 
+/// Extract the file paths an apply_patch / write_file invocation targets,
+/// used to dedupe transient failure/success pairs in [`TuiApp::recent_edit_failures`].
+/// Falls back across the several places the path may live: the result
+/// content (success path), the result `failed_path` field (apply_patch
+/// fallback), and the call arguments (write_file).
+fn edit_target_paths(result: &ToolResult, call: Option<&ToolCall>) -> Vec<PathBuf> {
+    if !matches!(result.tool_name.as_str(), "apply_patch" | "write_file") {
+        return Vec::new();
+    }
+    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Some(files) = result.content["files"].as_array() {
+        for item in files {
+            if let Some(path) = item["path"].as_str() {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(files) = result.content["checkpoint"]["files"].as_array() {
+        for item in files {
+            if let Some(path) = item["path"].as_str() {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(failed_path) = result.content["failed_path"].as_str() {
+        paths.insert(PathBuf::from(failed_path));
+    }
+    if let Some(path) = result.content["path"].as_str() {
+        paths.insert(PathBuf::from(path));
+    }
+    if paths.is_empty()
+        && let Some(call) = call
+        && let Some(path) = string_arg(&call.arguments, "path")
+    {
+        paths.insert(PathBuf::from(path));
+    }
+    paths.into_iter().collect()
+}
+
 fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
     let mut files = tool.result.content["checkpoint"]["files"]
         .as_array()
@@ -5108,21 +5147,21 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
         }
         "repo_map" => "repo map".to_string(),
         "definition_search" => string_arg(&call.arguments, "query")
-            .map(|query| format!("definition search for {query}"))
+            .map(|query| format!("definition search for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "definition search".to_string()),
         "reference_search" => string_arg(&call.arguments, "query")
             .or_else(|| string_arg(&call.arguments, "symbol_id"))
-            .map(|query| format!("reference search for {query}"))
+            .map(|query| format!("reference search for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "reference search".to_string()),
         "symbol_context" => string_arg(&call.arguments, "query")
-            .map(|query| format!("symbol context for {query}"))
+            .map(|query| format!("symbol context for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "symbol context".to_string()),
         "grep" => string_arg(&call.arguments, "query")
             .or_else(|| string_arg(&call.arguments, "pattern"))
-            .map(|query| format!("grep {query}"))
+            .map(|query| format!("grep {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "grep".to_string()),
         "glob" => string_arg(&call.arguments, "pattern")
-            .map(|pattern| format!("glob {pattern}"))
+            .map(|pattern| format!("glob {}", compact_text(&pattern, 60)))
             .unwrap_or_else(|| "glob".to_string()),
         "read_file" | "read_slice" => string_arg(&call.arguments, "path")
             .map(|path| format!("read {path}"))
@@ -5140,7 +5179,7 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
             .map(|url| format!("fetch {url}"))
             .unwrap_or_else(|| "web fetch".to_string()),
         "websearch" => string_arg(&call.arguments, "query")
-            .map(|query| format!("web search {query}"))
+            .map(|query| format!("web search {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "web search".to_string()),
         _ => call.name.clone(),
     }
@@ -5248,21 +5287,15 @@ fn expanded_shell_detail_lines(
 
 fn collapsed_shell_preview_lines(
     tool: &ToolTranscript,
-    width: Option<u16>,
+    _width: Option<u16>,
 ) -> Option<Vec<Line<'static>>> {
     if !matches!(tool.result.tool_name.as_str(), "shell" | "verify")
         || tool.result.status != ToolStatus::Success
     {
         return None;
     }
-    let mut lines = shell_output_block_lines(tool, Some(SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES));
-    if lines.is_empty() {
-        None
-    } else {
-        lines.insert(0, transcript_separator_line(width));
-        lines.push(transcript_separator_line(width));
-        Some(lines)
-    }
+    let lines = shell_output_block_lines(tool, Some(SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES));
+    if lines.is_empty() { None } else { Some(lines) }
 }
 
 fn shell_output_block_lines(
@@ -5318,11 +5351,6 @@ fn shell_output_line(content: &str) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     spans.extend(styled_output_spans(content));
     Line::from(spans)
-}
-
-fn transcript_separator_line(width: Option<u16>) -> Line<'static> {
-    let width = width.unwrap_or(96).max(8) as usize;
-    Line::from(Span::styled("─".repeat(width), Style::default().fg(QUIET)))
 }
 
 fn expanded_decl_search_detail_lines(
@@ -6594,7 +6622,48 @@ fn status_left_text(app: &TuiApp) -> String {
     } else {
         "no repo"
     };
-    format!("dir {} · git {}", app.directory, branch)
+    let mut base = format!("dir {} · git {}", app.directory, branch);
+    if let Some(segment) = turn_progress_segment(app) {
+        base.push_str(" · ");
+        base.push_str(&segment);
+    }
+    base
+}
+
+/// Compact mid-turn progress segment for the status bar — replaces the
+/// per-tool "running this turn: ... tokens · $X" and per-second "shell
+/// still running (Ns)" lines that used to be appended to the transcript
+/// log.
+fn turn_progress_segment(app: &TuiApp) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tool) = app.active_tool.as_deref()
+        && let Some(elapsed_ms) = app.active_tool_elapsed_ms
+    {
+        parts.push(format!("⟳ {tool} {:.0}s", elapsed_ms as f64 / 1000.0));
+    }
+    if let Some(progress) = app.turn_progress {
+        parts.push(format!(
+            "{} tools · {} in · ${:.4}",
+            progress.tool_count,
+            compact_token_count(progress.input_tokens),
+            progress.micro_usd as f64 / 1_000_000.0,
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.2}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn mode_status_text(app: &TuiApp) -> String {
@@ -7174,6 +7243,19 @@ pub(crate) struct TuiApp {
     pub(crate) needs_redraw: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
+    /// Elapsed time on the currently-running tool, sourced from the
+    /// 1Hz `AgentEvent::ToolProgress` heartbeat. Cleared when the tool
+    /// finishes or the turn ends.
+    pub(crate) active_tool_elapsed_ms: Option<u64>,
+    /// Latest mid-turn cost snapshot, surfaced in the status bar instead
+    /// of being appended to the transcript log on every stride.
+    pub(crate) turn_progress: Option<TurnProgress>,
+    /// File paths whose most recent edit failed within the current turn,
+    /// mapped to the transcript entry id of that failure. When a later
+    /// edit on the same file succeeds, the failure row is removed so a
+    /// noisy `unified-diff fallback could not apply cleanly` that the
+    /// agent immediately recovered from doesn't end up in scrollback.
+    pub(crate) recent_edit_failures: HashMap<PathBuf, u64>,
     pub(crate) cost: squeezy_core::CostSnapshot,
     /// Session-level cap in USD micros, sourced from
     /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)
@@ -7331,6 +7413,9 @@ impl TuiApp {
             needs_redraw: true,
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
+            active_tool_elapsed_ms: None,
+            turn_progress: None,
+            recent_edit_failures: HashMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             metrics: squeezy_core::TurnMetrics::default(),
@@ -7360,7 +7445,38 @@ impl TuiApp {
         }
         self.last_turn_duration = None;
         self.terminal_title_state = TerminalTitleState::Working;
+        self.turn_progress = None;
+        self.active_tool_elapsed_ms = None;
+        self.recent_edit_failures.clear();
         self.needs_redraw = true;
+    }
+
+    /// Record the latest mid-turn cost/token snapshot for the status
+    /// bar. Repeated identical resends (the broker fires on a tool-count
+    /// stride, not a token delta) are dropped so the status bar doesn't
+    /// flicker.
+    pub(crate) fn update_turn_progress(
+        &mut self,
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
+    ) {
+        let snapshot = TurnProgress {
+            tool_count,
+            input_tokens,
+            micro_usd,
+        };
+        if self.turn_progress == Some(snapshot) {
+            return;
+        }
+        self.turn_progress = Some(snapshot);
+    }
+
+    /// Update the active-tool elapsed clock. The tool name itself is
+    /// already tracked by [`Self::remember_active_tool_call`]; we only
+    /// need the elapsed-ms refresh from the 1Hz heartbeat.
+    pub(crate) fn note_active_tool_progress(&mut self, _tool_name: &str, elapsed_ms: u64) {
+        self.active_tool_elapsed_ms = Some(elapsed_ms);
     }
 
     pub(crate) fn note_turn_finished(&mut self) {
@@ -7368,6 +7484,10 @@ impl TuiApp {
             self.last_turn_duration = Some(started_at.elapsed());
         }
         self.terminal_title_state = TerminalTitleState::Notification;
+        // Status-bar progress snapshots only describe a live turn. The
+        // end-of-turn footer prints final totals separately.
+        self.turn_progress = None;
+        self.active_tool_elapsed_ms = None;
         self.needs_redraw = true;
     }
 
@@ -7400,6 +7520,29 @@ impl TuiApp {
         if tool_result_hidden_by_default(&result) {
             return;
         }
+        // Edit-family results that fail and then succeed on the same path
+        // within a turn are usually the apply_patch fallback dance, not a
+        // user-actionable error. Drop the prior failure row when the new
+        // row is a success; record the new failure row when it fails.
+        let edit_paths = edit_target_paths(&result, call.as_ref());
+        if !edit_paths.is_empty() {
+            match result.status {
+                ToolStatus::Success => {
+                    let removed: Vec<u64> = edit_paths
+                        .iter()
+                        .filter_map(|path| self.recent_edit_failures.remove(path))
+                        .collect();
+                    if !removed.is_empty() {
+                        self.transcript.retain(|entry| !removed.contains(&entry.id));
+                    }
+                }
+                ToolStatus::Error => {
+                    // Keep the entry id; we don't know it yet, so record
+                    // after pushing.
+                }
+                _ => {}
+            }
+        }
         let id = self.next_id();
         let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
         if let Some(last) = self.transcript.last_mut()
@@ -7407,7 +7550,18 @@ impl TuiApp {
         {
             return;
         }
+        let is_edit_failure = matches!(
+            entry.kind,
+            TranscriptEntryKind::ToolResult(ref t)
+                if matches!(t.result.tool_name.as_str(), "apply_patch" | "write_file")
+                    && t.result.status == ToolStatus::Error
+        );
         self.push_entry(entry);
+        if is_edit_failure {
+            for path in edit_paths {
+                self.recent_edit_failures.insert(path, id);
+            }
+        }
     }
 
     pub(crate) fn push_log(&mut self, message: String) {
@@ -7447,6 +7601,7 @@ impl TuiApp {
     pub(crate) fn clear_active_tools(&mut self) {
         self.active_tool = None;
         self.active_tool_calls.clear();
+        self.active_tool_elapsed_ms = None;
     }
 
     fn next_id(&mut self) -> u64 {
@@ -7675,6 +7830,15 @@ enum TranscriptCategory {
     Diffs,
     Receipts,
     Assistant,
+}
+
+/// Mid-turn cost/token snapshot surfaced in the status bar so the user
+/// can watch a turn's spend grow without log spam in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnProgress {
+    pub(crate) tool_count: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) micro_usd: u64,
 }
 
 pub(crate) struct PendingApproval {

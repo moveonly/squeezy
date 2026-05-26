@@ -5373,6 +5373,75 @@ fn temp_workspace(name: &str) -> PathBuf {
     root
 }
 
+#[test]
+fn apply_patch_failure_then_success_on_same_path_drops_the_failure_row() {
+    // Background: apply_patch's unified-diff fallback occasionally fails
+    // and the agent immediately retries with a full-file rewrite that
+    // succeeds. The user gains nothing from seeing the transient ✖ Failed
+    // row once we know the retry worked, so it gets pruned from the
+    // transcript on the matching success.
+    let mut app = test_app(SessionMode::Build);
+
+    let mut failure = sample_tool_result("apply_patch", "");
+    failure.status = ToolStatus::Error;
+    failure.content = serde_json::json!({
+        "error": "unified-diff fallback could not apply cleanly",
+        "failed_path": "src/middleware/open_beta_cache.rs",
+    });
+    app.push_tool_result_with_call(failure, None);
+    assert_eq!(app.transcript.len(), 1, "failure row recorded");
+
+    let mut success = sample_tool_result("apply_patch", "");
+    success.status = ToolStatus::Success;
+    success.content = serde_json::json!({
+        "files": [{ "path": "src/middleware/open_beta_cache.rs" }],
+    });
+    app.push_tool_result_with_call(success, None);
+
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "the prior failure row must be replaced, not stacked"
+    );
+    let kind = &app.transcript[0].kind;
+    match kind {
+        TranscriptEntryKind::ToolResult(tool) => {
+            assert_eq!(tool.result.status, ToolStatus::Success);
+        }
+        other => panic!("expected ToolResult entry, got {other:?}"),
+    }
+    assert!(
+        app.recent_edit_failures.is_empty(),
+        "tracker should be cleared after replay"
+    );
+}
+
+#[test]
+fn apply_patch_failure_on_different_path_is_not_suppressed_by_unrelated_success() {
+    let mut app = test_app(SessionMode::Build);
+
+    let mut failure = sample_tool_result("apply_patch", "");
+    failure.status = ToolStatus::Error;
+    failure.content = serde_json::json!({
+        "error": "unified-diff fallback could not apply cleanly",
+        "failed_path": "src/middleware/open_beta_cache.rs",
+    });
+    app.push_tool_result_with_call(failure, None);
+
+    let mut success = sample_tool_result("apply_patch", "");
+    success.status = ToolStatus::Success;
+    success.content = serde_json::json!({
+        "files": [{ "path": "src/other.rs" }],
+    });
+    app.push_tool_result_with_call(success, None);
+
+    assert_eq!(
+        app.transcript.len(),
+        2,
+        "failure on a different file should still be visible"
+    );
+}
+
 fn sample_tool_result(name: &str, output: &str) -> ToolResult {
     ToolResult {
         call_id: "call-1".to_string(),

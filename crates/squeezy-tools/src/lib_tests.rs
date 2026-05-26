@@ -4276,6 +4276,82 @@ fn unstructured_shape_keeps_head_and_tail_around_long_quiet_runs() {
 }
 
 #[test]
+fn unstructured_shape_drops_leading_whitespace_cargo_progress() {
+    // Real cargo output right-pads progress prefixes with leading
+    // whitespace; the noise filter has to ignore that whitespace so the
+    // lines actually get dropped.
+    let output = "   Compiling fnv v1.0.7\n   Downloading crates ...\n     Running tests/foo (target/debug/deps/foo-abc)\n     Finished `test` profile [unoptimized + debuginfo]\n";
+
+    let shaped = shape_shell_output("cargo test", output, "", false, Some(0));
+
+    assert!(
+        !shaped.stdout.contains("Compiling fnv"),
+        "expected leading-whitespace 'Compiling' line dropped, got: {}",
+        shaped.stdout
+    );
+    assert!(
+        !shaped.stdout.contains("Downloading crates"),
+        "expected 'Downloading crates' line dropped: {}",
+        shaped.stdout
+    );
+    assert!(
+        !shaped.stdout.contains("Running tests/foo"),
+        "expected 'Running tests/...' line dropped: {}",
+        shaped.stdout
+    );
+    // "Finished" is signal (it contains a real status) and should survive.
+    assert!(
+        shaped.stdout.contains("Finished"),
+        "expected 'Finished' line preserved: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn unstructured_shape_drops_empty_test_result_summaries() {
+    // libtest prints "test result: ok. 0 passed; 0 failed; ...; N filtered
+    // out" for every cargo-test binary that didn't match the filter. Each
+    // empty row is pure noise; only rows with real passes or failures
+    // should survive.
+    let output = "test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 100 filtered out; finished in 0.00s\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 72 filtered out; finished in 0.00s\ntest result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n";
+
+    let shaped = shape_shell_output("cargo test entitlement_cache", output, "", false, Some(0));
+
+    assert!(
+        shaped.stdout.contains("12 passed"),
+        "expected non-empty pass summary preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        shaped.stdout.contains("3 failed"),
+        "expected non-empty failure summary preserved: {}",
+        shaped.stdout
+    );
+    assert!(
+        !shaped.stdout.contains("0 passed; 0 failed"),
+        "expected empty (0 passed, 0 failed) summary dropped: {}",
+        shaped.stdout
+    );
+}
+
+#[test]
+fn unstructured_shape_dedupes_identical_signal_lines() {
+    // Cargo prints each compiler warning twice (lib target + lib test
+    // target). The shaper should fold byte-identical signal lines into
+    // one.
+    let output = "warning: associated function `is_fresh` is never used\nsome quiet line\nwarning: associated function `is_fresh` is never used\nfinal note\n";
+
+    let shaped = shape_shell_output("cargo test", output, "", false, Some(0));
+
+    let occurrences = shaped.stdout.matches("`is_fresh` is never used").count();
+    assert_eq!(
+        occurrences, 1,
+        "expected duplicate warning collapsed to one occurrence, got {} in: {}",
+        occurrences, shaped.stdout
+    );
+}
+
+#[test]
 fn web_tool_config_normalizes_blank_values() {
     let config = WebToolConfig {
         exa_mcp_url: "  ".to_string(),

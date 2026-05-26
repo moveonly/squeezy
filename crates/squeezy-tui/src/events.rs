@@ -309,28 +309,21 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     micro_usd,
                     ..
                 } => {
-                    // Surface progressive per-turn cost in the log only; the
-                    // transcript stays clean since the turn footer already
-                    // reports the final totals.
-                    app.push_log(format!(
-                        "running this turn: {} input tokens · ${:.4} (after {} tools)",
-                        input_tokens,
-                        micro_usd as f64 / 1_000_000.0,
-                        tool_count
-                    ));
+                    // Progressive per-turn cost lives in the status bar so
+                    // the transcript stays free of running-total noise.
+                    // Suppress identical resends (the broker fires on a
+                    // tool-count stride, not a token-delta).
+                    app.update_turn_progress(tool_count, input_tokens, micro_usd);
                 }
                 AgentEvent::ToolProgress {
                     tool_name,
                     elapsed_ms,
                     ..
                 } => {
-                    // The "running tool" line in the status bar is driven
-                    // by the active-tool tracker; log a heartbeat so the
-                    // event isn't silently dropped.
-                    app.push_log(format!(
-                        "{tool_name} still running ({:.1}s)",
-                        elapsed_ms as f64 / 1000.0
-                    ));
+                    // Heartbeat events feed the active-tool elapsed clock
+                    // in the status bar — never the transcript log, where
+                    // one append per second drowns the actual output.
+                    app.note_active_tool_progress(&tool_name, elapsed_ms);
                 }
                 AgentEvent::Cancelled { .. } => {
                     let mut message = "cancelled; edit prompt or retry".to_string();

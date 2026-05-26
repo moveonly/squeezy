@@ -3,7 +3,7 @@
 //! Split out of `lib.rs` (rjr.5 F01) so the registry's tool-dispatch impl is
 //! easier to navigate; nothing here touches `ToolRegistry` directly.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -192,8 +192,16 @@ fn libtest_signal_line(line: &str) -> bool {
         return false;
     }
     let lower = trimmed.to_ascii_lowercase();
-    lower.starts_with("test result:")
-        || lower.starts_with("failures:")
+    if lower.starts_with("test result:") {
+        // Filtered cargo runs print "test result: ok. 0 passed; 0 failed;
+        // 0 ignored; 0 measured; N filtered out" for every test binary
+        // that matched nothing — pure noise. Keep only rows that had
+        // actual passes or failures.
+        let had_passes = !lower.contains("0 passed");
+        let had_fails = !lower.contains("0 failed");
+        return had_passes || had_fails;
+    }
+    lower.starts_with("failures:")
         || lower.starts_with("thread '") && lower.contains("panicked")
         || lower.starts_with("panicked at")
         || lower.contains(" ... failed")
@@ -358,6 +366,10 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
     let mut head: Vec<String> = Vec::new();
     let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_BUDGET);
     let mut signal_lines: Vec<String> = Vec::new();
+    // Cargo emits each compiler diagnostic twice (once for the `(lib)`
+    // target, once for `(lib test)`) with byte-identical bodies. Suppress
+    // the duplicate so a single warning doesn't render twice.
+    let mut signal_seen: HashSet<String> = HashSet::new();
     let mut dropped = 0usize;
     let mut last_emitted: String = String::new();
     let mut repeats = 0usize;
@@ -392,7 +404,11 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
         last_emitted = trimmed.to_string();
         let shaped = trim_shaped_block(trimmed, 2_000);
         if line_has_signal(trimmed) {
-            signal_lines.push(shaped);
+            if signal_seen.insert(shaped.clone()) {
+                signal_lines.push(shaped);
+            } else {
+                dropped += 1;
+            }
         } else if head.len() < HEAD_BUDGET {
             head.push(shaped);
         } else {
@@ -428,7 +444,17 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
 }
 
 fn line_is_noise(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
+    // Cargo right-aligns its progress prefixes with leading whitespace
+    // ("   Compiling foo v1.0", "    Running tests/...", "  Downloading
+    // crates ..."), so prefix-match on the trimmed text or these never get
+    // dropped.
+    let lower = line.trim_start().to_ascii_lowercase();
+    if lower.starts_with("test result:") && lower.contains("0 passed") && lower.contains("0 failed")
+    {
+        // Filtered cargo runs print an empty "0 passed; 0 failed" summary
+        // for every test binary that matched nothing. Drop those.
+        return true;
+    }
     lower.starts_with("downloading ")
         || lower.starts_with("downloaded ")
         || lower.starts_with("compiling ")
