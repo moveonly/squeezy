@@ -6386,7 +6386,7 @@ fn expanded_edit_detail_lines(
         lines.push(detail_line(false, QUIET, summary));
         if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
             lines.push(detail_line(false, QUIET, "diff"));
-            lines.extend(render_diff_patch_full_lines(patch));
+            lines.extend(render_diff_patch_full_lines(patch, file.path.as_str()));
         }
     }
     if let Some(matches) = number_field(&tool.result.content, "matches") {
@@ -6533,8 +6533,8 @@ fn expanded_generic_tool_detail_lines(
     output_block_lines("details", &preview, verbosity)
 }
 
-fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
-    render::diff::render_patch_full_lines(patch)
+fn render_diff_patch_full_lines(patch: &str, path: &str) -> Vec<Line<'static>> {
+    render::diff::render_patch_full_lines(patch, render::diff::language_hint_from_path(path))
         .into_iter()
         .map(detail_rendered_line)
         .collect()

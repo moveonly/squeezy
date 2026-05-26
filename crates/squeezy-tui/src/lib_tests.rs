@@ -2726,31 +2726,35 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
     assert!(!rendered.contains("diff --git"), "{rendered}");
     assert!(!rendered.contains("index 123"), "{rendered}");
 
-    let add_span = lines
+    // Patch content is "old" / "new" — short strings that the highlighter
+    // labels as plain identifiers, so the sign + body fall back to the
+    // diff-foreground color. The bg tint, however, is always applied on
+    // +/- rows.
+    let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "+new")
-        .expect("add span");
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign span");
     assert_eq!(
-        add_span.style.fg,
+        add_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_ADD_FG,)
         ))
     );
-    assert_eq!(add_span.style.bg, None);
+    assert_eq!(add_sign.style.bg, Some(render::diff::diff_add_bg()));
 
-    let del_span = lines
+    let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "-old")
-        .expect("delete span");
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign span");
     assert_eq!(
-        del_span.style.fg,
+        del_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_DEL_FG,)
         ))
     );
-    assert_eq!(del_span.style.bg, None);
+    assert_eq!(del_sign.style.bg, Some(render::diff::diff_del_bg()));
 }
 
 #[test]
@@ -2938,25 +2942,28 @@ fn diff_render_colorizes_gutter() {
     };
 
     let lines = render::diff::render_diff_file(&file);
-    let add = lines
+    // The sign character carries the line's foreground colour; gutter,
+    // sign and content are split into separate spans so per-token syntax
+    // highlighting can attach colours to the body.
+    let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "+new")
-        .expect("add span");
-    let del = lines
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign span");
+    let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "-old")
-        .expect("delete span");
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign span");
 
     assert_eq!(
-        add.style.fg,
+        add_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_ADD_FG,)
         ))
     );
     assert_eq!(
-        del.style.fg,
+        del_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_DEL_FG,)
         ))
