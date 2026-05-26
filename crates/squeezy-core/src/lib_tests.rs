@@ -1847,6 +1847,124 @@ fn cli_and_env_both_tag_when_both_set() {
 }
 
 #[test]
+fn openrouter_provider_resolves_to_compatible_variant_with_preset_defaults() {
+    let settings = SettingsFile::default();
+    let config =
+        AppConfig::try_from_settings_and_env_vars(
+            settings,
+            Some("openrouter"),
+            |name| match name {
+                "OPENROUTER_BASE_URL" => None,
+                _ => None,
+            },
+        )
+        .expect("config builds");
+
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("openrouter must map to OpenAiCompatible variant");
+    };
+    assert_eq!(compatible.preset, OpenAiCompatiblePreset::OpenRouter);
+    assert_eq!(compatible.api_key_env, "OPENROUTER_API_KEY");
+    assert_eq!(compatible.base_url, DEFAULT_OPENROUTER_BASE_URL);
+    assert_eq!(config.model, DEFAULT_OPENROUTER_MODEL);
+    // Aggregator presets must not enable `store_responses` even when the user
+    // requests it; the OpenAI-Responses-only flag would be silently dropped
+    // by the chat-completions endpoint and confuse the cost meter.
+    assert!(!config.store_responses);
+}
+
+#[test]
+fn vertex_preset_templates_base_url_from_project_and_location() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "vertex".to_string(),
+        ProviderSettings {
+            vertex_project: Some("my-project".to_string()),
+            vertex_location: Some("europe-west4".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |name| match name {
+            "VERTEX_ACCESS_TOKEN" => Some("ya29.fake".to_string()),
+            _ => None,
+        })
+        .expect("vertex config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("vertex must map to OpenAiCompatible");
+    };
+    assert_eq!(compatible.preset, OpenAiCompatiblePreset::Vertex);
+    assert_eq!(
+        compatible.base_url,
+        "https://europe-west4-aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west4/endpoints/openapi"
+    );
+    assert_eq!(config.model, DEFAULT_VERTEX_MODEL);
+}
+
+#[test]
+fn vertex_preset_rejects_missing_project() {
+    let settings = SettingsFile::default();
+    let error = AppConfig::try_from_settings_and_env_vars(settings, Some("vertex"), |_| None)
+        .expect_err("vertex requires project");
+    assert!(
+        format!("{error}").contains("vertex_project"),
+        "error must explain the missing field, got: {error}"
+    );
+}
+
+#[test]
+fn aliases_map_to_compatible_presets() {
+    for (alias, expected) in [
+        ("vercel_ai", OpenAiCompatiblePreset::Vercel),
+        ("grok", OpenAiCompatiblePreset::XAi),
+        ("deep_seek", OpenAiCompatiblePreset::DeepSeek),
+        ("port_key", OpenAiCompatiblePreset::PortKey),
+        ("vertex_ai", OpenAiCompatiblePreset::Vertex),
+        ("google_vertex", OpenAiCompatiblePreset::Vertex),
+        ("custom", OpenAiCompatiblePreset::Custom),
+    ] {
+        // Some presets need extra fields filled in before the config can
+        // build: `custom` requires an explicit base_url, `vertex` requires
+        // a project so we can template the regional URL.
+        let mut providers = std::collections::BTreeMap::new();
+        if expected == OpenAiCompatiblePreset::Custom {
+            providers.insert(
+                "openai_compatible".to_string(),
+                ProviderSettings {
+                    api_key_env: Some("CUSTOM_KEY".to_string()),
+                    base_url: Some("https://custom.example/v1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        if expected == OpenAiCompatiblePreset::Vertex {
+            providers.insert(
+                "vertex".to_string(),
+                ProviderSettings {
+                    vertex_project: Some("alias-project".to_string()),
+                    vertex_location: Some("us-central1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let settings = SettingsFile {
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let config = AppConfig::try_from_settings_and_env_vars(settings, Some(alias), |_| None)
+            .unwrap_or_else(|err| panic!("alias {alias} should map: {err}"));
+        let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+            panic!("alias {alias} must map to OpenAiCompatible");
+        };
+        assert_eq!(compatible.preset, expected, "alias {alias}");
+    }
+}
+
+#[test]
 fn config_source_labels_strip_paths() {
     let mut config = AppConfig::from_env_vars(None, |_| None);
     config.config_sources = vec![

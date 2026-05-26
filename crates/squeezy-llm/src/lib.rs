@@ -12,13 +12,16 @@ pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
 mod anthropic;
 mod bedrock;
+mod compatible;
 mod credentials;
 mod google;
 mod keychain;
+pub mod model_discovery;
 mod ollama;
 mod openai;
 mod registry;
 mod retry;
+mod sse;
 pub mod tokens;
 pub use tokens::{
     DEFAULT_BYTES_PER_TOKEN, DEFAULT_EMA_ALPHA, ProviderCalibration, TokenCalibration,
@@ -27,6 +30,7 @@ pub use tokens::{
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
+pub use compatible::OpenAiCompatibleProvider;
 pub use credentials::{
     DefaultCredentialStore, KeyringCredentialStore, resolve_api_key, save_api_key,
     save_api_key_with_store,

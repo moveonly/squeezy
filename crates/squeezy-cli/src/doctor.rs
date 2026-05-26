@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::PathBuf, time::Duration};
 
 use clap::Args;
 use serde_json::json;
@@ -10,10 +10,15 @@ pub struct DoctorArgs {
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
     pub json: bool,
+    /// Probe the configured provider by issuing a tiny request to confirm
+    /// the auth + base_url work. Opt-in because it touches the network
+    /// (and, for first-party Anthropic, may consume a handful of tokens).
+    #[arg(long)]
+    pub probe: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Status {
+pub(crate) enum Status {
     Ok,
     Warn,
     Fail,
@@ -94,7 +99,7 @@ impl DoctorReport {
     }
 }
 
-pub fn run(args: &DoctorArgs) -> Result<DoctorReport> {
+pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     let version = env!("CARGO_PKG_VERSION");
     let target = env!("SQUEEZY_TARGET_TRIPLE");
     let mut checks = Vec::new();
@@ -143,6 +148,15 @@ pub fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             status: provider_check.0,
             detail: provider_check.1,
         });
+
+        if args.probe {
+            let (status, detail) = probe_provider(&config.provider).await;
+            checks.push(Check {
+                name: format!("probe:{provider_name}"),
+                status,
+                detail,
+            });
+        }
 
         checks.push(session_store_check(config));
     }
@@ -197,6 +211,10 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 Status::Ok,
                 format!("base_url={} (no API key required)", c.base_url),
             ),
+        ),
+        ProviderConfig::OpenAiCompatible(c) => (
+            c.preset.as_str(),
+            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
         ),
     }
 }
@@ -294,6 +312,220 @@ fn which(bin: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Live probe of the configured provider. Returns `(Status, detail)` so the
+/// caller can shove the result into a doctor `Check` row. The probe is
+/// intentionally cheap — most providers expose a `GET /models` listing that
+/// doesn't count against token budgets. Bedrock has no equivalent in the
+/// runtime crate we depend on, so it reports a warn rather than fail.
+pub(crate) async fn probe_provider(provider: &ProviderConfig) -> (Status, String) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return (Status::Warn, format!("could not build http client: {err}")),
+    };
+    match provider {
+        ProviderConfig::OpenAi(c) => {
+            probe_openai_compatible(&client, &c.base_url, env::var(&c.api_key_env).ok(), None).await
+        }
+        ProviderConfig::Anthropic(c) => {
+            // Anthropic added `GET /v1/models` in 2024; reuse the same shape
+            // as OpenAI-compatible, but with the `x-api-key` header.
+            probe_anthropic(&client, &c.base_url, env::var(&c.api_key_env).ok()).await
+        }
+        ProviderConfig::Google(c) => {
+            probe_google(&client, &c.base_url, env::var(&c.api_key_env).ok()).await
+        }
+        ProviderConfig::AzureOpenAi(c) => {
+            let key = env::var(&c.api_key_env).ok();
+            probe_azure_openai(&client, &c.base_url, &c.api_version, key).await
+        }
+        ProviderConfig::Bedrock(_) => (
+            Status::Warn,
+            "probe not implemented for Bedrock (no list-models endpoint in the runtime SDK)"
+                .to_string(),
+        ),
+        ProviderConfig::Ollama(c) => probe_ollama(&client, &c.base_url).await,
+        ProviderConfig::OpenAiCompatible(c) => {
+            let mut extra = Vec::new();
+            for (key, value) in &c.extra_headers {
+                extra.push((key.as_str(), value.as_str()));
+            }
+            probe_openai_compatible(
+                &client,
+                &c.base_url,
+                env::var(&c.api_key_env).ok(),
+                Some(extra),
+            )
+            .await
+        }
+    }
+}
+
+async fn probe_openai_compatible(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<String>,
+    extra_headers: Option<Vec<(&str, &str)>>,
+) -> (Status, String) {
+    let Some(api_key) = api_key.filter(|v| !v.trim().is_empty()) else {
+        return (
+            Status::Warn,
+            "skipping probe: API key env var is unset".to_string(),
+        );
+    };
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut request = client.get(&url).bearer_auth(api_key);
+    if let Some(headers) = extra_headers {
+        for (key, value) in headers {
+            request = request.header(key, value);
+        }
+    }
+    match request.send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                (Status::Ok, format!("GET {url} returned {status}"))
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                let snippet = body.chars().take(160).collect::<String>();
+                (
+                    Status::Fail,
+                    format!("GET {url} returned {status}: {snippet}"),
+                )
+            }
+        }
+        Err(err) => (Status::Fail, format!("GET {url} failed: {err}")),
+    }
+}
+
+async fn probe_anthropic(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<String>,
+) -> (Status, String) {
+    let Some(api_key) = api_key.filter(|v| !v.trim().is_empty()) else {
+        return (
+            Status::Warn,
+            "skipping probe: API key env var is unset".to_string(),
+        );
+    };
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    match client
+        .get(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                (Status::Ok, format!("GET {url} returned {status}"))
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                let snippet = body.chars().take(160).collect::<String>();
+                (
+                    Status::Fail,
+                    format!("GET {url} returned {status}: {snippet}"),
+                )
+            }
+        }
+        Err(err) => (Status::Fail, format!("GET {url} failed: {err}")),
+    }
+}
+
+async fn probe_google(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<String>,
+) -> (Status, String) {
+    let Some(api_key) = api_key.filter(|v| !v.trim().is_empty()) else {
+        return (
+            Status::Warn,
+            "skipping probe: API key env var is unset".to_string(),
+        );
+    };
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    match client
+        .get(&url)
+        .header("x-goog-api-key", api_key)
+        .send()
+        .await
+    {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                (Status::Ok, format!("GET {url} returned {status}"))
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                let snippet = body.chars().take(160).collect::<String>();
+                (
+                    Status::Fail,
+                    format!("GET {url} returned {status}: {snippet}"),
+                )
+            }
+        }
+        Err(err) => (Status::Fail, format!("GET {url} failed: {err}")),
+    }
+}
+
+async fn probe_azure_openai(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_version: &str,
+    api_key: Option<String>,
+) -> (Status, String) {
+    let Some(api_key) = api_key.filter(|v| !v.trim().is_empty()) else {
+        return (
+            Status::Warn,
+            "skipping probe: API key env var is unset".to_string(),
+        );
+    };
+    let url = format!(
+        "{}/models?api-version={api_version}",
+        base_url.trim_end_matches('/')
+    );
+    match client.get(&url).header("api-key", api_key).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                (Status::Ok, format!("GET {url} returned {status}"))
+            } else {
+                let body = response.text().await.unwrap_or_default();
+                let snippet = body.chars().take(160).collect::<String>();
+                (
+                    Status::Fail,
+                    format!("GET {url} returned {status}: {snippet}"),
+                )
+            }
+        }
+        Err(err) => (Status::Fail, format!("GET {url} failed: {err}")),
+    }
+}
+
+async fn probe_ollama(client: &reqwest::Client, base_url: &str) -> (Status, String) {
+    let url = format!("{}/tags", base_url.trim_end_matches('/'));
+    match client.get(&url).send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                (Status::Ok, format!("GET {url} returned {status}"))
+            } else {
+                (
+                    Status::Fail,
+                    format!("GET {url} returned {status} (Ollama running?)"),
+                )
+            }
+        }
+        Err(err) => (
+            Status::Fail,
+            format!("GET {url} failed: {err} (is the Ollama daemon running?)"),
+        ),
+    }
 }
 
 #[cfg(test)]

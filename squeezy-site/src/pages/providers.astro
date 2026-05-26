@@ -1,11 +1,17 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
-import { providerRows } from "../facts";
+import {
+  aggregatorRows,
+  cloudPlatformRows,
+  localRuntimeRows,
+  openAiCompatibleRows,
+  providerRows
+} from "../facts";
 ---
 
 <BaseLayout
   title="Providers · Squeezy"
-  description="Squeezy provider adapter support for OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, and Ollama."
+  description="Squeezy provider adapter support — aggregators, first-party vendor APIs, local runtime, and OpenAI-compatible services."
   active="providers"
 >
   <section class="page-hero">
@@ -14,16 +20,105 @@ import { providerRows } from "../facts";
       <h1>Bring your model. Keep the optimization local.</h1>
       <p class="lead">
         Squeezy keeps the agent runtime, code analysis, permissions, and cost
-        controls local, then routes model turns through OpenAI, Anthropic,
-        Google, Azure OpenAI, Amazon Bedrock, or Ollama under one tool loop.
+        controls local, then routes model turns through aggregators,
+        first-party vendor APIs, or local runtimes — all under one tool loop.
       </p>
     </div>
   </section>
 
   <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">aggregators</span>
+      <h2>One key, many models</h2>
+      <p>The fastest path to start. A single API key routes to every frontier model through the OpenAI-compatible Chat Completions API. OpenRouter also forwards Anthropic <code>cache_control</code> markers and reasoning effort, so caching and reasoning behave the same as a direct vendor call.</p>
+    </div>
+    <div class="matrix">
+      {
+        aggregatorRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">first-party vendor APIs</span>
+      <h2>Native endpoints from the model authors</h2>
+      <p>Each vendor exposes its own protocol — OpenAI Responses, Anthropic Messages, Gemini <code>streamGenerateContent</code> — wired up by a dedicated adapter.</p>
+    </div>
     <div class="matrix">
       {
         providerRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">cloud-platform hosts</span>
+      <h2>Hosted by the cloud, governed by its IAM</h2>
+      <p>Amazon Bedrock is AWS's multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability) reached through the AWS credential chain. Azure OpenAI is the OpenAI-only slice of Azure's broader model catalog; Azure AI Foundry's multi-vendor surface is reachable through the <code>openai_compatible</code> preset. Google Vertex AI exposes Gemini and partner models behind a Google Cloud OAuth2 access token; we template <code>base_url</code> from a project + location and (optionally) refresh the token from a service-account JSON.</p>
+    </div>
+    <div class="matrix">
+      {
+        cloudPlatformRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">local runtime</span>
+      <h2>Run models on this host</h2>
+      <p>No external network call, no billing, full control over which models are available.</p>
+    </div>
+    <div class="matrix">
+      {
+        localRuntimeRows.map((row) => (
+          <article class="matrix-row">
+            <div>
+              <h3>{row.name}</h3>
+            </div>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">openai-compatible</span>
+      <h2>Single-vendor services that speak Chat Completions</h2>
+      <p>The same adapter that drives the aggregators powers these. Set the preset, supply an API key, done. The <code>openai_compatible</code> "custom" preset accepts any base_url so self-hosted proxies (LiteLLM, Cloudflare Workers AI) work too.</p>
+    </div>
+    <div class="matrix">
+      {
+        openAiCompatibleRows.map((row) => (
           <article class="matrix-row">
             <div>
               <h3>{row.name}</h3>
@@ -47,10 +142,12 @@ import { providerRows } from "../facts";
         <span class="eyebrow">configuration</span>
         <h2>Bring your own model. Squeezy stays the agent.</h2>
         <p>
-          Squeezy resolves model settings from CLI flags, environment variables,
-          project configuration, user settings, and built-in defaults. Hosted
-          providers use the credentials expected by that platform. Ollama uses
-          your local runtime.
+          Squeezy resolves model settings from CLI flags, environment
+          variables, project configuration, user settings, and built-in
+          defaults. Aggregators and OpenAI-compatible services use a Bearer
+          API key; first-party vendors use their own header conventions;
+          Bedrock uses the AWS default credential chain; Ollama uses your
+          local runtime.
         </p>
         <div class="actions">
           <a class="button" href="/docs/config/" data-track-click="providers_config_docs">
@@ -64,12 +161,13 @@ import { providerRows } from "../facts";
       <div class="card code-card">
         <span class="label">example</span>
         <pre><code>[model]
-provider = "openai"
+provider = "openrouter"
 profile = "balanced"
 model = ""
 
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"</code></pre>
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-opus-4-7"</code></pre>
       </div>
     </div>
   </section>

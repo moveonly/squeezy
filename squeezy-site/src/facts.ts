@@ -155,6 +155,24 @@ export const languageRows: MatrixRow[] = [
   }
 ];
 
+export const aggregatorRows: MatrixRow[] = [
+  {
+    name: "OpenRouter",
+    detail: "One credit, every frontier model. OpenAI-compatible Chat Completions streaming, function tools, usage metadata, reasoning passthrough, Anthropic cache_control forwarding. Default model: anthropic/claude-opus-4-7.",
+    status: "OPENROUTER_API_KEY"
+  },
+  {
+    name: "Vercel AI Gateway",
+    detail: "Vercel's routing proxy for OpenAI, Anthropic, Google, xAI, and more. Default model: anthropic/claude-opus-4-7.",
+    status: "AI_GATEWAY_API_KEY"
+  },
+  {
+    name: "PortKey",
+    detail: "Gateway with virtual keys, caching, and observability. Configure a virtual key via x-portkey-virtual-key header.",
+    status: "PORTKEY_API_KEY"
+  }
+];
+
 export const providerRows: MatrixRow[] = [
   {
     name: "OpenAI",
@@ -170,21 +188,75 @@ export const providerRows: MatrixRow[] = [
     name: "Google Gemini",
     detail: "streamGenerateContent SSE, function declarations, usage metadata. Default model: gemini-2.5-pro, 1M context.",
     status: "GEMINI_API_KEY"
+  }
+];
+
+export const cloudPlatformRows: MatrixRow[] = [
+  {
+    name: "Amazon Bedrock",
+    detail: "AWS multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability). Bedrock Runtime ConverseStream over the AWS default credential chain. Default model: Claude Haiku 4.5, 200K context.",
+    status: "AWS credentials"
   },
   {
     name: "Azure OpenAI",
-    detail: "Azure Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context.",
+    detail: "OpenAI models hosted on Microsoft Azure (single-vendor slice of the broader Azure model catalog). Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context. For Azure AI Foundry's multi-vendor catalog use the openai_compatible preset with the Foundry serverless endpoint.",
     status: "AZURE_OPENAI_API_KEY"
   },
   {
-    name: "Amazon Bedrock",
-    detail: "AWS SDK Bedrock Runtime ConverseStream, default credential chain. Default model: Claude Haiku 4.5, 200K context.",
-    status: "AWS credentials"
-  },
+    name: "Google Vertex AI",
+    detail: "Gemini and other models on Google Cloud Vertex AI's OpenAI-compatible endpoint. OAuth2 access token (refresh every ~50 min) or service-account JSON, project + location templated into base_url. Default model: gemini-2.5-pro.",
+    status: "VERTEX_ACCESS_TOKEN"
+  }
+];
+
+export const localRuntimeRows: MatrixRow[] = [
   {
     name: "Ollama",
     detail: "Local /api/chat NDJSON streaming with function tool schemas. Default model: qwen3-coder, runtime-defined context.",
     status: "local runtime"
+  }
+];
+
+export const openAiCompatibleRows: MatrixRow[] = [
+  {
+    name: "Groq",
+    detail: "Fast OpenAI-compatible inference of open models. Curated registry: llama-3.3-70b-versatile, llama-3.1-8b-instant, moonshotai/kimi-k2-instruct.",
+    status: "GROQ_API_KEY"
+  },
+  {
+    name: "xAI",
+    detail: "Grok family via OpenAI-compatible API. Curated registry: grok-4, grok-4-fast-reasoning, grok-code-fast-1.",
+    status: "XAI_API_KEY"
+  },
+  {
+    name: "DeepSeek",
+    detail: "DeepSeek Chat and Reasoner via OpenAI-compatible API. Curated registry: deepseek-chat, deepseek-reasoner.",
+    status: "DEEPSEEK_API_KEY"
+  },
+  {
+    name: "Mistral La Plateforme",
+    detail: "Mistral's OpenAI-compatible Chat Completions endpoint. Default model: mistral-large-latest (light preset — no curated registry entries).",
+    status: "MISTRAL_API_KEY"
+  },
+  {
+    name: "Together AI",
+    detail: "Hosted open models via OpenAI-compatible API. Default model: meta-llama/Llama-3.3-70B-Instruct-Turbo (light preset).",
+    status: "TOGETHER_API_KEY"
+  },
+  {
+    name: "Fireworks AI",
+    detail: "Production OpenAI-compatible inference. Default model: accounts/fireworks/models/llama-v3p3-70b-instruct (light preset).",
+    status: "FIREWORKS_API_KEY"
+  },
+  {
+    name: "Cerebras",
+    detail: "Cerebras Cloud OpenAI-compatible endpoint. Default model: llama-3.3-70b (light preset).",
+    status: "CEREBRAS_API_KEY"
+  },
+  {
+    name: "Custom OpenAI-compatible",
+    detail: "Any endpoint that speaks POST /chat/completions with a Bearer token. Microsoft Foundry (Azure AI Studio) serverless deployments, Cloudflare Workers AI, self-hosted LiteLLM, and similar services use this preset.",
+    status: "openai_compatible preset"
   }
 ];
 

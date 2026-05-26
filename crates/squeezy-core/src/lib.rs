@@ -28,6 +28,45 @@ pub const DEFAULT_BEDROCK_REGION: &str = "us-east-1";
 pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
+
+// OpenAI-compatible aggregators (full preset tier — curated models in models.json, dedicated costly test).
+pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_VERCEL_AI_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+pub const DEFAULT_VERCEL_AI_MODEL: &str = "anthropic/claude-opus-4-7";
+pub const DEFAULT_PORTKEY_BASE_URL: &str = "https://api.portkey.ai/v1";
+pub const DEFAULT_PORTKEY_MODEL: &str = "anthropic/claude-opus-4-7";
+// OpenAI-compatible single-vendor (full preset tier).
+pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+pub const DEFAULT_GROQ_MODEL: &str = "llama-3.3-70b-versatile";
+pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4";
+pub const DEFAULT_DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+pub const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-chat";
+// Google Cloud Vertex AI's OpenAI-compatible endpoint. The base URL is
+// per-project + per-region, so users must set `vertex_project` and
+// `vertex_location` (or override `base_url` directly).
+pub const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
+pub const DEFAULT_VERTEX_MODEL: &str = "google/gemini-2.5-pro";
+// OpenAI-compatible single-vendor (light preset tier — no curated models, no dedicated costly test).
+pub const DEFAULT_MISTRAL_BASE_URL: &str = "https://api.mistral.ai/v1";
+pub const DEFAULT_MISTRAL_MODEL: &str = "mistral-large-latest";
+pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
+pub const DEFAULT_TOGETHER_MODEL: &str = "meta-llama/Llama-3.3-70B-Instruct-Turbo";
+pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference/v1";
+pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
+pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
+pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+
+/// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
+/// regional URL that names the project. Returns the resolved base URL for a
+/// `(project, location)` pair, ready for `/chat/completions` to be appended.
+pub fn vertex_base_url(project: &str, location: &str) -> String {
+    format!(
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi"
+    )
+}
+
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
@@ -363,6 +402,11 @@ impl AppConfig {
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
                 transport: provider_transport_settings(&providers, &["openai"]),
             }),
+            other if OpenAiCompatiblePreset::parse(other).is_some() => {
+                let preset =
+                    OpenAiCompatiblePreset::parse(other).expect("guarded by match condition");
+                build_openai_compatible_config(preset, &providers, &mut get_var)?
+            }
             unknown => {
                 return Err(SqueezyError::Config(format!(
                     "model.provider: unknown provider {unknown:?}"
@@ -387,6 +431,10 @@ impl AppConfig {
                 .unwrap_or_else(|| DEFAULT_BEDROCK_MODEL.to_string()),
             ProviderConfig::Ollama(_) => provider_setting(&providers, "ollama", "default_model")
                 .unwrap_or_else(|| DEFAULT_OLLAMA_MODEL.to_string()),
+            ProviderConfig::OpenAiCompatible(config) => {
+                provider_setting(&providers, config.preset.as_str(), "default_model")
+                    .unwrap_or_else(|| config.preset.default_model().to_string())
+            }
         };
         let profile = get_var("SQUEEZY_PROFILE")
             .or(model_settings.profile)
@@ -1225,6 +1273,7 @@ fn provider_kind(provider: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
 
@@ -1299,6 +1348,210 @@ pub enum ProviderConfig {
     AzureOpenAi(AzureOpenAiConfig),
     Bedrock(BedrockConfig),
     Ollama(OllamaConfig),
+    OpenAiCompatible(OpenAiCompatibleConfig),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenAiCompatibleConfig {
+    pub preset: OpenAiCompatiblePreset,
+    pub api_key_env: String,
+    pub api_key_keychain: Option<String>,
+    pub base_url: String,
+    pub extra_headers: BTreeMap<String, String>,
+    pub transport: ProviderTransportConfig,
+}
+
+/// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
+/// preset carries enough defaults that the user can wire a provider with just
+/// an API key. `Custom` is for any other OpenAI-compatible endpoint (e.g.
+/// self-hosted LiteLLM, Cloudflare Workers AI, Cohere) and requires the
+/// caller to supply `base_url` and `api_key_env` explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiCompatiblePreset {
+    OpenRouter,
+    Vercel,
+    PortKey,
+    Groq,
+    XAi,
+    DeepSeek,
+    Vertex,
+    Mistral,
+    Together,
+    Fireworks,
+    Cerebras,
+    Custom,
+}
+
+impl OpenAiCompatiblePreset {
+    /// Kebab/snake-case identifier used in TOML provider section names, CLI
+    /// `--provider` values, and the model registry.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "openrouter",
+            Self::Vercel => "vercel",
+            Self::PortKey => "portkey",
+            Self::Groq => "groq",
+            Self::XAi => "xai",
+            Self::DeepSeek => "deepseek",
+            Self::Vertex => "vertex",
+            Self::Mistral => "mistral",
+            Self::Together => "together",
+            Self::Fireworks => "fireworks",
+            Self::Cerebras => "cerebras",
+            Self::Custom => "openai_compatible",
+        }
+    }
+
+    /// Human-readable label for the startup picker and `--list-providers`.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OpenRouter",
+            Self::Vercel => "Vercel AI Gateway",
+            Self::PortKey => "PortKey",
+            Self::Groq => "Groq",
+            Self::XAi => "xAI",
+            Self::DeepSeek => "DeepSeek",
+            Self::Vertex => "Google Vertex AI",
+            Self::Mistral => "Mistral La Plateforme",
+            Self::Together => "Together AI",
+            Self::Fireworks => "Fireworks AI",
+            Self::Cerebras => "Cerebras",
+            Self::Custom => "OpenAI-compatible (custom)",
+        }
+    }
+
+    /// `true` when curated models exist in the registry and a dedicated costly
+    /// integration test ships in `crates/squeezy-llm/tests/`. Light presets
+    /// return `false` and fall back to generic context-window estimates.
+    pub const fn is_full_tier(self) -> bool {
+        matches!(
+            self,
+            Self::OpenRouter
+                | Self::Vercel
+                | Self::PortKey
+                | Self::Groq
+                | Self::XAi
+                | Self::DeepSeek
+                | Self::Vertex
+        )
+    }
+
+    pub const fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenRouter => DEFAULT_OPENROUTER_BASE_URL,
+            Self::Vercel => DEFAULT_VERCEL_AI_BASE_URL,
+            Self::PortKey => DEFAULT_PORTKEY_BASE_URL,
+            Self::Groq => DEFAULT_GROQ_BASE_URL,
+            Self::XAi => DEFAULT_XAI_BASE_URL,
+            Self::DeepSeek => DEFAULT_DEEPSEEK_BASE_URL,
+            // Vertex's base URL is per-project and per-region. The caller
+            // must template it from `vertex_project` + `vertex_location`
+            // (see `vertex_base_url`); presetting a static URL here would
+            // hard-code one project.
+            Self::Vertex => "",
+            Self::Mistral => DEFAULT_MISTRAL_BASE_URL,
+            Self::Together => DEFAULT_TOGETHER_BASE_URL,
+            Self::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
+            Self::Cerebras => DEFAULT_CEREBRAS_BASE_URL,
+            Self::Custom => "",
+        }
+    }
+
+    pub const fn default_api_key_env(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "OPENROUTER_API_KEY",
+            Self::Vercel => "AI_GATEWAY_API_KEY",
+            Self::PortKey => "PORTKEY_API_KEY",
+            Self::Groq => "GROQ_API_KEY",
+            Self::XAi => "XAI_API_KEY",
+            Self::DeepSeek => "DEEPSEEK_API_KEY",
+            // Vertex's "key" is an OAuth2 access token (~1 hour TTL). Users
+            // either set this env var to a token they refresh themselves
+            // (e.g. via `gcloud auth print-access-token`) or wire in a
+            // service-account JSON helper.
+            Self::Vertex => "VERTEX_ACCESS_TOKEN",
+            Self::Mistral => "MISTRAL_API_KEY",
+            Self::Together => "TOGETHER_API_KEY",
+            Self::Fireworks => "FIREWORKS_API_KEY",
+            Self::Cerebras => "CEREBRAS_API_KEY",
+            Self::Custom => "",
+        }
+    }
+
+    pub const fn default_model(self) -> &'static str {
+        match self {
+            Self::OpenRouter => DEFAULT_OPENROUTER_MODEL,
+            Self::Vercel => DEFAULT_VERCEL_AI_MODEL,
+            Self::PortKey => DEFAULT_PORTKEY_MODEL,
+            Self::Groq => DEFAULT_GROQ_MODEL,
+            Self::XAi => DEFAULT_XAI_MODEL,
+            Self::DeepSeek => DEFAULT_DEEPSEEK_MODEL,
+            Self::Vertex => DEFAULT_VERTEX_MODEL,
+            Self::Mistral => DEFAULT_MISTRAL_MODEL,
+            Self::Together => DEFAULT_TOGETHER_MODEL,
+            Self::Fireworks => DEFAULT_FIREWORKS_MODEL,
+            Self::Cerebras => DEFAULT_CEREBRAS_MODEL,
+            Self::Custom => "",
+        }
+    }
+
+    pub const fn default_api_key_keychain(self) -> &'static str {
+        match self {
+            Self::OpenRouter => "squeezy:openrouter",
+            Self::Vercel => "squeezy:vercel",
+            Self::PortKey => "squeezy:portkey",
+            Self::Groq => "squeezy:groq",
+            Self::XAi => "squeezy:xai",
+            Self::DeepSeek => "squeezy:deepseek",
+            Self::Vertex => "squeezy:vertex",
+            Self::Mistral => "squeezy:mistral",
+            Self::Together => "squeezy:together",
+            Self::Fireworks => "squeezy:fireworks",
+            Self::Cerebras => "squeezy:cerebras",
+            Self::Custom => "squeezy:openai_compatible",
+        }
+    }
+
+    /// Aliases accepted from CLI `--provider`, env `SQUEEZY_PROVIDER`, and TOML
+    /// `model.provider`. The canonical name (`as_str`) is always accepted.
+    pub fn parse(value: &str) -> Option<Self> {
+        let normalised = value.trim().to_ascii_lowercase().replace('-', "_");
+        match normalised.as_str() {
+            "openrouter" | "open_router" => Some(Self::OpenRouter),
+            "vercel" | "vercel_ai" | "vercel_ai_gateway" => Some(Self::Vercel),
+            "portkey" | "port_key" => Some(Self::PortKey),
+            "groq" => Some(Self::Groq),
+            "xai" | "x_ai" | "grok" => Some(Self::XAi),
+            "deepseek" | "deep_seek" => Some(Self::DeepSeek),
+            "vertex" | "vertex_ai" | "google_vertex" | "google_vertex_ai" => Some(Self::Vertex),
+            "mistral" | "mistral_ai" => Some(Self::Mistral),
+            "together" | "together_ai" => Some(Self::Together),
+            "fireworks" | "fireworks_ai" => Some(Self::Fireworks),
+            "cerebras" => Some(Self::Cerebras),
+            "openai_compatible" | "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+
+    /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
+    /// Used by the CLI to enumerate options without hard-coding the list.
+    pub fn all() -> [Self; 12] {
+        [
+            Self::OpenRouter,
+            Self::Vercel,
+            Self::PortKey,
+            Self::Groq,
+            Self::XAi,
+            Self::DeepSeek,
+            Self::Vertex,
+            Self::Mistral,
+            Self::Together,
+            Self::Fireworks,
+            Self::Cerebras,
+            Self::Custom,
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1698,9 +1951,13 @@ pub struct ProviderSettings {
     pub default_model: Option<String>,
     pub api_version: Option<String>,
     pub region: Option<String>,
+    pub preset: Option<String>,
+    pub vertex_project: Option<String>,
+    pub vertex_location: Option<String>,
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 impl ProviderSettings {
@@ -1714,13 +1971,39 @@ impl ProviderSettings {
                 "default_model",
                 "api_version",
                 "region",
+                "preset",
+                "vertex_project",
+                "vertex_location",
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
+                "headers",
             ],
             source,
             path,
         )?;
+        let headers = match table.get("headers") {
+            None => None,
+            Some(toml::Value::Table(table)) => {
+                let mut map = BTreeMap::new();
+                for (key, value) in table {
+                    let toml::Value::String(value) = value else {
+                        return Err(SqueezyError::Config(format!(
+                            "{source}: {} must map to string values",
+                            field(path, &format!("headers.{key}")),
+                        )));
+                    };
+                    map.insert(key.clone(), value.clone());
+                }
+                Some(map)
+            }
+            Some(_) => {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {} must be a TOML table of string values",
+                    field(path, "headers"),
+                )));
+            }
+        };
         Ok(Self {
             api_key_env: string_value(table, "api_key_env", source, &field(path, "api_key_env"))?,
             api_key_keychain: string_value(
@@ -1738,6 +2021,19 @@ impl ProviderSettings {
             )?,
             api_version: string_value(table, "api_version", source, &field(path, "api_version"))?,
             region: string_value(table, "region", source, &field(path, "region"))?,
+            preset: string_value(table, "preset", source, &field(path, "preset"))?,
+            vertex_project: string_value(
+                table,
+                "vertex_project",
+                source,
+                &field(path, "vertex_project"),
+            )?,
+            vertex_location: string_value(
+                table,
+                "vertex_location",
+                source,
+                &field(path, "vertex_location"),
+            )?,
             request_max_retries: u8_nonnegative_value(
                 table,
                 "request_max_retries",
@@ -1756,6 +2052,7 @@ impl ProviderSettings {
                 source,
                 &field(path, "stream_idle_timeout_ms"),
             )?,
+            headers,
         })
     }
 
@@ -1766,12 +2063,16 @@ impl ProviderSettings {
         replace_if_some(&mut self.default_model, next.default_model);
         replace_if_some(&mut self.api_version, next.api_version);
         replace_if_some(&mut self.region, next.region);
+        replace_if_some(&mut self.preset, next.preset);
+        replace_if_some(&mut self.vertex_project, next.vertex_project);
+        replace_if_some(&mut self.vertex_location, next.vertex_location);
         replace_if_some(&mut self.request_max_retries, next.request_max_retries);
         replace_if_some(&mut self.stream_max_retries, next.stream_max_retries);
         replace_if_some(
             &mut self.stream_idle_timeout_ms,
             next.stream_idle_timeout_ms,
         );
+        replace_if_some(&mut self.headers, next.headers);
     }
 }
 
@@ -5781,9 +6082,81 @@ fn provider_setting(
         "default_model" => settings.default_model.as_ref(),
         "api_version" => settings.api_version.as_ref(),
         "region" => settings.region.as_ref(),
+        "preset" => settings.preset.as_ref(),
+        "vertex_project" => settings.vertex_project.as_ref(),
+        "vertex_location" => settings.vertex_location.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
+}
+
+fn provider_setting_headers(
+    providers: &BTreeMap<String, ProviderSettings>,
+    provider: &str,
+) -> Option<BTreeMap<String, String>> {
+    providers.get(provider)?.headers.clone()
+}
+
+fn build_openai_compatible_config(
+    preset: OpenAiCompatiblePreset,
+    providers: &BTreeMap<String, ProviderSettings>,
+    get_var: &mut dyn FnMut(&str) -> Option<String>,
+) -> Result<ProviderConfig> {
+    let section = preset.as_str();
+    let api_key_env = provider_setting(providers, section, "api_key_env")
+        .or_else(|| {
+            let candidate = preset.default_api_key_env();
+            if candidate.is_empty() {
+                None
+            } else {
+                Some(candidate.to_string())
+            }
+        })
+        .ok_or_else(|| {
+            SqueezyError::Config(format!(
+                "providers.{section}.api_key_env is required for the {} preset",
+                preset.display_name()
+            ))
+        })?;
+    let api_key_keychain = provider_setting(providers, section, "api_key_keychain")
+        .or_else(|| Some(preset.default_api_key_keychain().to_string()));
+    let base_url_override = get_var(&format!("{}_BASE_URL", section.to_ascii_uppercase()))
+        .or_else(|| provider_setting(providers, section, "base_url"));
+    let base_url = match (preset, base_url_override) {
+        (_, Some(url)) => url,
+        (OpenAiCompatiblePreset::Vertex, None) => {
+            let project = get_var("VERTEX_PROJECT")
+                .or_else(|| get_var("GOOGLE_CLOUD_PROJECT"))
+                .or_else(|| provider_setting(providers, section, "vertex_project"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.vertex.vertex_project (or VERTEX_PROJECT / GOOGLE_CLOUD_PROJECT) is required for the Vertex AI preset"
+                            .to_string(),
+                    )
+                })?;
+            let location = get_var("VERTEX_LOCATION")
+                .or_else(|| provider_setting(providers, section, "vertex_location"))
+                .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
+            vertex_base_url(project.trim(), location.trim())
+        }
+        (_, None) => preset.default_base_url().to_string(),
+    };
+    if base_url.trim().is_empty() {
+        return Err(SqueezyError::Config(format!(
+            "providers.{section}.base_url is required for the {} preset",
+            preset.display_name()
+        )));
+    }
+    let extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
+    let transport = provider_transport_settings(providers, &[section]);
+    Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
+        preset,
+        api_key_env,
+        api_key_keychain,
+        base_url,
+        extra_headers,
+        transport,
+    }))
 }
 
 fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] {
@@ -5794,6 +6167,20 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
         ProviderConfig::AzureOpenAi(_) => &["azure_openai", "azure"],
         ProviderConfig::Bedrock(_) => &["bedrock"],
         ProviderConfig::Ollama(_) => &["ollama"],
+        ProviderConfig::OpenAiCompatible(config) => match config.preset {
+            OpenAiCompatiblePreset::OpenRouter => &["openrouter"],
+            OpenAiCompatiblePreset::Vercel => &["vercel"],
+            OpenAiCompatiblePreset::PortKey => &["portkey"],
+            OpenAiCompatiblePreset::Groq => &["groq"],
+            OpenAiCompatiblePreset::XAi => &["xai"],
+            OpenAiCompatiblePreset::DeepSeek => &["deepseek"],
+            OpenAiCompatiblePreset::Vertex => &["vertex"],
+            OpenAiCompatiblePreset::Mistral => &["mistral"],
+            OpenAiCompatiblePreset::Together => &["together"],
+            OpenAiCompatiblePreset::Fireworks => &["fireworks"],
+            OpenAiCompatiblePreset::Cerebras => &["cerebras"],
+            OpenAiCompatiblePreset::Custom => &["openai_compatible"],
+        },
     }
 }
 

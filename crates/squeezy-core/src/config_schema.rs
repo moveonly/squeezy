@@ -20,8 +20,8 @@ use crate::{
     DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
     DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
     DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode,
-    StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
+    SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
 };
 
 /// When a save takes effect.
@@ -342,6 +342,18 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "azure_openai",
     "bedrock",
     "ollama",
+    "openrouter",
+    "vercel",
+    "portkey",
+    "groq",
+    "xai",
+    "deepseek",
+    "vertex",
+    "mistral",
+    "together",
+    "fireworks",
+    "cerebras",
+    "openai_compatible",
 ];
 
 pub const PROFILE_OPTIONS: &[&str] = &["cheap", "balanced", "strong"];
@@ -1341,7 +1353,8 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
         AnthropicConfig, AzureOpenAiConfig, BedrockConfig, DEFAULT_ANTHROPIC_BASE_URL,
         DEFAULT_AZURE_OPENAI_API_VERSION, DEFAULT_AZURE_OPENAI_BASE_URL, DEFAULT_BEDROCK_REGION,
         DEFAULT_GOOGLE_BASE_URL, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OPENAI_BASE_URL, GoogleConfig,
-        OllamaConfig, OpenAiConfig, ProviderTransportConfig,
+        OllamaConfig, OpenAiCompatibleConfig, OpenAiCompatiblePreset, OpenAiConfig,
+        ProviderTransportConfig,
     };
     let transport = ProviderTransportConfig::default();
     cfg.provider = match s {
@@ -1379,7 +1392,17 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             base_url: DEFAULT_OLLAMA_BASE_URL.to_string(),
             transport,
         }),
-        _ => return Err("unknown provider"),
+        other => {
+            let preset = OpenAiCompatiblePreset::parse(other).ok_or("unknown provider")?;
+            ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
+                preset,
+                api_key_env: preset.default_api_key_env().to_string(),
+                api_key_keychain: Some(preset.default_api_key_keychain().to_string()),
+                base_url: preset.default_base_url().to_string(),
+                extra_headers: BTreeMap::new(),
+                transport,
+            })
+        }
     };
     cfg.model = default_model_for(s).to_string();
     Ok(())
@@ -1393,6 +1416,7 @@ fn provider_to_str(p: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
 
@@ -1404,7 +1428,10 @@ pub fn default_model_for(provider: &str) -> &'static str {
         "azure_openai" => DEFAULT_AZURE_OPENAI_MODEL,
         "bedrock" => DEFAULT_BEDROCK_MODEL,
         "ollama" => DEFAULT_OLLAMA_MODEL,
-        _ => DEFAULT_OPENAI_MODEL,
+        other => match OpenAiCompatiblePreset::parse(other) {
+            Some(preset) => preset.default_model(),
+            None => DEFAULT_OPENAI_MODEL,
+        },
     }
 }
 

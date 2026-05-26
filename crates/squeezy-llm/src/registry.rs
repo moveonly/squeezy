@@ -6,7 +6,7 @@ use squeezy_core::{CostSnapshot, ModelProfile, ProviderConfig, Result};
 
 use crate::{
     AnthropicProvider, BedrockProvider, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest,
-    OllamaProvider, OpenAiProvider,
+    OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -158,12 +158,7 @@ fn model_info_from_raw(raw: RawModelInfo) -> ModelInfo {
 }
 
 fn fallback_model_info(provider: &str, model: &str) -> ModelInfo {
-    let tokenizer = match provider {
-        "anthropic" | "bedrock" => TokenizerKind::Anthropic,
-        "google" => TokenizerKind::Google,
-        "ollama" => TokenizerKind::Ollama,
-        _ => TokenizerKind::OpenAiCompatible,
-    };
+    let tokenizer = fallback_tokenizer(provider, model);
     ModelInfo {
         provider: leak_string(provider.to_string()),
         id: leak_string(model.to_string()),
@@ -185,6 +180,30 @@ fn fallback_model_info(provider: &str, model: &str) -> ModelInfo {
     }
 }
 
+/// Best-guess tokenizer for `(provider, model)` pairs that aren't in the
+/// curated registry. The native single-vendor providers map directly; OpenAI-
+/// compatible aggregators expose vendor-namespaced model ids
+/// (`anthropic/claude-opus-4-7`, `google/gemini-2.5-pro`), and we honour the
+/// namespace so token estimates use the vendor's actual ratio.
+fn fallback_tokenizer(provider: &str, model: &str) -> TokenizerKind {
+    match provider {
+        "anthropic" | "bedrock" => TokenizerKind::Anthropic,
+        "google" => TokenizerKind::Google,
+        "ollama" => TokenizerKind::Ollama,
+        _ => {
+            let lower = model.to_ascii_lowercase();
+            let id = lower.split_once('/').map(|(_, id)| id).unwrap_or(&lower);
+            if id.starts_with("claude") {
+                TokenizerKind::Anthropic
+            } else if id.starts_with("gemini") {
+                TokenizerKind::Google
+            } else {
+                TokenizerKind::OpenAiCompatible
+            }
+        }
+    }
+}
+
 fn leak_string(value: String) -> &'static str {
     Box::leak(value.into_boxed_str())
 }
@@ -196,6 +215,18 @@ pub const PROVIDERS: &[&str] = &[
     "azure_openai",
     "bedrock",
     "ollama",
+    "openrouter",
+    "vercel",
+    "portkey",
+    "groq",
+    "xai",
+    "deepseek",
+    "vertex",
+    "mistral",
+    "together",
+    "fireworks",
+    "cerebras",
+    "openai_compatible",
 ];
 
 pub fn models_for_provider(provider: &str) -> impl Iterator<Item = &'static ModelInfo> {
@@ -304,6 +335,7 @@ pub fn provider_name(config: &ProviderConfig) -> &'static str {
         ProviderConfig::AzureOpenAi(_) => "azure_openai",
         ProviderConfig::Bedrock(_) => "bedrock",
         ProviderConfig::Ollama(_) => "ollama",
+        ProviderConfig::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
 
@@ -319,6 +351,9 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
         }
         ProviderConfig::Bedrock(bedrock) => Ok(Arc::new(BedrockProvider::from_config(bedrock)?)),
         ProviderConfig::Ollama(ollama) => Ok(Arc::new(OllamaProvider::from_config(ollama))),
+        ProviderConfig::OpenAiCompatible(config) => {
+            Ok(Arc::new(OpenAiCompatibleProvider::from_config(config)?))
+        }
     }
 }
 

@@ -90,7 +90,8 @@ const platforms = [
       </div>
       <div class="card code-card">
         <span class="label">start</span>
-        <pre><code>export OPENAI_API_KEY=...
+        <pre><code># Fastest path: one key, every frontier model
+export OPENROUTER_API_KEY=...
 squeezy config init --user
 squeezy doctor
 squeezy</code></pre>
@@ -103,7 +104,7 @@ squeezy</code></pre>
       <article class="card">
         <span class="label">providers</span>
         <h3>Bring your model key</h3>
-        <p>Use OpenAI, Anthropic, Google Gemini, Azure OpenAI, Amazon Bedrock, Ollama, or provider overrides from local config.</p>
+        <p>Start with an aggregator (OpenRouter, Vercel AI Gateway, PortKey) or use first-party vendor APIs (OpenAI, Anthropic, Google Gemini), cloud-platform hosts (Azure OpenAI, Amazon Bedrock), local Ollama, or any OpenAI-compatible service (Groq, xAI, DeepSeek, Mistral, Together, Fireworks, Cerebras).</p>
       </article>
       <article class="card">
         <span class="label">ask squeezy</span>

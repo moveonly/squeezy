@@ -986,6 +986,7 @@ pub(crate) fn provider_variant_label(provider: &squeezy_core::ProviderConfig) ->
         P::AzureOpenAi(_) => "azure_openai",
         P::Bedrock(_) => "bedrock",
         P::Ollama(_) => "ollama",
+        P::OpenAiCompatible(config) => config.preset.as_str(),
     }
 }
 
@@ -1056,6 +1057,13 @@ pub(crate) fn provider_api_key_env(
         // Bedrock uses AWS SDK creds; Ollama is local — neither has a single
         // env-var keychain entry the screen can write.
         P::Bedrock(_) | P::Ollama(_) => None,
+        P::OpenAiCompatible(c) => {
+            if c.api_key_env.is_empty() {
+                None
+            } else {
+                Some((c.preset.display_name(), c.api_key_env.clone()))
+            }
+        }
     }
 }
 

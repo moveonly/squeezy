@@ -1,6 +1,12 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import { providerRows } from "../../facts";
+import {
+  aggregatorRows,
+  cloudPlatformRows,
+  localRuntimeRows,
+  openAiCompatibleRows,
+  providerRows
+} from "../../facts";
 ---
 
 <DocsLayout
@@ -12,10 +18,75 @@ import { providerRows } from "../../facts";
   lead="Squeezy keeps code analysis, permissions, tool shaping, and session accounting local while routing model turns through configured hosted or local providers."
 >
   <section class="doc-block">
-    <h2>Provider adapters</h2>
+    <h2>Aggregators (one key, many models)</h2>
+    <p>Quickest start: a single API key routes to every frontier model through the OpenAI-compatible Chat Completions API. OpenRouter additionally forwards Anthropic <code>cache_control</code> markers and reasoning effort, so caching and reasoning behave the same as a direct vendor call.</p>
+    <div class="matrix compact-matrix">
+      {
+        aggregatorRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>First-party vendor APIs</h2>
+    <p>Native endpoints from the model authors. Each has its own protocol — OpenAI Responses, Anthropic Messages, Gemini <code>streamGenerateContent</code> — wired up by a dedicated adapter.</p>
     <div class="matrix compact-matrix">
       {
         providerRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Cloud-platform hosts</h2>
+    <p>Models hosted by cloud platforms behind that platform's IAM. Amazon Bedrock is AWS's multi-vendor catalog. Azure OpenAI is the OpenAI-only slice of the broader Azure model surface; for Azure AI Foundry's multi-vendor catalog use the <code>openai_compatible</code> preset below with the Foundry serverless endpoint. Google Vertex AI exposes an OpenAI-compatible <code>/chat/completions</code> endpoint that we reach via an OAuth2 access token; the preset templates <code>base_url</code> from a project + location and refreshes the token when a service-account JSON path is provided.</p>
+    <div class="matrix compact-matrix">
+      {
+        cloudPlatformRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Local runtime</h2>
+    <p>Run models on the same host as Squeezy. No external network call, no billing, full control over which models are available.</p>
+    <div class="matrix compact-matrix">
+      {
+        localRuntimeRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Other OpenAI-compatible</h2>
+    <p>Single-vendor services that speak <code>POST /chat/completions</code> with a Bearer token. The same adapter that drives the aggregators powers these — set the preset, supply an API key, done. The "Custom" preset accepts any base_url so self-hosted proxies (LiteLLM, Cloudflare Workers AI) work too.</p>
+    <div class="matrix compact-matrix">
+      {
+        openAiCompatibleRows.map((row) => (
           <article class="matrix-row">
             <h3>{row.name}</h3>
             <p>{row.detail}</p>
@@ -29,13 +100,14 @@ import { providerRows } from "../../facts";
 
   <section class="doc-block">
     <h2>Configuration</h2>
-    <p>Provider settings resolve from CLI flags, environment variables, project config, user settings, and built-in defaults. Hosted providers use API key environment variables or platform credential mechanisms; Bedrock uses the AWS default credential chain; Ollama uses the local runtime.</p>
+    <p>Provider settings resolve from CLI flags, environment variables, project config, user settings, and built-in defaults. Aggregators and OpenAI-compatible services use a Bearer API key; first-party vendors use their own header conventions; Bedrock uses the AWS default credential chain; Ollama uses the local runtime.</p>
     <pre><code>[model]
-provider = "openai"
+provider = "openrouter"
 profile = "balanced"
 model = ""
 
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"</code></pre>
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-opus-4-7"</code></pre>
   </section>
 </DocsLayout>
