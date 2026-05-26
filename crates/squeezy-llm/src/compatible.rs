@@ -200,34 +200,24 @@ impl LlmProvider for OpenAiCompatibleProvider {
         self.preset.as_str()
     }
 
-    fn stream_response(&self, mut request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+    fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
         let url = format!("{}/chat/completions", self.base_url);
-        let mut extra_headers = self.extra_headers.clone();
+        let extra_headers = self.extra_headers.clone();
         let preset = self.preset;
-        // PortKey rejects requests with `400 Either x-portkey-config or
-        // x-portkey-provider header is required`. When the model id is
-        // vendor-namespaced (`anthropic/claude-...`) we can derive the
-        // routing header from it and forward only the bare upstream id
-        // (PortKey routes by header, not OpenRouter-style prefix).
-        // User-supplied headers in `providers.portkey.headers` already
-        // overrode preset defaults and stay authoritative; we only fill
-        // the header when nothing routing-related was configured (e.g.
-        // a config-bound PortKey "User" key already routes itself).
+        // We previously auto-injected `x-portkey-provider` from a
+        // `vendor/model` prefix. That guessed at an OpenRouter-style
+        // routing semantic that PortKey does not actually use — PortKey
+        // accounts with attached integrations route by `@<integration>/<model>`
+        // ids, not by a `x-portkey-provider` header. Sending the header
+        // bypassed those integrations and produced misleading errors.
+        // The model id now passes through verbatim; user-supplied
+        // `providers.portkey.headers.*` still wins for the (rare) case
+        // where a deployment really does want a config/virtual-key
+        // header.
         let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
-        let mut portkey_inferred_provider = false;
-        if matches!(preset, OpenAiCompatiblePreset::PortKey)
-            && !portkey_routing_configured
-            && let Some(provider) = portkey_provider_from_model(&request.model)
-        {
-            extra_headers.insert("x-portkey-provider".to_string(), provider.to_string());
-            if let Some((_, bare)) = request.model.split_once('/') {
-                request.model = bare.to_string().into();
-            }
-            portkey_inferred_provider = true;
-        }
         let body = Self::request_body(&request);
         let provider_label = self.preset.display_name();
 
@@ -253,36 +243,30 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
-                // PortKey returns 400 for two distinct cases: missing
-                // routing context (no header at all) and missing upstream
-                // credentials (header present but PortKey has nothing to
-                // authenticate with at the vendor). The error body looks
-                // the same; we disambiguate by whether we already injected
-                // the routing header ourselves.
+                // PortKey returns 400 about `x-portkey-*` whenever it
+                // can't figure out which upstream to dial. The most
+                // common cause on integration-style PortKey accounts is
+                // that the model id is missing the `@<integration>/` prefix
+                // (e.g. `gpt-4o` instead of `@open-ai/gpt-4o`). The other
+                // case is a deployment that wants a routing header.
+                // `portkey_routing_configured` lets the second case
+                // suppress the "use a routing header" half of the hint.
                 let hint = if matches!(preset, OpenAiCompatiblePreset::PortKey)
                     && status == StatusCode::BAD_REQUEST
                     && message.to_ascii_lowercase().contains("x-portkey")
                 {
-                    if portkey_inferred_provider {
-                        // We sent `x-portkey-provider` from the model
-                        // namespace and PortKey still rejected — almost
-                        // always because PortKey has no upstream key for
-                        // that vendor (User-type key without a Config
-                        // attached).
-                        " — hint: x-portkey-provider was set from the model namespace, \
-                         but PortKey still rejected. Your key likely has no upstream \
-                         credentials. Attach a Config to the PortKey User key, or \
-                         create a Virtual Key that bundles the upstream key and set \
-                         `providers.portkey.headers.x-portkey-virtual-key` in your \
-                         settings TOML."
+                    if portkey_routing_configured {
+                        " — hint: a routing header is set in providers.portkey.headers \
+                         but PortKey still rejected. Check that the header value \
+                         (config id / virtual key / provider) actually exists in your \
+                         PortKey workspace."
                     } else {
-                        " — hint: PortKey needs to know which upstream provider to call. \
-                         Attach a Config to your User key in PortKey (recommended), or set \
-                         `providers.portkey.headers.x-portkey-virtual-key` / \
-                         `x-portkey-config` / `x-portkey-provider` in your settings TOML. \
-                         Recognised auto-routing model prefixes: openai/, anthropic/, \
-                         google/, azure-openai/, bedrock/, cohere/, mistral/, groq/, \
-                         deepseek/, together/, fireworks/, perplexity/."
+                        " — hint: PortKey routes by either an `@<integration>/<model>` \
+                         prefix on the model id (call `GET https://api.portkey.ai/v1/models` \
+                         with your key to see what's available — e.g. `@open-ai/gpt-4o-mini`, \
+                         `@openrouter/<vendor>/<model>`) or by a header in \
+                         providers.portkey.headers (x-portkey-config / x-portkey-virtual-key / \
+                         x-portkey-provider). Set one of those and retry."
                     }
                 } else {
                     ""
@@ -415,29 +399,6 @@ fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
             .iter()
             .any(|needle| key.eq_ignore_ascii_case(needle))
     })
-}
-
-/// Map a vendor-namespaced model id (`anthropic/claude-...`,
-/// `google/gemini-...`) to the value PortKey expects in
-/// `x-portkey-provider`. Returns `None` for bare model ids; in that case
-/// we let PortKey return its 400 so the user knows to configure routing.
-fn portkey_provider_from_model(model: &str) -> Option<&'static str> {
-    let (vendor, _) = model.split_once('/')?;
-    match vendor.to_ascii_lowercase().as_str() {
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        "google" | "gemini" => Some("google"),
-        "azure" | "azure-openai" | "azure_openai" => Some("azure-openai"),
-        "bedrock" => Some("bedrock"),
-        "cohere" => Some("cohere"),
-        "mistral" | "mistralai" => Some("mistral-ai"),
-        "groq" => Some("groq"),
-        "perplexity" => Some("perplexity-ai"),
-        "deepseek" => Some("deepseek"),
-        "together" | "together-ai" | "togetherai" => Some("together-ai"),
-        "fireworks" | "fireworks-ai" | "fireworksai" => Some("fireworks-ai"),
-        _ => None,
-    }
 }
 
 fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, String> {

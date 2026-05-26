@@ -51,7 +51,6 @@ model = ""
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
-api_key_keychain = "squeezy:openrouter"
 base_url = "https://openrouter.ai/api/v1"
 default_model = "anthropic/claude-opus-4-7"
 
@@ -64,37 +63,57 @@ default_model = "anthropic/claude-opus-4-7"
 
 [providers.vercel]
 api_key_env = "AI_GATEWAY_API_KEY"
-api_key_keychain = "squeezy:vercel"
 base_url = "https://ai-gateway.vercel.sh/v1"
 default_model = "anthropic/claude-opus-4-7"
 
 [providers.portkey]
 api_key_env = "PORTKEY_API_KEY"
-api_key_keychain = "squeezy:portkey"
 base_url = "https://api.portkey.ai/v1"
-# default_model points at a PortKey virtual key configured in your dashboard.
+# api_key = "..."   # or set via `squeezy auth set portkey`
 
-[providers.portkey.headers]
-"x-portkey-virtual-key" = "your-virtual-key"
-# or: "x-portkey-config" = "config-id"
+# PortKey is a gateway, not a model host. There are four ways to tell it
+# which upstream to call. Pick one — squeezy passes the model id and any
+# extra headers through verbatim.
+#
+# 1. Integration-prefixed model id (most common for accounts with
+#    "Integrations" attached in the PortKey workspace):
+#       model = "@openrouter/qwen/qwen3.6-35b-a3b"
+#       model = "@open-ai/gpt-4o-mini"
+#    Hit GET https://api.portkey.ai/v1/models with your key to list
+#    every model id available to your account.
+#
+# 2. Virtual Key — created in PortKey, bundles the upstream's API key:
+#       model = "claude-opus-4-7"
+#       [providers.portkey.headers]
+#       "x-portkey-virtual-key" = "vk-xxxxxxxxxxxx"
+#
+# 3. Config — created in PortKey, defines model aliases + routing:
+#       model = "sonnet-latest"           # alias defined in the Config
+#       [providers.portkey.headers]
+#       "x-portkey-config" = "your-config-id"
+#    (If the Config is already attached to your User key in PortKey,
+#    you don't need the header — just the model alias.)
+#
+# 4. Direct provider header (rare; for a generic PortKey key when the
+#    upstream credentials are configured PortKey-side under a default
+#    provider):
+#       [providers.portkey.headers]
+#       "x-portkey-provider" = "anthropic"
 
 # ── First-party vendor APIs (single vendor) ───────────────────────────────
 
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
-api_key_keychain = "squeezy:openai"
 base_url = "https://api.openai.com/v1"
 default_model = "gpt-5.5"
 
 [providers.anthropic]
 api_key_env = "ANTHROPIC_API_KEY"
-api_key_keychain = "squeezy:anthropic"
 base_url = "https://api.anthropic.com/v1"
 default_model = "claude-opus-4-7"
 
 [providers.google]
 api_key_env = "GEMINI_API_KEY"
-api_key_keychain = "squeezy:google"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 default_model = "gemini-2.5-pro"
 
@@ -114,7 +133,6 @@ default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
 
 [providers.azure_openai]
 api_key_env = "AZURE_OPENAI_API_KEY"
-api_key_keychain = "squeezy:azure_openai"
 base_url = "https://RESOURCE.openai.azure.com/openai/v1"
 api_version = "v1"
 default_model = "gpt-5.5"
@@ -213,7 +231,6 @@ selected defaults to `~/.squeezy/settings.toml`. Secret token values are never
 written. Use `--no-default` to run the selector again.
 
 For OpenAI, Anthropic, Google, Azure OpenAI, and every OpenAI-compatible
-preset, `api_key_keychain` is a macOS fallback service name for a Generic
 Password entry. The environment variable named by `api_key_env` always wins.
 When the environment variable is absent, Squeezy asks Keychain for the
 configured service. On non-macOS hosts this fallback is not available.

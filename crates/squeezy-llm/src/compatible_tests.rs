@@ -257,21 +257,6 @@ fn preset_default_headers_include_openrouter_attribution() {
 }
 
 #[test]
-fn portkey_provider_inferred_from_vendor_namespaced_model() {
-    assert_eq!(
-        portkey_provider_from_model("anthropic/claude-opus-4-7"),
-        Some("anthropic"),
-    );
-    assert_eq!(
-        portkey_provider_from_model("google/gemini-2.5-pro"),
-        Some("google"),
-    );
-    assert_eq!(portkey_provider_from_model("openai/gpt-4o"), Some("openai"),);
-    assert_eq!(portkey_provider_from_model("gpt-4o"), None);
-    assert_eq!(portkey_provider_from_model("unknown-vendor/foo"), None);
-}
-
-#[test]
 fn portkey_routing_header_present_detects_user_supplied_overrides() {
     let mut headers = BTreeMap::new();
     assert!(!portkey_routing_header_present(&headers));
