@@ -1393,13 +1393,13 @@ impl Agent {
                 "user_memory_ingested",
                 None,
                 Some(format!(
-                    "{} bytes ingested from ~/.squeezy/memory.md",
+                    "{} bytes ingested from ~/.squeezy/MEMORY.md",
                     user_memory.len()
                 )),
                 json!({ "bytes": user_memory.len() }),
             );
             config.instructions = format!(
-                "{}\n\nUser-level memory (~/.squeezy/memory.md):\n{}",
+                "{}\n\nUser-level memory (~/.squeezy/MEMORY.md):\n{}",
                 config.instructions, user_memory
             );
         }
@@ -3476,19 +3476,21 @@ fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
     }
 }
 
-/// Read `~/.squeezy/memory.md` and return its contents truncated to
-/// `max_bytes`. Returns `None` when ingestion is disabled, `HOME` is unset,
-/// or the file is absent / unreadable. Errors are silent on purpose: this is
-/// a best-effort enrichment, never load-bearing.
+/// Read `~/.squeezy/MEMORY.md` (preferred) or `~/.squeezy/memory.md` and
+/// return its contents truncated to `max_bytes`. Returns `None` when
+/// ingestion is disabled, `HOME` is unset, or neither file is present /
+/// readable. Errors are silent on purpose: this is a best-effort enrichment,
+/// never load-bearing. Uppercase first mirrors the project's `AGENTS.md`
+/// casing so users converging on the canonical name see it picked up.
 fn ingest_user_memory(max_bytes: usize) -> Option<String> {
     if max_bytes == 0 {
         return None;
     }
     let home = env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home)
-        .join(".squeezy")
-        .join("memory.md");
-    let body = fs::read_to_string(&path).ok()?;
+    let dir = std::path::PathBuf::from(home).join(".squeezy");
+    let body = fs::read_to_string(dir.join("MEMORY.md"))
+        .or_else(|_| fs::read_to_string(dir.join("memory.md")))
+        .ok()?;
     if body.is_empty() {
         return None;
     }

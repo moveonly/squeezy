@@ -3221,8 +3221,9 @@ pub struct ContextCompactionConfig {
     /// Maximum bytes of concatenated AGENTS.md content stitched into the
     /// base instructions at session start. 0 disables ingestion.
     pub repo_doc_max_bytes: usize,
-    /// Maximum bytes of `~/.squeezy/memory.md` stitched into the base
-    /// instructions at session start. 0 disables ingestion.
+    /// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
+    /// stitched into the base instructions at session start. 0 disables
+    /// ingestion.
     pub user_memory_max_bytes: usize,
     /// When true, the turn loop re-checks token usage between LLM events and
     /// triggers compaction once usage crosses `threshold_percent` of
@@ -6081,7 +6082,7 @@ pub fn user_settings_template() -> &'static str {
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
-# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
 # enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
 # model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
 # threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
@@ -6268,7 +6269,7 @@ pub fn project_settings_template() -> &'static str {
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
-# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
 # enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
 # model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
 # threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger

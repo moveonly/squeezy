@@ -3191,6 +3191,52 @@ fn ingest_user_memory_returns_none_when_missing() {
     assert!(result.is_none());
 }
 
+#[test]
+fn ingest_user_memory_reads_uppercase() {
+    let home = temp_workspace("ingest_user_memory_uppercase_only");
+    let dir = home.join(".squeezy");
+    fs::create_dir_all(&dir).expect("mkdir .squeezy");
+    fs::write(dir.join("MEMORY.md"), "uppercase-only body").expect("write MEMORY.md");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let result = super::ingest_user_memory(8_192);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    let body = result.expect("memory present");
+    assert!(body.contains("uppercase-only body"));
+}
+
+#[tokio::test]
+async fn agent_build_stitches_agents_md_into_instructions() {
+    let root = temp_workspace("agent_build_agents_md");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let marker = "session-init AGENTS.md preamble marker";
+    fs::write(root.join("AGENTS.md"), marker).expect("write AGENTS.md");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider,
+    );
+    let instructions = &agent.config().instructions;
+    assert!(
+        instructions.contains(marker),
+        "AGENTS.md not stitched into base instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains("Project conventions from AGENTS.md"),
+        "missing AGENTS.md preamble header: {instructions}"
+    );
+}
+
 fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     let mut items = Vec::new();
     for n in 0..16 {
