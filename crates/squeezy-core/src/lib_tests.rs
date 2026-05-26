@@ -164,7 +164,6 @@ fn config_without_env_uses_openai_provider_defaults() {
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
             assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
-            assert_eq!(openai.api_key_keychain.as_deref(), Some("squeezy:openai"));
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
         _ => panic!("expected OpenAI provider"),
@@ -334,12 +333,9 @@ fn shell_sandbox_defaults_to_best_effort() {
 }
 
 #[test]
-fn sandbox_ai_reviewer_keychain_and_hardening_settings_parse_and_inspect() {
+fn sandbox_ai_reviewer_and_hardening_settings_parse_and_inspect() {
     let settings = SettingsFile::from_toml_str(
         r#"
-[providers.openai]
-api_key_keychain = "custom:openai"
-
 [permissions.ai_reviewer]
 enabled = true
 model = "reviewer-model"
@@ -388,12 +384,6 @@ deny_debug_attach = false
     );
     assert!(!config.hardening.disable_core_dumps);
     assert!(!config.hardening.deny_debug_attach);
-    match &config.provider {
-        ProviderConfig::OpenAi(openai) => {
-            assert_eq!(openai.api_key_keychain.as_deref(), Some("custom:openai"));
-        }
-        _ => panic!("expected OpenAI provider"),
-    }
 
     let inspect = config.inspect_redacted();
     assert!(inspect.contains("[permissions.ai_reviewer]"));

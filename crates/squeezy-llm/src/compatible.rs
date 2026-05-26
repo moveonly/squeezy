@@ -60,15 +60,7 @@ impl OpenAiCompatibleProvider {
                 config.preset.display_name(),
             )));
         }
-        let api_key = if let Some(service) = config.api_key_keychain.as_deref() {
-            crate::keychain::resolve_api_key(
-                &config.api_key_env,
-                Some(service),
-                config.preset.as_str(),
-            )?
-        } else {
-            resolve_api_key(&config.api_key_env)?
-        };
+        let api_key = resolve_api_key(&config.api_key_env)?;
         let mut headers = preset_default_headers(config.preset);
         // User-supplied headers override preset defaults so deployments can
         // attach their own HTTP-Referer / X-Title / x-portkey-* values.

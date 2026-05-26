@@ -22,7 +22,6 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
 
     let provider = AnthropicProvider::from_config(&AnthropicConfig {
         api_key_env: ANTHROPIC_KEY_ENV.to_string(),
-        api_key_keychain: None,
         base_url: env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
         transport: ProviderTransportConfig::default(),

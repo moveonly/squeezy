@@ -1392,25 +1392,21 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     cfg.provider = match s {
         "openai" => ProviderConfig::OpenAi(OpenAiConfig {
             api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
-            api_key_keychain: None,
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
             api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
-            api_key_keychain: None,
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             transport,
         }),
         "google" => ProviderConfig::Google(GoogleConfig {
             api_key_env: "SQUEEZY_GOOGLE_KEY".to_string(),
-            api_key_keychain: None,
             base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
             transport,
         }),
         "azure_openai" => ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
             api_key_env: "SQUEEZY_AZURE_OPENAI_KEY".to_string(),
-            api_key_keychain: None,
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
             transport,
@@ -1429,7 +1425,6 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
                 preset,
                 api_key_env: preset.default_api_key_env().to_string(),
-                api_key_keychain: Some(preset.default_api_key_keychain().to_string()),
                 base_url: preset.default_base_url().to_string(),
                 extra_headers: BTreeMap::new(),
                 transport,
