@@ -877,7 +877,7 @@ fn shell_command_writes_protected_metadata(
     }
 }
 
-fn shell_segment_writes_filesystem(segment: &str) -> bool {
+pub(crate) fn shell_segment_writes_filesystem(segment: &str) -> bool {
     if is_destructive_shell_segment(segment) {
         return true;
     }
@@ -888,7 +888,7 @@ fn shell_segment_writes_filesystem(segment: &str) -> bool {
     let first = tokens.first().map(String::as_str).unwrap_or("");
     if matches!(
         first,
-        "cp" | "install" | "ln" | "mkdir" | "mktemp" | "rsync" | "tee" | "touch"
+        "chmod" | "cp" | "install" | "ln" | "mkdir" | "mktemp" | "mv" | "rsync" | "tee" | "touch"
     ) {
         return true;
     }

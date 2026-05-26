@@ -3691,6 +3691,96 @@ async fn shell_denies_protected_metadata_write_before_spawn() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn shell_segment_writes_filesystem_covers_metadata_write_verbs() {
+    use crate::shell::shell_segment_writes_filesystem;
+
+    for verb_segment in [
+        "mkdir .git/hooks",
+        "chmod 600 .git/config",
+        "ln -s /tmp/x .git/HEAD",
+        "mv tmp .git/config",
+        "touch .git/index",
+    ] {
+        assert!(
+            shell_segment_writes_filesystem(verb_segment),
+            "expected pre-spawn classifier to flag {verb_segment:?} as a filesystem write"
+        );
+    }
+
+    for destructive_segment in [
+        "rm .git/config",
+        "dd if=/dev/zero of=.git/HEAD",
+        "truncate -s 0 .git/index",
+    ] {
+        assert!(
+            shell_segment_writes_filesystem(destructive_segment),
+            "expected pre-spawn classifier to flag destructive {destructive_segment:?}"
+        );
+    }
+
+    for read_only_segment in ["cat .git/config", "ls .git", "grep foo .git/config"] {
+        assert!(
+            !shell_segment_writes_filesystem(read_only_segment),
+            "expected pre-spawn classifier to leave read-only {read_only_segment:?} alone"
+        );
+    }
+}
+
+#[test]
+fn shell_safe_metadata_write_verbs_skip_pre_spawn_gate() {
+    use crate::shell_parse::{is_destructive_shell_segment, is_safe_metadata_write_segment};
+
+    for safe in [
+        "mkdir /tmp/x",
+        "mkdir -p /tmp/nested/dir",
+        "chmod 600 src/config",
+        "chmod -R 700 build",
+        "ln -s /tmp/x /tmp/y",
+        "mv tmp/a tmp/b",
+        "touch src/lib.rs",
+    ] {
+        assert!(
+            is_safe_metadata_write_segment(safe),
+            "expected {safe:?} to clear the pre-spawn safe-verb allowlist"
+        );
+        assert!(
+            !is_destructive_shell_segment(safe),
+            "expected {safe:?} to skip the destructive pre-spawn gate"
+        );
+    }
+
+    for danger in [
+        "rm src/lib.rs",
+        "rm -rf target",
+        "dd if=/dev/zero of=src/lib.rs",
+        "truncate -s 0 src/lib.rs",
+        "chown -R nobody src",
+        // Forced overwrite stays gated even though mv is otherwise safe.
+        "mv -f tmp/a tmp/b",
+        "mv --force tmp/a tmp/b",
+    ] {
+        assert!(
+            !is_safe_metadata_write_segment(danger),
+            "expected {danger:?} to NOT be classified as a safe metadata write"
+        );
+        assert!(
+            is_destructive_shell_segment(danger),
+            "expected {danger:?} to trip the destructive pre-spawn gate"
+        );
+    }
+
+    let mkdir = analyze_shell_command("mkdir /tmp/x");
+    assert_eq!(mkdir.capability, PermissionCapability::Edit);
+    assert_eq!(mkdir.risk, PermissionRisk::Medium);
+    assert!(!mkdir.destructive);
+
+    let rm_star = analyze_shell_command("rm *");
+    assert_eq!(rm_star.capability, PermissionCapability::Destructive);
+    assert_eq!(rm_star.risk, PermissionRisk::Critical);
+    assert!(rm_star.destructive);
+}
+
 #[tokio::test]
 async fn shell_workdir_accepts_configured_extra_root() {
     let root = temp_workspace("shell_extra_workdir");
