@@ -100,12 +100,13 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
 pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
 pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
-// Emergency belt on subagent model rounds — matches CC's
-// `forkSubagent.maxTurns = 200`, the only concrete cap any peer
-// sets on a full subagent. Above this the cost broker, cancellation
-// token, and per-tool-call truncations should already have caught
-// any runaway.
-pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
+// Emergency belt on subagent model rounds. CC caps its narrow
+// `forkSubagent` at 200, but Plan/Delegate/Review subagents here
+// run full agent work — sized to match what real long-running
+// agent sessions reach in practice. The cost broker, cancellation
+// token, and per-tool-call truncations are the load-bearing
+// safeguards; this is the last-resort belt.
+pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 1_000;
 // Wall-clock ceiling for a single subagent run. None of the per-call
 // budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
 // time, so a slow model stream or a chain of slow tool calls can pin the
@@ -114,14 +115,14 @@ pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
 // loop reclaims control on the order of minutes. Set to `0` in TOML or
 // `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
 pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 300;
-// Generous default that absorbs reasoning-model overhead. The previous 1_200
-// silently broke any subagent run under a reasoning model with effort >= medium:
-// reasoning alone burns several thousand tokens before the model can emit a
-// single character of summary, which the OpenAI Responses API surfaces as
-// `response.incomplete: max_output_tokens` (a hard error in our SSE parser).
-// 16K leaves room for reasoning + a real summary across every model we ship a
-// preset for.
-pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 32_000;
+// Generous default sized for Plan/Delegate/Review summaries under a
+// reasoning model: thinking tokens burn first, then the actual summary.
+// 64K leaves room for both across every model we ship a preset for. The
+// OpenAI Responses API surfaces an under-budget run as
+// `response.incomplete: max_output_tokens` (a hard error in our SSE parser),
+// so the failure mode of being too tight is loud, not silent. Used only
+// as a fallback when the parent agent has no explicit max_output_tokens.
+pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 64_000;
 /// Floor for the DocHelp subagent's output budget when the parent does not
 /// cap `max_output_tokens`. DocHelp's "summary" is the user-visible answer
 /// (not a synopsis of a tool-driven exploration), so it gets a much higher
@@ -5924,8 +5925,8 @@ pub fn user_settings_template() -> &'static str {
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
-# max_model_rounds = 4
-# max_summary_tokens = 16000
+# max_model_rounds = 1000
+# max_summary_tokens = 64000
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -6109,8 +6110,8 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
-# max_model_rounds = 4
-# max_summary_tokens = 16000
+# max_model_rounds = 1000
+# max_summary_tokens = 64000
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact

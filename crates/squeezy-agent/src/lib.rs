@@ -5453,16 +5453,22 @@ async fn run_subagent(
     let mut config = parent.config.clone();
     config.session_mode = SessionMode::Plan;
     config.store_responses = false;
-    // DocHelp's "summary" is the user-facing answer, not a synopsis. Capping
-    // it at `max_summary_tokens` (which is sized for Explore/Delegate-style
-    // tool-run synopses) silently breaks the help path under reasoning
-    // models — see DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS for the full story.
+    // Plan/Delegate/Review subagents do real agent work and should be sized
+    // like the main agent — peer agents (codex, opencode) apply no output cap
+    // at all, CC only caps its narrow fork. Inherit the parent's cap; only
+    // fall back to `max_summary_tokens` when the parent didn't set one, so
+    // users with a strict global ceiling still get that ceiling honored.
+    // DocHelp keeps its own floor because its "summary" IS the user-facing
+    // answer (not a synopsis) — see DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS.
     config.max_output_tokens = match kind {
         SubagentKind::DocHelp => parent
             .config
             .max_output_tokens
             .or(Some(squeezy_core::DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS)),
-        _ => Some(config.subagents.max_summary_tokens),
+        _ => parent
+            .config
+            .max_output_tokens
+            .or(Some(config.subagents.max_summary_tokens)),
     };
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;

@@ -102,8 +102,8 @@ commented examples so that built-in defaults can evolve over time:
 # max_tool_calls_per_call = 24
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
-# max_model_rounds = 4
-# max_summary_tokens = 1200
+# max_model_rounds = 1000
+# max_summary_tokens = 64000
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
