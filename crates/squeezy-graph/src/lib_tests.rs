@@ -3243,6 +3243,179 @@ fn candidate_set_truncated_to_max_edge_candidates() {
 }
 
 #[test]
+fn rust_trait_dyn_dispatch_emits_candidate_set_with_both_impls() {
+    let source = r#"
+pub trait Animal {
+    fn speak(&self) -> String;
+}
+
+pub struct Dog;
+
+impl Animal for Dog {
+    fn speak(&self) -> String {
+        String::from("woof")
+    }
+}
+
+pub struct Cat;
+
+impl Animal for Cat {
+    fn speak(&self) -> String {
+        String::from("meow")
+    }
+}
+
+pub fn make_noise(animal: &dyn Animal) -> String {
+    animal.speak()
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let record = record("src/animals.rs", source);
+    let parsed = parser.parse_source(&record, source.to_string()).unwrap();
+    let graph = SemanticGraph::from_parsed(vec![parsed]);
+
+    // The `animal.speak()` call cannot be resolved exactly because `animal`
+    // is `&dyn Animal`; the graph must enumerate both impls as candidates.
+    let edge = graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.target_text.contains("speak")
+                && edge.kind == EdgeKind::Calls
+                && edge.confidence == Confidence::CandidateSet
+        })
+        .expect("expected a CandidateSet `Calls` edge for `animal.speak()` over `&dyn Animal`");
+
+    // Polymorphic dispatch enumerates the trait declaration plus every impl;
+    // each `speak` method on `Dog`, `Cat`, and the trait itself is a possible
+    // resolution and must travel with the edge.
+    assert!(
+        edge.candidates.len() >= 2,
+        "expected at least both impls in the candidate set, got {} ({:?})",
+        edge.candidates.len(),
+        edge.candidates,
+    );
+
+    let candidate_parents: Vec<String> = edge
+        .candidates
+        .iter()
+        .map(|id| {
+            let sym = graph
+                .symbols
+                .get(id)
+                .expect("candidate id resolves to a symbol");
+            assert_eq!(sym.name, "speak");
+            assert_eq!(sym.kind, SymbolKind::Method);
+            sym.parent_id
+                .as_ref()
+                .and_then(|pid| graph.symbols.get(pid))
+                .map(|parent| parent.name.clone())
+                .unwrap_or_default()
+        })
+        .collect();
+    // Both impl parents carry `<Trait> for <Type>`; assert each is visible.
+    assert!(
+        candidate_parents.iter().any(|n| n.contains("Dog")),
+        "expected Dog impl in candidate parents; got {candidate_parents:?}",
+    );
+    assert!(
+        candidate_parents.iter().any(|n| n.contains("Cat")),
+        "expected Cat impl in candidate parents; got {candidate_parents:?}",
+    );
+
+    // Ranking is deterministic: re-running on a fresh graph must produce the
+    // identical candidate order (rules out HashMap iteration noise).
+    let parsed_again = LanguageParser::new()
+        .unwrap()
+        .parse_source(&record, source.to_string())
+        .unwrap();
+    let graph_again = SemanticGraph::from_parsed(vec![parsed_again]);
+    let edge_again = graph_again
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.target_text.contains("speak")
+                && edge.kind == EdgeKind::Calls
+                && edge.confidence == Confidence::CandidateSet
+        })
+        .expect("re-built graph still emits the CandidateSet edge");
+    assert_eq!(
+        edge.candidates, edge_again.candidates,
+        "candidate ordering must be deterministic across graph rebuilds",
+    );
+}
+
+#[test]
+fn rust_trait_candidate_set_ranks_same_file_first() {
+    let local = r#"
+pub trait Animal {
+    fn speak(&self) -> String;
+}
+
+pub struct Dog;
+
+impl Animal for Dog {
+    fn speak(&self) -> String {
+        String::from("woof")
+    }
+}
+
+pub fn make_noise(animal: &dyn Animal) -> String {
+    animal.speak()
+}
+"#;
+    // A sibling crate-local file defines another `speak` method whose name
+    // collides; without same-file ranking it could be ordered ahead of the
+    // local impl just because `HashMap` iteration is non-deterministic.
+    let foreign = r#"
+pub struct Speaker;
+
+impl Speaker {
+    pub fn speak(&self) -> String {
+        String::from("hi")
+    }
+}
+"#;
+    let mut parser = LanguageParser::new().unwrap();
+    let local_record = record("src/animals.rs", local);
+    let foreign_record = record("src/speakers.rs", foreign);
+    let local_parsed = parser
+        .parse_source(&local_record, local.to_string())
+        .unwrap();
+    let foreign_parsed = parser
+        .parse_source(&foreign_record, foreign.to_string())
+        .unwrap();
+    let graph = SemanticGraph::from_parsed(vec![local_parsed, foreign_parsed]);
+
+    let edge = graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.target_text.contains("speak")
+                && edge.kind == EdgeKind::Calls
+                && edge.confidence == Confidence::CandidateSet
+        })
+        .expect("expected CandidateSet call edge for `animal.speak()`");
+
+    assert!(
+        edge.candidates.len() >= 2,
+        "expected both `speak` candidates to surface, got {} ({:?})",
+        edge.candidates.len(),
+        edge.candidates,
+    );
+
+    let first = graph
+        .symbols
+        .get(&edge.candidates[0])
+        .expect("first candidate resolves");
+    assert_eq!(
+        first.file_id.0, "src/animals.rs",
+        "same-file candidate should rank first; got {:?}",
+        first.file_id,
+    );
+}
+
+#[test]
 fn graph_edge_deserializes_without_candidates_field() {
     let stored = serde_json::json!({
         "from": "file:src/x.rs",
