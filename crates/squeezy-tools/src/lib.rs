@@ -92,10 +92,10 @@ use specs::{
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notes_recall_spec, notes_remember_spec, plan_patch_spec, read_file_spec,
-    read_slice_spec, read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec,
-    repo_map_spec, shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
-    websearch_spec, write_file_spec,
+    mcp_tool_spec, notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec,
+    read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
+    refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
+    upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1235,6 +1235,7 @@ impl ToolRegistry {
             load_skill_spec(),
             notes_remember_spec(),
             notes_recall_spec(),
+            observations_spec(),
         ];
         if !self.mcp.has_no_enabled_servers() {
             specs.extend([
@@ -1312,9 +1313,8 @@ impl ToolRegistry {
             "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
             | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
             | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => {
-                PermissionScope::Read
-            }
+            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill"
+            | "observations" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -1982,6 +1982,7 @@ impl ToolRegistry {
                 "load_skill" => self.execute_load_skill(&call).await,
                 "notes_remember" => self.execute_notes_remember(&call).await,
                 "notes_recall" => self.execute_notes_recall(&call).await,
+                "observations" => self.execute_observations(&call).await,
                 _ => make_result(
                     &call,
                     ToolStatus::Error,
@@ -2232,6 +2233,53 @@ impl ToolRegistry {
                 )
             }
             Err(err) => tool_error(call, format!("notes_recall failed: {err}")),
+        }
+    }
+
+    async fn execute_observations(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<ObservationsArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(store) = self.state_store.as_deref() else {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "observations requires the persistent store; no store handle available" }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
+        let query = args.query.as_deref().map(str::trim).unwrap_or("");
+        let lookup = if query.is_empty() {
+            store.list_recent_observations(limit)
+        } else {
+            store.search_observations(query, limit)
+        };
+        match lookup {
+            Ok(matches) => {
+                let items: Vec<Value> = matches
+                    .into_iter()
+                    .map(|obs| {
+                        json!({
+                            "id": obs.id,
+                            "timestamp": obs.updated_unix_millis,
+                            "kind": format!("{:?}", obs.kind).to_ascii_lowercase(),
+                            "summary": obs.text,
+                            "tags": obs.tags,
+                        })
+                    })
+                    .collect();
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({ "observations": items }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, format!("observations failed: {err}")),
         }
     }
 
@@ -2579,12 +2627,14 @@ impl ToolRegistry {
                                     }
                                 };
                                 state.current = new_contents;
+                                staged.mark_last_op_inexact();
                                 preview_ops.push(json!({
                                     "patch_index": index,
                                     "kind": "search_replace",
                                     "path": rel,
                                     "fallback": "unified_diff",
                                     "applied_via": "git_apply_3way",
+                                    "exact": false,
                                 }));
                                 return Ok(());
                             }
@@ -3599,6 +3649,14 @@ struct NotesRecallArgs {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ObservationsArgs {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
 fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "preference" => Some(ObservationKind::Preference),
@@ -3718,6 +3776,7 @@ pub(crate) enum StagedOp {
     SearchReplace {
         rel: String,
         file_index: usize,
+        exact: bool,
     },
     CreateFile {
         rel: String,
@@ -3750,6 +3809,7 @@ impl StagedApply {
             self.ops.push(StagedOp::SearchReplace {
                 rel: rel.to_string(),
                 file_index: idx,
+                exact: true,
             });
             return Ok(idx);
         }
@@ -3767,8 +3827,17 @@ impl StagedApply {
         self.ops.push(StagedOp::SearchReplace {
             rel: rel.to_string(),
             file_index: idx,
+            exact: true,
         });
         Ok(idx)
+    }
+
+    /// Mark the most-recently staged op as non-exact (e.g., the search-replace
+    /// matched only via the `unified_diff` fallback rather than verbatim).
+    fn mark_last_op_inexact(&mut self) {
+        if let Some(StagedOp::SearchReplace { exact, .. }) = self.ops.last_mut() {
+            *exact = false;
+        }
     }
 
     fn push_create(&mut self, rel: String, abs_path: PathBuf, contents: String) {
@@ -3932,17 +4001,43 @@ impl StagedOp {
     }
 
     pub(crate) fn delta_json_with_index(&self, status: &str, index_hint: usize) -> Value {
+        self.delta_json_full(status, index_hint, self.exact(), None)
+    }
+
+    /// True when the staged op matched the file's pre-image byte-for-byte.
+    /// Create/Delete/Move are always exact (no fuzz matching applies); a
+    /// SearchReplace becomes inexact when its literal `search` body did not
+    /// appear in the file and the `unified_diff` fallback resolved the change
+    /// via `git apply --3way`.
+    pub(crate) fn exact(&self) -> bool {
+        match self {
+            StagedOp::SearchReplace { exact, .. } => *exact,
+            StagedOp::CreateFile { .. }
+            | StagedOp::DeleteFile { .. }
+            | StagedOp::MoveFile { .. } => true,
+        }
+    }
+
+    pub(crate) fn delta_json_full(
+        &self,
+        status: &str,
+        index_hint: usize,
+        exact: bool,
+        error: Option<&str>,
+    ) -> Value {
         let mut value = json!({
             "kind": self.kind(),
             "status": status,
             "path": self.primary_path(),
+            "exact": exact,
         });
-        if index_hint != usize::MAX
-            && let Some(obj) = value.as_object_mut()
-        {
-            obj.insert("patch_index".to_string(), json!(index_hint));
-        }
         if let Some(obj) = value.as_object_mut() {
+            if index_hint != usize::MAX {
+                obj.insert("patch_index".to_string(), json!(index_hint));
+            }
+            if let Some(message) = error {
+                obj.insert("error".to_string(), json!(message));
+            }
             match self {
                 StagedOp::SearchReplace { .. } => {}
                 StagedOp::CreateFile { contents, .. } => {
@@ -4512,6 +4607,44 @@ fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<
             })
         })
         .collect()
+}
+
+/// Side-table extracted from a shell `ToolResult` describing a single
+/// best_effort sandbox fallback. The agent layer uses this to (a) tick the
+/// `approval.best_effort.fallback` telemetry counter and (b) decide whether
+/// to publish a once-per-session TUI warning.
+///
+/// `backend` is the OS sandbox backend that was attempted (e.g.
+/// `macos-sandbox-exec`); `fallback_count` is the cumulative number of
+/// fallbacks across the registry's lifetime (so per session); and
+/// `first_in_session` is the one-shot latch indicating whether this is the
+/// first time the registry has seen a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellBestEffortFallback {
+    pub backend: String,
+    pub fallback_count: u64,
+    pub first_in_session: bool,
+}
+
+/// Extract the best_effort fallback descriptor from a shell `ToolResult`,
+/// or `None` when the call did not degrade to the best_effort path. Reads
+/// the same `sandbox.best_effort_fallback` JSON that the audit row carries,
+/// so the agent and the audit log stay in lockstep.
+pub fn shell_best_effort_fallback_from_result(
+    result: &ToolResult,
+) -> Option<ShellBestEffortFallback> {
+    if result.tool_name != "shell" {
+        return None;
+    }
+    let payload = result.content.get("sandbox")?.get("best_effort_fallback")?;
+    let backend = payload.get("backend")?.as_str()?.to_string();
+    let fallback_count = payload.get("fallback_count")?.as_u64()?;
+    let first_in_session = payload.get("first_in_session")?.as_bool()?;
+    Some(ShellBestEffortFallback {
+        backend,
+        fallback_count,
+        first_in_session,
+    })
 }
 
 pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {

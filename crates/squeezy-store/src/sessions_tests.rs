@@ -1052,6 +1052,168 @@ fn session_event_kind_parses_unknown_as_unknown() {
     assert_eq!(typed, SessionEventKind::Unknown);
 }
 
+#[test]
+fn typed_session_events_round_trip_through_event_log() {
+    let root = temp_root("typed-events-roundtrip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let expected = vec![
+        SessionEventKind::SessionStarted,
+        SessionEventKind::UserMessage {
+            text: "ship it".to_string(),
+        },
+        SessionEventKind::ToolCall {
+            call_id: "call-1".to_string(),
+            tool: "read_file".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+        },
+        SessionEventKind::ToolResult {
+            output: json!({"call_id": "call-1", "output": "fn main() {}"}),
+        },
+        SessionEventKind::ApprovalRequested {
+            tool: "shell".to_string(),
+            payload: json!({"command": "ls"}),
+        },
+        SessionEventKind::ApprovalDecided {
+            tool: "shell".to_string(),
+            decision: "allowed".to_string(),
+            payload: json!({"command": "ls"}),
+        },
+        SessionEventKind::AssistantCompleted {
+            text: "all set".to_string(),
+            response_id: Some("resp-1".to_string()),
+        },
+        SessionEventKind::ContextCompacted {
+            record: json!(null),
+            summary: Some("compacted".to_string()),
+            replacement_id: Some("ckpt-1".to_string()),
+            conversation: Vec::new(),
+        },
+        SessionEventKind::SessionEnded {
+            status: "completed".to_string(),
+        },
+    ];
+    for kind in &expected {
+        handle
+            .append_typed_event(kind.clone(), Some("1".to_string()), None)
+            .expect("append typed event");
+    }
+    handle.flush_events().expect("flush");
+
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(record.events.len(), expected.len());
+    for (event, expected_kind) in record.events.iter().zip(expected.iter()) {
+        assert_eq!(event.kind, expected_kind.discriminator());
+        let typed = SessionEventKind::try_from_event(event).expect("typed view");
+        assert_eq!(&typed, expected_kind);
+    }
+}
+
+#[test]
+fn replay_resume_state_falls_back_when_resume_json_deleted() {
+    // Acceptance: deleting `resume_state.json` and triggering the replay
+    // fallback must reconstruct a functionally equivalent conversation
+    // (same shape, same order) from the durable `events.jsonl` stream.
+    let root = temp_root("replay-fallback-equivalent");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    // A full turn: user prompt -> tool call -> tool result -> assistant
+    // reply. Each step uses the typed append API so the test also pins
+    // the typed-producer surface alongside the replay round-trip.
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "investigate failure".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::ToolCall {
+                call_id: "call-7".to_string(),
+                tool: "read_file".to_string(),
+                arguments: json!({"path": "src/lib.rs"}),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("tool call");
+    handle
+        .append_typed_event(
+            SessionEventKind::ToolResult {
+                output: json!({"call_id": "call-7", "output": "fn main() {}"}),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("tool result");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "see line 1".to_string(),
+                response_id: Some("resp-7".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json")).expect("delete resume_state.json");
+    assert!(handle.read_resume_state().is_err(), "sidecar must be gone");
+
+    // Replay must rebuild the exact conversation shape from the durable
+    // event log — items in the same order, with `FunctionCallOutput`
+    // unwrapped from the `{call_id, output}` envelope the agent emits.
+    let replayed = handle.replay_resume_state().expect("replay");
+    assert!(replayed.resume_available);
+    assert_eq!(
+        replayed.conversation,
+        vec![
+            ResumeItem::UserText {
+                text: "investigate failure".to_string()
+            },
+            ResumeItem::FunctionCall {
+                call_id: "call-7".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "src/lib.rs"}),
+            },
+            ResumeItem::FunctionCallOutput {
+                call_id: "call-7".to_string(),
+                output: "fn main() {}".to_string(),
+            },
+            ResumeItem::AssistantText {
+                text: "see line 1".to_string()
+            },
+        ],
+    );
+}
+
 fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
     let root = temp_root(label);
     let config = AppConfig {

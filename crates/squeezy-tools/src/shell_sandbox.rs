@@ -4,7 +4,10 @@ use std::{
     collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
-    sync::Mutex as StdMutex,
+    sync::{
+        Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,26 @@ pub(crate) enum ShellSandboxBackendStatus {
 #[derive(Debug, Default)]
 pub(crate) struct ShellSandboxHealth {
     backends: StdMutex<HashMap<&'static str, ShellSandboxBackendStatus>>,
+    /// Lifetime count of best_effort fallbacks observed by this registry,
+    /// across all backends. The agent layer pivots on this to keep the
+    /// `approval.best_effort.fallback` telemetry counter in step with the
+    /// runtime — every increment fires one telemetry event.
+    best_effort_fallback_count: AtomicU64,
+    /// One-shot latch so the user-visible TUI warning fires at most once
+    /// per session, even when several shell calls in a row land on the
+    /// same degraded backend. The telemetry counter above keeps ticking.
+    best_effort_warning_emitted: AtomicBool,
+}
+
+/// Outcome of `ShellSandboxHealth::record_best_effort_fallback`. The agent
+/// reads `fallback_count` to drive the telemetry counter and `first_in_session`
+/// to decide whether to surface the user-facing TUI warning. Returning both
+/// in one struct keeps the (count, latch) update atomic — callers never see
+/// the counter advance without also learning whether they're the warner.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ShellSandboxFallbackRecord {
+    pub(crate) fallback_count: u64,
+    pub(crate) first_in_session: bool,
 }
 
 impl ShellSandboxHealth {
@@ -67,6 +90,32 @@ impl ShellSandboxHealth {
                 ShellSandboxBackendStatus::Unavailable(reason.into()),
             );
     }
+
+    /// Bump the cumulative best_effort fallback counter and report whether
+    /// this is the first occurrence in the session so the caller can
+    /// publish a one-shot TUI warning. The counter keeps incrementing on
+    /// every call so telemetry dashboards see each silent degradation.
+    pub(crate) fn record_best_effort_fallback(&self) -> ShellSandboxFallbackRecord {
+        // `fetch_add` on a `Relaxed` ordering is fine here: this is a
+        // monotonic counter consumed by the same registry that produced
+        // it, so we don't need to fence between the count update and the
+        // latch flip below.
+        let prev = self
+            .best_effort_fallback_count
+            .fetch_add(1, Ordering::Relaxed);
+        let first_in_session = !self
+            .best_effort_warning_emitted
+            .swap(true, Ordering::Relaxed);
+        ShellSandboxFallbackRecord {
+            fallback_count: prev.saturating_add(1),
+            first_in_session,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn best_effort_fallback_count(&self) -> u64 {
+        self.best_effort_fallback_count.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +134,23 @@ pub(crate) struct ShellSandboxPlan {
     #[allow(dead_code)]
     pub(crate) filesystem_write_roots: Vec<PathBuf>,
     pub(crate) fallback_reason: Option<String>,
+    /// When this plan represents a best_effort fallback after a sandbox
+    /// failure, carries the originating backend plus the session counter
+    /// snapshot. Lets the audit row and the JSON surfaced to the agent
+    /// (which then drives telemetry + a one-shot TUI warning) describe
+    /// the degradation without a side channel.
+    pub(crate) best_effort_fallback: Option<BestEffortFallback>,
+}
+
+/// Side-table that accompanies a best_effort fallback plan. The agent
+/// reads these fields to (a) tick the `approval.best_effort.fallback`
+/// telemetry counter and (b) decide whether to publish the once-per-session
+/// TUI banner.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BestEffortFallback {
+    pub(crate) backend: &'static str,
+    pub(crate) fallback_count: u64,
+    pub(crate) first_in_session: bool,
 }
 
 impl ShellSandboxPlan {
@@ -102,6 +168,16 @@ impl ShellSandboxPlan {
         config: &ShellSandboxConfig,
         fallback_reason: Option<String>,
     ) -> Self {
+        Self::direct_with_fallback_record(command, mode, config, fallback_reason, None)
+    }
+
+    pub(crate) fn direct_with_fallback_record(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+        fallback_reason: Option<String>,
+        best_effort: Option<(&'static str, ShellSandboxFallbackRecord)>,
+    ) -> Self {
         let shell = ShellProgram::for_command(command);
         Self {
             program: shell.program,
@@ -116,6 +192,11 @@ impl ShellSandboxPlan {
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
             fallback_reason,
+            best_effort_fallback: best_effort.map(|(backend, record)| BestEffortFallback {
+                backend,
+                fallback_count: record.fallback_count,
+                first_in_session: record.first_in_session,
+            }),
         }
     }
 
@@ -134,11 +215,12 @@ impl ShellSandboxPlan {
             filesystem_read_roots: Vec::new(),
             filesystem_write_roots: Vec::new(),
             fallback_reason: None,
+            best_effort_fallback: None,
         }
     }
 
     pub(crate) fn metadata(&self) -> Value {
-        json!({
+        let mut payload = json!({
             "backend": self.backend,
             "mode": self.mode,
             "network": self.network,
@@ -147,8 +229,48 @@ impl ShellSandboxPlan {
             "read_roots": path_list_json(&self.configured_read_roots),
             "write_roots": path_list_json(&self.configured_write_roots),
             "fallback_reason": self.fallback_reason,
-        })
+        });
+        if let Some(record) = self.best_effort_fallback
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert(
+                "best_effort_fallback".to_string(),
+                best_effort_fallback_json(record),
+            );
+        }
+        payload
     }
+
+    /// Build the audit metadata row at the fallback EMISSION site, where
+    /// the plan still references the failing backend (so `backend`,
+    /// `filesystem`, etc. describe the attempt that was abandoned) but
+    /// the caller already has the counter snapshot in hand.
+    pub(crate) fn metadata_with_best_effort_fallback(
+        &self,
+        degraded_backend: &'static str,
+        record: &ShellSandboxFallbackRecord,
+    ) -> Value {
+        let mut payload = self.metadata();
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "best_effort_fallback".to_string(),
+                best_effort_fallback_json(BestEffortFallback {
+                    backend: degraded_backend,
+                    fallback_count: record.fallback_count,
+                    first_in_session: record.first_in_session,
+                }),
+            );
+        }
+        payload
+    }
+}
+
+fn best_effort_fallback_json(record: BestEffortFallback) -> Value {
+    json!({
+        "backend": record.backend,
+        "fallback_count": record.fallback_count,
+        "first_in_session": record.first_in_session,
+    })
 }
 
 pub(crate) fn path_list_json(paths: &[PathBuf]) -> Value {
@@ -415,6 +537,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                 filesystem_read_roots: Vec::new(),
                 filesystem_write_roots: Vec::new(),
                 fallback_reason: None,
+                best_effort_fallback: None,
             });
         }
         let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
@@ -473,6 +596,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
                     Vec::new()
                 },
                 fallback_reason: None,
+                best_effort_fallback: None,
             });
         }
     }
@@ -505,6 +629,7 @@ pub(crate) fn prepare_shell_sandbox_plan_with_probe(
             fallback_reason: Some(
                 "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
             ),
+            best_effort_fallback: None,
         })
     }
 
@@ -594,14 +719,33 @@ pub(crate) fn macos_shell_sandbox_profile(
     if allow_network {
         profile.push_str("(allow network*)\n");
     } else {
-        // The kernel still expects an explicit allow for AF_UNIX so that
-        // local sockets (DNS resolver shared memory, IPC) work; only the
-        // network-family connections are denied by default.
-        profile.push_str("(allow network* (local unix))\n");
-        profile.push_str("(allow network-inbound (local unix))\n");
+        // When network is denied we narrow AF_UNIX to an explicit
+        // allowlist rather than allowing every local socket. Without an
+        // allowlist a sandboxed shell can reach pulseaudio, ssh-agent,
+        // WindowServer, etc. via `nc -U`. Each allowed entry is matched
+        // as a path subpath so prefixes like `/private/tmp/agent.sock`
+        // cover sockets created beneath them.
+        for entry in MACOS_AF_UNIX_ALLOWLIST {
+            let escaped = sandbox_profile_string(entry);
+            profile.push_str(&format!(
+                "(allow network* (local unix-socket (subpath {escaped})))\n"
+            ));
+            profile.push_str(&format!(
+                "(allow network-inbound (local unix-socket (subpath {escaped})))\n"
+            ));
+        }
     }
     profile
 }
+
+/// Subpath-qualified AF_UNIX socket allowlist used when the network
+/// posture is denied. An empty list means AF_UNIX is denied entirely
+/// when network is denied; the default Seatbelt `(deny default)` rule
+/// supplies the actual deny. A future ticket can promote this to a
+/// `ShellSandboxConfig::socket_domain_allowlist` field; the constant
+/// keeps the policy site visible in one place.
+#[cfg(target_os = "macos")]
+const MACOS_AF_UNIX_ALLOWLIST: &[&str] = &[];
 
 /// Read-only roots every shell needs to look at: system libraries, the
 /// dynamic linker, certificate stores, the toolchain prefix, and the user's
@@ -860,6 +1004,13 @@ pub(crate) fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellS
                 if enforce_filesystem {
                     linux_landlock_restrict(&read_roots, &write_roots)?;
                 }
+                // The seccomp filter is the last step before exec: it must
+                // not block any of the prctl/unshare/landlock setup, and it
+                // applies to the upcoming `execve` and everything inherited
+                // by the shell. We set `PR_SET_NO_NEW_PRIVS` here as a
+                // safety net in case the landlock branch was skipped — the
+                // kernel requires NNP for an unprivileged seccomp install.
+                linux_seccomp::install_shell_filter()?;
                 Ok(())
             });
         }
@@ -1147,3 +1298,100 @@ pub(crate) fn linux_unshare_supported() -> bool {
 pub(crate) fn linux_unshare_supported() -> bool {
     false
 }
+
+/// Seccomp deny-list applied to the shell child immediately before `exec`.
+///
+/// The Linux unshare + Landlock layers cover filesystem and (when network is
+/// denied) outbound IP traffic, but they do not close pivot paths a malicious
+/// command could use to reach back into the agent itself: `ptrace` against
+/// sibling processes in the same user namespace, `process_vm_readv` /
+/// `process_vm_writev` for cross-process memory, or `socket(AF_UNIX)` for
+/// connecting to abstract or filesystem-backed local sockets the agent runs.
+/// We mirror codex's Linux sandbox by returning `EPERM` for those calls;
+/// the kernel returns the same errno a normal access check would, so a
+/// well-behaved tool degrades to a clean error instead of crashing.
+#[cfg(target_os = "linux")]
+mod linux_seccomp {
+    use std::collections::BTreeMap;
+
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch, apply_filter,
+    };
+
+    /// Install the shell-child seccomp filter on the current thread.
+    ///
+    /// Must be called from inside the `pre_exec` hook after fork and before
+    /// `execve` so only the child inherits it. Sets `PR_SET_NO_NEW_PRIVS`
+    /// first because an unprivileged seccomp install requires NNP. Calling
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` twice is harmless if landlock has
+    /// already enabled it on the same thread.
+    pub(super) fn install_shell_filter() -> std::io::Result<()> {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let program = build_shell_filter()?;
+        apply_filter(&program).map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Build the BPF program separately so tests can exercise the same
+    /// rule set without going through a `pre_exec` fork dance.
+    pub(super) fn build_shell_filter() -> std::io::Result<BpfProgram> {
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        // Unconditional denies: empty rule vec matches every invocation.
+        rules.insert(libc::SYS_ptrace, vec![]);
+        rules.insert(libc::SYS_process_vm_readv, vec![]);
+        rules.insert(libc::SYS_process_vm_writev, vec![]);
+
+        // `socket(AF_UNIX, ...)` and `socketpair(AF_UNIX, ...)`: deny when
+        // arg0 equals AF_UNIX. Other socket families fall through to the
+        // default Allow action because IP-family sockets are governed by
+        // CLONE_NEWNET (handled at unshare time) and ICMP/raw is governed
+        // by capabilities the unprivileged shell does not hold.
+        let unix_match = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(std::io::Error::other)?,
+        ])
+        .map_err(std::io::Error::other)?;
+        rules.insert(libc::SYS_socket, vec![unix_match.clone()]);
+        rules.insert(libc::SYS_socketpair, vec![unix_match]);
+
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            target_arch(),
+        )
+        .map_err(std::io::Error::other)?;
+        filter.try_into().map_err(std::io::Error::other)
+    }
+
+    /// Pick the seccomp `TargetArch` matching the build host. We only
+    /// support the two architectures squeezy ships Linux binaries for;
+    /// other targets fall through to a build-time `unimplemented!()` so a
+    /// silent miscompilation cannot turn into a no-op filter.
+    fn target_arch() -> TargetArch {
+        #[cfg(target_arch = "x86_64")]
+        {
+            TargetArch::x86_64
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            TargetArch::aarch64
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            unimplemented!("seccomp filter target arch is not supported");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "shell_sandbox_tests.rs"]
+mod tests;

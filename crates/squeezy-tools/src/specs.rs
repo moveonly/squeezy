@@ -531,6 +531,22 @@ pub(crate) fn notes_recall_spec() -> ToolSpec {
     }
 }
 
+pub(crate) fn observations_spec() -> ToolSpec {
+    ToolSpec {
+        name: "observations".to_string(),
+        description: "Surface persisted observations (decisions, preferences, conventions, dead-ends, notes) recorded across sessions. Omit `query` to list the most recent; provide it to token-search the redb-backed index. Read-only.".to_string(),
+        capability: PermissionCapability::Read,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {"type": "string", "description": "Optional free-text query. When omitted or empty, returns the most recent observations sorted by recency."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10, "description": "Maximum number of observations to return."}
+            }
+        }),
+    }
+}
+
 pub(crate) fn plan_patch_spec() -> ToolSpec {
     ToolSpec {
         name: "plan_patch".to_string(),

@@ -24,6 +24,7 @@ use squeezy_llm::{
 
 mod auth;
 mod doctor;
+mod update;
 use auth::handle_auth_command;
 use doctor::DoctorArgs;
 use squeezy_store::{
@@ -405,6 +406,11 @@ async fn main() -> squeezy_core::Result<()> {
         return result;
     }
 
+    // Best-effort update probe before the TUI takes over the terminal. The
+    // helper consults a 24h cache, so this is a no-op HTTP-wise on most
+    // startups; the banner stays quiet unless GitHub reports a new release
+    // we haven't already nagged the user about.
+    let update_banner = update::banner_for_startup(&update::check_for_update().await);
     let result = squeezy_tui::run_with_startup_profile(
         config,
         provider,
@@ -412,6 +418,7 @@ async fn main() -> squeezy_core::Result<()> {
             onboarding_summary: onboarding.visible_summary,
             languages: onboarding.language_summary,
             skip_resume_picker: cli.no_resume_picker,
+            update_banner,
         },
     )
     .await;

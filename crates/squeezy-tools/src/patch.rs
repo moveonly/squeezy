@@ -587,6 +587,19 @@ impl ToolRegistry {
         let bytes_written = staged.bytes_written();
 
         if dry_run {
+            let preview_delta = staged.delta_preview_json(false);
+            let summary: Vec<Value> = staged
+                .ops
+                .iter()
+                .map(|op| {
+                    json!({
+                        "path": op.primary_path(),
+                        "status": "applied",
+                        "exact": op.exact(),
+                    })
+                })
+                .collect();
+            let exact_overall = staged.ops.iter().all(|op| op.exact());
             let content = json!({
                 "dry_run": true,
                 "plan_id": args.plan_id,
@@ -596,10 +609,10 @@ impl ToolRegistry {
                 "locality": locality,
                 "warnings": warnings,
                 "applied_delta": {
-                    "exact": true,
-                    "operations": staged
-                        .delta_preview_json(false)
+                    "exact": exact_overall,
+                    "operations": preview_delta,
                 },
+                "delta": summary,
             });
             return make_result(
                 call,
@@ -619,19 +632,28 @@ impl ToolRegistry {
         let mut written: BTreeSet<usize> = BTreeSet::new();
         for (idx, op) in staged.ops.iter().enumerate() {
             if write_failure.is_some() {
-                applied_delta.push(op.delta_json_with_index("skipped", idx));
+                applied_delta.push(op.delta_json_full("skipped", idx, op.exact(), None));
                 continue;
             }
             match op.apply(&staged.files, &mut written) {
-                Ok(()) => applied_delta.push(op.delta_json_with_index("applied", idx)),
+                Ok(()) => {
+                    applied_delta.push(op.delta_json_full("applied", idx, op.exact(), None));
+                }
                 Err(err) => {
-                    applied_delta.push(op.delta_json_with_index("failed", idx));
-                    write_failure = Some((op.primary_path().to_string(), err.to_string(), idx));
+                    let message = err.to_string();
+                    applied_delta.push(op.delta_json_full(
+                        "failed",
+                        idx,
+                        op.exact(),
+                        Some(&message),
+                    ));
+                    write_failure = Some((op.primary_path().to_string(), message, idx));
                 }
             }
         }
         self.invalidate_diff_cache();
-        let exact_delta = write_failure.is_none();
+        let exact_delta = write_failure.is_none() && staged.ops.iter().all(|op| op.exact());
+        let delta_summary = audit_delta_summary(&applied_delta);
 
         if let Some((failed_path, error, _idx)) = write_failure {
             let mut error_content = json!({
@@ -647,6 +669,7 @@ impl ToolRegistry {
                     "exact": exact_delta,
                     "operations": applied_delta,
                 },
+                "delta": delta_summary,
             });
             self.append_checkpoint_to_content(
                 &mut error_content,
@@ -680,6 +703,7 @@ impl ToolRegistry {
                 "exact": exact_delta,
                 "operations": applied_delta,
             },
+            "delta": delta_summary,
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -725,6 +749,32 @@ impl ToolRegistry {
         plans.retain(|_, plan| plan.expires_at_ms > now);
         plans.get(plan_id).cloned()
     }
+}
+
+/// Build the audit-facing per-op summary array — `[{path, status, exact,
+/// error?}]` — from the rich `applied_delta.operations` entries. Callers that
+/// only want to know which paths landed exactly can read this without parsing
+/// the full delta shape.
+pub(crate) fn audit_delta_summary(entries: &[Value]) -> Vec<Value> {
+    entries
+        .iter()
+        .map(|entry| {
+            let mut summary = json!({
+                "path": entry.get("path").cloned().unwrap_or(Value::Null),
+                "status": entry.get("status").cloned().unwrap_or(Value::Null),
+                "exact": entry
+                    .get("exact")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true),
+            });
+            if let Some(error) = entry.get("error").and_then(|v| v.as_str())
+                && let Some(obj) = summary.as_object_mut()
+            {
+                obj.insert("error".to_string(), json!(error));
+            }
+            summary
+        })
+        .collect()
 }
 
 pub(crate) fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {

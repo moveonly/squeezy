@@ -270,6 +270,33 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
 }
 
 #[test]
+fn shell_sandbox_best_effort_fallback_event_tags_backend_and_tool() {
+    // F3-4: surface silent best_effort sandbox degradation as a counter.
+    // The event name must be the documented `approval.best_effort.fallback`
+    // slug so dashboards can pivot on it; the `sandbox_backend` property
+    // carries which platform backend was attempted.
+    let event = TelemetryEvent::shell_sandbox_best_effort_fallback("macos-sandbox-exec");
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(
+        text.contains("approval_best_effort_fallback"),
+        "event name slug missing: {text}"
+    );
+    assert!(
+        text.contains("\"sandbox_backend\":\"macos-sandbox-exec\""),
+        "sandbox_backend missing: {text}"
+    );
+    assert!(
+        text.contains("\"tool_name\":\"shell\""),
+        "tool_name missing: {text}"
+    );
+    assert!(
+        text.contains("\"tool_family\":\"shell\""),
+        "tool_family missing: {text}"
+    );
+}
+
+#[test]
 fn graph_event_carries_timing_counts_and_language_distribution() {
     let event = TelemetryEvent::graph_build_completed(GraphPerfReport {
         refresh_kind: RefreshKind::Cold,

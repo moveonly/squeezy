@@ -11,6 +11,7 @@ use std::{
 };
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use http::{HeaderName, HeaderValue};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{
@@ -21,7 +22,10 @@ use rmcp::{
         ResourceUpdatedNotificationParam, Tool as RmcpTool,
     },
     service::{NotificationContext, RequestContext, RoleClient},
-    transport::{StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -39,6 +43,7 @@ const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
 const RESOURCE_READ_CACHE_TTL: Duration = Duration::from_secs(300);
+const MAX_TOOL_SCHEMA_BYTES: usize = 4096;
 
 pub type McpResult<T> = Result<T, McpError>;
 
@@ -1193,7 +1198,10 @@ async fn start_http_service(
             McpTransport::Stdio => "stdio",
         },
     })?;
-    let transport = StreamableHttpClientTransport::from_uri(url.clone());
+    let config = build_streamable_http_config(server_name, url.clone(), server, |name| {
+        std::env::var(name).ok()
+    });
+    let transport = StreamableHttpClientTransport::from_config(config);
     let service = handler
         .serve(transport)
         .await
@@ -1205,6 +1213,100 @@ async fn start_http_service(
         service: Arc::new(service),
         _process: None,
     })
+}
+
+/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+///
+/// Resolves `bearer_token_env_var`, `http_headers`, and `env_http_headers`
+/// against the supplied env lookup. Missing env vars are skipped (not fatal);
+/// invalid header names/values log a warning and are dropped so a single bad
+/// entry never blocks the whole server from connecting. Env-sourced headers
+/// override the static map on name conflict so secret rotation does not lose
+/// to a stale literal.
+fn build_streamable_http_config<F>(
+    server_name: &str,
+    url: String,
+    server: &McpServerConfig,
+    lookup_env: F,
+) -> StreamableHttpClientTransportConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let auth_header = server.bearer_token_env_var.as_deref().and_then(|name| {
+        let value = lookup_env(name)?;
+        if value.trim().is_empty() {
+            tracing::warn!(
+                server = server_name,
+                env_var = name,
+                "bearer_token_env_var resolved to empty value; skipping Authorization header"
+            );
+            return None;
+        }
+        Some(value)
+    });
+
+    let mut custom_headers: std::collections::HashMap<HeaderName, HeaderValue> =
+        std::collections::HashMap::new();
+    for (name, value) in &server.http_headers {
+        match (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(header_name), Ok(header_value)) => {
+                custom_headers.insert(header_name, header_value);
+            }
+            (Err(err), _) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = name,
+                    "invalid HTTP header name: {err}"
+                );
+            }
+            (_, Err(err)) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = name,
+                    "invalid HTTP header value: {err}"
+                );
+            }
+        }
+    }
+    for (header_name, env_var) in &server.env_http_headers {
+        let Some(value) = lookup_env(env_var) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        match (
+            HeaderName::try_from(header_name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(name), Ok(val)) => {
+                custom_headers.insert(name, val);
+            }
+            (Err(err), _) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = header_name,
+                    "invalid HTTP header name: {err}"
+                );
+            }
+            (_, Err(err)) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = header_name,
+                    env_var = env_var,
+                    "invalid HTTP header value resolved from env: {err}"
+                );
+            }
+        }
+    }
+
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    config.auth_header = auth_header;
+    config.custom_headers = custom_headers;
+    config
 }
 
 async fn with_timeout<T>(
@@ -1267,7 +1369,19 @@ fn convert_tools(
                 .as_ref()
                 .map(|description| description.to_string())
                 .unwrap_or_else(|| format!("MCP tool {server_name}/{raw_name}"));
-            let parameters = schema_object(tool.schema_as_json_value());
+            let raw_parameters = schema_object(tool.schema_as_json_value());
+            let (parameters, stats) = compact_tool_schema(&raw_parameters, MAX_TOOL_SCHEMA_BYTES);
+            if stats.compacted_bytes < stats.original_bytes {
+                tracing::debug!(
+                    target: "squeezy::mcp",
+                    server = %server_name,
+                    tool = %raw_name,
+                    original_bytes = stats.original_bytes,
+                    compacted_bytes = stats.compacted_bytes,
+                    ratio = stats.ratio,
+                    "compacted MCP tool schema"
+                );
+            }
             ExternalMcpTool {
                 server: server_name.to_string(),
                 raw_name: raw_name.clone(),
@@ -1298,6 +1412,134 @@ fn schema_object(value: Value) -> Value {
             "properties": {},
             "additionalProperties": true,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct CompactionStats {
+    pub original_bytes: usize,
+    pub compacted_bytes: usize,
+    pub ratio: f32,
+}
+
+/// Strip explicit `null` fields and empty-string `description` entries from a
+/// JSON schema, recursively. Returns a new value; the input is left intact.
+pub(crate) fn sanitize_tool_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, child) in map {
+                if matches!(child, Value::Null) {
+                    continue;
+                }
+                if key == "description"
+                    && matches!(child, Value::String(text) if text.trim().is_empty())
+                {
+                    continue;
+                }
+                out.insert(key.clone(), sanitize_tool_schema(child));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sanitize_tool_schema).collect()),
+        _ => value.clone(),
+    }
+}
+
+/// Run the three-pass compactor:
+///   (1) sanitize — strip null / empty-description fields,
+///   (2) `$defs` hoist — drop unreachable definitions,
+///   (3) minify — handled implicitly by `Value::to_string()` at emission time.
+/// Reports the byte cost before and after compaction. The cap is informational
+/// for now (used to gate deeper passes in future work); the function always
+/// returns a schema whose serialized size is ≤ the original.
+pub(crate) fn compact_tool_schema(value: &Value, _max_bytes: usize) -> (Value, CompactionStats) {
+    let original_bytes = value.to_string().len();
+    let sanitized = sanitize_tool_schema(value);
+    let pruned = prune_unreachable_defs(sanitized);
+    let compacted_bytes = pruned.to_string().len();
+    let ratio = if original_bytes == 0 {
+        1.0
+    } else {
+        compacted_bytes as f32 / original_bytes as f32
+    };
+    (
+        pruned,
+        CompactionStats {
+            original_bytes,
+            compacted_bytes,
+            ratio,
+        },
+    )
+}
+
+/// Drop entries from `$defs` / `definitions` that are not referenced anywhere
+/// in the schema (by `"$ref": "#/$defs/<name>"` or `"#/definitions/<name>"`).
+fn prune_unreachable_defs(mut value: Value) -> Value {
+    let object = match value.as_object_mut() {
+        Some(object) => object,
+        None => return value,
+    };
+    for key in ["$defs", "definitions"] {
+        let Some(Value::Object(defs)) = object.get(key).cloned() else {
+            continue;
+        };
+        if defs.is_empty() {
+            object.remove(key);
+            continue;
+        }
+        // Build the set of refs that appear OUTSIDE the defs block itself.
+        let mut probe = object.clone();
+        probe.remove(key);
+        let mut referenced = BTreeSet::new();
+        collect_refs(&Value::Object(probe), key, &mut referenced);
+        // Walk over def bodies too — a referenced def may itself ref another def.
+        let mut frontier: Vec<String> = referenced.iter().cloned().collect();
+        while let Some(name) = frontier.pop() {
+            let Some(body) = defs.get(&name) else {
+                continue;
+            };
+            let mut nested = BTreeSet::new();
+            collect_refs(body, key, &mut nested);
+            for next in nested {
+                if referenced.insert(next.clone()) {
+                    frontier.push(next);
+                }
+            }
+        }
+        let kept: serde_json::Map<String, Value> = defs
+            .into_iter()
+            .filter(|(name, _)| referenced.contains(name))
+            .collect();
+        if kept.is_empty() {
+            object.remove(key);
+        } else {
+            object.insert(key.to_string(), Value::Object(kept));
+        }
+    }
+    value
+}
+
+fn collect_refs(value: &Value, defs_key: &str, out: &mut BTreeSet<String>) {
+    let prefix = format!("#/{defs_key}/");
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if key == "$ref"
+                    && let Some(text) = child.as_str()
+                    && let Some(name) = text.strip_prefix(&prefix)
+                {
+                    out.insert(name.to_string());
+                }
+                collect_refs(child, defs_key, out);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_refs(item, defs_key, out);
+            }
+        }
+        _ => {}
     }
 }
 

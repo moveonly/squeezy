@@ -18,6 +18,7 @@ futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 squeezy-core.workspace = true
+squeezy-hooks.workspace = true
 squeezy-llm.workspace = true
 squeezy-skills.workspace = true
 squeezy-store.workspace = true

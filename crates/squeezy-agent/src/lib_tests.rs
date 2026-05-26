@@ -3417,6 +3417,146 @@ fn compaction_strategy_parse_round_trip() {
     }
 }
 
+/// Provider that scripts the parent's first round (a `delegate` tool call),
+/// scripts the subagent's first round (a rejected tool call + cost), and then
+/// returns a pending stream for every subsequent stream — so the subagent's
+/// second round hangs and the wall-clock timeout fires.
+struct SubagentTimeoutProvider {
+    calls: Mutex<usize>,
+}
+
+impl SubagentTimeoutProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl LlmProvider for SubagentTimeoutProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut calls = self.calls.lock().expect("calls");
+        *calls += 1;
+        let n = *calls;
+        drop(calls);
+        match n {
+            1 => {
+                let events = vec![
+                    Ok(LlmEvent::Started),
+                    Ok(LlmEvent::ToolCall(LlmToolCall {
+                        call_id: "del_1".to_string(),
+                        name: "delegate".to_string(),
+                        arguments: json!({"prompt": "hang please"}),
+                    })),
+                    Ok(LlmEvent::Completed {
+                        response_id: Some("resp_parent_1".to_string()),
+                        cost: CostSnapshot::default(),
+                    }),
+                ];
+                let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+                    Box::pin(stream::iter(events));
+                stream
+            }
+            2 => {
+                // Subagent's first round: drive a tool call we will reject so
+                // the loop continues past the empty-tool-calls fast path, and
+                // ship a non-zero cost so partial metrics are observable when
+                // the wall-clock timer fires in the next round.
+                let events = vec![
+                    Ok(LlmEvent::Started),
+                    Ok(LlmEvent::ToolCall(LlmToolCall {
+                        call_id: "sub_1".to_string(),
+                        name: "definitely_not_a_real_tool".to_string(),
+                        arguments: json!({}),
+                    })),
+                    Ok(LlmEvent::Completed {
+                        response_id: Some("resp_sub_1".to_string()),
+                        cost: CostSnapshot {
+                            input_tokens: Some(42),
+                            output_tokens: Some(7),
+                            estimated_usd_micros: Some(1_234),
+                            ..CostSnapshot::default()
+                        },
+                    }),
+                ];
+                let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+                    Box::pin(stream::iter(events));
+                stream
+            }
+            _ => Box::pin(stream::pending()),
+        }
+    }
+}
+
+#[tokio::test]
+async fn subagent_wall_clock_timeout_terminates_with_partial_metrics() {
+    let provider = Arc::new(SubagentTimeoutProvider::new());
+    let mut config = AppConfig::default();
+    // 1s budget keeps the test fast while staying well above scheduler noise.
+    config.subagents.max_runtime_secs = Some(1);
+    let agent = Agent::new(config, provider.clone());
+
+    let cancel = CancellationToken::new();
+    let started = std::time::Instant::now();
+    let mut rx = agent.start_turn("delegate to the void".to_string(), cancel.clone());
+    let mut saw_timeout = false;
+    let mut subagent_metrics = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::SubagentFailed {
+            agent,
+            error,
+            metrics,
+            ..
+        } = event
+        {
+            assert_eq!(agent, "delegate");
+            assert!(
+                error.contains("wall-clock") || error.contains("timed_out"),
+                "timeout error should be self-describing: {error}"
+            );
+            subagent_metrics = Some(metrics);
+            saw_timeout = true;
+            cancel.cancel();
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    // Drain any tail events without blocking the test on the parent's
+    // post-cancel teardown.
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        while rx.recv().await.is_some() {}
+    })
+    .await;
+
+    assert!(
+        saw_timeout,
+        "expected SubagentFailed for the timed-out delegate"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "timeout fired in {elapsed:?}, expected <2.5s"
+    );
+    let metrics = subagent_metrics.expect("metrics captured");
+    // Partial cost from round 1 must survive the timeout. If we accidentally
+    // returned `TurnMetrics::default()`, every counter below would be zero.
+    // `SubagentFailed.metrics` carries the subagent's own TurnMetrics, so
+    // the spent tokens land on `provider` (the parent later folds them into
+    // its own `subagent_provider` via `merge_subagent_tool_metrics`).
+    assert_eq!(
+        metrics.provider.input_tokens,
+        Some(42),
+        "partial provider cost dropped on timeout: {metrics:?}"
+    );
+    assert!(
+        metrics.model_output_bytes > 0,
+        "model_output_bytes from the rejected tool result should be preserved: {metrics:?}"
+    );
+}
+
 #[tokio::test]
 async fn compact_with_strategy_falls_back_to_extractive_when_hanging_provider_times_out() {
     use squeezy_core::Redactor;
@@ -3781,6 +3921,202 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
 }
 
 #[test]
+fn parse_subagent_structured_tail_extracts_findings_object() {
+    let text = "Here is the plan.\n\n{\"findings\": [{\"finding\": \"missing tracing\", \"recommendation\": \"add span\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span\"}";
+    let parsed = super::parse_subagent_structured_tail(text).expect("structured tail should parse");
+    assert_eq!(parsed["summary"], json!("add a tracing span"));
+    assert_eq!(parsed["findings"][0]["finding"], json!("missing tracing"));
+    assert_eq!(parsed["findings"][0]["priority"], json!("warning"));
+}
+
+#[test]
+fn parse_subagent_structured_tail_returns_none_for_plain_text() {
+    assert!(
+        super::parse_subagent_structured_tail("Just a free-text summary with no JSON in sight.")
+            .is_none(),
+        "plain text must not be coerced into structured output"
+    );
+}
+
+#[test]
+fn parse_subagent_structured_tail_accepts_bare_json_object() {
+    let text = "{\"findings\": [], \"summary\": \"nothing to report\"}";
+    let parsed = super::parse_subagent_structured_tail(text).expect("bare JSON object parses");
+    assert_eq!(parsed["findings"], json!([]));
+    assert_eq!(parsed["summary"], json!("nothing to report"));
+}
+
+#[test]
+fn parse_subagent_structured_tail_rejects_json_array_only() {
+    // The contract requires an object. A bare array tail should not be
+    // misclassified as the structured-output payload.
+    assert!(super::parse_subagent_structured_tail("[1, 2, 3]").is_none());
+}
+
+#[test]
+fn plan_subagent_instructions_advertise_json_tail_contract() {
+    let request = super::SubagentRequest {
+        prompt: "plan something".to_string(),
+        scope: None,
+        thoroughness: None,
+    };
+    let plan = super::subagent_instructions(SubagentKind::Plan, &request);
+    assert!(
+        plan.contains("Output contract") && plan.contains("\"findings\""),
+        "plan prompt must teach the JSON tail contract: {plan}"
+    );
+    let review = super::subagent_instructions(SubagentKind::Review, &request);
+    assert!(
+        review.contains("Output contract") && review.contains("\"findings\""),
+        "review prompt must teach the JSON tail contract: {review}"
+    );
+    let delegate = super::subagent_instructions(SubagentKind::Delegate, &request);
+    assert!(
+        !delegate.contains("Output contract"),
+        "delegate prompt must not advertise the Plan/Review JSON tail contract: {delegate}"
+    );
+}
+
+#[tokio::test]
+async fn plan_subagent_parses_json_tail_into_structured_output() {
+    let provider = Arc::new(MockProvider::new(vec![
+        // Parent turn 1: emit a delegate_plan tool call.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "plan_1".to_string(),
+                name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+                arguments: json!({ "goal": "add tracing to ingest pipeline" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Plan subagent: return text followed by a JSON tail.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Plan: instrument ingest with spans.\n\n".to_string(),
+            )),
+            Ok(LlmEvent::TextDelta(
+                "{\"findings\": [{\"finding\": \"missing tracing on ingest\", \"recommendation\": \"add span around process_batch\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span on ingest\"}".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("plan_subagent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Parent turn 2: wrap up.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("plan tracing".to_string(), CancellationToken::new());
+    let mut plan_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == DELEGATE_PLAN_TOOL_NAME
+        {
+            plan_result = Some(result);
+        }
+    }
+
+    let plan_result = plan_result.expect("plan tool result");
+    assert_eq!(plan_result.status, ToolStatus::Success);
+    let structured = plan_result
+        .content
+        .get("structured_output")
+        .expect("plan subagent must surface structured_output on success");
+    assert_eq!(
+        structured["findings"][0]["finding"],
+        json!("missing tracing on ingest")
+    );
+    assert_eq!(structured["findings"][0]["priority"], json!("warning"));
+    assert_eq!(structured["summary"], json!("add a tracing span on ingest"));
+    let summary = plan_result
+        .content
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary must be present");
+    assert!(
+        summary.contains("instrument ingest"),
+        "raw assistant text must still appear in summary: {summary}"
+    );
+}
+
+#[tokio::test]
+async fn plan_subagent_falls_back_to_summary_when_json_missing() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "plan_1".to_string(),
+                name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+                arguments: json!({ "goal": "describe ingest" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Plan subagent: emits plain prose with no JSON tail.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Plan: refactor ingest module to extract span helpers.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("plan_subagent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("plan tracing".to_string(), CancellationToken::new());
+    let mut plan_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == DELEGATE_PLAN_TOOL_NAME
+        {
+            plan_result = Some(result);
+        }
+    }
+
+    let plan_result = plan_result.expect("plan tool result");
+    assert_eq!(plan_result.status, ToolStatus::Success);
+    assert!(
+        plan_result.content.get("structured_output").is_none(),
+        "free-text plan subagent must not produce structured_output"
+    );
+    let summary = plan_result
+        .content
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary must be present");
+    assert!(
+        summary.contains("refactor ingest module"),
+        "raw assistant text must still appear in summary: {summary}"
+    );
+}
+
+#[test]
 fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
     let plan_call = ToolCall {
         call_id: "c1".to_string(),
@@ -4107,4 +4443,257 @@ fn progress_snapshot_fires_at_stride_multiples() {
 fn progress_snapshot_returns_none_before_any_calls() {
     let broker = CostBroker::new(&AppConfig::default());
     assert!(broker.progress_snapshot_if_due(3).is_none());
+}
+
+fn shell_fallback_result(
+    backend: &str,
+    fallback_count: u64,
+    first_in_session: bool,
+) -> squeezy_tools::ToolResult {
+    squeezy_tools::ToolResult {
+        call_id: "shell-call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "none",
+                "mode": "best_effort",
+                "best_effort_fallback": {
+                    "backend": backend,
+                    "fallback_count": fallback_count,
+                    "first_in_session": first_in_session,
+                }
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    }
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_warns_tui_exactly_once_per_session() {
+    // F3-4: the TUI must learn about the sandbox degradation on the
+    // first fallback and never again in the same session. The tool
+    // layer's one-shot latch drives `first_in_session`; the agent
+    // routes that signal into AgentEvent::ShellSandboxBestEffortFallback.
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(8);
+
+    let first = shell_fallback_result("macos-sandbox-exec", 1, true);
+    let second = shell_fallback_result("macos-sandbox-exec", 2, false);
+    let third = shell_fallback_result("macos-sandbox-exec", 3, false);
+
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(7), &first).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(8), &second).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(9), &third).await;
+
+    drop(tx);
+
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one TUI warning must be emitted per session"
+    );
+    let AgentEvent::ShellSandboxBestEffortFallback {
+        turn_id,
+        backend,
+        fallback_count,
+    } = &events[0]
+    else {
+        panic!("expected AgentEvent::ShellSandboxBestEffortFallback");
+    };
+    assert_eq!(
+        turn_id.get(),
+        7,
+        "warning must carry the originating turn id"
+    );
+    assert_eq!(backend, "macos-sandbox-exec");
+    assert_eq!(*fallback_count, 1);
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_ignores_clean_shell_results_and_non_shell_tools() {
+    // Defence in depth: clean shell completions and non-shell tools
+    // must NOT trip the warning; the agent helper inspects the result
+    // payload and only routes on the embedded fallback descriptor.
+    let (tx, mut rx) = mpsc::channel::<AgentEvent>(4);
+
+    let clean_shell = squeezy_tools::ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "required",
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let read_file = squeezy_tools::ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: json!({"path": "foo.rs"}),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(1), &clean_shell).await;
+    maybe_emit_shell_sandbox_fallback_warning(&tx, TurnId::new(2), &read_file).await;
+    drop(tx);
+
+    assert!(
+        rx.recv().await.is_none(),
+        "no AgentEvent must fire for clean or non-shell results"
+    );
+}
+
+#[tokio::test]
+async fn shell_sandbox_fallback_counter_emits_per_call() {
+    // The `approval.best_effort.fallback{tool=shell}` counter ticks on
+    // EVERY fallback, even after the TUI warning has already fired.
+    // We drive `emit_tool_telemetry` directly with synthesized results
+    // so the test does not depend on the live shell sandbox.
+    let temp = std::env::temp_dir().join(format!(
+        "squeezy-best-effort-fallback-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&temp).expect("temp dir");
+    let install_id_path = temp.join("install_id");
+    let config = AppConfig {
+        telemetry: squeezy_telemetry::telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let telemetry = TelemetryClient::from_config_with_install_path(&config, &install_id_path);
+    assert!(telemetry.enabled(), "telemetry must be live for this test");
+
+    let call = ToolCall {
+        call_id: "shell-call".to_string(),
+        name: "shell".to_string(),
+        arguments: json!({"command": "true"}),
+    };
+
+    // First fallback: first_in_session=true.
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        1,
+        &call,
+        &shell_fallback_result("macos-sandbox-exec", 1, true),
+        Duration::from_millis(5),
+    );
+    // Second fallback: counter must still tick even though the TUI
+    // one-shot latch has flipped.
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        2,
+        &call,
+        &shell_fallback_result("macos-sandbox-exec", 2, false),
+        Duration::from_millis(7),
+    );
+    // Clean shell call must NOT add a fallback counter event.
+    let clean = squeezy_tools::ToolResult {
+        call_id: "clean".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "required",
+            }
+        }),
+        cost_hint: squeezy_tools::ToolCostHint::default(),
+        receipt: squeezy_tools::ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    emit_tool_telemetry(
+        &config,
+        &telemetry,
+        TurnId::new(1),
+        3,
+        &call,
+        &clean,
+        Duration::from_millis(2),
+    );
+
+    // `spawn` is fire-and-forget; let queued tasks land in the queue.
+    // Each `emit_tool_telemetry` schedules background tasks for both
+    // the tool-completed event and (optionally) the fallback counter,
+    // so we yield twice per call and then poll the queue snapshot
+    // until both invariants hold or we run out of patience.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut snapshot = Vec::new();
+    while std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+        snapshot = telemetry.pending_events_snapshot().await;
+        let tool_completed = snapshot
+            .iter()
+            .filter(|event| event.event == squeezy_telemetry::TelemetryEventName::ToolCompleted)
+            .count();
+        let fallback = snapshot
+            .iter()
+            .filter(|event| {
+                event.event == squeezy_telemetry::TelemetryEventName::ShellSandboxBestEffortFallback
+            })
+            .count();
+        if tool_completed >= 3 && fallback >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut fallback_events = 0;
+    let mut tool_completed_events = 0;
+    for event in &snapshot {
+        match event.event {
+            squeezy_telemetry::TelemetryEventName::ShellSandboxBestEffortFallback => {
+                fallback_events += 1;
+                assert_eq!(
+                    event.properties.sandbox_backend.as_deref(),
+                    Some("macos-sandbox-exec")
+                );
+            }
+            squeezy_telemetry::TelemetryEventName::ToolCompleted => {
+                tool_completed_events += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        fallback_events, 2,
+        "counter must tick on every fallback (got {fallback_events})"
+    );
+    assert_eq!(
+        tool_completed_events, 3,
+        "tool_completed must still fire for every call regardless of fallback"
+    );
+
+    let _ = fs::remove_dir_all(temp);
 }

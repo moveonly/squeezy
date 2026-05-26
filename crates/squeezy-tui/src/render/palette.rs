@@ -1,4 +1,10 @@
-use std::{env, sync::OnceLock};
+use std::{
+    env,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use ratatui::style::Color;
 
@@ -37,9 +43,40 @@ pub(crate) enum ColorLevel {
     TrueColor,
 }
 
+/// Runtime palette tone override. Encoded as `0 = unset (follow detection)`,
+/// `1 = Dark`, `2 = Light`. Updates from `/theme` flip this atomically and
+/// every read of [`palette_tone`] sees the new value on the next draw.
+static TONE_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+const TONE_OVERRIDE_UNSET: u8 = 0;
+const TONE_OVERRIDE_DARK: u8 = 1;
+const TONE_OVERRIDE_LIGHT: u8 = 2;
+
 pub(crate) fn palette_tone() -> PaletteTone {
+    match TONE_OVERRIDE.load(Ordering::Relaxed) {
+        TONE_OVERRIDE_DARK => PaletteTone::Dark,
+        TONE_OVERRIDE_LIGHT => PaletteTone::Light,
+        _ => detected_palette_tone(),
+    }
+}
+
+/// Cached terminal-detected tone. Separate from the override so the `system`
+/// preference falls back to detection without a redundant env read.
+pub(crate) fn detected_palette_tone() -> PaletteTone {
     static TONE: OnceLock<PaletteTone> = OnceLock::new();
     *TONE.get_or_init(detect_palette_tone)
+}
+
+/// Pin the runtime palette tone. `Some(tone)` overrides terminal detection;
+/// `None` clears the override and falls back to detection. Subsequent renders
+/// see the change immediately.
+pub(crate) fn set_palette_tone_override(tone: Option<PaletteTone>) {
+    let encoded = match tone {
+        None => TONE_OVERRIDE_UNSET,
+        Some(PaletteTone::Dark) => TONE_OVERRIDE_DARK,
+        Some(PaletteTone::Light) => TONE_OVERRIDE_LIGHT,
+    };
+    TONE_OVERRIDE.store(encoded, Ordering::Relaxed);
 }
 
 pub(crate) fn color_level() -> ColorLevel {

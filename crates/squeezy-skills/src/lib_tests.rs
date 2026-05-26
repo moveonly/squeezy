@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use squeezy_core::{SkillConfigEntry, SkillsConfig};
+use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
 
 use super::*;
 
@@ -843,6 +843,72 @@ fn squeezy_help_doc_citations_are_bundled_paths() {
             }
         }
     }
+}
+
+#[test]
+fn discover_applies_context_percent_budget_to_catalog() {
+    let root = temp_workspace("skills_budget_mode_discover");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill_with_body(
+        &skill_dir,
+        "rust-nav",
+        "Rust nav",
+        &[],
+        // Pad the body so the active bundle would exceed a small budget
+        // and force the catalog to fall back to a stub. That confirms the
+        // discover-time budget actually drives render-time decisions.
+        &"x".repeat(20_000),
+    );
+    // 32K-token model gets a 2_560-char active budget; the 20K-char body
+    // can't fit so the catalog should emit a stub.
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_body_cap_chars: 64_000,
+        active_budget_mode: SkillsBudgetMode::ContextPercent { percent: 2.0 },
+        model_context_window: Some(32_000),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let activation = catalog
+        .activate_for_input("/skill rust-nav do something")
+        .expect("activate");
+    let rendered = catalog
+        .render_active_skills(&activation.skills)
+        .expect("render active skills");
+    assert!(rendered.chars().count() <= 2_560);
+    assert!(rendered.contains("truncated=\"true\""));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn discover_chars_mode_pins_catalog_budget_regardless_of_window() {
+    let root = temp_workspace("skills_budget_mode_chars");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_mode: SkillsBudgetMode::Chars { chars: 8_000 },
+        preamble_budget_mode: SkillsBudgetMode::Chars { chars: 8_000 },
+        model_context_window: Some(200_000),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let activation = catalog
+        .activate_for_input("/skill rust-nav do something")
+        .expect("activate");
+    let rendered = catalog
+        .render_active_skills(&activation.skills)
+        .expect("render active skills");
+    // The bundle is small but the budget must still be the explicit 8_000
+    // cap, not 2% of the 200K-token window (which would be 16_000).
+    assert!(rendered.chars().count() <= 8_000);
+
+    let _ = fs::remove_dir_all(root);
 }
 
 fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {

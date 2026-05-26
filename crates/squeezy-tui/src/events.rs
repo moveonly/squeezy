@@ -9,7 +9,7 @@ use squeezy_tools::{McpElicitationResponse, McpStatusSnapshot, ToolStatus};
 use tokio::sync::broadcast;
 
 use crate::{
-    CONTEXT_NUDGE_PCT, PendingApproval, PendingMcpElicitation, PendingPlanChoice,
+    CONTEXT_NUDGE_THRESHOLD_RATIO_PCT, PendingApproval, PendingMcpElicitation, PendingPlanChoice,
     PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compact_text,
     compaction_status_line, context_window_pct, dedupe_assistant_repeated_tool_output,
     format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
@@ -320,6 +320,26 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     );
                     app.push_transcript_item(TranscriptItem::system(notice));
                 }
+                AgentEvent::ShellSandboxBestEffortFallback {
+                    backend,
+                    fallback_count,
+                    ..
+                } => {
+                    // Fires at most once per session — the agent's
+                    // `maybe_emit_shell_sandbox_fallback_warning` gates on
+                    // the tool-layer one-shot latch. Surface both the
+                    // banner (status-bar pane) and a transcript notice
+                    // so users notice mid-turn AND have a durable record.
+                    let banner = format!(
+                        "shell sandbox degraded: {backend} unavailable, running without OS isolation (best_effort)"
+                    );
+                    app.app_notifications
+                        .push(banner, crate::notification::Severity::Warn);
+                    let notice = format!(
+                        "shell sandbox degraded: backend `{backend}` unavailable; subsequent shell calls run without OS isolation under mode=best_effort (fallback #{fallback_count})"
+                    );
+                    app.push_transcript_item(TranscriptItem::system(notice));
+                }
                 AgentEvent::CostUpdate {
                     tool_count,
                     input_tokens,
@@ -433,6 +453,13 @@ pub(crate) fn cancel_pending_request_user_input(app: &mut TuiApp) {
 /// this *before* the next turn so the user has a chance to `/pin` or
 /// `/compact` deliberately rather than discovering after the fact that
 /// the conversation has been rewritten.
+///
+/// The nudge fires at [`CONTEXT_NUDGE_THRESHOLD_RATIO_PCT`] of the
+/// compaction threshold (well before the 100% mark that triggers
+/// auto-compaction) and is suppressed once the estimate has already
+/// reached the threshold — by that point the auto-compaction surface
+/// is the actionable signal and a "consider /compact" advisory is
+/// stale advice.
 pub(crate) fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
     if app.context_compaction_threshold == 0 || app.context_compaction_nudge_shown {
         return;
@@ -441,12 +468,12 @@ pub(crate) fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
         app.context_estimate.estimated_tokens,
         app.context_compaction_threshold,
     );
-    if pct < CONTEXT_NUDGE_PCT {
+    if !(CONTEXT_NUDGE_THRESHOLD_RATIO_PCT..100).contains(&pct) {
         return;
     }
     app.context_compaction_nudge_shown = true;
     app.push_log(format!(
-        "context window {pct}% full ({used}/{threshold} tok) — /pin to keep important context · /compact to summarize before the next turn",
+        "context {pct}% of auto-compact threshold ({used}/{threshold} tok) — /pin to keep what matters · /compact to summarize before auto-compaction triggers",
         used = app.context_estimate.estimated_tokens,
         threshold = app.context_compaction_threshold,
     ));

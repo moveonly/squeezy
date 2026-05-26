@@ -98,14 +98,22 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // the subagent's natural exit is the model emitting a final answer
 // with no tool calls.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
 // Emergency belt on subagent model rounds — matches CC's
 // `forkSubagent.maxTurns = 200`, the only concrete cap any peer
 // sets on a full subagent. Above this the cost broker, cancellation
 // token, and per-tool-call truncations should already have caught
 // any runaway.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
+// Wall-clock ceiling for a single subagent run. None of the per-call
+// budgets (tool calls, bytes, model rounds, summary tokens) measure elapsed
+// time, so a slow model stream or a chain of slow tool calls can pin the
+// parent indefinitely without ever tripping them. 300s sits well above the
+// median Explore/Plan/Review run while still guaranteeing the parent's turn
+// loop reclaims control on the order of minutes. Set to `0` in TOML or
+// `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0` to disable.
+pub const DEFAULT_SUBAGENT_MAX_RUNTIME_SECS: u64 = 300;
 // Generous default that absorbs reasoning-model overhead. The previous 1_200
 // silently broke any subagent run under a reasoning model with effort >= medium:
 // reasoning alone burns several thousand tokens before the model can emit a
@@ -196,7 +204,7 @@ pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
     "upstream_flow",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
@@ -586,7 +594,7 @@ impl AppConfig {
             get_var("SQUEEZY_SESSION_MODE"),
             session_settings.mode.unwrap_or_default(),
         );
-        let skills = SkillsConfig::from_settings_and_env_vars(
+        let mut skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
         );
@@ -603,6 +611,10 @@ impl AppConfig {
             settings.context.unwrap_or_default(),
             &mut get_var,
         );
+        // Skills' ContextPercent budget mode reads the same window value as
+        // mid-turn compaction; resolve it here instead of duplicating the
+        // env/file precedence logic.
+        skills.model_context_window = context_compaction.model_context_window;
         let subagents = SubagentConfig::from_settings_and_env(
             settings.subagents.unwrap_or_default(),
             &mut get_var,
@@ -845,9 +857,13 @@ impl AppConfig {
             self.subagents.max_model_rounds
         ));
         output.push_str(&format!(
-            "max_summary_tokens = {}\n\n",
+            "max_summary_tokens = {}\n",
             self.subagents.max_summary_tokens
         ));
+        match self.subagents.max_runtime_secs {
+            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n\n")),
+            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n\n"),
+        }
 
         output.push_str("[budgets]\n");
         output.push_str(&format!(
@@ -1083,6 +1099,19 @@ impl AppConfig {
             "preamble_budget_chars = {}\n",
             self.skills.preamble_budget_chars
         ));
+        // The mode tables follow the same inline-table shape that
+        // `from_table` accepts, so the inspect output round-trips when
+        // pasted back into a settings file.
+        emit_skills_budget_mode(
+            &mut output,
+            "active_budget_mode",
+            self.skills.active_budget_mode,
+        );
+        emit_skills_budget_mode(
+            &mut output,
+            "preamble_budget_mode",
+            self.skills.preamble_budget_mode,
+        );
         if self.skills.config.is_empty() {
             output.push('\n');
         } else {
@@ -1181,6 +1210,10 @@ impl AppConfig {
         output.push_str(&format!(
             "alternate_screen = {}\n",
             toml_string(self.tui.alternate_screen.as_str())
+        ));
+        output.push_str(&format!(
+            "theme = {}\n",
+            toml_string(self.tui.theme.as_str())
         ));
         output.push_str(&format!(
             "show_reasoning_usage = {}\n\n",
@@ -1320,6 +1353,23 @@ fn toml_path_array(values: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
     toml_string_array(&values)
+}
+
+fn emit_skills_budget_mode(output: &mut String, key: &str, mode: SkillsBudgetMode) {
+    match mode {
+        SkillsBudgetMode::Chars { chars } => {
+            output.push_str(&format!("{key} = {{ chars = {chars} }}\n"));
+        }
+        SkillsBudgetMode::ContextPercent { percent } => {
+            // `{:?}` on f32 always emits a decimal point, keeping the TOML
+            // parser on the float branch instead of misreading e.g. `2`
+            // as an integer next round-trip.
+            output.push_str(&format!(
+                "{key} = {{ context_percent = {:?} }}\n",
+                percent as f64
+            ));
+        }
+    }
 }
 
 fn toml_bare_or_quoted_key(key: &str) -> String {
@@ -1664,7 +1714,7 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SettingsFile {
     pub provider: Option<String>,
     pub profile: Option<String>,
@@ -2809,6 +2859,7 @@ pub struct SubagentSettings {
     pub max_search_files_per_call: Option<u64>,
     pub max_model_rounds: Option<usize>,
     pub max_summary_tokens: Option<u32>,
+    pub max_runtime_secs: Option<u64>,
 }
 
 impl SubagentSettings {
@@ -2824,6 +2875,7 @@ impl SubagentSettings {
                 "max_search_files_per_call",
                 "max_model_rounds",
                 "max_summary_tokens",
+                "max_runtime_secs",
             ],
             source,
             path,
@@ -2872,6 +2924,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_summary_tokens"),
             )?,
+            max_runtime_secs: u64_value(
+                table,
+                "max_runtime_secs",
+                source,
+                &field(path, "max_runtime_secs"),
+            )?,
         })
     }
 
@@ -2893,6 +2951,7 @@ impl SubagentSettings {
         );
         replace_if_some(&mut self.max_model_rounds, next.max_model_rounds);
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
+        replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
     }
 }
 
@@ -2906,6 +2965,10 @@ pub struct SubagentConfig {
     pub max_search_files_per_call: u64,
     pub max_model_rounds: usize,
     pub max_summary_tokens: u32,
+    /// Wall-clock cap on a single subagent run. `None` (set via TOML
+    /// `max_runtime_secs = 0` or `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0`)
+    /// disables the timeout entirely; cancellation and round caps remain.
+    pub max_runtime_secs: Option<u64>,
 }
 
 impl SubagentConfig {
@@ -2954,6 +3017,13 @@ impl SubagentConfig {
                 .filter(|value| *value > 0)
                 .or(settings.max_summary_tokens)
                 .unwrap_or(DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS),
+            max_runtime_secs: {
+                let raw = get_var("SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .or(settings.max_runtime_secs)
+                    .unwrap_or(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS);
+                if raw == 0 { None } else { Some(raw) }
+            },
         }
     }
 }
@@ -2969,6 +3039,7 @@ impl Default for SubagentConfig {
             max_search_files_per_call: DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+            max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
         }
     }
 }
@@ -4905,7 +4976,7 @@ impl WebSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SkillsSettings {
     pub user_dir: Option<PathBuf>,
     pub compat_user_dir: Option<PathBuf>,
@@ -4913,6 +4984,8 @@ pub struct SkillsSettings {
     pub active_body_cap_chars: Option<usize>,
     pub preamble_enabled: Option<bool>,
     pub preamble_budget_chars: Option<usize>,
+    pub active_budget_mode: Option<SkillsBudgetMode>,
+    pub preamble_budget_mode: Option<SkillsBudgetMode>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -4927,6 +5000,8 @@ impl SkillsSettings {
                 "active_body_cap_chars",
                 "preamble_enabled",
                 "preamble_budget_chars",
+                "active_budget_mode",
+                "preamble_budget_mode",
                 "config",
             ],
             source,
@@ -4964,6 +5039,18 @@ impl SkillsSettings {
                 source,
                 &field(path, "preamble_budget_chars"),
             )?,
+            active_budget_mode: skills_budget_mode_value(
+                table,
+                "active_budget_mode",
+                source,
+                &field(path, "active_budget_mode"),
+            )?,
+            preamble_budget_mode: skills_budget_mode_value(
+                table,
+                "preamble_budget_mode",
+                source,
+                &field(path, "preamble_budget_mode"),
+            )?,
             config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
@@ -4975,6 +5062,8 @@ impl SkillsSettings {
         replace_if_some(&mut self.active_body_cap_chars, next.active_body_cap_chars);
         replace_if_some(&mut self.preamble_enabled, next.preamble_enabled);
         replace_if_some(&mut self.preamble_budget_chars, next.preamble_budget_chars);
+        replace_if_some(&mut self.active_budget_mode, next.active_budget_mode);
+        replace_if_some(&mut self.preamble_budget_mode, next.preamble_budget_mode);
         self.config.extend(next.config);
     }
 }
@@ -4983,6 +5072,13 @@ pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
 pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
 pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
 pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+/// Default fraction of `model_context_window` (in percent) consumed by the
+/// active and available-skills bundles when no explicit chars budget is set.
+/// Matches the codex reference (`SKILL_METADATA_CONTEXT_WINDOW_PERCENT=2`).
+pub const DEFAULT_SKILLS_BUDGET_CONTEXT_PERCENT: f32 = 2.0;
+/// Conservative chars-per-token used when scaling a token-denominated context
+/// window into a chars budget. Mirrors `CHARS_PER_TOKEN` in `ai_reviewer.rs`.
+pub const SKILLS_CHARS_PER_TOKEN: u64 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillConfigEntry {
@@ -4991,7 +5087,60 @@ pub struct SkillConfigEntry {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Selects how a skills budget is computed at render time.
+///
+/// `Chars` is an absolute cap and ignores the context window. `ContextPercent`
+/// scales the budget to a fraction of `model_context_window` (converted to
+/// chars via [`SKILLS_CHARS_PER_TOKEN`]), so larger-context models get
+/// proportionally more room for skill instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillsBudgetMode {
+    /// Absolute character cap, regardless of context window.
+    Chars { chars: usize },
+    /// Percentage of the model context window (0..=100), converted to chars
+    /// via `SKILLS_CHARS_PER_TOKEN`.
+    ContextPercent { percent: f32 },
+}
+
+impl Default for SkillsBudgetMode {
+    fn default() -> Self {
+        Self::ContextPercent {
+            percent: DEFAULT_SKILLS_BUDGET_CONTEXT_PERCENT,
+        }
+    }
+}
+
+impl SkillsBudgetMode {
+    /// Computes the effective character budget for this mode. `Chars(n)` is
+    /// returned verbatim. `ContextPercent(p)` scales `model_context_window`
+    /// (in tokens) to chars and applies `p%`; if the window is unknown, the
+    /// caller's `fallback_chars` is used (typically the legacy
+    /// `*_budget_chars` default).
+    pub fn effective_chars(
+        &self,
+        model_context_window: Option<u64>,
+        fallback_chars: usize,
+    ) -> usize {
+        match *self {
+            Self::Chars { chars } => chars,
+            Self::ContextPercent { percent } => {
+                let Some(window) = model_context_window else {
+                    return fallback_chars;
+                };
+                // Clamp to non-negative and bound the float math: at worst a
+                // 200K-token window with percent=100 yields ~800k chars, well
+                // under f32's safe integer range (~16M).
+                let percent = percent.max(0.0);
+                let chars_per_token = SKILLS_CHARS_PER_TOKEN as f32;
+                let effective = (window as f32) * chars_per_token * percent / 100.0;
+                effective.round().max(0.0) as usize
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
@@ -4999,6 +5148,19 @@ pub struct SkillsConfig {
     pub active_body_cap_chars: usize,
     pub preamble_enabled: bool,
     pub preamble_budget_chars: usize,
+    /// Mode used to compute the active skills bundle budget at render time.
+    /// Falls back to `Chars(active_budget_chars)` when only the legacy field
+    /// is set in user settings.
+    pub active_budget_mode: SkillsBudgetMode,
+    /// Mode used to compute the available-skills preamble budget at render
+    /// time. Falls back to `Chars(preamble_budget_chars)` when only the
+    /// legacy field is set in user settings.
+    pub preamble_budget_mode: SkillsBudgetMode,
+    /// Token budget for the active model, copied from
+    /// `context_compaction.model_context_window`. `None` keeps
+    /// `ContextPercent` modes dormant and forces a fall-back to
+    /// `*_budget_chars`.
+    pub model_context_window: Option<u64>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -5011,6 +5173,31 @@ impl SkillsConfig {
         settings: SkillsSettings,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Self {
+        // Legacy `*_budget_chars` keys keep working: if the user only set the
+        // chars field (and not the new mode), treat it as a Chars-mode
+        // override so behavior matches the pre-mode release exactly.
+        let active_budget_chars = settings
+            .active_budget_chars
+            .unwrap_or(DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS);
+        let preamble_budget_chars = settings
+            .preamble_budget_chars
+            .unwrap_or(DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS);
+        let active_budget_mode = settings
+            .active_budget_mode
+            .or_else(|| {
+                settings
+                    .active_budget_chars
+                    .map(|chars| SkillsBudgetMode::Chars { chars })
+            })
+            .unwrap_or_default();
+        let preamble_budget_mode = settings
+            .preamble_budget_mode
+            .or_else(|| {
+                settings
+                    .preamble_budget_chars
+                    .map(|chars| SkillsBudgetMode::Chars { chars })
+            })
+            .unwrap_or_default();
         Self {
             user_dir: expand_home_path(
                 var("SQUEEZY_SKILLS_USER_DIR")
@@ -5024,18 +5211,17 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
-            active_budget_chars: settings
-                .active_budget_chars
-                .unwrap_or(DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS),
+            active_budget_chars,
             active_body_cap_chars: settings
                 .active_body_cap_chars
                 .unwrap_or(DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS),
             preamble_enabled: settings
                 .preamble_enabled
                 .unwrap_or(DEFAULT_SKILLS_PREAMBLE_ENABLED),
-            preamble_budget_chars: settings
-                .preamble_budget_chars
-                .unwrap_or(DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS),
+            preamble_budget_chars,
+            active_budget_mode,
+            preamble_budget_mode,
+            model_context_window: None,
             config: settings
                 .config
                 .into_iter()
@@ -5046,6 +5232,22 @@ impl SkillsConfig {
                 })
                 .collect(),
         }
+    }
+
+    /// Computes the active skills bundle budget for the current context
+    /// window. Falls through to `active_budget_chars` when the mode is
+    /// `ContextPercent` but no window is configured.
+    pub fn active_budget_effective_chars(&self) -> usize {
+        self.active_budget_mode
+            .effective_chars(self.model_context_window, self.active_budget_chars)
+    }
+
+    /// Computes the available-skills preamble budget for the current context
+    /// window. Falls through to `preamble_budget_chars` when the mode is
+    /// `ContextPercent` but no window is configured.
+    pub fn preamble_budget_effective_chars(&self) -> usize {
+        self.preamble_budget_mode
+            .effective_chars(self.model_context_window, self.preamble_budget_chars)
     }
 }
 
@@ -5058,6 +5260,9 @@ impl Default for SkillsConfig {
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
             preamble_enabled: DEFAULT_SKILLS_PREAMBLE_ENABLED,
             preamble_budget_chars: DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS,
+            active_budget_mode: SkillsBudgetMode::default(),
+            preamble_budget_mode: SkillsBudgetMode::default(),
+            model_context_window: None,
             config: Vec::new(),
         }
     }
@@ -5300,6 +5505,36 @@ impl TuiAlternateScreen {
     }
 }
 
+/// User-controlled palette tone for the TUI. `System` defers to the
+/// existing terminal-tone detection (`COLORFGBG`); `Dark` and `Light`
+/// pin the tone regardless of what the terminal reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTheme {
+    System,
+    Dark,
+    Light,
+}
+
+impl TuiTheme {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "system" | "auto" => Some(Self::System),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
@@ -5316,6 +5551,8 @@ pub struct TuiConfig {
     /// Color status-line items with their accent palette.
     /// Defaults to `true`.
     pub status_line_use_colors: bool,
+    /// Palette tone preference. `System` defers to terminal detection.
+    pub theme: TuiTheme,
 }
 
 impl TuiConfig {
@@ -5340,6 +5577,7 @@ impl TuiConfig {
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
+            theme: settings.theme.unwrap_or(TuiTheme::System),
         }
     }
 }
@@ -5361,6 +5599,7 @@ pub struct TuiSettings {
     pub show_reasoning_usage: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
+    pub theme: Option<TuiTheme>,
 }
 
 impl TuiSettings {
@@ -5377,6 +5616,7 @@ impl TuiSettings {
                 "show_reasoning_usage",
                 "status_line",
                 "status_line_use_colors",
+                "theme",
             ],
             source,
             path,
@@ -5431,6 +5671,7 @@ impl TuiSettings {
                 source,
                 &field(path, "status_line_use_colors"),
             )?,
+            theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
         })
     }
 
@@ -5447,6 +5688,7 @@ impl TuiSettings {
             &mut self.status_line_use_colors,
             next.status_line_use_colors,
         );
+        replace_if_some(&mut self.theme, next.theme);
     }
 }
 
@@ -5734,10 +5976,12 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
-# active_budget_chars = 4000
+# active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
-# preamble_budget_chars = 800
+# preamble_budget_chars = 800         # legacy absolute cap; used only when preamble_budget_mode is unset
+# active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
+# preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 #
 # [[skills.config]]
 # name = "example-skill"
@@ -6300,6 +6544,15 @@ pub struct McpServerConfig {
     pub disabled_tools: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub permissions: McpPermissionConfig,
+    /// Name of the environment variable holding the bearer token for HTTP/SSE
+    /// transports. Resolved at session start; missing env vars are skipped.
+    pub bearer_token_env_var: Option<String>,
+    /// Static HTTP headers attached to every request on HTTP/SSE transports.
+    pub http_headers: BTreeMap<String, String>,
+    /// HTTP headers whose values are read from environment variables at session
+    /// start. Map key is the header name, value is the env var name. On
+    /// conflict with `http_headers`, the env-sourced value wins.
+    pub env_http_headers: BTreeMap<String, String>,
 }
 
 impl McpServerConfig {
@@ -6322,6 +6575,9 @@ impl McpServerConfig {
                 "disabled_tools",
                 "env",
                 "permissions",
+                "bearer_token_env_var",
+                "http_headers",
+                "env_http_headers",
             ],
             source,
             path,
@@ -6329,6 +6585,16 @@ impl McpServerConfig {
         let transport = mcp_transport_value(table, "transport", source, &field(path, "transport"))?
             .unwrap_or(McpTransport::Stdio);
         let env = string_map_value(table, "env", source, &field(path, "env"))?.unwrap_or_default();
+        let http_headers =
+            string_map_value(table, "http_headers", source, &field(path, "http_headers"))?
+                .unwrap_or_default();
+        let env_http_headers = string_map_value(
+            table,
+            "env_http_headers",
+            source,
+            &field(path, "env_http_headers"),
+        )?
+        .unwrap_or_default();
         let permissions = optional_table(table, "permissions", source)?
             .map(|table| {
                 McpPermissionConfig::from_table(name, table, source, &field(path, "permissions"))
@@ -6358,6 +6624,14 @@ impl McpServerConfig {
             .unwrap_or_default(),
             env,
             permissions,
+            bearer_token_env_var: string_value(
+                table,
+                "bearer_token_env_var",
+                source,
+                &field(path, "bearer_token_env_var"),
+            )?,
+            http_headers,
+            env_http_headers,
         })
     }
 
@@ -6378,6 +6652,13 @@ impl McpServerConfig {
             self.env.extend(next.env);
         }
         self.permissions.merge(next.permissions);
+        replace_if_some(&mut self.bearer_token_env_var, next.bearer_token_env_var);
+        if !next.http_headers.is_empty() {
+            self.http_headers.extend(next.http_headers);
+        }
+        if !next.env_http_headers.is_empty() {
+            self.env_http_headers.extend(next.env_http_headers);
+        }
     }
 }
 
@@ -6715,6 +6996,48 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn skills_budget_mode_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<SkillsBudgetMode>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let entry = value
+        .as_table()
+        .ok_or_else(|| type_error(source, path, "table"))?;
+    reject_unknown_keys(entry, &["chars", "context_percent"], source, path)?;
+    let chars = usize_value(entry, "chars", source, &field(path, "chars"))?;
+    let context_percent = match entry.get("context_percent") {
+        None => None,
+        Some(value) => {
+            let raw = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|integer| integer as f64))
+                .ok_or_else(|| type_error(source, &field(path, "context_percent"), "number"))?;
+            if !raw.is_finite() || raw < 0.0 {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {}: expected a non-negative number",
+                    field(path, "context_percent")
+                )));
+            }
+            Some(raw as f32)
+        }
+    };
+    match (chars, context_percent) {
+        (Some(_), Some(_)) => Err(SqueezyError::Config(format!(
+            "{source}: {path}: set exactly one of `chars` or `context_percent`",
+        ))),
+        (None, None) => Err(SqueezyError::Config(format!(
+            "{source}: {path}: set either `chars` or `context_percent`",
+        ))),
+        (Some(chars), None) => Ok(Some(SkillsBudgetMode::Chars { chars })),
+        (None, Some(percent)) => Ok(Some(SkillsBudgetMode::ContextPercent { percent })),
+    }
 }
 
 fn skill_config_entries_value(
@@ -7109,6 +7432,22 @@ fn tui_alternate_screen_value(
             "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
+}
+
+fn tui_theme_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiTheme>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    TuiTheme::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI theme {value:?}; expected system, dark, or light"
+        ))
+    })
 }
 
 fn reasoning_effort_value(

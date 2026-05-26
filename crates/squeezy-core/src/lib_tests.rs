@@ -199,6 +199,21 @@ compaction_max_summary_bytes = 4096
 }
 
 #[test]
+fn subagent_config_defaults_stay_within_cost_broker_ceiling() {
+    let defaults = SubagentConfig::default();
+    assert!(
+        defaults.max_tool_bytes_read_per_call <= 100_000_000,
+        "default max_tool_bytes_read_per_call = {} exceeds 100MB ceiling",
+        defaults.max_tool_bytes_read_per_call
+    );
+    assert!(
+        defaults.max_search_files_per_call <= 50_000,
+        "default max_search_files_per_call = {} exceeds 50K ceiling",
+        defaults.max_search_files_per_call
+    );
+}
+
+#[test]
 fn subagent_config_reads_settings_and_env() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -553,6 +568,97 @@ enabled = true
         config.skills.active_budget_chars
     );
     assert_eq!(round_tripped_config.skills.config, config.skills.config);
+}
+
+#[test]
+fn skills_budget_mode_context_percent_scales_with_window() {
+    // 200K-token model with 2% percent: 200_000 * 4 * 0.02 = 16_000.
+    let mode = SkillsBudgetMode::ContextPercent { percent: 2.0 };
+    assert_eq!(mode.effective_chars(Some(200_000), 4_000), 16_000);
+    // 32K-token model with the same percent: 32_000 * 4 * 0.02 = 2_560.
+    assert_eq!(mode.effective_chars(Some(32_000), 4_000), 2_560);
+    // Without a window, the legacy chars cap is used so behavior stays
+    // predictable when the user has not configured the active model size.
+    assert_eq!(mode.effective_chars(None, 4_000), 4_000);
+}
+
+#[test]
+fn skills_budget_mode_chars_ignores_window() {
+    // Explicit Chars override pins the budget regardless of context size.
+    let mode = SkillsBudgetMode::Chars { chars: 8_000 };
+    assert_eq!(mode.effective_chars(Some(32_000), 4_000), 8_000);
+    assert_eq!(mode.effective_chars(Some(200_000), 4_000), 8_000);
+    assert_eq!(mode.effective_chars(None, 4_000), 8_000);
+}
+
+#[test]
+fn skills_default_budget_mode_resolves_to_two_percent_of_context_window() {
+    let config = SkillsConfig {
+        model_context_window: Some(200_000),
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.active_budget_mode,
+        SkillsBudgetMode::ContextPercent { percent } if (percent - 2.0).abs() < f32::EPSILON
+    ));
+    assert_eq!(config.active_budget_effective_chars(), 16_000);
+    assert_eq!(config.preamble_budget_effective_chars(), 16_000);
+}
+
+#[test]
+fn skills_legacy_chars_setting_is_honored_when_mode_unset() {
+    // A user who only set `active_budget_chars` in TOML should keep the
+    // pre-mode behaviour: that field becomes the absolute cap, even when a
+    // 200K-token window is configured.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_chars = 1234
+preamble_budget_chars = 321
+
+[context]
+model_context_window = 200000
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.skills.active_budget_chars, 1234);
+    assert_eq!(config.skills.active_budget_effective_chars(), 1234);
+    assert_eq!(config.skills.preamble_budget_effective_chars(), 321);
+}
+
+#[test]
+fn skills_explicit_mode_table_parses() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_mode = { chars = 9000 }
+preamble_budget_mode = { context_percent = 5.0 }
+
+[context]
+model_context_window = 50000
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.skills.active_budget_effective_chars(), 9_000);
+    // 50_000 tokens * 4 chars/token * 0.05 = 10_000 chars.
+    assert_eq!(config.skills.preamble_budget_effective_chars(), 10_000);
+}
+
+#[test]
+fn skills_mode_table_rejects_both_keys() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_mode = { chars = 9000, context_percent = 2.0 }
+"#,
+        "test",
+    )
+    .expect_err("conflicting keys must error");
+    assert!(err.to_string().contains("set exactly one"));
 }
 
 #[test]
@@ -2289,6 +2395,70 @@ fn resolve_field_source_returns_env_when_env_var_set() {
 }
 
 #[test]
+fn tui_theme_parses_lowercase_and_aliases_auto_to_system() {
+    assert_eq!(TuiTheme::parse("system"), Some(TuiTheme::System));
+    assert_eq!(TuiTheme::parse("dark"), Some(TuiTheme::Dark));
+    assert_eq!(TuiTheme::parse("light"), Some(TuiTheme::Light));
+    // `auto` is the historical / config-screen equivalent of "system".
+    assert_eq!(TuiTheme::parse("auto"), Some(TuiTheme::System));
+    // Whitespace and uppercase are tolerated so users typing `/theme Dark`
+    // hit the same branch as the canonical `/theme dark` form.
+    assert_eq!(TuiTheme::parse("  Dark  "), Some(TuiTheme::Dark));
+    assert_eq!(TuiTheme::parse("LIGHT"), Some(TuiTheme::Light));
+    assert_eq!(TuiTheme::parse("solarized"), None);
+    assert_eq!(TuiTheme::parse(""), None);
+}
+
+#[test]
+fn tui_theme_round_trips_through_settings_toml() {
+    let parsed = SettingsFile::from_toml_str(
+        r#"
+[tui]
+theme = "dark"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
+    assert_eq!(config.tui.theme, TuiTheme::Dark);
+
+    // Emit and re-parse to confirm the writer persists the field.
+    let emitted = config.inspect_redacted();
+    assert!(
+        emitted.contains("theme = \"dark\""),
+        "inspect should emit the theme leaf, got: {emitted}"
+    );
+    let reparsed = SettingsFile::from_toml_str(&emitted, "round trip").expect("inspect re-parse");
+    let reloaded = AppConfig::from_settings_and_env_vars(reparsed, |_| None);
+    assert_eq!(reloaded.tui.theme, TuiTheme::Dark);
+}
+
+#[test]
+fn tui_theme_defaults_to_system_when_unset() {
+    let parsed =
+        SettingsFile::from_toml_str("[tui]\ntick_rate_ms = 50\n", "test").expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
+    assert_eq!(config.tui.theme, TuiTheme::System);
+}
+
+#[test]
+fn tui_theme_rejects_unknown_string() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[tui]
+theme = "solarized"
+"#,
+        "test",
+    );
+    let err = result.expect_err("invalid theme should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid TUI theme") || msg.contains("solarized"),
+        "expected invalid-theme diagnostic, got: {msg}"
+    );
+}
+
+#[test]
 fn unknown_fields_are_warned_and_removed_from_settings_file() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy-unknown-fields-{}-{}",
@@ -2299,7 +2469,7 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
     let path = dir.join("settings.toml");
     std::fs::write(
         &path,
-        "[tui]\nstatus_line_use_colors = true\ntick_rate_ms = 100\n",
+        "[tui]\nlegacy_widget_padding = true\ntick_rate_ms = 100\n",
     )
     .expect("write seed settings");
 
@@ -2308,7 +2478,7 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
 
     let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
     assert!(
-        !cleaned.contains("status_line_use_colors"),
+        !cleaned.contains("legacy_widget_padding"),
         "unknown key should be stripped, got: {cleaned}"
     );
     assert!(

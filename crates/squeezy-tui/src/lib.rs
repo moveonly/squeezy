@@ -42,7 +42,7 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
     TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
-    TuiAlternateScreen,
+    TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
@@ -228,6 +228,12 @@ pub struct StartupProfile {
     /// any, is honoured). The CLI flips this on via `--no-resume-picker`
     /// for non-interactive flows (CI, scripts).
     pub skip_resume_picker: bool,
+    /// Optional banner that the CLI populates from
+    /// `update::banner_for_startup()` when GitHub reports a newer
+    /// release than the running binary. Empty / `None` keeps the
+    /// transcript quiet. The TUI flushes this through `push_log` at
+    /// startup so it lands above the first agent turn.
+    pub update_banner: Option<String>,
 }
 
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
@@ -247,6 +253,7 @@ pub async fn run_with_onboarding(
             onboarding_summary,
             languages: String::new(),
             skip_resume_picker: false,
+            update_banner: None,
         },
     )
     .await
@@ -282,6 +289,11 @@ async fn run_inner(
     resume_session_id: Option<String>,
     startup: StartupProfile,
 ) -> Result<()> {
+    // Apply the persisted theme preference before the first render so the
+    // initial paint already reflects the user's choice — without this the
+    // first frame uses the auto-detected tone and pops to the override on
+    // the next redraw.
+    render::palette::set_palette_tone_override(theme_to_tone_override(config.tui.theme));
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
@@ -314,6 +326,9 @@ async fn run_inner(
         &plans_session_owned,
         &protected_plan_ids,
     );
+    // `StartupProfile` is moved into `TuiApp::new`, so capture the banner
+    // (the only field needed below) before that hand-off.
+    let update_banner = startup.update_banner.clone();
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
@@ -335,6 +350,9 @@ async fn run_inner(
             plans_session_owned,
             proposed_plan::PLAN_RETENTION_LIMIT
         ));
+    }
+    if let Some(banner) = update_banner.filter(|s| !s.trim().is_empty()) {
+        app.push_log(banner);
     }
     for item in initial_transcript {
         app.push_transcript_item(item);
@@ -619,6 +637,10 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
             return;
         }
     };
+    // Mirror an external theme edit into the runtime palette override
+    // immediately — the agent's config_snapshot already carries the new
+    // value, but the palette layer reads the override directly.
+    render::palette::set_palette_tone_override(theme_to_tone_override(new_cfg.tui.theme));
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -1226,6 +1248,55 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
     app.status = "/statusline".to_string();
 }
 
+/// Convert a [`TuiTheme`] preference into the runtime palette tone override.
+/// `System` clears the override so terminal detection (`COLORFGBG`) wins.
+fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
+    match theme {
+        TuiTheme::System => None,
+        TuiTheme::Dark => Some(render::palette::PaletteTone::Dark),
+        TuiTheme::Light => Some(render::palette::PaletteTone::Light),
+    }
+}
+
+/// Apply a `/theme` switch: flip the runtime palette override, mirror the
+/// new value into the agent's in-memory config, and persist to the user-
+/// scope settings file so the choice survives a restart. Persistence failures
+/// surface in the status line but the live switch still takes effect — the
+/// user can re-run later to retry the save.
+fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+
+    let mut next = agent.config_snapshot();
+    next.tui.theme = theme;
+    agent.replace_config(next);
+
+    let target_path = squeezy_core::default_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edits = [SettingsEdit {
+        path: &["tui", "theme"],
+        op: EditOp::SetString(theme.as_str().to_string()),
+    }];
+    match apply_edits(&scope_target, &edits) {
+        Ok(_) => {
+            app.app_notifications.push(
+                format!("theme → {}", theme.as_str()),
+                NotifySeverity::Success,
+            );
+            app.status = format!("theme saved to {}", target_path.display());
+        }
+        Err(err) => {
+            app.app_notifications.push(
+                format!("theme switched but save failed: {err}"),
+                NotifySeverity::Warn,
+            );
+            app.status = format!("theme switched (not persisted): {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the user-scope settings file and
 /// apply it in-memory immediately.
@@ -1579,6 +1650,18 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
+            return true;
+        }
+        "/theme" => {
+            let Some(raw) = parts.next() else {
+                app.status = "usage: /theme [system|dark|light]".to_string();
+                return true;
+            };
+            let Some(theme) = TuiTheme::parse(raw) else {
+                app.status = format!("unknown theme {raw:?}; expected system, dark, or light");
+                return true;
+            };
+            apply_theme_change(app, agent, theme);
             return true;
         }
         "/jobs" => {
@@ -3280,6 +3363,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let include_startup_card = area.height >= 16;
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
+    let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = if should_show_task_panel(app) {
         let h = if approval_height > 0 {
             task_panel_height(app).min(5)
@@ -3294,6 +3378,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         .unwrap_or(0)
         .saturating_add(approval_height)
         .saturating_add(input_height)
+        .saturating_add(plan_indicator_height)
         .saturating_add(2);
     let optional_height = area.height.saturating_sub(required_height);
     let attachment_height = attachment_panel_height(app, optional_height);
@@ -3325,6 +3410,9 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
     }
+    if plan_indicator_height > 0 {
+        constraints.push(Constraint::Length(plan_indicator_height));
+    }
     constraints.push(Constraint::Length(input_height));
     if approval_height > 0 {
         constraints.push(Constraint::Length(approval_height));
@@ -3353,6 +3441,10 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    if plan_indicator_height > 0 {
+        render_plan_mode_indicator(frame, chunks[index], app);
         index += 1;
     }
     render_input(frame, chunks[index], app);
@@ -3431,6 +3523,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     let input_height = input_panel_height(app, area.width);
     let approval_height = approval_menu_height(app);
+    let plan_indicator_height = plan_mode_indicator_height(app);
     let task_height = should_show_task_panel(app).then_some(task_panel_height(app));
     let status_height = 2;
     let live_lines = pending_assistant_lines(app);
@@ -3440,6 +3533,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         .unwrap_or(0)
         .saturating_add(input_height)
         .saturating_add(approval_height)
+        .saturating_add(plan_indicator_height)
         .saturating_add(status_height)
         .saturating_add(live_gap);
     let attachment_height =
@@ -3459,6 +3553,9 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         constraints.push(Constraint::Length(attachment_height));
+    }
+    if plan_indicator_height > 0 {
+        constraints.push(Constraint::Length(plan_indicator_height));
     }
     constraints.push(Constraint::Length(input_height));
     if approval_height > 0 {
@@ -3489,6 +3586,10 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     }
     if attachment_height > 0 {
         render_attachments(frame, chunks[index], app);
+        index += 1;
+    }
+    if plan_indicator_height > 0 {
+        render_plan_mode_indicator(frame, chunks[index], app);
         index += 1;
     }
     render_input(frame, chunks[index], app);
@@ -4064,6 +4165,36 @@ fn render_attachments(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     let paragraph = Paragraph::new(lines)
         .style(Style::default().fg(QUIET))
         .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+/// One-row constraint reserved above the composer for the PLAN MODE
+/// indicator. Returns 0 in Build mode so the layout is unchanged for the
+/// majority case (audit f07-plan-mode-prompt-overlay: only Plan mode pays
+/// the row).
+fn plan_mode_indicator_height(app: &TuiApp) -> u16 {
+    match app.mode {
+        SessionMode::Plan => 1,
+        SessionMode::Build => 0,
+    }
+}
+
+/// Build the styled "[PLAN MODE] Shift+Tab to exit" line. Uses the
+/// existing `MODE_PURPLE` palette entry (no new colors) and ASCII
+/// brackets with a Unicode `⊕` glyph — matches the other status glyphs
+/// (`⟳`, `▸`) already used in this file.
+pub(crate) fn format_plan_mode_indicator_line() -> Line<'static> {
+    let label_style = Style::default()
+        .fg(MODE_PURPLE)
+        .add_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled("⊕ PLAN MODE", label_style),
+        Span::styled(" · Shift+Tab to exit", Style::default().fg(QUIET)),
+    ])
+}
+
+fn render_plan_mode_indicator(frame: &mut Frame<'_>, area: Rect, _app: &TuiApp) {
+    let paragraph = Paragraph::new(format_plan_mode_indicator_line());
     frame.render_widget(paragraph, area);
 }
 
@@ -7492,7 +7623,12 @@ pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
 }
 
 const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
-pub(crate) const CONTEXT_NUDGE_PCT: u64 = 95;
+/// Percent of `context_compaction_threshold` at which we surface the
+/// compaction nudge. The threshold is itself a fraction of the full
+/// context window (default 80% of the model max), so firing the nudge
+/// at 70% of the threshold gives users a runway to `/pin` or `/compact`
+/// deliberately before auto-compaction kicks in at 100%.
+pub(crate) const CONTEXT_NUDGE_THRESHOLD_RATIO_PCT: u64 = 70;
 
 fn format_status_hints(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {
@@ -8129,6 +8265,7 @@ impl TuiApp {
                 onboarding_summary,
                 languages: String::new(),
                 skip_resume_picker: false,
+                update_banner: None,
             },
             clipboard,
         )

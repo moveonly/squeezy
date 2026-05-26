@@ -6,6 +6,7 @@ members = [
     "crates/squeezy-eval",
     "crates/squeezy-graph",
     "crates/squeezy-harness",
+    "crates/squeezy-hooks",
     "crates/squeezy-llm",
     "crates/squeezy-mcp",
     "crates/squeezy-parse",
@@ -42,6 +43,7 @@ dirs = "5"
 futures-core = "0.3"
 futures-util = "0.3"
 globset = "0.4"
+http = "1"
 ignore = "0.4"
 libc = "0.2"
 pulldown-cmark = "0.13.4"
@@ -94,6 +96,7 @@ windows-sys = "0.59"
 squeezy-agent = { path = "crates/squeezy-agent", version = "=0.1.0" }
 squeezy-core = { path = "crates/squeezy-core", version = "=0.1.0" }
 squeezy-graph = { path = "crates/squeezy-graph", version = "=0.1.0" }
+squeezy-hooks = { path = "crates/squeezy-hooks", version = "=0.1.0" }
 squeezy-llm = { path = "crates/squeezy-llm", version = "=0.1.0" }
 squeezy-mcp = { path = "crates/squeezy-mcp", version = "=0.1.0" }
 squeezy-parse = { path = "crates/squeezy-parse", version = "=0.1.0" }

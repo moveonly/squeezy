@@ -144,6 +144,14 @@ jobs:
           "$binary" --version
           "$binary" --help >/dev/null
 
+      - name: Ad-hoc codesign macOS binary
+        if: startsWith(matrix.target, 'x86_64-apple-darwin') || startsWith(matrix.target, 'aarch64-apple-darwin')
+        shell: bash
+        run: |
+          binary="${{ matrix.binary-path }}"
+          codesign --force --sign - "$binary"
+          codesign -v "$binary"
+
       - name: Package release archive
         shell: bash
         run: |
@@ -166,6 +174,23 @@ jobs:
               ;;
           esac
 
+      - name: GPG-sign release archive
+        if: ${{ env.RELEASE_GPG_PRIVATE_KEY != '' }}
+        env:
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+          RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
+        shell: bash
+        run: |
+          archive="${{ matrix.archive }}"
+          GNUPGHOME="$(mktemp -d)"
+          export GNUPGHOME
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$RELEASE_GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback \
+            --passphrase "${RELEASE_GPG_PASSPHRASE:-}" \
+            --armor --detach-sign --output "dist/$archive.asc" "dist/$archive"
+          gpg --batch --verify "dist/$archive.asc" "dist/$archive"
+
       - name: Upload release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -173,6 +198,16 @@ jobs:
           path: |
             dist/${{ matrix.archive }}
             dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Upload release signature
+        if: ${{ env.RELEASE_GPG_PRIVATE_KEY != '' }}
+        env:
+          RELEASE_GPG_PRIVATE_KEY: ${{ secrets.RELEASE_GPG_PRIVATE_KEY }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sig-${{ matrix.target }}
+          path: dist/${{ matrix.archive }}.asc
           if-no-files-found: error
 
   publish:

@@ -100,6 +100,49 @@ fn status_mode_color_distinguishes_build_and_plan() {
     );
 }
 
+#[test]
+fn plan_mode_indicator_renders_above_composer_in_plan_mode() {
+    let app = test_app(SessionMode::Plan);
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        output.contains("PLAN MODE"),
+        "expected PLAN MODE banner in plan mode output:\n{output}"
+    );
+    assert!(
+        output.contains("Shift+Tab to exit"),
+        "expected exit hint in plan mode output:\n{output}"
+    );
+}
+
+#[test]
+fn plan_mode_indicator_absent_in_build_mode() {
+    let app = test_app(SessionMode::Build);
+    let output = render_to_string(&app, 120, 16);
+    assert!(
+        !output.contains("PLAN MODE"),
+        "build mode must not render the plan banner:\n{output}"
+    );
+}
+
+#[test]
+fn plan_mode_indicator_height_is_zero_in_build_and_one_in_plan() {
+    let mut app = test_app(SessionMode::Build);
+    assert_eq!(plan_mode_indicator_height(&app), 0);
+    app.mode = SessionMode::Plan;
+    assert_eq!(plan_mode_indicator_height(&app), 1);
+}
+
+#[test]
+fn plan_mode_indicator_line_uses_existing_mode_purple_palette() {
+    let line = format_plan_mode_indicator_line();
+    let label_span = line
+        .spans
+        .first()
+        .expect("plan-mode line must have at least one span");
+    assert!(label_span.content.contains("PLAN MODE"));
+    assert_eq!(label_span.style.fg, Some(MODE_PURPLE));
+}
+
 #[tokio::test]
 async fn shift_tab_toggles_mode() {
     let mut agent = test_agent(SessionMode::Build);
@@ -3110,6 +3153,7 @@ fn approval_status_line_is_compact_single_line() {
         permission,
         matched_rule: None,
         reason: "default shell permission is ask".to_string(),
+        context: None,
     };
     let line = format_approval_status_line(&request);
     assert!(!line.contains('\n'), "status line must be single line");
@@ -4905,6 +4949,22 @@ fn context_budget_hint_omitted_below_threshold() {
     );
 }
 
+/// Helper: count post-turn compaction-nudge log entries in the transcript.
+/// We key on the "auto-compact" wording the nudge introduces — that phrase
+/// is unique to this advisory, so the filter doubles as proof that the
+/// rendered text references the auto-trigger explicitly (the whole point
+/// of the nudge is to be actionable advice *before* auto-compaction
+/// rewrites the conversation).
+fn count_auto_compact_nudges(app: &TuiApp) -> usize {
+    app.transcript
+        .iter()
+        .filter(|entry| {
+            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+                if message.contains("auto-compact"))
+        })
+        .count()
+}
+
 #[tokio::test]
 async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     let mut app = test_app(SessionMode::Build);
@@ -4919,6 +4979,8 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate {
+            // 5_800 / 6_000 ≈ 97% of the auto-compact threshold — comfortably
+            // above the 70% nudge floor and below the 100% suppression edge.
             estimated_tokens: 5_800,
             ..ContextEstimate::default()
         },
@@ -4928,15 +4990,11 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let nudges = app
-        .transcript
-        .iter()
-        .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
-                if message.contains("context window") && message.contains("full"))
-        })
-        .count();
-    assert_eq!(nudges, 1, "nudge must fire exactly once on first crossing");
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        1,
+        "nudge must fire exactly once on first crossing"
+    );
 
     // A second high-usage turn must not fire the nudge again until
     // compaction resets the latch.
@@ -4958,15 +5016,130 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
     drop(tx);
     drain_agent_events(&mut app).await;
 
-    let nudges = app
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        1,
+        "nudge must not fire again until compaction"
+    );
+}
+
+/// The nudge must fire as soon as estimated tokens reach 70% of the
+/// auto-compact threshold (well before the 100% mark that triggers
+/// compaction), and the rendered text must reference the auto-trigger so
+/// the advice is actionable — otherwise users only see "consider
+/// /compact" *after* compaction has already rewritten the conversation.
+#[tokio::test]
+async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 4_200 / 6_000 = 70.0% — exactly at the firing point.
+            estimated_tokens: 4_200,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let message = app
         .transcript
         .iter()
-        .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
-                if message.contains("context window") && message.contains("full"))
+        .find_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Log(text) if text.contains("auto-compact") => Some(text.clone()),
+            _ => None,
         })
-        .count();
-    assert_eq!(nudges, 1, "nudge must not fire again until compaction");
+        .expect("nudge must fire at 70% of the auto-compact threshold");
+    // Text must reference the auto-trigger explicitly so the advice is
+    // actionable — without "auto-compact" in the message, users can't tell
+    // why /pin or /compact would help.
+    assert!(
+        message.contains("auto-compact"),
+        "nudge must reference the auto-trigger; got: {message}"
+    );
+    assert!(
+        message.contains("/pin") && message.contains("/compact"),
+        "nudge must surface the deliberate actions; got: {message}"
+    );
+}
+
+/// Once estimated tokens reach or pass the auto-compact threshold the
+/// nudge must stay silent — auto-compaction is already taking over the
+/// UI, and a stale "consider /compact" advisory would just clutter the
+/// post-compaction transcript with advice the user can no longer act on.
+#[tokio::test]
+async fn pre_compaction_nudge_suppressed_at_or_past_threshold() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 6_100 / 6_000 ≈ 102% — past the threshold, so we're already in
+            // auto-compaction territory. The nudge would be useless advice.
+            estimated_tokens: 6_100,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        0,
+        "nudge must not fire once usage has already crossed the auto-compact threshold",
+    );
+}
+
+/// Below 70% of the auto-compact threshold the nudge should stay silent —
+/// firing earlier would be alarmist for routine sessions.
+#[tokio::test]
+async fn pre_compaction_nudge_silent_below_seventy_percent() {
+    let mut app = test_app(SessionMode::Build);
+    app.context_compaction_threshold = 6_000;
+
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("ok"),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate {
+            // 4_100 / 6_000 ≈ 68% — just under the 70% firing floor.
+            estimated_tokens: 4_100,
+            ..ContextEstimate::default()
+        },
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert_eq!(
+        count_auto_compact_nudges(&app),
+        0,
+        "nudge must stay silent below the 70% firing floor",
+    );
 }
 
 #[tokio::test]
@@ -5485,6 +5658,7 @@ fn sample_approval_request() -> ToolApprovalRequest {
         },
         matched_rule: None,
         reason: "default compiler permission is ask".to_string(),
+        context: None,
     }
 }
 
@@ -5826,6 +6000,165 @@ async fn slash_verbosity_opens_config_when_called_without_arg() {
         state.current_section().id,
         squeezy_core::config_schema::SectionId::Verbosity
     );
+}
+
+// ---- /theme palette switch ----
+
+/// `/theme dark` and `/theme light` flip the runtime palette override and
+/// mirror the choice into the agent's config so a settings-screen open
+/// reflects the new value.
+#[tokio::test]
+async fn slash_theme_dark_flips_palette_and_config() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Point settings writes at a tempfile so the test never touches HOME.
+    let dir = temp_workspace("theme_dark");
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme dark").await;
+    assert!(ran, "/theme dark should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Dark
+    );
+    let saved = std::fs::read_to_string(&settings_path).expect("settings file written");
+    assert!(
+        saved.contains("theme = \"dark\""),
+        "settings.toml should record the theme; got {saved}"
+    );
+}
+
+/// `/theme light` flips the override to the light tone.
+#[tokio::test]
+async fn slash_theme_light_flips_palette() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_light");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Light
+    );
+}
+
+/// `/theme system` clears the override so terminal detection wins again.
+#[tokio::test]
+async fn slash_theme_system_clears_override() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_system");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    // Pin to Dark first so the System branch has something visible to clear.
+    palette::set_palette_tone_override(Some(palette::PaletteTone::Dark));
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
+    assert!(ran);
+    // With the override cleared the visible tone is whichever the detector
+    // returns for the current process — we only assert that the override
+    // really was reset back to the detector's value.
+    assert_eq!(palette::palette_tone(), palette::detected_palette_tone());
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::System
+    );
+}
+
+/// Unknown sub-arguments don't mutate anything — the user sees a usage hint
+/// instead of a silent tone change.
+#[tokio::test]
+async fn slash_theme_unknown_value_does_not_change_palette() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_bad");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let before_tone = palette::palette_tone();
+    let before_theme = agent.config_snapshot().tui.theme;
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme zebra").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), before_tone);
+    assert_eq!(agent.config_snapshot().tui.theme, before_theme);
+    assert!(
+        app.status.contains("unknown theme"),
+        "status should mention the bad value, got: {}",
+        app.status
+    );
+}
+
+/// Bare `/theme` (no sub-arg) shows usage — used to remind the user of the
+/// allowed values without forcing them to open the config screen.
+#[tokio::test]
+async fn slash_theme_without_arg_shows_usage() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_usage");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme").await;
+    assert!(ran);
+    assert!(
+        app.status.starts_with("usage:") && app.status.contains("/theme"),
+        "expected usage hint, got: {}",
+        app.status
+    );
+}
+
+/// Serializes `/theme` tests so the process-global palette override and the
+/// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
+static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `SQUEEZY_SETTINGS_PATH` lets tests redirect persistence away from the
+/// real home directory; this guard also resets the runtime palette override
+/// so leftover state from one test doesn't bleed into the next.
+struct ScopedSettingsPath {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedSettingsPath {
+    fn new(path: PathBuf) -> Self {
+        let lock = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Start every theme test from a known palette state — even if a
+        // previous test left an override behind.
+        crate::render::palette::set_palette_tone_override(None);
+        let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
+        // SAFETY: the global mutex above ensures no other theme test is
+        // mutating this env var at the same time.
+        unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", &path) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedSettingsPath {
+    fn drop(&mut self) {
+        // SAFETY: see `new`.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", value) },
+            None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
+        }
+        crate::render::palette::set_palette_tone_override(None);
+    }
 }
 
 // ---- F37: @-mention composer ----
@@ -6270,6 +6603,57 @@ fn json_patch_preview_parser_emits_events_per_patch() {
     if let PatchPreviewEvent::Complete { count } = complete {
         assert_eq!(*count, 2);
     }
+}
+
+#[tokio::test]
+async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
+    // F3-4: the TUI must surface the silent sandbox degradation
+    // through the notification banner AND a transcript notice on the
+    // first fallback; the agent's once-per-session gate means this
+    // event only ever fires once, so we assert both surfaces hold a
+    // single entry afterwards.
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::ShellSandboxBestEffortFallback {
+        turn_id: TurnId::new(3),
+        backend: "macos-sandbox-exec".to_string(),
+        fallback_count: 1,
+    })
+    .await
+    .expect("send fallback warning");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let banner_message = app
+        .app_notifications
+        .current()
+        .map(|notification| notification.message.clone())
+        .expect("banner notification should be queued");
+    assert!(
+        banner_message.contains("shell sandbox degraded"),
+        "banner text mismatch: {banner_message}"
+    );
+    assert!(
+        banner_message.contains("macos-sandbox-exec"),
+        "banner must name the degraded backend: {banner_message}"
+    );
+
+    let needle = "shell sandbox degraded";
+    let occurrences = app
+        .transcript
+        .iter()
+        .filter(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => item.content.contains(needle),
+            TranscriptEntryKind::Log(message) => message.contains(needle),
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "fallback warning must render exactly once; transcript: {:?}",
+        app.transcript
+    );
 }
 
 #[tokio::test]

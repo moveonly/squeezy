@@ -5,6 +5,8 @@ use serde_json::json;
 use squeezy_core::{AppConfig, ProviderConfig, Result};
 use squeezy_store::{SessionStore, ensure_repo_profile};
 
+use crate::update::{self, UpdateStatus};
+
 #[derive(Debug, Args)]
 pub struct DoctorArgs {
     /// Emit machine-readable JSON instead of the human table.
@@ -162,6 +164,7 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
     }
 
     checks.push(sandbox_check());
+    checks.push(update_check(update::check_for_update().await));
 
     // Warnings (e.g. missing optional API keys, missing sandbox tool) print as
     // such but do not fail the command: smoke tests in CI / brew test run in
@@ -238,6 +241,23 @@ fn probe_writable(root: &PathBuf) -> std::io::Result<()> {
     let probe = root.join(".squeezy-doctor-probe");
     fs::write(&probe, b"ok")?;
     fs::remove_file(&probe)
+}
+
+/// Pull the result of `update::check_for_update()` into a doctor row. Newer
+/// releases warn (so the user actually sees the nudge in CI smoke runs);
+/// up-to-date and offline / disabled checks stay `ok` because we don't want a
+/// network-isolated CI to mark the doctor red on principle.
+fn update_check(status: UpdateStatus) -> Check {
+    let row_status = if status.is_warning() {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    Check {
+        name: "update".to_string(),
+        status: row_status,
+        detail: status.doctor_detail(),
+    }
 }
 
 #[cfg(target_os = "macos")]

@@ -155,6 +155,12 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "/statusline",
         "configure which items appear in the status bar",
     ),
+    slash_args(
+        "/theme",
+        "switch palette tone (persists to settings)",
+        true,
+        "[system|dark|light]",
+    ),
 ];
 
 impl SlashCommand {

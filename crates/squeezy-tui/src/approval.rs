@@ -21,6 +21,9 @@ pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>
     let permission = &request.permission;
     let header = header_line(request);
     let mut lines = vec![header];
+    if let Some(ctx) = request.context.as_deref() {
+        append_context(&mut lines, ctx);
+    }
     match permission.capability {
         PermissionCapability::Shell => append_shell(&mut lines, permission),
         PermissionCapability::Edit => append_edit(&mut lines, permission),
@@ -35,6 +38,24 @@ pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>
     }
     append_rule_preview(&mut lines, permission);
     lines
+}
+
+fn append_context(lines: &mut Vec<Line<'static>>, context: &str) {
+    let trimmed = context.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "context: ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            trimmed.replace('\n', " "),
+            Style::default().fg(Color::White),
+        ),
+    ]));
 }
 
 fn header_line(request: &ToolApprovalRequest) -> Line<'static> {

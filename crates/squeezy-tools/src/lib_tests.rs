@@ -2094,6 +2094,196 @@ async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
         files.iter().any(|f| f["path"] == "doc.txt"),
         "checkpoint should record the touched file"
     );
+    // The unified-diff fallback is squeezy's fuzz/whitespace-tolerant path:
+    // when this lands the op the caller should be able to audit that it was
+    // not an exact match.
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("delta array");
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0]["status"], "applied");
+    assert_eq!(delta[0]["exact"], false);
+    assert_eq!(delta[0]["path"], "doc.txt");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
+    // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
+    // array — one entry per requested op, each `applied` and `exact=true`
+    // when the search-replace matched the pre-image byte-for-byte.
+    let root = temp_workspace("apply_patch_delta_exact");
+    fs::write(root.join("alpha.txt"), "alpha-before\n").expect("write alpha");
+    fs::write(root.join("beta.txt"), "beta-before\n").expect("write beta");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_delta_exact".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "alpha.txt",
+                            "search": "alpha-before\n",
+                            "replace": "alpha-after\n",
+                            "expected_sha256": sha256_hex("alpha-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "beta.txt",
+                            "search": "beta-before\n",
+                            "replace": "beta-after\n",
+                            "expected_sha256": sha256_hex("beta-before\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-delta-exact".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("top-level delta array");
+    assert_eq!(delta.len(), 2, "one entry per op: {delta:?}");
+    for (idx, entry) in delta.iter().enumerate() {
+        assert_eq!(
+            entry["status"], "applied",
+            "op {idx} status mismatch: {entry}"
+        );
+        assert_eq!(
+            entry["exact"], true,
+            "op {idx} should be an exact match: {entry}"
+        );
+        assert!(
+            entry.get("error").is_none(),
+            "exact success must not carry an error field: {entry}"
+        );
+    }
+    assert_eq!(delta[0]["path"], "alpha.txt");
+    assert_eq!(delta[1]["path"], "beta.txt");
+    // applied_delta.operations should also carry the per-op exact flag.
+    let applied_delta = result.content.get("applied_delta").expect("applied_delta");
+    let ops = applied_delta
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ops[0]["exact"], true);
+    assert_eq!(ops[1]["exact"], true);
+    assert_eq!(applied_delta["exact"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_patch_delta_reports_per_op_failure_with_error() {
+    // Audit F14: when an op fails mid-apply, the per-op delta must mark that
+    // op `failed` with an `error` field populated, and any later ops must be
+    // `skipped` — the caller needs enough information to audit which path is
+    // broken without reparsing the top-level error string.
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_workspace("apply_patch_delta_failure");
+    fs::write(root.join("first.txt"), "first-before\n").expect("write first");
+    fs::write(root.join("second.txt"), "second-before\n").expect("write second");
+    fs::write(root.join("third.txt"), "third-before\n").expect("write third");
+    let read_only = root.join("second.txt");
+    let mut perms = fs::metadata(&read_only).expect("read meta").permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&read_only, perms).expect("set readonly");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_delta_failure".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [
+                        {
+                            "path": "first.txt",
+                            "search": "first-before\n",
+                            "replace": "first-after\n",
+                            "expected_sha256": sha256_hex("first-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "second.txt",
+                            "search": "second-before\n",
+                            "replace": "second-after\n",
+                            "expected_sha256": sha256_hex("second-before\n".as_bytes()),
+                        },
+                        {
+                            "path": "third.txt",
+                            "search": "third-before\n",
+                            "replace": "third-after\n",
+                            "expected_sha256": sha256_hex("third-before\n".as_bytes()),
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-delta-failure".to_string(),
+        )
+        .await;
+
+    if let Ok(meta) = fs::metadata(&read_only) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = fs::set_permissions(&read_only, perms);
+    }
+
+    if result.status == ToolStatus::Error {
+        let delta = result
+            .content
+            .get("delta")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .expect("delta array on partial failure");
+        assert_eq!(delta.len(), 3, "one entry per op: {delta:?}");
+        assert_eq!(delta[0]["status"], "applied");
+        assert_eq!(delta[0]["exact"], true);
+        assert!(delta[0].get("error").is_none());
+
+        assert_eq!(delta[1]["status"], "failed");
+        assert_eq!(delta[1]["exact"], true);
+        assert!(
+            delta[1]["error"].as_str().is_some_and(|s| !s.is_empty()),
+            "failed op must surface its error string: {}",
+            delta[1]
+        );
+        assert_eq!(delta[1]["path"], "second.txt");
+
+        assert_eq!(
+            delta[2]["status"], "skipped",
+            "ops after the failure must be skipped: {}",
+            delta[2]
+        );
+        assert_eq!(delta[2]["exact"], true);
+    } else {
+        // Some sandboxes (root, etc) ignore 0o444; in that case every op
+        // applied and the failure-path assertions don't fire.
+        assert_eq!(result.status, ToolStatus::Success);
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3499,6 +3689,96 @@ async fn shell_denies_protected_metadata_write_before_spawn() {
     );
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shell_segment_writes_filesystem_covers_metadata_write_verbs() {
+    use crate::shell::shell_segment_writes_filesystem;
+
+    for verb_segment in [
+        "mkdir .git/hooks",
+        "chmod 600 .git/config",
+        "ln -s /tmp/x .git/HEAD",
+        "mv tmp .git/config",
+        "touch .git/index",
+    ] {
+        assert!(
+            shell_segment_writes_filesystem(verb_segment),
+            "expected pre-spawn classifier to flag {verb_segment:?} as a filesystem write"
+        );
+    }
+
+    for destructive_segment in [
+        "rm .git/config",
+        "dd if=/dev/zero of=.git/HEAD",
+        "truncate -s 0 .git/index",
+    ] {
+        assert!(
+            shell_segment_writes_filesystem(destructive_segment),
+            "expected pre-spawn classifier to flag destructive {destructive_segment:?}"
+        );
+    }
+
+    for read_only_segment in ["cat .git/config", "ls .git", "grep foo .git/config"] {
+        assert!(
+            !shell_segment_writes_filesystem(read_only_segment),
+            "expected pre-spawn classifier to leave read-only {read_only_segment:?} alone"
+        );
+    }
+}
+
+#[test]
+fn shell_safe_metadata_write_verbs_skip_pre_spawn_gate() {
+    use crate::shell_parse::{is_destructive_shell_segment, is_safe_metadata_write_segment};
+
+    for safe in [
+        "mkdir /tmp/x",
+        "mkdir -p /tmp/nested/dir",
+        "chmod 600 src/config",
+        "chmod -R 700 build",
+        "ln -s /tmp/x /tmp/y",
+        "mv tmp/a tmp/b",
+        "touch src/lib.rs",
+    ] {
+        assert!(
+            is_safe_metadata_write_segment(safe),
+            "expected {safe:?} to clear the pre-spawn safe-verb allowlist"
+        );
+        assert!(
+            !is_destructive_shell_segment(safe),
+            "expected {safe:?} to skip the destructive pre-spawn gate"
+        );
+    }
+
+    for danger in [
+        "rm src/lib.rs",
+        "rm -rf target",
+        "dd if=/dev/zero of=src/lib.rs",
+        "truncate -s 0 src/lib.rs",
+        "chown -R nobody src",
+        // Forced overwrite stays gated even though mv is otherwise safe.
+        "mv -f tmp/a tmp/b",
+        "mv --force tmp/a tmp/b",
+    ] {
+        assert!(
+            !is_safe_metadata_write_segment(danger),
+            "expected {danger:?} to NOT be classified as a safe metadata write"
+        );
+        assert!(
+            is_destructive_shell_segment(danger),
+            "expected {danger:?} to trip the destructive pre-spawn gate"
+        );
+    }
+
+    let mkdir = analyze_shell_command("mkdir /tmp/x");
+    assert_eq!(mkdir.capability, PermissionCapability::Edit);
+    assert_eq!(mkdir.risk, PermissionRisk::Medium);
+    assert!(!mkdir.destructive);
+
+    let rm_star = analyze_shell_command("rm *");
+    assert_eq!(rm_star.capability, PermissionCapability::Destructive);
+    assert_eq!(rm_star.risk, PermissionRisk::Critical);
+    assert!(rm_star.destructive);
 }
 
 #[tokio::test]
@@ -5328,6 +5608,7 @@ fn tool_specs_are_sorted_by_name() {
             "load_skill",
             "notes_recall",
             "notes_remember",
+            "observations",
             "plan_patch",
             "read_file",
             "read_slice",
@@ -6875,6 +7156,7 @@ fn fake_sandbox_plan(backend: &'static str, required: bool) -> ShellSandboxPlan 
         filesystem_read_roots: Vec::new(),
         filesystem_write_roots: Vec::new(),
         fallback_reason: None,
+        best_effort_fallback: None,
     }
 }
 
@@ -6946,6 +7228,43 @@ fn macos_sandbox_profile_deny_lists_protected_metadata_under_write_roots() {
 
     assert!(profile.contains("require-not"), "{profile}");
     assert!(profile.contains(&git_path), "{profile}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile_denies_af_unix_when_network_denied() {
+    let root = temp_workspace("macos_profile_af_unix_denied");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), false);
+
+    // With network denied and the default empty AF_UNIX allowlist, the
+    // profile must not emit any allow-network rule. The default
+    // `(deny default)` then keeps AF_UNIX blocked.
+    assert!(
+        !profile.contains("(allow network"),
+        "denied-network profile must not allow AF_UNIX sockets: {profile}"
+    );
+    assert!(
+        !profile.contains("(local unix)"),
+        "stale `(local unix)` rule should be removed: {profile}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn macos_sandbox_profile_allows_full_network_when_network_allowed() {
+    let root = temp_workspace("macos_profile_network_allowed");
+    let profile = macos_shell_sandbox_profile(&root, &ShellSandboxConfig::default(), true);
+
+    // When network is permitted the existing wildcard allow remains so
+    // that classified-network commands keep working unchanged.
+    assert!(
+        profile.contains("(allow network*)"),
+        "allow-network profile must keep the wildcard rule: {profile}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -7277,6 +7596,145 @@ fn shell_best_effort_falls_back_when_sandbox_apply_fails_at_runtime() {
 }
 
 #[test]
+fn shell_sandbox_health_counts_fallbacks_and_latches_warning() {
+    // F3-4: the tools layer is the source of truth for the
+    // `approval.best_effort.fallback{tool=shell}` counter AND the
+    // one-shot TUI warning. The counter ticks every time; the latch
+    // flips to "not first" after the first call.
+    let health = ShellSandboxHealth::default();
+
+    assert_eq!(health.best_effort_fallback_count(), 0);
+
+    let first = health.record_best_effort_fallback();
+    assert_eq!(first.fallback_count, 1);
+    assert!(
+        first.first_in_session,
+        "first fallback in a session must surface the warning"
+    );
+
+    let second = health.record_best_effort_fallback();
+    assert_eq!(second.fallback_count, 2, "counter must keep ticking");
+    assert!(
+        !second.first_in_session,
+        "subsequent fallbacks must NOT re-fire the one-shot warning"
+    );
+
+    let third = health.record_best_effort_fallback();
+    assert_eq!(third.fallback_count, 3);
+    assert!(!third.first_in_session);
+
+    assert_eq!(health.best_effort_fallback_count(), 3);
+}
+
+#[test]
+fn shell_sandbox_plan_metadata_carries_best_effort_fallback_record() {
+    // The fallback record reaches the agent layer via the `sandbox`
+    // JSON in `ToolResult.content`; we round-trip it here to lock in
+    // the schema the agent reads in `shell_best_effort_fallback_from_result`.
+    let health = ShellSandboxHealth::default();
+    let record = health.record_best_effort_fallback();
+
+    let config = sandbox_config(
+        ShellSandboxMode::BestEffort,
+        ShellSandboxNetworkPolicy::DenyByDefault,
+    );
+    let plan = ShellSandboxPlan::direct_with_fallback_record(
+        "printf ok",
+        ShellSandboxMode::BestEffort,
+        &config,
+        Some("backend disabled".to_string()),
+        Some(("macos-sandbox-exec", record)),
+    );
+
+    let metadata = plan.metadata();
+    let fallback = metadata
+        .get("best_effort_fallback")
+        .expect("best_effort_fallback present in metadata");
+    assert_eq!(
+        fallback.get("backend").and_then(Value::as_str),
+        Some("macos-sandbox-exec")
+    );
+    assert_eq!(
+        fallback.get("fallback_count").and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        fallback.get("first_in_session").and_then(Value::as_bool),
+        Some(true)
+    );
+
+    // The public agent-facing helper round-trips the same payload off a
+    // synthetic ToolResult.
+    let result = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({ "sandbox": metadata }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    let parsed = shell_best_effort_fallback_from_result(&result)
+        .expect("agent helper extracts the fallback descriptor");
+    assert_eq!(parsed.backend, "macos-sandbox-exec");
+    assert_eq!(parsed.fallback_count, 1);
+    assert!(parsed.first_in_session);
+}
+
+#[test]
+fn shell_best_effort_fallback_from_result_ignores_non_shell_tools_and_clean_runs() {
+    // Defence in depth: the agent layer must only fire its one-shot
+    // warning for shell calls, and only when the sandbox actually
+    // degraded. Read_file or a clean shell call must return `None`.
+    let plain_result = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "backend": "macos-sandbox-exec",
+                "mode": "best_effort",
+            }
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    assert!(shell_best_effort_fallback_from_result(&plain_result).is_none());
+
+    let non_shell = ToolResult {
+        call_id: "call".to_string(),
+        tool_name: "read_file".to_string(),
+        status: ToolStatus::Success,
+        content: json!({
+            "sandbox": {
+                "best_effort_fallback": {
+                    "backend": "macos-sandbox-exec",
+                    "fallback_count": 1,
+                    "first_in_session": true,
+                }
+            }
+        }),
+        cost_hint: ToolCostHint::default(),
+        receipt: ToolReceipt {
+            output_sha256: "0".repeat(64),
+            content_sha256: None,
+        },
+        spill_model_output: None,
+    };
+    assert!(
+        shell_best_effort_fallback_from_result(&non_shell).is_none(),
+        "non-shell tools must not trip the shell sandbox warning"
+    );
+}
+
+#[test]
 fn shell_checkpoint_policy_skips_read_only_commands() {
     let ls = analyze_shell_command("ls -la");
     assert!(!shell_command_needs_checkpoint(false, &ls));
@@ -7471,6 +7929,111 @@ async fn notes_tools_fail_when_no_store_handle_available() {
                     "kind": "note",
                     "text": "no store available"
                 }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+}
+
+#[tokio::test]
+async fn observations_tool_lists_recent_and_searches_existing_store() {
+    use squeezy_store::{Observation, ObservationKind};
+
+    let root = temp_workspace("observations_tool");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+
+    let seeded = [
+        (
+            ObservationKind::Decision,
+            "Prefer ripgrep over grep for workspace search.",
+            vec!["search", "tooling"],
+            "audit",
+        ),
+        (
+            ObservationKind::Convention,
+            "Public APIs document units explicitly.",
+            vec!["docs"],
+            "convention-log",
+        ),
+        (
+            ObservationKind::DeadEnd,
+            "Attempted to vendor libgit2; build broke on Windows.",
+            vec!["build", "git"],
+            "post-mortem",
+        ),
+    ];
+    let mut put_ids = Vec::new();
+    for (kind, text, tags, source) in seeded.iter() {
+        let mut obs = Observation::new(*kind, *text, *source);
+        obs.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
+        let stored = store.put_observation(obs).expect("put observation");
+        put_ids.push(stored.id);
+    }
+
+    let registry = registry_with_state_store(&root, store.clone());
+
+    // Default (no query) returns newest-first, capped by `limit`.
+    let listed = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_list".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(listed.status, ToolStatus::Success);
+    let listed_items = listed.content["observations"]
+        .as_array()
+        .expect("observations array");
+    assert_eq!(listed_items.len(), seeded.len());
+    let first = &listed_items[0];
+    assert_eq!(first["id"], put_ids[2]);
+    assert_eq!(first["kind"], "deadend");
+    assert_eq!(first["summary"], seeded[2].1);
+    assert_eq!(first["tags"], json!(["build", "git"]));
+    assert!(first["timestamp"].is_number());
+    // Recency ordering: newest seeded first, oldest last.
+    let ordered_ids: Vec<&str> = listed_items
+        .iter()
+        .map(|item| item["id"].as_str().expect("id string"))
+        .collect();
+    let expected_recent: Vec<&str> = put_ids.iter().rev().map(String::as_str).collect();
+    assert_eq!(ordered_ids, expected_recent);
+
+    // Query path delegates to `search_observations` and honours `limit`.
+    let searched = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_search".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({"query": "ripgrep", "limit": 5}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(searched.status, ToolStatus::Success);
+    let searched_items = searched.content["observations"]
+        .as_array()
+        .expect("observations array");
+    assert_eq!(searched_items.len(), 1);
+    assert_eq!(searched_items[0]["id"], put_ids[0]);
+    assert_eq!(searched_items[0]["kind"], "decision");
+    assert_eq!(searched_items[0]["summary"], seeded[0].1);
+}
+
+#[tokio::test]
+async fn observations_tool_fails_without_store_handle() {
+    let root = temp_workspace("observations_no_store");
+    let registry = registry_with_runtime_config(&root, ToolRuntimeConfig::default());
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_no_store".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({}),
             },
             CancellationToken::new(),
         )

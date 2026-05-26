@@ -160,6 +160,19 @@ pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
             parser_backed,
             dynamic,
         }
+    } else if segments
+        .iter()
+        .all(|segment| is_safe_metadata_write_segment(segment))
+    {
+        ShellPermissionAnalysis {
+            capability: PermissionCapability::Edit,
+            risk: PermissionRisk::Medium,
+            rule_target: format!("{first}:*"),
+            network: false,
+            destructive: false,
+            parser_backed,
+            dynamic,
+        }
     } else {
         ShellPermissionAnalysis {
             capability: PermissionCapability::Shell,
@@ -813,8 +826,20 @@ pub(crate) fn is_destructive_shell_segment(segment: &str) -> bool {
     let first = tokens.first().copied().unwrap_or("");
     if matches!(
         first,
-        "rm" | "rmdir" | "mv" | "dd" | "truncate" | "shred" | "chmod" | "chown" | "sudo"
+        "rm" | "rmdir" | "dd" | "truncate" | "shred" | "chown" | "sudo"
     ) {
+        return true;
+    }
+    // mv defaults to overwrite-on-dest-exists. Plain `mv a b` is treated as a
+    // metadata-write-safe verb (the kernel sandbox enforces the actual write
+    // rules); explicit `-f`/`--force` is the strict "force overwrite" idiom
+    // and stays gated behind approval.
+    if first == "mv"
+        && tokens
+            .iter()
+            .skip(1)
+            .any(|tok| *tok == "-f" || *tok == "--force")
+    {
         return true;
     }
     if destructive_git_pair(&tokens) || destructive_two_word_command(&tokens) {
@@ -827,6 +852,21 @@ pub(crate) fn is_destructive_shell_segment(segment: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Pre-spawn safe-verb allowlist for benign metadata-write commands. These
+/// verbs touch only inode metadata or create new entries (`mkdir`, `chmod`,
+/// `ln`, `touch`) or perform a single rename (`mv` without `-f`), and the
+/// kernel sandbox enforces the actual fs scope. Verbs that delete or
+/// arbitrarily overwrite (`rm`, `dd`, `truncate`, `chown`, `mv -f`) remain
+/// destructive and stay gated behind approval.
+pub(crate) fn is_safe_metadata_write_segment(segment: &str) -> bool {
+    if is_destructive_shell_segment(segment) {
+        return false;
+    }
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let first = tokens.first().copied().unwrap_or("");
+    matches!(first, "mkdir" | "chmod" | "ln" | "mv" | "touch")
 }
 
 /// Detects shell output redirects that write to a filename (`>`, `>>`, `>|`,

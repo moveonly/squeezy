@@ -27,6 +27,7 @@ use squeezy_core::{
     ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
 };
+use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -37,9 +38,10 @@ use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
-    SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent, SessionReplayEventKind,
-    SessionReplayTape, SessionResumeState, SessionStatus, SessionStore, SqueezyStore,
+    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionEventKind,
+    SessionHandle, SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent,
+    SessionReplayEventKind, SessionReplayTape, SessionResumeState, SessionStatus, SessionStore,
+    SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -48,9 +50,10 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ShellAskApprover, ShellAskDecision, ShellAskRequest, ToolCall, ToolCostHint,
-    ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry, ToolRegistryRuntime,
-    ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig, sha256_hex,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback, ToolCall,
+    ToolCostHint, ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry,
+    ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
+    sha256_hex, shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -104,6 +107,12 @@ pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
+/// Deterministic-keys contract for Plan and Review subagents. The parser
+/// reads the JSON object from the tail of the final assistant message so
+/// the parent agent can iterate findings as structured data. Free-text
+/// preambles before the JSON are preserved in `summary` and silently
+/// ignored by the parser.
+const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final assistant message with a single JSON object on its own line of the form `{\"findings\": [{\"finding\": \"...\", \"recommendation\": \"...\", \"priority\": \"blocker|warning|info\"}], \"summary\": \"...\"}`. Add no prose after the JSON object. If you have nothing to report, emit `{\"findings\": [], \"summary\": \"...\"}`.";
 /// Maximum number of subagents that may be active at once for a single
 /// parent Agent. The registry rejects further `start()` calls until an
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
@@ -1069,6 +1078,12 @@ pub struct Agent {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     store: Option<Arc<SqueezyStore>>,
     replay: Option<Arc<ReplayRuntime>>,
+    /// Optional registry of lifecycle hook handlers. Skills and other
+    /// extensions register here; the per-turn LLM call site dispatches
+    /// `HookEvent::PreTurn` before issuing the request when this is
+    /// `Some`. Defaults to `None` for backwards compatibility — callers
+    /// that need hooks install a registry via `set_hooks`.
+    hooks: Option<Arc<HookRegistry>>,
     /// Config save queued from the config screen. Drained before each
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
@@ -1142,12 +1157,11 @@ impl Agent {
             metadata.ended_at_ms = None;
             metadata.resume_available = true;
         });
-        let _ = handle.append_event(SessionEvent::new(
-            "session_resumed",
+        let _ = handle.append_typed_event(
+            SessionEventKind::SessionResumed,
             None,
             Some("session resumed".to_string()),
-            json!({}),
-        ));
+        );
         Ok((agent, transcript))
     }
 
@@ -1425,6 +1439,7 @@ impl Agent {
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
             replay,
+            hooks: None,
             pending_swap: None,
         }
     }
@@ -1477,6 +1492,23 @@ impl Agent {
             self.provider = provider;
         }
         Some(swap)
+    }
+
+    /// Install a hook registry. Handlers registered here observe
+    /// `HookEvent::PreTurn` before each turn's LLM request and are
+    /// reserved (variant-only) for the other event kinds. Passing
+    /// `None` clears any previously-installed registry. Wrapped in
+    /// `Arc` so cloned `TurnRuntime`s share the same handler set
+    /// without paying for re-registration on every turn.
+    pub fn set_hooks(&mut self, hooks: Option<Arc<HookRegistry>>) {
+        self.hooks = hooks;
+    }
+
+    /// Borrow the currently-installed hook registry, if any. Returns
+    /// `None` when hooks are disabled (default) so the caller can skip
+    /// dispatch entirely.
+    pub fn hooks(&self) -> Option<&Arc<HookRegistry>> {
+        self.hooks.as_ref()
     }
 
     /// Snapshot of session-scoped permission rules. Primarily intended for
@@ -2350,6 +2382,7 @@ impl Agent {
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
         let subagents = self.subagents.clone();
+        let hooks = self.hooks.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -2491,6 +2524,7 @@ impl Agent {
                     loaded_tool_schemas,
                     replay,
                     subagents,
+                    hooks,
                 }
                 .run(task_title.clone())
                 .await;
@@ -3308,6 +3342,10 @@ struct TurnRuntime {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     replay: Option<Arc<ReplayRuntime>>,
     subagents: SubagentRegistry,
+    /// Hook registry shared with `Agent`. `None` when no hooks are
+    /// installed — the per-round LLM call site checks this before
+    /// building a `HookContext`.
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl TurnRuntime {
@@ -3494,6 +3532,43 @@ impl TurnRuntime {
         self.session_log
             .as_ref()
             .map(|handle| format!("squeezy::{}", handle.session_id()))
+    }
+
+    /// Fan out a `HookEvent::PreTurn` to every registered handler when
+    /// a hook registry is installed. Mutation replies are logged but
+    /// not yet applied — that wiring is deferred to a follow-up
+    /// commit so this first hooks foundation stays minimal and
+    /// strictly observational. Returns immediately when no registry
+    /// is configured so the no-hooks path costs zero allocations.
+    fn dispatch_pre_turn(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({ "turn_index": self.turn_id.to_string() });
+        let results = registry.dispatch(HookEvent::PreTurn, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PreTurn handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PreTurn handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
@@ -3799,6 +3874,11 @@ impl TurnRuntime {
         // (which the TUI can flip mid-turn) varies, and the rare implicit
         // skill append below invalidates this on a revision boundary.
         let mut instructions_cache: [Option<String>; 2] = [None, None];
+        // Fire the PreTurn hook once per user turn, immediately before
+        // the first round's LLM request is built. Mutation replies are
+        // currently observational only — see `dispatch_pre_turn` for
+        // the rationale.
+        self.dispatch_pre_turn();
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -5130,6 +5210,11 @@ struct SubagentExecution {
     metrics: TurnMetrics,
     supporting_receipts: Vec<Value>,
     model: String,
+    /// Structured JSON payload extracted from the final assistant message,
+    /// when the subagent honored the deterministic-keys contract. `None`
+    /// when no JSON tail is present or it failed to parse, in which case
+    /// `summary` carries the raw text and callers can fall back to it.
+    structured_output: Option<Value>,
 }
 
 async fn handle_subagent_call(
@@ -5154,6 +5239,7 @@ async fn handle_subagent_call(
                 metrics: TurnMetrics::default(),
                 supporting_receipts: Vec::new(),
                 model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                structured_output: None,
             },
         );
     }
@@ -5172,6 +5258,7 @@ async fn handle_subagent_call(
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
                 },
             );
         }
@@ -5222,6 +5309,7 @@ async fn handle_subagent_call(
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
                 },
             );
         }
@@ -5398,6 +5486,7 @@ async fn run_subagent(
             metrics: TurnMetrics::default(),
             supporting_receipts: Vec::new(),
             model,
+            structured_output: None,
         };
     }
     let allowed_tool_names = allowed_tools
@@ -5434,7 +5523,7 @@ async fn run_subagent(
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
     let mut seen_outputs = SeenToolOutputs::default();
 
-    let execution = run_subagent_loop(
+    let mut execution = run_subagent_loop(
         parent,
         &config,
         &tool_specs,
@@ -5459,11 +5548,115 @@ async fn run_subagent(
 
     drop(hidden_tx);
     let _ = drain_handle.await;
+    // Plan and Review subagents promise a JSON object on the final
+    // assistant line; harvest it into `structured_output` so the
+    // parent can iterate findings as data. Failure to parse keeps
+    // `structured_output = None` and the raw text in `summary`.
+    if matches!(kind, SubagentKind::Plan | SubagentKind::Review)
+        && execution.status == ToolStatus::Success
+        && execution.structured_output.is_none()
+    {
+        execution.structured_output = parse_subagent_structured_tail(&execution.summary);
+    }
     execution
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent_loop(
+    parent: &ToolExecutionContext<'_>,
+    config: &AppConfig,
+    tool_specs: &[Arc<LlmToolSpec>],
+    allowed_tools: &[AdvertisedTool],
+    allowed_tool_names: &BTreeSet<String>,
+    instructions: &str,
+    hidden_tx: &mpsc::Sender<AgentEvent>,
+    local_jobs: &JobRegistry,
+    local_task_state: &Arc<Mutex<Option<TaskStateSnapshot>>>,
+    local_loaded_schemas: &Arc<Mutex<Vec<String>>>,
+    local_mode: &Arc<AtomicU8>,
+    local_exploration: &Arc<Mutex<ExplorationTurnState>>,
+    seen_outputs: &mut SeenToolOutputs,
+    broker: &mut CostBroker,
+    assistant_stream: &mut StreamRedactor,
+    assistant_message: &mut String,
+    conversation: &mut Vec<LlmInputItem>,
+    supporting_receipts: &mut Vec<Value>,
+    model: String,
+) -> SubagentExecution {
+    let runtime_budget = config.subagents.max_runtime_secs.map(Duration::from_secs);
+    let Some(budget) = runtime_budget else {
+        return run_subagent_rounds(
+            parent,
+            config,
+            tool_specs,
+            allowed_tools,
+            allowed_tool_names,
+            instructions,
+            hidden_tx,
+            local_jobs,
+            local_task_state,
+            local_loaded_schemas,
+            local_mode,
+            local_exploration,
+            seen_outputs,
+            broker,
+            assistant_stream,
+            assistant_message,
+            conversation,
+            supporting_receipts,
+            model,
+        )
+        .await;
+    };
+    let loop_model = model.clone();
+    let timed = tokio::time::timeout(
+        budget,
+        run_subagent_rounds(
+            parent,
+            config,
+            tool_specs,
+            allowed_tools,
+            allowed_tool_names,
+            instructions,
+            hidden_tx,
+            local_jobs,
+            local_task_state,
+            local_loaded_schemas,
+            local_mode,
+            local_exploration,
+            seen_outputs,
+            broker,
+            assistant_stream,
+            assistant_message,
+            conversation,
+            supporting_receipts,
+            loop_model,
+        ),
+    )
+    .await;
+    match timed {
+        Ok(execution) => execution,
+        Err(_) => {
+            broker.metrics.redactions += assistant_stream.total_redactions();
+            SubagentExecution {
+                status: ToolStatus::Error,
+                summary: String::new(),
+                status_label: "timed_out",
+                error: Some(format!(
+                    "subagent exceeded {}s wall-clock budget",
+                    budget.as_secs()
+                )),
+                metrics: broker.metrics.clone(),
+                supporting_receipts: std::mem::take(supporting_receipts),
+                model,
+                structured_output: None,
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent_rounds(
     parent: &ToolExecutionContext<'_>,
     config: &AppConfig,
     tool_specs: &[Arc<LlmToolSpec>],
@@ -5523,6 +5716,7 @@ async fn run_subagent_loop(
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
+                        structured_output: None,
                     };
                 }
             };
@@ -5562,6 +5756,7 @@ async fn run_subagent_loop(
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
+                        structured_output: None,
                     };
                 }
             }
@@ -5675,6 +5870,7 @@ async fn run_subagent_loop(
         metrics: broker.metrics.clone(),
         supporting_receipts: std::mem::take(supporting_receipts),
         model,
+        structured_output: None,
     }
 }
 
@@ -5696,7 +5892,36 @@ fn successful_subagent_execution(
         metrics,
         supporting_receipts,
         model,
+        structured_output: None,
     }
+}
+
+/// Tries to extract a single JSON object from the tail of a Plan/Review
+/// subagent's final assistant message. Models that obey the deterministic-
+/// keys contract emit `{"findings": [...], "summary": "..."}` on the last
+/// non-empty line; we accept either the whole trimmed text being JSON or
+/// the largest `{...}` substring near the end. Returns `None` when no
+/// brace pair is found or it fails to parse — callers fall back to the
+/// raw `summary` string in that case.
+fn parse_subagent_structured_tail(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && value.is_object()
+    {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start >= end {
+        return None;
+    }
+    let slice = trimmed.get(start..=end)?;
+    serde_json::from_str::<Value>(slice)
+        .ok()
+        .filter(Value::is_object)
 }
 
 fn subagent_control_result(
@@ -5727,6 +5952,9 @@ fn subagent_control_result(
     });
     if let Some(error) = execution.error {
         content["error"] = json!(error);
+    }
+    if let Some(structured) = execution.structured_output {
+        content["structured_output"] = structured;
     }
     control_tool_result(call, execution.status, content)
 }
@@ -5779,13 +6007,13 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
             format!(
-                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands."
+                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
         SubagentKind::Review => {
             let base = role_config(SubagentRole::Reviewer).instructions;
             format!(
-                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains."
+                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
     }
@@ -6216,55 +6444,32 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
-        if call.name == DELEGATE_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Delegate,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == EXPLORE_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Explore,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == DELEGATE_PLAN_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Plan,
-                    broker,
-                ))
-                .await,
-            );
-            recorded[index] = true;
-            continue;
-        }
-        if call.name == DELEGATE_REVIEW_TOOL_NAME {
-            results[index] = Some(
-                Box::pin(handle_subagent_call(
-                    &context,
-                    call,
-                    SubagentKind::Review,
-                    broker,
-                ))
-                .await,
-            );
+        let subagent_kind = match call.name.as_str() {
+            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
+            EXPLORE_TOOL_NAME => Some(SubagentKind::Explore),
+            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
+            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
+            _ => None,
+        };
+        if let Some(kind) = subagent_kind {
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallStarted {
+                    turn_id: context.turn_id,
+                    call: redact_tool_call(call.clone(), &context.redactor),
+                    origin: context.origin,
+                })
+                .await;
+            let result = Box::pin(handle_subagent_call(&context, call, kind, broker)).await;
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
             recorded[index] = true;
             continue;
         }
@@ -6821,6 +7026,7 @@ async fn record_and_emit_progress(
 ) {
     broker.record_executed_result(result);
     maybe_emit_cost_update(broker, tx, turn_id).await;
+    maybe_emit_shell_sandbox_fallback_warning(tx, turn_id, result).await;
 }
 
 fn budget_denied_result(call: &ToolCall, reason: String) -> ToolResult {
@@ -6875,6 +7081,46 @@ fn emit_tool_telemetry(
         output_sha256: Some(result.receipt.output_sha256.as_str()),
         content_sha256: result.receipt.content_sha256.as_deref(),
     }));
+    // `approval.best_effort.fallback{tool=shell}` ticks once per silent
+    // shell-sandbox degradation. Co-located with the per-tool event so
+    // every call site that already calls `emit_tool_telemetry` benefits
+    // without threading the new event through individual handlers.
+    if let Some(fallback) = shell_best_effort_fallback_from_result(result) {
+        telemetry.spawn(TelemetryEvent::shell_sandbox_best_effort_fallback(
+            &fallback.backend,
+        ));
+    }
+}
+
+/// Detect a shell best_effort sandbox fallback in `result` and, when this
+/// is the first occurrence in the session, publish a one-shot
+/// [`AgentEvent::ShellSandboxBestEffortFallback`] so the TUI can warn the
+/// user. The per-call telemetry counter is emitted separately by
+/// [`emit_tool_telemetry`]; this function only handles the user-visible
+/// once-per-session signal.
+async fn maybe_emit_shell_sandbox_fallback_warning(
+    tx: &mpsc::Sender<AgentEvent>,
+    turn_id: TurnId,
+    result: &ToolResult,
+) {
+    let Some(ShellBestEffortFallback {
+        backend,
+        fallback_count,
+        first_in_session,
+    }) = shell_best_effort_fallback_from_result(result)
+    else {
+        return;
+    };
+    if !first_in_session {
+        return;
+    }
+    let _ = tx
+        .send(AgentEvent::ShellSandboxBestEffortFallback {
+            turn_id,
+            backend,
+            fallback_count,
+        })
+        .await;
 }
 
 /// SHA-256 of the canonical JSON arguments the model sent for a tool call.
@@ -6914,6 +7160,48 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
         | SqueezyError::Workspace(_)
         | SqueezyError::Parse(_) => ErrorKind::Unknown,
     }
+}
+
+/// Maximum bytes of preceding assistant text passed in
+/// [`ToolApprovalRequest::context`]. Sized to fit a few sentences without
+/// dominating the approval modal.
+const APPROVAL_CONTEXT_CAP: usize = 300;
+
+/// Extract the most recent assistant message from `state`, redact it, and
+/// head-truncate to [`APPROVAL_CONTEXT_CAP`] bytes so the approval modal
+/// can render "you asked me to X, so I'm trying Y" above the buttons.
+async fn approval_context_from_state(
+    state: Option<&Arc<Mutex<ConversationState>>>,
+    redactor: &Redactor,
+) -> Option<String> {
+    let state = state?;
+    let guard = state.lock().await;
+    let last_assistant = guard
+        .transcript
+        .iter()
+        .rev()
+        .find(|item| item.role == Role::Assistant)?;
+    let redacted = redactor.redact(&last_assistant.content).text;
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(head_truncate_bytes(trimmed, APPROVAL_CONTEXT_CAP))
+}
+
+/// Truncate `value` to at most `cap` bytes on a UTF-8 boundary, appending
+/// an ellipsis when truncation occurred.
+fn head_truncate_bytes(value: &str, cap: usize) -> String {
+    if value.len() <= cap {
+        return value.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = value[..end].trim_end().to_string();
+    out.push('…');
+    out
 }
 
 async fn permission_decision(
@@ -7043,6 +7331,9 @@ async fn permission_decision_for_request(
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
+            let approval_context =
+                approval_context_from_state(context.conversation_state.as_ref(), &context.redactor)
+                    .await;
             let approval_request = ToolApprovalRequest {
                 id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
@@ -7051,6 +7342,7 @@ async fn permission_decision_for_request(
                 permission: redact_permission_request(request.clone(), &context.redactor),
                 matched_rule: verdict.matched_rule,
                 reason: context.redactor.redact(&verdict.reason).text,
+                context: approval_context,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -8792,6 +9084,11 @@ pub struct ToolApprovalRequest {
     pub permission: PermissionRequest,
     pub matched_rule: Option<PermissionRule>,
     pub reason: String,
+    /// Snippet of the most recent assistant message (head-truncated to
+    /// ~300 chars) so the approval dialog can show why the tool is
+    /// being run. `None` when no assistant message is available (e.g.
+    /// the very first turn or subagent contexts without a transcript).
+    pub context: Option<String>,
 }
 
 impl ToolApprovalRequest {
@@ -9015,6 +9312,17 @@ pub enum AgentEvent {
     CostWarning {
         turn_id: TurnId,
         status: CostCapStatus,
+    },
+    /// Emitted at most once per session, the first time the shell tool's OS
+    /// sandbox backend silently degrades to the best_effort path (probe
+    /// failure, runtime sandbox_apply error, etc.). The TUI surfaces a
+    /// warning so users see the degradation; the per-call telemetry counter
+    /// `approval.best_effort.fallback{tool=shell}` keeps ticking on every
+    /// fallback for backend dashboards.
+    ShellSandboxBestEffortFallback {
+        turn_id: TurnId,
+        backend: String,
+        fallback_count: u64,
     },
     /// Per-turn progress callout emitted every few tool calls so a user
     /// watching a live transcript can see cost accumulating before the

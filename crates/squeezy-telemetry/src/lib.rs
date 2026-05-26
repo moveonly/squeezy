@@ -131,6 +131,18 @@ impl TelemetryClient {
         let events = drain_queued_events(&state).await;
         send_batch(state, events).await
     }
+
+    /// Snapshot of the events the client has accepted but not yet
+    /// flushed. Exposed for integration tests in sibling crates so they
+    /// can assert that a code path enqueued a specific
+    /// [`TelemetryEvent`] without standing up an HTTP server. Returns an
+    /// empty `Vec` when the client is disabled.
+    pub async fn pending_events_snapshot(&self) -> Vec<TelemetryEvent> {
+        let Some(state) = self.state.as_ref() else {
+            return Vec::new();
+        };
+        state.queue.lock().await.events.clone()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -574,6 +586,26 @@ impl TelemetryEvent {
             },
         }
     }
+
+    /// `approval.best_effort.fallback{tool=shell}` counter event. The
+    /// shell tool fires this every time the configured OS sandbox
+    /// backend probe/runtime check fails and the call retries without
+    /// isolation under `mode = "best_effort"`. The TUI surfaces a
+    /// separate one-shot warning to the user; this event lets backend
+    /// dashboards count silent degradations across the fleet.
+    pub fn shell_sandbox_best_effort_fallback(backend: &str) -> Self {
+        Self {
+            event: TelemetryEventName::ShellSandboxBestEffortFallback,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                tool_name: Some(FirstPartyToolName::Shell),
+                tool_family: Some(ToolFamily::Shell),
+                sandbox_backend: Some(backend.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -591,6 +623,14 @@ pub enum TelemetryEventName {
     GraphRefreshCompleted,
     #[serde(rename = "squeezy_failure_seen")]
     FailureSeen,
+    /// `approval.best_effort.fallback{tool=shell}` — emitted every time
+    /// the shell tool's OS sandbox backend probe or runtime check fails
+    /// and the call retries without isolation under
+    /// `mode = "best_effort"`. Mirrors the codex `policy_transforms`
+    /// telemetry counter so the silent degradation surfaces in
+    /// dashboards rather than only in audit logs.
+    #[serde(rename = "approval_best_effort_fallback")]
+    ShellSandboxBestEffortFallback,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +726,12 @@ pub struct TelemetryProperties {
     /// tools that don't surface a content hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_sha256: Option<String>,
+    /// Tagged on shell-sandbox events (e.g.
+    /// `ShellSandboxBestEffortFallback`) so dashboards can break down by
+    /// the OS backend that was attempted (`macos-sandbox-exec`,
+    /// `linux-direct-syscalls`, `windows-job-object`, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_backend: Option<String>,
 }
 
 impl TelemetryProperties {

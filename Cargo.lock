@@ -3053,6 +3053,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "seccompiler"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae55de56877481d112a559bbc12667635fdaf5e005712fd4e2b2fa50ffc884"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "secret-service"
 version = "4.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3317,8 +3326,10 @@ name = "squeezy"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "dirs",
  "futures-util",
  "reqwest 0.12.28",
+ "serde",
  "serde_json",
  "squeezy-agent",
  "squeezy-core",
@@ -3342,6 +3353,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squeezy-core",
+ "squeezy-hooks",
  "squeezy-llm",
  "squeezy-skills",
  "squeezy-store",
@@ -3423,6 +3435,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "squeezy-hooks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "squeezy-llm"
 version = "0.1.0"
 dependencies = [
@@ -3448,6 +3468,7 @@ name = "squeezy-mcp"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "http 1.4.0",
  "libc",
  "rmcp",
  "serde",
@@ -3531,6 +3552,7 @@ dependencies = [
  "libc",
  "regex",
  "reqwest 0.12.28",
+ "seccompiler",
  "serde",
  "serde_json",
  "sha2 0.11.0",

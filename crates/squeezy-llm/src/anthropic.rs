@@ -12,7 +12,7 @@ use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
     credentials::resolve_api_key,
-    retry::{RetryPolicy, idle_timeout, send_with_retry},
+    retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -236,57 +236,76 @@ impl LlmProvider for AnthropicProvider {
         let body = Self::request_body(&request);
         let transport = self.transport;
 
-        Box::pin(try_stream! {
-            let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-                client
-                    .post(&url)
-                    .header("x-api-key", api_key.clone())
-                    .header("anthropic-version", ANTHROPIC_VERSION)
-                    .json(&body)
-            }).await?;
+        let attempt_cancel = cancel.clone();
+        let make_attempt = move || -> LlmStream {
+            anthropic_stream_attempt(
+                client.clone(),
+                api_key.clone(),
+                url.clone(),
+                body.clone(),
+                transport,
+                attempt_cancel.clone(),
+            )
+        };
 
-            let status = response.status();
-            let response = if status == StatusCode::OK {
-                response
-            } else {
-                let message = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "failed to read error response".to_string());
-                Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
-                unreachable!("provider error returned above");
-            };
+        with_stream_retry(
+            "anthropic",
+            RetryPolicy::provider_stream(transport),
+            cancel,
+            make_attempt,
+        )
+    }
+}
 
-            yield LlmEvent::Started;
+fn anthropic_stream_attempt(
+    client: reqwest::Client,
+    api_key: String,
+    url: String,
+    body: Value,
+    transport: ProviderTransportConfig,
+    cancel: CancellationToken,
+) -> LlmStream {
+    Box::pin(try_stream! {
+        let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
+            client
+                .post(&url)
+                .header("x-api-key", api_key.clone())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body)
+        }).await?;
 
-            let mut decoder = SseDecoder::default();
-            let mut state = AnthropicStreamState::default();
-            let mut saw_completed = false;
-            let mut bytes = response.bytes_stream();
-            loop {
-                let polled = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        yield LlmEvent::Cancelled;
-                        return;
-                    }
-                    next = timeout(idle_timeout(transport), bytes.next()) => next,
-                };
-                let next = polled.map_err(|_| {
-                    SqueezyError::ProviderStream("Anthropic stream idle timeout".to_string())
-                })?;
-                let Some(chunk) = next else { break; };
-                let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
-                for event in decoder.push(&chunk) {
-                    for llm_event in parse_anthropic_event(&event, &mut state)? {
-                        if matches!(llm_event, LlmEvent::Completed { .. }) {
-                            saw_completed = true;
-                        }
-                        yield llm_event;
-                    }
+        let status = response.status();
+        let response = if status == StatusCode::OK {
+            response
+        } else {
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read error response".to_string());
+            Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
+            unreachable!("provider error returned above");
+        };
+
+        yield LlmEvent::Started;
+
+        let mut decoder = SseDecoder::default();
+        let mut state = AnthropicStreamState::default();
+        let mut saw_completed = false;
+        let mut bytes = response.bytes_stream();
+        loop {
+            let polled = tokio::select! {
+                _ = cancel.cancelled() => {
+                    yield LlmEvent::Cancelled;
+                    return;
                 }
-            }
-
-            for event in decoder.finish() {
+                next = timeout(idle_timeout(transport), bytes.next()) => next,
+            };
+            let next = polled.map_err(|_| {
+                SqueezyError::ProviderStream("Anthropic stream idle timeout".to_string())
+            })?;
+            let Some(chunk) = next else { break; };
+            let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
+            for event in decoder.push(&chunk) {
                 for llm_event in parse_anthropic_event(&event, &mut state)? {
                     if matches!(llm_event, LlmEvent::Completed { .. }) {
                         saw_completed = true;
@@ -294,14 +313,23 @@ impl LlmProvider for AnthropicProvider {
                     yield llm_event;
                 }
             }
+        }
 
-            if !saw_completed {
-                Err(SqueezyError::ProviderStream(
-                    "Anthropic stream ended without message_stop".to_string(),
-                ))?;
+        for event in decoder.finish() {
+            for llm_event in parse_anthropic_event(&event, &mut state)? {
+                if matches!(llm_event, LlmEvent::Completed { .. }) {
+                    saw_completed = true;
+                }
+                yield llm_event;
             }
-        })
-    }
+        }
+
+        if !saw_completed {
+            Err(SqueezyError::ProviderStream(
+                "Anthropic stream ended without message_stop".to_string(),
+            ))?;
+        }
+    })
 }
 
 #[derive(Debug, Default)]

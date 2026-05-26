@@ -18,8 +18,10 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+dirs.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 squeezy-agent.workspace = true
 squeezy-core.workspace = true

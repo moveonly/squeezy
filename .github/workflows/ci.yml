@@ -249,13 +249,21 @@ jobs:
             > "$mirror/$tag/squeezy-${triple}.tar.gz.sha256"
 
           target="$(mktemp -d)/bin"
+          install_log="$(mktemp)"
           SQUEEZY_INSTALL_DIR="$target" \
             SQUEEZY_INSTALL_TAG="$tag" \
             SQUEEZY_INSTALL_BASE_URL="file://$mirror" \
-            sh install.sh
+            SQUEEZY_GPG_KEY_PATH="$(mktemp -u)/missing.gpg" \
+            sh install.sh >"$install_log" 2>&1
+          cat "$install_log"
 
           test -x "$target/squeezy"
           "$target/squeezy" --version
+
+          if ! grep -q "skipping GPG verify" "$install_log"; then
+            echo "install.sh did not warn about missing GPG key" >&2
+            exit 1
+          fi
 
           # Negative path: corrupt the checksum and confirm install fails.
           echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  squeezy-${triple}.tar.gz" \

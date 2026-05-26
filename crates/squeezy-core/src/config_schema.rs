@@ -371,6 +371,7 @@ pub const TOOL_OUTPUT_VERBOSITY_OPTIONS: &[&str] = &["compact", "normal", "verbo
 pub const TRANSCRIPT_DEFAULT_OPTIONS: &[&str] = &["compact", "expanded"];
 pub const ALTERNATE_SCREEN_OPTIONS: &[&str] = &["auto", "never", "always"];
 pub const PERMISSION_MODE_OPTIONS: &[&str] = &["allow", "ask", "deny"];
+pub const THEME_OPTIONS: &[&str] = &["system", "dark", "light"];
 
 pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
     ConfigSectionMeta {
@@ -713,6 +714,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default_display: "true",
                 default: || FieldValue::Bool(true),
                 help: "Color status-bar items using their accent palette.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "theme",
+                toml_path: &["tui", "theme"],
+                kind: FieldKind::Enum {
+                    options: THEME_OPTIONS,
+                },
+                tier: ApplyTier::Immediate,
+                get: get_theme,
+                set: set_theme,
+                default_display: "system",
+                default: || FieldValue::Enum("system"),
+                help: "Palette tone (system follows the terminal). Configure via /theme.",
                 env_override: None,
                 secret: false,
             },
@@ -1717,6 +1733,18 @@ fn set_alternate_screen(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'
         "always" => TuiAlternateScreen::Always,
         _ => return Err("invalid alternate_screen"),
     };
+    Ok(())
+}
+
+fn get_theme(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Enum(cfg.tui.theme.as_str())
+}
+fn set_theme(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    let s = match value {
+        FieldValue::Enum(s) => s,
+        _ => return Err("expects enum"),
+    };
+    cfg.tui.theme = crate::TuiTheme::parse(s).ok_or("invalid theme")?;
     Ok(())
 }
 
