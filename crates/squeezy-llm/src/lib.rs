@@ -34,11 +34,7 @@ pub use tokens::{
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use compatible::OpenAiCompatibleProvider;
-pub use credentials::{
-    DefaultCredentialStore, KeySource, KeyringCredentialStore, ResolvedKey, resolve_api_key,
-    resolve_api_key_with_inline, resolve_api_key_with_inline_and_store, resolve_api_key_with_store,
-    save_api_key, save_api_key_with_store,
-};
+pub use credentials::{KeySource, ResolvedKey, resolve_api_key, resolve_api_key_with_inline};
 pub use google::GoogleProvider;
 pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
 pub use openai::OpenAiProvider;

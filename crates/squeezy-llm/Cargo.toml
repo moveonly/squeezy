@@ -24,7 +24,6 @@ aws-smithy-types.workspace = true
 dirs.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
-keyring.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -32,16 +31,3 @@ squeezy-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = [
-    "linux-native-async-persistent",
-    "tokio",
-    "crypto-rust",
-] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }

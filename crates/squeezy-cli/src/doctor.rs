@@ -211,7 +211,8 @@ fn env_check(env_name: &str) -> (Status, String) {
     (
         Status::Warn,
         format!(
-            "{env_name} not set; set it or save it via the TUI config screen to the OS keychain"
+            "{env_name} not set; export it, set [providers.<name>] api_key = \"…\" in \
+             ~/.squeezy/settings.toml, or run `squeezy auth set <provider>`"
         ),
     )
 }

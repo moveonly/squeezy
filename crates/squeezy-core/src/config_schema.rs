@@ -113,8 +113,9 @@ pub enum FieldKind {
         must_exist: bool,
         dir_only: bool,
     },
-    /// API-key style secret. Never read into `AppConfig`; edits route to
-    /// `squeezy_llm::credentials::save_api_key_with_store(env_var, ...)`.
+    /// API-key style secret. Never read into `AppConfig` directly; the
+    /// TUI handles entry through its dedicated secret-editor path which
+    /// writes `[providers.<name>] api_key` to the active scope's TOML.
     Secret {
         env_var: &'static str,
     },
@@ -206,8 +207,9 @@ pub enum FieldValue {
     StringList(Vec<String>),
     Path(PathBuf),
     /// Placeholder — secrets never carry the plaintext through `FieldValue`.
-    /// The screen mask-renders this as `••••` and routes editing directly
-    /// to the keychain.
+    /// The screen mask-renders this as `••••` and routes editing through
+    /// the dedicated secret-entry flow which writes inline `api_key` to
+    /// the active scope's TOML.
     Secret,
     /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
     SubTabs(usize),
@@ -329,8 +331,9 @@ pub struct FieldMeta {
     /// `SQUEEZY_*` env var that, when set, shadows this field at runtime.
     /// Displayed as the `[env]` badge and disables in-screen editing.
     pub env_override: Option<&'static str>,
-    /// `true` for API-key style fields: rendered as `••••`, edits route to
-    /// the keychain rather than `apply_edits`.
+    /// `true` for API-key style fields: rendered as `••••`, edits route
+    /// through the secret-entry flow which writes inline `api_key` to the
+    /// active scope's TOML.
     pub secret: bool,
 }
 
