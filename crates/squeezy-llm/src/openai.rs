@@ -245,6 +245,7 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
 
     match event_type {
         "response.output_text.delta" => {
@@ -317,7 +318,14 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .unwrap_or("OpenAI stream error");
             Err(SqueezyError::ProviderStream(message.to_string()))
         }
-        _ => Ok(None),
+        _ => {
+            tracing::debug!(
+                target: "squeezy_llm::openai",
+                event_type,
+                "unhandled OpenAI SSE event"
+            );
+            Ok(None)
+        }
     }
 }
 

@@ -3650,9 +3650,19 @@ fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
 }
 
 fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    pending_assistant_display_content(app)
-        .map(|content| assistant_text_lines(false, turn_coin_span(app), &content, Style::default()))
-        .unwrap_or_default()
+    let mut lines = Vec::new();
+    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
+    }
+    if let Some(content) = pending_assistant_display_content(app) {
+        lines.extend(assistant_text_lines(
+            false,
+            turn_coin_span(app),
+            &content,
+            Style::default(),
+        ));
+    }
+    lines
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {

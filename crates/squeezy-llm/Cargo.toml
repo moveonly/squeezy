@@ -31,6 +31,7 @@ serde_json.workspace = true
 squeezy-core.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = [
