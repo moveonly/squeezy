@@ -12,9 +12,11 @@
 //! plan blocks that should be promoted to log entries.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 pub(crate) const OPEN_TAG: &str = "<proposed_plan>";
@@ -122,24 +124,31 @@ pub(crate) const PLAN_RETENTION_LIMIT: usize = 20;
 /// deleted; `0` when the dir is missing, empty, or already under the
 /// limit. Read errors are silently treated as "nothing to prune" so a
 /// permissions issue can never crash session startup. The `current`
-/// pointer file is always preserved regardless of mtime.
-pub(crate) fn prune_plan_dir(workspace_root: &Path, session_id: &str) -> usize {
+/// pointer file is always preserved regardless of mtime. Plan ids in
+/// `protected` are also kept regardless of mtime — used for git-aware
+/// retention (PR-H, issue 13).
+pub(crate) fn prune_plan_dir(
+    workspace_root: &Path,
+    session_id: &str,
+    protected: &HashSet<String>,
+) -> usize {
     let dir = session_plan_dir(workspace_root, session_id);
     let Ok(entries) = fs::read_dir(&dir) else {
         return 0;
     };
-    let mut plans: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut plans: Vec<(std::time::SystemTime, PathBuf, String)> = entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
                 return None;
             }
+            let plan_id = path.file_stem()?.to_string_lossy().to_string();
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok()?;
-            Some((modified, path))
+            Some((modified, path, plan_id))
         })
         .collect();
     if plans.len() <= PLAN_RETENTION_LIMIT {
@@ -147,12 +156,84 @@ pub(crate) fn prune_plan_dir(workspace_root: &Path, session_id: &str) -> usize {
     }
     plans.sort_by_key(|(modified, _, _)| std::cmp::Reverse(*modified));
     let mut deleted = 0;
-    for (_, path) in plans.into_iter().skip(PLAN_RETENTION_LIMIT) {
+    // Newest PLAN_RETENTION_LIMIT survive unconditionally; older plans
+    // are deleted unless the id appears in `protected`.
+    for (_, path, plan_id) in plans.into_iter().skip(PLAN_RETENTION_LIMIT) {
+        if protected.contains(&plan_id) {
+            continue;
+        }
         if fs::remove_file(&path).is_ok() {
             deleted += 1;
         }
     }
     deleted
+}
+
+/// Collect plan ids (`plan-<hex>`) that appear anywhere in the last
+/// `days` of `git log -p` output for the given workspace. Used as the
+/// `protected` set for [`prune_plan_dir`] so plan files referenced in
+/// recent commit messages or diffs survive retention even when older
+/// than [`PLAN_RETENTION_LIMIT`] siblings (PR-H, issue 13).
+///
+/// Returns an empty set when git is unavailable, the workspace is not
+/// a git repo, or the command fails — pruning then falls back to its
+/// previous mtime-only behaviour.
+pub(crate) fn git_referenced_plan_ids(workspace_root: &Path, days: u32) -> HashSet<String> {
+    let since = format!("{days} days ago");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .arg("log")
+        .arg("-p")
+        .arg("--no-color")
+        .arg("--since")
+        .arg(&since)
+        .output();
+    let Ok(output) = output else {
+        return HashSet::new();
+    };
+    if !output.status.success() {
+        return HashSet::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    extract_plan_ids(&text)
+}
+
+/// Scan free-form text for `plan-<hex>` tokens. Used by the git-aware
+/// pruning helper to detect plan ids referenced in commit messages and
+/// diff bodies. The hex tail must be 1+ lowercase hex chars; trailing
+/// punctuation is ignored.
+pub(crate) fn extract_plan_ids(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut idx = 0;
+    let bytes = text.as_bytes();
+    while idx < bytes.len() {
+        let Some(pos) = text[idx..].find("plan-") else {
+            break;
+        };
+        let start = idx + pos;
+        // Reject when preceded by an ASCII alphanumeric (avoid matching
+        // mid-identifier `applan-foo`).
+        if start > 0 {
+            let prev = bytes[start - 1];
+            if prev.is_ascii_alphanumeric() {
+                idx = start + "plan-".len();
+                continue;
+            }
+        }
+        let tail_start = start + "plan-".len();
+        let mut tail_end = tail_start;
+        while tail_end < bytes.len()
+            && (bytes[tail_end].is_ascii_hexdigit() && !bytes[tail_end].is_ascii_uppercase())
+        {
+            tail_end += 1;
+        }
+        if tail_end > tail_start {
+            out.insert(text[start..tail_end].to_string());
+        }
+        idx = tail_end.max(start + "plan-".len());
+    }
+    out
 }
 
 /// One-shot migration of pre-v3 flat-layout plan files. Any `*.md` file

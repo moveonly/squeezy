@@ -1,10 +1,11 @@
 use super::{
     BUILD_PLAN_STILL_IN_EFFECT_FORMAT, CURRENT_POINTER_FILE, LEGACY_PLAN_DIR, PLAN_DIR,
     PLAN_RETENTION_LIMIT, PlanLookupError, PlanMeta, ProposedPlanExtractor, current_pointer_for,
-    delete_plan, list_plans, migrate_legacy_plans, persist_plan, plan_file_for, plan_id_for,
-    prune_plan_dir, read_current_plan_id, read_plan_body, resolve_plan_prefix, session_plan_dir,
-    set_active_plan, strip_front_matter,
+    delete_plan, extract_plan_ids, list_plans, migrate_legacy_plans, persist_plan, plan_file_for,
+    plan_id_for, prune_plan_dir, read_current_plan_id, read_plan_body, resolve_plan_prefix,
+    session_plan_dir, set_active_plan, strip_front_matter,
 };
+use std::collections::HashSet;
 
 const TEST_SESSION_ID: &str = "test-sess-tui";
 const OTHER_SESSION_ID: &str = "test-sess-other";
@@ -201,7 +202,7 @@ fn prune_plan_dir_keeps_newest_within_retention_limit() {
             newest_paths.push(path);
         }
     }
-    let deleted = prune_plan_dir(&root, TEST_SESSION_ID);
+    let deleted = prune_plan_dir(&root, TEST_SESSION_ID, &HashSet::new());
     assert_eq!(deleted, total - PLAN_RETENTION_LIMIT);
     let remaining: Vec<_> = std::fs::read_dir(&plans_dir)
         .expect("read plans")
@@ -229,7 +230,7 @@ fn prune_plan_dir_does_not_touch_sibling_sessions() {
     // anything in B.
     std::fs::write(plans_b.join("plan-keep.md"), "body b").expect("write b");
 
-    let deleted = prune_plan_dir(&root, TEST_SESSION_ID);
+    let deleted = prune_plan_dir(&root, TEST_SESSION_ID, &HashSet::new());
     assert!(deleted >= 2, "prune must remove the extras in session A");
     assert!(
         plans_b.join("plan-keep.md").exists(),
@@ -246,7 +247,7 @@ fn prune_plan_dir_noops_when_under_limit() {
     for idx in 0..3 {
         std::fs::write(plans_dir.join(format!("plan-{idx}.md")), "body").expect("write");
     }
-    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID), 0);
+    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID, &HashSet::new()), 0);
     let count = std::fs::read_dir(&plans_dir).expect("read").count();
     assert_eq!(count, 3);
     let _ = std::fs::remove_dir_all(&root);
@@ -255,8 +256,65 @@ fn prune_plan_dir_noops_when_under_limit() {
 #[test]
 fn prune_plan_dir_noops_when_dir_missing() {
     let root = fresh_workspace("prune_missing");
-    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID), 0);
+    assert_eq!(prune_plan_dir(&root, TEST_SESSION_ID, &HashSet::new()), 0);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn prune_plan_dir_keeps_protected_plan_ids() {
+    let root = fresh_workspace("prune_protected");
+    let plans_dir = session_plan_dir(&root, TEST_SESSION_ID);
+    std::fs::create_dir_all(&plans_dir).expect("mkdir plans");
+    let total = PLAN_RETENTION_LIMIT + 3;
+    let now = std::time::SystemTime::now();
+    let mut protected_id = String::new();
+    for idx in 0..total {
+        let id = format!("plan-{idx:04}");
+        let path = plans_dir.join(format!("{id}.md"));
+        std::fs::write(&path, format!("body {idx}")).expect("write");
+        let mtime = now - std::time::Duration::from_secs((total - idx) as u64);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(mtime)
+            .expect("set mtime");
+        // Pick one of the eldest entries as the "protected" id.
+        if idx == 1 {
+            protected_id = id;
+        }
+    }
+    let mut protected = HashSet::new();
+    protected.insert(protected_id.clone());
+    let deleted = prune_plan_dir(&root, TEST_SESSION_ID, &protected);
+    // Protected plan would have been deleted under default rules but
+    // must survive due to the protected set.
+    assert!(
+        plans_dir.join(format!("{protected_id}.md")).exists(),
+        "protected plan id must not be deleted"
+    );
+    // Total deletions are one fewer than the unprotected baseline
+    // because the protected id was skipped.
+    let baseline = total - PLAN_RETENTION_LIMIT;
+    assert_eq!(deleted, baseline - 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn extract_plan_ids_finds_tokens_anywhere_in_text() {
+    let mut text = String::new();
+    text.push_str("commit abc123 ref'd plan-abc12345\n");
+    text.push_str("diff line plan-deadbeef999 trailing\n");
+    text.push_str("the word applan-foo must not match\n");
+    text.push_str("standalone plan-0 should match\n");
+    let ids = extract_plan_ids(&text);
+    assert!(ids.contains("plan-abc12345"));
+    assert!(ids.contains("plan-deadbeef999"));
+    assert!(ids.contains("plan-0"));
+    assert!(
+        !ids.iter().any(|id| id.contains("applan")),
+        "must not match mid-identifier `applan-foo`: {ids:?}"
+    );
 }
 
 #[test]

@@ -366,7 +366,17 @@ async fn run_inner(
     let plans_session_owned = session_id_for_plans
         .clone()
         .unwrap_or_else(|| proposed_plan::FALLBACK_SESSION_ID.to_string());
-    let pruned = proposed_plan::prune_plan_dir(&config.workspace_root, &plans_session_owned);
+    // PR-H (issue 13): plan ids referenced in the last 30 days of git
+    // history survive retention pruning even when older than the cap,
+    // so design-doc references in commits don't get yanked under the
+    // user. Best-effort: no git repo → empty protected set → mtime
+    // behaviour.
+    let protected_plan_ids = proposed_plan::git_referenced_plan_ids(&config.workspace_root, 30);
+    let pruned = proposed_plan::prune_plan_dir(
+        &config.workspace_root,
+        &plans_session_owned,
+        &protected_plan_ids,
+    );
     let mut app = TuiApp::new(
         agent.provider_name(),
         &config,
