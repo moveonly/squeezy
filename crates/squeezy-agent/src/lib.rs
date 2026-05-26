@@ -4924,6 +4924,7 @@ struct PermissionDecisionContext {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
+    telemetry: TelemetryClient,
 }
 
 impl PermissionDecisionContext {
@@ -4942,6 +4943,7 @@ impl PermissionDecisionContext {
             session_mode: context.session_mode.clone(),
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
+            telemetry: context.telemetry.clone(),
         }
     }
 
@@ -7264,6 +7266,7 @@ async fn permission_decision_for_request(
             state: context.ai_reviewer_state.clone(),
             turn_id: context.turn_id,
             cancel: context.cancel.child_token(),
+            telemetry: context.telemetry.clone(),
         })
         .await
         {

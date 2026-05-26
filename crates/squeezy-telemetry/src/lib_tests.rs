@@ -270,6 +270,25 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
 }
 
 #[test]
+fn ai_reviewer_allow_downgrade_event_tags_capability() {
+    // squeezy-2so: the reviewer silently downgrades model `allow` decisions
+    // when the capability is not in the operator's allowlist. The counter
+    // must carry the capability label so operators can pivot dashboards on
+    // it and decide which capability deserves to be added to the allowlist.
+    let event = TelemetryEvent::ai_reviewer_allow_downgrade("shell");
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(
+        text.contains("ai_reviewer_allow_downgrade"),
+        "event name slug missing: {text}"
+    );
+    assert!(
+        text.contains("\"permission_capability\":\"shell\""),
+        "permission_capability missing: {text}"
+    );
+}
+
+#[test]
 fn shell_sandbox_best_effort_fallback_event_tags_backend_and_tool() {
     // F3-4: surface silent best_effort sandbox degradation as a counter.
     // The event name must be the documented `approval.best_effort.fallback`

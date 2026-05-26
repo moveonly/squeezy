@@ -606,6 +606,25 @@ impl TelemetryEvent {
             },
         }
     }
+
+    /// `ai_reviewer.allow_downgrade{capability}` counter event. Fires when
+    /// the AI reviewer model returned `allow` but the requested capability
+    /// is not in the operator's `allow_capabilities` allowlist, so the
+    /// reviewer silently downgrades the decision to "no decision" and falls
+    /// back to the user prompt. Without this counter, operators cannot tell
+    /// how often the reviewer would have approved if the allowlist were
+    /// wider, so the allowlist cannot evolve.
+    pub fn ai_reviewer_allow_downgrade(capability: &str) -> Self {
+        Self {
+            event: TelemetryEventName::AiReviewerAllowDowngrade,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                permission_capability: Some(capability.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,6 +650,13 @@ pub enum TelemetryEventName {
     /// dashboards rather than only in audit logs.
     #[serde(rename = "approval_best_effort_fallback")]
     ShellSandboxBestEffortFallback,
+    /// `ai_reviewer.allow_downgrade{capability}` — emitted when the AI
+    /// reviewer would have approved but the capability was not in the
+    /// operator's `allow_capabilities` allowlist, so the verdict silently
+    /// fell back to the user prompt. Lets operators see how often a wider
+    /// allowlist would have spared an interruption.
+    #[serde(rename = "ai_reviewer_allow_downgrade")]
+    AiReviewerAllowDowngrade,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -732,6 +758,13 @@ pub struct TelemetryProperties {
     /// `linux-direct-syscalls`, `windows-job-object`, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_backend: Option<String>,
+    /// Tagged on AI-reviewer events (`AiReviewerAllowDowngrade`) so
+    /// dashboards can break down silent allow-downgrade rates by the
+    /// requested capability (`read`, `edit`, `shell`, ...). Operators
+    /// use this to decide which capability to add to the
+    /// `allow_capabilities` allowlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_capability: Option<String>,
 }
 
 impl TelemetryProperties {

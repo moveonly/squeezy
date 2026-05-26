@@ -12,6 +12,7 @@ use squeezy_core::{
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
+use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
 
 fn default_policy() -> &'static str {
@@ -67,6 +68,7 @@ pub(crate) struct AiReviewerInput<'a> {
     pub(crate) state: Arc<StdMutex<AiReviewerState>>,
     pub(crate) turn_id: TurnId,
     pub(crate) cancel: CancellationToken,
+    pub(crate) telemetry: TelemetryClient,
 }
 
 pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerOutcome {
@@ -156,6 +158,16 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                     reason: format!("AI reviewer approved: {}", decision.reason),
                 })
             } else {
+                // squeezy-2so: the model said allow but the operator's
+                // allow_capabilities list excludes this capability, so the
+                // verdict silently falls back to the user prompt. Fire a
+                // counter tagged with the capability so operators can see
+                // how often a wider allowlist would have spared the prompt.
+                input
+                    .telemetry
+                    .spawn(TelemetryEvent::ai_reviewer_allow_downgrade(
+                        input.request.capability.as_str(),
+                    ));
                 AiReviewerOutcome::NoDecision {
                     reason: format!(
                         "ai reviewer allow ignored for non-allowlisted {} capability",
