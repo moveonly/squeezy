@@ -1330,14 +1330,14 @@ mod linux_seccomp {
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        let program = build_shell_filter().map_err(std::io::Error::other)?;
+        let program = build_shell_filter()?;
         apply_filter(&program).map_err(std::io::Error::other)?;
         Ok(())
     }
 
     /// Build the BPF program separately so tests can exercise the same
     /// rule set without going through a `pre_exec` fork dance.
-    pub(super) fn build_shell_filter() -> Result<BpfProgram, seccompiler::Error> {
+    pub(super) fn build_shell_filter() -> std::io::Result<BpfProgram> {
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
         // Unconditional denies: empty rule vec matches every invocation.
         rules.insert(libc::SYS_ptrace, vec![]);
@@ -1349,12 +1349,16 @@ mod linux_seccomp {
         // default Allow action because IP-family sockets are governed by
         // CLONE_NEWNET (handled at unshare time) and ICMP/raw is governed
         // by capabilities the unprivileged shell does not hold.
-        let unix_match = SeccompRule::new(vec![SeccompCondition::new(
-            0,
-            SeccompCmpArgLen::Dword,
-            SeccompCmpOp::Eq,
-            libc::AF_UNIX as u64,
-        )?])?;
+        let unix_match = SeccompRule::new(vec![
+            SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                libc::AF_UNIX as u64,
+            )
+            .map_err(std::io::Error::other)?,
+        ])
+        .map_err(std::io::Error::other)?;
         rules.insert(libc::SYS_socket, vec![unix_match.clone()]);
         rules.insert(libc::SYS_socketpair, vec![unix_match]);
 
@@ -1363,8 +1367,9 @@ mod linux_seccomp {
             SeccompAction::Allow,
             SeccompAction::Errno(libc::EPERM as u32),
             target_arch(),
-        )?;
-        filter.try_into()
+        )
+        .map_err(std::io::Error::other)?;
+        filter.try_into().map_err(std::io::Error::other)
     }
 
     /// Pick the seccomp `TargetArch` matching the build host. We only

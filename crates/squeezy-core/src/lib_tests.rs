@@ -2469,7 +2469,7 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
     let path = dir.join("settings.toml");
     std::fs::write(
         &path,
-        "[tui]\nstatus_line_use_colors = true\ntick_rate_ms = 100\n",
+        "[tui]\nlegacy_widget_padding = true\ntick_rate_ms = 100\n",
     )
     .expect("write seed settings");
 
@@ -2478,7 +2478,7 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
 
     let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
     assert!(
-        !cleaned.contains("status_line_use_colors"),
+        !cleaned.contains("legacy_widget_padding"),
         "unknown key should be stripped, got: {cleaned}"
     );
     assert!(
