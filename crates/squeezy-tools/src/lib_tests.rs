@@ -6213,6 +6213,124 @@ pub fn gamma() {}
 }
 
 #[tokio::test]
+async fn reference_search_emits_confidence_distribution() {
+    let root = temp_workspace("graph_reference_confidence_distribution");
+    fs::create_dir_all(root.join("services")).expect("create services dir");
+    fs::write(
+        root.join("services").join("greeter.py"),
+        r#"
+class Greeter:
+    def hello(self):
+        return "hi"
+
+# Same-file reference to Greeter — binds via the loose-reference path and
+# therefore lands in the `Heuristic` bucket.
+def make_local():
+    return Greeter()
+"#,
+    )
+    .expect("write greeter");
+    // Cross-file alias-import reference: `Greeter` is brought in via `as GA`,
+    // calls through that alias bind via `reference_alias_matches_symbol` and
+    // therefore land in the `ImportResolved` bucket.
+    fs::write(
+        root.join("aliased.py"),
+        r#"
+from services.greeter import Greeter as GA
+
+def make_aliased():
+    return GA()
+"#,
+    )
+    .expect("write aliased");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let definition = registry
+        .execute(
+            ToolCall {
+                call_id: "ref_distribution_def".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "Greeter", "path": "services/greeter.py"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(definition.status, ToolStatus::Success);
+    let greeter_id = definition.content["packets"][0]["symbol"]["id"]
+        .as_str()
+        .expect("definition packet carries symbol id")
+        .to_string();
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "ref_distribution".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"symbol_id": greeter_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+
+    let distribution = &result.cost_hint.confidence_distribution;
+    assert!(
+        !distribution.is_empty(),
+        "reference_search must populate confidence_distribution, got {result:?}"
+    );
+
+    let valid_ids: std::collections::HashSet<&str> = squeezy_core::Confidence::ALL
+        .iter()
+        .map(|c| c.id())
+        .collect();
+    for key in distribution.keys() {
+        assert!(
+            valid_ids.contains(key.as_str()),
+            "distribution key `{key}` is not a Confidence::id() value"
+        );
+    }
+
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("reference_search packets array");
+    let total: u32 = distribution.values().copied().sum();
+    assert_eq!(
+        total as usize,
+        packets.len(),
+        "distribution counts must sum to the number of returned packets"
+    );
+
+    let mut expected: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for packet in packets {
+        let label = packet["confidence"]
+            .as_str()
+            .expect("packet must carry a confidence label")
+            .to_string();
+        *expected.entry(label).or_insert(0) += 1;
+    }
+    assert_eq!(
+        distribution, &expected,
+        "cost_hint distribution must match per-packet confidence counts"
+    );
+
+    assert!(
+        distribution.len() >= 2,
+        "fixture must produce a mix of confidence buckets, got {distribution:?}"
+    );
+    assert!(
+        distribution.contains_key("import_resolved"),
+        "fixture must surface at least one import_resolved reference, got {distribution:?}"
+    );
+    assert!(
+        distribution.contains_key("heuristic"),
+        "fixture must surface at least one heuristic reference, got {distribution:?}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn decl_search_resolves_fuzzy_symbol_query() {
     let root = temp_workspace("graph_fuzzy_symbol");
     write_rust_crate(
