@@ -4041,10 +4041,7 @@ fn active_tool_surfaces_current_work_in_working_line() {
 
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(
-        output.contains("Exploring definition search for getFoo"),
-        "{output}"
-    );
+    assert!(output.contains("Definition: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
 }
 
@@ -4072,7 +4069,7 @@ async fn queued_tool_event_updates_visible_working_status_without_transcript_row
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(output.contains("Exploring grep getFoo"), "{output}");
+    assert!(output.contains("Grep: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
     assert!(!output.contains("args="), "{output}");
 }
@@ -4108,8 +4105,87 @@ async fn task_state_tool_does_not_replace_visible_active_work() {
 
     assert_eq!(app.active_tool.as_deref(), Some("shell"));
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("Running ls"), "{output}");
+    assert!(output.contains("Shell: ls"), "{output}");
     assert!(!output.contains("update_task_state"), "{output}");
+}
+
+#[test]
+fn working_cell_shows_current_tool() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "cargo test --workspace"}),
+    });
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(output.contains("• Working ("), "{output}");
+    assert!(
+        output.contains("Shell: cargo test --workspace"),
+        "{output}"
+    );
+}
+
+#[test]
+fn working_cell_appends_per_tool_elapsed_after_heartbeat() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "cargo test --workspace"}),
+    });
+    app.note_active_tool_progress("shell", 4_500);
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(
+        output.contains("Shell: cargo test --workspace"),
+        "{output}"
+    );
+    assert!(output.contains(" · 4s"), "{output}");
+}
+
+#[test]
+fn working_cell_truncates_long_command_args() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": format!("echo {}", "x".repeat(200)),
+        }),
+    });
+
+    let output = render_to_string(&app, 200, 16);
+
+    assert!(output.contains("Shell: echo "), "{output}");
+    assert!(output.contains("..."), "{output}");
+    assert!(!output.contains(&"x".repeat(200)), "{output}");
+}
+
+#[test]
+fn working_cell_omits_args_for_unknown_tool() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "mcp__server__custom".to_string(),
+        arguments: serde_json::json!({"opaque": "payload"}),
+    });
+
+    let output = render_to_string(&app, 140, 16);
+
+    // Capitalized tool name with no colon when no template-driven args.
+    assert!(output.contains("Mcp__server__custom"), "{output}");
+    assert!(!output.contains("Mcp__server__custom:"), "{output}");
 }
 
 #[test]

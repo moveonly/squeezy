@@ -3736,6 +3736,9 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.extend(active_tool_spans(call));
+        if let Some(elapsed_ms) = app.active_tool_elapsed_ms {
+            spans.extend(active_tool_elapsed_spans(elapsed_ms));
+        }
     }
     Line::from(spans)
 }
@@ -6000,34 +6003,124 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
 }
 
 fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
-    let action = active_tool_action(&call.name);
-    let mut spans = vec![Span::styled(
-        action,
+    let name_span = Span::styled(
+        friendly_tool_name(&call.name),
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-    )];
-    if matches!(call.name.as_str(), "shell" | "verify")
-        && let Some(command) = string_arg(&call.arguments, "command")
-    {
-        spans.extend(command_spans(&command));
+    );
+    let args = active_tool_args(call);
+    if args.is_empty() {
+        return vec![name_span];
+    }
+    let mut spans = vec![
+        name_span,
+        Span::styled(": ", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+    ];
+    if matches!(call.name.as_str(), "shell" | "verify") {
+        spans.extend(command_spans(&compact_text(&args, 80)));
     } else {
         spans.push(Span::styled(
-            tool_call_label(call),
+            compact_text(&args, 80),
             Style::default().fg(Color::White),
         ));
     }
     spans
 }
 
+/// Per-tool elapsed segment ("· 3s") appended after the tool label.
+/// Returns no spans when the heartbeat hasn't reported elapsed yet — the
+/// turn-level "(Ns · esc to interrupt)" already covers that case.
+fn active_tool_elapsed_spans(elapsed_ms: u64) -> Vec<Span<'static>> {
+    let secs = elapsed_ms / 1000;
+    if secs == 0 {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(" · ", Style::default().fg(QUIET)),
+        Span::styled(format!("{secs}s"), Style::default().fg(QUIET)),
+    ]
+}
+
 pub(crate) fn is_control_tool_name(name: &str) -> bool {
     matches!(name, "update_task_state" | "load_tool_schema")
 }
 
-fn active_tool_action(tool_name: &str) -> &'static str {
+/// Argument snippet for the working-row label. Returns only the
+/// arguments (no tool-name prefix), so the row reads
+/// `Friendly: <args>` without duplicating the tool identity. Returns an
+/// empty string when no useful snippet is available — the row then ends
+/// at the colon.
+fn active_tool_args(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "shell" | "verify" => string_arg(&call.arguments, "command")
+            .or_else(|| string_arg(&call.arguments, "description"))
+            .unwrap_or_default(),
+        "decl_search" => {
+            let language = string_arg(&call.arguments, "language");
+            let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
+            let query = string_arg(&call.arguments, "query");
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(language) = language {
+                parts.push(language);
+            }
+            if let Some(kind) = kind {
+                parts.push(kind);
+            }
+            if let Some(query) = query {
+                parts.push(query);
+            }
+            parts.join(" ")
+        }
+        "definition_search"
+        | "reference_search"
+        | "symbol_context"
+        | "grep"
+        | "websearch" => string_arg(&call.arguments, "query")
+            .or_else(|| string_arg(&call.arguments, "pattern"))
+            .or_else(|| string_arg(&call.arguments, "symbol_id"))
+            .unwrap_or_default(),
+        "glob" => string_arg(&call.arguments, "pattern").unwrap_or_default(),
+        "read_file" | "read_slice" | "write_file" => {
+            string_arg(&call.arguments, "path").unwrap_or_default()
+        }
+        "plan_patch" => string_arg(&call.arguments, "objective").unwrap_or_default(),
+        "webfetch" => string_arg(&call.arguments, "url").unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Title-cased display name for the working-row label (codex-style
+/// "Shell: …", "Read: …"). Known tools get explicit casing; unknown tools
+/// fall back to ASCII-uppercase first letter so a server-defined tool
+/// like `slack_search` reads as `Slack_search` rather than the raw slug.
+fn friendly_tool_name(tool_name: &str) -> String {
     match tool_name {
-        "plan_patch" => "Planning ",
-        "apply_patch" | "write_file" => "Editing ",
-        name if is_exploration_tool(name) => "Exploring ",
-        _ => "Running ",
+        "shell" => "Shell".to_string(),
+        "verify" => "Verify".to_string(),
+        "read_file" | "read_slice" => "Read".to_string(),
+        "read_tool_output" => "Expand".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "write_file" => "Write".to_string(),
+        "apply_patch" => "Patch".to_string(),
+        "plan_patch" => "Plan".to_string(),
+        "repo_map" => "Repo map".to_string(),
+        "diff_context" => "Diff".to_string(),
+        "decl_search" => "Declarations".to_string(),
+        "definition_search" => "Definition".to_string(),
+        "reference_search" => "References".to_string(),
+        "symbol_context" => "Symbol".to_string(),
+        "hierarchy" => "Hierarchy".to_string(),
+        "upstream_flow" => "Upstream".to_string(),
+        "downstream_flow" => "Downstream".to_string(),
+        "webfetch" => "Fetch".to_string(),
+        "websearch" => "Search".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        }
     }
 }
 
