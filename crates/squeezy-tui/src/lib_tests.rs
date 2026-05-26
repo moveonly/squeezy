@@ -5919,3 +5919,54 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
         "should emit exactly one patch, got events: {events:?}"
     );
 }
+
+#[test]
+fn idle_app_reports_no_active_animation() {
+    let mut app = test_app(SessionMode::Build);
+    // Fresh `TuiApp` starts with needs_redraw = true so the first frame
+    // paints. Simulate the loop having drawn that frame.
+    app.needs_redraw = false;
+    assert_eq!(app.turn_visual, TurnVisualState::Idle);
+    assert_eq!(app.terminal_title_state, TerminalTitleState::Cleared);
+    assert!(
+        !app.has_active_animation(),
+        "idle TuiApp should not advertise any active animation"
+    );
+    assert!(
+        !app.needs_redraw,
+        "no mutation occurred so needs_redraw should stay false"
+    );
+}
+
+#[test]
+fn note_turn_started_marks_dirty_and_animation_active() {
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    app.turn_visual = TurnVisualState::Running;
+    app.note_turn_started();
+    assert!(app.needs_redraw, "starting a turn should request a redraw");
+    assert!(
+        app.has_active_animation(),
+        "running turn should keep animations alive"
+    );
+}
+
+#[test]
+fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Idle;
+    // Walk through an entire glyph cycle worth of ticks. None of them
+    // should advance the prompt coin glyph or change its colour, because
+    // the coin is meant to be static at idle.
+    for tick in 0..32u64 {
+        app.animation_tick = tick * 50; // ~160 frames worth of motion
+        assert_eq!(
+            prompt_coin_frame(&app),
+            "●",
+            "idle prompt coin glyph must stay '●' at tick {tick}"
+        );
+        let span = prompt_coin_span(&app);
+        assert_eq!(span.content.as_ref(), "●");
+        assert_eq!(span.style.fg, Some(crate::render::palette::AMBER));
+    }
+}

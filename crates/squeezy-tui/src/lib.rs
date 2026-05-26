@@ -350,14 +350,25 @@ async fn run_inner(
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
-        app.app_notifications.tick();
+        if app.app_notifications.tick() {
+            app.needs_redraw = true;
+        }
         if app.animation_tick.is_multiple_of(settings_poll_every)
             && app.config_screen.is_none()
             && settings_watcher.poll()
         {
             apply_external_settings_reload(&mut app, &mut agent);
+            app.needs_redraw = true;
         }
-        terminal.draw_app(&mut app)?;
+        // Only repaint when state actually changed (`needs_redraw`), a
+        // resize is pending, or something visible is currently animating.
+        // Skipping the draw on idle iterations stops the continuous
+        // stdout traffic that triggers terminal emulators' per-tab
+        // activity indicators.
+        if app.needs_redraw || app.pending_resize || app.has_active_animation() {
+            terminal.draw_app(&mut app)?;
+            app.needs_redraw = false;
+        }
 
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
@@ -648,6 +659,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         return Ok(false);
     }
 
+    // Any event we read here either drives a state mutation directly or
+    // arms `pending_resize` for the next draw. In every non-timeout
+    // branch we flip `needs_redraw` so the main loop knows to repaint.
+    app.needs_redraw = true;
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
         Event::Mouse(mouse) => {
@@ -6181,6 +6196,13 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
+    // At idle the coin is a steady AMBER ●. Animating it forced a real
+    // cell change every 320 ms, which kept terminal-emulator per-tab
+    // activity indicators buzzing forever even though the agent was
+    // doing nothing.
+    if app.turn_visual == TurnVisualState::Idle {
+        return Span::styled("●", Style::default().fg(AMBER));
+    }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
         GOLD
     } else {
@@ -6191,6 +6213,9 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
     const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
+    if app.turn_visual == TurnVisualState::Idle {
+        return FRAMES[0];
+    }
     let elapsed_ms = prompt_elapsed_ms(app);
     let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
     let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
@@ -7142,6 +7167,11 @@ pub(crate) struct TuiApp {
     pub(crate) last_terminal_title: Option<String>,
     pub(crate) animation_tick: u64,
     pub(crate) animation_tick_rate: Duration,
+    /// Set by any state mutator that requires the next frame to repaint.
+    /// Cleared by the main loop immediately after `draw_app`. Without
+    /// this gate the loop redraws every ~50 ms and idle terminals show
+    /// continuous activity in their per-tab indicators.
+    pub(crate) needs_redraw: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
     pub(crate) cost: squeezy_core::CostSnapshot,
@@ -7296,6 +7326,9 @@ impl TuiApp {
             last_terminal_title: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
+            // Start dirty so the first iteration of the main loop paints
+            // the initial frame.
+            needs_redraw: true,
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
@@ -7327,6 +7360,7 @@ impl TuiApp {
         }
         self.last_turn_duration = None;
         self.terminal_title_state = TerminalTitleState::Working;
+        self.needs_redraw = true;
     }
 
     pub(crate) fn note_turn_finished(&mut self) {
@@ -7334,6 +7368,18 @@ impl TuiApp {
             self.last_turn_duration = Some(started_at.elapsed());
         }
         self.terminal_title_state = TerminalTitleState::Notification;
+        self.needs_redraw = true;
+    }
+
+    /// Whether the next frame would visibly differ from the current one
+    /// purely because some animation is in motion. Decoupled from
+    /// `needs_redraw`: state mutations set the dirty flag; this predicate
+    /// catches the case where nothing has mutated but the on-screen
+    /// content is still moving (working spinner, title spinner, etc.).
+    /// When neither is true the main loop skips `draw_app` entirely.
+    pub(crate) fn has_active_animation(&self) -> bool {
+        matches!(self.turn_visual, TurnVisualState::Running)
+            || self.terminal_title_state == TerminalTitleState::Working
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {

@@ -20,7 +20,9 @@ use crate::{
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
     if let Some(mut rx) = app.turn_rx.take() {
         let mut keep_rx = true;
+        let mut processed = false;
         while let Ok(event) = rx.try_recv() {
+            processed = true;
             match event {
                 AgentEvent::UserMessage { message, .. } => {
                     app.push_transcript_item(message);
@@ -380,6 +382,9 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
         if keep_rx {
             app.turn_rx = Some(rx);
         }
+        if processed {
+            app.needs_redraw = true;
+        }
     }
 }
 
@@ -448,23 +453,34 @@ pub(crate) fn finalize_proposed_plan(app: &mut TuiApp) {
 }
 
 pub(crate) fn drain_job_events(app: &mut TuiApp) {
+    let mut processed = false;
     loop {
         let event = match app.job_rx.as_mut() {
             Some(rx) => rx.try_recv(),
-            None => return,
+            None => break,
         };
         match event {
-            Ok(JobEvent::Updated(job)) => apply_job_update(app, job),
-            Ok(JobEvent::Notification(notification)) => apply_job_notification(app, notification),
+            Ok(JobEvent::Updated(job)) => {
+                apply_job_update(app, job);
+                processed = true;
+            }
+            Ok(JobEvent::Notification(notification)) => {
+                apply_job_notification(app, notification);
+                processed = true;
+            }
             Err(broadcast::error::TryRecvError::Empty) => break,
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 app.status = format!("skipped {skipped} job updates");
+                processed = true;
             }
             Err(broadcast::error::TryRecvError::Closed) => {
                 app.job_rx = None;
                 break;
             }
         }
+    }
+    if processed {
+        app.needs_redraw = true;
     }
 }
 
