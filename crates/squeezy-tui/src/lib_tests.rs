@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
@@ -7400,5 +7400,73 @@ fn status_line_codex_aliases_parse() {
     assert_eq!(
         "project".parse::<StatusLineItem>().unwrap(),
         StatusLineItem::ProjectName
+    );
+}
+
+#[test]
+fn frame_rate_limiter_allows_first_frame_immediately() {
+    let limiter = FrameRateLimiter::default();
+    let now = Instant::now();
+    assert!(
+        limiter.allow(now),
+        "fresh limiter must let the first frame through"
+    );
+    assert!(
+        limiter.time_until_next(now).is_none(),
+        "fresh limiter reports no wait before the first frame"
+    );
+}
+
+#[test]
+fn frame_rate_limiter_rejects_frames_inside_min_interval() {
+    let mut limiter = FrameRateLimiter::default();
+    let t0 = Instant::now();
+    limiter.mark_emitted(t0);
+
+    // 1 ms after the last emit is well inside the 16 ms budget: deny.
+    let too_soon = t0 + Duration::from_millis(1);
+    assert!(!limiter.allow(too_soon), "limiter must clamp to 60 FPS");
+    let wait = limiter
+        .time_until_next(too_soon)
+        .expect("limiter should report remaining wait");
+    assert_eq!(
+        wait,
+        MAX_FRAME_INTERVAL - Duration::from_millis(1),
+        "wait reflects time left in the frame budget"
+    );
+
+    // At exactly `MAX_FRAME_INTERVAL` after the last emit the next frame
+    // is allowed again.
+    let at_budget = t0 + MAX_FRAME_INTERVAL;
+    assert!(
+        limiter.allow(at_budget),
+        "limiter must release once MAX_FRAME_INTERVAL has elapsed"
+    );
+    assert!(
+        limiter.time_until_next(at_budget).is_none(),
+        "no wait once the budget has elapsed"
+    );
+}
+
+#[test]
+fn frame_rate_limiter_coalesces_burst_into_one_emit() {
+    // Simulates a flurry of events arriving inside a single frame budget:
+    // only one draw should pass the limiter; the rest must be denied so
+    // the loop coalesces them into the next frame.
+    let mut limiter = FrameRateLimiter::default();
+    let t0 = Instant::now();
+    assert!(limiter.allow(t0), "first burst frame is allowed");
+    limiter.mark_emitted(t0);
+
+    let mut denied = 0;
+    for i in 1..=5 {
+        let t = t0 + Duration::from_millis(i);
+        if !limiter.allow(t) {
+            denied += 1;
+        }
+    }
+    assert_eq!(
+        denied, 5,
+        "all five follow-up events inside the budget must be denied"
     );
 }

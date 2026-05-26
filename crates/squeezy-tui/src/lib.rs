@@ -236,6 +236,46 @@ pub struct StartupProfile {
     pub update_banner: Option<String>,
 }
 
+/// Maximum draw rate enforced by the event loop. 60 FPS keeps animations
+/// smooth on every common refresh rate while protecting against unbounded
+/// redraw spam when a flurry of agent/job events lands inside one tick.
+const MAX_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Clamps consecutive draws so they cannot fire faster than
+/// `MAX_FRAME_INTERVAL`. Many events between draws coalesce into a single
+/// redraw.
+#[derive(Debug, Default)]
+struct FrameRateLimiter {
+    last_emitted_at: Option<Instant>,
+}
+
+impl FrameRateLimiter {
+    /// Returns `true` when a draw is allowed at `now`. Callers must invoke
+    /// `mark_emitted` immediately after the draw completes.
+    fn allow(&self, now: Instant) -> bool {
+        match self.last_emitted_at {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= MAX_FRAME_INTERVAL,
+        }
+    }
+
+    fn mark_emitted(&mut self, at: Instant) {
+        self.last_emitted_at = Some(at);
+    }
+
+    /// How long the caller must wait before the next draw is allowed.
+    /// `None` when a draw can fire immediately.
+    fn time_until_next(&self, now: Instant) -> Option<Duration> {
+        let last = self.last_emitted_at?;
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed >= MAX_FRAME_INTERVAL {
+            None
+        } else {
+            Some(MAX_FRAME_INTERVAL - elapsed)
+        }
+    }
+}
+
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     run_inner(config, provider, None, StartupProfile::default()).await
 }
@@ -375,8 +415,15 @@ async fn run_inner(
     let mut settings_watcher = settings_watcher::SettingsWatcher::new();
     // Poll mtimes roughly once per second; tick_rate defaults to 50ms.
     let settings_poll_every = (1000 / config.tick_rate.as_millis().max(1) as u64).max(1);
+    let mut frame_limiter = FrameRateLimiter::default();
 
     loop {
+        // Drain producers first so the next draw reflects everything that
+        // has landed since the previous iteration. A flurry of events
+        // therefore coalesces into a single frame.
+        drain_job_events(&mut app);
+        drain_agent_events(&mut app).await;
+
         app.animation_tick = app.animation_tick.wrapping_add(1);
         if app.app_notifications.tick() {
             app.needs_redraw = true;
@@ -392,15 +439,28 @@ async fn run_inner(
         // resize is pending, or something visible is currently animating.
         // Skipping the draw on idle iterations stops the continuous
         // stdout traffic that triggers terminal emulators' per-tab
-        // activity indicators.
-        if app.needs_redraw || app.pending_resize || app.has_active_animation() {
+        // activity indicators. The frame limiter caps the redraw rate at
+        // 60 FPS so bursts of events do not produce a draw storm.
+        let wants_draw = app.needs_redraw || app.pending_resize || app.has_active_animation();
+        let now = Instant::now();
+        if wants_draw && frame_limiter.allow(now) {
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
+            frame_limiter.mark_emitted(now);
         }
 
-        drain_job_events(&mut app);
-        drain_agent_events(&mut app).await;
-        if poll_input(&mut app, &mut agent, config.tick_rate).await? {
+        // Bound the input poll so a deferred draw wakes promptly when the
+        // frame budget releases; otherwise honour the configured tick rate.
+        let poll_budget = if wants_draw {
+            frame_limiter
+                .time_until_next(Instant::now())
+                .unwrap_or(Duration::ZERO)
+                .min(config.tick_rate)
+        } else {
+            config.tick_rate
+        };
+
+        if poll_input(&mut app, &mut agent, poll_budget).await? {
             break;
         }
     }
