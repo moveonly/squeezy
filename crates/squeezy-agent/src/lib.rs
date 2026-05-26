@@ -931,6 +931,43 @@ impl Drop for SubagentLease {
     }
 }
 
+/// Typed reason the registry refused a `start()` call. Carries the
+/// `limit`/`active` counts so callers can render a "5 of 4 already
+/// running" warning rather than a flat string, and `as_message` is the
+/// canonical user-visible rendering used in tool results and session
+/// receipts so offline replayers see a single stable phrasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentStartError {
+    reason: SubagentRejectionReason,
+    limit: usize,
+    active: usize,
+}
+
+impl SubagentStartError {
+    fn as_message(&self) -> String {
+        match self.reason {
+            SubagentRejectionReason::ConcurrencyCap => format!(
+                "subagent concurrency limit reached ({}; {} already running)",
+                self.limit, self.active
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRejectionReason {
+    ConcurrencyCap,
+}
+
+impl SubagentRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConcurrencyCap => "concurrency_cap",
+        }
+    }
+}
+
 impl SubagentRegistry {
     fn start(
         &self,
@@ -938,17 +975,19 @@ impl SubagentRegistry {
         cancel: CancellationToken,
         max_concurrent: usize,
         status: impl Into<String>,
-    ) -> Result<SubagentLease, String> {
+    ) -> Result<SubagentLease, SubagentStartError> {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         let active = state
             .values()
             .filter(|metadata| !metadata.cancel.is_cancelled())
             .count();
-        if active >= max_concurrent.max(1) {
-            return Err(format!(
-                "subagent concurrency limit reached ({})",
-                max_concurrent.max(1)
-            ));
+        let limit = max_concurrent.max(1);
+        if active >= limit {
+            return Err(SubagentStartError {
+                reason: SubagentRejectionReason::ConcurrencyCap,
+                limit,
+                active,
+            });
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.insert(
@@ -1448,6 +1487,14 @@ impl Agent {
     /// Borrow the current effective config.
     pub fn config(&self) -> &AppConfig {
         &self.config
+    }
+
+    /// Test-only handle to the subagent registry so callers can
+    /// pre-saturate it and exercise the cap-rejection path without
+    /// having to script `SUBAGENT_MAX_CONCURRENT` real subagents.
+    #[cfg(test)]
+    pub(crate) fn subagent_registry_for_test(&self) -> SubagentRegistry {
+        self.subagents.clone()
     }
 
     /// Clone the current effective config — used by the config screen to
@@ -5448,6 +5495,66 @@ async fn handle_subagent_call(
             );
         }
     };
+    let child_cancel = context.cancel.child_token();
+    let lease = match context.subagents.start(
+        kind.role().unwrap_or(SubagentRole::Explorer),
+        child_cancel.clone(),
+        SUBAGENT_MAX_CONCURRENT,
+        format!("{} starting", kind.as_str()),
+    ) {
+        Ok(lease) => lease,
+        Err(start_error) => {
+            broker.metrics.subagent_failures += 1;
+            let error_message = start_error.as_message();
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "subagent_rejected",
+                Some(context.turn_id),
+                Some(format!("{}: {}", kind.as_str(), error_message)),
+                json!({
+                    "agent": kind.as_str(),
+                    "reason": start_error.reason.as_str(),
+                    "limit": start_error.limit,
+                    "active": start_error.active,
+                }),
+            );
+            // Bump the `failure_seen{kind=tool}` counter so dashboards
+            // notice fleets that routinely hit the concurrency cap. The
+            // structured `subagent_rejected` session-log event above
+            // carries the specific `reason` for offline analysis; the
+            // shared telemetry counter just signals "subagents are
+            // being refused".
+            context
+                .telemetry
+                .spawn(TelemetryEvent::failure_seen(ErrorKind::Tool));
+            let _ = context
+                .tx
+                .send(AgentEvent::SubagentRejected {
+                    turn_id: context.turn_id,
+                    agent: kind.as_str().to_string(),
+                    reason: start_error.reason,
+                    limit: start_error.limit,
+                    active: start_error.active,
+                })
+                .await;
+            return subagent_control_result(
+                call,
+                kind,
+                SubagentExecution {
+                    status: ToolStatus::Denied,
+                    summary: String::new(),
+                    status_label: "capped",
+                    error: Some(error_message),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
+                },
+            );
+        }
+    };
+
     let started_prompt = context
         .redactor
         .redact(&compact_text(&request.prompt, 240))
@@ -5472,33 +5579,6 @@ async fn handle_subagent_call(
             prompt: started_prompt,
         })
         .await;
-
-    let child_cancel = context.cancel.child_token();
-    let lease = match context.subagents.start(
-        kind.role().unwrap_or(SubagentRole::Explorer),
-        child_cancel.clone(),
-        SUBAGENT_MAX_CONCURRENT,
-        format!("{} starting", kind.as_str()),
-    ) {
-        Ok(lease) => lease,
-        Err(error) => {
-            record_subagent_failure(&mut broker.metrics, kind);
-            return subagent_control_result(
-                call,
-                kind,
-                SubagentExecution {
-                    status: ToolStatus::Denied,
-                    summary: String::new(),
-                    status_label: "capped",
-                    error: Some(error),
-                    metrics: TurnMetrics::default(),
-                    supporting_receipts: Vec::new(),
-                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                    structured_output: None,
-                },
-            );
-        }
-    };
 
     let execution = run_subagent(context, kind, request).await;
     drop(lease);
@@ -9631,6 +9711,20 @@ pub enum AgentEvent {
         agent: String,
         error: String,
         metrics: TurnMetrics,
+    },
+    /// The subagent registry refused to admit a new subagent. Fires before
+    /// any provider work, in lieu of `SubagentStarted`/`SubagentFailed`,
+    /// so the TUI can surface a "concurrency cap reached, 4 already
+    /// running" warning instead of a bare failure with no diagnostic
+    /// hook. `active` is the count observed at rejection time (always
+    /// `>= limit` for `ConcurrencyCap`); both are surfaced so future
+    /// rejection reasons (e.g. depth cap) can reuse the same shape.
+    SubagentRejected {
+        turn_id: TurnId,
+        agent: String,
+        reason: SubagentRejectionReason,
+        limit: usize,
+        active: usize,
     },
     AiReviewerTripped {
         turn_id: TurnId,

@@ -3667,9 +3667,13 @@ fn subagent_registry_caps_concurrency() {
             "overflow",
         )
         .expect_err("starting past the cap should fail");
+    assert_eq!(err.reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(err.limit, SUBAGENT_MAX_CONCURRENT);
+    assert_eq!(err.active, SUBAGENT_MAX_CONCURRENT);
+    let message = err.as_message();
     assert!(
-        err.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
-        "cap error should mention the limit: {err}"
+        message.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
+        "cap error should mention the limit: {message}"
     );
     drop(leases.pop());
     let lease = registry
@@ -3878,6 +3882,123 @@ async fn subagent_wall_clock_timeout_terminates_with_partial_metrics() {
     assert!(
         metrics.model_output_bytes > 0,
         "model_output_bytes from the rejected tool result should be preserved: {metrics:?}"
+    );
+}
+
+/// Scripts a single `delegate` tool call so the parent loop reaches
+/// `handle_subagent_call`. The cap rejection short-circuits before the
+/// subagent runs, so a second parent round is needed to consume the
+/// rejection tool result and finish the turn.
+struct OneDelegateProvider {
+    calls: Mutex<usize>,
+}
+
+impl OneDelegateProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl LlmProvider for OneDelegateProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut calls = self.calls.lock().expect("calls");
+        *calls += 1;
+        let n = *calls;
+        drop(calls);
+        let events = match n {
+            1 => vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_capped".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: json!({"prompt": "please help"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+            _ => vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("noted".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+        };
+        let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+            Box::pin(stream::iter(events));
+        stream
+    }
+}
+
+#[tokio::test]
+async fn subagent_concurrency_cap_emits_rejected_event() {
+    let provider = Arc::new(OneDelegateProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    // Saturate the registry from outside the turn so the first delegate
+    // attempt hits the cap synchronously. Leases live until the end of
+    // the test, mirroring how a real parent would have N in-flight peers.
+    let registry = agent.subagent_registry_for_test();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..SUBAGENT_MAX_CONCURRENT {
+        leases.push(
+            registry
+                .start(
+                    roles::SubagentRole::Explorer,
+                    cancel.child_token(),
+                    SUBAGENT_MAX_CONCURRENT,
+                    format!("pre-saturate {slot}"),
+                )
+                .expect("under-cap start"),
+        );
+    }
+
+    let mut rx = agent.start_turn("delegate now".to_string(), cancel.clone());
+    let mut rejection: Option<(String, SubagentRejectionReason, usize, usize)> = None;
+    let mut saw_started = false;
+    let mut saw_failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentRejected {
+                agent,
+                reason,
+                limit,
+                active,
+                ..
+            } => {
+                rejection = Some((agent, reason, limit, active));
+            }
+            AgentEvent::SubagentStarted { .. } => saw_started = true,
+            AgentEvent::SubagentFailed { .. } => saw_failed = true,
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    drop(leases);
+
+    let (agent_name, reason, limit, active) =
+        rejection.expect("expected a SubagentRejected event when the cap is full");
+    assert_eq!(agent_name, "delegate");
+    assert_eq!(reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(limit, SUBAGENT_MAX_CONCURRENT);
+    assert_eq!(active, SUBAGENT_MAX_CONCURRENT);
+    assert!(
+        !saw_started,
+        "SubagentStarted must not fire when the registry refuses the lease"
+    );
+    assert!(
+        !saw_failed,
+        "rejection must use SubagentRejected, not SubagentFailed"
     );
 }
 

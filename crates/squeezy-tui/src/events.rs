@@ -244,6 +244,22 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         compact_text(&error, 180)
                     ));
                 }
+                AgentEvent::SubagentRejected {
+                    agent,
+                    reason,
+                    limit,
+                    active,
+                    ..
+                } => {
+                    app.status =
+                        format!("{agent} subagent capped ({active}/{limit} already running)");
+                    app.push_log(format!(
+                        "{agent} subagent capped reason={} limit={} active={}",
+                        reason.as_str(),
+                        limit,
+                        active,
+                    ));
+                }
                 AgentEvent::AiReviewerTripped { reason, .. } => {
                     app.status = "approval review paused".to_string();
                     app.push_log(format!("AI approval reviewer paused: {reason}"));
