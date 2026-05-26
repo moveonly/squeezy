@@ -11,6 +11,24 @@ pub struct SkillPreambleRender {
     pub omitted_count: usize,
 }
 
+/// Counters emitted alongside an `<active_skills>` render so the agent
+/// can record them to telemetry without re-walking the inputs.
+///
+/// `total` counts how many `LoadedSkill` candidates entered the
+/// render; `included` is how many appear in the final block (either as
+/// full body or as a stub); `dropped` is how many were skipped because
+/// the aggregate budget was exhausted; `body_truncated` is how many
+/// were emitted as a `<skill truncated="true">` stub rather than full
+/// body (either because the per-skill `body_cap_chars` fired or the
+/// aggregate fit only after falling back to the stub).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkillActivationMetrics {
+    pub total: usize,
+    pub included: usize,
+    pub dropped: usize,
+    pub body_truncated: usize,
+}
+
 pub fn render_active_skills(
     skills: &[LoadedSkill],
     budget_chars: usize,
@@ -141,6 +159,92 @@ pub fn render_skill_preamble(
     })
 }
 
+/// Render the active-skill block and report counters describing how
+/// many skills were included, dropped, or body-truncated.
+///
+/// This is the metrics-aware companion to `render_active_skills`. The
+/// rendered string matches `render_active_skills` exactly for the same
+/// inputs; only the second tuple element is new. Callers that just
+/// need the string can keep using `render_active_skills`; callers that
+/// also want to feed a telemetry handle (e.g. the agent calling
+/// `record_skill_activation`) should use this variant.
+pub fn render_active_skills_with_metrics(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+    body_cap_chars: usize,
+) -> (Option<String>, SkillActivationMetrics) {
+    let mut metrics = SkillActivationMetrics {
+        total: skills.len(),
+        ..SkillActivationMetrics::default()
+    };
+
+    if skills.is_empty() || budget_chars == 0 {
+        return (None, metrics);
+    }
+
+    let mut blocks = Vec::with_capacity(skills.len());
+    let mut body_cap_truncated = vec![false; skills.len()];
+    for (index, skill) in skills.iter().enumerate() {
+        let body_chars = char_count(&skill.body);
+        if body_chars > body_cap_chars {
+            body_cap_truncated[index] = true;
+            blocks.push(render_stub(skill, "body_cap"));
+        } else {
+            blocks.push(skill.prompt_block());
+        }
+    }
+
+    if let Some(block) = wrap_blocks(&blocks)
+        && char_count(&block) <= budget_chars
+    {
+        metrics.included = skills.len();
+        metrics.body_truncated = body_cap_truncated.iter().filter(|hit| **hit).count();
+        return (Some(block), metrics);
+    }
+
+    let mut fitted = Vec::new();
+    let mut included_is_stub = Vec::<bool>::new();
+    for (skill, block) in skills.iter().zip(blocks) {
+        let starts_as_stub = block_contains_stub(&block);
+        let candidates = if starts_as_stub {
+            vec![(block, true)]
+        } else {
+            vec![
+                (block, false),
+                (render_stub(skill, "aggregate_budget"), true),
+            ]
+        };
+        let mut inserted = false;
+        for (candidate, candidate_is_stub) in candidates {
+            let mut attempt = fitted.clone();
+            attempt.push(candidate.clone());
+            if let Some(rendered) = wrap_blocks(&attempt)
+                && char_count(&rendered) <= budget_chars
+            {
+                fitted = attempt;
+                included_is_stub.push(candidate_is_stub);
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            metrics.dropped += 1;
+        }
+    }
+
+    let rendered = wrap_blocks(&fitted).filter(|rendered| char_count(rendered) <= budget_chars);
+    if rendered.is_some() {
+        metrics.included = included_is_stub.len();
+        metrics.body_truncated = included_is_stub.iter().filter(|stub| **stub).count();
+    } else {
+        // Final wrap failed the budget — treat every block as dropped.
+        metrics.dropped = skills.len();
+        metrics.included = 0;
+        metrics.body_truncated = 0;
+    }
+    (rendered, metrics)
+}
+
 fn wrap_blocks(blocks: &[String]) -> Option<String> {
     (!blocks.is_empty())
         .then(|| format!("<active_skills>\n{}\n</active_skills>", blocks.join("\n")))
@@ -203,3 +307,7 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 fn char_count(value: &str) -> usize {
     value.chars().count()
 }
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;
