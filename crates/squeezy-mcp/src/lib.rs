@@ -39,6 +39,27 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// Timeout applied to MCP tool discovery (including the implicit session
+/// bring-up on the first call). Falls back to `timeout_ms`, then to the
+/// crate-wide default.
+fn discovery_timeout_ms(server: &McpServerConfig) -> u64 {
+    server
+        .discovery_timeout_ms
+        .or(server.timeout_ms)
+        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
+}
+
+/// Timeout applied to MCP tool invocations and follow-on requests (tool
+/// calls, resource listing, resource reads). Falls back to `timeout_ms`,
+/// then to the crate-wide default.
+fn tool_call_timeout_ms(server: &McpServerConfig) -> u64 {
+    server
+        .tool_call_timeout_ms
+        .or(server.timeout_ms)
+        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
+}
+
 const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
@@ -467,7 +488,7 @@ impl McpClientRegistry {
                 uri: uri.to_string(),
             });
         }
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(&server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -511,7 +532,7 @@ impl McpClientRegistry {
         server: &McpServerConfig,
         cancel: CancellationToken,
     ) -> McpResult<Vec<ExternalMcpTool>> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = discovery_timeout_ms(server);
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
@@ -582,7 +603,7 @@ impl McpClientRegistry {
         arguments: JsonObject,
         cancel: CancellationToken,
     ) -> McpResult<Value> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
@@ -739,7 +760,7 @@ impl McpClientRegistry {
         cursor: Option<String>,
         cancel: CancellationToken,
     ) -> McpResult<rmcp::model::ListResourcesResult> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -768,7 +789,7 @@ impl McpClientRegistry {
         cursor: Option<String>,
         cancel: CancellationToken,
     ) -> McpResult<rmcp::model::ListResourceTemplatesResult> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -1720,6 +1741,8 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "args": &server.args,
         "url": &server.url,
         "timeout_ms": server.timeout_ms,
+        "discovery_timeout_ms": server.discovery_timeout_ms,
+        "tool_call_timeout_ms": server.tool_call_timeout_ms,
         "env_keys": server.env.keys().collect::<Vec<_>>(),
         "enabled_tools": &server.enabled_tools,
         "disabled_tools": &server.disabled_tools,

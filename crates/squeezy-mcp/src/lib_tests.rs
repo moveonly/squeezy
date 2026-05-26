@@ -25,6 +25,8 @@ fn fixture_server(enabled: bool, command: Option<&str>) -> McpServerConfig {
         args: Vec::new(),
         url: None,
         timeout_ms: Some(500),
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
         enabled_tools: None,
         disabled_tools: Vec::new(),
         env: BTreeMap::new(),
@@ -168,6 +170,43 @@ fn uri_templates_allow_declared_prefix_only() {
         "file:///etc/passwd",
         "docs://api/v3/repos/{owner}/{repo}"
     ));
+}
+
+#[test]
+fn separate_startup_and_tool_timeouts_apply() {
+    // Unset → both paths fall back to the shared timeout_ms.
+    let mut server = fixture_server(true, Some("unused"));
+    server.timeout_ms = Some(7_500);
+    assert_eq!(discovery_timeout_ms(&server), 7_500);
+    assert_eq!(tool_call_timeout_ms(&server), 7_500);
+
+    // Override only discovery → tool calls still use shared timeout_ms.
+    server.discovery_timeout_ms = Some(45_000);
+    assert_eq!(discovery_timeout_ms(&server), 45_000);
+    assert_eq!(tool_call_timeout_ms(&server), 7_500);
+
+    // Override only tool calls → discovery still uses its override.
+    server.tool_call_timeout_ms = Some(120_000);
+    assert_eq!(discovery_timeout_ms(&server), 45_000);
+    assert_eq!(tool_call_timeout_ms(&server), 120_000);
+
+    // With timeout_ms cleared the new knobs still apply; only the side
+    // without an override falls back to the crate default.
+    server.timeout_ms = None;
+    server.discovery_timeout_ms = None;
+    assert_eq!(discovery_timeout_ms(&server), DEFAULT_MCP_TIMEOUT_MS);
+    assert_eq!(tool_call_timeout_ms(&server), 120_000);
+}
+
+#[test]
+fn tool_cache_key_changes_when_timeout_split_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    let base = tool_cache_key("docs", &server);
+    server.discovery_timeout_ms = Some(60_000);
+    let discovery_changed = tool_cache_key("docs", &server);
+    assert_ne!(base, discovery_changed);
+    server.tool_call_timeout_ms = Some(90_000);
+    assert_ne!(discovery_changed, tool_cache_key("docs", &server));
 }
 
 #[test]
@@ -355,6 +394,8 @@ fn http_fixture_server() -> McpServerConfig {
         args: Vec::new(),
         url: Some("http://localhost:0/mcp".to_string()),
         timeout_ms: Some(500),
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
         enabled_tools: None,
         disabled_tools: Vec::new(),
         env: BTreeMap::new(),

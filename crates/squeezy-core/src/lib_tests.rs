@@ -1380,6 +1380,8 @@ enabled = true
 transport = "http"
 url = "https://docs.example/mcp"
 timeout_ms = 5000
+discovery_timeout_ms = 45000
+tool_call_timeout_ms = 120000
 env = { TOKEN = "secret" }
 
 [mcp.servers.docs.permissions]
@@ -1440,6 +1442,15 @@ reason = "docs lookups are safe"
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Always);
     assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
+    assert_eq!(config.mcp_servers["docs"].timeout_ms, Some(5_000));
+    assert_eq!(
+        config.mcp_servers["docs"].discovery_timeout_ms,
+        Some(45_000)
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].tool_call_timeout_ms,
+        Some(120_000)
+    );
     assert_eq!(
         config.mcp_servers["docs"].permissions.default,
         Some(PermissionMode::Ask)

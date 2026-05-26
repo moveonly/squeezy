@@ -1277,6 +1277,12 @@ impl AppConfig {
             if let Some(timeout_ms) = server.timeout_ms {
                 output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
             }
+            if let Some(discovery_timeout_ms) = server.discovery_timeout_ms {
+                output.push_str(&format!("discovery_timeout_ms = {discovery_timeout_ms}\n"));
+            }
+            if let Some(tool_call_timeout_ms) = server.tool_call_timeout_ms {
+                output.push_str(&format!("tool_call_timeout_ms = {tool_call_timeout_ms}\n"));
+            }
             if let Some(enabled_tools) = &server.enabled_tools {
                 output.push_str(&format!(
                     "enabled_tools = {}\n",
@@ -6777,6 +6783,15 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Timeout applied to MCP tool discovery (`tools/list`, plus the implicit
+    /// session bring-up on the first call). Falls back to `timeout_ms` when
+    /// unset. Useful for servers that are slow to initialize but fast per
+    /// call, or vice-versa.
+    pub discovery_timeout_ms: Option<u64>,
+    /// Timeout applied to MCP tool invocations and follow-on requests
+    /// (`tools/call`, `resources/list`, `resources/read`). Falls back to
+    /// `timeout_ms` when unset.
+    pub tool_call_timeout_ms: Option<u64>,
     pub enabled_tools: Option<Vec<String>>,
     pub disabled_tools: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -6808,6 +6823,8 @@ impl McpServerConfig {
                 "args",
                 "url",
                 "timeout_ms",
+                "discovery_timeout_ms",
+                "tool_call_timeout_ms",
                 "enabled_tools",
                 "disabled_tools",
                 "env",
@@ -6846,6 +6863,18 @@ impl McpServerConfig {
                 .unwrap_or_default(),
             url: string_value(table, "url", source, &field(path, "url"))?,
             timeout_ms: u64_value(table, "timeout_ms", source, &field(path, "timeout_ms"))?,
+            discovery_timeout_ms: u64_value(
+                table,
+                "discovery_timeout_ms",
+                source,
+                &field(path, "discovery_timeout_ms"),
+            )?,
+            tool_call_timeout_ms: u64_value(
+                table,
+                "tool_call_timeout_ms",
+                source,
+                &field(path, "tool_call_timeout_ms"),
+            )?,
             enabled_tools: string_array_value(
                 table,
                 "enabled_tools",
@@ -6881,6 +6910,8 @@ impl McpServerConfig {
         }
         replace_if_some(&mut self.url, next.url);
         replace_if_some(&mut self.timeout_ms, next.timeout_ms);
+        replace_if_some(&mut self.discovery_timeout_ms, next.discovery_timeout_ms);
+        replace_if_some(&mut self.tool_call_timeout_ms, next.tool_call_timeout_ms);
         replace_if_some(&mut self.enabled_tools, next.enabled_tools);
         if !next.disabled_tools.is_empty() {
             self.disabled_tools = next.disabled_tools;
