@@ -104,6 +104,12 @@ pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
 const JOB_SUMMARY_MAX_CHARS: usize = 320;
 const SUBAGENT_SUMMARY_CHARS_PER_TOKEN: usize = 4;
+/// Deterministic-keys contract for Plan and Review subagents. The parser
+/// reads the JSON object from the tail of the final assistant message so
+/// the parent agent can iterate findings as structured data. Free-text
+/// preambles before the JSON are preserved in `summary` and silently
+/// ignored by the parser.
+const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final assistant message with a single JSON object on its own line of the form `{\"findings\": [{\"finding\": \"...\", \"recommendation\": \"...\", \"priority\": \"blocker|warning|info\"}], \"summary\": \"...\"}`. Add no prose after the JSON object. If you have nothing to report, emit `{\"findings\": [], \"summary\": \"...\"}`.";
 /// Maximum number of subagents that may be active at once for a single
 /// parent Agent. The registry rejects further `start()` calls until an
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
@@ -5130,6 +5136,11 @@ struct SubagentExecution {
     metrics: TurnMetrics,
     supporting_receipts: Vec<Value>,
     model: String,
+    /// Structured JSON payload extracted from the final assistant message,
+    /// when the subagent honored the deterministic-keys contract. `None`
+    /// when no JSON tail is present or it failed to parse, in which case
+    /// `summary` carries the raw text and callers can fall back to it.
+    structured_output: Option<Value>,
 }
 
 async fn handle_subagent_call(
@@ -5154,6 +5165,7 @@ async fn handle_subagent_call(
                 metrics: TurnMetrics::default(),
                 supporting_receipts: Vec::new(),
                 model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                structured_output: None,
             },
         );
     }
@@ -5172,6 +5184,7 @@ async fn handle_subagent_call(
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
                 },
             );
         }
@@ -5222,6 +5235,7 @@ async fn handle_subagent_call(
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
                 },
             );
         }
@@ -5398,6 +5412,7 @@ async fn run_subagent(
             metrics: TurnMetrics::default(),
             supporting_receipts: Vec::new(),
             model,
+            structured_output: None,
         };
     }
     let allowed_tool_names = allowed_tools
@@ -5434,7 +5449,7 @@ async fn run_subagent(
     let local_exploration = Arc::new(Mutex::new(ExplorationTurnState::from_plan(None)));
     let mut seen_outputs = SeenToolOutputs::default();
 
-    let execution = run_subagent_loop(
+    let mut execution = run_subagent_loop(
         parent,
         &config,
         &tool_specs,
@@ -5459,6 +5474,16 @@ async fn run_subagent(
 
     drop(hidden_tx);
     let _ = drain_handle.await;
+    // Plan and Review subagents promise a JSON object on the final
+    // assistant line; harvest it into `structured_output` so the
+    // parent can iterate findings as data. Failure to parse keeps
+    // `structured_output = None` and the raw text in `summary`.
+    if matches!(kind, SubagentKind::Plan | SubagentKind::Review)
+        && execution.status == ToolStatus::Success
+        && execution.structured_output.is_none()
+    {
+        execution.structured_output = parse_subagent_structured_tail(&execution.summary);
+    }
     execution
 }
 
@@ -5523,6 +5548,7 @@ async fn run_subagent_loop(
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
+                        structured_output: None,
                     };
                 }
             };
@@ -5562,6 +5588,7 @@ async fn run_subagent_loop(
                         metrics: broker.metrics.clone(),
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
+                        structured_output: None,
                     };
                 }
             }
@@ -5675,6 +5702,7 @@ async fn run_subagent_loop(
         metrics: broker.metrics.clone(),
         supporting_receipts: std::mem::take(supporting_receipts),
         model,
+        structured_output: None,
     }
 }
 
@@ -5696,7 +5724,36 @@ fn successful_subagent_execution(
         metrics,
         supporting_receipts,
         model,
+        structured_output: None,
     }
+}
+
+/// Tries to extract a single JSON object from the tail of a Plan/Review
+/// subagent's final assistant message. Models that obey the deterministic-
+/// keys contract emit `{"findings": [...], "summary": "..."}` on the last
+/// non-empty line; we accept either the whole trimmed text being JSON or
+/// the largest `{...}` substring near the end. Returns `None` when no
+/// brace pair is found or it fails to parse — callers fall back to the
+/// raw `summary` string in that case.
+fn parse_subagent_structured_tail(text: &str) -> Option<Value> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed)
+        && value.is_object()
+    {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start >= end {
+        return None;
+    }
+    let slice = trimmed.get(start..=end)?;
+    serde_json::from_str::<Value>(slice)
+        .ok()
+        .filter(Value::is_object)
 }
 
 fn subagent_control_result(
@@ -5727,6 +5784,9 @@ fn subagent_control_result(
     });
     if let Some(error) = execution.error {
         content["error"] = json!(error);
+    }
+    if let Some(structured) = execution.structured_output {
+        content["structured_output"] = structured;
     }
     control_tool_result(call, execution.status, content)
 }
@@ -5779,13 +5839,13 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
             format!(
-                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands."
+                "{base}\n\nReturn structured JSON-ready findings: ordered steps with rationale, impacted files/symbols, and a recommended plan_id when plan_patch is called. Do not modify files or run shell commands.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
         SubagentKind::Review => {
             let base = role_config(SubagentRole::Reviewer).instructions;
             format!(
-                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains."
+                "{base}\n\nReport actionable issues only. Each finding must include severity (blocker|warning|info), file, line (if known), message, and suggested_fix when one is obvious. Return pass=true only when no blocker or warning remains.\n\n{SUBAGENT_JSON_TAIL_INSTRUCTION}"
             )
         }
     }

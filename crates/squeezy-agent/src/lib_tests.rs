@@ -3781,6 +3781,202 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
 }
 
 #[test]
+fn parse_subagent_structured_tail_extracts_findings_object() {
+    let text = "Here is the plan.\n\n{\"findings\": [{\"finding\": \"missing tracing\", \"recommendation\": \"add span\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span\"}";
+    let parsed = super::parse_subagent_structured_tail(text).expect("structured tail should parse");
+    assert_eq!(parsed["summary"], json!("add a tracing span"));
+    assert_eq!(parsed["findings"][0]["finding"], json!("missing tracing"));
+    assert_eq!(parsed["findings"][0]["priority"], json!("warning"));
+}
+
+#[test]
+fn parse_subagent_structured_tail_returns_none_for_plain_text() {
+    assert!(
+        super::parse_subagent_structured_tail("Just a free-text summary with no JSON in sight.")
+            .is_none(),
+        "plain text must not be coerced into structured output"
+    );
+}
+
+#[test]
+fn parse_subagent_structured_tail_accepts_bare_json_object() {
+    let text = "{\"findings\": [], \"summary\": \"nothing to report\"}";
+    let parsed = super::parse_subagent_structured_tail(text).expect("bare JSON object parses");
+    assert_eq!(parsed["findings"], json!([]));
+    assert_eq!(parsed["summary"], json!("nothing to report"));
+}
+
+#[test]
+fn parse_subagent_structured_tail_rejects_json_array_only() {
+    // The contract requires an object. A bare array tail should not be
+    // misclassified as the structured-output payload.
+    assert!(super::parse_subagent_structured_tail("[1, 2, 3]").is_none());
+}
+
+#[test]
+fn plan_subagent_instructions_advertise_json_tail_contract() {
+    let request = super::SubagentRequest {
+        prompt: "plan something".to_string(),
+        scope: None,
+        thoroughness: None,
+    };
+    let plan = super::subagent_instructions(SubagentKind::Plan, &request);
+    assert!(
+        plan.contains("Output contract") && plan.contains("\"findings\""),
+        "plan prompt must teach the JSON tail contract: {plan}"
+    );
+    let review = super::subagent_instructions(SubagentKind::Review, &request);
+    assert!(
+        review.contains("Output contract") && review.contains("\"findings\""),
+        "review prompt must teach the JSON tail contract: {review}"
+    );
+    let delegate = super::subagent_instructions(SubagentKind::Delegate, &request);
+    assert!(
+        !delegate.contains("Output contract"),
+        "delegate prompt must not advertise the Plan/Review JSON tail contract: {delegate}"
+    );
+}
+
+#[tokio::test]
+async fn plan_subagent_parses_json_tail_into_structured_output() {
+    let provider = Arc::new(MockProvider::new(vec![
+        // Parent turn 1: emit a delegate_plan tool call.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "plan_1".to_string(),
+                name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+                arguments: json!({ "goal": "add tracing to ingest pipeline" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Plan subagent: return text followed by a JSON tail.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Plan: instrument ingest with spans.\n\n".to_string(),
+            )),
+            Ok(LlmEvent::TextDelta(
+                "{\"findings\": [{\"finding\": \"missing tracing on ingest\", \"recommendation\": \"add span around process_batch\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span on ingest\"}".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("plan_subagent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Parent turn 2: wrap up.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("plan tracing".to_string(), CancellationToken::new());
+    let mut plan_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == DELEGATE_PLAN_TOOL_NAME
+        {
+            plan_result = Some(result);
+        }
+    }
+
+    let plan_result = plan_result.expect("plan tool result");
+    assert_eq!(plan_result.status, ToolStatus::Success);
+    let structured = plan_result
+        .content
+        .get("structured_output")
+        .expect("plan subagent must surface structured_output on success");
+    assert_eq!(
+        structured["findings"][0]["finding"],
+        json!("missing tracing on ingest")
+    );
+    assert_eq!(structured["findings"][0]["priority"], json!("warning"));
+    assert_eq!(structured["summary"], json!("add a tracing span on ingest"));
+    let summary = plan_result
+        .content
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary must be present");
+    assert!(
+        summary.contains("instrument ingest"),
+        "raw assistant text must still appear in summary: {summary}"
+    );
+}
+
+#[tokio::test]
+async fn plan_subagent_falls_back_to_summary_when_json_missing() {
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "plan_1".to_string(),
+                name: DELEGATE_PLAN_TOOL_NAME.to_string(),
+                arguments: json!({ "goal": "describe ingest" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Plan subagent: emits plain prose with no JSON tail.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Plan: refactor ingest module to extract span helpers.".to_string(),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("plan_subagent_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("parent_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let agent = Agent::new(AppConfig::default(), provider);
+
+    let mut rx = agent.start_turn("plan tracing".to_string(), CancellationToken::new());
+    let mut plan_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == DELEGATE_PLAN_TOOL_NAME
+        {
+            plan_result = Some(result);
+        }
+    }
+
+    let plan_result = plan_result.expect("plan tool result");
+    assert_eq!(plan_result.status, ToolStatus::Success);
+    assert!(
+        plan_result.content.get("structured_output").is_none(),
+        "free-text plan subagent must not produce structured_output"
+    );
+    let summary = plan_result
+        .content
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .expect("summary must be present");
+    assert!(
+        summary.contains("refactor ingest module"),
+        "raw assistant text must still appear in summary: {summary}"
+    );
+}
+
+#[test]
 fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
     let plan_call = ToolCall {
         call_id: "c1".to_string(),
