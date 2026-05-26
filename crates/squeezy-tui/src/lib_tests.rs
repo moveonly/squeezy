@@ -1860,8 +1860,14 @@ async fn slash_help_lists_topics() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help").await);
 
-    assert_eq!(app.status, "help index");
+    wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
+    assert!(
+        transcript_message_contents(&app)
+            .iter()
+            .any(|content| *content == "/help"),
+        "user prompt should remain in the transcript"
+    );
     assert!(content.contains("Supported topics"), "{content}");
     assert!(content.contains("`providers`"), "{content}");
 }
@@ -1873,8 +1879,14 @@ async fn slash_help_config_renders_citations_and_config() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help providers").await);
 
-    assert_eq!(app.status, "help providers");
+    wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
+    assert!(
+        transcript_message_contents(&app)
+            .iter()
+            .any(|content| *content == "/help providers"),
+        "user prompt should remain in the transcript"
+    );
     assert!(content.contains("docs/external/PROVIDERS.md"), "{content}");
     assert!(content.contains("[model]"), "{content}");
     assert!(!content.contains("--api-key"), "{content}");
@@ -1887,8 +1899,14 @@ async fn slash_help_unsupported_points_to_public_resources() {
 
     assert!(handle_slash_command(&mut app, &mut agent, "/help quantum billing").await);
 
-    assert_eq!(app.status, "help topic not covered locally");
+    wait_for_turn_completion(&mut app).await;
     let content = last_message_content(&app).expect("help transcript");
+    assert!(
+        transcript_message_contents(&app)
+            .iter()
+            .any(|content| *content == "/help quantum billing"),
+        "user prompt should remain in the transcript"
+    );
     assert!(content.contains("won't guess"), "{content}");
     assert!(
         content.contains("https://squeezyagent.com/docs/"),
@@ -5215,6 +5233,27 @@ fn last_message_content(app: &TuiApp) -> Option<&str> {
         TranscriptEntryKind::Message(item) => Some(item.content.as_str()),
         _ => None,
     }
+}
+
+async fn wait_for_turn_completion(app: &mut TuiApp) {
+    for _ in 0..100 {
+        drain_agent_events(app).await;
+        if app.turn_rx.is_none() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("help turn did not complete");
+}
+
+fn transcript_message_contents(app: &TuiApp) -> Vec<&str> {
+    app.transcript
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => Some(item.content.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn render_to_string(app: &TuiApp, width: u16, height: u16) -> String {

@@ -1557,12 +1557,21 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
 }
 
 #[tokio::test]
-async fn squeezy_help_self_question_completes_without_provider_request() {
-    let provider = Arc::new(MockProvider::new(Vec::new()));
+async fn squeezy_help_query_uses_doc_subagent_and_provider_request() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(
+            "Squeezy providers are configured through the bundled provider docs.".to_string(),
+        )),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+        }),
+    ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
     let mut rx = agent.start_turn(
-        "How do I configure Squeezy providers?".to_string(),
+        "/help how to configure models".to_string(),
         CancellationToken::new(),
     );
     let mut completed = None;
@@ -1572,14 +1581,32 @@ async fn squeezy_help_self_question_completes_without_provider_request() {
         }
     }
 
-    assert!(provider.requests().is_empty());
-    let completed = completed.expect("help turn should complete");
-    assert!(completed.contains("Squeezy help"), "{completed}");
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
     assert!(
-        completed.contains("docs/external/PROVIDERS.md"),
-        "{completed}"
+        request
+            .instructions
+            .contains("hidden documentation subagent"),
+        "{:?}",
+        request.instructions
     );
-    assert!(completed.contains("[model]"), "{completed}");
+    assert!(
+        request.instructions.contains("docs/external"),
+        "{:?}",
+        request.instructions
+    );
+    let tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"grep"), "{tool_names:?}");
+    assert!(!tool_names.contains(&"apply_patch"), "{tool_names:?}");
+
+    let completed = completed.expect("help turn should complete");
+    assert!(completed.contains("provider docs"), "{completed}");
+    assert!(!completed.contains("won't guess"), "{completed}");
 }
 
 #[tokio::test]
@@ -1754,7 +1781,7 @@ fn tool_loop_guard_distinguishes_shell_failures_by_command() {
 }
 
 #[tokio::test]
-async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
+async fn unsupported_squeezy_help_question_falls_back_after_doc_subagent_failure() {
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
@@ -1769,7 +1796,10 @@ async fn unsupported_squeezy_help_question_refuses_without_provider_request() {
         }
     }
 
-    assert!(provider.requests().is_empty());
+    assert!(
+        !provider.requests().is_empty(),
+        "help should try the doc subagent before falling back"
+    );
     let completed = completed.expect("help turn should complete");
     assert!(completed.contains("won't guess"), "{completed}");
     assert!(

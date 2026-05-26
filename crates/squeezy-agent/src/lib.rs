@@ -33,7 +33,7 @@ use squeezy_llm::{
     RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context_calibrated,
     fetch_ollama_context_window,
 };
-use squeezy_skills::{HelpAnswer, SqueezyHelp, matches_squeezy_help_input};
+use squeezy_skills::{HelpAnswer, HelpStatus, SqueezyHelp, matches_squeezy_help_input};
 use squeezy_store::{
     BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionHandle,
     SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent, SessionReplayEventKind,
@@ -2420,14 +2420,28 @@ impl Agent {
                 }
                 // Cheap pre-check first so unrelated coding turns do not pay for a
                 // full `inspect_redacted()` rendering on every turn.
-                if matches_squeezy_help_input(&task_title)
-                    && let Some(answer) =
-                        SqueezyHelp::new(config.inspect_redacted()).answer_for_input(&task_title)
-                {
+                if matches_squeezy_help_input(&task_title) {
+                    let outcome = resolve_help_turn(
+                        &task_title,
+                        &HelpResolutionDeps {
+                            provider: provider.clone(),
+                            tools: tools.clone(),
+                            telemetry: telemetry.clone(),
+                            config: config.clone(),
+                            redactor: redactor.clone(),
+                            cancel: cancel.clone(),
+                            approval_ids: approval_ids.clone(),
+                            session_rules: session_rules.clone(),
+                            ai_reviewer_state: ai_reviewer_state.clone(),
+                            session_mode: session_mode.clone(),
+                            subagents: subagents.clone(),
+                        },
+                    )
+                    .await;
                     complete_squeezy_help_turn(
                         turn_id,
                         task_title,
-                        answer,
+                        outcome,
                         redacted_input.redactions,
                         HelpTurnDeps {
                             tx: tx.clone(),
@@ -2621,6 +2635,13 @@ struct HelpTurnDeps {
     session_mode: Arc<AtomicU8>,
 }
 
+#[derive(Debug, Clone)]
+struct HelpTurnOutcome {
+    answer: HelpAnswer,
+    metrics: TurnMetrics,
+    cost: CostSnapshot,
+}
+
 struct LocalToolTurnDeps {
     tx: mpsc::Sender<AgentEvent>,
     provider: Arc<dyn LlmProvider>,
@@ -2642,13 +2663,152 @@ struct LocalToolTurnDeps {
     subagents: SubagentRegistry,
 }
 
+fn parse_explicit_help_topic(input: &str) -> Option<&str> {
+    let rest = input.trim().strip_prefix("/help")?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+fn help_answer_from_local_index(config_inspect: String) -> HelpTurnOutcome {
+    let answer = SqueezyHelp::new(config_inspect).topic_index();
+    HelpTurnOutcome {
+        answer,
+        metrics: TurnMetrics::default(),
+        cost: CostSnapshot::default(),
+    }
+}
+
+async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpTurnOutcome {
+    if let Some(topic) = parse_explicit_help_topic(task_title) {
+        if topic.is_empty() {
+            return help_answer_from_local_index(deps.config.inspect_redacted());
+        }
+    }
+
+    let outcome = run_doc_help_subagent(task_title, deps).await;
+    if let Some(outcome) = outcome {
+        return outcome;
+    }
+
+    let fallback = SqueezyHelp::new(deps.config.inspect_redacted()).answer_for_input(task_title);
+    let answer =
+        fallback.unwrap_or_else(|| SqueezyHelp::new(deps.config.inspect_redacted()).topic_index());
+    let mut metrics = TurnMetrics::default();
+    if deps.config.subagents.enabled {
+        metrics.subagent_calls = 1;
+        metrics.subagent_failures = 1;
+    }
+    HelpTurnOutcome {
+        metrics,
+        cost: CostSnapshot::default(),
+        answer,
+    }
+}
+
+struct HelpResolutionDeps {
+    provider: Arc<dyn LlmProvider>,
+    tools: ToolRegistry,
+    telemetry: TelemetryClient,
+    config: AppConfig,
+    redactor: Arc<Redactor>,
+    cancel: CancellationToken,
+    approval_ids: Arc<AtomicU64>,
+    session_rules: Arc<RwLock<Vec<PermissionRule>>>,
+    ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
+    session_mode: Arc<AtomicU8>,
+    subagents: SubagentRegistry,
+}
+
+async fn run_doc_help_subagent(
+    task_title: &str,
+    deps: &HelpResolutionDeps,
+) -> Option<HelpTurnOutcome> {
+    if !deps.config.subagents.enabled {
+        return None;
+    }
+    let config_inspect = deps.config.inspect_redacted();
+    let prompt =
+        format!("User help request:\n{task_title}\n\nRedacted config inspect:\n{config_inspect}");
+    let request = SubagentRequest {
+        prompt,
+        scope: Some(
+            "Bundled docs under docs/external and the provided redacted config inspect output."
+                .to_string(),
+        ),
+        thoroughness: None,
+    };
+    let mut all_tool_specs = core_control_tools(
+        &deps.config.subagents,
+        load_session_mode(&deps.session_mode),
+    );
+    all_tool_specs.extend(deps.tools.specs().iter().cloned().map(advertised_tool));
+    let allowed_tools = subagent_allowed_tools(&all_tool_specs, SubagentKind::DocHelp);
+    if allowed_tools.is_empty() {
+        return None;
+    }
+    let jobs = JobRegistry::new();
+    let parent = ToolExecutionContext {
+        turn_id: TurnId::new(0),
+        origin: ToolOrigin::Subagent,
+        provider: deps.provider.clone(),
+        tools: &deps.tools,
+        jobs: &jobs,
+        config: &deps.config,
+        telemetry: deps.telemetry.clone(),
+        redactor: deps.redactor.clone(),
+        tx: mpsc::channel(1).0,
+        cancel: deps.cancel.clone(),
+        approval_ids: deps.approval_ids.clone(),
+        session_rules: deps.session_rules.clone(),
+        ai_reviewer_state: deps.ai_reviewer_state.clone(),
+        session_mode: deps.session_mode.clone(),
+        session_log: None,
+        conversation_state: None,
+        task_state: Arc::new(Mutex::new(None)),
+        all_tool_specs: &all_tool_specs,
+        loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
+        exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
+        subagents: deps.subagents.clone(),
+    };
+    let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
+    if execution.status != ToolStatus::Success || execution.summary.trim().is_empty() {
+        return None;
+    }
+    let answer = HelpAnswer {
+        topic: task_title.trim().to_string(),
+        status: HelpStatus::Answered,
+        body: execution.summary,
+        citations: Vec::new(),
+        config_sections: Vec::new(),
+    };
+    let mut metrics = TurnMetrics::default();
+    metrics.merge_subagent_tool_metrics(&execution.metrics);
+    metrics.subagent_calls = 1;
+    let cost = execution.metrics.provider.clone();
+    Some(HelpTurnOutcome {
+        answer,
+        metrics,
+        cost,
+    })
+}
+
 async fn complete_squeezy_help_turn(
     turn_id: TurnId,
     task_title: String,
-    answer: HelpAnswer,
+    outcome: HelpTurnOutcome,
     seed_redactions: u64,
     deps: HelpTurnDeps,
 ) {
+    let HelpTurnOutcome {
+        answer,
+        mut metrics,
+        cost,
+    } = outcome;
     let HelpTurnDeps {
         tx,
         redactor,
@@ -2664,11 +2824,7 @@ async fn complete_squeezy_help_turn(
     let user_transcript = TranscriptItem::user(task_title.clone());
     let rendered = redactor.redact(&answer.render_markdown());
     let message = TranscriptItem::assistant(rendered.text);
-    let metrics = TurnMetrics {
-        redactions: seed_redactions + rendered.redactions,
-        ..TurnMetrics::default()
-    };
-    let cost = CostSnapshot::default();
+    metrics.redactions += seed_redactions + rendered.redactions;
 
     log_session_event(
         session_log.as_ref(),
@@ -2705,7 +2861,7 @@ async fn complete_squeezy_help_turn(
             latest_task_state.as_ref(),
             task_title.clone(),
             TaskStateStatus::Completed,
-            Some(format!("Squeezy help: {}", answer.topic)),
+            Some("Squeezy help".to_string()),
         ),
     )
     .await;
@@ -4361,6 +4517,7 @@ struct TurnPersistInput<'a> {
 enum SubagentKind {
     Delegate,
     Explore,
+    DocHelp,
     Plan,
     Review,
 }
@@ -4370,6 +4527,7 @@ impl SubagentKind {
         match self {
             Self::Delegate => "delegate",
             Self::Explore => "explore",
+            Self::DocHelp => "doc_help",
             Self::Plan => "plan",
             Self::Review => "review",
         }
@@ -4384,6 +4542,7 @@ impl SubagentKind {
         match self {
             Self::Delegate => None,
             Self::Explore => Some(SubagentRole::Explorer),
+            Self::DocHelp => None,
             Self::Plan => Some(SubagentRole::Planner),
             Self::Review => Some(SubagentRole::Reviewer),
         }
@@ -5026,7 +5185,7 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .unwrap_or_else(|| {
                 "Review the current diff. Report only actionable findings.".to_string()
             }),
-        SubagentKind::Delegate | SubagentKind::Explore => call
+        SubagentKind::Delegate | SubagentKind::Explore | SubagentKind::DocHelp => call
             .arguments
             .get("prompt")
             .and_then(Value::as_str)
@@ -5444,6 +5603,9 @@ fn subagent_instructions(kind: SubagentKind, request: &SubagentRequest) -> Strin
             let base = role_config(SubagentRole::Explorer).instructions;
             format!("{base}\n\nThoroughness: {thoroughness}.")
         }
+        SubagentKind::DocHelp => {
+            "You are Squeezy's hidden documentation subagent. Answer the user's Squeezy help question by reading the bundled docs under docs/external and the provided redacted config snapshot. Use read/search tools only, prefer exact doc paths and config sections, and return a concise user-facing answer. Do not mention internal agent mechanics, do not modify files, do not run shell commands, and do not ask the user follow-up questions unless the docs truly require clarification.".to_string()
+        }
         SubagentKind::Plan => {
             let base = role_config(SubagentRole::Planner).instructions;
             format!(
@@ -5475,6 +5637,7 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
                 .unwrap_or(&parent_model)
                 .to_string()
         }),
+        (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
         (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
             .unwrap_or(&parent_model)
@@ -5529,6 +5692,8 @@ const EXPLORE_SUBAGENT_TOOL_NAMES: &[&str] = &[
     "read_file",
 ];
 
+const DOC_HELP_SUBAGENT_TOOL_NAMES: &[&str] = &["glob", "grep", "read_file", "read_slice"];
+
 fn subagent_allowed_tools(
     all_tool_specs: &[AdvertisedTool],
     kind: SubagentKind,
@@ -5536,6 +5701,7 @@ fn subagent_allowed_tools(
     let names: BTreeSet<&str> = match kind {
         SubagentKind::Delegate => DELEGATE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Explore => EXPLORE_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
+        SubagentKind::DocHelp => DOC_HELP_SUBAGENT_TOOL_NAMES.iter().copied().collect(),
         SubagentKind::Plan => role_config(SubagentRole::Planner)
             .allowed_tools
             .iter()

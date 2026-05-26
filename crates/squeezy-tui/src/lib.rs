@@ -45,7 +45,6 @@ use squeezy_core::{
     TuiAlternateScreen,
 };
 use squeezy_llm::{LlmProvider, RequestTokenEstimate};
-use squeezy_skills::{HelpStatus, SqueezyHelp};
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
@@ -2274,7 +2273,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/help" => {
-            handle_help_command(app, rest);
+            handle_help_command(app, agent, rest);
             return true;
         }
         "/model" => {
@@ -2931,18 +2930,13 @@ fn plans_open(app: &mut TuiApp, sid: &str, plan_id: &str) {
     )));
 }
 
-fn handle_help_command(app: &mut TuiApp, rest: &str) {
-    let help = SqueezyHelp::new(app.help_config_inspect.clone());
-    let answer = if rest.trim().is_empty() {
-        help.topic_index()
+fn handle_help_command(app: &mut TuiApp, agent: &mut Agent, rest: &str) {
+    let prompt = if rest.trim().is_empty() {
+        "/help".to_string()
     } else {
-        help.answer_topic(rest)
+        format!("/help {}", rest.trim())
     };
-    app.status = match answer.status {
-        HelpStatus::Answered => format!("help {}", answer.topic),
-        HelpStatus::Unsupported => "help topic not covered locally".to_string(),
-    };
-    app.push_transcript_item(TranscriptItem::system(answer.render_markdown()));
+    start_user_turn(app, agent, prompt);
 }
 
 async fn handle_feedback_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
@@ -8276,7 +8270,6 @@ struct TuiApp {
     tool_output_verbosity: ToolOutputVerbosity,
     transcript_default: TranscriptDefault,
     show_reasoning_usage: bool,
-    help_config_inspect: String,
     repo: RepoStatus,
     permissions: PermissionStatus,
     telemetry: TelemetryStatus,
@@ -8467,7 +8460,6 @@ impl TuiApp {
             tool_output_verbosity: config.tui.tool_output_verbosity,
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
-            help_config_inspect: config.inspect_redacted(),
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
