@@ -90,7 +90,8 @@ detect_target() {
     Linux)
       case "$arch" in
         x86_64|amd64) echo "x86_64-unknown-linux-musl" ;;
-        *) err "unsupported Linux architecture: $arch (only x86_64 is published)" ;;
+        arm64|aarch64) echo "aarch64-unknown-linux-musl" ;;
+        *) err "unsupported Linux architecture: $arch" ;;
       esac
       ;;
     *)
