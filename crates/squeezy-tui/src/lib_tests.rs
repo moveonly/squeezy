@@ -5094,6 +5094,61 @@ async fn completion_clears_cancelled_prompt() {
     );
 }
 
+#[tokio::test]
+async fn cancel_restores_prompt_into_composer() {
+    let mut app = test_app(SessionMode::Build);
+    // Mirror the Enter handler: prompt stashed, composer cleared, turn live.
+    app.cancelled_prompt = Some("write the README".to_string());
+    app.input.clear();
+    app.input_cursor = 0;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert_eq!(
+        app.input, "write the README",
+        "cancel must put the typed prompt back in the composer",
+    );
+    assert_eq!(app.input_cursor, app.input.len());
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "auto-restore consumes the stash; got: {:?}",
+        app.cancelled_prompt
+    );
+}
+
+#[tokio::test]
+async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("original".to_string());
+    // User started typing again before the Cancelled event drained.
+    app.input = "new draft".to_string();
+    app.input_cursor = app.input.len();
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert_eq!(
+        app.input, "new draft",
+        "cancel must not overwrite the user's in-progress draft",
+    );
+    assert_eq!(
+        app.cancelled_prompt.as_deref(),
+        Some("original"),
+        "stash stays so Ctrl-R can still recover the original prompt",
+    );
+}
+
 #[test]
 fn context_budget_renders_percent_and_threshold() {
     let mut app = test_app(SessionMode::Build);

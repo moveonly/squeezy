@@ -13,8 +13,8 @@ use crate::{
     PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compact_text,
     compaction_status_line, context_window_pct, dedupe_assistant_repeated_tool_output,
     format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
-    format_mcp_status_snapshot, is_control_tool_name, proposed_plan, render, tool_call_label,
-    tool_result_status_text,
+    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, render,
+    tool_call_label, tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -406,6 +406,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
+                    input::restore_prompt_after_cancel(app);
                     keep_rx = false;
                     break;
                 }

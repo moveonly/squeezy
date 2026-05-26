@@ -489,6 +489,23 @@ pub(crate) fn set_input(app: &mut TuiApp, input: String) {
     clamp_slash_menu_index(app);
 }
 
+/// Move the stashed `cancelled_prompt` back into the composer so a turn
+/// the user just aborted doesn't vaporize their typed prompt. Skipped
+/// when the composer already has text (the user started a new draft mid-
+/// cancel) or when nothing was stashed. Returns `true` when the prompt
+/// was restored.
+pub(crate) fn restore_prompt_after_cancel(app: &mut TuiApp) -> bool {
+    if !app.input.is_empty() {
+        return false;
+    }
+    let Some(text) = app.cancelled_prompt.take() else {
+        return false;
+    };
+    app.input = text;
+    app.input_cursor = app.input.len();
+    true
+}
+
 pub(crate) fn input_cursor(app: &TuiApp) -> usize {
     text_cursor(&app.input, app.input_cursor)
 }
