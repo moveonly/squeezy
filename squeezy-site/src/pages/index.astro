@@ -2,6 +2,7 @@
 import BaseLayout from "../layouts/BaseLayout.astro";
 import GitHubIcon from "../components/GitHubIcon.astro";
 import TerminalWindow from "../components/TerminalWindow.astro";
+import EvidenceLoop from "../components/EvidenceLoop.astro";
 import { SITE } from "../config";
 import { homepageCards, optimizationCards, operatingLoop, productPosition, toolSurface } from "../facts";
 ---
@@ -27,34 +28,7 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
       </div>
     </div>
     <div class="hero-visual">
-      <TerminalWindow title="~/work/payments · squeezy">
-        <div class="terminal-body">
-          <div class="terminal-line">
-            <span class="prompt">&gt;</span>
-            <span class="command">find every caller of PaymentRouter::settle</span>
-          </div>
-          <div class="terminal-line">
-            <span class="green">repo_map</span>
-            <span>4 crates · 312 modules · Rust first-class</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">decl_search</span>
-            <span>crates/payments/src/router.rs:184 (resolved)</span>
-          </div>
-          <div class="terminal-line">
-            <span class="cyan">upstream_flow</span>
-            <span>7 callers · 3 crates · resolved=5, candidate=2</span>
-          </div>
-          <div class="terminal-line">
-            <span class="amber">read_slice</span>
-            <span>router.rs:178-212 · 34 lines · hash dd1f0a</span>
-          </div>
-          <div class="terminal-line">
-            <span class="muted">status</span>
-            <span>tools 4 · bytes 1,284 · tokens 2,150 · ~$0.006</span>
-          </div>
-        </div>
-      </TerminalWindow>
+      <EvidenceLoop />
     </div>
   </section>
 
@@ -173,6 +147,46 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
   </section>
 
   <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">in the terminal</span>
+      <h2>What a Squeezy turn actually looks like.</h2>
+      <p>
+        Hand-authored transcript. The status line on every turn reports tool
+        calls, read bytes, receipt hits, spills, provider tokens, cache usage,
+        and estimated cost when the provider exposes enough data.
+      </p>
+    </div>
+    <TerminalWindow title="~/work/payments · squeezy">
+      <div class="terminal-body">
+        <div class="terminal-line">
+          <span class="prompt">&gt;</span>
+          <span class="command">find every caller of PaymentRouter::settle across the workspace</span>
+        </div>
+        <div class="terminal-line">
+          <span class="green">repo_map</span>
+          <span>4 crates · 312 modules · Rust first-class · graph hot</span>
+        </div>
+        <div class="terminal-line">
+          <span class="cyan">decl_search</span>
+          <span>PaymentRouter::settle → crates/payments/src/router.rs:184 (resolved)</span>
+        </div>
+        <div class="terminal-line">
+          <span class="cyan">upstream_flow</span>
+          <span>7 callers across 3 crates · confidence: resolved=5, candidate=2</span>
+        </div>
+        <div class="terminal-line">
+          <span class="amber">read_slice</span>
+          <span>router.rs:178-212 · 34 lines · hash dd1f0a</span>
+        </div>
+        <div class="terminal-line">
+          <span class="muted">status</span>
+          <span>tools 4 · bytes 1,284 · receipts 0 · spills 0 · tokens 2,150 · ~$0.006</span>
+        </div>
+      </div>
+    </TerminalWindow>
+  </section>
+
+  <section class="section">
     <div class="section-header">
       <span class="eyebrow">example tasks</span>
       <h2>What you'd actually use it for.</h2>
