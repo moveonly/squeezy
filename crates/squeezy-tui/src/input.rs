@@ -48,6 +48,34 @@ const fn slash_args(
     }
 }
 
+/// If `text` starts with a registered slash command followed by end-of-line or
+/// whitespace, return the byte length of that command. Used by the renderer
+/// to highlight recognised commands in amber both in the live input widget
+/// and in the transcript view of a sent prompt. Returns the longest match so
+/// `/job-cancel foo` resolves to `/job-cancel`, not `/job`.
+pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
+    if !text.starts_with('/') {
+        return None;
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter_map(|cmd| {
+            if !text.starts_with(cmd.name) {
+                return None;
+            }
+            let len = cmd.name.len();
+            // Must be followed by end-of-string or whitespace — `/helpme` is
+            // not `/help`.
+            let next = text.as_bytes().get(len).copied();
+            if next.is_none() || next.is_some_and(|b| b.is_ascii_whitespace()) {
+                Some(len)
+            } else {
+                None
+            }
+        })
+        .max()
+}
+
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     slash("/help", "show local Squeezy help topics"),
     slash_args(
@@ -716,3 +744,7 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
         }
     }
 }
+
+#[cfg(test)]
+#[path = "input_tests.rs"]
+mod tests;

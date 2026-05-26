@@ -5236,7 +5236,17 @@ async fn run_subagent(
     let mut config = parent.config.clone();
     config.session_mode = SessionMode::Plan;
     config.store_responses = false;
-    config.max_output_tokens = Some(config.subagents.max_summary_tokens);
+    // DocHelp's "summary" is the user-facing answer, not a synopsis. Capping
+    // it at `max_summary_tokens` (which is sized for Explore/Delegate-style
+    // tool-run synopses) silently breaks the help path under reasoning
+    // models — see DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS for the full story.
+    config.max_output_tokens = match kind {
+        SubagentKind::DocHelp => parent
+            .config
+            .max_output_tokens
+            .or(Some(squeezy_core::DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS)),
+        _ => Some(config.subagents.max_summary_tokens),
+    };
     config.max_tool_calls_per_turn = config.subagents.max_tool_calls_per_call;
     config.max_tool_bytes_read_per_turn = config.subagents.max_tool_bytes_read_per_call;
     config.max_search_files_per_turn = config.subagents.max_search_files_per_call;

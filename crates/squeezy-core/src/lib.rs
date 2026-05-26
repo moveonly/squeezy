@@ -66,7 +66,19 @@ pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
 // token, and per-tool-call truncations should already have caught
 // any runaway.
 pub const DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS: usize = 200;
-pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 1_200;
+// Generous default that absorbs reasoning-model overhead. The previous 1_200
+// silently broke any subagent run under a reasoning model with effort >= medium:
+// reasoning alone burns several thousand tokens before the model can emit a
+// single character of summary, which the OpenAI Responses API surfaces as
+// `response.incomplete: max_output_tokens` (a hard error in our SSE parser).
+// 16K leaves room for reasoning + a real summary across every model we ship a
+// preset for.
+pub const DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS: u32 = 32_000;
+/// Floor for the DocHelp subagent's output budget when the parent does not
+/// cap `max_output_tokens`. DocHelp's "summary" is the user-visible answer
+/// (not a synopsis of a tool-driven exploration), so it gets a much higher
+/// floor than other subagent kinds.
+pub const DEFAULT_DOC_HELP_MAX_OUTPUT_TOKENS: u32 = 32_000;
 pub const DEFAULT_TICK_RATE_MS: u64 = 50;
 pub const DEFAULT_TELEMETRY_ENDPOINT: &str =
     "https://squeezy-telemetry.esqueezy.workers.dev/v1/batch";
@@ -5317,7 +5329,7 @@ pub fn user_settings_template() -> &'static str {
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
 # max_model_rounds = 4
-# max_summary_tokens = 1200
+# max_summary_tokens = 16000
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
@@ -5502,7 +5514,7 @@ pub fn project_settings_template() -> &'static str {
 # max_tool_bytes_read_per_call = 8388608
 # max_search_files_per_call = 2000
 # max_model_rounds = 4
-# max_summary_tokens = 1200
+# max_summary_tokens = 16000
 
 # [redaction]
 # Add project-specific Rust regex patterns for secrets Squeezy should redact
