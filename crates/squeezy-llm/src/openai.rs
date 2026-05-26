@@ -79,7 +79,7 @@ impl OpenAiProvider {
         })
     }
 
-    fn request_body(request: &LlmRequest) -> Value {
+    fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
@@ -99,11 +99,22 @@ impl OpenAiProvider {
         if let Some(response_verbosity) = request.response_verbosity {
             body["text"] = json!({ "verbosity": openai_text_verbosity(response_verbosity) });
         }
-        if let Some(reasoning_effort) = request.reasoning_effort {
-            body["reasoning"] = json!({
-                "effort": reasoning_effort.as_str(),
-                "summary": "auto",
-            });
+        // The o-series and gpt-5.x models reason internally regardless of
+        // whether the caller picks an effort level; the API just won't stream
+        // a summary or expose `encrypted_content` for replay unless we ask
+        // for it. Request both whenever the model registry says this model
+        // supports reasoning, and only forward `effort` when the caller
+        // explicitly set one (else the provider uses its own per-model
+        // default).
+        let reasoning_capable = crate::capabilities_for(provider_name, &request.model)
+            .is_some_and(|caps| caps.reasoning_effort);
+        if reasoning_capable || request.reasoning_effort.is_some() {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("summary".to_string(), json!("auto"));
+            if let Some(effort) = request.reasoning_effort {
+                reasoning.insert("effort".to_string(), json!(effort.as_str()));
+            }
+            body["reasoning"] = Value::Object(reasoning);
             if !request.store {
                 body["include"] = json!(["reasoning.encrypted_content"]);
             }
@@ -152,7 +163,7 @@ impl LlmProvider for OpenAiProvider {
             url.push_str("?api-version=");
             url.push_str(api_version);
         }
-        let body = Self::request_body(&request);
+        let body = Self::request_body(&request, provider_name);
 
         Box::pin(try_stream! {
             let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {

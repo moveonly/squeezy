@@ -60,14 +60,18 @@ impl GoogleProvider {
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
         }
-        if let Some(effort) = request.reasoning_effort
-            && crate::capabilities_for("google", &request.model)
-                .is_some_and(|caps| caps.reasoning_effort)
-        {
-            body["generationConfig"]["thinkingConfig"] = json!({
-                "includeThoughts": true,
-                "thinkingBudget": effort.thinking_budget_tokens(),
-            });
+        // Gemini 2.5 thinks by default; the API just won't return thought
+        // summaries unless `includeThoughts` is on. Mirror OpenAI: request
+        // summaries whenever the model is reasoning-capable, and only set
+        // an explicit `thinkingBudget` when the caller picked an effort.
+        let reasoning_capable = crate::capabilities_for("google", &request.model)
+            .is_some_and(|caps| caps.reasoning_effort);
+        if reasoning_capable || request.reasoning_effort.is_some() {
+            let mut thinking = json!({ "includeThoughts": true });
+            if let Some(effort) = request.reasoning_effort {
+                thinking["thinkingBudget"] = json!(effort.thinking_budget_tokens());
+            }
+            body["generationConfig"]["thinkingConfig"] = thinking;
         }
         if !request.tools.is_empty() {
             body["tools"] = json!([{

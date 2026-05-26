@@ -30,7 +30,7 @@ fn request_body_uses_responses_streaming_shape() {
         store: true,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "be brief");
@@ -77,7 +77,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["input"][0]["type"], "function_call");
     assert_eq!(body["input"][0]["arguments"], r#"{"pattern":"needle"}"#);
@@ -114,7 +114,7 @@ fn request_body_preserves_function_tool_order() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["tools"][0]["name"], "write_file");
@@ -136,7 +136,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["text"]["verbosity"], "high");
     assert_eq!(body["reasoning"]["effort"], "high");
@@ -165,7 +165,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             store: false,
         };
 
-        let body = OpenAiProvider::request_body(&request);
+        let body = OpenAiProvider::request_body(&request, "openai");
 
         assert_eq!(body["text"]["verbosity"], openai);
     }
@@ -186,7 +186,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
     assert_eq!(body["prompt_cache_key"], "squeezy::session-1");
 }
 
@@ -205,7 +205,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
     assert!(body.get("prompt_cache_key").is_none());
 }
 
