@@ -6976,6 +6976,48 @@ fn error_kind(error: &SqueezyError) -> ErrorKind {
     }
 }
 
+/// Maximum bytes of preceding assistant text passed in
+/// [`ToolApprovalRequest::context`]. Sized to fit a few sentences without
+/// dominating the approval modal.
+const APPROVAL_CONTEXT_CAP: usize = 300;
+
+/// Extract the most recent assistant message from `state`, redact it, and
+/// head-truncate to [`APPROVAL_CONTEXT_CAP`] bytes so the approval modal
+/// can render "you asked me to X, so I'm trying Y" above the buttons.
+async fn approval_context_from_state(
+    state: Option<&Arc<Mutex<ConversationState>>>,
+    redactor: &Redactor,
+) -> Option<String> {
+    let state = state?;
+    let guard = state.lock().await;
+    let last_assistant = guard
+        .transcript
+        .iter()
+        .rev()
+        .find(|item| item.role == Role::Assistant)?;
+    let redacted = redactor.redact(&last_assistant.content).text;
+    let trimmed = redacted.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(head_truncate_bytes(trimmed, APPROVAL_CONTEXT_CAP))
+}
+
+/// Truncate `value` to at most `cap` bytes on a UTF-8 boundary, appending
+/// an ellipsis when truncation occurred.
+fn head_truncate_bytes(value: &str, cap: usize) -> String {
+    if value.len() <= cap {
+        return value.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = value[..end].trim_end().to_string();
+    out.push('…');
+    out
+}
+
 async fn permission_decision(
     call: &ToolCall,
     context: &ToolExecutionContext<'_>,
@@ -7103,6 +7145,9 @@ async fn permission_decision_for_request(
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
+            let approval_context =
+                approval_context_from_state(context.conversation_state.as_ref(), &context.redactor)
+                    .await;
             let approval_request = ToolApprovalRequest {
                 id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
@@ -7111,6 +7156,7 @@ async fn permission_decision_for_request(
                 permission: redact_permission_request(request.clone(), &context.redactor),
                 matched_rule: verdict.matched_rule,
                 reason: context.redactor.redact(&verdict.reason).text,
+                context: approval_context,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -8852,6 +8898,11 @@ pub struct ToolApprovalRequest {
     pub permission: PermissionRequest,
     pub matched_rule: Option<PermissionRule>,
     pub reason: String,
+    /// Snippet of the most recent assistant message (head-truncated to
+    /// ~300 chars) so the approval dialog can show why the tool is
+    /// being run. `None` when no assistant message is available (e.g.
+    /// the very first turn or subagent contexts without a transcript).
+    pub context: Option<String>,
 }
 
 impl ToolApprovalRequest {

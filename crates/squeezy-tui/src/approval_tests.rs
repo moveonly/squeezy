@@ -43,6 +43,7 @@ fn request_with(
         },
         matched_rule: None,
         reason: "test".to_string(),
+        context: None,
     }
 }
 
@@ -96,6 +97,43 @@ fn mcp_preview_shows_server_and_tool() {
     );
     let out = flatten(&render_preview(&req));
     assert!(out.contains("mcp filesystem/read"), "{out}");
+}
+
+#[test]
+fn context_field_is_rendered_above_rule_preview() {
+    let mut req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "grep -r ERROR",
+        &[("command", "grep -r ERROR logs/")],
+    );
+    let snippet = "You asked me to inspect logs, so I'm running grep -r ERROR.";
+    req.context = Some(snippet.to_string());
+    let lines = render_preview(&req);
+    let out = flatten(&lines);
+    assert!(out.contains(snippet), "context snippet missing: {out}");
+    // The context block must appear above the rule preview line so the
+    // user reads "why" before scanning the suggested rule and buttons.
+    let context_idx = out.find(snippet).expect("context substring");
+    let rule_idx = out
+        .find("Allow Project:")
+        .expect("rule preview line missing");
+    assert!(
+        context_idx < rule_idx,
+        "context should render above rule preview ({context_idx} >= {rule_idx})\n{out}",
+    );
+}
+
+#[test]
+fn missing_context_keeps_existing_preview_layout() {
+    let req = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "ls",
+        &[("command", "ls")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(!out.contains("context:"), "stray context label: {out}");
 }
 
 #[test]

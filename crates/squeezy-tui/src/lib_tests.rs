@@ -3153,6 +3153,7 @@ fn approval_status_line_is_compact_single_line() {
         permission,
         matched_rule: None,
         reason: "default shell permission is ask".to_string(),
+        context: None,
     };
     let line = format_approval_status_line(&request);
     assert!(!line.contains('\n'), "status line must be single line");
@@ -5657,6 +5658,7 @@ fn sample_approval_request() -> ToolApprovalRequest {
         },
         matched_rule: None,
         reason: "default compiler permission is ask".to_string(),
+        context: None,
     }
 }
 
