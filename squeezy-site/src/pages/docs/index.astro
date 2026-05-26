@@ -5,21 +5,21 @@ import { DOCS_NAV } from "../../config";
 const descriptions: Record<string, string> = {
   Install: "Set up the binary, run diagnostics, choose a provider, and start a repo session.",
   Graph: "Understand graph construction, refresh, confidence labels, and source slicing.",
-  Optimization: "See how Squeezy reduces repeated tool output and provider context.",
+  "Cost & receipts": "See how Squeezy reduces repeated tool output and provider context.",
   Config: "Review configuration precedence, provider defaults, and local inspection commands.",
   Permissions: "Understand policy-gated local tools, sandbox behavior, and verification controls.",
-  Languages: "Review premium language support and graph coverage.",
+  Languages: "Review first-class language support and graph coverage.",
   Providers: "Review model/provider adapters and local configuration.",
   Support: "Debug startup, ask Squeezy about itself, and prepare redacted reports."
 };
 ---
 
 <DocsLayout
-  title="Docs - Squeezy"
+  title="Docs · Squeezy"
   description="Technical overview of Squeezy's static analysis, token optimization, providers, installation, and support flow."
   activeDoc="overview"
   eyebrow="technical docs"
-  heading="How Squeezy spends fewer model tokens."
+  heading="How Squeezy works under the hood."
   lead="These docs explain the local systems behind Squeezy: graph navigation, exact reads, receipts, provider configuration, install flow, and support diagnostics."
 >
   <section class="doc-block">
@@ -33,7 +33,7 @@ const descriptions: Record<string, string> = {
       <article class="card">
         <span class="label">2</span>
         <h3>Ask targeted questions</h3>
-        <p>Graph tools answer architecture, declaration, reference, hierarchy, call, flow, and changed-code questions with compact evidence.</p>
+        <p>Graph tools answer architecture, declaration, reference, hierarchy, call, flow, and changed-code questions with paths, spans, and confidence.</p>
       </article>
       <article class="card">
         <span class="label">3</span>
@@ -53,7 +53,7 @@ const descriptions: Record<string, string> = {
     <div class="doc-card-grid">
       {
         DOCS_NAV.map((item) => (
-          <a class="card" href={item.href} data-track-click={`docs_${item.label.toLowerCase().replaceAll(" ", "_")}`}>
+          <a class="card" href={item.href} data-track-click={`docs_${item.label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")}`}>
             <span class="label">{item.status}</span>
             <h3>{item.label}</h3>
             <p>{descriptions[item.label]}</p>

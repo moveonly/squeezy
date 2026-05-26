@@ -8,9 +8,10 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
 ---
 
 <BaseLayout
-  title="Squeezy - Spend model tokens where they matter"
+  title="Squeezy · Local-first coding agent"
   description={SITE.description}
   active="home"
+  jsonLd={true}
 >
   <section class="hero">
     <div class="hero-copy">
@@ -26,7 +27,7 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
         </a>
       </div>
     </div>
-    <div class="hero-visual" aria-label="Squeezy evidence loop visual">
+    <div class="hero-visual">
       <EvidenceLoop />
     </div>
   </section>
@@ -37,16 +38,16 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
       <strong>Rust TUI</strong>
     </div>
     <div>
-      <span>First pass</span>
-      <strong>static graph</strong>
-    </div>
-    <div>
-      <span>Model input</span>
-      <strong>compact evidence</strong>
+      <span>Languages</span>
+      <strong>9 with native graph</strong>
     </div>
     <div>
       <span>Providers</span>
-      <strong>bring your key</strong>
+      <strong>6, BYO key</strong>
+    </div>
+    <div>
+      <span>License</span>
+      <strong>Apache 2.0</strong>
     </div>
   </section>
 
@@ -74,6 +75,21 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
     </div>
   </section>
 
+  <section class="section compact">
+    <div class="section-header">
+      <span class="eyebrow">how it differs</span>
+      <h2>A CLI/TUI agent that adds a persistent local graph.</h2>
+      <p>
+        Squeezy is a terminal agent, not an editor extension. It works with the
+        model providers you already use, and it adds a persistent local
+        semantic graph that other agents recompute from raw files every turn.
+        The graph is the cost mechanism: when an agent can answer a question
+        from local structure, it does, and the tokens stay available for the
+        work that actually needs a model.
+      </p>
+    </div>
+  </section>
+
   <section class="section band">
     <div class="grid-2 align-center">
       <div class="section-header">
@@ -81,15 +97,15 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
         <h2>Static analysis narrows the question before the model sees code.</h2>
         <p>
           Squeezy builds and refreshes a local semantic graph from supported
-          languages. The model receives compact evidence: symbols, callers,
-          references, spans, confidence, and exact next reads.
+          languages. The model receives a narrowed task: symbols, callers,
+          references, spans, confidence, and the exact next read.
         </p>
         <div class="actions">
           <a class="button" href="/how-it-works/" data-track-click="home_how">How it works</a>
           <a class="button secondary" href="/languages/" data-track-click="home_languages">Language coverage</a>
         </div>
       </div>
-      <TerminalWindow title="squeezy evidence packet">
+      <TerminalWindow title="squeezy session">
         <div class="terminal-body">
           <div class="terminal-line">
             <span class="green">repo_map</span>
@@ -115,7 +131,7 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
   <section class="section">
     <div class="section-header">
       <span class="eyebrow">what changes</span>
-      <h2>The model gets a reasoned work packet with local evidence.</h2>
+      <h2>The model receives a focused task, not a repo to skim.</h2>
     </div>
     <div class="flow">
       {
@@ -132,10 +148,81 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
 
   <section class="section band">
     <div class="section-header">
-      <span class="eyebrow">optimization</span>
-      <h2>Token reduction starts in the architecture.</h2>
+      <span class="eyebrow">in the terminal</span>
+      <h2>What a Squeezy turn actually looks like.</h2>
       <p>
-        Squeezy is designed to avoid unnecessary provider work. The optimization
+        Hand-authored transcript. The status line on every turn reports tool
+        calls, read bytes, receipt hits, spills, provider tokens, cache usage,
+        and estimated cost when the provider exposes enough data.
+      </p>
+    </div>
+    <TerminalWindow title="~/work/payments · squeezy">
+      <div class="terminal-body">
+        <div class="terminal-line">
+          <span class="prompt">&gt;</span>
+          <span class="command">find every caller of PaymentRouter::settle across the workspace</span>
+        </div>
+        <div class="terminal-line">
+          <span class="green">repo_map</span>
+          <span>4 crates · 312 modules · Rust first-class · graph hot</span>
+        </div>
+        <div class="terminal-line">
+          <span class="cyan">decl_search</span>
+          <span>PaymentRouter::settle → crates/payments/src/router.rs:184 (resolved)</span>
+        </div>
+        <div class="terminal-line">
+          <span class="cyan">upstream_flow</span>
+          <span>7 callers across 3 crates · confidence: resolved=5, candidate=2</span>
+        </div>
+        <div class="terminal-line">
+          <span class="amber">read_slice</span>
+          <span>router.rs:178-212 · 34 lines · hash dd1f0a</span>
+        </div>
+        <div class="terminal-line">
+          <span class="muted">status</span>
+          <span>tools 4 · bytes 1,284 · receipts 0 · spills 0 · tokens 2,150 · ~$0.006</span>
+        </div>
+      </div>
+    </TerminalWindow>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">example tasks</span>
+      <h2>What you'd actually use it for.</h2>
+      <p>
+        Three prompts that route through graph navigation first. The model only
+        sees the narrowed answer.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">navigation</span>
+        <h3>Find every caller of a function across a large monorepo.</h3>
+        <p class="example-prompt">"Where is PaymentRouter::settle called?"</p>
+        <p>Squeezy resolves the declaration from the graph, then walks upstream_flow. The model never sees full call-site files.</p>
+      </article>
+      <article class="card">
+        <span class="label">refactor</span>
+        <h3>Plan an API surface change and see what breaks.</h3>
+        <p class="example-prompt">"Rename `Tools` to `ToolRegistry` across crates/squeezy-tools."</p>
+        <p>Plan-mode uses plan_patch with graph impact context, then a bounded verify run reports compile failures without dumping each file.</p>
+      </article>
+      <article class="card">
+        <span class="label">review</span>
+        <h3>Review a diff and explain the risky changes.</h3>
+        <p class="example-prompt">"Review the current branch and flag anything load-bearing."</p>
+        <p>diff_context plus symbol_context return changed ranges with their callers and references. Whole-file dumps stay out of the prompt.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">optimization</span>
+      <h2>The cost work happens before the model call.</h2>
+      <p>
+        Squeezy avoids unnecessary provider work by design. The optimization
         lives in local indexes, tool output shaping, receipt reuse, lazy schemas,
         and explicit verification.
       </p>
@@ -156,7 +243,7 @@ import { homepageCards, optimizationCards, operatingLoop, productPosition, toolS
   <section class="section">
     <div class="section-header">
       <span class="eyebrow">product surface</span>
-      <h2>Built for engineering work with local code intelligence.</h2>
+      <h2>A tool surface designed for code work, not chat.</h2>
     </div>
     <div class="grid-3">
       {

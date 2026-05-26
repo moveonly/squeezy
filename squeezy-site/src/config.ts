@@ -2,12 +2,12 @@ export const SITE = {
   name: "Squeezy",
   url: "https://squeezyagent.com",
   description:
-    "A Rust coding agent that spends model tokens only after local static analysis has narrowed the code evidence.",
+    "A terminal coding agent built on a local semantic graph. Answer navigation, reference, and impact questions before spending model tokens.",
   repoUrl: "https://github.com/esqueezy/squeezy",
   issuesUrl: "https://github.com/esqueezy/squeezy/issues",
   discussionsUrl: "https://github.com/esqueezy/squeezy/discussions",
   telemetryEndpoint: "https://squeezy-telemetry.esqueezy.workers.dev/v1/site",
-  securityContactLabel: "security contact before public v0"
+  securityContactLabel: "Private disclosures: a dedicated channel is being set up."
 };
 
 export const DOCS_NAV = [
@@ -23,7 +23,7 @@ export const DOCS_NAV = [
   },
   {
     href: "/docs/cost-receipts/",
-    label: "Optimization",
+    label: "Cost & receipts",
     status: "token budget"
   },
   {

@@ -1,0 +1,119 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro";
+import Wip from "../components/Wip.astro";
+---
+
+<BaseLayout
+  title="Privacy · Squeezy"
+  description="What squeezyagent.com collects, what it does not collect, and how to opt out."
+  active="docs"
+>
+  <section class="page-hero">
+    <div class="page-hero-inner">
+      <span class="eyebrow">privacy</span>
+      <h1>What this site collects, and how to turn it off.</h1>
+      <p class="lead">
+        squeezyagent.com runs as a static site and sends a small set of
+        anonymous-by-default events to a Squeezy-operated telemetry endpoint.
+        This page describes exactly what is sent, and the three ways to opt out.
+      </p>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">scope</span>
+      <h2>This page covers the website only.</h2>
+      <p>
+        The Squeezy command-line tool has its own telemetry model documented in
+        the product docs. The site never reads or transmits your local code,
+        repositories, sessions, or provider credentials. The website cannot
+        access them: it runs in your browser only.
+      </p>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">events sent</span>
+      <h2>Two event types, both bounded.</h2>
+    </div>
+    <div class="grid-2">
+      <article class="card">
+        <span class="label">page view</span>
+        <h3>squeezy_site_page_view</h3>
+        <p>Sent on page load. Includes the page path, a referrer category (none, internal, search, social, external), and bounded UTM parameters when present in the URL.</p>
+      </article>
+      <article class="card">
+        <span class="label">cta click</span>
+        <h3>squeezy_site_cta_clicked</h3>
+        <p>Sent when a tracked link is clicked. Includes the link identifier (for example, hero_install or github_header) and whether the target is internal or GitHub.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">identifiers</span>
+      <h2>Pseudonymous, not strictly anonymous.</h2>
+      <p>
+        Both events carry a persistent <code>visitor_id</code> stored in
+        <code>localStorage</code> and a per-tab <code>session_id</code> stored
+        in <code>sessionStorage</code>. Both are random UUIDs generated in your
+        browser. We do not link them to your name, email, IP address, or any
+        third-party identity. Clearing browser storage rotates them.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">not collected</span>
+        <h3>No IP storage</h3>
+        <p>The receiving telemetry Worker does not store IP addresses against events.</p>
+      </article>
+      <article class="card">
+        <span class="label">not collected</span>
+        <h3>No third-party trackers</h3>
+        <p>No Google Analytics, no Facebook pixel, no advertising trackers, no session-replay tools.</p>
+      </article>
+      <article class="card">
+        <span class="label">not collected</span>
+        <h3>No form data</h3>
+        <p>The site has no forms, no comments, no accounts, and no client-side login surface.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section band">
+    <div class="section-header">
+      <span class="eyebrow">opt out</span>
+      <h2>Three ways to disable site telemetry.</h2>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">browser</span>
+        <h3>Do Not Track</h3>
+        <p>Set Do Not Track in your browser. The site checks <code>navigator.doNotTrack</code> on every page and skips telemetry when it is enabled.</p>
+      </article>
+      <article class="card">
+        <span class="label">browser</span>
+        <h3>Global Privacy Control</h3>
+        <p>Enable GPC in your browser. The site checks <code>navigator.globalPrivacyControl</code> and skips telemetry when it is enabled.</p>
+      </article>
+      <article class="card">
+        <span class="label">manual</span>
+        <h3>Local opt-out key</h3>
+        <p>Open DevTools and run <code>localStorage.setItem("squeezy_site_telemetry_opt_out", "1")</code>. The site stops sending telemetry from that browser.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">status</span>
+      <h2>Review status.</h2>
+      <p>
+        <Wip label="WIP" note="Independent privacy review pending. Treat this page as a description of intent and current implementation, not a legal statement." />
+      </p>
+    </div>
+  </section>
+</BaseLayout>

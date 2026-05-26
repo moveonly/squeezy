@@ -1,0 +1,14 @@
+---
+const { label = "WIP", note = "" } = Astro.props;
+---
+
+{
+  note ? (
+    <span class="wip-inline">
+      <span class="status-pill wip">{label}</span>
+      <span class="wip-note">{note}</span>
+    </span>
+  ) : (
+    <span class="status-pill wip">{label}</span>
+  )
+}

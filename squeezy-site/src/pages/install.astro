@@ -1,5 +1,6 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
+import Wip from "../components/Wip.astro";
 
 const platforms = [
   {
@@ -8,7 +9,7 @@ const platforms = [
     targets: ["aarch64-apple-darwin", "x86_64-apple-darwin"],
     primary: "curl installer",
     command: "curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh",
-    secondary: "Homebrew: brew install esqueezy/tap/squeezy"
+    secondary: "Or: brew install esqueezy/tap/squeezy"
   },
   {
     name: "Linux",
@@ -16,7 +17,7 @@ const platforms = [
     targets: ["x86_64-unknown-linux-musl"],
     primary: "curl installer",
     command: "curl -fsSL https://raw.githubusercontent.com/esqueezy/squeezy/main/install.sh | sh",
-    secondary: "Manual archive: squeezy-x86_64-unknown-linux-musl.tar.gz"
+    secondary: "Or: cargo install squeezy --locked"
   },
   {
     name: "Windows",
@@ -24,13 +25,14 @@ const platforms = [
     targets: ["x86_64-pc-windows-msvc"],
     primary: "Winget",
     command: "winget install esqueezy.Squeezy",
-    secondary: "Manual archive: squeezy-x86_64-pc-windows-msvc.zip"
+    secondary: "Or: extract squeezy-x86_64-pc-windows-msvc.zip and add to PATH.",
+    note: "Binary is unsigned today; signed release is in progress."
   }
 ];
 ---
 
 <BaseLayout
-  title="Install Squeezy"
+  title="Install · Squeezy"
   description="Choose a platform, install Squeezy, run doctor, and start the agent."
   active="install"
 >
@@ -66,6 +68,9 @@ const platforms = [
               {platform.targets.map((target) => <span>{target}</span>)}
             </div>
             <p>{platform.secondary}</p>
+            {platform.note && (
+              <Wip label="WIP" note={platform.note} />
+            )}
           </article>
         ))
       }

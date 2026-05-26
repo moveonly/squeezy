@@ -1,24 +1,23 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
 import TerminalWindow from "../components/TerminalWindow.astro";
+import Wip from "../components/Wip.astro";
 import { benchmarkFacts } from "../facts";
 ---
 
 <BaseLayout
-  title="Cost-Saving Benchmark - Squeezy"
-  description="Cost-saving benchmark plan for Squeezy graph navigation, read shaping, receipts, and model-context reduction."
+  title="Benchmark methodology · Squeezy"
+  description="How Squeezy will measure cost savings from graph navigation, exact reads, receipts, and output shaping."
   active="benchmarks"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">cost-saving benchmark</span>
-      <span class="status-pill warning">UNDER CONSTRUCTION</span>
-      <h1>Benchmarking model-context savings without unsupported claims.</h1>
+      <span class="eyebrow">benchmark methodology</span>
+      <h1>How we'll measure cost savings.</h1>
       <p class="lead">
-        This page will publish the method and results for measuring how much
-        provider context Squeezy avoids by doing code discovery locally first.
-        Until the report is ready, the page is intentionally limited to scope
-        and measurement plan.
+        This page documents the method for measuring how much provider context
+        Squeezy avoids by doing code discovery locally first. Numbers ship once
+        the report is reproducible end-to-end.
       </p>
     </div>
   </section>
@@ -42,6 +41,10 @@ import { benchmarkFacts } from "../facts";
           <div class="terminal-line">
             <span class="muted">baseline</span>
             <span>graph-first discovery compared with ordinary search and reads</span>
+          </div>
+          <div class="terminal-line">
+            <Wip label="WIP" />
+            <span>numbers pending the first reproducible report</span>
           </div>
         </div>
       </TerminalWindow>
@@ -71,8 +74,8 @@ import { benchmarkFacts } from "../facts";
         number without that evidence should not ship.
       </p>
       <div class="actions">
-        <a class="button" href="/docs/cost-receipts/" data-track-click="benchmark_optimization_docs">
-          Optimization docs
+        <a class="button" href="/docs/cost-receipts/" data-track-click="benchmark_cost_docs">
+          Cost &amp; receipts
         </a>
         <a class="button secondary" href="/docs/semantic-navigation/" data-track-click="benchmark_graph_docs">
           Graph docs

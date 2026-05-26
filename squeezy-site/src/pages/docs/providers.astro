@@ -4,7 +4,7 @@ import { providerRows } from "../../facts";
 ---
 
 <DocsLayout
-  title="Provider Support - Squeezy"
+  title="Providers · Squeezy"
   description="Squeezy provider adapter support and local provider configuration."
   activeDoc="/docs/providers/"
   eyebrow="providers"
@@ -19,10 +19,12 @@ import { providerRows } from "../../facts";
           <article class="matrix-row">
             <h3>{row.name}</h3>
             <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
           </article>
         ))
       }
     </div>
+    <p class="footnote">Default models and context windows are seed metadata for routing and local accounting, not provider billing authority.</p>
   </section>
 
   <section class="doc-block">

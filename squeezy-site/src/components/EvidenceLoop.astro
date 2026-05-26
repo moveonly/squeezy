@@ -1,91 +1,75 @@
-<div class="evidence-loop" aria-label="Animated evidence loop">
-  <canvas id="evidence-loop-canvas" width="960" height="520"></canvas>
-  <div class="evidence-legend">
-    <span>intent</span>
-    <span>graph</span>
-    <span>evidence</span>
-    <span>model</span>
-  </div>
-</div>
-
-<script>
-  const canvas = document.getElementById("evidence-loop-canvas");
-  const context = canvas instanceof HTMLCanvasElement ? canvas.getContext("2d") : null;
-
-  if (canvas && context) {
-    const nodes = [
-      { label: "intent", x: 0.16, y: 0.55, color: "#f0b84d" },
-      { label: "repo map", x: 0.37, y: 0.33, color: "#7cd7b5" },
-      { label: "refs", x: 0.58, y: 0.62, color: "#72b7ff" },
-      { label: "slices", x: 0.76, y: 0.38, color: "#d8d2c5" }
-    ];
-
-    const resize = () => {
-      const box = canvas.getBoundingClientRect();
-      const scale = window.devicePixelRatio || 1;
-      canvas.width = Math.max(640, Math.floor(box.width * scale));
-      canvas.height = Math.max(360, Math.floor(box.height * scale));
-      context.setTransform(scale, 0, 0, scale, 0, 0);
-    };
-
-    const draw = (time) => {
-      const width = canvas.clientWidth;
-      const height = canvas.clientHeight;
-      context.clearRect(0, 0, width, height);
-      context.fillStyle = "rgba(8, 10, 9, 0.92)";
-      context.fillRect(0, 0, width, height);
-
-      context.strokeStyle = "rgba(216, 210, 197, 0.08)";
-      context.lineWidth = 1;
-      for (let x = 24; x < width; x += 24) {
-        context.beginPath();
-        context.moveTo(x, 0);
-        context.lineTo(x, height);
-        context.stroke();
-      }
-      for (let y = 24; y < height; y += 24) {
-        context.beginPath();
-        context.moveTo(0, y);
-        context.lineTo(width, y);
-        context.stroke();
-      }
-
-      const points = nodes.map((node) => ({ ...node, px: node.x * width, py: node.y * height }));
-      for (let index = 0; index < points.length; index += 1) {
-        const current = points[index];
-        const next = points[(index + 1) % points.length];
-        const pulse = (Math.sin(time / 650 + index * 1.4) + 1) / 2;
-        context.strokeStyle = `rgba(240, 184, 77, ${0.18 + pulse * 0.32})`;
-        context.lineWidth = 2;
-        context.beginPath();
-        context.moveTo(current.px, current.py);
-        context.bezierCurveTo(
-          current.px + 90,
-          current.py - 90,
-          next.px - 90,
-          next.py + 90,
-          next.px,
-          next.py
-        );
-        context.stroke();
-      }
-
-      for (const point of points) {
-        const radius = 14 + Math.sin(time / 700 + point.px) * 2;
-        context.fillStyle = point.color;
-        context.beginPath();
-        context.arc(point.px, point.py, radius, 0, Math.PI * 2);
-        context.fill();
-        context.fillStyle = "rgba(216, 210, 197, 0.92)";
-        context.font = "13px ui-monospace, SFMono-Regular, Menlo, monospace";
-        context.fillText(point.label, point.px - 34, point.py + 34);
-      }
-
-      requestAnimationFrame(draw);
-    };
-
-    resize();
-    window.addEventListener("resize", resize);
-    requestAnimationFrame(draw);
+---
+const stages = [
+  {
+    zone: "local",
+    num: "01",
+    title: "Intent",
+    caption: "/q find callers of X"
+  },
+  {
+    zone: "local",
+    num: "02",
+    title: "Local semantic graph",
+    caption: "tree-sitter · 9 languages · workspace facts"
+  },
+  {
+    zone: "local",
+    num: "03",
+    title: "Narrowed evidence",
+    caption: "paths · spans · confidence · exact slice"
+  },
+  {
+    zone: "remote",
+    num: "04",
+    title: "Model",
+    caption: "bounded prompt · billable context"
   }
-</script>
+];
+---
+
+<figure
+  class="evidence-loop"
+  role="img"
+  aria-label="A four-stage pipeline. Stages one through three (intent, local semantic graph, narrowed evidence) run on your machine. Only stage four, the model call, leaves your machine as billable context."
+>
+  <div class="loop-zone loop-zone-local">
+    <span class="loop-zone-label">Your machine</span>
+    {
+      stages
+        .filter((stage) => stage.zone === "local")
+        .map((stage, index, list) => (
+          <>
+            <div class="loop-stage">
+              <span class="loop-stage-num">{stage.num}</span>
+              <div class="loop-stage-body">
+                <strong>{stage.title}</strong>
+                <code>{stage.caption}</code>
+              </div>
+            </div>
+            {index < list.length - 1 && <div class="loop-connector" aria-hidden="true" />}
+          </>
+        ))
+    }
+  </div>
+  <div class="loop-cross" aria-hidden="true">
+    <span class="loop-cross-line" />
+    <span class="loop-cross-label">only this crosses the network</span>
+    <span class="loop-cross-arrow">&#x2193;</span>
+  </div>
+  <div class="loop-zone loop-zone-remote">
+    <span class="loop-zone-label">Provider</span>
+    {
+      stages
+        .filter((stage) => stage.zone === "remote")
+        .map((stage) => (
+          <div class="loop-stage">
+            <span class="loop-stage-num">{stage.num}</span>
+            <div class="loop-stage-body">
+              <strong>{stage.title}</strong>
+              <code>{stage.caption}</code>
+            </div>
+          </div>
+        ))
+    }
+  </div>
+</figure>

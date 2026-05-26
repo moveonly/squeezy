@@ -11,30 +11,30 @@ export type MatrixRow = {
 };
 
 export const productPosition = {
-  eyebrow: "cost-optimized Rust coding agent",
-  title: "Spend model tokens where they matter.",
+  eyebrow: "Local-first coding agent",
+  title: "Understand the repo before you ask the model.",
   lead:
-    "Teams burn expensive model cycles on repository discovery that local static analysis can do faster and more deterministically. Squeezy builds a semantic graph first, then feeds the agent compact code evidence instead of broad raw-file dumps."
+    "Squeezy is a terminal coding agent that builds a local semantic graph of your codebase, then answers navigation, reference, and impact questions from that graph instead of from paid model context."
 };
 
 export const homepageCards: FactCard[] = [
   {
-    label: "CPU first",
-    title: "Let local analysis do the repetitive work",
+    label: "Local first",
+    title: "Static analysis does the repetitive work",
     body:
-      "Squeezy maps the repository locally, then answers common navigation questions with compact evidence before the model spends context on source text."
+      "Squeezy maps the repository locally, then answers common navigation questions from the graph before the model touches source text."
   },
   {
     label: "Token budget",
     title: "Less context sent without losing the trail",
     body:
-      "Graph tools return paths, spans, hashes, confidence labels, provenance, and next actions. Raw reads stay available, but they are narrowed to the exact slice when structure is enough."
+      "Graph tools return paths, spans, hashes, confidence labels, provenance, and next actions. Raw reads stay available, narrowed to the exact slice when structure is enough."
   },
   {
-    label: "Native runtime",
+    label: "Terminal app",
     title: "Fast local agent loop",
     body:
-      "Squeezy runs as a native terminal agent with deterministic local work, explicit verification, and bounded tool output."
+      "Squeezy runs as a single Rust binary with deterministic local work, explicit verification, and bounded tool output."
   }
 ];
 
@@ -43,13 +43,13 @@ export const optimizationCards: FactCard[] = [
     label: "static graph",
     title: "Semantic navigation before file reads",
     body:
-      "repo_map, declaration search, references, hierarchy, symbol context, upstream/downstream flow, and read_slice all work from local graph state and return compact evidence packets."
+      "repo_map, declaration search, references, hierarchy, symbol context, upstream/downstream flow, and read_slice work from local graph state and return narrowed results with paths, spans, and confidence."
   },
   {
     label: "read shaping",
     title: "Exact slices, diff reads, and receipts",
     body:
-      "Read tools can return bounded slices, changed ranges, receipt stubs for unchanged content, and spill handles for large output. The model gets enough evidence to act without paying for repeated bytes."
+      "Read tools return bounded slices, changed ranges, receipt stubs for unchanged content, and spill handles for large output. The model gets enough to act without paying for repeated bytes."
   },
   {
     label: "tool budget",
@@ -110,75 +110,81 @@ export const toolSurface: FactCard[] = [
 export const languageRows: MatrixRow[] = [
   {
     name: "Rust",
-    detail: "Graph-backed navigation for modules, declarations, imports, references, calls, tests, and crate structure.",
-    status: "premium graph support"
+    detail: "Modules, traits, impls, references, calls, tests, and crate facts from cargo metadata.",
+    status: "first-class graph"
   },
   {
     name: "Python",
-    detail: "Graph-backed navigation for classes, functions, imports, calls, decorators, bases, annotations, exports, and references.",
-    status: "premium graph support"
+    detail: "Classes, functions, imports, decorators, bases, annotations, exports, and references.",
+    status: "first-class graph"
   },
   {
     name: "Java",
-    detail: "Graph-backed navigation for packages, imports, types, members, inheritance, calls, references, and project structure.",
-    status: "premium graph support"
+    detail: "Packages, types, members, inheritance, implements edges, calls, references, and Maven/Gradle facts.",
+    status: "first-class graph"
   },
   {
     name: "C#",
-    detail: "Graph-backed navigation for namespaces, using directives, types, members, partial links, inheritance, references, and C# project files.",
-    status: "premium graph support"
+    detail: "Namespaces, types, members, partial links, inheritance, references, and .csproj/.sln project facts.",
+    status: "first-class graph"
   },
   {
     name: "Go",
-    detail: "Graph-backed navigation for packages, imports, structs, interfaces, type aliases, functions, methods, receivers, tests, calls, and references.",
-    status: "premium graph support"
+    detail: "Packages, structs, interfaces, methods, receivers, tests, calls, and references.",
+    status: "first-class graph"
   },
   {
     name: "C",
-    detail: "Graph-backed navigation for includes, structs, unions, enums, typedefs, fields, functions, macros, and references.",
-    status: "premium graph support"
+    detail: "Includes, structs, unions, enums, typedefs, functions, macros, and references.",
+    status: "first-class graph"
   },
   {
     name: "C++",
-    detail: "Graph-backed navigation for includes, namespaces, classes, structs, methods, constructors, destructors, templates, operators, and references.",
-    status: "premium graph support"
+    detail: "Includes, namespaces, classes, methods, constructors, destructors, templates, operators, and references.",
+    status: "first-class graph"
   },
   {
     name: "JavaScript",
-    detail: "Graph-backed navigation for imports, exports, CommonJS aliases, functions, classes, object/member references, calls, and JSX declarations.",
-    status: "premium graph support"
+    detail: "Imports, exports, CommonJS aliases, functions, classes, member references, calls, and JSX declarations.",
+    status: "first-class graph"
   },
   {
     name: "TypeScript",
-    detail: "Graph-backed navigation for imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
-    status: "premium graph support"
+    detail: "Imports, exports, classes, interfaces, type aliases, enums, decorators, type references, calls, and TSX declarations.",
+    status: "first-class graph"
   }
 ];
 
 export const providerRows: MatrixRow[] = [
   {
     name: "OpenAI",
-    detail: "Use OpenAI models while keeping repository indexing, permissions, tool shaping, and cost accounting in Squeezy."
+    detail: "Responses streaming, function tools, cached-token usage. Default model: gpt-5.5, 400K context.",
+    status: "OPENAI_API_KEY"
   },
   {
     name: "Anthropic",
-    detail: "Use Anthropic models with the same local graph navigation, tool loop, and session accounting."
+    detail: "Messages streaming, function tools, cache read/write usage. Default model: claude-opus-4-7, 200K context.",
+    status: "ANTHROPIC_API_KEY"
   },
   {
     name: "Google Gemini",
-    detail: "Use Gemini models without changing how Squeezy plans, narrows evidence, and verifies local work."
+    detail: "streamGenerateContent SSE, function declarations, usage metadata. Default model: gemini-2.5-pro, 1M context.",
+    status: "GEMINI_API_KEY"
   },
   {
     name: "Azure OpenAI",
-    detail: "Use Azure-hosted OpenAI models through your configured Azure endpoint and credentials."
+    detail: "Azure Responses-compatible streaming with api-key auth and api-version. Default model: gpt-5.5, 400K context.",
+    status: "AZURE_OPENAI_API_KEY"
   },
   {
     name: "Amazon Bedrock",
-    detail: "Use models hosted through Amazon Bedrock with your AWS credentials and region configuration."
+    detail: "AWS SDK Bedrock Runtime ConverseStream, default credential chain. Default model: Claude Haiku 4.5, 200K context.",
+    status: "AWS credentials"
   },
   {
     name: "Ollama",
-    detail: "Use a local Ollama model for local-first development when the selected model can follow the tool loop."
+    detail: "Local /api/chat NDJSON streaming with function tool schemas. Default model: qwen3-coder, runtime-defined context.",
+    status: "local runtime"
   }
 ];
 
