@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, Result, SessionMetrics,
-    SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload, Result,
+    SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -1109,6 +1109,15 @@ pub enum SessionEventKind {
         #[serde(default)]
         conversation: Vec<ResumeItem>,
     },
+    /// Provider-tagged reasoning blob emitted at the end of each reasoning
+    /// segment (one per `LlmEvent::ReasoningDone`). Persisted so the
+    /// `events.jsonl` replay fallback can rebuild the same `ResumeItem::Reasoning`
+    /// items that `resume_state.json` would have produced, preserving
+    /// the model's prior chain-of-thought (including OpenAI
+    /// `encrypted_content` and Anthropic/Google signed blocks) across resume.
+    Reasoning {
+        payload: ReasoningPayload,
+    },
     ApprovalRequested {
         #[serde(default)]
         tool: String,
@@ -1149,6 +1158,7 @@ impl SessionEventKind {
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::ContextCompacted { .. } => "context_compacted",
+            Self::Reasoning { .. } => "reasoning",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ApprovalDecided { .. } => "approval_decided",
             Self::SessionStarted => "session_started",
@@ -1434,6 +1444,9 @@ fn apply_event_to_replay(
         // no `conversation` field, so we treat it as a no-op and let the
         // linear replay continue.
         SessionEventKind::ContextCompacted { .. } => {}
+        SessionEventKind::Reasoning { payload } => {
+            conversation.push(ResumeItem::Reasoning { payload });
+        }
         // Approval and session-lifecycle events are bookkeeping rather
         // than conversation items; they do not modify the resume state's
         // conversation/transcript but still need to be enumerated so the

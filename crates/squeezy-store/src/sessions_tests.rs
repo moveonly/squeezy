@@ -3,10 +3,10 @@ use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
 use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
-    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot, FileId, SessionLogConfig,
-    SessionMetrics,
+    AnthropicThinkingBlock, AnthropicThinkingKind, AppConfig, ContextAttachment,
+    ContextAttachmentKind, ContextAttachmentSource, ContextAttachmentStatus,
+    ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
+    ContextPin, CostSnapshot, FileId, ReasoningPayload, SessionLogConfig, SessionMetrics,
 };
 
 use crate::{
@@ -1125,6 +1125,13 @@ fn typed_session_events_round_trip_through_event_log() {
             replacement_id: Some("ckpt-1".to_string()),
             conversation: Vec::new(),
         },
+        SessionEventKind::Reasoning {
+            payload: ReasoningPayload::OpenAi {
+                item_id: "rs_typed_log".to_string(),
+                summary: vec!["typed log thinking".to_string()],
+                encrypted_content: Some("ENCRYPTED-TYPED".to_string()),
+            },
+        },
         SessionEventKind::SessionEnded {
             status: "completed".to_string(),
         },
@@ -1236,6 +1243,111 @@ fn replay_resume_state_falls_back_when_resume_json_deleted() {
                 text: "see line 1".to_string()
             },
         ],
+    );
+}
+
+#[test]
+fn replay_resume_state_round_trips_reasoning_items() {
+    // Acceptance for squeezy-fp0: a session that records reasoning blobs
+    // alongside user / assistant text must, after `resume_state.json` is
+    // deleted, replay an identical conversation off the durable
+    // `events.jsonl` stream — including the reasoning items, with their
+    // provider-tagged ids and opaque content preserved bit-for-bit. Without
+    // this, resuming a gpt-5.x or Claude thinking session loses the model's
+    // prior chain-of-thought and the next turn has to re-derive (and re-bill
+    // for) the same reasoning.
+    let root = temp_root("replay-reasoning-round-trip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let openai_reasoning = ReasoningPayload::OpenAi {
+        item_id: "rs_openai_42".to_string(),
+        summary: vec!["Read the file before patching it.".to_string()],
+        encrypted_content: Some("ENCRYPTED-OPENAI-BLOB".to_string()),
+    };
+    let anthropic_reasoning = ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: AnthropicThinkingKind::Thinking,
+            text: "First check the failing test.".to_string(),
+            signature: Some("sig-anthropic".to_string()),
+            data: None,
+        }],
+    };
+
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "why does the test fail?".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::Reasoning {
+                payload: openai_reasoning.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("openai reasoning");
+    handle
+        .append_typed_event(
+            SessionEventKind::Reasoning {
+                payload: anthropic_reasoning.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("anthropic reasoning");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "the test asserts the wrong column".to_string(),
+                response_id: Some("resp-reasoning-1".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json"))
+        .expect("delete resume_state.json to force the events.jsonl fallback");
+
+    let replayed = handle
+        .replay_resume_state()
+        .expect("replay reconstructs from events.jsonl");
+    assert!(replayed.resume_available);
+    assert_eq!(
+        replayed.conversation,
+        vec![
+            ResumeItem::UserText {
+                text: "why does the test fail?".to_string(),
+            },
+            ResumeItem::Reasoning {
+                payload: openai_reasoning,
+            },
+            ResumeItem::Reasoning {
+                payload: anthropic_reasoning,
+            },
+            ResumeItem::AssistantText {
+                text: "the test asserts the wrong column".to_string(),
+            },
+        ],
+        "reasoning items must round-trip with id and content preserved",
     );
 }
 
