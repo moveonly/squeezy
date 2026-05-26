@@ -3,12 +3,11 @@ use super::*;
 const CONTROL_TOOL_NAMES: &[&str] = &["delegate", "explore", "delegate_plan", "delegate_review"];
 
 #[test]
-fn catalog_contains_all_four_roles() {
+fn catalog_contains_all_three_roles() {
     let catalog = catalog();
-    assert_eq!(catalog.len(), 4, "expected exactly four roles in catalog");
+    assert_eq!(catalog.len(), 3, "expected exactly three roles in catalog");
     for role in [
         SubagentRole::Explorer,
-        SubagentRole::Worker,
         SubagentRole::Planner,
         SubagentRole::Reviewer,
     ] {
@@ -25,27 +24,6 @@ fn catalog_contains_all_four_roles() {
             role.as_str()
         );
     }
-}
-
-#[test]
-fn active_roles_are_explorer_planner_reviewer() {
-    let active: Vec<_> = catalog()
-        .values()
-        .filter(|cfg| cfg.status == RoleStatus::Active)
-        .map(|cfg| cfg.role)
-        .collect();
-    assert!(active.contains(&SubagentRole::Explorer));
-    assert!(active.contains(&SubagentRole::Planner));
-    assert!(active.contains(&SubagentRole::Reviewer));
-    assert!(!active.contains(&SubagentRole::Worker));
-}
-
-#[test]
-fn worker_is_roadmap() {
-    assert_eq!(
-        role_config(SubagentRole::Worker).status,
-        RoleStatus::Roadmap
-    );
 }
 
 #[test]
@@ -86,11 +64,11 @@ fn reviewer_and_planner_are_read_only() {
 fn from_str_round_trips_known_roles() {
     for role in [
         SubagentRole::Explorer,
-        SubagentRole::Worker,
         SubagentRole::Planner,
         SubagentRole::Reviewer,
     ] {
         assert_eq!(SubagentRole::from_str(role.as_str()), Some(role));
     }
+    assert_eq!(SubagentRole::from_str("worker"), None);
     assert_eq!(SubagentRole::from_str("nonsense"), None);
 }
