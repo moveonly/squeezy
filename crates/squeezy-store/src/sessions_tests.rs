@@ -1862,6 +1862,8 @@ fn hash_payload(payload: &serde_json::Value) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
 // `HOME` is process-global; the memory tests below mutate it to point at a
 // temp dir so the user's real `~/.squeezy/memory.md` is never touched. The
 // lock keeps parallel test runners from racing on the env mutation.
