@@ -412,6 +412,53 @@ fn parser_extracts_completed_response_id_and_usage() {
 }
 
 #[test]
+fn parser_populates_both_cache_counters_from_usage() {
+    let mut state = AnthropicStreamState::default();
+
+    parse_anthropic_event(
+        r#"{
+          "type":"message_start",
+          "message":{
+            "id":"msg_cache",
+            "usage":{
+              "input_tokens":42,
+              "output_tokens":1,
+              "cache_read_input_tokens":17,
+              "cache_creation_input_tokens":29
+            }
+          }
+        }"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{
+          "type":"message_delta",
+          "delta":{"stop_reason":"end_turn"},
+          "usage":{"output_tokens":8}
+        }"#,
+        &mut state,
+    )
+    .expect("delta");
+    let event = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+
+    assert_eq!(
+        event,
+        vec![LlmEvent::Completed {
+            response_id: Some("msg_cache".to_string()),
+            cost: CostSnapshot {
+                input_tokens: Some(42),
+                output_tokens: Some(8),
+                reasoning_output_tokens: None,
+                cached_input_tokens: Some(17),
+                cache_write_input_tokens: Some(29),
+                estimated_usd_micros: None,
+            },
+        }]
+    );
+}
+
+#[test]
 fn parser_surfaces_error_events() {
     let mut state = AnthropicStreamState::default();
     let err = parse_anthropic_event(
