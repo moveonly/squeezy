@@ -480,6 +480,37 @@ impl StreamState {
     }
 }
 
+/// Flatten a Chat-Completions delta field that may be a plain string or an
+/// array of structured content parts into a single string. The spec says
+/// `content` and `reasoning_content` are strings, but live aggregator routes
+/// (notably Qwen via OpenRouter/PortKey, Anthropic-via-aggregator routes that
+/// echo the Responses content-part shape) sometimes stream them as arrays
+/// of `{type, text}` or `{type, delta}` objects. The old `as_str`-only path
+/// silently dropped those entire deltas — billed output tokens with no text
+/// ever surfacing to the agent loop.
+///
+/// Accepts the union of shapes we have seen on real traffic: a bare string;
+/// an array whose elements expose either a `text` or `delta` string field
+/// (regardless of `type`, which varies — `text`, `output_text`,
+/// `output_text_delta`, `text_delta`, `reasoning`, etc).
+fn collect_delta_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                } else if let Some(delta) = part.get("delta").and_then(Value::as_str) {
+                    out.push_str(delta);
+                }
+            }
+            out
+        }
+        _ => String::new(),
+    }
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
@@ -519,21 +550,17 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     if let Some(choices) = choices {
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
-                if let Some(reasoning) = delta
-                    .get("reasoning_content")
-                    .or_else(|| delta.get("reasoning"))
-                    .and_then(Value::as_str)
-                    && !reasoning.is_empty()
-                {
+                let reasoning = collect_delta_text(delta.get("reasoning_content"))
+                    + &collect_delta_text(delta.get("reasoning"));
+                if !reasoning.is_empty() {
                     events.push(LlmEvent::ReasoningDelta {
-                        text: reasoning.to_string(),
+                        text: reasoning,
                         kind: ReasoningKind::Summary,
                     });
                 }
-                if let Some(content) = delta.get("content").and_then(Value::as_str)
-                    && !content.is_empty()
-                {
-                    events.push(LlmEvent::TextDelta(content.to_string()));
+                let content = collect_delta_text(delta.get("content"));
+                if !content.is_empty() {
+                    events.push(LlmEvent::TextDelta(content));
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
                     for tool_call in tool_calls {
