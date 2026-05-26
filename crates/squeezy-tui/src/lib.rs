@@ -3987,7 +3987,7 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
-                let mut lines = reasoning_block_lines(&snapshot.display_text, false);
+                let mut lines = reasoning_block_lines(&snapshot.display_text, false, selected);
                 lines.push(Line::from(""));
                 lines
             } else {
@@ -4282,7 +4282,8 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
-                let mut lines = reasoning_block_lines(&snapshot.display_text, entry.collapsed);
+                let mut lines =
+                    reasoning_block_lines(&snapshot.display_text, entry.collapsed, selected);
                 lines.push(Line::from(""));
                 lines
             } else {
@@ -5026,7 +5027,11 @@ fn format_assistant_message_entry(
         && let Some(snapshot) = item.reasoning.as_ref()
         && !snapshot.display_text.trim().is_empty()
     {
-        lines.extend(reasoning_block_lines(&snapshot.display_text, collapsed));
+        lines.extend(reasoning_block_lines(
+            &snapshot.display_text,
+            collapsed,
+            false,
+        ));
     }
     if collapsed {
         lines.push(assistant_line(
@@ -5047,10 +5052,11 @@ fn format_assistant_message_entry(
     lines
 }
 
-fn reasoning_block_lines(text: &str, collapsed: bool) -> Vec<Line<'static>> {
+fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
     let style = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::ITALIC);
+    let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();
     if collapsed {
@@ -5065,12 +5071,12 @@ fn reasoning_block_lines(text: &str, collapsed: bool) -> Vec<Line<'static>> {
             String::new()
         };
         lines.push(Line::from(Span::styled(
-            format!("▸ reasoning: {summary}{suffix}"),
+            format!("{marker}▸ reasoning: {summary}{suffix}"),
             style,
         )));
     } else {
         lines.push(Line::from(Span::styled(
-            format!("▾ reasoning ({} lines)", body_lines.len().max(1)),
+            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1)),
             style,
         )));
         for raw in body_lines {
@@ -8727,9 +8733,7 @@ impl TranscriptEntry {
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
-            TranscriptEntryKind::Reasoning(snapshot) => {
-                text_has_collapsible_content(&snapshot.display_text)
-            }
+            TranscriptEntryKind::Reasoning(_) => true,
         }
     }
 
