@@ -592,6 +592,124 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn mixed_subagent_kinds_track_cost_per_kind() {
+    let root = temp_workspace("subagent_per_kind_rollup");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        // Turn 1 parent: dispatch explore subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "explore_call".to_string(),
+                name: "explore".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Find the needle entrypoint",
+                    "scope": "src.rs"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn1_parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Explore subagent final assistant message.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("found".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("explore_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(7),
+                    output_tokens: Some(5),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        // Turn 1 parent final.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ready".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn1_parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Turn 2 parent: dispatch delegate subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "delegate_call".to_string(),
+                name: "delegate".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Summarize architecture",
+                    "scope": "Rust crates"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn2_parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Delegate subagent final assistant message.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("Architecture summary".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("delegate_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(40),
+                    output_tokens: Some(60),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        // Turn 2 parent final.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn2_parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.model = "expensive-main".to_string();
+    config.subagents.explore_model = Some("cheap-explore".to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("first".to_string(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("second".to_string(), CancellationToken::new())).await;
+
+    let snapshot = agent.session_accounting_snapshot().await;
+    // Aggregate counters still account for both kinds.
+    assert_eq!(snapshot.metrics.subagent_calls, 2);
+    assert_eq!(snapshot.metrics.subagent_failures, 0);
+
+    // Per-kind buckets must split the cost: explore got 7/5 input/output,
+    // delegate got 40/60. A regression that aggregates them would fail
+    // either equality.
+    let by_kind = &snapshot.metrics.subagent_by_kind;
+    assert_eq!(by_kind.explore.calls, 1);
+    assert_eq!(by_kind.explore.failures, 0);
+    assert_eq!(by_kind.explore.provider.input_tokens, Some(7));
+    assert_eq!(by_kind.explore.provider.output_tokens, Some(5));
+
+    assert_eq!(by_kind.delegate.calls, 1);
+    assert_eq!(by_kind.delegate.failures, 0);
+    assert_eq!(by_kind.delegate.provider.input_tokens, Some(40));
+    assert_eq!(by_kind.delegate.provider.output_tokens, Some(60));
+
+    // Untouched buckets stay zeroed.
+    assert_eq!(by_kind.plan.calls, 0);
+    assert_eq!(by_kind.review.calls, 0);
+    assert_eq!(by_kind.plan.provider.input_tokens, None);
+    assert_eq!(by_kind.review.provider.input_tokens, None);
+
+    let _ = fs::remove_dir_all(root);
+}
+
 // Regression test: previously the subagent's internal event channel had a
 // buffer of 8 with no receiver, and every parallel tool call pushed two
 // `AgentEvent` messages (`ToolCallStarted` and `ToolCallCompleted`). A

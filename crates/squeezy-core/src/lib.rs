@@ -8334,6 +8334,65 @@ pub struct CostSnapshot {
     pub estimated_usd_micros: Option<u64>,
 }
 
+/// Per-`SubagentKind` rollup attached to [`TurnMetrics`] /
+/// [`SessionMetrics`]. Each bucket carries the same counters as the
+/// aggregate `subagent_*` fields but scoped to a single kind so the
+/// operator can answer "is Explore burning the bulk of subagent tokens?"
+/// and tune `explore_model` accordingly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentKindMetrics {
+    #[serde(default)]
+    pub delegate: SubagentKindBucket,
+    #[serde(default)]
+    pub explore: SubagentKindBucket,
+    #[serde(default)]
+    pub plan: SubagentKindBucket,
+    #[serde(default)]
+    pub review: SubagentKindBucket,
+}
+
+impl SubagentKindMetrics {
+    pub fn merge(&mut self, other: &SubagentKindMetrics) {
+        self.delegate.merge(&other.delegate);
+        self.explore.merge(&other.explore);
+        self.plan.merge(&other.plan);
+        self.review.merge(&other.review);
+    }
+
+    /// Mutable handle to the bucket for `kind`. Returns `None` for kinds
+    /// outside the four audited buckets (delegate/explore/plan/review)
+    /// so callers can ignore intra-agent helper kinds like `doc_help`
+    /// without polluting the rollup.
+    pub fn bucket_mut(&mut self, kind: &str) -> Option<&mut SubagentKindBucket> {
+        match kind {
+            "delegate" => Some(&mut self.delegate),
+            "explore" => Some(&mut self.explore),
+            "plan" => Some(&mut self.plan),
+            "review" => Some(&mut self.review),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentKindBucket {
+    pub calls: u64,
+    pub failures: u64,
+    pub tool_calls: u64,
+    pub bytes_read: u64,
+    pub provider: CostSnapshot,
+}
+
+impl SubagentKindBucket {
+    pub fn merge(&mut self, other: &SubagentKindBucket) {
+        self.calls += other.calls;
+        self.failures += other.failures;
+        self.tool_calls += other.tool_calls;
+        self.bytes_read += other.bytes_read;
+        merge_cost_snapshot(&mut self.provider, &other.provider);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub turns: u64,
@@ -8364,6 +8423,8 @@ pub struct SessionMetrics {
     pub redactions: u64,
     pub provider: CostSnapshot,
     pub subagent_provider: CostSnapshot,
+    #[serde(default)]
+    pub subagent_by_kind: SubagentKindMetrics,
 }
 
 impl SessionMetrics {
@@ -8396,6 +8457,7 @@ impl SessionMetrics {
         self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
         merge_cost_snapshot(&mut self.subagent_provider, &turn.subagent_provider);
+        self.subagent_by_kind.merge(&turn.subagent_by_kind);
     }
 }
 
@@ -8428,6 +8490,8 @@ pub struct TurnMetrics {
     pub redactions: u64,
     pub provider: CostSnapshot,
     pub subagent_provider: CostSnapshot,
+    #[serde(default)]
+    pub subagent_by_kind: SubagentKindMetrics,
 }
 
 impl TurnMetrics {
