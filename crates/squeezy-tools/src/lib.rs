@@ -92,10 +92,10 @@ use specs::{
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notes_recall_spec, notes_remember_spec, plan_patch_spec, read_file_spec,
-    read_slice_spec, read_tool_output_spec, reference_search_spec, refresh_compiler_facts_spec,
-    repo_map_spec, shell_spec, symbol_context_spec, upstream_flow_spec, verify_spec, webfetch_spec,
-    websearch_spec, write_file_spec,
+    mcp_tool_spec, notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec,
+    read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
+    refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
+    upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1235,6 +1235,7 @@ impl ToolRegistry {
             load_skill_spec(),
             notes_remember_spec(),
             notes_recall_spec(),
+            observations_spec(),
         ];
         if !self.mcp.has_no_enabled_servers() {
             specs.extend([
@@ -1312,9 +1313,8 @@ impl ToolRegistry {
             "checkpoint_list" | "checkpoint_show" | "decl_search" | "definition_search"
             | "diff_context" | "downstream_flow" | "glob" | "grep" | "hierarchy" | "plan_patch"
             | "read_file" | "read_slice" | "read_tool_output" | "reference_search" | "repo_map"
-            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill" => {
-                PermissionScope::Read
-            }
+            | "symbol_context" | "upstream_flow" | "list_skills" | "load_skill"
+            | "observations" => PermissionScope::Read,
             _ => PermissionScope::Read,
         }
     }
@@ -1982,6 +1982,7 @@ impl ToolRegistry {
                 "load_skill" => self.execute_load_skill(&call).await,
                 "notes_remember" => self.execute_notes_remember(&call).await,
                 "notes_recall" => self.execute_notes_recall(&call).await,
+                "observations" => self.execute_observations(&call).await,
                 _ => make_result(
                     &call,
                     ToolStatus::Error,
@@ -2232,6 +2233,53 @@ impl ToolRegistry {
                 )
             }
             Err(err) => tool_error(call, format!("notes_recall failed: {err}")),
+        }
+    }
+
+    async fn execute_observations(&self, call: &ToolCall) -> ToolResult {
+        let args = match serde_json::from_value::<ObservationsArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        let Some(store) = self.state_store.as_deref() else {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({ "error": "observations requires the persistent store; no store handle available" }),
+                ToolCostHint::default(),
+                None,
+            );
+        };
+        let limit = args.limit.unwrap_or(10).clamp(1, 50) as usize;
+        let query = args.query.as_deref().map(str::trim).unwrap_or("");
+        let lookup = if query.is_empty() {
+            store.list_recent_observations(limit)
+        } else {
+            store.search_observations(query, limit)
+        };
+        match lookup {
+            Ok(matches) => {
+                let items: Vec<Value> = matches
+                    .into_iter()
+                    .map(|obs| {
+                        json!({
+                            "id": obs.id,
+                            "timestamp": obs.updated_unix_millis,
+                            "kind": format!("{:?}", obs.kind).to_ascii_lowercase(),
+                            "summary": obs.text,
+                            "tags": obs.tags,
+                        })
+                    })
+                    .collect();
+                make_result(
+                    call,
+                    ToolStatus::Success,
+                    json!({ "observations": items }),
+                    ToolCostHint::default(),
+                    None,
+                )
+            }
+            Err(err) => tool_error(call, format!("observations failed: {err}")),
         }
     }
 
@@ -3597,6 +3645,14 @@ struct NotesRememberArgs {
 #[derive(Debug, Deserialize)]
 struct NotesRecallArgs {
     query: String,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ObservationsArgs {
+    #[serde(default)]
+    query: Option<String>,
     #[serde(default)]
     limit: Option<u32>,
 }

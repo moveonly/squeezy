@@ -5608,6 +5608,7 @@ fn tool_specs_are_sorted_by_name() {
             "load_skill",
             "notes_recall",
             "notes_remember",
+            "observations",
             "plan_patch",
             "read_file",
             "read_slice",
@@ -7788,6 +7789,111 @@ async fn notes_tools_fail_when_no_store_handle_available() {
                     "kind": "note",
                     "text": "no store available"
                 }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+}
+
+#[tokio::test]
+async fn observations_tool_lists_recent_and_searches_existing_store() {
+    use squeezy_store::{Observation, ObservationKind};
+
+    let root = temp_workspace("observations_tool");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("open store"));
+
+    let seeded = [
+        (
+            ObservationKind::Decision,
+            "Prefer ripgrep over grep for workspace search.",
+            vec!["search", "tooling"],
+            "audit",
+        ),
+        (
+            ObservationKind::Convention,
+            "Public APIs document units explicitly.",
+            vec!["docs"],
+            "convention-log",
+        ),
+        (
+            ObservationKind::DeadEnd,
+            "Attempted to vendor libgit2; build broke on Windows.",
+            vec!["build", "git"],
+            "post-mortem",
+        ),
+    ];
+    let mut put_ids = Vec::new();
+    for (kind, text, tags, source) in seeded.iter() {
+        let mut obs = Observation::new(*kind, *text, *source);
+        obs.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
+        let stored = store.put_observation(obs).expect("put observation");
+        put_ids.push(stored.id);
+    }
+
+    let registry = registry_with_state_store(&root, store.clone());
+
+    // Default (no query) returns newest-first, capped by `limit`.
+    let listed = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_list".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(listed.status, ToolStatus::Success);
+    let listed_items = listed.content["observations"]
+        .as_array()
+        .expect("observations array");
+    assert_eq!(listed_items.len(), seeded.len());
+    let first = &listed_items[0];
+    assert_eq!(first["id"], put_ids[2]);
+    assert_eq!(first["kind"], "deadend");
+    assert_eq!(first["summary"], seeded[2].1);
+    assert_eq!(first["tags"], json!(["build", "git"]));
+    assert!(first["timestamp"].is_number());
+    // Recency ordering: newest seeded first, oldest last.
+    let ordered_ids: Vec<&str> = listed_items
+        .iter()
+        .map(|item| item["id"].as_str().expect("id string"))
+        .collect();
+    let expected_recent: Vec<&str> = put_ids.iter().rev().map(String::as_str).collect();
+    assert_eq!(ordered_ids, expected_recent);
+
+    // Query path delegates to `search_observations` and honours `limit`.
+    let searched = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_search".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({"query": "ripgrep", "limit": 5}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(searched.status, ToolStatus::Success);
+    let searched_items = searched.content["observations"]
+        .as_array()
+        .expect("observations array");
+    assert_eq!(searched_items.len(), 1);
+    assert_eq!(searched_items[0]["id"], put_ids[0]);
+    assert_eq!(searched_items[0]["kind"], "decision");
+    assert_eq!(searched_items[0]["summary"], seeded[0].1);
+}
+
+#[tokio::test]
+async fn observations_tool_fails_without_store_handle() {
+    let root = temp_workspace("observations_no_store");
+    let registry = registry_with_runtime_config(&root, ToolRuntimeConfig::default());
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "obs_no_store".to_string(),
+                name: "observations".to_string(),
+                arguments: json!({}),
             },
             CancellationToken::new(),
         )
