@@ -3,7 +3,7 @@ use squeezy_agent::Agent;
 use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldKind, FieldValue};
 
 use super::{
-    ConfigScope, ConfigScreenState, EditorOutcome, KeyOutcome, ModelPickerState,
+    ConfigScope, ConfigScreenState, EditorOutcome, FieldEditor, KeyOutcome, ModelPickerState,
     SearchOverlayState, SecretEntryState, clear_scope_override, clear_scope_override_silent,
     compute_search_matches, cycle_to_next_registry_model, discard_all_session_writes,
     handle_editor_key, model_field_meta, open_editor_for, perform_reset, picker_matches,
@@ -586,9 +586,6 @@ fn handle_secret_entry_key(
         (KeyCode::Char(c), m)
             if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
         {
-            // Bracketed paste delivers each char individually through the
-            // event loop, so this handles both interactive typing and
-            // paste from the clipboard.
             entry.insert_char(c);
         }
         (KeyCode::Enter, _) => {
@@ -624,6 +621,78 @@ fn handle_secret_entry_key(
         _ => {}
     }
     KeyOutcome::KeepOpen
+}
+
+/// Dispatch a `crossterm::Event::Paste` payload while the config screen is
+/// open. Bracketed paste arrives as one `Event::Paste(text)` — not as a
+/// stream of `KeyEvent::Char` events — so without this hook the active
+/// input field never sees the pasted text. Routes to whichever sub-mode
+/// owns the cursor (secret entry, search, picker, or field editor).
+pub(crate) fn handle_paste(state: &mut ConfigScreenState, text: &str) {
+    // Most config inputs are single-line scalars; take only the first line
+    // so a stray trailing newline from the clipboard does not commit early
+    // or look garbled in the masked secret entry.
+    let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
+    let line = match cleaned.lines().next() {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    if let Some(entry) = state.secret_entry.as_mut() {
+        for c in line.chars() {
+            entry.insert_char(c);
+        }
+        return;
+    }
+
+    if let Some(search) = state.search.as_mut() {
+        search.query.push_str(line);
+        search.matches = compute_search_matches(&search.query);
+        search.cursor = 0;
+        return;
+    }
+
+    if let Some(picker) = state.picker.as_mut() {
+        picker.filter.push_str(line);
+        picker.cursor = 0;
+        return;
+    }
+
+    if let Some(editor) = state.editor.as_mut() {
+        insert_into_editor(editor, line);
+    }
+}
+
+fn insert_into_editor(editor: &mut FieldEditor, text: &str) {
+    match editor {
+        FieldEditor::Text { draft, cursor }
+        | FieldEditor::StringList { draft, cursor }
+        | FieldEditor::Path { draft, cursor } => {
+            insert_chars_at(draft, cursor, text.chars());
+        }
+        FieldEditor::Integer { draft, cursor, .. }
+        | FieldEditor::OptionalInteger { draft, cursor, .. }
+        | FieldEditor::Duration { draft, cursor } => {
+            insert_chars_at(
+                draft,
+                cursor,
+                text.chars().filter(|c| c.is_ascii_digit() || *c == '-'),
+            );
+        }
+        FieldEditor::Enum { .. } | FieldEditor::OptionalEnum { .. } | FieldEditor::Bool(_) => {}
+    }
+}
+
+fn insert_chars_at(draft: &mut String, cursor: &mut usize, chars: impl IntoIterator<Item = char>) {
+    let mut existing: Vec<char> = draft.chars().collect();
+    for c in chars {
+        if *cursor > existing.len() {
+            *cursor = existing.len();
+        }
+        existing.insert(*cursor, c);
+        *cursor += 1;
+    }
+    *draft = existing.into_iter().collect();
 }
 
 fn handle_search_key(state: &mut ConfigScreenState, key: KeyEvent) -> KeyOutcome {

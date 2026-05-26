@@ -1092,6 +1092,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
     let normalized = normalize_pasted_text(&text);
+    // The config screen owns its own set of focusable text inputs (secret
+    // entry, search, picker filter, field editor). Route paste there
+    // instead of attaching it as transcript context when the screen is up.
+    if let Some(state) = app.config_screen.as_mut() {
+        config_screen::handle_paste(state, &normalized);
+        return Ok(());
+    }
     if app
         .pending_mcp_elicitation
         .as_ref()
