@@ -127,6 +127,60 @@ fn parse_chat_event_emits_text_delta() {
 }
 
 #[test]
+fn parse_chat_event_emits_text_delta_for_array_shape_content() {
+    // Some aggregator routes (notably Qwen via OpenRouter/PortKey) stream
+    // `content` as an array of content parts instead of a bare string.
+    // The old parser silently dropped these — see the regression caught
+    // on `portkey:@openrouter/qwen/qwen3.6-35b-a3b` where every assistant
+    // turn billed output tokens but the stored text was empty.
+    let mut state = StreamState::default();
+    let events = parse_chat_event(
+        r#"{"id":"r","choices":[{"delta":{"content":[{"type":"text","text":"hel"},{"type":"text","text":"lo"}]}}]}"#,
+        &mut state,
+    )
+    .expect("valid event");
+    assert_eq!(events, vec![LlmEvent::TextDelta("hello".to_string())]);
+}
+
+#[test]
+fn parse_chat_event_emits_text_delta_for_part_with_delta_key() {
+    // Responses-style content parts use `delta` rather than `text` for the
+    // streamed increment. Accept both.
+    let mut state = StreamState::default();
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"content":[{"type":"output_text_delta","delta":"world"}]}}]}"#,
+        &mut state,
+    )
+    .expect("valid event");
+    assert_eq!(events, vec![LlmEvent::TextDelta("world".to_string())]);
+}
+
+#[test]
+fn parse_chat_event_emits_reasoning_delta_for_array_shape() {
+    let mut state = StreamState::default();
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":[{"type":"reasoning","text":"think"}]}}]}"#,
+        &mut state,
+    )
+    .expect("valid event");
+    assert_eq!(
+        events,
+        vec![LlmEvent::ReasoningDelta {
+            text: "think".to_string(),
+            kind: ReasoningKind::Summary,
+        }]
+    );
+}
+
+#[test]
+fn parse_chat_event_ignores_unknown_delta_shapes_without_panic() {
+    let mut state = StreamState::default();
+    let events = parse_chat_event(r#"{"choices":[{"delta":{"content":42}}]}"#, &mut state)
+        .expect("valid event");
+    assert!(events.is_empty());
+}
+
+#[test]
 fn parse_chat_event_accumulates_tool_call_across_deltas() {
     let mut state = StreamState::default();
     parse_chat_event(
