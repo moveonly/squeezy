@@ -350,7 +350,11 @@ impl ConfigScreenState {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
-            SectionId::Reset => RESET_ACTIONS.len(),
+            // The Reset section only ever surfaces the action for the active
+            // scope tab — resetting another tab's file from here would be
+            // confusing and the tier-tab context already disambiguates which
+            // file is being targeted.
+            SectionId::Reset => 1,
             _ => section.fields.len(),
         }
     }
@@ -376,9 +380,11 @@ impl ConfigScreenState {
     }
 
     /// Reset action for the focused row when the active section is `Reset`.
-    pub(crate) fn reset_action_at_row(&self, row: usize) -> Option<&'static ResetAction> {
+    /// There is exactly one row, and it always targets the active scope
+    /// tab's file.
+    pub(crate) fn reset_action_at_row(&self, _row: usize) -> Option<&'static ResetAction> {
         if self.current_section().id == SectionId::Reset {
-            RESET_ACTIONS.get(row)
+            RESET_ACTIONS.iter().find(|a| a.scope == self.scope)
         } else {
             None
         }
@@ -604,33 +610,19 @@ fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Opt
 
 /// Inheritance badge label shown next to the field's value.
 ///
-/// The vocabulary is intentionally uniform across tabs:
-///   - `[env]`                — overridden by an environment variable.
-///   - `[inherited-default]`  — falls through to the binary defaults.
-///   - `[inherited-<tier>]`   — falls through to a higher-precedence tier.
-///   - bare tier name         — the value lives in the active tab's file.
-///
-/// Treating the binary defaults as `[inherited-default]` on every tab
-/// (including User) keeps the labelling honest: the User tab does not own
-/// a value that nobody has typed, so it shouldn't read as `[default]` as
-/// if it were a deliberate setting.
-pub(crate) fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
+/// Returns `[env]` when the running value is dictated by an environment
+/// variable — the only case worth surfacing inline, because env-shadowed
+/// fields are inert in the editor and Enter / Space refuses to write
+/// them. Every other source (own tier, inherited tier, binary default)
+/// is rendered without a trailing badge: the displayed value is the
+/// effective one, the tier the user is editing is already visible in
+/// the tab strip, and badges like "repo" or "[inherited-default]" turn
+/// out to be noise that the user has to mentally filter on every row.
+pub(crate) fn inheritance_label(_active: ConfigScope, source: FieldSource) -> String {
     if source == FieldSource::Env {
-        return "[env]".to_string();
-    }
-    if source == FieldSource::Default {
-        return "[inherited-default]".to_string();
-    }
-    let scope_of_source = match source {
-        FieldSource::User => ConfigScope::User,
-        FieldSource::Project => ConfigScope::Repo,
-        FieldSource::Repo => ConfigScope::Local,
-        FieldSource::Env | FieldSource::Default => unreachable!(),
-    };
-    if scope_of_source == active {
-        active.label().to_lowercase()
+        "[env]".to_string()
     } else {
-        format!("[inherited-{}]", scope_of_source.label().to_lowercase())
+        String::new()
     }
 }
 

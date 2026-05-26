@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     io::{self, Write},
     path::PathBuf,
@@ -29,7 +29,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Paragraph, Widget, Wrap},
 };
 #[cfg(test)]
 use squeezy_agent::RequestUserInputChoice;
@@ -103,7 +103,16 @@ const LONG_ASSISTANT_CHARS: usize = 1_200;
 const TOOL_PREVIEW_COMPACT_BYTES: usize = 300;
 const TOOL_PREVIEW_NORMAL_BYTES: usize = 1_200;
 const TOOL_PREVIEW_VERBOSE_BYTES: usize = 4_000;
-const SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES: usize = 80;
+/// Default tool-card cap for model-initiated tool calls. Matches codex's
+/// `TOOL_CALL_MAX_LINES`. Aggressive on purpose — the structured detail
+/// is one keystroke (Ctrl-E / Ctrl-T) away, and a 5-line preview keeps
+/// the transcript readable even when the model fires off long commands.
+const TOOL_CALL_MAX_LINES: usize = 5;
+/// Larger cap for `!`-shell calls the user typed directly (those carry
+/// `direct_user_shell: true` in their arguments, set by
+/// `local_shell_command_call` in the agent). Mirrors codex's
+/// `USER_SHELL_TOOL_CALL_MAX_LINES`.
+const USER_SHELL_TOOL_CALL_MAX_LINES: usize = 50;
 const PROMPT_MIN_HEIGHT: u16 = 3;
 const PROMPT_MAX_HEIGHT: u16 = 8;
 const INLINE_VIEWPORT_HEIGHT: u16 = 18;
@@ -350,14 +359,25 @@ async fn run_inner(
 
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
-        app.app_notifications.tick();
+        if app.app_notifications.tick() {
+            app.needs_redraw = true;
+        }
         if app.animation_tick.is_multiple_of(settings_poll_every)
             && app.config_screen.is_none()
             && settings_watcher.poll()
         {
             apply_external_settings_reload(&mut app, &mut agent);
+            app.needs_redraw = true;
         }
-        terminal.draw_app(&mut app)?;
+        // Only repaint when state actually changed (`needs_redraw`), a
+        // resize is pending, or something visible is currently animating.
+        // Skipping the draw on idle iterations stops the continuous
+        // stdout traffic that triggers terminal emulators' per-tab
+        // activity indicators.
+        if app.needs_redraw || app.pending_resize || app.has_active_animation() {
+            terminal.draw_app(&mut app)?;
+            app.needs_redraw = false;
+        }
 
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
@@ -648,6 +668,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
         return Ok(false);
     }
 
+    // Any event we read here either drives a state mutation directly or
+    // arms `pending_resize` for the next draw. In every non-timeout
+    // branch we flip `needs_redraw` so the main loop knows to repaint.
+    app.needs_redraw = true;
     match event::read().map_err(|err| SqueezyError::Terminal(err.to_string()))? {
         Event::Key(key) => handle_key(app, agent, key).await,
         Event::Mouse(mouse) => {
@@ -759,6 +783,27 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         } else {
             move_input_cursor_line_end(app);
         }
+        return Ok(false);
+    }
+
+    // Ctrl+T toggles the full-screen transcript overlay. While the
+    // overlay is open, the rest of `handle_key` is preempted by the
+    // dispatcher below so input/turn handling stays out of the way.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        app.transcript_overlay = if app.transcript_overlay.is_some() {
+            None
+        } else {
+            Some(TranscriptOverlayState::default())
+        };
+        app.status = if app.transcript_overlay.is_some() {
+            "transcript overlay (Esc to close)".to_string()
+        } else {
+            "transcript overlay closed".to_string()
+        };
+        return Ok(false);
+    }
+
+    if app.transcript_overlay.is_some() && handle_transcript_overlay_key(app, key) {
         return Ok(false);
     }
 
@@ -1394,6 +1439,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 changed,
                 if changed == 1 { "y" } else { "ies" }
             );
+            return true;
+        }
+        "/diff" => {
+            handle_slash_diff(app);
             return true;
         }
         "/verbosity" => {
@@ -2263,6 +2312,60 @@ fn select_next_transcript_entry(app: &mut TuiApp) {
     app.status = format!("selected transcript entry {}", entry.id + 1);
 }
 
+/// Handle a keystroke while the full-screen transcript overlay is open.
+/// Returns `true` when the key was consumed so the caller does not also
+/// dispatch it to the normal input/turn paths.
+fn handle_transcript_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
+    if app.transcript_overlay.is_none() {
+        return false;
+    }
+    const PAGE: u16 = 10;
+    match key.code {
+        KeyCode::Esc => {
+            app.transcript_overlay = None;
+            app.status = "transcript overlay closed".to_string();
+            true
+        }
+        KeyCode::PageUp => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_sub(PAGE);
+            }
+            true
+        }
+        KeyCode::PageDown => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_add(PAGE);
+            }
+            true
+        }
+        KeyCode::Up => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_sub(1);
+            }
+            true
+        }
+        KeyCode::Down => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = state.scroll.saturating_add(1);
+            }
+            true
+        }
+        KeyCode::Home => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = 0;
+            }
+            true
+        }
+        KeyCode::End => {
+            if let Some(state) = app.transcript_overlay.as_mut() {
+                state.scroll = u16::MAX;
+            }
+            true
+        }
+        _ => true, // swallow everything else so the overlay stays modal
+    }
+}
+
 fn toggle_selected_transcript_entry(app: &mut TuiApp) {
     let selected = app.selected_entry.filter(|index| {
         app.transcript
@@ -3047,6 +3150,10 @@ fn format_approval_menu_lines(
 
 fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if app.transcript_overlay.is_some() {
+        render_transcript_overlay(frame, area, app);
+        return;
+    }
     if let Some(state) = &app.config_screen {
         let notif_h = app.app_notifications.height();
         let chunks = Layout::default()
@@ -3601,6 +3708,87 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp, include_st
     frame.render_widget(paragraph, area);
 }
 
+/// State for the full-screen transcript overlay (Ctrl+T). All transcript
+/// entries are rendered in their fully-expanded form regardless of each
+/// entry's collapsed flag; the user scrolls with PgUp/PgDn/arrows.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TranscriptOverlayState {
+    pub(crate) scroll: u16,
+}
+
+/// Render the full-screen transcript overlay. Replaces the normal
+/// transcript + prompt layout while `app.transcript_overlay` is `Some`.
+fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    let state = match app.transcript_overlay {
+        Some(state) => state,
+        None => return,
+    };
+    let title = " Transcript — Ctrl-T or Esc to close · PgUp/PgDn scroll ";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(GOLD))
+        .title(Span::styled(
+            title,
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = transcript_lines_for_overlay(app, Some(inner.width));
+    let paragraph = Paragraph::new(lines)
+        .scroll((state.scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, inner);
+}
+
+/// Build the per-entry line list for the overlay: every entry is forced
+/// to its expanded form. Skips the pending-assistant tail since the
+/// overlay is a snapshot of committed transcript content.
+fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (index, entry) in app.transcript.iter().enumerate() {
+        lines.extend(format_transcript_entry_expanded(
+            entry,
+            app.selected_entry == Some(index),
+            app.tool_output_verbosity,
+            message_outcome(&app.transcript, index),
+            width,
+            app.show_reasoning_usage,
+        ));
+    }
+    lines
+}
+
+fn format_transcript_entry_expanded(
+    entry: &TranscriptEntry,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    outcome: MessageOutcome,
+    width: Option<u16>,
+    show_reasoning: bool,
+) -> Vec<Line<'static>> {
+    match &entry.kind {
+        TranscriptEntryKind::Message(item) => {
+            format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
+        }
+        TranscriptEntryKind::ToolResult(tool) => {
+            format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
+        }
+        TranscriptEntryKind::Log(message) => format_log_entry(message, false, selected),
+        TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
+        TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, false);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
 fn transcript_lines_for_render(
     app: &TuiApp,
     width: Option<u16>,
@@ -3853,6 +4041,7 @@ fn format_transcript_entry_with_width(
         ),
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
+        TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
             if show_reasoning {
                 let mut lines = reasoning_block_lines(&snapshot.display_text, entry.collapsed);
@@ -3875,6 +4064,134 @@ fn format_plan_card_entry(
     if collapsed {
         return lines.into_iter().take(1).collect();
     }
+    lines
+}
+
+/// Run the `/diff` slash command: capture a worktree diff (tracked +
+/// untracked) via `GitVcs::snapshot` and push a styled card into the
+/// transcript. On a clean tree or a non-git workspace we surface a log
+/// advisory instead of an empty card. Mirrors codex's `get_git_diff` +
+/// `disable_output_cap` UX — never truncated, always renderable via the
+/// existing `render::diff` helpers.
+fn handle_slash_diff(app: &mut TuiApp) {
+    let workspace_root = app.workspace_root.clone();
+    let vcs = match GitVcs::open(&workspace_root) {
+        Ok(vcs) => vcs,
+        Err(err) => {
+            app.push_log(format!("/diff failed to open workspace VCS: {err}"));
+            return;
+        }
+    };
+    let snapshot = vcs.snapshot(
+        DiffMode::Worktree,
+        DiffOptions {
+            include_patch: true,
+            ..DiffOptions::default()
+        },
+    );
+    if snapshot.vcs.kind != VcsKind::Git {
+        app.push_log("/diff: workspace is not a git repository".to_string());
+        return;
+    }
+    if !snapshot.errors.is_empty() {
+        for error in &snapshot.errors {
+            app.push_log(format!("/diff git error: {error}"));
+        }
+    }
+    if snapshot.files.is_empty() {
+        app.push_log("/diff: no uncommitted changes".to_string());
+        return;
+    }
+    let card = build_diff_card(&snapshot);
+    app.push_diff_card(card);
+}
+
+/// Build a renderable diff card from a worktree snapshot. Files are
+/// listed in path order with a per-file header (`path +A -D`) followed
+/// by the styled patch body. Binary files render a one-line marker.
+fn build_diff_card(snapshot: &squeezy_vcs::DiffSnapshot) -> DiffCardData {
+    let summary = format!(
+        "{} file{} · +{} -{}{}",
+        snapshot.summary.files_changed,
+        if snapshot.summary.files_changed == 1 {
+            ""
+        } else {
+            "s"
+        },
+        snapshot.summary.additions,
+        snapshot.summary.deletions,
+        if snapshot.summary.untracked_files > 0 {
+            format!(" · {} untracked", snapshot.summary.untracked_files)
+        } else {
+            String::new()
+        },
+    );
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut plain = String::new();
+    for (index, file) in snapshot.files.iter().enumerate() {
+        if index > 0 {
+            lines.push(Line::from(""));
+            plain.push('\n');
+        }
+        let header = format!(
+            "{} {}{}",
+            file.code,
+            file.path,
+            if file.additions > 0 || file.deletions > 0 {
+                format!(" +{} -{}", file.additions, file.deletions)
+            } else {
+                String::new()
+            }
+        );
+        lines.push(Line::from(Span::styled(
+            header.clone(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        )));
+        plain.push_str(&header);
+        plain.push('\n');
+        let file_lines = render::diff::render_diff_file(file);
+        for line in &file_lines {
+            plain.push_str(
+                &line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join(""),
+            );
+            plain.push('\n');
+        }
+        lines.extend(file_lines);
+    }
+    DiffCardData {
+        summary,
+        plain,
+        lines,
+    }
+}
+
+fn format_diff_card_entry(
+    data: &DiffCardData,
+    collapsed: bool,
+    selected: bool,
+) -> Vec<Line<'static>> {
+    let header = action_line_spans(
+        selected,
+        "✱",
+        GOLD,
+        "Diff",
+        GOLD,
+        vec![Span::styled(
+            data.summary.clone(),
+            Style::default().fg(QUIET),
+        )],
+    );
+    if collapsed {
+        return vec![header];
+    }
+    let mut lines = Vec::with_capacity(data.lines.len() + 1);
+    lines.push(header);
+    lines.extend(data.lines.iter().cloned());
     lines
 }
 
@@ -4420,18 +4737,6 @@ fn format_tool_result_entry(
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
-    if collapsed {
-        let mut lines = vec![action_line_spans(
-            selected,
-            marker,
-            color,
-            action,
-            color,
-            summary_spans,
-        )];
-        lines.extend(collapsed_tool_preview_lines(tool, width));
-        return lines;
-    }
     let mut lines = vec![action_line_spans(
         selected,
         marker,
@@ -4440,32 +4745,100 @@ fn format_tool_result_entry(
         color,
         summary_spans,
     )];
-    lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
+    if collapsed {
+        lines.extend(collapsed_tool_preview_lines(
+            tool,
+            tool_output_verbosity,
+            width,
+        ));
+    } else {
+        lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
+    }
     lines
 }
 
-fn collapsed_tool_preview_lines(tool: &ToolTranscript, width: Option<u16>) -> Vec<Line<'static>> {
-    if let Some(lines) = collapsed_shell_preview_lines(tool, width) {
+/// Whether this tool result was triggered by the user typing `!<command>`
+/// (a "direct user shell" call), as opposed to being initiated by the
+/// model. Mirrors codex's `ExecCall::is_user_shell_command`. The agent
+/// stamps `direct_user_shell: true` on these calls in
+/// `local_shell_command_call` (crates/squeezy-agent/src/lib.rs).
+fn is_user_shell_call(tool: &ToolTranscript) -> bool {
+    let from_call = tool
+        .call
+        .as_ref()
+        .and_then(|call| call.arguments.get("direct_user_shell"))
+        .and_then(|value| value.as_bool());
+    if let Some(value) = from_call {
+        return value;
+    }
+    tool.result
+        .content
+        .get("direct_user_shell")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+/// Default cap for the collapsed tool-card preview.
+fn tool_preview_line_cap(tool: &ToolTranscript) -> usize {
+    if is_user_shell_call(tool) {
+        USER_SHELL_TOOL_CALL_MAX_LINES
+    } else {
+        TOOL_CALL_MAX_LINES
+    }
+}
+
+/// Tools whose expanded body is *the* point of the card (a small,
+/// structured artifact like a diff or a per-file summary) and which we
+/// therefore do not truncate by default. Matches codex's behaviour of
+/// never capping patch output.
+fn tool_bypasses_preview_cap(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "apply_patch" | "write_file" | "plan_patch" | "diff_context"
+    )
+}
+
+fn collapsed_tool_preview_lines(
+    tool: &ToolTranscript,
+    tool_output_verbosity: ToolOutputVerbosity,
+    _width: Option<u16>,
+) -> Vec<Line<'static>> {
+    if tool_bypasses_preview_cap(tool.result.tool_name.as_str()) {
+        return expanded_tool_detail_lines(tool, tool_output_verbosity);
+    }
+    let detail = expanded_tool_detail_lines(tool, tool_output_verbosity);
+    let cap = tool_preview_line_cap(tool);
+    head_tail_truncate_lines(detail, cap)
+}
+
+/// Head-tail truncate a list of rendered detail lines, inserting a single
+/// "… +N lines (Ctrl-E to expand)" ellipsis between the head and tail
+/// when the total exceeds `2 * cap`. Cap is the maximum number of lines
+/// to keep on EACH end. Mirrors codex's `output_ellipsis_line` UX —
+/// wording stays consistent with the existing diff renderer
+/// (see `render::diff::head_tail`).
+fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'static>> {
+    if cap == 0 || lines.len() <= cap.saturating_mul(2) {
         return lines;
     }
-    if !matches!(tool.result.status, ToolStatus::Success)
-        || !matches!(tool.result.tool_name.as_str(), "apply_patch" | "write_file")
-    {
-        return Vec::new();
-    }
-    let Some(file) = edit_changed_files(tool).into_iter().find(|file| {
-        file.patch
-            .as_ref()
-            .is_some_and(|patch| !patch.trim().is_empty())
-    }) else {
-        return Vec::new();
-    };
-    let Some(patch) = file.patch.as_deref() else {
-        return Vec::new();
-    };
-    let mut lines = vec![detail_line(false, QUIET, format!("diff {}", file.path))];
-    lines.extend(render_diff_patch_preview_lines(patch, 10));
-    lines
+    let omitted = lines.len().saturating_sub(cap * 2);
+    let mut out = Vec::with_capacity(cap * 2 + 1);
+    out.extend(lines.iter().take(cap).cloned());
+    out.push(detail_line(
+        false,
+        QUIET,
+        format!("… +{omitted} lines (Ctrl-E to expand)"),
+    ));
+    out.extend(
+        lines
+            .into_iter()
+            .rev()
+            .take(cap)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev(),
+    );
+    out
 }
 
 fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
@@ -5019,6 +5392,45 @@ struct EditChangedFile {
     patch_truncated: bool,
 }
 
+/// Extract the file paths an apply_patch / write_file invocation targets,
+/// used to dedupe transient failure/success pairs in [`TuiApp::recent_edit_failures`].
+/// Falls back across the several places the path may live: the result
+/// content (success path), the result `failed_path` field (apply_patch
+/// fallback), and the call arguments (write_file).
+fn edit_target_paths(result: &ToolResult, call: Option<&ToolCall>) -> Vec<PathBuf> {
+    if !matches!(result.tool_name.as_str(), "apply_patch" | "write_file") {
+        return Vec::new();
+    }
+    let mut paths: BTreeSet<PathBuf> = BTreeSet::new();
+    if let Some(files) = result.content["files"].as_array() {
+        for item in files {
+            if let Some(path) = item["path"].as_str() {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(files) = result.content["checkpoint"]["files"].as_array() {
+        for item in files {
+            if let Some(path) = item["path"].as_str() {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+    if let Some(failed_path) = result.content["failed_path"].as_str() {
+        paths.insert(PathBuf::from(failed_path));
+    }
+    if let Some(path) = result.content["path"].as_str() {
+        paths.insert(PathBuf::from(path));
+    }
+    if paths.is_empty()
+        && let Some(call) = call
+        && let Some(path) = string_arg(&call.arguments, "path")
+    {
+        paths.insert(PathBuf::from(path));
+    }
+    paths.into_iter().collect()
+}
+
 fn edit_changed_files(tool: &ToolTranscript) -> Vec<EditChangedFile> {
     let mut files = tool.result.content["checkpoint"]["files"]
         .as_array()
@@ -5176,21 +5588,21 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
         }
         "repo_map" => "repo map".to_string(),
         "definition_search" => string_arg(&call.arguments, "query")
-            .map(|query| format!("definition search for {query}"))
+            .map(|query| format!("definition search for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "definition search".to_string()),
         "reference_search" => string_arg(&call.arguments, "query")
             .or_else(|| string_arg(&call.arguments, "symbol_id"))
-            .map(|query| format!("reference search for {query}"))
+            .map(|query| format!("reference search for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "reference search".to_string()),
         "symbol_context" => string_arg(&call.arguments, "query")
-            .map(|query| format!("symbol context for {query}"))
+            .map(|query| format!("symbol context for {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "symbol context".to_string()),
         "grep" => string_arg(&call.arguments, "query")
             .or_else(|| string_arg(&call.arguments, "pattern"))
-            .map(|query| format!("grep {query}"))
+            .map(|query| format!("grep {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "grep".to_string()),
         "glob" => string_arg(&call.arguments, "pattern")
-            .map(|pattern| format!("glob {pattern}"))
+            .map(|pattern| format!("glob {}", compact_text(&pattern, 60)))
             .unwrap_or_else(|| "glob".to_string()),
         "read_file" | "read_slice" => string_arg(&call.arguments, "path")
             .map(|path| format!("read {path}"))
@@ -5208,7 +5620,7 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
             .map(|url| format!("fetch {url}"))
             .unwrap_or_else(|| "web fetch".to_string()),
         "websearch" => string_arg(&call.arguments, "query")
-            .map(|query| format!("web search {query}"))
+            .map(|query| format!("web search {}", compact_text(&query, 60)))
             .unwrap_or_else(|| "web search".to_string()),
         _ => call.name.clone(),
     }
@@ -5314,25 +5726,6 @@ fn expanded_shell_detail_lines(
     lines
 }
 
-fn collapsed_shell_preview_lines(
-    tool: &ToolTranscript,
-    width: Option<u16>,
-) -> Option<Vec<Line<'static>>> {
-    if !matches!(tool.result.tool_name.as_str(), "shell" | "verify")
-        || tool.result.status != ToolStatus::Success
-    {
-        return None;
-    }
-    let mut lines = shell_output_block_lines(tool, Some(SHELL_COLLAPSED_OUTPUT_PREVIEW_LINES));
-    if lines.is_empty() {
-        None
-    } else {
-        lines.insert(0, transcript_separator_line(width));
-        lines.push(transcript_separator_line(width));
-        Some(lines)
-    }
-}
-
 fn shell_output_block_lines(
     tool: &ToolTranscript,
     preview_limit: Option<usize>,
@@ -5386,11 +5779,6 @@ fn shell_output_line(content: &str) -> Line<'static> {
     let mut spans = vec![Span::raw("  ")];
     spans.extend(styled_output_spans(content));
     Line::from(spans)
-}
-
-fn transcript_separator_line(width: Option<u16>) -> Line<'static> {
-    let width = width.unwrap_or(96).max(8) as usize;
-    Line::from(Span::styled("─".repeat(width), Style::default().fg(QUIET)))
 }
 
 fn expanded_decl_search_detail_lines(
@@ -5677,13 +6065,6 @@ fn expanded_generic_tool_detail_lines(
 ) -> Vec<Line<'static>> {
     let preview = preview_tool_result(&tool.result, verbosity);
     output_block_lines("details", &preview, verbosity)
-}
-
-fn render_diff_patch_preview_lines(patch: &str, limit: usize) -> Vec<Line<'static>> {
-    render::diff::render_patch_preview_lines(patch, limit)
-        .into_iter()
-        .map(detail_rendered_line)
-        .collect()
 }
 
 fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
@@ -6264,6 +6645,13 @@ fn assistant_static_span(color: Color) -> Span<'static> {
 }
 
 fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
+    // At idle the coin is a steady AMBER ●. Animating it forced a real
+    // cell change every 320 ms, which kept terminal-emulator per-tab
+    // activity indicators buzzing forever even though the agent was
+    // doing nothing.
+    if app.turn_visual == TurnVisualState::Idle {
+        return Span::styled("●", Style::default().fg(AMBER));
+    }
     let color = if (prompt_elapsed_ms(app) / 800).is_multiple_of(2) {
         GOLD
     } else {
@@ -6274,6 +6662,9 @@ fn prompt_coin_span(app: &TuiApp) -> Span<'static> {
 
 fn prompt_coin_frame(app: &TuiApp) -> &'static str {
     const FRAMES: [&str; 8] = ["●", "◕", "◐", "◔", "○", "◔", "◑", "◕"];
+    if app.turn_visual == TurnVisualState::Idle {
+        return FRAMES[0];
+    }
     let elapsed_ms = prompt_elapsed_ms(app);
     let direction_reversed = (elapsed_ms / 60_000) % 2 == 1;
     let frame_index = ((elapsed_ms / 320) as usize) % FRAMES.len();
@@ -6652,7 +7043,48 @@ fn status_left_text(app: &TuiApp) -> String {
     } else {
         "no repo"
     };
-    format!("dir {} · git {}", app.directory, branch)
+    let mut base = format!("dir {} · git {}", app.directory, branch);
+    if let Some(segment) = turn_progress_segment(app) {
+        base.push_str(" · ");
+        base.push_str(&segment);
+    }
+    base
+}
+
+/// Compact mid-turn progress segment for the status bar — replaces the
+/// per-tool "running this turn: ... tokens · $X" and per-second "shell
+/// still running (Ns)" lines that used to be appended to the transcript
+/// log.
+fn turn_progress_segment(app: &TuiApp) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(tool) = app.active_tool.as_deref()
+        && let Some(elapsed_ms) = app.active_tool_elapsed_ms
+    {
+        parts.push(format!("⟳ {tool} {:.0}s", elapsed_ms as f64 / 1000.0));
+    }
+    if let Some(progress) = app.turn_progress {
+        parts.push(format!(
+            "{} tools · {} in · ${:.4}",
+            progress.tool_count,
+            compact_token_count(progress.input_tokens),
+            progress.micro_usd as f64 / 1_000_000.0,
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
+}
+
+fn compact_token_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.2}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn mode_status_text(app: &TuiApp) -> String {
@@ -6818,7 +7250,7 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
-        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand/collapse · Ctrl-Y copy · /help"
+        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help"
             .to_string();
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
@@ -6829,10 +7261,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand/collapse · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -7147,6 +7579,11 @@ pub(crate) struct TuiApp {
     pub(crate) mention_popup: Option<mention::MentionPopup>,
     pub(crate) workspace_files: Option<Arc<Vec<PathBuf>>>,
     pub(crate) overlay: Option<overlay::Overlay>,
+    /// Full-screen transcript overlay (Ctrl+T) that renders every entry
+    /// in its uncapped form. `None` = closed; `Some(state)` = open with
+    /// a scroll offset. Mirrors codex's `open_transcript_overlay` as the
+    /// escape hatch from the new aggressive default truncation.
+    pub(crate) transcript_overlay: Option<TranscriptOverlayState>,
     pub(crate) alternate_scroll_enabled: bool,
     pub(crate) attachments: Vec<ContextAttachment>,
     pub(crate) context_compaction: ContextCompactionState,
@@ -7229,8 +7666,26 @@ pub(crate) struct TuiApp {
     pub(crate) last_terminal_title: Option<String>,
     pub(crate) animation_tick: u64,
     pub(crate) animation_tick_rate: Duration,
+    /// Set by any state mutator that requires the next frame to repaint.
+    /// Cleared by the main loop immediately after `draw_app`. Without
+    /// this gate the loop redraws every ~50 ms and idle terminals show
+    /// continuous activity in their per-tab indicators.
+    pub(crate) needs_redraw: bool,
     pub(crate) exit_confirm_armed: bool,
     pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
+    /// Elapsed time on the currently-running tool, sourced from the
+    /// 1Hz `AgentEvent::ToolProgress` heartbeat. Cleared when the tool
+    /// finishes or the turn ends.
+    pub(crate) active_tool_elapsed_ms: Option<u64>,
+    /// Latest mid-turn cost snapshot, surfaced in the status bar instead
+    /// of being appended to the transcript log on every stride.
+    pub(crate) turn_progress: Option<TurnProgress>,
+    /// File paths whose most recent edit failed within the current turn,
+    /// mapped to the transcript entry id of that failure. When a later
+    /// edit on the same file succeeds, the failure row is removed so a
+    /// noisy `unified-diff fallback could not apply cleanly` that the
+    /// agent immediately recovered from doesn't end up in scrollback.
+    pub(crate) recent_edit_failures: HashMap<PathBuf, u64>,
     pub(crate) cost: squeezy_core::CostSnapshot,
     /// Session-level cap in USD micros, sourced from
     /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)
@@ -7349,6 +7804,7 @@ impl TuiApp {
             mention_popup: None,
             workspace_files: None,
             overlay: None,
+            transcript_overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
                 == TerminalMode::AlternateScreen,
             attachments: Vec::new(),
@@ -7384,8 +7840,14 @@ impl TuiApp {
             last_terminal_title: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
+            // Start dirty so the first iteration of the main loop paints
+            // the initial frame.
+            needs_redraw: true,
             exit_confirm_armed: false,
             active_tool_calls: BTreeMap::new(),
+            active_tool_elapsed_ms: None,
+            turn_progress: None,
+            recent_edit_failures: HashMap::new(),
             cost: squeezy_core::CostSnapshot::default(),
             cost_cap_usd_micros: config.max_session_cost_usd_micros.filter(|cap| *cap > 0),
             metrics: squeezy_core::TurnMetrics::default(),
@@ -7415,6 +7877,38 @@ impl TuiApp {
         }
         self.last_turn_duration = None;
         self.terminal_title_state = TerminalTitleState::Working;
+        self.turn_progress = None;
+        self.active_tool_elapsed_ms = None;
+        self.recent_edit_failures.clear();
+        self.needs_redraw = true;
+    }
+
+    /// Record the latest mid-turn cost/token snapshot for the status
+    /// bar. Repeated identical resends (the broker fires on a tool-count
+    /// stride, not a token delta) are dropped so the status bar doesn't
+    /// flicker.
+    pub(crate) fn update_turn_progress(
+        &mut self,
+        tool_count: u64,
+        input_tokens: u64,
+        micro_usd: u64,
+    ) {
+        let snapshot = TurnProgress {
+            tool_count,
+            input_tokens,
+            micro_usd,
+        };
+        if self.turn_progress == Some(snapshot) {
+            return;
+        }
+        self.turn_progress = Some(snapshot);
+    }
+
+    /// Update the active-tool elapsed clock. The tool name itself is
+    /// already tracked by [`Self::remember_active_tool_call`]; we only
+    /// need the elapsed-ms refresh from the 1Hz heartbeat.
+    pub(crate) fn note_active_tool_progress(&mut self, _tool_name: &str, elapsed_ms: u64) {
+        self.active_tool_elapsed_ms = Some(elapsed_ms);
     }
 
     pub(crate) fn note_turn_finished(&mut self) {
@@ -7422,6 +7916,22 @@ impl TuiApp {
             self.last_turn_duration = Some(started_at.elapsed());
         }
         self.terminal_title_state = TerminalTitleState::Notification;
+        // Status-bar progress snapshots only describe a live turn. The
+        // end-of-turn footer prints final totals separately.
+        self.turn_progress = None;
+        self.active_tool_elapsed_ms = None;
+        self.needs_redraw = true;
+    }
+
+    /// Whether the next frame would visibly differ from the current one
+    /// purely because some animation is in motion. Decoupled from
+    /// `needs_redraw`: state mutations set the dirty flag; this predicate
+    /// catches the case where nothing has mutated but the on-screen
+    /// content is still moving (working spinner, title spinner, etc.).
+    /// When neither is true the main loop skips `draw_app` entirely.
+    pub(crate) fn has_active_animation(&self) -> bool {
+        matches!(self.turn_visual, TurnVisualState::Running)
+            || self.terminal_title_state == TerminalTitleState::Working
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -7442,6 +7952,29 @@ impl TuiApp {
         if tool_result_hidden_by_default(&result) {
             return;
         }
+        // Edit-family results that fail and then succeed on the same path
+        // within a turn are usually the apply_patch fallback dance, not a
+        // user-actionable error. Drop the prior failure row when the new
+        // row is a success; record the new failure row when it fails.
+        let edit_paths = edit_target_paths(&result, call.as_ref());
+        if !edit_paths.is_empty() {
+            match result.status {
+                ToolStatus::Success => {
+                    let removed: Vec<u64> = edit_paths
+                        .iter()
+                        .filter_map(|path| self.recent_edit_failures.remove(path))
+                        .collect();
+                    if !removed.is_empty() {
+                        self.transcript.retain(|entry| !removed.contains(&entry.id));
+                    }
+                }
+                ToolStatus::Error => {
+                    // Keep the entry id; we don't know it yet, so record
+                    // after pushing.
+                }
+                _ => {}
+            }
+        }
         let id = self.next_id();
         let entry = TranscriptEntry::tool_result(id, result, call, self.transcript_default);
         if let Some(last) = self.transcript.last_mut()
@@ -7449,7 +7982,18 @@ impl TuiApp {
         {
             return;
         }
+        let is_edit_failure = matches!(
+            entry.kind,
+            TranscriptEntryKind::ToolResult(ref t)
+                if matches!(t.result.tool_name.as_str(), "apply_patch" | "write_file")
+                    && t.result.status == ToolStatus::Error
+        );
         self.push_entry(entry);
+        if is_edit_failure {
+            for path in edit_paths {
+                self.recent_edit_failures.insert(path, id);
+            }
+        }
     }
 
     pub(crate) fn push_log(&mut self, message: String) {
@@ -7464,6 +8008,11 @@ impl TuiApp {
             data,
             self.transcript_default,
         ));
+    }
+
+    pub(crate) fn push_diff_card(&mut self, data: DiffCardData) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::diff_card(id, data));
     }
 
     pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
@@ -7498,6 +8047,7 @@ impl TuiApp {
     pub(crate) fn clear_active_tools(&mut self) {
         self.active_tool = None;
         self.active_tool_calls.clear();
+        self.active_tool_elapsed_ms = None;
     }
 
     fn next_id(&mut self) -> u64 {
@@ -7530,8 +8080,13 @@ impl TranscriptEntry {
         id: u64,
         result: ToolResult,
         call: Option<ToolCall>,
-        transcript_default: TranscriptDefault,
+        _transcript_default: TranscriptDefault,
     ) -> Self {
+        // Tool results are now uniformly collapsed-by-default: the new
+        // codex-style head-tail preview caps each card at ~5 lines (50
+        // for direct `!`-shell). `TranscriptDefault::Normal|Compact`
+        // still gates messages and logs but no longer the tool card,
+        // because the cap itself is the whole point of the preview.
         Self {
             id,
             kind: TranscriptEntryKind::ToolResult(Box::new(ToolTranscript {
@@ -7539,7 +8094,7 @@ impl TranscriptEntry {
                 result,
                 repeat_count: 1,
             })),
-            collapsed: transcript_default == TranscriptDefault::Compact,
+            collapsed: true,
         }
     }
 
@@ -7561,6 +8116,16 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::PlanCard(Box::new(data)),
             // Plan cards default to fully expanded even in Compact mode
             // — the whole point of the card is to show the plan body.
+            collapsed: false,
+        }
+    }
+
+    fn diff_card(id: u64, data: DiffCardData) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::Diff(Box::new(data)),
+            // Mirror codex's `/diff`: never truncated by default. The
+            // user can still Ctrl-E to fold the body if it's huge.
             collapsed: false,
         }
     }
@@ -7590,6 +8155,7 @@ impl TranscriptEntry {
             },
             TranscriptCategory::Diffs => match &self.kind {
                 TranscriptEntryKind::ToolResult(tool) => tool.result.tool_name.contains("diff"),
+                TranscriptEntryKind::Diff(_) => true,
                 _ => false,
             },
             TranscriptCategory::Receipts => match &self.kind {
@@ -7618,6 +8184,9 @@ impl TranscriptEntry {
                 let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
                 vec![format!("plan {}\n{body}", data.plan_id)]
             }
+            TranscriptEntryKind::Diff(data) => {
+                vec![format!("diff ({})\n{}", data.summary, data.plain)]
+            }
             TranscriptEntryKind::Reasoning(snapshot) => {
                 vec![format!("reasoning: {}", snapshot.display_text)]
             }
@@ -7643,6 +8212,7 @@ impl TranscriptEntry {
             TranscriptEntryKind::ToolResult(_) => true,
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
             TranscriptEntryKind::PlanCard(_) => true,
+            TranscriptEntryKind::Diff(_) => true,
             TranscriptEntryKind::Reasoning(snapshot) => {
                 text_has_collapsible_content(&snapshot.display_text)
             }
@@ -7671,6 +8241,11 @@ impl TranscriptEntry {
                 proposed_plan::read_plan_body(&data.path).unwrap_or_default(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::Diff(data) => (
+                format!("diff ({})", data.summary),
+                data.plain.clone(),
+                format!("transcript:{}", self.id),
+            ),
             TranscriptEntryKind::Reasoning(snapshot) => (
                 "reasoning".to_string(),
                 snapshot.display_text.clone(),
@@ -7689,10 +8264,24 @@ enum TranscriptEntryKind {
     /// plan file. The body is loaded from disk at render time so the
     /// cell tracks in-place refinements and survives compaction.
     PlanCard(Box<render::plan_card::PlanCardData>),
+    /// Output of the `/diff` slash command — a snapshot of uncommitted
+    /// changes (tracked + untracked), captured at invocation time and
+    /// rendered as pre-styled lines using `render::diff`. Stored
+    /// pre-rendered so per-frame work is constant.
+    Diff(Box<DiffCardData>),
     /// A finalized reasoning segment from the model. Stored separately
     /// so each reasoning block becomes its own grey collapsible entry
     /// instead of being pinned to the next assistant message.
     Reasoning(Box<squeezy_core::ReasoningSnapshot>),
+}
+
+/// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
+/// existing diff styling so re-rendering a frame is constant-time.
+#[derive(Debug, Clone)]
+pub(crate) struct DiffCardData {
+    pub(crate) summary: String,
+    pub(crate) plain: String,
+    pub(crate) lines: Vec<Line<'static>>,
 }
 
 #[derive(Debug, Clone)]
@@ -7754,6 +8343,15 @@ enum TranscriptCategory {
     Diffs,
     Receipts,
     Assistant,
+}
+
+/// Mid-turn cost/token snapshot surfaced in the status bar so the user
+/// can watch a turn's spend grow without log spam in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnProgress {
+    pub(crate) tool_count: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) micro_usd: u64,
 }
 
 pub(crate) struct PendingApproval {

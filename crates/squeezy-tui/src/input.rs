@@ -120,6 +120,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash("/collapse", "collapse transcript entries"),
     slash("/expand", "expand transcript entries"),
+    slash("/diff", "show uncommitted changes (tracked + untracked)"),
     slash("/jobs", "list background jobs"),
     slash_args("/job", "show a background job", true, "<id>"),
     slash_args("/job-cancel", "cancel a background job", true, "<id>"),

@@ -1947,26 +1947,38 @@ fn transcript_item_formats_role_label() {
 
 #[test]
 fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
+    // Long-output regression: under the codex-style 5-line cap, a short
+    // grep result fits inside the preview window so the body shows even
+    // in the collapsed state — but a long body must be head-tail truncated
+    // with the Ctrl-E ellipsis, then fully expand when toggled.
     let mut app = test_app(SessionMode::Build);
-    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    let payload = (0..30)
+        .map(|i| format!("match-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.push_tool_result(sample_tool_result("grep", &payload));
 
     assert!(app.transcript[0].collapsed);
-    let collapsed = render_to_string(&app, 100, 12);
+    let collapsed = render_to_string(&app, 100, 24);
     assert!(collapsed.contains("✔ Explored"), "{collapsed}");
     assert!(collapsed.contains("grep"), "{collapsed}");
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
-        !collapsed.contains("needle found"),
-        "collapsed view should hide payload: {collapsed}"
+        collapsed.contains("Ctrl-E to expand"),
+        "collapsed view should show truncation hint: {collapsed}"
+    );
+    assert!(
+        !collapsed.contains("match-15"),
+        "middle of the body must be elided: {collapsed}"
     );
 
     select_previous_transcript_entry(&mut app);
     toggle_selected_transcript_entry(&mut app);
 
     assert!(!app.transcript[0].collapsed);
-    let expanded = render_to_string(&app, 100, 18);
-    assert!(expanded.contains("needle found"), "{expanded}");
+    let expanded = render_to_string(&app, 100, 40);
+    assert!(expanded.contains("match-15"), "{expanded}");
     assert!(!expanded.contains("receipt output="), "{expanded}");
 }
 
@@ -2257,7 +2269,10 @@ fn tool_rows_summarize_diff_glob_read_and_plan_outputs() {
         }),
     );
 
-    let output = render_to_string(&app, 180, 18);
+    // Each card now shows a short body preview by default (codex-style
+    // 5-line cap), so the rendered height is taller than the old empty-
+    // body collapsed view — render at a height that fits all three cards.
+    let output = render_to_string(&app, 180, 40);
 
     assert!(
         output.contains("✔ Explored diff context (worktree) · 2 files · +3 -1"),
@@ -2367,6 +2382,9 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
 
 #[test]
 fn collapsed_edit_row_shows_diff_preview() {
+    // apply_patch cards bypass the codex-style 5-line cap (the diff *is*
+    // the point of the card) so the body renders inline by default. We
+    // verify the per-file summary header + the +/- patch lines survive.
     let mut app = test_app(SessionMode::Build);
     let mut result = sample_tool_result("apply_patch", "");
     result.content = serde_json::json!({
@@ -2385,7 +2403,7 @@ fn collapsed_edit_row_shows_diff_preview() {
     let output = render_to_string(&app, 120, 14);
 
     assert!(output.contains("✔ Edited src/lib.rs · +1 -1"), "{output}");
-    assert!(output.contains("diff src/lib.rs"), "{output}");
+    assert!(output.contains("file src/lib.rs +1 -1"), "{output}");
     assert!(output.contains("-old"), "{output}");
     assert!(output.contains("+new"), "{output}");
 }
@@ -3345,12 +3363,13 @@ fn active_prompt_keeps_one_blank_line_after_header() {
 }
 
 #[test]
-fn footer_mentions_expand_collapse_shortcut() {
+fn footer_mentions_expand_and_transcript_shortcuts() {
     let app = test_app(SessionMode::Build);
 
-    let output = render_to_string(&app, 120, 16);
+    let output = render_to_string(&app, 140, 16);
 
-    assert!(output.contains("Ctrl-E expand/collapse"), "{output}");
+    assert!(output.contains("Ctrl-E expand"), "{output}");
+    assert!(output.contains("Ctrl-T transcript"), "{output}");
 }
 
 #[test]
@@ -5387,6 +5406,75 @@ fn temp_workspace(name: &str) -> PathBuf {
     root
 }
 
+#[test]
+fn apply_patch_failure_then_success_on_same_path_drops_the_failure_row() {
+    // Background: apply_patch's unified-diff fallback occasionally fails
+    // and the agent immediately retries with a full-file rewrite that
+    // succeeds. The user gains nothing from seeing the transient ✖ Failed
+    // row once we know the retry worked, so it gets pruned from the
+    // transcript on the matching success.
+    let mut app = test_app(SessionMode::Build);
+
+    let mut failure = sample_tool_result("apply_patch", "");
+    failure.status = ToolStatus::Error;
+    failure.content = serde_json::json!({
+        "error": "unified-diff fallback could not apply cleanly",
+        "failed_path": "src/middleware/open_beta_cache.rs",
+    });
+    app.push_tool_result_with_call(failure, None);
+    assert_eq!(app.transcript.len(), 1, "failure row recorded");
+
+    let mut success = sample_tool_result("apply_patch", "");
+    success.status = ToolStatus::Success;
+    success.content = serde_json::json!({
+        "files": [{ "path": "src/middleware/open_beta_cache.rs" }],
+    });
+    app.push_tool_result_with_call(success, None);
+
+    assert_eq!(
+        app.transcript.len(),
+        1,
+        "the prior failure row must be replaced, not stacked"
+    );
+    let kind = &app.transcript[0].kind;
+    match kind {
+        TranscriptEntryKind::ToolResult(tool) => {
+            assert_eq!(tool.result.status, ToolStatus::Success);
+        }
+        other => panic!("expected ToolResult entry, got {other:?}"),
+    }
+    assert!(
+        app.recent_edit_failures.is_empty(),
+        "tracker should be cleared after replay"
+    );
+}
+
+#[test]
+fn apply_patch_failure_on_different_path_is_not_suppressed_by_unrelated_success() {
+    let mut app = test_app(SessionMode::Build);
+
+    let mut failure = sample_tool_result("apply_patch", "");
+    failure.status = ToolStatus::Error;
+    failure.content = serde_json::json!({
+        "error": "unified-diff fallback could not apply cleanly",
+        "failed_path": "src/middleware/open_beta_cache.rs",
+    });
+    app.push_tool_result_with_call(failure, None);
+
+    let mut success = sample_tool_result("apply_patch", "");
+    success.status = ToolStatus::Success;
+    success.content = serde_json::json!({
+        "files": [{ "path": "src/other.rs" }],
+    });
+    app.push_tool_result_with_call(success, None);
+
+    assert_eq!(
+        app.transcript.len(),
+        2,
+        "failure on a different file should still be visible"
+    );
+}
+
 fn sample_tool_result(name: &str, output: &str) -> ToolResult {
     ToolResult {
         call_id: "call-1".to_string(),
@@ -5911,6 +5999,201 @@ fn json_patch_preview_parser_emits_events_per_patch() {
 }
 
 #[test]
+fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..30)
+        .map(|i| format!("line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "ls -la"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": body,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    let output = render_to_string(&app, 140, 18);
+    // First and last lines must survive head-tail truncation; middle is elided.
+    assert!(output.contains("line-00"), "head missing: {output}");
+    assert!(output.contains("line-29"), "tail missing: {output}");
+    assert!(
+        !output.contains("line-14"),
+        "middle should be elided: {output}"
+    );
+    assert!(
+        output.contains("Ctrl-E to expand"),
+        "ellipsis hint missing: {output}"
+    );
+}
+
+#[test]
+fn tool_card_user_shell_keeps_fifty_line_cap() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..80)
+        .map(|i| format!("line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": "ls -la",
+            "direct_user_shell": true,
+        }),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": body,
+        "stderr": "",
+        "direct_user_shell": true,
+    });
+    app.push_tool_result_with_call(result, Some(call));
+
+    // With 80 lines and a 50-line cap, head+tail keep 100 lines max so we
+    // expect NO truncation. Render area is intentionally tall.
+    let output = render_to_string(&app, 140, 200);
+    assert!(
+        !output.contains("Ctrl-E to expand"),
+        "user-shell under 2*cap should not be truncated: {output}"
+    );
+    assert!(output.contains("line-40"), "mid line missing: {output}");
+}
+
+#[test]
+fn apply_patch_card_is_not_truncated_to_five_lines() {
+    let mut app = test_app(SessionMode::Build);
+    let patch = (0..20)
+        .map(|i| format!("+ added line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let patch_body = format!("--- a/foo.rs\n+++ b/foo.rs\n@@ -1,0 +1,20 @@\n{patch}\n");
+    let mut result = sample_tool_result("apply_patch", "");
+    result.content = serde_json::json!({
+        "files": [{
+            "path": "foo.rs",
+            "additions": 20,
+            "deletions": 0,
+            "patch": patch_body,
+        }],
+    });
+    app.push_tool_result_with_call(result, None);
+
+    let output = render_to_string(&app, 140, 60);
+    assert!(
+        !output.contains("Ctrl-E to expand"),
+        "apply_patch must bypass the 5-line cap: {output}"
+    );
+    assert!(output.contains("foo.rs"), "header missing: {output}");
+}
+
+#[tokio::test]
+async fn ctrl_t_opens_and_closes_transcript_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Ctrl-T should open the overlay"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Esc should close the overlay"
+    );
+}
+
+#[test]
+fn transcript_overlay_renders_entries_uncollapsed() {
+    let mut app = test_app(SessionMode::Build);
+    let body = (0..30)
+        .map(|i| format!("line-{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let call = ToolCall {
+        call_id: "shell-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "ls -la"}),
+    };
+    let mut result = sample_tool_result("shell", "");
+    result.call_id = "shell-1".to_string();
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "workdir": ".",
+        "exit_code": 0,
+        "stdout": body,
+        "stderr": "",
+    });
+    app.push_tool_result_with_call(result, Some(call));
+    app.transcript_overlay = Some(TranscriptOverlayState::default());
+
+    let output = render_to_string(&app, 140, 60);
+    assert!(
+        output.contains("Transcript"),
+        "overlay frame missing: {output}"
+    );
+    // Middle line is normally elided by the head-tail cap; the overlay
+    // forces every entry expanded so the line must be present.
+    assert!(
+        output.contains("line-14"),
+        "overlay must show full body: {output}"
+    );
+    assert!(
+        !output.contains("Ctrl-E to expand"),
+        "overlay should not show truncation ellipsis: {output}"
+    );
+}
+
+#[test]
+fn diff_card_pushed_via_helper_renders_summary_and_lines() {
+    let mut app = test_app(SessionMode::Build);
+    let lines: Vec<ratatui::text::Line<'static>> = vec![
+        ratatui::text::Line::from(ratatui::text::Span::raw("+ added".to_string())),
+        ratatui::text::Line::from(ratatui::text::Span::raw("- removed".to_string())),
+    ];
+    app.push_diff_card(super::DiffCardData {
+        summary: "1 file · +1 -1".to_string(),
+        plain: "+ added\n- removed\n".to_string(),
+        lines,
+    });
+
+    let output = render_to_string(&app, 140, 18);
+    assert!(output.contains("Diff"), "header missing: {output}");
+    assert!(
+        output.contains("1 file · +1 -1"),
+        "summary missing: {output}"
+    );
+    assert!(output.contains("+ added"), "diff body missing: {output}");
+    assert!(output.contains("- removed"), "diff body missing: {output}");
+}
+
+#[test]
 fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
     use super::streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
@@ -5932,4 +6215,55 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
         vec!["a.rs".to_string()],
         "should emit exactly one patch, got events: {events:?}"
     );
+}
+
+#[test]
+fn idle_app_reports_no_active_animation() {
+    let mut app = test_app(SessionMode::Build);
+    // Fresh `TuiApp` starts with needs_redraw = true so the first frame
+    // paints. Simulate the loop having drawn that frame.
+    app.needs_redraw = false;
+    assert_eq!(app.turn_visual, TurnVisualState::Idle);
+    assert_eq!(app.terminal_title_state, TerminalTitleState::Cleared);
+    assert!(
+        !app.has_active_animation(),
+        "idle TuiApp should not advertise any active animation"
+    );
+    assert!(
+        !app.needs_redraw,
+        "no mutation occurred so needs_redraw should stay false"
+    );
+}
+
+#[test]
+fn note_turn_started_marks_dirty_and_animation_active() {
+    let mut app = test_app(SessionMode::Build);
+    app.needs_redraw = false;
+    app.turn_visual = TurnVisualState::Running;
+    app.note_turn_started();
+    assert!(app.needs_redraw, "starting a turn should request a redraw");
+    assert!(
+        app.has_active_animation(),
+        "running turn should keep animations alive"
+    );
+}
+
+#[test]
+fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
+    let mut app = test_app(SessionMode::Build);
+    app.turn_visual = TurnVisualState::Idle;
+    // Walk through an entire glyph cycle worth of ticks. None of them
+    // should advance the prompt coin glyph or change its colour, because
+    // the coin is meant to be static at idle.
+    for tick in 0..32u64 {
+        app.animation_tick = tick * 50; // ~160 frames worth of motion
+        assert_eq!(
+            prompt_coin_frame(&app),
+            "●",
+            "idle prompt coin glyph must stay '●' at tick {tick}"
+        );
+        let span = prompt_coin_span(&app);
+        assert_eq!(span.content.as_ref(), "●");
+        assert_eq!(span.style.fg, Some(crate::render::palette::AMBER));
+    }
 }

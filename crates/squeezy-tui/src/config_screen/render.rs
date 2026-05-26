@@ -12,7 +12,9 @@ use super::{
     ConfigScope, ConfigScreenState, FieldEditor, ModelPickerState, SearchOverlayState,
     SecretEntryState, inheritance_label, picker_matches, provider_api_key_env, tier_path,
 };
-use crate::render::palette::{AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SUCCESS_GREEN};
+use crate::render::palette::{
+    AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN,
+};
 
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     let chunks = Layout::default()
@@ -40,23 +42,26 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         active: bool,
         exists: bool,
     ) -> Vec<Span<'static>> {
-        let marker = if active { "▸ " } else { "  " };
+        // The active tab is identified by the amber dot alone — we used to
+        // also stamp an extra "▸ " in front of the label, but the ▸
+        // separators between tabs already make that look like "▸ ▸ Repo"
+        // when the middle/last tab is active. Dropping the active marker
+        // keeps the row aligned and leaves a single clear indicator.
         let label_style = if active {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
         let dot = if exists { "●" } else { "○" };
-        let dot_style = if exists {
-            Style::default().fg(SUCCESS_GREEN)
+        // Active dot is amber, inactive dots are quiet (grey). File
+        // existence is still encoded via ●/○ shape, but the colour
+        // dimension is reserved for "this is the tab you're editing".
+        let dot_style = if active {
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(QUIET)
         };
         vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if active { GOLD } else { QUIET }),
-            ),
             Span::styled(label, label_style),
             Span::raw(" "),
             Span::styled(dot, dot_style),
@@ -78,33 +83,23 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
         state.scope == ConfigScope::User,
         user_exists,
     ));
-    spans.push(Span::styled(
-        " ▸ ",
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Repo",
         "./squeezy.toml (committed)",
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
-    spans.push(Span::styled(
-        " ▸ ",
-        Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-    ));
+    spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Local",
         "~/.squeezy/projects/<this>/settings.toml",
         state.scope == ConfigScope::Local,
         local_exists,
     ));
-    spans.push(Span::styled(
-        "    ● tier file exists · ○ not on disk · Local > Repo > User",
-        Style::default().fg(QUIET),
-    ));
     if state.dirty {
         spans.push(Span::styled(
-            "  (changes applied)",
+            "    (changes applied)",
             Style::default().fg(QUIET),
         ));
     }
@@ -147,7 +142,11 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
 
 fn render_reset_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     let section = state.current_section();
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(RESET_ACTIONS.len() * 3 + 4);
+    let action = match RESET_ACTIONS.iter().find(|a| a.scope == state.scope) {
+        Some(a) => a,
+        None => return,
+    };
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(6);
     lines.push(Line::from(vec![
         Span::styled(
             section.label,
@@ -157,41 +156,35 @@ fn render_reset_section(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenS
         Span::styled(section.description, Style::default().fg(QUIET)),
     ]));
     lines.push(Line::raw(""));
-    for (idx, action) in RESET_ACTIONS.iter().enumerate() {
-        let active = idx == state.field_index;
-        let prefix = if active { "› " } else { "  " };
-        let prefix_style = Style::default().fg(if active { GOLD } else { QUIET });
-        let label_style = if active {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        let tier_path = tier_path(state, action.scope);
-        let exists = std::fs::metadata(&tier_path).is_ok();
-        let status = if exists {
-            Span::styled("[file present]", Style::default().fg(SUCCESS_GREEN))
-        } else {
-            Span::styled("[no file]", Style::default().fg(QUIET))
-        };
-        lines.push(Line::from(vec![
-            Span::styled(prefix, prefix_style),
-            Span::styled(format!("{:<28}", action.label), label_style),
-            status,
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(action.detail, Style::default().fg(QUIET)),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(tier_path.display().to_string(), Style::default().fg(QUIET)),
-        ]));
-        lines.push(Line::raw(""));
-    }
+
+    let tier_path = tier_path(state, action.scope);
+    let exists = std::fs::metadata(&tier_path).is_ok();
+    let status = if exists {
+        Span::styled("[file present]", Style::default().fg(SUCCESS_GREEN))
+    } else {
+        Span::styled("[no file]", Style::default().fg(QUIET))
+    };
+    lines.push(Line::from(vec![
+        Span::styled("› ", Style::default().fg(GOLD)),
+        Span::styled(
+            format!("{:<28}", action.label),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        status,
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(action.detail, Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(tier_path.display().to_string(), Style::default().fg(QUIET)),
+    ]));
+    lines.push(Line::raw(""));
     lines.push(Line::from(vec![
         Span::styled("? ", Style::default().fg(QUIET)),
         Span::styled(
-            "Enter on a row to delete that tier's file (with y/n confirmation). Ctrl+Z restores it.",
+            "Enter to delete this tier's file (with y/n confirmation). Ctrl+Z restores it.",
             Style::default().fg(QUIET),
         ),
     ]));
@@ -508,7 +501,21 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) 
             Span::styled(section.label, style),
         ]));
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    // The sidebar lists CONFIG_SECTIONS verbatim; on shorter terminals it
+    // overflows and items at the bottom (notably Reset) get clipped. Pin
+    // the active row inside the visible window by scrolling just enough
+    // to keep it on-screen.
+    let height = area.height as usize;
+    let total = lines.len();
+    let scroll = if height == 0 || total <= height {
+        0u16
+    } else {
+        state
+            .section_index
+            .saturating_sub(height - 1)
+            .min(total - height) as u16
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }
 
 fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
@@ -561,7 +568,7 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 } else {
                     Style::default().fg(Color::White)
                 };
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(prefix, prefix_style),
                     Span::styled(
                         format!("{:<width$}", field.label, width = max_label + 2),
@@ -571,9 +578,12 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                         value_str,
                         Style::default().fg(if active { GOLD } else { Color::White }),
                     ),
-                    Span::raw(" "),
-                    Span::styled(source_label, source_style(source)),
-                ]));
+                ];
+                if !source_label.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(source_label, source_style(source)));
+                }
+                lines.push(Line::from(spans));
             }
             None => {
                 // Synthetic API-key row.
