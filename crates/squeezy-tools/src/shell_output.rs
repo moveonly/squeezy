@@ -7,7 +7,8 @@ use std::collections::VecDeque;
 
 use serde_json::Value;
 
-use crate::{collapse_whitespace, shell_command_prefix, shell_segments};
+use crate::collapse_whitespace;
+use crate::shell_parse::{shell_command_prefix, shell_segments};
 
 pub(crate) fn insert_content_field(content: &mut Value, key: &str, value: Value) {
     if let Some(object) = content.as_object_mut() {

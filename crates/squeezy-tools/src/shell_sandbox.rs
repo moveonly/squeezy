@@ -1,0 +1,1149 @@
+#[cfg(target_os = "macos")]
+use std::process::Stdio;
+use std::{
+    collections::HashMap,
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Mutex as StdMutex,
+    time::Duration,
+};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::env;
+
+#[cfg(target_os = "linux")]
+use std::{fs::OpenOptions, io::Write};
+
+use serde_json::{Value, json};
+#[cfg(target_os = "macos")]
+use squeezy_core::sensitive_pattern_base;
+use squeezy_core::{ShellSandboxConfig, ShellSandboxMode, ShellSandboxNetworkPolicy};
+use tokio::process::Command;
+
+use crate::shell_program::ShellProgram;
+use crate::{ShellPermissionAnalysis, ShellRunOutcome, shell_exit_signal};
+
+pub(crate) const SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone)]
+pub(crate) enum ShellSandboxBackendStatus {
+    Available,
+    Unavailable(String),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ShellSandboxHealth {
+    backends: StdMutex<HashMap<&'static str, ShellSandboxBackendStatus>>,
+}
+
+impl ShellSandboxHealth {
+    pub(crate) fn status(&self, backend: &'static str) -> Option<ShellSandboxBackendStatus> {
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(backend)
+            .cloned()
+    }
+
+    pub(crate) fn mark_available(&self, backend: &'static str) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(backend, ShellSandboxBackendStatus::Available);
+    }
+
+    pub(crate) fn mark_unavailable(&self, backend: &'static str, reason: impl Into<String>) {
+        if backend == "none" {
+            return;
+        }
+        self.backends
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                backend,
+                ShellSandboxBackendStatus::Unavailable(reason.into()),
+            );
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShellSandboxPlan {
+    pub(crate) program: String,
+    pub(crate) args: Vec<String>,
+    pub(crate) backend: &'static str,
+    pub(crate) mode: &'static str,
+    pub(crate) network: &'static str,
+    pub(crate) filesystem: &'static str,
+    pub(crate) required: bool,
+    pub(crate) configured_read_roots: Vec<PathBuf>,
+    pub(crate) configured_write_roots: Vec<PathBuf>,
+    #[allow(dead_code)]
+    pub(crate) filesystem_read_roots: Vec<PathBuf>,
+    #[allow(dead_code)]
+    pub(crate) filesystem_write_roots: Vec<PathBuf>,
+    pub(crate) fallback_reason: Option<String>,
+}
+
+impl ShellSandboxPlan {
+    pub(crate) fn direct(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+    ) -> Self {
+        Self::direct_with_fallback(command, mode, config, None)
+    }
+
+    pub(crate) fn direct_with_fallback(
+        command: &str,
+        mode: ShellSandboxMode,
+        config: &ShellSandboxConfig,
+        fallback_reason: Option<String>,
+    ) -> Self {
+        let shell = ShellProgram::for_command(command);
+        Self {
+            program: shell.program,
+            args: shell.args,
+            backend: "none",
+            mode: mode.as_str(),
+            network: "not_enforced",
+            filesystem: "not_enforced",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason,
+        }
+    }
+
+    pub(crate) fn external(command: &str, config: &ShellSandboxConfig) -> Self {
+        let shell = ShellProgram::for_command(command);
+        Self {
+            program: shell.program,
+            args: shell.args,
+            backend: "external",
+            mode: ShellSandboxMode::External.as_str(),
+            network: "external",
+            filesystem: "external",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: None,
+        }
+    }
+
+    pub(crate) fn metadata(&self) -> Value {
+        json!({
+            "backend": self.backend,
+            "mode": self.mode,
+            "network": self.network,
+            "filesystem": self.filesystem,
+            "required": self.required,
+            "read_roots": path_list_json(&self.configured_read_roots),
+            "write_roots": path_list_json(&self.configured_write_roots),
+            "fallback_reason": self.fallback_reason,
+        })
+    }
+}
+
+pub(crate) fn path_list_json(paths: &[PathBuf]) -> Value {
+    Value::Array(
+        paths
+            .iter()
+            .map(|path| Value::String(path.display().to_string()))
+            .collect(),
+    )
+}
+
+pub(crate) fn shell_sandbox_status_metadata(config: &ShellSandboxConfig, status: &str) -> Value {
+    json!({
+        "backend": "none",
+        "mode": config.mode.as_str(),
+        "network": "not_enforced",
+        "filesystem": "not_enforced",
+        "required": false,
+        "status": status,
+        "read_roots": path_list_json(&config.read_roots),
+        "write_roots": path_list_json(&config.write_roots),
+    })
+}
+
+pub(crate) fn macos_sandbox_exec_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/usr/bin/sandbox-exec").exists()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+pub(crate) fn prepare_shell_sandbox_plan(
+    command: &str,
+    analysis: &ShellPermissionAnalysis,
+    root: &Path,
+    config: &ShellSandboxConfig,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    prepare_shell_sandbox_plan_with_probe(
+        command,
+        analysis,
+        root,
+        config,
+        macos_sandbox_exec_supported(),
+        linux_unshare_supported(),
+        linux_landlock_supported(),
+    )
+}
+
+pub(crate) async fn apply_shell_sandbox_backend_health<F, Fut>(
+    command: &str,
+    config: &ShellSandboxConfig,
+    health: &ShellSandboxHealth,
+    plan: ShellSandboxPlan,
+    probe_failure: F,
+) -> std::result::Result<ShellSandboxPlan, String>
+where
+    F: FnOnce(ShellSandboxPlan, Duration) -> Fut,
+    Fut: Future<Output = Option<String>>,
+{
+    let backend = plan.backend;
+    if backend == "none" {
+        return Ok(plan);
+    }
+
+    match health.status(backend) {
+        Some(ShellSandboxBackendStatus::Available) => return Ok(plan),
+        Some(ShellSandboxBackendStatus::Unavailable(reason)) => {
+            return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+        }
+        None => {}
+    }
+
+    let probe_input = plan.clone();
+    if let Some(reason) = probe_failure(probe_input, SHELL_SANDBOX_BACKEND_PROBE_TIMEOUT).await {
+        health.mark_unavailable(backend, reason.clone());
+        return shell_sandbox_backend_unavailable_plan(command, config, backend, &reason);
+    }
+
+    health.mark_available(backend);
+    Ok(plan)
+}
+
+pub(crate) fn shell_sandbox_backend_unavailable_plan(
+    command: &str,
+    config: &ShellSandboxConfig,
+    backend: &'static str,
+    reason: &str,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    if config.mode == ShellSandboxMode::Required {
+        return Err(format!(
+            "required shell sandbox backend {backend} unavailable: {reason}"
+        ));
+    }
+
+    Ok(ShellSandboxPlan::direct_with_fallback(
+        command,
+        config.mode,
+        config,
+        Some(shell_sandbox_backend_disabled_reason(backend, reason)),
+    ))
+}
+
+pub(crate) fn shell_sandbox_backend_disabled_reason(backend: &'static str, reason: &str) -> String {
+    format!(
+        "shell sandbox backend {backend} disabled after health check failure: {reason}; running without OS sandbox because mode is best_effort"
+    )
+}
+
+pub(crate) async fn shell_sandbox_backend_probe_failure(
+    plan: ShellSandboxPlan,
+    timeout: Duration,
+) -> Option<String> {
+    match plan.backend {
+        "macos-sandbox-exec" => macos_sandbox_plan_probe_failure(plan, timeout).await,
+        // Linux support is already probed before this point via unshare and
+        // Landlock capability checks; a second process probe would add latency
+        // without exercising the same pre_exec path.
+        "linux-direct-syscalls" => None,
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn macos_sandbox_plan_probe_failure(
+    plan: ShellSandboxPlan,
+    timeout: Duration,
+) -> Option<String> {
+    let mut args = plan.args.clone();
+    let Some(command_arg) = args.last_mut() else {
+        return Some(format!(
+            "shell sandbox backend {} probe could not build command",
+            plan.backend
+        ));
+    };
+    *command_arg = "true".to_string();
+
+    let mut child = match tokio::process::Command::new(&plan.program)
+        .args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            return Some(format!(
+                "shell sandbox backend {} probe failed to start: {err}",
+                plan.backend
+            ));
+        }
+    };
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => None,
+        Ok(Ok(status)) => Some(shell_sandbox_backend_probe_status_reason(
+            plan.backend,
+            &status,
+        )),
+        Ok(Err(err)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Some(format!(
+                "shell sandbox backend {} probe wait failed: {err}",
+                plan.backend
+            ))
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Some(format!(
+                "shell sandbox backend {} probe timed out after {} ms",
+                plan.backend,
+                timeout.as_millis()
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn macos_sandbox_plan_probe_failure(
+    _plan: ShellSandboxPlan,
+    _timeout: Duration,
+) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn shell_sandbox_backend_probe_status_reason(
+    backend: &'static str,
+    status: &std::process::ExitStatus,
+) -> String {
+    if let Some(code) = status.code() {
+        return format!("shell sandbox backend {backend} probe exited with code {code}");
+    }
+    if let Some(signal) = shell_exit_signal(Some(status)) {
+        return format!("shell sandbox backend {backend} probe terminated by signal {signal}");
+    }
+    format!("shell sandbox backend {backend} probe ended without an exit code")
+}
+
+#[allow(unused_variables)]
+pub(crate) fn prepare_shell_sandbox_plan_with_probe(
+    command: &str,
+    analysis: &ShellPermissionAnalysis,
+    root: &Path,
+    config: &ShellSandboxConfig,
+    macos_sandbox_exec_available: bool,
+    linux_unshare_available: bool,
+    linux_landlock_available: bool,
+) -> std::result::Result<ShellSandboxPlan, String> {
+    if config.mode == ShellSandboxMode::Off {
+        return Ok(ShellSandboxPlan::direct(
+            command,
+            ShellSandboxMode::Off,
+            config,
+        ));
+    }
+    if config.mode == ShellSandboxMode::External {
+        return Ok(ShellSandboxPlan::external(command, config));
+    }
+
+    let required = config.mode == ShellSandboxMode::Required;
+    // The sandbox-level network posture has THREE distinct states:
+    //   - "allowed_approved": classified network + user opted into
+    //     `allow_when_approved`; the sandbox opens its network namespace.
+    //   - "denied_classified": classified network + default
+    //     `deny_by_default`; the permission layer may still allow the
+    //     command to RUN, but the sandbox keeps network closed so a
+    //     misclassified target or a follow-on system() call can't reach
+    //     out unnoticed.
+    //   - "denied": non-network classification; sandbox always denies.
+    let network = match (config.network, analysis.network) {
+        (ShellSandboxNetworkPolicy::AllowWhenApproved, true) => "allowed_approved",
+        (ShellSandboxNetworkPolicy::DenyByDefault, true) => "denied_classified",
+        _ => "denied",
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let fallback_reason: Option<String>;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let fallback_reason: Option<String> = None;
+
+    #[cfg(target_os = "macos")]
+    {
+        if macos_sandbox_exec_available {
+            return Ok(ShellSandboxPlan {
+                program: "/usr/bin/sandbox-exec".to_string(),
+                args: vec![
+                    "-p".to_string(),
+                    macos_shell_sandbox_profile(root, config, network != "denied"),
+                    "sh".to_string(),
+                    "-lc".to_string(),
+                    command.to_string(),
+                ],
+                backend: "macos-sandbox-exec",
+                mode: config.mode.as_str(),
+                network,
+                filesystem: "enforced",
+                required,
+                configured_read_roots: config.read_roots.clone(),
+                configured_write_roots: config.write_roots.clone(),
+                filesystem_read_roots: Vec::new(),
+                filesystem_write_roots: Vec::new(),
+                fallback_reason: None,
+            });
+        }
+        let reason = "required shell sandbox unavailable: /usr/bin/sandbox-exec not found or cannot apply profiles";
+        if required {
+            return Err(reason.to_string());
+        }
+        fallback_reason = Some(reason.to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Probe whether unshare can actually be applied as the current
+        // user. If the kernel forbids it (e.g. unprivileged_userns_clone=0
+        // or seccomp policy in the container), required mode must fail
+        // closed at sandbox-prepare time rather than silently exit 1
+        // after fork.
+        if !linux_unshare_available {
+            if required {
+                return Err(format!(
+                    "required shell sandbox unavailable: linux unshare(CLONE_NEWUSER|CLONE_NEWNS{}) failed",
+                    if network == "denied" {
+                        " |CLONE_NEWNET"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            fallback_reason =
+                Some("required shell sandbox unavailable: linux unshare failed".to_string());
+        } else {
+            let filesystem = if linux_landlock_available {
+                "enforced"
+            } else if required {
+                return Err("required shell sandbox unavailable: linux Landlock filesystem enforcement unavailable".to_string());
+            } else {
+                "best_effort_unavailable"
+            };
+            return Ok(ShellSandboxPlan {
+                program: "sh".to_string(),
+                args: vec!["-lc".to_string(), command.to_string()],
+                backend: "linux-direct-syscalls",
+                mode: config.mode.as_str(),
+                network,
+                filesystem,
+                required,
+                configured_read_roots: config.read_roots.clone(),
+                configured_write_roots: config.write_roots.clone(),
+                filesystem_read_roots: if linux_landlock_available {
+                    linux_shell_read_roots(root, config)
+                } else {
+                    Vec::new()
+                },
+                filesystem_write_roots: if linux_landlock_available {
+                    shell_writable_roots(root, config)
+                } else {
+                    Vec::new()
+                },
+                fallback_reason: None,
+            });
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if required {
+            return Err(
+                "required shell sandbox unavailable on windows: filesystem and network isolation are not provided; use mode = \"best_effort\" or mode = \"external\""
+                    .to_string(),
+            );
+        }
+        let shell = ShellProgram::for_command(command);
+        Ok(ShellSandboxPlan {
+            program: shell.program,
+            args: shell.args,
+            backend: "windows-job-object",
+            mode: config.mode.as_str(),
+            network: if network == "denied" {
+                "denied_best_effort"
+            } else {
+                network
+            },
+            filesystem: "best_effort_unavailable",
+            required: false,
+            configured_read_roots: config.read_roots.clone(),
+            configured_write_roots: config.write_roots.clone(),
+            filesystem_read_roots: Vec::new(),
+            filesystem_write_roots: Vec::new(),
+            fallback_reason: Some(
+                "windows: process-tree cleanup via Job Object; no FS/network isolation".to_string(),
+            ),
+        })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            if required {
+                return Err(format!(
+                    "required shell sandbox unavailable on {}",
+                    std::env::consts::OS
+                ));
+            }
+        }
+
+        Ok(ShellSandboxPlan::direct_with_fallback(
+            command,
+            config.mode,
+            config,
+            fallback_reason,
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn macos_shell_sandbox_profile(
+    root: &Path,
+    config: &ShellSandboxConfig,
+    allow_network: bool,
+) -> String {
+    let mut profile = String::from("(version 1)\n(deny default)\n");
+    // Process-level capabilities every build/run/test needs.
+    profile.push_str("(allow process-exec)\n");
+    profile.push_str("(allow process-fork)\n");
+    profile.push_str("(allow signal (target self))\n");
+    profile.push_str("(allow sysctl-read)\n");
+    profile.push_str("(allow mach-lookup)\n");
+    profile.push_str("(allow ipc-posix-shm)\n");
+    profile.push_str("(allow iokit-open)\n");
+    profile.push_str("(allow system-socket)\n");
+    profile.push_str("(allow file-read-metadata)\n");
+    // Reads from system / toolchain prefixes: required so compilers,
+    // shells, dynamic linker, and certificate stores can do their job.
+    let mut read_roots = macos_read_roots();
+    read_roots.extend(config.read_roots.iter().cloned());
+    read_roots.extend(config.write_roots.iter().cloned());
+    read_roots.sort();
+    read_roots.dedup();
+    for path in read_roots {
+        profile.push_str(&format!(
+            "(allow file-read* (subpath {}))\n",
+            sandbox_profile_string(&path.display().to_string())
+        ));
+    }
+    // Read+write inside the workspace, tmp dirs, and toolchain caches.
+    let mut write_roots = shell_writable_roots(root, config);
+    write_roots.sort();
+    write_roots.dedup();
+    for path in write_roots {
+        let escaped = sandbox_profile_string(&path.display().to_string());
+        profile.push_str(&format!("(allow file-read* (subpath {escaped}))\n"));
+        if config.protected_metadata_names.is_empty() {
+            profile.push_str(&format!("(allow file-write* (subpath {escaped}))\n"));
+        } else {
+            profile.push_str(&format!(
+                "(allow file-write* (require-all (subpath {escaped})"
+            ));
+            for name in &config.protected_metadata_names {
+                let protected = sandbox_profile_string(&path.join(name).display().to_string());
+                profile.push_str(&format!(" (require-not (subpath {protected}))"));
+            }
+            profile.push_str("))\n");
+        }
+    }
+    // Sensitive paths get an EXPLICIT deny on top of the default deny so
+    // even if a future allow rule widens reads, these subpaths stay
+    // blocked.
+    let mut denied_paths = sensitive_absolute_paths(root, config);
+    denied_paths.sort();
+    denied_paths.dedup();
+    for path in denied_paths {
+        profile.push_str(&format!(
+            "(deny file-read* file-write* (subpath {}))\n",
+            sandbox_profile_string(&path.display().to_string())
+        ));
+    }
+    if allow_network {
+        profile.push_str("(allow network*)\n");
+    } else {
+        // The kernel still expects an explicit allow for AF_UNIX so that
+        // local sockets (DNS resolver shared memory, IPC) work; only the
+        // network-family connections are denied by default.
+        profile.push_str("(allow network* (local unix))\n");
+        profile.push_str("(allow network-inbound (local unix))\n");
+    }
+    profile
+}
+
+/// Read-only roots every shell needs to look at: system libraries, the
+/// dynamic linker, certificate stores, the toolchain prefix, and the user's
+/// rustup / cargo prefixes. We add the prefixes as reads here AND as
+/// writable roots below so cargo can read its registry index even when
+/// not invoked under `cargo build`.
+#[cfg(target_os = "macos")]
+fn macos_read_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/System",
+        "/Library",
+        "/private/etc",
+        "/private/var/db",
+        "/private/var/folders",
+        "/opt",
+        "/dev/null",
+        "/dev/zero",
+        "/dev/random",
+        "/dev/urandom",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    // Toolchain prefixes the user may have configured.
+    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    // Default toolchain locations under $HOME.
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
+    }
+    roots
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn shell_writable_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut roots = vec![
+        root.to_path_buf(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/private/var/folders"),
+    ];
+    for name in ["TMPDIR", "TEMP", "TMP", "CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        // The toolchain writes through `cargo build` / `cargo test` etc.;
+        // adding these by default avoids breaking the canonical use case
+        // when `mode = "required"`.
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
+    }
+    roots.extend(config.write_roots.iter().cloned());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+#[cfg(target_os = "linux")]
+fn linux_shell_read_roots(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/opt",
+        "/nix/store",
+        "/dev",
+        "/proc",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    for name in ["CARGO_HOME", "RUSTUP_HOME"] {
+        if let Some(path) = env::var_os(name).map(PathBuf::from) {
+            roots.push(path);
+        }
+    }
+    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+        roots.push(home.join(".cargo"));
+        roots.push(home.join(".rustup"));
+    }
+    roots.push(root.to_path_buf());
+    roots.extend(config.read_roots.iter().cloned());
+    roots.extend(config.write_roots.iter().cloned());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Resolve the list of absolute paths the macOS sandbox profile should
+/// explicitly deny on top of the (deny default) base. Only the macOS
+/// profile generator calls this; gated to avoid dead-code warnings on
+/// Linux and other targets where no sandbox-exec profile is generated.
+#[cfg(target_os = "macos")]
+fn sensitive_absolute_paths(root: &Path, config: &ShellSandboxConfig) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for pattern in &config.sensitive_path_patterns {
+        let base = sensitive_pattern_base(pattern);
+        if base.is_empty() {
+            continue;
+        }
+        paths.push(root.join(&base));
+        if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+            paths.push(home.join(&base));
+        }
+        for allowed_root in config.read_roots.iter().chain(config.write_roots.iter()) {
+            paths.push(allowed_root.join(&base));
+        }
+    }
+    paths
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_profile_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Recognises the on-process signals that the sandbox backend itself
+/// failed to apply (as opposed to the user's command failing). Used in
+/// `mode = "required"` to deny the call rather than silently letting it
+/// run unsandboxed.
+pub(crate) fn shell_sandbox_runtime_unavailable(
+    plan: &ShellSandboxPlan,
+    exit_code: Option<i32>,
+    stderr: &str,
+) -> bool {
+    shell_sandbox_runtime_unavailable_with_probe(plan, exit_code, stderr, linux_unshare_supported())
+}
+
+pub(crate) fn shell_sandbox_runtime_unavailable_with_probe(
+    plan: &ShellSandboxPlan,
+    exit_code: Option<i32>,
+    stderr: &str,
+    linux_unshare_available: bool,
+) -> bool {
+    match plan.backend {
+        "macos-sandbox-exec" => {
+            // sandbox-exec returns 71 with a `sandbox_apply` message when
+            // the kernel refuses to apply the SBPL profile.
+            exit_code == Some(71) && stderr.contains("sandbox_apply")
+        }
+        "linux-direct-syscalls" => {
+            // The pre_exec hook returns Err with an EPERM/EINVAL when
+            // unshare fails after a successful spawn handshake. Tokio's
+            // child reports this as a Unix `_exit(1)`/wait status with
+            // empty stdout/stderr; we can't distinguish that perfectly
+            // from a legitimate `exit 1`. Fall back to a probe: re-check
+            // the supported-flag at the parent level, and report
+            // unavailable if the kernel no longer supports unshare.
+            !linux_unshare_available && exit_code == Some(1) && stderr.is_empty()
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn shell_sandbox_direct_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+    if !run.stdout_bytes.is_empty() || !run.stderr_bytes.is_empty() {
+        return None;
+    }
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    if exit_code.is_some() {
+        return None;
+    }
+    let signal = shell_exit_signal(run.exit_status.as_ref())?;
+    Some(format!(
+        "shell sandbox backend {} terminated by signal {signal} with no output; retried without OS sandbox because mode is best_effort",
+        sandbox_plan.backend
+    ))
+}
+
+pub(crate) fn shell_sandbox_best_effort_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    shell_sandbox_direct_fallback_reason(sandbox_plan, run)
+        .or_else(|| shell_sandbox_runtime_fallback_reason(sandbox_plan, run))
+}
+
+pub(crate) fn shell_sandbox_runtime_fallback_reason(
+    sandbox_plan: &ShellSandboxPlan,
+    run: &ShellRunOutcome,
+) -> Option<String> {
+    if sandbox_plan.required || sandbox_plan.backend == "none" || run.timed_out {
+        return None;
+    }
+
+    let exit_code = run.exit_status.as_ref().and_then(|status| status.code());
+    let stderr = String::from_utf8_lossy(&run.stderr_bytes);
+    if shell_sandbox_runtime_unavailable(sandbox_plan, exit_code, &stderr) {
+        return Some(format!(
+            "shell sandbox backend {} failed at runtime; retried without OS sandbox because mode is best_effort",
+            sandbox_plan.backend
+        ));
+    }
+
+    None
+}
+
+pub(crate) fn configure_shell_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+    }
+}
+
+pub(crate) fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellSandboxPlan) {
+    #[cfg(target_os = "linux")]
+    if plan.backend == "linux-direct-syscalls" {
+        let deny_network = plan.network == "denied";
+        let enforce_filesystem = plan.filesystem == "enforced";
+        let read_roots = plan.filesystem_read_roots.clone();
+        let write_roots = plan.filesystem_write_roots.clone();
+        // `Command::process_group(0)` already arranges a `setpgid(0, 0)` in
+        // the child's pre_exec, so we don't duplicate it here. We focus on
+        // the namespace unshare, which is the additional isolation step.
+        // CLONE_NEWUSER + uid_map is required for an unprivileged process
+        // to call unshare(CLONE_NEWNS) on stock distros; we fall back to a
+        // single-step unshare if user-namespace setup is forbidden so that
+        // best-effort mode does not hard-fail on every call.
+        unsafe {
+            command.pre_exec(move || {
+                linux_unshare_pre_exec(deny_network)?;
+                if enforce_filesystem {
+                    linux_landlock_restrict(&read_roots, &write_roots)?;
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = (command, plan);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_unshare_pre_exec(deny_network: bool) -> std::io::Result<()> {
+    // Capture the parent's uid/gid before any namespace switch.
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    // Preferred path: open a user namespace first so the subsequent mount
+    // and network namespace creation are allowed without CAP_SYS_ADMIN.
+    let mut flags = libc::CLONE_NEWUSER | libc::CLONE_NEWNS;
+    if deny_network {
+        flags |= libc::CLONE_NEWNET;
+    }
+    if unsafe { libc::unshare(flags) } == 0 {
+        // Best effort: drop the inherited setgroups capability and map our
+        // uid/gid into the new user namespace. If any of these writes fail
+        // (e.g. /proc not yet mounted), continue — the sandbox is still in
+        // place; the only effect is that uid/gid inside the namespace look
+        // unmapped.
+        let _ = linux_write_proc("/proc/self/setgroups", b"deny");
+        let _ = linux_write_proc("/proc/self/uid_map", format!("0 {uid} 1").as_bytes());
+        let _ = linux_write_proc("/proc/self/gid_map", format!("0 {gid} 1").as_bytes());
+        return Ok(());
+    }
+
+    // Fallback path: try the privileged form. Will succeed in containers
+    // launched with CAP_SYS_ADMIN, fail with EPERM otherwise.
+    let mut fallback = libc::CLONE_NEWNS;
+    if deny_network {
+        fallback |= libc::CLONE_NEWNET;
+    }
+    if unsafe { libc::unshare(fallback) } == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_write_proc(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).open(path)?;
+    file.write_all(contents)
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+#[cfg(target_os = "linux")]
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_EXECUTE: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_WRITE_FILE: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_READ_DIR: u64 = 1 << 3;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REMOVE_DIR: u64 = 1 << 4;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REMOVE_FILE: u64 = 1 << 5;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_CHAR: u64 = 1 << 6;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_DIR: u64 = 1 << 7;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_REG: u64 = 1 << 8;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_SOCK: u64 = 1 << 9;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_FIFO: u64 = 1 << 10;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK: u64 = 1 << 11;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_MAKE_SYM: u64 = 1 << 12;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_REFER: u64 = 1 << 13;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_TRUNCATE: u64 = 1 << 14;
+#[cfg(target_os = "linux")]
+const LANDLOCK_ACCESS_FS_IOCTL_DEV: u64 = 1 << 15;
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_supported() -> bool {
+    linux_landlock_abi_version() > 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_landlock_supported() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_abi_version() -> i32 {
+    let version = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<libc::c_void>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if version <= 0 { 0 } else { version as i32 }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_restrict(read_roots: &[PathBuf], write_roots: &[PathBuf]) -> std::io::Result<()> {
+    let abi = linux_landlock_abi_version();
+    if abi <= 0 {
+        return Err(std::io::Error::other("Landlock is unavailable"));
+    }
+    let handled_access_fs = linux_landlock_handled_access(abi);
+    let ruleset_attr = LandlockRulesetAttr { handled_access_fs };
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &ruleset_attr as *const LandlockRulesetAttr,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ruleset_fd = ruleset_fd as libc::c_int;
+    let add_result = (|| {
+        let read_access = linux_landlock_read_access(handled_access_fs);
+        let write_access = linux_landlock_write_access(handled_access_fs);
+        for root in read_roots {
+            linux_landlock_add_path_rule(ruleset_fd, root, read_access)?;
+        }
+        for root in write_roots {
+            linux_landlock_add_path_rule(ruleset_fd, root, write_access)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = add_result {
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        return Err(err);
+    }
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        let err = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(ruleset_fd);
+        }
+        return Err(err);
+    }
+    let restrict_result =
+        unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0u32) };
+    let close_result = unsafe { libc::close(ruleset_fd) };
+    if restrict_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_add_path_rule(
+    ruleset_fd: libc::c_int,
+    path: &Path,
+    allowed_access: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !path.exists() {
+        return Ok(());
+    }
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("sandbox root contains NUL byte"))?;
+    let parent_fd = unsafe { libc::open(c_path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if parent_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let path_beneath = LandlockPathBeneathAttr {
+        allowed_access,
+        parent_fd,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset_fd,
+            LANDLOCK_RULE_PATH_BENEATH,
+            &path_beneath as *const LandlockPathBeneathAttr,
+            0u32,
+        )
+    };
+    let close_result = unsafe { libc::close(parent_fd) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if close_result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_handled_access(abi: i32) -> u64 {
+    let mut access = LANDLOCK_ACCESS_FS_EXECUTE
+        | LANDLOCK_ACCESS_FS_WRITE_FILE
+        | LANDLOCK_ACCESS_FS_READ_FILE
+        | LANDLOCK_ACCESS_FS_READ_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_DIR
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR
+        | LANDLOCK_ACCESS_FS_MAKE_DIR
+        | LANDLOCK_ACCESS_FS_MAKE_REG
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK
+        | LANDLOCK_ACCESS_FS_MAKE_SYM;
+    if abi >= 2 {
+        access |= LANDLOCK_ACCESS_FS_REFER;
+    }
+    if abi >= 3 {
+        access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    }
+    if abi >= 5 {
+        access |= LANDLOCK_ACCESS_FS_IOCTL_DEV;
+    }
+    access
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_read_access(handled_access_fs: u64) -> u64 {
+    handled_access_fs
+        & (LANDLOCK_ACCESS_FS_EXECUTE
+            | LANDLOCK_ACCESS_FS_READ_FILE
+            | LANDLOCK_ACCESS_FS_READ_DIR
+            | LANDLOCK_ACCESS_FS_IOCTL_DEV)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_landlock_write_access(handled_access_fs: u64) -> u64 {
+    handled_access_fs
+}
+
+/// Probe whether the kernel currently permits unprivileged user-namespace
+/// creation. We do this from the parent process by reading the well-known
+/// sysctl knob; this is the same signal that controls whether the eventual
+/// child `unshare(CLONE_NEWUSER|...)` will succeed. If the sysctl is
+/// missing (older kernels, namespaces unsupported altogether) we treat
+/// that as "not supported" so required mode denies pre-spawn instead of
+/// silently failing inside the child.
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_unshare_supported() -> bool {
+    if let Ok(value) = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        && value.trim() == "0"
+    {
+        return false;
+    }
+    // /proc/self/ns/user existing is necessary for the syscall to do
+    // anything useful; this also covers WSL1 (no namespaces).
+    std::path::Path::new("/proc/self/ns/user").exists()
+}
+
+/// Stub for non-Linux compilation so the macOS / cross-compile builds keep
+/// working without `#[cfg]` everywhere in callers.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub(crate) fn linux_unshare_supported() -> bool {
+    false
+}
