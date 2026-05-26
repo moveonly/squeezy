@@ -25,8 +25,39 @@ impl KeyringCredentialStore for DefaultCredentialStore {
 
     fn save(&self, account: &str, value: &str) -> std::result::Result<(), String> {
         let entry = Entry::new(KEYRING_SERVICE, account).map_err(|error| error.to_string())?;
-        entry.set_password(value).map_err(|error| error.to_string())
+        match entry.set_password(value) {
+            Ok(()) => Ok(()),
+            Err(first_err) if is_duplicate_item_error(&first_err) => {
+                // The macOS keychain backend surfaces `errSecDuplicateItem`
+                // when an existing generic-password item was created with
+                // attributes (label, access group) that don't line up with
+                // what `keyring` writes, so `SecItemAdd` fires instead of
+                // an in-place update. Delete the stale item and retry once.
+                if let Err(delete_err) = entry.delete_credential()
+                    && !matches!(delete_err, keyring::Error::NoEntry)
+                {
+                    return Err(format!(
+                        "{first_err}; cleanup before retry failed: {delete_err}"
+                    ));
+                }
+                let entry =
+                    Entry::new(KEYRING_SERVICE, account).map_err(|error| error.to_string())?;
+                entry
+                    .set_password(value)
+                    .map_err(|retry_err| format!("retry after delete failed: {retry_err}"))
+            }
+            Err(error) => Err(error.to_string()),
+        }
     }
+}
+
+fn is_duplicate_item_error(err: &keyring::Error) -> bool {
+    // The keyring crate doesn't expose a dedicated variant for
+    // errSecDuplicateItem on macOS, so fall back to a substring match on
+    // the platform-supplied message — the apple-native backend always
+    // includes "already exists in the keychain" for code -25299.
+    let lowered = err.to_string().to_ascii_lowercase();
+    lowered.contains("already exists")
 }
 
 pub fn resolve_api_key(env_var: &str) -> Result<String> {
