@@ -14,6 +14,7 @@ pub(crate) const WORKING_SHIMMER_HIGHLIGHT: Color = Color::Rgb(255, 251, 235);
 pub(crate) const DIFF_ADD_FG: Color = Color::Rgb(21, 128, 61);
 pub(crate) const DIFF_DEL_FG: Color = Color::Rgb(252, 165, 165);
 pub(crate) const DIFF_HUNK_FG: Color = Color::Rgb(254, 240, 138);
+pub(crate) const SEPARATOR_BLUE: Color = Color::Rgb(96, 165, 250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaletteTone {
