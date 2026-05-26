@@ -1,62 +1,72 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Mutex, PoisonError},
-};
-
 use super::*;
 
-#[derive(Debug, Default)]
-struct MockCredentialStore {
-    values: Mutex<BTreeMap<String, String>>,
-}
-
-impl KeyringCredentialStore for MockCredentialStore {
-    fn load(&self, account: &str) -> std::result::Result<Option<String>, String> {
-        Ok(self
-            .values
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(account)
-            .cloned())
+#[test]
+fn resolver_prefers_inline_over_env_and_fallback() {
+    let key_name = "SQUEEZY_RESOLVER_TEST_INLINE";
+    unsafe {
+        std::env::set_var(key_name, "env-loser");
     }
-
-    fn save(&self, account: &str, value: &str) -> std::result::Result<(), String> {
-        self.values
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(account.to_string(), value.to_string());
-        Ok(())
+    let resolved =
+        resolve_api_key_with_inline(Some("inline-winner"), key_name).expect("inline wins");
+    unsafe {
+        std::env::remove_var(key_name);
     }
+    assert_eq!(resolved.value, "inline-winner");
+    assert_eq!(resolved.source, KeySource::Inline);
 }
 
 #[test]
-fn resolves_from_env_first_then_keyring() {
-    let store = MockCredentialStore::default();
-    save_api_key_with_store("SQUEEZY_TEST_API_KEY", "keyring-value", &store).expect("save");
-
+fn empty_inline_falls_through_to_env() {
+    let key_name = "SQUEEZY_RESOLVER_TEST_EMPTY_INLINE";
     unsafe {
-        std::env::set_var("SQUEEZY_TEST_API_KEY", "env-value");
+        std::env::set_var(key_name, "env-fallback");
     }
-    assert_eq!(
-        resolve_api_key_with_store("SQUEEZY_TEST_API_KEY", &store).expect("env"),
-        "env-value"
-    );
-
+    let resolved = resolve_api_key_with_inline(Some("   "), key_name).expect("env fallback");
     unsafe {
-        std::env::remove_var("SQUEEZY_TEST_API_KEY");
+        std::env::remove_var(key_name);
     }
-    assert_eq!(
-        resolve_api_key_with_store("SQUEEZY_TEST_API_KEY", &store).expect("keyring"),
-        "keyring-value"
-    );
+    assert_eq!(resolved.value, "env-fallback");
+    assert_eq!(resolved.source, KeySource::Env);
 }
 
 #[test]
-fn missing_key_mentions_env_and_keyring_service() {
+fn resolver_falls_back_to_vendor_env_var() {
+    // Squeezy-prefixed env var is the canonical name in code; the
+    // vendor-style `<X>_API_KEY` is the fallback. Setting only the
+    // fallback should still resolve and be tagged FallbackEnv.
+    unsafe {
+        std::env::set_var("RESOLVER_TEST_FALLBACK_API_KEY", "from-vendor-name");
+    }
+    let resolved =
+        resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_FALLBACK_KEY").expect("fallback");
+    unsafe {
+        std::env::remove_var("RESOLVER_TEST_FALLBACK_API_KEY");
+    }
+    assert_eq!(resolved.value, "from-vendor-name");
+    assert_eq!(resolved.source, KeySource::FallbackEnv);
+}
+
+#[test]
+fn missing_key_message_mentions_env_and_toml() {
     let error =
-        resolve_api_key_with_store("SQUEEZY_TEST_MISSING_KEY", &MockCredentialStore::default())
-            .expect_err("missing");
+        resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_MISSING").expect_err("missing");
     let message = error.to_string();
-    assert!(message.contains("SQUEEZY_TEST_MISSING_KEY"), "{message}");
-    assert!(message.contains(KEYRING_SERVICE), "{message}");
+    assert!(
+        message.contains("SQUEEZY_RESOLVER_TEST_MISSING"),
+        "{message}"
+    );
+    assert!(message.contains("api_key"), "{message}");
+}
+
+#[test]
+fn fallback_env_var_translation_round_trips() {
+    assert_eq!(
+        fallback_env_var("SQUEEZY_OPENAI_KEY"),
+        Some("OPENAI_API_KEY".to_string())
+    );
+    assert_eq!(
+        fallback_env_var("OPENAI_API_KEY"),
+        Some("SQUEEZY_OPENAI_KEY".to_string())
+    );
+    assert_eq!(fallback_env_var("UNRELATED"), None);
 }

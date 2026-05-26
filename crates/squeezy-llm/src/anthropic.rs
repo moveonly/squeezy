@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
-    credentials::resolve_api_key,
+    credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
 };
 
@@ -39,7 +39,8 @@ impl std::fmt::Debug for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
-        let api_key = resolve_api_key(&config.api_key_env)?;
+        let api_key =
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         Ok(Self {
             client: reqwest::Client::new(),
             api_key,

@@ -113,8 +113,9 @@ pub enum FieldKind {
         must_exist: bool,
         dir_only: bool,
     },
-    /// API-key style secret. Never read into `AppConfig`; edits route to
-    /// `squeezy_llm::credentials::save_api_key_with_store(env_var, ...)`.
+    /// API-key style secret. Never read into `AppConfig` directly; the
+    /// TUI handles entry through its dedicated secret-editor path which
+    /// writes `[providers.<name>] api_key` to the active scope's TOML.
     Secret {
         env_var: &'static str,
     },
@@ -206,8 +207,9 @@ pub enum FieldValue {
     StringList(Vec<String>),
     Path(PathBuf),
     /// Placeholder — secrets never carry the plaintext through `FieldValue`.
-    /// The screen mask-renders this as `••••` and routes editing directly
-    /// to the keychain.
+    /// The screen mask-renders this as `••••` and routes editing through
+    /// the dedicated secret-entry flow which writes inline `api_key` to
+    /// the active scope's TOML.
     Secret,
     /// Selected sub-tab index (read-only convenience for `ProviderSubTabs`).
     SubTabs(usize),
@@ -329,8 +331,9 @@ pub struct FieldMeta {
     /// `SQUEEZY_*` env var that, when set, shadows this field at runtime.
     /// Displayed as the `[env]` badge and disables in-screen editing.
     pub env_override: Option<&'static str>,
-    /// `true` for API-key style fields: rendered as `••••`, edits route to
-    /// the keychain rather than `apply_edits`.
+    /// `true` for API-key style fields: rendered as `••••`, edits route
+    /// through the secret-entry flow which writes inline `api_key` to the
+    /// active scope's TOML.
     pub secret: bool,
 }
 
@@ -1408,21 +1411,25 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     cfg.provider = match s {
         "openai" => ProviderConfig::OpenAi(OpenAiConfig {
             api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
+            api_key: None,
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
             api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
+            api_key: None,
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             transport,
         }),
         "google" => ProviderConfig::Google(GoogleConfig {
             api_key_env: "SQUEEZY_GOOGLE_KEY".to_string(),
+            api_key: None,
             base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
             transport,
         }),
         "azure_openai" => ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
             api_key_env: "SQUEEZY_AZURE_OPENAI_KEY".to_string(),
+            api_key: None,
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),
             transport,
@@ -1441,6 +1448,7 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
             ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
                 preset,
                 api_key_env: preset.default_api_key_env().to_string(),
+                api_key: None,
                 base_url: preset.default_base_url().to_string(),
                 extra_headers: BTreeMap::new(),
                 transport,

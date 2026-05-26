@@ -257,6 +257,20 @@ fn preset_default_headers_include_openrouter_attribution() {
 }
 
 #[test]
+fn portkey_routing_header_present_detects_user_supplied_overrides() {
+    let mut headers = BTreeMap::new();
+    assert!(!portkey_routing_header_present(&headers));
+    headers.insert("X-Other".to_string(), "v".to_string());
+    assert!(!portkey_routing_header_present(&headers));
+    headers.insert("x-portkey-virtual-key".to_string(), "vk-abc".to_string());
+    assert!(portkey_routing_header_present(&headers));
+    // Match is case-insensitive so user TOML casing doesn't matter.
+    let mut mixed = BTreeMap::new();
+    mixed.insert("X-Portkey-Config".to_string(), "cfg-1".to_string());
+    assert!(portkey_routing_header_present(&mixed));
+}
+
+#[test]
 fn request_body_passes_reasoning_effort_in_both_legacy_and_unified_shapes() {
     use squeezy_core::ReasoningEffort;
     let mut request = sample_request();

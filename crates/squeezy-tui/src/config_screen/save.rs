@@ -9,6 +9,126 @@ use squeezy_core::{
 use super::{ConfigScope, ConfigScreenState, model_field_meta, provider_variant_label, tier_path};
 use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 
+/// Persist an inline `[providers.<section>] api_key = "..."` into the active
+/// scope's TOML and rebuild the provider client so the next turn picks it
+/// up. The dynamic section name (e.g. `portkey`, `openai`) precludes the
+/// regular `FieldMeta::toml_path` (`&'static [&'static str]`) flow, so we
+/// drive `apply_edits` directly via `SetTableEntry` which already accepts
+/// an owned `key: String`. Refuses Repo scope to keep secrets out of the
+/// committed `squeezy.toml`.
+pub(crate) fn save_inline_provider_api_key(
+    state: &mut ConfigScreenState,
+    agent: &mut Agent,
+    notifications: &mut NotificationQueue,
+    section: &str,
+    env_var: &str,
+    value: &str,
+) {
+    let (target_path, scope_target) = match state.scope {
+        ConfigScope::User => {
+            let p = state.sources.user_path_default.clone();
+            (p.clone(), SettingsScope::user(&p))
+        }
+        ConfigScope::Local => {
+            let p = state.sources.repo_path_default.clone();
+            (p.clone(), SettingsScope::repo(&p))
+        }
+        ConfigScope::Repo => {
+            notifications.push(
+                format!(
+                    "Refused: API keys never go into the committed squeezy.toml. \
+                     Switch the scope tab to Local or User and try again \
+                     (env var: {env_var})."
+                ),
+                NotifySeverity::Warn,
+            );
+            return;
+        }
+    };
+
+    let pre_write_bytes = std::fs::read(&target_path).ok();
+    state
+        .undo_stack
+        .push((target_path.clone(), pre_write_bytes));
+
+    let edit = SettingsEdit {
+        path: &[],
+        op: EditOp::SetTableEntry {
+            table_path: &["providers"],
+            key: section.to_string(),
+            fields: vec![("api_key", EditOp::SetString(value.to_string()))],
+        },
+    };
+
+    let outcome = match apply_edits(&scope_target, &[edit]) {
+        Ok(o) => o,
+        Err(err) => {
+            state.undo_stack.pop();
+            notifications.push(
+                format!("Failed to write {}: {err}", target_path.display()),
+                NotifySeverity::Error,
+            );
+            return;
+        }
+    };
+
+    // Update the in-memory effective config so the pre-fill on a reopen of
+    // the secret entry sees what we just wrote, and so the provider
+    // rebuild below picks up the new value without re-reading the file.
+    set_effective_provider_api_key(&mut state.effective, value);
+
+    if let Ok(reloaded) = squeezy_core::load_separated_settings_sources() {
+        state.sources = reloaded;
+    }
+
+    // Build the new provider eagerly off the tokio runtime — mirrors the
+    // pattern in `save_field_inner` since `provider_from_config` may do
+    // blocking secret-store I/O depending on the platform.
+    let provider_cfg = state.effective.provider.clone();
+    let new_provider = std::thread::spawn(move || squeezy_llm::provider_from_config(&provider_cfg))
+        .join()
+        .ok()
+        .and_then(|r| r.ok());
+    if new_provider.is_none() {
+        notifications.push(
+            format!(
+                "Saved {} to {}, but the provider failed to build with the new key.",
+                env_var,
+                outcome.path.display()
+            ),
+            NotifySeverity::Error,
+        );
+        return;
+    }
+
+    agent.arm_config_swap(PendingConfigSwap {
+        config: state.effective.clone(),
+        provider: new_provider,
+        display_note: Some(format!(
+            "{} key updated",
+            provider_variant_label(&state.effective.provider)
+        )),
+    });
+
+    notifications.push(
+        format!("✓ saved {} key to {}", section, outcome.path.display()),
+        NotifySeverity::Success,
+    );
+}
+
+fn set_effective_provider_api_key(cfg: &mut AppConfig, value: &str) {
+    use squeezy_core::ProviderConfig as P;
+    let v = Some(value.to_string());
+    match &mut cfg.provider {
+        P::OpenAi(c) => c.api_key = v,
+        P::Anthropic(c) => c.api_key = v,
+        P::Google(c) => c.api_key = v,
+        P::AzureOpenAi(c) => c.api_key = v,
+        P::OpenAiCompatible(c) => c.api_key = v,
+        P::Bedrock(_) | P::Ollama(_) => {}
+    }
+}
+
 pub(crate) fn save_field(
     state: &mut ConfigScreenState,
     agent: &mut Agent,

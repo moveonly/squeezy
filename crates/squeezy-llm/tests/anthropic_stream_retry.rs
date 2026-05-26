@@ -148,6 +148,7 @@ fn provider_for(addr: SocketAddr, stream_max_retries: u8) -> AnthropicProvider {
     }
     let config = AnthropicConfig {
         api_key_env: env_var,
+        api_key: None,
         base_url: format!("http://{addr}"),
         transport: ProviderTransportConfig {
             request_max_retries: 0,

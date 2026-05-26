@@ -33,7 +33,7 @@ pub(crate) use keys::{handle_key, handle_paste};
 pub(crate) use render::render;
 pub(crate) use save::{
     clear_scope_override, clear_scope_override_silent, discard_all_session_writes, perform_reset,
-    save_field, save_field_silent, undo_last_write,
+    save_field, save_field_silent, save_inline_provider_api_key, undo_last_write,
 };
 
 /// Synthetic row index in the Models section that exposes the API-key
@@ -1056,6 +1056,39 @@ pub(crate) fn provider_api_key_env(
                 Some((c.preset.display_name(), c.api_key_env.clone()))
             }
         }
+    }
+}
+
+/// Return the `[providers.<section>]` table name for the current provider,
+/// so the TUI Enter handler can write the inline `api_key` to the right
+/// part of the TOML.
+pub(crate) fn provider_section_name(
+    provider: &squeezy_core::ProviderConfig,
+) -> Option<&'static str> {
+    use squeezy_core::ProviderConfig as P;
+    match provider {
+        P::OpenAi(_) => Some("openai"),
+        P::Anthropic(_) => Some("anthropic"),
+        P::Google(_) => Some("google"),
+        P::AzureOpenAi(_) => Some("azure_openai"),
+        P::Bedrock(_) | P::Ollama(_) => None,
+        P::OpenAiCompatible(c) => Some(c.preset.as_str()),
+    }
+}
+
+/// Read the currently-stored inline `api_key` for the active provider out of
+/// the merged config TOML (user + repo + local), without touching env vars or
+/// secrets stores. Used by the secret-entry pre-fill so reopening the field
+/// shows the value the user previously saved.
+pub(crate) fn provider_inline_api_key(provider: &squeezy_core::ProviderConfig) -> Option<String> {
+    use squeezy_core::ProviderConfig as P;
+    match provider {
+        P::OpenAi(c) => c.api_key.clone(),
+        P::Anthropic(c) => c.api_key.clone(),
+        P::Google(c) => c.api_key.clone(),
+        P::AzureOpenAi(c) => c.api_key.clone(),
+        P::Bedrock(_) | P::Ollama(_) => None,
+        P::OpenAiCompatible(c) => c.api_key.clone(),
     }
 }
 

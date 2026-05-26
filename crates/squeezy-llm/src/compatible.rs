@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
-    credentials::resolve_api_key,
+    credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
 };
@@ -60,7 +60,8 @@ impl OpenAiCompatibleProvider {
                 config.preset.display_name(),
             )));
         }
-        let api_key = resolve_api_key(&config.api_key_env)?;
+        let api_key =
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         let mut headers = preset_default_headers(config.preset);
         // User-supplied headers override preset defaults so deployments can
         // attach their own HTTP-Referer / X-Title / x-portkey-* values.
@@ -204,8 +205,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
         let api_key = self.api_key.clone();
         let transport = self.transport;
         let url = format!("{}/chat/completions", self.base_url);
-        let body = Self::request_body(&request);
         let extra_headers = self.extra_headers.clone();
+        let preset = self.preset;
+        // We previously auto-injected `x-portkey-provider` from a
+        // `vendor/model` prefix. That guessed at an OpenRouter-style
+        // routing semantic that PortKey does not actually use — PortKey
+        // accounts with attached integrations route by `@<integration>/<model>`
+        // ids, not by a `x-portkey-provider` header. Sending the header
+        // bypassed those integrations and produced misleading errors.
+        // The model id now passes through verbatim; user-supplied
+        // `providers.portkey.headers.*` still wins for the (rare) case
+        // where a deployment really does want a config/virtual-key
+        // header.
+        let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
+        let body = Self::request_body(&request);
         let provider_label = self.preset.display_name();
 
         Box::pin(try_stream! {
@@ -230,8 +243,36 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
+                // PortKey returns 400 about `x-portkey-*` whenever it
+                // can't figure out which upstream to dial. The most
+                // common cause on integration-style PortKey accounts is
+                // that the model id is missing the `@<integration>/` prefix
+                // (e.g. `gpt-4o` instead of `@open-ai/gpt-4o`). The other
+                // case is a deployment that wants a routing header.
+                // `portkey_routing_configured` lets the second case
+                // suppress the "use a routing header" half of the hint.
+                let hint = if matches!(preset, OpenAiCompatiblePreset::PortKey)
+                    && status == StatusCode::BAD_REQUEST
+                    && message.to_ascii_lowercase().contains("x-portkey")
+                {
+                    if portkey_routing_configured {
+                        " — hint: a routing header is set in providers.portkey.headers \
+                         but PortKey still rejected. Check that the header value \
+                         (config id / virtual key / provider) actually exists in your \
+                         PortKey workspace."
+                    } else {
+                        " — hint: PortKey routes by either an `@<integration>/<model>` \
+                         prefix on the model id (call `GET https://api.portkey.ai/v1/models` \
+                         with your key to see what's available — e.g. `@open-ai/gpt-4o-mini`, \
+                         `@openrouter/<vendor>/<model>`) or by a header in \
+                         providers.portkey.headers (x-portkey-config / x-portkey-virtual-key / \
+                         x-portkey-provider). Set one of those and retry."
+                    }
+                } else {
+                    ""
+                };
                 Err(SqueezyError::ProviderRequest(format!(
-                    "{provider_label} {status}: {message}"
+                    "{provider_label} {status}: {message}{hint}"
                 )))?;
                 unreachable!("provider error returned above");
             };
@@ -342,6 +383,21 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
         // Chat Completions has no signed reasoning replay format. Reasoning
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
+    })
+}
+
+fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
+    // PortKey accepts any of these as the upstream-routing signal; if the
+    // user already configured one, we don't override.
+    const ROUTING_HEADERS: &[&str] = &[
+        "x-portkey-provider",
+        "x-portkey-virtual-key",
+        "x-portkey-config",
+    ];
+    headers.keys().any(|key| {
+        ROUTING_HEADERS
+            .iter()
+            .any(|needle| key.eq_ignore_ascii_case(needle))
     })
 }
 

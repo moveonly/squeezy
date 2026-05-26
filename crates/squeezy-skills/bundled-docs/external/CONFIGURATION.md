@@ -107,7 +107,6 @@ commented examples so that built-in defaults can evolve over time:
 
 # [providers.openai]
 # api_key_env = "OPENAI_API_KEY"
-# api_key_keychain = "squeezy:openai"        # macOS fallback; env var wins
 # base_url = "https://api.openai.com/v1"
 # default_model = "gpt-5.5"
 
@@ -240,9 +239,7 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   sent to providers whose model registry entry marks native reasoning controls
   as supported.
 - `[providers.<id>]`: provider defaults such as `api_key_env`,
-  `api_key_keychain`, `base_url`, `default_model`, `api_version`, and
   `region`. Environment variables always win. On macOS, when a provider has
-  `api_key_keychain`, Squeezy can read a Generic Password item from Keychain
   using that service name and the provider account name (`openai`,
   `anthropic`, `google`, or `azure_openai`). On non-macOS hosts this fallback
   is unavailable and missing environment variables remain provider-config

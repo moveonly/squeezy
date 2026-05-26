@@ -38,6 +38,7 @@ async fn azure_openai_responses_streaming_costly() -> Result<()> {
 
     let provider = OpenAiProvider::from_azure_config(&AzureOpenAiConfig {
         api_key_env: API_KEY_ENV.to_string(),
+        api_key: None,
         base_url,
         api_version,
         transport: ProviderTransportConfig::default(),

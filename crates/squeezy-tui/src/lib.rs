@@ -5210,7 +5210,7 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
 
 fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
     let color = log_color(message);
-    if collapsed {
+    if collapsed && !is_failure_log(message) {
         let preview = compact_text(message, 140);
         return vec![detail_line(selected, color, preview)];
     }

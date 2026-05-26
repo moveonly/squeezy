@@ -341,7 +341,7 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
             ),
         ]),
         Line::from(vec![
-            Span::styled("keychain → ", Style::default().fg(QUIET)),
+            Span::styled("env  ", Style::default().fg(QUIET)),
             Span::styled(entry.env_var.as_str(), Style::default().fg(Color::White)),
         ]),
         Line::raw(""),
@@ -352,8 +352,9 @@ fn render_secret_entry(frame: &mut Frame<'_>, area: Rect, entry: &SecretEntrySta
         ]),
         Line::raw(""),
         Line::from(vec![Span::styled(
-            "Paste your key. Stored in the OS keychain only — never written to any TOML \
-             or transcript. The running provider client is rebuilt on the next prompt.",
+            "Paste your key. Saved as inline `api_key` in the active scope's settings \
+             TOML (User or Local). Refuses the committed repo TOML. The running \
+             provider client is rebuilt on the next prompt.",
             Style::default().fg(QUIET),
         )]),
         Line::raw(""),
@@ -610,6 +611,8 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                         Some(t) => (t.0.to_string(), t.1),
                         None => ("—".to_string(), String::new()),
                     };
+                let inline_present =
+                    super::provider_inline_api_key(&state.effective.provider).is_some();
                 let label_style = if active {
                     Style::default()
                         .fg(MODE_PURPLE)
@@ -619,22 +622,31 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
                 };
                 let env_text = if env_var.is_empty() {
                     "n/a for this provider".to_string()
-                } else {
+                } else if inline_present {
                     format!("•••• ({env_var})")
+                } else {
+                    format!("unset ({env_var})")
                 };
-                lines.push(Line::from(vec![
+                let badge = if env_var.is_empty() {
+                    String::new()
+                } else if inline_present {
+                    format!("[toml · {}]", provider_label.to_lowercase())
+                } else {
+                    format!("[unset · {}]", provider_label.to_lowercase())
+                };
+                let mut spans = vec![
                     Span::styled(prefix, prefix_style),
                     Span::styled(
                         format!("{:<width$}", api_key_label, width = max_label + 2),
                         label_style,
                     ),
                     Span::styled(env_text, Style::default().fg(QUIET)),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("[keychain · {}]", provider_label.to_lowercase()),
-                        Style::default().fg(MODE_PURPLE),
-                    ),
-                ]));
+                ];
+                if !badge.is_empty() {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(badge, Style::default().fg(MODE_PURPLE)));
+                }
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -649,8 +661,9 @@ fn render_field_pane(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenStat
             Span::styled("? ", Style::default().fg(QUIET)),
             Span::styled(
                 format!(
-                    "Enter / Space sets the API key for {} (keychain account {}). \
-                     The plaintext never lands in any TOML or transcript.",
+                    "Enter / Space sets the API key for {} (env var {}). Saved as \
+                     inline `[providers.*].api_key` in the active scope's TOML \
+                     (User or Local; Repo is refused).",
                     provider_label, env_var
                 ),
                 Style::default().fg(QUIET),
