@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
@@ -1702,8 +1703,19 @@ impl SettingsFile {
             }
             Err(error) => return Err(error.into()),
         };
+        let settings = Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?;
+        let unknowns = take_unknown_fields();
+        if !unknowns.is_empty()
+            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
+        {
+            tracing::warn!(
+                path = %path.display(),
+                ?error,
+                "failed to strip unknown fields from settings.toml"
+            );
+        }
         Ok((
-            Self::from_toml_str(&text, &format!("{label}:{}", path.display()))?,
+            settings,
             vec![
                 "defaults".to_string(),
                 format!("{label}:{}", path.display()),
@@ -1712,6 +1724,7 @@ impl SettingsFile {
     }
 
     pub fn from_toml_str(text: &str, source: &str) -> Result<Self> {
+        UNKNOWN_FIELDS.with(|cell| cell.borrow_mut().clear());
         if text.trim().is_empty() {
             return Ok(Self::default());
         }
@@ -6042,35 +6055,31 @@ fn load_settings_from_paths(
 ) -> Result<(SettingsFile, Vec<String>)> {
     let mut settings = SettingsFile::default();
     let mut sources = vec!["defaults".to_string()];
-    if let Some(user_path) = user_path
-        && user_path.is_file()
-    {
-        let user = SettingsFile::from_toml_str(
-            &fs::read_to_string(user_path)?,
-            &format!("user:{}", user_path.display()),
+    for (path, label) in [
+        (user_path, "user"),
+        (project_path, "project"),
+        (repo_path, "repo"),
+    ] {
+        let Some(path) = path else { continue };
+        if !path.is_file() {
+            continue;
+        }
+        let parsed = SettingsFile::from_toml_str(
+            &fs::read_to_string(path)?,
+            &format!("{label}:{}", path.display()),
         )?;
-        settings.merge(user);
-        sources.push(format!("user:{}", user_path.display()));
-    }
-    if let Some(project_path) = project_path
-        && project_path.is_file()
-    {
-        let project = SettingsFile::from_toml_str(
-            &fs::read_to_string(project_path)?,
-            &format!("project:{}", project_path.display()),
-        )?;
-        settings.merge(project);
-        sources.push(format!("project:{}", project_path.display()));
-    }
-    if let Some(repo_path) = repo_path
-        && repo_path.is_file()
-    {
-        let repo = SettingsFile::from_toml_str(
-            &fs::read_to_string(repo_path)?,
-            &format!("repo:{}", repo_path.display()),
-        )?;
-        settings.merge(repo);
-        sources.push(format!("repo:{}", repo_path.display()));
+        let unknowns = take_unknown_fields();
+        if !unknowns.is_empty()
+            && let Err(error) = strip_unknown_fields_from_file(path, &unknowns)
+        {
+            tracing::warn!(
+                path = %path.display(),
+                ?error,
+                "failed to strip unknown fields from settings.toml"
+            );
+        }
+        settings.merge(parsed);
+        sources.push(format!("{label}:{}", path.display()));
     }
     Ok((settings, sources))
 }
@@ -6447,21 +6456,79 @@ fn providers_settings(
     Ok(Some(result))
 }
 
+thread_local! {
+    /// Dotted paths of unknown fields seen during the most recent
+    /// `SettingsFile::from_toml_str` call. The file loader clears this
+    /// before parsing and drains it afterwards to rewrite the source
+    /// without the dead keys.
+    static UNKNOWN_FIELDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
 fn reject_unknown_keys(
     table: &toml::value::Table,
     allowed: &[&str],
     source: &str,
     path: &str,
 ) -> Result<()> {
+    // Pre-1.0 the schema is still moving; silently ignoring renamed or
+    // removed fields lets users keep their old settings.toml around while
+    // we iterate. The loader uses `UNKNOWN_FIELDS` to rewrite the source
+    // file without the dead keys after each load.
     for key in table.keys() {
         if !allowed.iter().any(|allowed| key == allowed) {
             let field_path = field(path, key);
-            return Err(SqueezyError::Config(format!(
-                "{source}: {field_path}: unknown field"
-            )));
+            tracing::warn!(source, field = %field_path, "ignoring unknown config field");
+            UNKNOWN_FIELDS.with(|cell| cell.borrow_mut().push(field_path));
         }
     }
     Ok(())
+}
+
+fn take_unknown_fields() -> Vec<String> {
+    UNKNOWN_FIELDS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+}
+
+fn strip_unknown_fields_from_file(path: &Path, dotted_paths: &[String]) -> std::io::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut doc: toml_edit::DocumentMut = match text.parse() {
+        Ok(doc) => doc,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                ?error,
+                "could not re-parse settings.toml for cleanup; leaving file untouched"
+            );
+            return Ok(());
+        }
+    };
+    let mut changed = false;
+    for dotted in dotted_paths {
+        if remove_dotted_path(doc.as_table_mut(), dotted) {
+            changed = true;
+        }
+    }
+    if changed {
+        fs::write(path, doc.to_string())?;
+    }
+    Ok(())
+}
+
+fn remove_dotted_path(root: &mut toml_edit::Table, dotted: &str) -> bool {
+    let mut parts = dotted.split('.').collect::<Vec<_>>();
+    let Some(last) = parts.pop() else {
+        return false;
+    };
+    let mut current: &mut toml_edit::Table = root;
+    for segment in &parts {
+        let next = current
+            .get_mut(segment)
+            .and_then(|item| item.as_table_mut());
+        match next {
+            Some(table) => current = table,
+            None => return false,
+        }
+    }
+    current.remove(last).is_some()
 }
 
 fn optional_table<'a>(

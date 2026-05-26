@@ -2287,3 +2287,34 @@ fn resolve_field_source_returns_env_when_env_var_set() {
     unsafe { std::env::remove_var("SQUEEZY_PROVIDER") };
     assert_eq!(resolved, config_schema::FieldSource::Env);
 }
+
+#[test]
+fn unknown_fields_are_warned_and_removed_from_settings_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "squeezy-unknown-fields-{}-{}",
+        std::process::id(),
+        CONFIG_TEST_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+    ));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let path = dir.join("settings.toml");
+    std::fs::write(
+        &path,
+        "[tui]\nstatus_line_use_colors = true\ntick_rate_ms = 100\n",
+    )
+    .expect("write seed settings");
+
+    let (_settings, _sources) =
+        SettingsFile::load_optional_source(&path, "test").expect("load_optional_source");
+
+    let cleaned = std::fs::read_to_string(&path).expect("read cleaned settings");
+    assert!(
+        !cleaned.contains("status_line_use_colors"),
+        "unknown key should be stripped, got: {cleaned}"
+    );
+    assert!(
+        cleaned.contains("tick_rate_ms = 100"),
+        "known key should be preserved, got: {cleaned}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
