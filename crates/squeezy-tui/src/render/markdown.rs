@@ -8,7 +8,8 @@ use crate::render::{highlight, palette};
 
 pub fn render_markdown(source: &str) -> Vec<Line<'static>> {
     let mut writer = Writer::default();
-    for event in Parser::new_ext(source, Options::empty()) {
+    let options = Options::ENABLE_TABLES;
+    for event in Parser::new_ext(source, options) {
         writer.event(event);
     }
     writer.finish()
@@ -23,6 +24,12 @@ struct Writer {
     list_stack: Vec<ListState>,
     quote_depth: usize,
     code_block: Option<CodeBlock>,
+    /// Stack of links currently open. Each entry holds the destination URL we
+    /// must append once the inner text events have been emitted.
+    link_stack: Vec<String>,
+    /// Active table builder. While set, all inline text routes into the
+    /// builder instead of the global span buffer.
+    table: Option<TableBuilder>,
 }
 
 #[derive(Clone, Debug)]
@@ -37,10 +44,142 @@ struct CodeBlock {
     source: String,
 }
 
+/// Accumulator for GFM tables. Cells are collected as plain strings (style is
+/// dropped for the table render) so that columns can be width-padded and
+/// joined with ` | ` separators. A `---` divider is emitted between header
+/// and body rows.
+#[derive(Default, Debug)]
+struct TableBuilder {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    /// Row currently being built (one entry per `TableRow`/`TableHead`).
+    current_row: Vec<String>,
+    /// Cell currently being built (one entry per `TableCell`).
+    current_cell: String,
+    /// True while inside `TableHead` so cells flush into `headers` rather
+    /// than `rows`.
+    in_header: bool,
+}
+
+impl TableBuilder {
+    fn push_text(&mut self, text: &str) {
+        // Markdown soft/hard breaks inside a table cell should not introduce
+        // newlines in the rendered grid; collapse them to single spaces.
+        for ch in text.chars() {
+            if ch == '\n' || ch == '\r' {
+                if !self.current_cell.ends_with(' ') {
+                    self.current_cell.push(' ');
+                }
+            } else {
+                self.current_cell.push(ch);
+            }
+        }
+    }
+
+    fn finish_cell(&mut self) {
+        let cell = std::mem::take(&mut self.current_cell);
+        self.current_row.push(cell);
+    }
+
+    fn finish_row(&mut self) {
+        let row = std::mem::take(&mut self.current_row);
+        if self.in_header {
+            self.headers = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+
+    fn render(self, style: Style) -> Vec<Line<'static>> {
+        let col_count = self
+            .headers
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0));
+        if col_count == 0 {
+            return Vec::new();
+        }
+        let mut widths = vec![0usize; col_count];
+        // Compute column widths via display char counts (treat each char as 1).
+        for (i, width) in widths.iter_mut().enumerate() {
+            let header_cell = self.headers.get(i).map(String::as_str).unwrap_or("");
+            *width = (*width).max(header_cell.chars().count());
+            for row in &self.rows {
+                let body_cell = row.get(i).map(String::as_str).unwrap_or("");
+                *width = (*width).max(body_cell.chars().count());
+            }
+        }
+
+        let render_row = |row: &[String]| -> Line<'static> {
+            let mut buf = String::new();
+            for (i, width) in widths.iter().enumerate() {
+                if i > 0 {
+                    buf.push_str(" | ");
+                }
+                let cell = row.get(i).map(String::as_str).unwrap_or("");
+                buf.push_str(cell);
+                let cell_width = cell.chars().count();
+                if cell_width < *width {
+                    buf.extend(std::iter::repeat_n(' ', *width - cell_width));
+                }
+            }
+            Line::from(Span::styled(buf, style))
+        };
+
+        let mut out = Vec::new();
+        if !self.headers.is_empty() {
+            out.push(render_row(&self.headers));
+            let mut divider = String::new();
+            for (i, width) in widths.iter().enumerate() {
+                if i > 0 {
+                    divider.push_str("-+-");
+                }
+                divider.extend(std::iter::repeat_n('-', (*width).max(3)));
+            }
+            out.push(Line::from(Span::styled(
+                divider,
+                style.patch(Style::default().fg(palette::QUIET)),
+            )));
+        }
+        for row in &self.rows {
+            out.push(render_row(row));
+        }
+        out
+    }
+}
+
 impl Writer {
     fn event(&mut self, event: Event<'_>) {
         if self.code_block.is_some() {
             self.code_event(event);
+            return;
+        }
+
+        // While inside a table, route all inline text (Text/Code/Html/Math/
+        // breaks/etc.) into the active cell. Start/End tag events still flow
+        // through `start`/`end` so we observe `TableCell`/`TableRow`/`TableHead`
+        // boundaries.
+        if self.table.is_some() {
+            match event {
+                Event::Start(tag) => self.start(tag),
+                Event::End(tag) => self.end(tag),
+                Event::Text(text)
+                | Event::Code(text)
+                | Event::Html(text)
+                | Event::InlineHtml(text)
+                | Event::InlineMath(text)
+                | Event::DisplayMath(text)
+                | Event::FootnoteReference(text) => {
+                    if let Some(table) = self.table.as_mut() {
+                        table.push_text(&text);
+                    }
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    if let Some(table) = self.table.as_mut() {
+                        table.push_text(" ");
+                    }
+                }
+                Event::Rule | Event::TaskListMarker(_) => {}
+            }
             return;
         }
 
@@ -93,12 +232,22 @@ impl Writer {
             Tag::Strikethrough => {
                 self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
             }
-            Tag::Link { .. } | Tag::Image { .. } => {}
-            Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
-            | Tag::FootnoteDefinition(_)
+            Tag::Link { dest_url, .. } => {
+                self.link_stack.push(dest_url.into_string());
+            }
+            Tag::Image { .. } => {}
+            Tag::Table(_) => {
+                self.finish_line();
+                self.table = Some(TableBuilder::default());
+            }
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.in_header = true;
+                }
+            }
+            Tag::TableRow => {}
+            Tag::TableCell => {}
+            Tag::FootnoteDefinition(_)
             | Tag::DefinitionList
             | Tag::DefinitionListTitle
             | Tag::DefinitionListDefinition
@@ -126,17 +275,47 @@ impl Writer {
             | TagEnd::Strikethrough
             | TagEnd::Superscript
             | TagEnd::Subscript => self.pop_style(),
-            TagEnd::Link
-            | TagEnd::Image
+            TagEnd::Link => {
+                if let Some(url) = self.link_stack.pop()
+                    && !url.is_empty()
+                {
+                    let text = format!(" ({url})");
+                    if let Some(table) = self.table.as_mut() {
+                        table.push_text(&text);
+                    } else {
+                        self.push_text(&text, self.current_style);
+                    }
+                }
+            }
+            TagEnd::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_cell();
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row();
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.finish_row();
+                    table.in_header = false;
+                }
+            }
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.finish_line();
+                    let rendered = table.render(self.current_style);
+                    self.lines.extend(rendered);
+                }
+            }
+            TagEnd::Image
             | TagEnd::HtmlBlock
             | TagEnd::FootnoteDefinition
             | TagEnd::DefinitionList
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::MetadataBlock(_) => {}
         }
     }
@@ -384,3 +563,7 @@ fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
         CodeBlockKind::Indented => None,
     }
 }
+
+#[cfg(test)]
+#[path = "markdown_tests.rs"]
+mod tests;
