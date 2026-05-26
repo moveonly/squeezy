@@ -12,7 +12,12 @@ impl SemanticGraph {
                     .unwrap_or(true)
         });
         self.rebuild_resolution_indexes();
-        self.js_ts_resolver = JsTsResolver::from_files(&self.files);
+        // Incrementally update the JS/TS module-resolution table: configs
+        // (tsconfig.json / package.json) whose `ContentHash` matches the
+        // cached entry are reused, only changed/added/removed configs are
+        // re-parsed. In a TS monorepo a single file save no longer pays
+        // the cost of rebuilding the entire workspace path map.
+        self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
 
         // Move-out, mutate, move-back. Each builder iterates a single

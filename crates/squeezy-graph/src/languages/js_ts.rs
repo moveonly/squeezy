@@ -70,10 +70,20 @@ pub(crate) fn is_js_ts_language(language: LanguageKind) -> bool {
     )
 }
 
+/// Incrementally maintained JS/TS module resolver.
+///
+/// Workspace-wide `tsconfig.json` / `package.json` files contribute path
+/// mappings and package definitions. Re-parsing every config on every
+/// `rebuild_semantic_edges` is O(n) per file save; the per-file caches
+/// below let us reuse the derived state for configs whose `ContentHash`
+/// is unchanged and only re-aggregate the flat lookup vectors when an
+/// entry was added, removed, or rebuilt.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct JsTsResolver {
     path_mappings: Vec<JsTsPathMapping>,
     packages: Vec<JsTsPackage>,
+    tsconfig_entries: HashMap<FileId, JsTsTsconfigEntry>,
+    package_entries: HashMap<FileId, JsTsPackageEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,93 +102,171 @@ pub(crate) struct JsTsPackage {
     main_entries: Vec<String>,
 }
 
-impl JsTsResolver {
-    pub(crate) fn from_files(files: &HashMap<FileId, FileRecord>) -> Self {
-        let mut resolver = Self::default();
-        for file in files.values() {
-            if file.relative_path.ends_with("tsconfig.json") {
-                resolver.add_tsconfig(file);
-            } else if file.relative_path.ends_with("package.json") {
-                resolver.add_package(file);
-            }
-        }
-        resolver
+#[derive(Debug, Clone)]
+struct JsTsTsconfigEntry {
+    hash: ContentHash,
+    relative_path: String,
+    mappings: Vec<JsTsPathMapping>,
+}
+
+#[derive(Debug, Clone)]
+struct JsTsPackageEntry {
+    hash: ContentHash,
+    relative_path: String,
+    package: Option<JsTsPackage>,
+}
+
+/// Outcome of an incremental [`JsTsResolver::update_from_files`] pass.
+///
+/// `inserted` and `rebuilt` count freshly parsed configs (cache misses),
+/// `reused` counts configs whose `ContentHash` matched the cache and were
+/// skipped entirely. `removed` counts entries dropped because the file is
+/// no longer in the workspace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct JsTsResolverUpdate {
+    pub inserted: usize,
+    pub rebuilt: usize,
+    pub reused: usize,
+    pub removed: usize,
+}
+
+impl JsTsResolverUpdate {
+    pub(crate) fn changed(&self) -> bool {
+        self.inserted + self.rebuilt + self.removed > 0
     }
 
-    fn add_tsconfig(&mut self, file: &FileRecord) {
-        let Ok(raw) = std::fs::read_to_string(&file.path) else {
-            return;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return;
-        };
-        let Some(options) = json
-            .get("compilerOptions")
-            .and_then(|value| value.as_object())
-        else {
-            return;
-        };
-        let config_dir = parent_dir_string(&file.relative_path);
-        let base_url = options
-            .get("baseUrl")
-            .and_then(|value| value.as_str())
-            .map(|value| js_ts_normalize_module_path(&join_module_path(&config_dir, value)));
-        if let Some(paths) = options.get("paths").and_then(|value| value.as_object()) {
-            for (pattern, targets) in paths {
-                let targets = targets
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|value| value.as_str())
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>();
-                if !targets.is_empty() {
-                    self.path_mappings.push(JsTsPathMapping {
-                        config_dir: config_dir.clone(),
-                        base_url: base_url.clone(),
-                        pattern: pattern.clone(),
-                        targets,
-                    });
+    pub(crate) fn parses(&self) -> usize {
+        self.inserted + self.rebuilt
+    }
+}
+
+impl JsTsResolver {
+    /// Incrementally bring the resolver in sync with the workspace.
+    ///
+    /// Only configs whose `ContentHash` differs from the cached entry
+    /// are re-parsed; unchanged configs reuse the previously derived
+    /// `JsTsPathMapping` / `JsTsPackage` state. The flat lookup vectors
+    /// are re-aggregated only when at least one entry was inserted,
+    /// rebuilt, or removed.
+    pub(crate) fn update_from_files(
+        &mut self,
+        files: &HashMap<FileId, FileRecord>,
+    ) -> JsTsResolverUpdate {
+        let mut update = JsTsResolverUpdate::default();
+
+        let mut tsconfig_ids: HashSet<&FileId> = HashSet::new();
+        let mut package_ids: HashSet<&FileId> = HashSet::new();
+        for (file_id, file) in files {
+            if file.relative_path.ends_with("tsconfig.json") {
+                tsconfig_ids.insert(file_id);
+            } else if file.relative_path.ends_with("package.json") {
+                package_ids.insert(file_id);
+            }
+        }
+
+        let drop_tsconfigs: Vec<FileId> = self
+            .tsconfig_entries
+            .keys()
+            .filter(|id| !tsconfig_ids.contains(id))
+            .cloned()
+            .collect();
+        for id in drop_tsconfigs {
+            self.tsconfig_entries.remove(&id);
+            update.removed += 1;
+        }
+        let drop_packages: Vec<FileId> = self
+            .package_entries
+            .keys()
+            .filter(|id| !package_ids.contains(id))
+            .cloned()
+            .collect();
+        for id in drop_packages {
+            self.package_entries.remove(&id);
+            update.removed += 1;
+        }
+
+        for id in tsconfig_ids {
+            let file = &files[id];
+            match self.tsconfig_entries.get(id) {
+                Some(entry) if entry.hash == file.hash => update.reused += 1,
+                Some(_) => {
+                    let mappings = parse_tsconfig_mappings(file);
+                    self.tsconfig_entries.insert(
+                        id.clone(),
+                        JsTsTsconfigEntry {
+                            hash: file.hash.clone(),
+                            relative_path: file.relative_path.clone(),
+                            mappings,
+                        },
+                    );
+                    update.rebuilt += 1;
+                }
+                None => {
+                    let mappings = parse_tsconfig_mappings(file);
+                    self.tsconfig_entries.insert(
+                        id.clone(),
+                        JsTsTsconfigEntry {
+                            hash: file.hash.clone(),
+                            relative_path: file.relative_path.clone(),
+                            mappings,
+                        },
+                    );
+                    update.inserted += 1;
                 }
             }
         }
-        if let Some(base_url) = base_url {
-            self.path_mappings.push(JsTsPathMapping {
-                config_dir,
-                base_url: None,
-                pattern: "*".to_string(),
-                targets: vec![format!("{base_url}/*")],
-            });
-        }
-    }
-
-    fn add_package(&mut self, file: &FileRecord) {
-        let Ok(raw) = std::fs::read_to_string(&file.path) else {
-            return;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            return;
-        };
-        let Some(name) = json.get("name").and_then(|value| value.as_str()) else {
-            return;
-        };
-        let root = parent_dir_string(&file.relative_path);
-        let mut main_entries = Vec::new();
-        for field in ["types", "typings", "module", "main"] {
-            if let Some(value) = json.get(field).and_then(|value| value.as_str()) {
-                main_entries.push(value.to_string());
+        for id in package_ids {
+            let file = &files[id];
+            match self.package_entries.get(id) {
+                Some(entry) if entry.hash == file.hash => update.reused += 1,
+                Some(_) => {
+                    let package = parse_package_entry(file);
+                    self.package_entries.insert(
+                        id.clone(),
+                        JsTsPackageEntry {
+                            hash: file.hash.clone(),
+                            relative_path: file.relative_path.clone(),
+                            package,
+                        },
+                    );
+                    update.rebuilt += 1;
+                }
+                None => {
+                    let package = parse_package_entry(file);
+                    self.package_entries.insert(
+                        id.clone(),
+                        JsTsPackageEntry {
+                            hash: file.hash.clone(),
+                            relative_path: file.relative_path.clone(),
+                            package,
+                        },
+                    );
+                    update.inserted += 1;
+                }
             }
         }
-        let mut exports = Vec::new();
-        if let Some(value) = json.get("exports") {
-            collect_js_ts_exports(".", value, &mut exports);
+
+        if update.changed() {
+            self.rebuild_flat_views();
         }
-        self.packages.push(JsTsPackage {
-            root,
-            name: name.to_string(),
-            exports,
-            main_entries,
-        });
+
+        update
+    }
+
+    fn rebuild_flat_views(&mut self) {
+        let mut tsconfigs: Vec<&JsTsTsconfigEntry> = self.tsconfig_entries.values().collect();
+        tsconfigs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        self.path_mappings = tsconfigs
+            .into_iter()
+            .flat_map(|entry| entry.mappings.iter().cloned())
+            .collect();
+
+        let mut packages: Vec<&JsTsPackageEntry> = self.package_entries.values().collect();
+        packages.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+        self.packages = packages
+            .into_iter()
+            .filter_map(|entry| entry.package.clone())
+            .collect();
     }
 
     fn module_candidates(
@@ -262,6 +350,78 @@ impl JsTsResolver {
 
         candidates
     }
+}
+
+fn parse_tsconfig_mappings(file: &FileRecord) -> Vec<JsTsPathMapping> {
+    let Ok(raw) = std::fs::read_to_string(&file.path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let Some(options) = json
+        .get("compilerOptions")
+        .and_then(|value| value.as_object())
+    else {
+        return Vec::new();
+    };
+    let config_dir = parent_dir_string(&file.relative_path);
+    let base_url = options
+        .get("baseUrl")
+        .and_then(|value| value.as_str())
+        .map(|value| js_ts_normalize_module_path(&join_module_path(&config_dir, value)));
+    let mut mappings = Vec::new();
+    if let Some(paths) = options.get("paths").and_then(|value| value.as_object()) {
+        for (pattern, targets) in paths {
+            let targets = targets
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            if !targets.is_empty() {
+                mappings.push(JsTsPathMapping {
+                    config_dir: config_dir.clone(),
+                    base_url: base_url.clone(),
+                    pattern: pattern.clone(),
+                    targets,
+                });
+            }
+        }
+    }
+    if let Some(base_url) = base_url {
+        mappings.push(JsTsPathMapping {
+            config_dir,
+            base_url: None,
+            pattern: "*".to_string(),
+            targets: vec![format!("{base_url}/*")],
+        });
+    }
+    mappings
+}
+
+fn parse_package_entry(file: &FileRecord) -> Option<JsTsPackage> {
+    let raw = std::fs::read_to_string(&file.path).ok()?;
+    let json = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let name = json.get("name").and_then(|value| value.as_str())?;
+    let root = parent_dir_string(&file.relative_path);
+    let mut main_entries = Vec::new();
+    for field in ["types", "typings", "module", "main"] {
+        if let Some(value) = json.get(field).and_then(|value| value.as_str()) {
+            main_entries.push(value.to_string());
+        }
+    }
+    let mut exports = Vec::new();
+    if let Some(value) = json.get("exports") {
+        collect_js_ts_exports(".", value, &mut exports);
+    }
+    Some(JsTsPackage {
+        root,
+        name: name.to_string(),
+        exports,
+        main_entries,
+    })
 }
 
 pub(crate) fn collect_js_ts_exports(
