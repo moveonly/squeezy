@@ -255,19 +255,34 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
-                // PortKey returns 400 when neither a config-bound user key
-                // nor an explicit routing header tells it which upstream to
-                // call. Surface the actionable knobs instead of leaving the
-                // raw gateway message standing alone.
+                // PortKey returns 400 for two distinct cases: missing
+                // routing context (no header at all) and missing upstream
+                // credentials (header present but PortKey has nothing to
+                // authenticate with at the vendor). The error body looks
+                // the same; we disambiguate by whether we already injected
+                // the routing header ourselves.
                 let hint = if matches!(preset, OpenAiCompatiblePreset::PortKey)
                     && status == StatusCode::BAD_REQUEST
                     && message.to_ascii_lowercase().contains("x-portkey")
-                    && !portkey_inferred_provider
                 {
-                    " — hint: either use a PortKey \"User\" key with a Config attached, \
-                     use a vendor-namespaced model id (e.g. `anthropic/claude-opus-4-7`), \
-                     or set `providers.portkey.headers.x-portkey-provider` (or `x-portkey-config` / \
-                     `x-portkey-virtual-key`) in your settings TOML"
+                    if portkey_inferred_provider {
+                        // We sent `x-portkey-provider` from the model
+                        // namespace and PortKey still rejected — almost
+                        // always because PortKey has no upstream key for
+                        // that vendor (User-type key without a Config
+                        // attached).
+                        " — hint: x-portkey-provider was set from the model namespace, \
+                         but PortKey still rejected. Your key likely has no upstream \
+                         credentials. Attach a Config to the PortKey User key, or \
+                         create a Virtual Key that bundles the upstream key and set \
+                         `providers.portkey.headers.x-portkey-virtual-key` in your \
+                         settings TOML."
+                    } else {
+                        " — hint: either use a PortKey \"User\" key with a Config attached, \
+                         use a vendor-namespaced model id (e.g. `anthropic/claude-opus-4-7`), \
+                         or set `providers.portkey.headers.x-portkey-provider` (or \
+                         `x-portkey-config` / `x-portkey-virtual-key`) in your settings TOML"
+                    }
                 } else {
                     ""
                 };

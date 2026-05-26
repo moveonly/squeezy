@@ -7,7 +7,8 @@ use super::{
     SearchOverlayState, SecretEntryState, clear_scope_override, clear_scope_override_silent,
     compute_search_matches, cycle_to_next_registry_model, discard_all_session_writes,
     handle_editor_key, model_field_meta, open_editor_for, perform_reset, picker_matches,
-    provider_api_key_env, save_field, save_field_silent, undo_last_write,
+    provider_api_key_env, provider_inline_api_key, provider_section_name, save_field,
+    save_field_silent, save_inline_provider_api_key, undo_last_write,
 };
 use crate::notification::{NotificationQueue, Severity as NotifySeverity};
 
@@ -539,13 +540,13 @@ fn open_api_key_entry_for_current_provider(
 ) {
     match provider_api_key_env(&state.effective.provider) {
         Some((label, env_var)) => {
-            // Pre-fill from whatever the resolver finds (env var or
-            // keychain) so reopening the field shows the existing key as
-            // •••• and Ctrl+T can reveal it instead of looking empty as
-            // if nothing was ever saved.
-            let draft = squeezy_llm::resolve_api_key(&env_var)
-                .ok()
-                .unwrap_or_default();
+            // Pre-fill from the inline `api_key` already present in the
+            // merged TOML (user + repo + local) so reopening the field
+            // shows the saved value as •••• and Ctrl+T can reveal it.
+            // We deliberately do not consult env vars here: the field is
+            // labelled as the TOML-stored secret, and a stale env value
+            // would mis-suggest that pressing Enter would overwrite it.
+            let draft = provider_inline_api_key(&state.effective.provider).unwrap_or_default();
             let cursor = draft.chars().count();
             state.secret_entry = Some(SecretEntryState {
                 env_var,
@@ -567,7 +568,7 @@ fn open_api_key_entry_for_current_provider(
 
 fn handle_secret_entry_key(
     state: &mut ConfigScreenState,
-    _agent: &mut Agent,
+    agent: &mut Agent,
     notifications: &mut NotificationQueue,
     key: KeyEvent,
 ) -> KeyOutcome {
@@ -602,29 +603,25 @@ fn handle_secret_entry_key(
             entry.cursor = 0;
             state.secret_entry = None;
             if value.trim().is_empty() {
-                notifications.push(
-                    "API key was empty — nothing written to the keychain.",
-                    NotifySeverity::Warn,
-                );
+                notifications.push("API key was empty — nothing written.", NotifySeverity::Warn);
                 return KeyOutcome::KeepOpen;
             }
-            match squeezy_llm::save_api_key(&env_var, value.trim()) {
-                Ok(()) => {
-                    notifications.push(
-                        format!(
-                            "✓ saved {} to the OS keychain (not stored in any TOML)",
-                            env_var
-                        ),
-                        NotifySeverity::Success,
-                    );
-                }
-                Err(err) => {
-                    notifications.push(
-                        format!("failed to save {env_var}: {err}"),
-                        NotifySeverity::Error,
-                    );
-                }
-            }
+            let Some(section) = provider_section_name(&state.effective.provider) else {
+                notifications.push(
+                    "This provider does not have a single inline API key (Bedrock \
+                     uses AWS creds, Ollama is local).",
+                    NotifySeverity::Info,
+                );
+                return KeyOutcome::KeepOpen;
+            };
+            save_inline_provider_api_key(
+                state,
+                agent,
+                notifications,
+                section,
+                &env_var,
+                value.trim(),
+            );
         }
         _ => {}
     }
