@@ -39,8 +39,8 @@ fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    assert_eq!(state.scope, ConfigScope::User);
-    for expected in [ConfigScope::Repo, ConfigScope::Local, ConfigScope::User] {
+    assert_eq!(state.scope, ConfigScope::Local);
+    for expected in [ConfigScope::User, ConfigScope::Repo, ConfigScope::Local] {
         handle_key(
             &mut state,
             &mut agent,
@@ -56,7 +56,7 @@ fn tab_cycles_through_three_scopes() {
         &mut q,
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
     );
-    assert_eq!(state.scope, ConfigScope::Local);
+    assert_eq!(state.scope, ConfigScope::Repo);
 }
 
 #[test]
@@ -90,6 +90,7 @@ fn space_toggles_bool_field() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
     // show_reasoning_usage is at index 4 in Verbosity: env_override=None, Bool.
     state.field_index = 4;
     let before = state.effective.tui.show_reasoning_usage;
@@ -281,6 +282,7 @@ async fn space_cycles_enum_field_to_next_option() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
     state.field_index = 0; // provider (Enum)
     let before = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
         FieldValue::Enum(v) => v,
@@ -415,6 +417,7 @@ async fn space_cycling_provider_resets_model_in_memory() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
+    state.scope = ConfigScope::User;
     // provider is row 0
     state.field_index = 0;
     let model_before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {

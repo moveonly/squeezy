@@ -302,7 +302,7 @@ impl ConfigScreenState {
             ),
         ];
         Self {
-            scope: ConfigScope::User,
+            scope: ConfigScope::Local,
             section_index,
             field_index: 0,
             editor: None,
