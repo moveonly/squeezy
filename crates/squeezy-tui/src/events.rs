@@ -47,15 +47,19 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 }
                 AgentEvent::ReasoningSegment { mut snapshot, .. } => {
                     // Each reasoning block ends with its own segment event.
-                    // OpenAI's payload arrives with an empty summary in the
-                    // common case; fall back to the live streamed buffer so
-                    // the persisted transcript entry isn't blank.
-                    if snapshot.display_text.trim().is_empty()
-                        && !app.pending_reasoning.trim().is_empty()
+                    // Prefer the live streamed buffer when it has more
+                    // content than the provider's snapshot: OpenAI ships
+                    // `summary = []` so the buffer is the only carrier;
+                    // qwen via OpenRouter/PortKey streams the full thought
+                    // via deltas but emits only a short digest in the final
+                    // payload, and without this guard we'd persist the
+                    // digest and the body the user watched scroll by would
+                    // visibly vanish at end of turn.
+                    let streamed = std::mem::take(&mut app.pending_reasoning);
+                    if streamed.trim().chars().count()
+                        > snapshot.display_text.trim().chars().count()
                     {
-                        snapshot.display_text = std::mem::take(&mut app.pending_reasoning);
-                    } else {
-                        app.pending_reasoning.clear();
+                        snapshot.display_text = streamed;
                     }
                     // Always persist to the transcript. The agent loop
                     // already records reasoning into the conversation
