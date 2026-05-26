@@ -451,7 +451,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
     lines.push(Line::raw(""));
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  no matches · Ctrl+Enter to commit the filter as a custom model id",
+            "  no matches · Enter to commit the filter as a custom model id",
             Style::default().fg(QUIET),
         )));
     } else {
@@ -495,7 +495,7 @@ fn render_model_picker(frame: &mut Frame<'_>, area: Rect, picker: &ModelPickerSt
     }
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
-        "Type filter · ↑/↓ move · Enter commit · Tab all-providers · Ctrl+Enter custom · Esc cancel",
+        "Type filter · ↑/↓ move · Enter commit (or custom id if no match) · Tab all-providers · Esc cancel",
         Style::default().fg(QUIET),
     )));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);

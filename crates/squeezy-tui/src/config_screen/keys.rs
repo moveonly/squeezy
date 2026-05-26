@@ -448,11 +448,15 @@ fn handle_picker_key(
             picker.cursor = 0;
         }
         (KeyCode::Enter, m) if m.contains(KeyModifiers::CONTROL) => {
-            // Ctrl+Enter — commit the raw filter buffer as a custom string.
+            // Ctrl+Enter — power-user escape hatch that commits the raw filter
+            // even when it matches a known model. Most terminals strip the
+            // Control modifier from Enter (only kitty-keyboard-protocol hosts
+            // like Kitty/WezTerm/Ghostty deliver it), so the plain-Enter
+            // branch below is the load-bearing path for custom ids.
             let custom = picker.filter.trim().to_string();
             if custom.is_empty() {
                 notifications.push(
-                    "Type a model id first, then Ctrl+Enter to commit.",
+                    "Type a model id first, then press Enter to commit.",
                     NotifySeverity::Info,
                 );
             } else {
@@ -462,10 +466,15 @@ fn handle_picker_key(
         (KeyCode::Enter, _) => {
             let matches = picker_matches(picker);
             if matches.is_empty() {
-                notifications.push(
-                    "No model matches the filter. Ctrl+Enter to commit the filter as a custom id.",
-                    NotifySeverity::Info,
-                );
+                let custom = picker.filter.trim().to_string();
+                if custom.is_empty() {
+                    notifications.push(
+                        "Type a model id first, then press Enter to commit.",
+                        NotifySeverity::Info,
+                    );
+                } else {
+                    commit_model_picker(state, agent, notifications, custom);
+                }
             } else {
                 let id = matches[picker.cursor.min(matches.len() - 1)].id.to_string();
                 commit_model_picker(state, agent, notifications, id);
