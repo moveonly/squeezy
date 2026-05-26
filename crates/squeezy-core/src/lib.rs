@@ -98,8 +98,8 @@ pub const DEFAULT_COST_WARN_PERCENT: u8 = 85;
 // the subagent's natural exit is the model emitting a final answer
 // with no tool calls.
 pub const DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL: u64 = 10_000;
-pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 1_000_000_000;
-pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 1_000_000;
+pub const DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL: u64 = 100_000_000;
+pub const DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL: u64 = 50_000;
 // Emergency belt on subagent model rounds — matches CC's
 // `forkSubagent.maxTurns = 200`, the only concrete cap any peer
 // sets on a full subagent. Above this the cost broker, cancellation

@@ -199,6 +199,21 @@ compaction_max_summary_bytes = 4096
 }
 
 #[test]
+fn subagent_config_defaults_stay_within_cost_broker_ceiling() {
+    let defaults = SubagentConfig::default();
+    assert!(
+        defaults.max_tool_bytes_read_per_call <= 100_000_000,
+        "default max_tool_bytes_read_per_call = {} exceeds 100MB ceiling",
+        defaults.max_tool_bytes_read_per_call
+    );
+    assert!(
+        defaults.max_search_files_per_call <= 50_000,
+        "default max_search_files_per_call = {} exceeds 50K ceiling",
+        defaults.max_search_files_per_call
+    );
+}
+
+#[test]
 fn subagent_config_reads_settings_and_env() {
     let settings = SettingsFile::from_toml_str(
         r#"
