@@ -6300,6 +6300,15 @@ pub struct McpServerConfig {
     pub disabled_tools: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub permissions: McpPermissionConfig,
+    /// Name of the environment variable holding the bearer token for HTTP/SSE
+    /// transports. Resolved at session start; missing env vars are skipped.
+    pub bearer_token_env_var: Option<String>,
+    /// Static HTTP headers attached to every request on HTTP/SSE transports.
+    pub http_headers: BTreeMap<String, String>,
+    /// HTTP headers whose values are read from environment variables at session
+    /// start. Map key is the header name, value is the env var name. On
+    /// conflict with `http_headers`, the env-sourced value wins.
+    pub env_http_headers: BTreeMap<String, String>,
 }
 
 impl McpServerConfig {
@@ -6322,6 +6331,9 @@ impl McpServerConfig {
                 "disabled_tools",
                 "env",
                 "permissions",
+                "bearer_token_env_var",
+                "http_headers",
+                "env_http_headers",
             ],
             source,
             path,
@@ -6329,6 +6341,16 @@ impl McpServerConfig {
         let transport = mcp_transport_value(table, "transport", source, &field(path, "transport"))?
             .unwrap_or(McpTransport::Stdio);
         let env = string_map_value(table, "env", source, &field(path, "env"))?.unwrap_or_default();
+        let http_headers =
+            string_map_value(table, "http_headers", source, &field(path, "http_headers"))?
+                .unwrap_or_default();
+        let env_http_headers = string_map_value(
+            table,
+            "env_http_headers",
+            source,
+            &field(path, "env_http_headers"),
+        )?
+        .unwrap_or_default();
         let permissions = optional_table(table, "permissions", source)?
             .map(|table| {
                 McpPermissionConfig::from_table(name, table, source, &field(path, "permissions"))
@@ -6358,6 +6380,14 @@ impl McpServerConfig {
             .unwrap_or_default(),
             env,
             permissions,
+            bearer_token_env_var: string_value(
+                table,
+                "bearer_token_env_var",
+                source,
+                &field(path, "bearer_token_env_var"),
+            )?,
+            http_headers,
+            env_http_headers,
         })
     }
 
@@ -6378,6 +6408,13 @@ impl McpServerConfig {
             self.env.extend(next.env);
         }
         self.permissions.merge(next.permissions);
+        replace_if_some(&mut self.bearer_token_env_var, next.bearer_token_env_var);
+        if !next.http_headers.is_empty() {
+            self.http_headers.extend(next.http_headers);
+        }
+        if !next.env_http_headers.is_empty() {
+            self.env_http_headers.extend(next.env_http_headers);
+        }
     }
 }
 

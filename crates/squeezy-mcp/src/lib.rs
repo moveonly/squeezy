@@ -11,6 +11,7 @@ use std::{
 };
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
+use http::{HeaderName, HeaderValue};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{
@@ -21,7 +22,10 @@ use rmcp::{
         ResourceUpdatedNotificationParam, Tool as RmcpTool,
     },
     service::{NotificationContext, RequestContext, RoleClient},
-    transport::{StreamableHttpClientTransport, TokioChildProcess},
+    transport::{
+        StreamableHttpClientTransport, TokioChildProcess,
+        streamable_http_client::StreamableHttpClientTransportConfig,
+    },
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1194,7 +1198,10 @@ async fn start_http_service(
             McpTransport::Stdio => "stdio",
         },
     })?;
-    let transport = StreamableHttpClientTransport::from_uri(url.clone());
+    let config = build_streamable_http_config(server_name, url.clone(), server, |name| {
+        std::env::var(name).ok()
+    });
+    let transport = StreamableHttpClientTransport::from_config(config);
     let service = handler
         .serve(transport)
         .await
@@ -1206,6 +1213,100 @@ async fn start_http_service(
         service: Arc::new(service),
         _process: None,
     })
+}
+
+/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+///
+/// Resolves `bearer_token_env_var`, `http_headers`, and `env_http_headers`
+/// against the supplied env lookup. Missing env vars are skipped (not fatal);
+/// invalid header names/values log a warning and are dropped so a single bad
+/// entry never blocks the whole server from connecting. Env-sourced headers
+/// override the static map on name conflict so secret rotation does not lose
+/// to a stale literal.
+fn build_streamable_http_config<F>(
+    server_name: &str,
+    url: String,
+    server: &McpServerConfig,
+    lookup_env: F,
+) -> StreamableHttpClientTransportConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let auth_header = server.bearer_token_env_var.as_deref().and_then(|name| {
+        let value = lookup_env(name)?;
+        if value.trim().is_empty() {
+            tracing::warn!(
+                server = server_name,
+                env_var = name,
+                "bearer_token_env_var resolved to empty value; skipping Authorization header"
+            );
+            return None;
+        }
+        Some(value)
+    });
+
+    let mut custom_headers: std::collections::HashMap<HeaderName, HeaderValue> =
+        std::collections::HashMap::new();
+    for (name, value) in &server.http_headers {
+        match (
+            HeaderName::try_from(name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(header_name), Ok(header_value)) => {
+                custom_headers.insert(header_name, header_value);
+            }
+            (Err(err), _) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = name,
+                    "invalid HTTP header name: {err}"
+                );
+            }
+            (_, Err(err)) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = name,
+                    "invalid HTTP header value: {err}"
+                );
+            }
+        }
+    }
+    for (header_name, env_var) in &server.env_http_headers {
+        let Some(value) = lookup_env(env_var) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        match (
+            HeaderName::try_from(header_name.as_str()),
+            HeaderValue::try_from(value.as_str()),
+        ) {
+            (Ok(name), Ok(val)) => {
+                custom_headers.insert(name, val);
+            }
+            (Err(err), _) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = header_name,
+                    "invalid HTTP header name: {err}"
+                );
+            }
+            (_, Err(err)) => {
+                tracing::warn!(
+                    server = server_name,
+                    header = header_name,
+                    env_var = env_var,
+                    "invalid HTTP header value resolved from env: {err}"
+                );
+            }
+        }
+    }
+
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    config.auth_header = auth_header;
+    config.custom_headers = custom_headers;
+    config
 }
 
 async fn with_timeout<T>(

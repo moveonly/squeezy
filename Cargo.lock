@@ -3450,6 +3450,7 @@ name = "squeezy-mcp"
 version = "0.1.0"
 dependencies = [
  "futures-util",
+ "http 1.4.0",
  "libc",
  "rmcp",
  "serde",
