@@ -17,13 +17,72 @@ See [`CONFIGURATION.md`](CONFIGURATION.md) for the merging rules and the
 `config inspect` / `doctor` source reporting. The default user settings
 path can be overridden with `SQUEEZY_SETTINGS_PATH`.
 
+## Fastest start: pick an aggregator
+
+If you don't already have a vendor account, **OpenRouter** is the shortest
+path: one credit account routes to every frontier model under a single key.
+Vercel AI Gateway and PortKey work the same way and are listed below.
+
+```toml
+[model]
+provider = "openrouter"
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-opus-4-7"
+```
+
+Then export the key and run `squeezy`:
+
+```sh
+export OPENROUTER_API_KEY=...   # https://openrouter.ai/keys
+squeezy
+```
+
 ## Settings File
 
 ```toml
 [model]
-provider = "openai"
+provider = "openrouter"
 profile = "balanced"
 model = ""
+
+# ── Aggregators (one credit, many models) ──────────────────────────────────
+
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+api_key_keychain = "squeezy:openrouter"
+base_url = "https://openrouter.ai/api/v1"
+default_model = "anthropic/claude-opus-4-7"
+
+[providers.openrouter.headers]
+# Optional — OpenRouter uses these for traffic attribution. Squeezy ships
+# defaults that point at the Squeezy GitHub; override if you'd rather show
+# your own deployment.
+"HTTP-Referer" = "https://github.com/esqueezy/squeezy"
+"X-Title" = "Squeezy"
+
+[providers.vercel]
+api_key_env = "AI_GATEWAY_API_KEY"
+api_key_keychain = "squeezy:vercel"
+base_url = "https://ai-gateway.vercel.sh/v1"
+default_model = "anthropic/claude-opus-4-7"
+
+[providers.portkey]
+api_key_env = "PORTKEY_API_KEY"
+api_key_keychain = "squeezy:portkey"
+base_url = "https://api.portkey.ai/v1"
+# default_model points at a PortKey virtual key configured in your dashboard.
+
+[providers.portkey.headers]
+"x-portkey-virtual-key" = "your-virtual-key"
+# or: "x-portkey-config" = "config-id"
+
+# ── First-party vendor APIs (single vendor) ───────────────────────────────
+# Azure OpenAI is Microsoft's hosted OpenAI deployment and is OpenAI-only.
+# For Azure AI Foundry's broader catalog (Llama, Phi, Mistral, Cohere, …) use
+# the `openai_compatible` preset further down with the Foundry serverless
+# endpoint as the base_url.
 
 [providers.openai]
 api_key_env = "OPENAI_API_KEY"
@@ -50,41 +109,117 @@ base_url = "https://RESOURCE.openai.azure.com/openai/v1"
 api_version = "v1"
 default_model = "gpt-5.5"
 
+# ── Aggregators (continued): Amazon Bedrock ───────────────────────────────
+# Bedrock is AWS's multi-vendor catalog (Anthropic, Meta, Mistral, Amazon,
+# Cohere, AI21, Stability) reached over the AWS default credential chain.
+
 [providers.bedrock]
 region = "us-east-1"
 default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
 
+# ── Local runtime ─────────────────────────────────────────────────────────
+
 [providers.ollama]
 base_url = "http://localhost:11434/api"
 default_model = "qwen3-coder"
+
+# ── Single-vendor OpenAI-compatible (full preset) ─────────────────────────
+
+[providers.groq]
+api_key_env = "GROQ_API_KEY"
+default_model = "llama-3.3-70b-versatile"
+# base_url defaults to https://api.groq.com/openai/v1
+
+[providers.xai]
+api_key_env = "XAI_API_KEY"
+default_model = "grok-4"
+# base_url defaults to https://api.x.ai/v1
+
+[providers.deepseek]
+api_key_env = "DEEPSEEK_API_KEY"
+default_model = "deepseek-chat"
+# base_url defaults to https://api.deepseek.com/v1
+
+# ── Single-vendor OpenAI-compatible (light preset) ────────────────────────
+# No curated models in the registry; cost/limit estimates fall back to
+# generic OpenAI-compatible defaults. Override `default_model` per-section.
+
+[providers.mistral]
+api_key_env = "MISTRAL_API_KEY"
+default_model = "mistral-large-latest"
+# base_url defaults to https://api.mistral.ai/v1
+
+[providers.together]
+api_key_env = "TOGETHER_API_KEY"
+default_model = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+# base_url defaults to https://api.together.xyz/v1
+
+[providers.fireworks]
+api_key_env = "FIREWORKS_API_KEY"
+default_model = "accounts/fireworks/models/llama-v3p3-70b-instruct"
+# base_url defaults to https://api.fireworks.ai/inference/v1
+
+[providers.cerebras]
+api_key_env = "CEREBRAS_API_KEY"
+default_model = "llama-3.3-70b"
+# base_url defaults to https://api.cerebras.ai/v1
+
+# ── Custom OpenAI-compatible endpoint ─────────────────────────────────────
+# Any service that speaks `POST /chat/completions` with a Bearer token
+# works through the `openai_compatible` preset. Examples:
+#
+#   * Microsoft Foundry (Azure AI Studio) serverless deployment — base_url is
+#     your Foundry endpoint, e.g.
+#     https://your-deployment.eastus2.models.ai.azure.com/v1
+#   * Cloudflare Workers AI — base_url contains your account id.
+#   * Self-hosted LiteLLM proxy — base_url is your deployment.
+#   * Cohere — partial compatibility; tool calling may differ.
+
+[providers.openai_compatible]
+api_key_env = "CUSTOM_API_KEY"
+base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
+default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
 ```
 
-`model = ""` means Squeezy uses the selected provider default. `profile` is recorded and exposed to telemetry/model selection surfaces; current accepted values are `cheap`, `balanced`, and `strong`.
+`model = ""` means Squeezy uses the selected provider default. `profile` is
+recorded and exposed to telemetry/model selection surfaces; current accepted
+values are `cheap`, `balanced`, and `strong`.
 
 On first interactive startup, when no provider/model choice has been saved,
-Squeezy detects available API-key environment variables (`OPENAI_API_KEY`,
-`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, and Azure variants)
-plus local Ollama availability. It asks for provider/token, model, and supported
-model options such as OpenAI reasoning effort, then saves only the environment
-variable name and selected defaults to `~/.squeezy/settings.toml`. Secret token
-values are never written. Use `--no-default` to run the selector again.
+Squeezy detects available API-key environment variables and local Ollama
+availability. Aggregators (OpenRouter / Vercel / PortKey) are listed first
+because one key gives access to many models. The picker also detects
+`GROQ_API_KEY`, `XAI_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`,
+`TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `CEREBRAS_API_KEY`,
+`AI_GATEWAY_API_KEY`, `PORTKEY_API_KEY`, plus the existing
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and Azure variants.
+It asks for provider/token, model, and supported model options (e.g. OpenAI
+reasoning effort), then saves only the environment variable name and the
+selected defaults to `~/.squeezy/settings.toml`. Secret token values are never
+written. Use `--no-default` to run the selector again.
 
-For OpenAI, Anthropic, Google, and Azure OpenAI, `api_key_keychain` is a macOS
-fallback service name for a Generic Password entry. The environment variable
-named by `api_key_env` always wins. When the environment variable is absent,
-Squeezy asks Keychain for the configured service with account `openai`,
-`anthropic`, `google`, or `azure_openai`. On non-macOS hosts this fallback is
-not available.
+For OpenAI, Anthropic, Google, Azure OpenAI, and every OpenAI-compatible
+preset, `api_key_keychain` is a macOS fallback service name for a Generic
+Password entry. The environment variable named by `api_key_env` always wins.
+When the environment variable is absent, Squeezy asks Keychain for the
+configured service. On non-macOS hosts this fallback is not available.
 
 ## CLI
 
 ```sh
 cargo run -p squeezy -- --list-providers
 cargo run -p squeezy -- --list-models
+cargo run -p squeezy -- --provider openrouter --model anthropic/claude-opus-4-7 --prompt "hello"
+cargo run -p squeezy -- --provider groq --model llama-3.1-8b-instant --prompt "hello"
 cargo run -p squeezy -- --provider ollama --model qwen3 --prompt "hello"
 ```
 
-Existing env overrides remain supported: `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`, `SQUEEZY_PROFILE`, provider base URL variables, and provider API-key-env variables.
+Existing env overrides remain supported: `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`,
+`SQUEEZY_PROFILE`, the provider-specific base URL variables
+(`OPENROUTER_BASE_URL`, `VERCEL_BASE_URL`, `PORTKEY_BASE_URL`, `GROQ_BASE_URL`,
+`XAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `MISTRAL_BASE_URL`, `TOGETHER_BASE_URL`,
+`FIREWORKS_BASE_URL`, `CEREBRAS_BASE_URL`), and the provider API-key-env
+variables.
 
 ## Built-In Model Accounting Metadata
 
@@ -99,9 +234,19 @@ estimate assembled-request size without starting a model turn:
 | `bedrock` | `anthropic.claude-haiku-4-5-20251001-v1:0` | 200,000 | 64,000 |
 | `google` | `gemini-2.5-pro` | 1,048,576 | 65,536 |
 | `ollama` | `qwen3-coder` | Runtime | Runtime |
+| `openrouter` | `anthropic/claude-opus-4-7` | 200,000 | 64,000 |
+| `vercel` | `anthropic/claude-opus-4-7` | 200,000 | 64,000 |
+| `groq` | `llama-3.3-70b-versatile` | 131,072 | 32,768 |
+| `xai` | `grok-4` | 256,000 | 32,768 |
+| `deepseek` | `deepseek-chat` | 131,072 | 8,192 |
+
+Light-preset providers (`portkey`, `mistral`, `together`, `fireworks`,
+`cerebras`) and the `openai_compatible` custom preset fall back to a generic
+272K context / 64K max-output estimate until you set `default_model` to a
+model that exists in the curated registry.
 
 Ollama limits are local model metadata. Squeezy tries `/api/show` and uses
-`model_info.*.context_length` or `num_ctx` when available; otherwise the
+`model_info.*.context_window` or `num_ctx` when available; otherwise the
 context window remains unknown. Custom model ids are also treated as unknown
 until added to the registry or reported by the local provider.
 
@@ -113,7 +258,33 @@ until added to the registry or reported by the local provider.
 - `azure_openai`: Azure OpenAI Responses-compatible streaming with `api-key` auth and `api-version`.
 - `ollama`: Local `/api/chat` NDJSON streaming with function tool schemas and zero-dollar pricing.
 - `bedrock`: AWS SDK Bedrock Runtime `ConverseStream` transport, AWS default credential chain, region/base-url configuration, text streaming, tool use/tool results, and usage metadata.
+- `openrouter` / `vercel` / `portkey` / `groq` / `xai` / `deepseek` / `mistral` / `together` / `fireworks` / `cerebras` / `openai_compatible`: OpenAI-compatible `POST /chat/completions` streaming with Bearer auth, function-tool schemas, and `usage` extraction. OpenRouter ships default `HTTP-Referer` / `X-Title` headers for traffic attribution.
 
-Pricing values are seed metadata for routing and telemetry, not billing authority. Refresh them from provider pricing pages when changing defaults.
+Pricing values are seed metadata for routing and telemetry, not billing
+authority. Aggregator entries leave pricing `null` because effective price
+depends on the route and the aggregator's markup; the token meter still
+reports usage. Refresh pricing from provider pages when changing defaults.
 Context usage values are local estimates. They are meant to explain Squeezy's
 assembled request and are not provider billing counters.
+
+## Live integration tests
+
+Each hosted provider has an opt-in "costly" integration test under
+`crates/squeezy-llm/tests/*_costly.rs`. They are gated by the `costly-tests`
+Cargo feature and `SQUEEZY_RUN_COSTLY_TESTS=1`, plus the relevant provider
+credential. CI does not run them. Local invocation:
+
+```sh
+SQUEEZY_RUN_COSTLY_TESTS=1 \
+  OPENROUTER_API_KEY=sk-... \
+  cargo test -p squeezy-llm --features costly-tests \
+  --test openrouter_costly -- --include-ignored
+```
+
+The same shape works for `vercel_costly`, `portkey_costly`, `groq_costly`,
+`xai_costly`, `deepseek_costly`, `google_costly`, `azure_openai_costly`,
+`bedrock_costly`, plus the existing `openai_costly` and `anthropic_costly`.
+
+A free Ollama smoke test lives at `crates/squeezy-llm/tests/ollama_smoke.rs`.
+It silently skips when no daemon is reachable; set `SQUEEZY_OLLAMA_SMOKE=1`
+to fail loudly on a host that's expected to have Ollama running.

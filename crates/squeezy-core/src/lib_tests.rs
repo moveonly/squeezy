@@ -1847,6 +1847,68 @@ fn cli_and_env_both_tag_when_both_set() {
 }
 
 #[test]
+fn openrouter_provider_resolves_to_compatible_variant_with_preset_defaults() {
+    let settings = SettingsFile::default();
+    let config =
+        AppConfig::try_from_settings_and_env_vars(
+            settings,
+            Some("openrouter"),
+            |name| match name {
+                "OPENROUTER_BASE_URL" => None,
+                _ => None,
+            },
+        )
+        .expect("config builds");
+
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("openrouter must map to OpenAiCompatible variant");
+    };
+    assert_eq!(compatible.preset, OpenAiCompatiblePreset::OpenRouter);
+    assert_eq!(compatible.api_key_env, "OPENROUTER_API_KEY");
+    assert_eq!(compatible.base_url, DEFAULT_OPENROUTER_BASE_URL);
+    assert_eq!(config.model, DEFAULT_OPENROUTER_MODEL);
+    // Aggregator presets must not enable `store_responses` even when the user
+    // requests it; the OpenAI-Responses-only flag would be silently dropped
+    // by the chat-completions endpoint and confuse the cost meter.
+    assert!(!config.store_responses);
+}
+
+#[test]
+fn aliases_map_to_compatible_presets() {
+    for (alias, expected) in [
+        ("vercel_ai", OpenAiCompatiblePreset::Vercel),
+        ("grok", OpenAiCompatiblePreset::XAi),
+        ("deep_seek", OpenAiCompatiblePreset::DeepSeek),
+        ("port_key", OpenAiCompatiblePreset::PortKey),
+        ("custom", OpenAiCompatiblePreset::Custom),
+    ] {
+        // The "custom" preset needs an explicit base_url because there is no
+        // default; configure one through `[providers.openai_compatible]`.
+        let mut providers = std::collections::BTreeMap::new();
+        if expected == OpenAiCompatiblePreset::Custom {
+            providers.insert(
+                "openai_compatible".to_string(),
+                ProviderSettings {
+                    api_key_env: Some("CUSTOM_KEY".to_string()),
+                    base_url: Some("https://custom.example/v1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        let settings = SettingsFile {
+            providers: Some(providers),
+            ..Default::default()
+        };
+        let config = AppConfig::try_from_settings_and_env_vars(settings, Some(alias), |_| None)
+            .unwrap_or_else(|err| panic!("alias {alias} should map: {err}"));
+        let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+            panic!("alias {alias} must map to OpenAiCompatible");
+        };
+        assert_eq!(compatible.preset, expected, "alias {alias}");
+    }
+}
+
+#[test]
 fn config_source_labels_strip_paths() {
     let mut config = AppConfig::from_env_vars(None, |_| None);
     config.config_sources = vec![

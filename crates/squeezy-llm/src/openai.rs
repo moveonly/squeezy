@@ -14,6 +14,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     credentials::resolve_api_key,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
+    sse::SseDecoder,
 };
 
 #[derive(Clone)]
@@ -212,65 +213,6 @@ impl LlmProvider for OpenAiProvider {
                 ))?;
             }
         })
-    }
-}
-
-#[derive(Debug, Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(bytes);
-        let mut events = Vec::new();
-
-        while let Some((index, len)) = find_event_boundary(&self.buffer) {
-            let event = self.buffer.drain(..index + len).collect::<Vec<_>>();
-            if let Some(data) = decode_sse_event(&event) {
-                events.push(data);
-            }
-        }
-
-        events
-    }
-
-    fn finish(&mut self) -> Vec<String> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-
-        let event = std::mem::take(&mut self.buffer);
-        decode_sse_event(&event).into_iter().collect()
-    }
-}
-
-fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
-
-    [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
-}
-
-fn decode_sse_event(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut data_lines = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start());
-        }
-    }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
     }
 }
 

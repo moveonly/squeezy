@@ -45,52 +45,6 @@ fn request_body_uses_responses_streaming_shape() {
 }
 
 #[test]
-fn sse_decoder_collects_data_events_across_chunks() {
-    let mut decoder = SseDecoder::default();
-
-    assert!(
-        decoder
-            .push(b"event: message\ndata: {\"type\":\"response.")
-            .is_empty()
-    );
-    let events = decoder.push(b"output_text.delta\",\"delta\":\"hi\"}\n\n");
-
-    assert_eq!(
-        events,
-        vec![r#"{"type":"response.output_text.delta","delta":"hi"}"#]
-    );
-}
-
-#[test]
-fn sse_decoder_accepts_crlf_event_delimiters() {
-    let mut decoder = SseDecoder::default();
-    let events = decoder.push(
-        b"event: message\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\r\n\r\n",
-    );
-
-    assert_eq!(
-        events,
-        vec![r#"{"type":"response.output_text.delta","delta":"hi"}"#]
-    );
-}
-
-#[test]
-fn sse_decoder_splits_multiple_crlf_events() {
-    let mut decoder = SseDecoder::default();
-    let events = decoder.push(
-        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}\r\n\r\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"two\"}\r\n\r\n",
-    );
-
-    assert_eq!(
-        events,
-        vec![
-            r#"{"type":"response.output_text.delta","delta":"one"}"#,
-            r#"{"type":"response.output_text.delta","delta":"two"}"#
-        ]
-    );
-}
-
-#[test]
 fn parser_extracts_text_delta() {
     let event = parse_openai_event(r#"{"type":"response.output_text.delta","delta":"hello"}"#)
         .expect("valid event");

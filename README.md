@@ -5,10 +5,20 @@ citizens. Squeezy parses repositories into a persistent local semantic graph and
 queries that graph through structured tools that return compact evidence
 packets — spans, hashes, confidence, freshness — instead of raw file dumps.
 
-> **Status:** early development. The TUI scaffold is runnable; OpenAI,
-> Anthropic, Gemini, Azure OpenAI, Ollama, and Bedrock adapters are available;
-> deterministic validation harness tasks run in CI; graph-backed navigation
-> tools expose compact evidence packets.
+> **Status:** early development. The TUI scaffold is runnable; deterministic
+> validation harness tasks run in CI; graph-backed navigation tools expose
+> compact evidence packets. Providers:
+>
+> - **Aggregators (one key/credential, many models):** OpenRouter, Vercel AI
+>   Gateway, PortKey, Amazon Bedrock (AWS multi-vendor catalog).
+> - **First-party vendor APIs (single vendor):** OpenAI, Anthropic, Google
+>   Gemini, Azure OpenAI (Microsoft-hosted OpenAI, OpenAI-only).
+> - **Local runtime:** Ollama.
+> - **Other OpenAI-compatible:** Groq, xAI, DeepSeek, Mistral La Plateforme,
+>   Together AI, Fireworks AI, Cerebras.
+> - Any other OpenAI-compatible endpoint — Microsoft Foundry (Azure AI Studio)
+>   for the broader Foundry catalog, Cloudflare Workers AI, self-hosted
+>   LiteLLM, … — works via the `openai_compatible` preset.
 
 The **why** lives in [`docs/THESIS.md`](docs/THESIS.md). User docs live in
 [`docs/external/`](docs/external) and contributor docs live in
@@ -43,8 +53,16 @@ uninstall instructions are in [`docs/external/INSTALL.md`](docs/external/INSTALL
 ```sh
 squeezy doctor                    # diagnose configuration and providers
 squeezy config init --user        # write the default user settings file
-export OPENAI_API_KEY=...         # or pick another provider; bring your own key
-squeezy                           # open the TUI
+
+# Fastest path: one credit, every frontier model (recommended)
+export OPENROUTER_API_KEY=...     # https://openrouter.ai/keys
+squeezy
+
+# Or use any other supported provider — first-party vendor APIs (OpenAI,
+# Anthropic, Google Gemini), cloud-platform hosts (Azure OpenAI, Amazon
+# Bedrock), local Ollama, or other OpenAI-compatible services (Vercel AI
+# Gateway, PortKey, Groq, xAI, DeepSeek, Mistral, Together AI, Fireworks AI,
+# Cerebras). See docs/external/PROVIDERS.md for the matching env vars.
 ```
 
 `squeezy doctor` reports on the merged configuration sources, repo profile,

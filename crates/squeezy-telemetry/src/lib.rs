@@ -809,10 +809,22 @@ pub enum ProviderKind {
     AzureOpenAi,
     Bedrock,
     Ollama,
+    OpenRouter,
+    Vercel,
+    PortKey,
+    Groq,
+    XAi,
+    DeepSeek,
+    Mistral,
+    Together,
+    Fireworks,
+    Cerebras,
+    OpenAiCompatible,
 }
 
 impl ProviderKind {
     fn from_provider(provider: &ProviderConfig) -> Self {
+        use squeezy_core::OpenAiCompatiblePreset;
         match provider {
             ProviderConfig::OpenAi(_) => Self::OpenAi,
             ProviderConfig::Anthropic(_) => Self::Anthropic,
@@ -820,6 +832,19 @@ impl ProviderKind {
             ProviderConfig::AzureOpenAi(_) => Self::AzureOpenAi,
             ProviderConfig::Bedrock(_) => Self::Bedrock,
             ProviderConfig::Ollama(_) => Self::Ollama,
+            ProviderConfig::OpenAiCompatible(config) => match config.preset {
+                OpenAiCompatiblePreset::OpenRouter => Self::OpenRouter,
+                OpenAiCompatiblePreset::Vercel => Self::Vercel,
+                OpenAiCompatiblePreset::PortKey => Self::PortKey,
+                OpenAiCompatiblePreset::Groq => Self::Groq,
+                OpenAiCompatiblePreset::XAi => Self::XAi,
+                OpenAiCompatiblePreset::DeepSeek => Self::DeepSeek,
+                OpenAiCompatiblePreset::Mistral => Self::Mistral,
+                OpenAiCompatiblePreset::Together => Self::Together,
+                OpenAiCompatiblePreset::Fireworks => Self::Fireworks,
+                OpenAiCompatiblePreset::Cerebras => Self::Cerebras,
+                OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
+            },
         }
     }
 }
@@ -837,12 +862,20 @@ pub enum ModelFamily {
 
 impl ModelFamily {
     fn from_model(provider: &ProviderConfig, model: &str) -> Self {
-        let model = model.to_ascii_lowercase();
-        if model.starts_with("gpt") || model.starts_with("o1") || model.starts_with("o3") {
+        let model_lower = model.to_ascii_lowercase();
+        // OpenAI-compatible aggregators often namespace models as
+        // "<vendor>/<id>" (e.g. "anthropic/claude-opus-4-7"). Strip the
+        // namespace so the family classifier matches on the actual model id.
+        let stripped = model_lower
+            .split_once('/')
+            .map(|(_, id)| id)
+            .unwrap_or(&model_lower);
+        if stripped.starts_with("gpt") || stripped.starts_with("o1") || stripped.starts_with("o3") {
             Self::Gpt
-        } else if model.starts_with("claude") || matches!(provider, ProviderConfig::Anthropic(_)) {
+        } else if stripped.starts_with("claude") || matches!(provider, ProviderConfig::Anthropic(_))
+        {
             Self::Claude
-        } else if model.starts_with("gemini") || matches!(provider, ProviderConfig::Google(_)) {
+        } else if stripped.starts_with("gemini") || matches!(provider, ProviderConfig::Google(_)) {
             Self::Gemini
         } else if matches!(provider, ProviderConfig::Bedrock(_)) {
             Self::Bedrock

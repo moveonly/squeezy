@@ -198,6 +198,10 @@ fn provider_credential_check(provider: &ProviderConfig) -> (&'static str, (Statu
                 format!("base_url={} (no API key required)", c.base_url),
             ),
         ),
+        ProviderConfig::OpenAiCompatible(c) => (
+            c.preset.as_str(),
+            env_check(&c.api_key_env, c.api_key_keychain.as_deref()),
+        ),
     }
 }
 

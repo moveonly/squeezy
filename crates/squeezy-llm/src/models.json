@@ -414,5 +414,420 @@
     "tokenizer": "ollama",
     "lifecycle": "local",
     "metadata_source": "runtime ollama /api/show metadata"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-opus-4-7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-opus-4-7"
+  },
+  {
+    "provider": "openrouter",
+    "id": "anthropic/claude-haiku-4-5",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/anthropic/claude-haiku-4-5"
+  },
+  {
+    "provider": "openrouter",
+    "id": "openai/gpt-5.5",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/openai/gpt-5.5"
+  },
+  {
+    "provider": "openrouter",
+    "id": "google/gemini-2.5-pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://openrouter.ai/google/gemini-2.5-pro"
+  },
+  {
+    "provider": "vercel",
+    "id": "anthropic/claude-opus-4-7",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 200000,
+      "max_output_tokens": 64000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "anthropic",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/docs/ai-gateway/models"
+  },
+  {
+    "provider": "vercel",
+    "id": "openai/gpt-5.5",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 400000,
+      "max_output_tokens": 128000,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/docs/ai-gateway/models"
+  },
+  {
+    "provider": "vercel",
+    "id": "google/gemini-2.5-pro",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": null,
+    "limits": {
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 65536,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "google",
+    "lifecycle": "active",
+    "metadata_source": "https://vercel.com/docs/ai-gateway/models"
+  },
+  {
+    "provider": "groq",
+    "id": "llama-3.3-70b-versatile",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 590000,
+      "output_usd_micros_per_mtok": 790000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://console.groq.com/docs/models"
+  },
+  {
+    "provider": "groq",
+    "id": "llama-3.1-8b-instant",
+    "profile": "cheap",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 50000,
+      "output_usd_micros_per_mtok": 80000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://console.groq.com/docs/models"
+  },
+  {
+    "provider": "groq",
+    "id": "moonshotai/kimi-k2-instruct",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 1000000,
+      "output_usd_micros_per_mtok": 3000000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 16384,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://console.groq.com/docs/models"
+  },
+  {
+    "provider": "xai",
+    "id": "grok-4",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 3000000,
+      "output_usd_micros_per_mtok": 15000000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 256000,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.x.ai/docs/models"
+  },
+  {
+    "provider": "xai",
+    "id": "grok-4-fast-reasoning",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 200000,
+      "output_usd_micros_per_mtok": 500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 256000,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.x.ai/docs/models"
+  },
+  {
+    "provider": "xai",
+    "id": "grok-code-fast-1",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 200000,
+      "output_usd_micros_per_mtok": 1500000,
+      "cache_read_usd_micros_per_mtok": null,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 256000,
+      "max_output_tokens": 32768,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://docs.x.ai/docs/models"
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-chat",
+    "profile": "balanced",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": false,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 270000,
+      "output_usd_micros_per_mtok": 1100000,
+      "cache_read_usd_micros_per_mtok": 27000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 8192,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
+  },
+  {
+    "provider": "deepseek",
+    "id": "deepseek-reasoner",
+    "profile": "strong",
+    "capabilities": {
+      "streaming": true,
+      "tool_calling": true,
+      "json_mode": true,
+      "vision": false,
+      "response_state": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": false,
+      "text_verbosity": false,
+      "prompt_caching": false
+    },
+    "pricing": {
+      "input_usd_micros_per_mtok": 550000,
+      "output_usd_micros_per_mtok": 2190000,
+      "cache_read_usd_micros_per_mtok": 55000,
+      "cache_write_usd_micros_per_mtok": null
+    },
+    "limits": {
+      "context_window_tokens": 131072,
+      "max_output_tokens": 8192,
+      "effective_context_window_percent": 95
+    },
+    "tokenizer": "openai_compatible",
+    "lifecycle": "active",
+    "metadata_source": "https://api-docs.deepseek.com/quick_start/pricing"
   }
 ]

@@ -1,6 +1,11 @@
 ---
 import DocsLayout from "../../layouts/DocsLayout.astro";
-import { providerRows } from "../../facts";
+import {
+  aggregatorRows,
+  localRuntimeRows,
+  openAiCompatibleRows,
+  providerRows
+} from "../../facts";
 ---
 
 <DocsLayout
@@ -12,10 +17,59 @@ import { providerRows } from "../../facts";
   lead="Squeezy keeps code analysis, permissions, tool shaping, and session accounting local while routing model turns through configured hosted or local providers."
 >
   <section class="doc-block">
-    <h2>Provider adapters</h2>
+    <h2>Aggregators (one key, many models)</h2>
+    <p>Quickest start: a single API key (or cloud credential) routes to every frontier model. OpenRouter, Vercel AI Gateway, and PortKey speak the OpenAI-compatible Chat Completions API. Amazon Bedrock is AWS's multi-vendor catalog (Anthropic, Meta, Mistral, Amazon, Cohere, AI21, Stability) over the AWS default credential chain.</p>
+    <div class="matrix compact-matrix">
+      {
+        aggregatorRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>First-party vendor APIs</h2>
+    <p>Single-vendor endpoints. Each has its own protocol — OpenAI Responses, Anthropic Messages, Gemini streamGenerateContent — and is wired up by a dedicated adapter. Azure OpenAI is Microsoft's hosted OpenAI deployment (OpenAI models only). For Azure AI Foundry's broader catalog (Llama, Phi, Mistral, Cohere, …) use the <code>openai_compatible</code> preset below with the Foundry serverless endpoint as <code>base_url</code>.</p>
     <div class="matrix compact-matrix">
       {
         providerRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Local runtime</h2>
+    <p>Run models on the same host as Squeezy. No external network call, no billing, full control over which models are available.</p>
+    <div class="matrix compact-matrix">
+      {
+        localRuntimeRows.map((row) => (
+          <article class="matrix-row">
+            <h3>{row.name}</h3>
+            <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
+          </article>
+        ))
+      }
+    </div>
+  </section>
+
+  <section class="doc-block">
+    <h2>Other OpenAI-compatible</h2>
+    <p>Single-vendor services that speak <code>POST /chat/completions</code> with a Bearer token. The same adapter that drives the aggregators powers these — set the preset, supply an API key, done. The "Custom" preset accepts any base_url so self-hosted proxies (LiteLLM, Cloudflare Workers AI) work too.</p>
+    <div class="matrix compact-matrix">
+      {
+        openAiCompatibleRows.map((row) => (
           <article class="matrix-row">
             <h3>{row.name}</h3>
             <p>{row.detail}</p>
@@ -29,13 +83,14 @@ import { providerRows } from "../../facts";
 
   <section class="doc-block">
     <h2>Configuration</h2>
-    <p>Provider settings resolve from CLI flags, environment variables, project config, user settings, and built-in defaults. Hosted providers use API key environment variables or platform credential mechanisms; Bedrock uses the AWS default credential chain; Ollama uses the local runtime.</p>
+    <p>Provider settings resolve from CLI flags, environment variables, project config, user settings, and built-in defaults. Aggregators and OpenAI-compatible services use a Bearer API key; first-party vendors use their own header conventions; Bedrock uses the AWS default credential chain; Ollama uses the local runtime.</p>
     <pre><code>[model]
-provider = "openai"
+provider = "openrouter"
 profile = "balanced"
 model = ""
 
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"</code></pre>
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-opus-4-7"</code></pre>
   </section>
 </DocsLayout>

@@ -13,9 +13,9 @@ use futures_util::StreamExt;
 use squeezy_agent::Agent;
 use squeezy_core::{
     AppConfig, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport, ModelProfile,
-    PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort, ResponseVerbosity, SessionMode,
-    SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
-    project_settings_template, user_settings_template,
+    OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
+    ResponseVerbosity, SessionMode, SettingsFile, SqueezyError, default_settings_path,
+    find_project_settings_path, project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, ModelInfo, PROVIDERS, UnavailableProvider,
@@ -1209,7 +1209,7 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
     let choices = detect_provider_choices(config).await;
     if choices.is_empty() {
         return Err(SqueezyError::Config(
-            "no provider credentials or local Ollama models detected; set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or start Ollama, then run squeezy again"
+            "no provider credentials or local Ollama models detected; set OPENROUTER_API_KEY for the fastest path to many models, or set OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / XAI_API_KEY / DEEPSEEK_API_KEY / MISTRAL_API_KEY / TOGETHER_API_KEY / FIREWORKS_API_KEY / CEREBRAS_API_KEY / AI_GATEWAY_API_KEY / PORTKEY_API_KEY, or start Ollama, then run squeezy again"
                 .to_string(),
         ));
     }
@@ -1265,6 +1265,32 @@ async fn run_startup_model_selector(config: &AppConfig) -> squeezy_core::Result<
 
 async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
     let mut choices = Vec::new();
+
+    // OpenAI-compatible presets surface first when their API keys are set —
+    // aggregators (OpenRouter / Vercel / PortKey) give access to many models
+    // through one credit account and are the recommended starting point.
+    for preset in OpenAiCompatiblePreset::all() {
+        if matches!(preset, OpenAiCompatiblePreset::Custom) {
+            continue;
+        }
+        let env_var = preset.default_api_key_env();
+        if env_var.is_empty() {
+            continue;
+        }
+        if env::var_os(env_var).is_none() {
+            continue;
+        }
+        let base_url = env::var(format!("{}_BASE_URL", preset.as_str().to_ascii_uppercase()))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| preset.default_base_url().to_string());
+        choices.push(compatible_provider_choice(
+            preset,
+            env_var.to_string(),
+            base_url,
+        ));
+    }
+
     for api_key_env in detected_env_names("OPENAI_API_KEY_ENV", &["OPENAI_API_KEY"]) {
         choices.push(hosted_provider_choice(
             "openai",
@@ -1330,6 +1356,37 @@ async fn detect_provider_choices(_config: &AppConfig) -> Vec<ProviderChoice> {
 
     choices.retain(|choice| !choice.models.is_empty());
     choices
+}
+
+fn compatible_provider_choice(
+    preset: OpenAiCompatiblePreset,
+    api_key_env: String,
+    base_url: String,
+) -> ProviderChoice {
+    let curated: Vec<String> = models_for_provider(preset.as_str())
+        .map(model_choice_label)
+        .collect();
+    let mut models = curated;
+    if models.is_empty() {
+        let default_model = preset.default_model();
+        if !default_model.is_empty() {
+            models.push(format!("{default_model} (balanced, vendor default)"));
+        }
+    }
+    if models.is_empty() {
+        // PortKey + Custom can't ship a sensible default model id since both
+        // expect the user to configure their own virtual key or self-host
+        // endpoint. Offer a placeholder choice so the picker still shows
+        // the provider; users will edit settings.toml afterwards.
+        models.push("(set providers.<name>.default_model in settings.toml)".to_string());
+    }
+    ProviderChoice {
+        provider: preset.as_str(),
+        label: format!("{} via {api_key_env}", preset.display_name()),
+        api_key_env: Some(api_key_env),
+        base_url: Some(base_url),
+        models,
+    }
 }
 
 fn detected_env_names(selector_env: &str, defaults: &[&str]) -> Vec<String> {
