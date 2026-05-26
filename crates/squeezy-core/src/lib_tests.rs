@@ -2318,3 +2318,71 @@ fn unknown_fields_are_warned_and_removed_from_settings_file() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn inline_api_key_parses_from_toml_and_flows_into_openai_config() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+provider = "openai"
+
+[providers.openai]
+api_key = "sk-test-inline-12345"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    match config.provider {
+        ProviderConfig::OpenAi(openai) => {
+            assert_eq!(openai.api_key.as_deref(), Some("sk-test-inline-12345"));
+        }
+        _ => panic!("expected OpenAi provider"),
+    }
+}
+
+#[test]
+fn inline_api_key_is_redacted_on_serde_serialize() {
+    let settings = ProviderSettings {
+        api_key_env: Some("OPENAI_API_KEY".to_string()),
+        api_key: Some("sk-secret-do-not-leak".to_string()),
+        ..ProviderSettings::default()
+    };
+    let emitted = toml::to_string(&settings).expect("serialize");
+    assert!(
+        !emitted.contains("sk-secret-do-not-leak"),
+        "serialize must not leak plaintext; got: {emitted}"
+    );
+    assert!(
+        emitted.contains("<redacted>"),
+        "serialize must emit the redaction marker; got: {emitted}"
+    );
+}
+
+#[test]
+fn local_inline_api_key_overrides_user_inline_api_key() {
+    let mut user = ProviderSettings {
+        api_key: Some("from-user".to_string()),
+        ..ProviderSettings::default()
+    };
+    let local = ProviderSettings {
+        api_key: Some("from-local".to_string()),
+        ..ProviderSettings::default()
+    };
+    user.merge(local);
+    assert_eq!(user.api_key.as_deref(), Some("from-local"));
+}
+
+#[test]
+fn provider_settings_accepts_both_api_key_and_api_key_env() {
+    SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "sk-test"
+api_key_env = "OPENAI_API_KEY"
+"#,
+        "test",
+    )
+    .expect("api_key + api_key_env both parse cleanly");
+}

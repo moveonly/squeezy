@@ -60,8 +60,37 @@ fn is_duplicate_item_error(err: &keyring::Error) -> bool {
     lowered.contains("already exists")
 }
 
+/// Where a resolved API key actually came from. Lets callers distinguish
+/// "the user typed it into TOML" (steady state) from "we read it out of
+/// the legacy keychain" (migration trigger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// Inline `api_key` from a TOML layer (user or project-local).
+    Inline,
+    /// Environment variable named by `api_key_env`.
+    Env,
+    /// OS keychain entry under `(KEYRING_SERVICE, env_var)`. Legacy
+    /// storage path that PR1 keeps as a read-only fallback for users who
+    /// still have keys there from before TOML storage shipped.
+    KeychainLegacy,
+    /// Fallback env var pair (e.g. SQUEEZY_OPENAI_KEY ↔ OPENAI_API_KEY).
+    FallbackEnv,
+    /// Fallback env var name's keychain entry, again legacy.
+    FallbackKeychainLegacy,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedKey {
+    pub value: String,
+    pub source: KeySource,
+}
+
 pub fn resolve_api_key(env_var: &str) -> Result<String> {
-    resolve_api_key_with_store(env_var, &DefaultCredentialStore)
+    resolve_api_key_with_inline(None, env_var).map(|r| r.value)
+}
+
+pub fn resolve_api_key_with_inline(inline: Option<&str>, env_var: &str) -> Result<ResolvedKey> {
+    resolve_api_key_with_inline_and_store(inline, env_var, &DefaultCredentialStore)
 }
 
 pub fn save_api_key(env_var: &str, value: &str) -> Result<()> {
@@ -72,16 +101,39 @@ pub fn resolve_api_key_with_store(
     env_var: &str,
     store: &dyn KeyringCredentialStore,
 ) -> Result<String> {
-    // Try the configured env var first (env then keychain), then the
-    // common-vendor fallback (e.g. SQUEEZY_OPENAI_KEY → OPENAI_API_KEY)
-    // so users who only have the upstream-vendor name set still work.
-    if let Some(value) = lookup_env_or_keychain(env_var, store)? {
-        return Ok(value);
+    resolve_api_key_with_inline_and_store(None, env_var, store).map(|r| r.value)
+}
+
+pub fn resolve_api_key_with_inline_and_store(
+    inline: Option<&str>,
+    env_var: &str,
+    store: &dyn KeyringCredentialStore,
+) -> Result<ResolvedKey> {
+    // Inline TOML wins over everything else: it's how PR1+ users opt
+    // into TOML-as-source-of-truth without disturbing existing shell
+    // env exports or legacy keychain entries.
+    if let Some(value) = inline
+        && !value.trim().is_empty()
+    {
+        return Ok(ResolvedKey {
+            value: value.to_string(),
+            source: KeySource::Inline,
+        });
+    }
+    if let Some(resolved) = lookup_env_or_keychain(env_var, store)? {
+        return Ok(resolved);
     }
     if let Some(fallback) = fallback_env_var(env_var)
-        && let Some(value) = lookup_env_or_keychain(&fallback, store)?
+        && let Some(mut resolved) = lookup_env_or_keychain(&fallback, store)?
     {
-        return Ok(value);
+        // Promote the source tag to its fallback variant so doctor /
+        // migration code can tell the two paths apart.
+        resolved.source = match resolved.source {
+            KeySource::Env => KeySource::FallbackEnv,
+            KeySource::KeychainLegacy => KeySource::FallbackKeychainLegacy,
+            other => other,
+        };
+        return Ok(resolved);
     }
     let fallback_note = fallback_env_var(env_var)
         .map(|name| format!(" or {name}"))
@@ -95,14 +147,20 @@ pub fn resolve_api_key_with_store(
 fn lookup_env_or_keychain(
     env_var: &str,
     store: &dyn KeyringCredentialStore,
-) -> Result<Option<String>> {
+) -> Result<Option<ResolvedKey>> {
     if let Ok(value) = env::var(env_var)
         && !value.trim().is_empty()
     {
-        return Ok(Some(value));
+        return Ok(Some(ResolvedKey {
+            value,
+            source: KeySource::Env,
+        }));
     }
     match store.load(env_var) {
-        Ok(Some(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(Some(value)) if !value.trim().is_empty() => Ok(Some(ResolvedKey {
+            value,
+            source: KeySource::KeychainLegacy,
+        })),
         Ok(_) => Ok(None),
         Err(error) => Err(SqueezyError::ProviderNotConfigured(format!(
             "keyring service {KEYRING_SERVICE} account {env_var} failed: {error}"

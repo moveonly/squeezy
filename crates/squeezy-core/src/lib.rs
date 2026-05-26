@@ -345,6 +345,7 @@ impl AppConfig {
                 api_key_env: get_var("ANTHROPIC_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "anthropic", "api_key_env"))
                     .unwrap_or_else(|| "SQUEEZY_ANTHROPIC_KEY".to_string()),
+                api_key: provider_setting(&providers, "anthropic", "api_key"),
                 base_url: get_var("ANTHROPIC_BASE_URL")
                     .or_else(|| provider_setting(&providers, "anthropic", "base_url"))
                     .unwrap_or_else(|| DEFAULT_ANTHROPIC_BASE_URL.to_string()),
@@ -354,6 +355,7 @@ impl AppConfig {
                 api_key_env: get_var("GOOGLE_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "google", "api_key_env"))
                     .unwrap_or_else(|| "SQUEEZY_GOOGLE_KEY".to_string()),
+                api_key: provider_setting(&providers, "google", "api_key"),
                 base_url: get_var("GOOGLE_BASE_URL")
                     .or_else(|| provider_setting(&providers, "google", "base_url"))
                     .unwrap_or_else(|| DEFAULT_GOOGLE_BASE_URL.to_string()),
@@ -365,6 +367,8 @@ impl AppConfig {
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
                         .or_else(|| provider_setting(&providers, "azure", "api_key_env"))
                         .unwrap_or_else(|| "SQUEEZY_AZURE_OPENAI_KEY".to_string()),
+                    api_key: provider_setting(&providers, "azure_openai", "api_key")
+                        .or_else(|| provider_setting(&providers, "azure", "api_key")),
                     base_url: get_var("AZURE_OPENAI_BASE_URL")
                         .or_else(|| provider_setting(&providers, "azure_openai", "base_url"))
                         .or_else(|| provider_setting(&providers, "azure", "base_url"))
@@ -397,6 +401,7 @@ impl AppConfig {
                 api_key_env: get_var("OPENAI_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "openai", "api_key_env"))
                     .unwrap_or_else(|| "SQUEEZY_OPENAI_KEY".to_string()),
+                api_key: provider_setting(&providers, "openai", "api_key"),
                 base_url: get_var("OPENAI_BASE_URL")
                     .or_else(|| provider_setting(&providers, "openai", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OPENAI_BASE_URL.to_string()),
@@ -1355,6 +1360,11 @@ pub enum ProviderConfig {
 pub struct OpenAiCompatibleConfig {
     pub preset: OpenAiCompatiblePreset,
     pub api_key_env: String,
+    /// Inline plaintext API key resolved from the user/local TOML layer.
+    /// `None` keeps the legacy env/keychain resolution. Never serialized
+    /// in plain text — emits `"<redacted>"` for accidental dumps.
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: String,
     pub extra_headers: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
@@ -1539,6 +1549,8 @@ impl OpenAiCompatiblePreset {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenAiConfig {
     pub api_key_env: String,
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: String,
     pub transport: ProviderTransportConfig,
 }
@@ -1546,6 +1558,8 @@ pub struct OpenAiConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnthropicConfig {
     pub api_key_env: String,
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: String,
     pub transport: ProviderTransportConfig,
 }
@@ -1553,6 +1567,8 @@ pub struct AnthropicConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleConfig {
     pub api_key_env: String,
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: String,
     pub transport: ProviderTransportConfig,
 }
@@ -1560,6 +1576,8 @@ pub struct GoogleConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AzureOpenAiConfig {
     pub api_key_env: String,
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: String,
     pub api_version: String,
     pub transport: ProviderTransportConfig,
@@ -1946,6 +1964,12 @@ impl HardeningConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSettings {
     pub api_key_env: Option<String>,
+    /// Inline plaintext API key, persisted in the user/local TOML layer.
+    /// Serde Serialize emits `"<redacted>"` so accidental
+    /// `to_string` / inspect paths can't leak it; Deserialize parses the
+    /// real value out of TOML normally.
+    #[serde(serialize_with = "redact_secret_opt")]
+    pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub default_model: Option<String>,
     pub api_version: Option<String>,
@@ -1965,6 +1989,7 @@ impl ProviderSettings {
             table,
             &[
                 "api_key_env",
+                "api_key",
                 "base_url",
                 "default_model",
                 "api_version",
@@ -2004,6 +2029,7 @@ impl ProviderSettings {
         };
         Ok(Self {
             api_key_env: string_value(table, "api_key_env", source, &field(path, "api_key_env"))?,
+            api_key: string_value(table, "api_key", source, &field(path, "api_key"))?,
             base_url: string_value(table, "base_url", source, &field(path, "base_url"))?,
             default_model: string_value(
                 table,
@@ -2050,6 +2076,7 @@ impl ProviderSettings {
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.api_key_env, next.api_key_env);
+        replace_if_some(&mut self.api_key, next.api_key);
         replace_if_some(&mut self.base_url, next.base_url);
         replace_if_some(&mut self.default_model, next.default_model);
         replace_if_some(&mut self.api_version, next.api_version);
@@ -2064,6 +2091,23 @@ impl ProviderSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.headers, next.headers);
+    }
+}
+
+/// Serde Serializer hook for `Option<String>` fields holding a secret.
+/// `None` round-trips as null/absent; `Some(_)` emits the literal
+/// `"<redacted>"` so any path that serializes the struct (debug dumps,
+/// inspect output, accidental `to_string`) can't leak the plaintext.
+fn redact_secret_opt<S>(
+    value: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(_) => serializer.serialize_some("<redacted>"),
+        None => serializer.serialize_none(),
     }
 }
 
@@ -6092,6 +6136,7 @@ fn provider_setting(
     let settings = providers.get(provider)?;
     let value = match key {
         "api_key_env" => settings.api_key_env.as_ref(),
+        "api_key" => settings.api_key.as_ref(),
         "base_url" => settings.base_url.as_ref(),
         "default_model" => settings.default_model.as_ref(),
         "api_version" => settings.api_version.as_ref(),
@@ -6161,9 +6206,11 @@ fn build_openai_compatible_config(
     }
     let extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
     let transport = provider_transport_settings(providers, &[section]);
+    let api_key = provider_setting(providers, section, "api_key");
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
         preset,
         api_key_env,
+        api_key,
         base_url,
         extra_headers,
         transport,

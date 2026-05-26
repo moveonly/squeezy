@@ -39,6 +39,7 @@ async fn portkey_chat_completions_streaming_costly() -> Result<()> {
     let provider = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
         preset: PRESET,
         api_key_env: API_KEY_ENV.to_string(),
+        api_key: None,
         base_url: env::var("PORTKEY_BASE_URL")
             .unwrap_or_else(|_| PRESET.default_base_url().to_string()),
         extra_headers,

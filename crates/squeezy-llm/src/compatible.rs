@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
-    credentials::resolve_api_key,
+    credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
 };
@@ -60,7 +60,8 @@ impl OpenAiCompatibleProvider {
                 config.preset.display_name(),
             )));
         }
-        let api_key = resolve_api_key(&config.api_key_env)?;
+        let api_key =
+            resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
         let mut headers = preset_default_headers(config.preset);
         // User-supplied headers override preset defaults so deployments can
         // attach their own HTTP-Referer / X-Title / x-portkey-* values.
@@ -199,13 +200,37 @@ impl LlmProvider for OpenAiCompatibleProvider {
         self.preset.as_str()
     }
 
-    fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+    fn stream_response(&self, mut request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
         let url = format!("{}/chat/completions", self.base_url);
+        let mut extra_headers = self.extra_headers.clone();
+        let preset = self.preset;
+        // PortKey rejects requests with `400 Either x-portkey-config or
+        // x-portkey-provider header is required`. When the model id is
+        // vendor-namespaced (`anthropic/claude-...`) we can derive the
+        // routing header from it and forward only the bare upstream id
+        // (PortKey routes by header, not OpenRouter-style prefix).
+        // User-supplied headers in `providers.portkey.headers` already
+        // overrode preset defaults and stay authoritative; we only fill
+        // the header when nothing routing-related was configured (e.g.
+        // a config-bound PortKey "User" key already routes itself).
+        let portkey_routing_configured = portkey_routing_header_present(&extra_headers);
+        let portkey_model_was_namespaced = request.model.contains('/');
+        if matches!(preset, OpenAiCompatiblePreset::PortKey)
+            && !portkey_routing_configured
+            && let Some(provider) = portkey_provider_from_model(&request.model)
+        {
+            extra_headers.insert("x-portkey-provider".to_string(), provider.to_string());
+            if let Some((_, bare)) = request.model.split_once('/') {
+                request.model = bare.to_string().into();
+            }
+        }
+        let portkey_inferred_provider = matches!(preset, OpenAiCompatiblePreset::PortKey)
+            && !portkey_routing_configured
+            && portkey_model_was_namespaced;
         let body = Self::request_body(&request);
-        let extra_headers = self.extra_headers.clone();
         let provider_label = self.preset.display_name();
 
         Box::pin(try_stream! {
@@ -230,8 +255,24 @@ impl LlmProvider for OpenAiCompatibleProvider {
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
+                // PortKey returns 400 when neither a config-bound user key
+                // nor an explicit routing header tells it which upstream to
+                // call. Surface the actionable knobs instead of leaving the
+                // raw gateway message standing alone.
+                let hint = if matches!(preset, OpenAiCompatiblePreset::PortKey)
+                    && status == StatusCode::BAD_REQUEST
+                    && message.to_ascii_lowercase().contains("x-portkey")
+                    && !portkey_inferred_provider
+                {
+                    " — hint: either use a PortKey \"User\" key with a Config attached, \
+                     use a vendor-namespaced model id (e.g. `anthropic/claude-opus-4-7`), \
+                     or set `providers.portkey.headers.x-portkey-provider` (or `x-portkey-config` / \
+                     `x-portkey-virtual-key`) in your settings TOML"
+                } else {
+                    ""
+                };
                 Err(SqueezyError::ProviderRequest(format!(
-                    "{provider_label} {status}: {message}"
+                    "{provider_label} {status}: {message}{hint}"
                 )))?;
                 unreachable!("provider error returned above");
             };
@@ -343,6 +384,44 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
         // items are rendered in the UI but skipped when replaying.
         LlmInputItem::Reasoning(_) => return None,
     })
+}
+
+fn portkey_routing_header_present(headers: &BTreeMap<String, String>) -> bool {
+    // PortKey accepts any of these as the upstream-routing signal; if the
+    // user already configured one, we don't override.
+    const ROUTING_HEADERS: &[&str] = &[
+        "x-portkey-provider",
+        "x-portkey-virtual-key",
+        "x-portkey-config",
+    ];
+    headers.keys().any(|key| {
+        ROUTING_HEADERS
+            .iter()
+            .any(|needle| key.eq_ignore_ascii_case(needle))
+    })
+}
+
+/// Map a vendor-namespaced model id (`anthropic/claude-...`,
+/// `google/gemini-...`) to the value PortKey expects in
+/// `x-portkey-provider`. Returns `None` for bare model ids; in that case
+/// we let PortKey return its 400 so the user knows to configure routing.
+fn portkey_provider_from_model(model: &str) -> Option<&'static str> {
+    let (vendor, _) = model.split_once('/')?;
+    match vendor.to_ascii_lowercase().as_str() {
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "google" | "gemini" => Some("google"),
+        "azure" | "azure-openai" | "azure_openai" => Some("azure-openai"),
+        "bedrock" => Some("bedrock"),
+        "cohere" => Some("cohere"),
+        "mistral" | "mistralai" => Some("mistral-ai"),
+        "groq" => Some("groq"),
+        "perplexity" => Some("perplexity-ai"),
+        "deepseek" => Some("deepseek"),
+        "together" | "together-ai" | "togetherai" => Some("together-ai"),
+        "fireworks" | "fireworks-ai" | "fireworksai" => Some("fireworks-ai"),
+        _ => None,
+    }
 }
 
 fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, String> {
