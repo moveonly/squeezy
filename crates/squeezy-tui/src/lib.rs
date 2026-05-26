@@ -61,6 +61,7 @@ mod config_screen;
 mod events;
 mod history;
 mod input;
+mod keymap;
 mod mention;
 mod notification;
 mod overlay;
@@ -796,10 +797,12 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
-    // F11 toggles the config screen from anywhere. Ctrl+C is still honored
-    // below so users can always abort even with the screen open.
-    if key.code == KeyCode::F(11) && key.modifiers.is_empty() {
-        toggle_config_screen(app, agent, None);
+    // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
+    // Home/End by default) resolve through the keymap before the legacy
+    // hardcoded handlers below get a look. The Home/End actions only fire
+    // when the composer is empty; otherwise we fall through so the
+    // hardcoded line-start/line-end edit semantics keep working.
+    if dispatch_keymap_action(app, agent, key) {
         return Ok(false);
     }
 
@@ -876,11 +879,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         // fall through — the keystroke still performs its normal action
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-        copy_to_clipboard(app, ClipboardTarget::LastAssistant);
-        return Ok(false);
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         if app.input.is_empty() {
             toggle_selected_transcript_entry(app);
@@ -890,36 +888,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    // Ctrl+T toggles the full-screen transcript overlay. While the
-    // overlay is open, the rest of `handle_key` is preempted by the
-    // dispatcher below so input/turn handling stays out of the way.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-        app.transcript_overlay = if app.transcript_overlay.is_some() {
-            None
-        } else {
-            Some(TranscriptOverlayState::default())
-        };
-        app.status = if app.transcript_overlay.is_some() {
-            "transcript overlay (Esc to close)".to_string()
-        } else {
-            "transcript overlay closed".to_string()
-        };
-        return Ok(false);
-    }
-
+    // The transcript-overlay open/close action is dispatched up top
+    // by `dispatch_keymap_action`. While the overlay is open we still
+    // need to forward navigation keys to its own handler before the
+    // composer takes over.
     if app.transcript_overlay.is_some() && handle_transcript_overlay_key(app, key) {
-        return Ok(false);
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        if app.task_state.is_some() {
-            app.task_panel_collapsed = !app.task_panel_collapsed;
-            app.status = if app.task_panel_collapsed {
-                "task panel collapsed".to_string()
-            } else {
-                "task panel expanded".to_string()
-            };
-        }
         return Ok(false);
     }
 
@@ -982,13 +955,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.code == KeyCode::Char('r')
-        && restore_cancelled_prompt(app)
-    {
-        return Ok(false);
-    }
-
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
         move_input_cursor_word_left(app);
         return Ok(false);
@@ -1036,31 +1002,16 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             // turn/approval interrupts, so a bare ESC at this point is a no-op.
             Ok(false)
         }
-        // Scroll keys intentionally leave `app.status` alone so command
-        // handlers can keep their latest state even though the footer stays
-        // context-only.
-        KeyCode::PageUp => {
-            scroll_transcript_up(app, 8);
-            Ok(false)
-        }
-        KeyCode::PageDown => {
-            scroll_transcript_down(app, 8);
-            Ok(false)
-        }
+        // PageUp/PageDown and (empty-composer) Home/End are routed via
+        // `dispatch_keymap_action` so users can rebind them via
+        // `[tui.keymap]`. When dispatch returned `false` for Home/End
+        // (composer non-empty) the line-cursor cases below execute.
         KeyCode::Home => {
-            if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = u16::MAX;
-            } else {
-                move_input_cursor_line_start(app);
-            }
+            move_input_cursor_line_start(app);
             Ok(false)
         }
         KeyCode::End => {
-            if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = 0;
-            } else {
-                move_input_cursor_line_end(app);
-            }
+            move_input_cursor_line_end(app);
             Ok(false)
         }
         KeyCode::Left => {
@@ -1238,6 +1189,110 @@ fn normalize_pasted_text(text: &str) -> String {
 
 fn is_inline_paste(text: &str) -> bool {
     text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
+}
+
+/// Resolve `key` against the user-configurable keymap and execute the
+/// matched action. Returns `true` if the action consumed the keystroke
+/// so the caller skips the legacy hardcoded handlers. Bindings that
+/// have no override behave exactly like the pre-keymap build.
+///
+/// Composer basics (Enter / Esc / Backspace / character input) are
+/// intentionally outside this dispatch — they stay hardcoded below
+/// since rebinding them breaks every workflow.
+fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
+        return false;
+    };
+    match action {
+        keymap::Action::ToggleConfigScreen => {
+            toggle_config_screen(app, agent, None);
+            true
+        }
+        keymap::Action::ToggleTranscriptOverlay => {
+            // Skip while the config screen is in the foreground; that
+            // overlay owns its own key routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            app.transcript_overlay = if app.transcript_overlay.is_some() {
+                None
+            } else {
+                Some(TranscriptOverlayState::default())
+            };
+            app.status = if app.transcript_overlay.is_some() {
+                "transcript overlay (Esc to close)".to_string()
+            } else {
+                "transcript overlay closed".to_string()
+            };
+            true
+        }
+        keymap::Action::ToggleTaskPanel => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.task_state.is_some() {
+                app.task_panel_collapsed = !app.task_panel_collapsed;
+                app.status = if app.task_panel_collapsed {
+                    "task panel collapsed".to_string()
+                } else {
+                    "task panel expanded".to_string()
+                };
+            }
+            true
+        }
+        keymap::Action::CopyLastAssistant => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+            true
+        }
+        keymap::Action::RestoreCancelledPrompt => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            restore_cancelled_prompt(app)
+        }
+        keymap::Action::ScrollTranscriptPageUp => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_transcript_up(app, 8);
+            true
+        }
+        keymap::Action::ScrollTranscriptPageDown => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_transcript_down(app, 8);
+            true
+        }
+        keymap::Action::TranscriptHome => {
+            // The legacy binding only jumps to top when the composer
+            // is empty; otherwise it acts as a line-start cursor move.
+            // Defer to the composer handler in that case.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = u16::MAX;
+                true
+            } else {
+                false
+            }
+        }
+        keymap::Action::TranscriptEnd => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = 0;
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
@@ -1735,6 +1790,21 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 return true;
             };
             apply_theme_change(app, agent, theme);
+            return true;
+        }
+        "/keymap" => {
+            let body = keymap::format_keymap_command(&app.keymap);
+            let overrides = keymap::Action::ALL
+                .iter()
+                .copied()
+                .filter(|a| app.keymap.binding(*a) != a.default_binding())
+                .count();
+            app.status = if overrides == 0 {
+                "keymap (defaults)".to_string()
+            } else {
+                format!("keymap ({overrides} override(s))")
+            };
+            app.push_transcript_item(TranscriptItem::system(body));
             return true;
         }
         "/jobs" => {
@@ -8544,6 +8614,11 @@ pub(crate) struct TuiApp {
     /// Latest mid-turn task-progress text surfaced by the agent.
     /// Drives the `task-progress` status item.
     pub(crate) latest_plan_progress: Option<String>,
+    /// Resolved key bindings (defaults + user overrides from
+    /// `[tui.keymap]`). Built once at startup; `/keymap` reads from
+    /// here and `handle_key` consults it before dispatching to the
+    /// legacy hardcoded handlers.
+    pub(crate) keymap: keymap::KeymapResolver,
 }
 
 impl TuiApp {
@@ -8702,6 +8777,7 @@ impl TuiApp {
             status_line_use_colors: config.tui.status_line_use_colors,
             status_line_setup: None,
             latest_plan_progress: None,
+            keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
         }
     }
 

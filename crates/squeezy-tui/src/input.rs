@@ -304,6 +304,7 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[system|dark|light]",
         &[PermissionCapability::Edit],
     ),
+    slash("/keymap", "list current key bindings"),
 ];
 
 impl SlashCommand {

@@ -6406,6 +6406,130 @@ async fn slash_theme_without_arg_shows_usage() {
     );
 }
 
+/// `/keymap` lists the current bindings — even with no overrides it
+/// must surface every action plus the persisted-defaults hint so a
+/// fresh install can be inspected.
+#[tokio::test]
+async fn slash_keymap_lists_defaults() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/keymap").await;
+    assert!(ran);
+    let body = last_message_content(&app)
+        .expect("transcript entry")
+        .to_string();
+    assert!(body.contains("transcript_overlay"), "missing entry: {body}");
+    assert!(body.contains("page_up"), "missing entry: {body}");
+    assert!(body.contains("Ctrl+T"), "default binding missing: {body}");
+    assert!(body.contains("PageUp"), "default binding missing: {body}");
+    assert!(body.contains("[tui.keymap]"), "config hint missing: {body}");
+    assert!(
+        !body.contains("(override)"),
+        "no overrides expected: {body}",
+    );
+    assert!(
+        app.status.contains("defaults"),
+        "status should hint defaults, got: {}",
+        app.status,
+    );
+}
+
+/// A user override in `[tui.keymap]` flips the live key dispatch so
+/// the rebound key fires the action and the original default no
+/// longer does. Exercises the resolver wiring end-to-end.
+#[tokio::test]
+async fn keymap_override_redirects_transcript_overlay() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // The pre-existing default no longer toggles the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Ctrl+T must no longer toggle when rebound",
+    );
+
+    // The user's new binding now toggles it open and closed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Ctrl+O must open the overlay after rebind",
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Ctrl+O must close the overlay on second press",
+    );
+}
+
+/// `/keymap` reports overrides and validation problems so the user
+/// can see why a typo silently fell back to the default.
+#[tokio::test]
+async fn slash_keymap_surfaces_overrides_and_diagnostics() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    config
+        .tui
+        .keymap
+        .insert("not_a_real_action".to_string(), "Ctrl+x".to_string());
+    config
+        .tui
+        .keymap
+        .insert("page_up".to_string(), "garbage".to_string());
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/keymap").await;
+    assert!(ran);
+    let body = last_message_content(&app)
+        .expect("transcript entry")
+        .to_string();
+    assert!(
+        body.contains("transcript_overlay")
+            && body.contains("Ctrl+O")
+            && body.contains("(override)"),
+        "override line missing: {body}",
+    );
+    assert!(
+        body.contains("Unknown action names") && body.contains("not_a_real_action"),
+        "unknown-action diagnostic missing: {body}",
+    );
+    assert!(
+        body.contains("Invalid key specs") && body.contains("page_up"),
+        "invalid-spec diagnostic missing: {body}",
+    );
+    // page_up keeps its default binding even though the override was
+    // invalid — verifies the resolver isolates failures.
+    assert!(body.contains("PageUp"), "default binding lost: {body}");
+}
+
 /// Serializes `/theme` tests so the process-global palette override and the
 /// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
 static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

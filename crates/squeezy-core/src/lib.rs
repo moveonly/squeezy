@@ -5758,9 +5758,18 @@ pub struct TuiConfig {
     pub status_line_use_colors: bool,
     /// Palette tone preference. `System` defers to terminal detection.
     pub theme: TuiTheme,
+<<<<<<< HEAD
     /// Off-screen attention surface (OSC 9 desktop notification / BEL).
     /// Fires on turn-complete and approval-pending; default `Off`.
     pub desktop_notifications: NotificationMethod,
+=======
+    /// User-supplied key rebindings for the TUI composer / chat surface.
+    /// Keyed by an action slug (e.g. `transcript_overlay`, `page_up`);
+    /// the value is a key spec like `"Ctrl+t"` or `"PageUp"`. Unknown
+    /// slugs and unparseable specs are surfaced by the TUI when
+    /// `/keymap` is invoked.
+    pub keymap: BTreeMap<String, String>,
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
 }
 
 impl TuiConfig {
@@ -5786,9 +5795,13 @@ impl TuiConfig {
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
             theme: settings.theme.unwrap_or(TuiTheme::System),
+<<<<<<< HEAD
             desktop_notifications: settings
                 .desktop_notifications
                 .unwrap_or(NotificationMethod::Off),
+=======
+            keymap: settings.keymap.unwrap_or_default(),
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
         }
     }
 }
@@ -5811,7 +5824,11 @@ pub struct TuiSettings {
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
+<<<<<<< HEAD
     pub desktop_notifications: Option<NotificationMethod>,
+=======
+    pub keymap: Option<BTreeMap<String, String>>,
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
 }
 
 impl TuiSettings {
@@ -5829,7 +5846,11 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+<<<<<<< HEAD
                 "desktop_notifications",
+=======
+                "keymap",
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
             ],
             source,
             path,
@@ -5885,12 +5906,16 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+<<<<<<< HEAD
             desktop_notifications: notification_method_value(
                 table,
                 "desktop_notifications",
                 source,
                 &field(path, "desktop_notifications"),
             )?,
+=======
+            keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
         })
     }
 
@@ -5908,7 +5933,11 @@ impl TuiSettings {
             next.status_line_use_colors,
         );
         replace_if_some(&mut self.theme, next.theme);
+<<<<<<< HEAD
         replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
+=======
+        replace_if_some(&mut self.keymap, next.keymap);
+>>>>>>> 3fa3eaa (tui: read [tui.keymap] overrides and add /keymap inspector)
     }
 }
 
