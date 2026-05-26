@@ -8643,13 +8643,17 @@ impl TranscriptEntry {
     fn reasoning(
         id: u64,
         snapshot: squeezy_core::ReasoningSnapshot,
-        _transcript_default: TranscriptDefault,
+        transcript_default: TranscriptDefault,
     ) -> Self {
         Self {
             id,
             kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
-            // Always collapsed at first; the user can expand with Ctrl-E.
-            collapsed: true,
+            // Default expanded so reasoning the user just watched stream in
+            // stays visible after the segment lands; auto-collapsing the
+            // full body to a one-line summary makes the text look like it
+            // vanished. Users on `transcript_default = "compact"` keep the
+            // collapsed shape, and Ctrl-E still toggles it either way.
+            collapsed: transcript_default == TranscriptDefault::Compact,
         }
     }
 
