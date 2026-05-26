@@ -62,6 +62,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
                     "costly OpenAI smoke test was cancelled".to_string(),
                 ));
             }
+            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
         }
     }
 

@@ -199,7 +199,10 @@ async fn collect_reviewer_text(
         match event.map_err(|err| err.to_string())? {
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
             LlmEvent::Completed { .. } | LlmEvent::Cancelled => break,
-            LlmEvent::Started | LlmEvent::ToolCall(_) => {}
+            LlmEvent::Started
+            | LlmEvent::ToolCall(_)
+            | LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_) => {}
         }
     }
     Ok(text)

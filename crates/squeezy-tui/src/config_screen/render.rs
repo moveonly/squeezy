@@ -16,6 +16,21 @@ use crate::render::palette::{
     AMBER, ERROR_RED, GOLD, MODE_PURPLE, QUIET, SEPARATOR_BLUE, SUCCESS_GREEN,
 };
 
+/// Pretty-print an absolute config path: replace `$HOME` with `~` so the
+/// tab subtitle stays compact, while still surfacing the per-machine
+/// project hash for the Local tier so the user can grep `~/.squeezy/projects/`
+/// for the exact directory.
+fn display_path(path: &std::path::Path) -> String {
+    let full = path.display().to_string();
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+        && let Some(rest) = full.strip_prefix(&home)
+    {
+        return format!("~{rest}");
+    }
+    full
+}
+
 pub(crate) fn render(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -38,7 +53,7 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     /// so the user can tell at a glance which tabs are doing work.
     fn tab(
         label: &'static str,
-        subtitle: &'static str,
+        subtitle: String,
         active: bool,
         exists: bool,
     ) -> Vec<Span<'static>> {
@@ -79,21 +94,24 @@ fn render_tabs(frame: &mut Frame<'_>, area: Rect, state: &ConfigScreenState) {
     spans.push(Span::styled(" │ ", Style::default().fg(QUIET)));
     spans.extend(tab(
         "User",
-        "~/.squeezy/settings.toml",
+        display_path(&state.sources.user_path_default),
         state.scope == ConfigScope::User,
         user_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Repo",
-        "./squeezy.toml (committed)",
+        format!(
+            "{} (committed)",
+            display_path(&state.sources.project_path_default)
+        ),
         state.scope == ConfigScope::Repo,
         repo_exists,
     ));
     spans.push(Span::styled(" ▸ ", Style::default().fg(SEPARATOR_BLUE)));
     spans.extend(tab(
         "Local",
-        "~/.squeezy/projects/<this>/settings.toml",
+        display_path(&state.sources.repo_path_default),
         state.scope == ConfigScope::Local,
         local_exists,
     ));

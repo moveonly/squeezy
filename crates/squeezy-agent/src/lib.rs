@@ -30,8 +30,8 @@ use squeezy_core::{
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    RequestTokenEstimate, capabilities_for, estimate_cost, estimate_request_context_calibrated,
-    fetch_ollama_context_window,
+    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, capabilities_for, estimate_cost,
+    estimate_request_context_calibrated, fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
@@ -82,6 +82,7 @@ use roles::{RoleModelPolicy, SubagentRole, role_config};
 
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
+pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
 
 // Emergency belt on tool rounds per turn — codex and opencode loop
 // unbounded; CC only caps explicit-purpose subagents (its
@@ -448,8 +449,10 @@ pub struct ConversationShape {
     pub assistant_text: usize,
     pub function_calls: usize,
     pub function_outputs: usize,
+    pub reasoning_items: usize,
     pub text_bytes: usize,
     pub tool_output_bytes: usize,
+    pub reasoning_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -3655,7 +3658,13 @@ impl TurnRuntime {
         self.publish_task_state(TaskStateSnapshot::starting(task_title.clone()))
             .await;
         if self.cancel.is_cancelled() {
-            self.finish_cancelled_turn(&task_title).await;
+            self.finish_cancelled_turn(
+                &task_title,
+                &total_cost,
+                &broker.metrics,
+                &broker.calibration,
+            )
+            .await;
             return Ok(());
         }
 
@@ -3724,7 +3733,13 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             if self.append_implicit_skill_instructions(
@@ -3786,7 +3801,13 @@ impl TurnRuntime {
         let mut instructions_cache: [Option<String>; 2] = [None, None];
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             if let Some(status) = broker.session_cap_reached() {
@@ -3794,6 +3815,13 @@ impl TurnRuntime {
                     TaskStateStatus::Failed,
                     Some(format_cap_reached_reason(status)),
                     &task_title,
+                )
+                .await;
+                self.persist_turn_accounting(
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                    false,
                 )
                 .await;
                 let _ = self
@@ -3861,7 +3889,13 @@ impl TurnRuntime {
                     .await?
             {
                 if self.cancel.is_cancelled() {
-                    self.finish_cancelled_turn(&task_title).await;
+                    self.finish_cancelled_turn(
+                        &task_title,
+                        &total_cost,
+                        &broker.metrics,
+                        &broker.calibration,
+                    )
+                    .await;
                     return Ok(());
                 }
                 match event {
@@ -3890,6 +3924,42 @@ impl TurnRuntime {
                             .send(AgentEvent::AssistantDelta {
                                 turn_id: self.turn_id,
                                 delta: chunk.text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    LlmEvent::ReasoningDelta { text, .. } => {
+                        if self
+                            .tx
+                            .send(AgentEvent::ReasoningDelta {
+                                turn_id: self.turn_id,
+                                delta: text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                    LlmEvent::ReasoningDone(payload) => {
+                        let snapshot = ReasoningSnapshot::from_payload(payload.clone());
+                        // Push the opaque blob into the conversation now so the
+                        // model gets it back on every subsequent provider call
+                        // in this turn (tool result → next model call → ...),
+                        // not just at the end. Mirrors codex: each reasoning
+                        // segment is committed when it closes.
+                        conversation.push(redact_input_item(
+                            LlmInputItem::Reasoning(payload),
+                            &self.redactor,
+                        ));
+                        if self
+                            .tx
+                            .send(AgentEvent::ReasoningSegment {
+                                turn_id: self.turn_id,
+                                snapshot,
                             })
                             .await
                             .is_err()
@@ -3957,7 +4027,13 @@ impl TurnRuntime {
                         break;
                     }
                     LlmEvent::Cancelled => {
-                        self.finish_cancelled_turn(&task_title).await;
+                        self.finish_cancelled_turn(
+                            &task_title,
+                            &total_cost,
+                            &broker.metrics,
+                            &broker.calibration,
+                        )
+                        .await;
                         return Ok(());
                     }
                 }
@@ -3971,13 +4047,22 @@ impl TurnRuntime {
                     self.record_replay_model_text_delta(&tail);
                 }
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
-                // `assistant_stream` has already redacted the text via
-                // `StreamRedactor`, so this push is idempotent w.r.t. the
-                // conversation invariant.
+                let raw_assistant_text = std::mem::take(&mut assistant_message);
+                // Reasoning blobs and segment events have already been pushed
+                // by the `LlmEvent::ReasoningDone` arm above; only the
+                // assistant text remains.
+                //
+                // Conversation state keeps the raw text (including any
+                // `<proposed_plan>` block) so the model retains its own
+                // prior plan when refining next turn. The displayed and
+                // persisted transcript drops the block — the structured
+                // Plan card is the canonical visualization.
                 conversation.push(redact_input_item(
-                    LlmInputItem::AssistantText(message.content.clone()),
+                    LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
+                ));
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &raw_assistant_text,
                 ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -4017,10 +4102,13 @@ impl TurnRuntime {
                 }
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
-                let message = TranscriptItem::assistant(std::mem::take(&mut assistant_message));
+                let raw_assistant_text = std::mem::take(&mut assistant_message);
                 conversation.push(redact_input_item(
-                    LlmInputItem::AssistantText(message.content.clone()),
+                    LlmInputItem::AssistantText(raw_assistant_text.clone()),
                     &self.redactor,
+                ));
+                let message = TranscriptItem::assistant(plan_mode::strip_proposed_plan_blocks(
+                    &raw_assistant_text,
                 ));
                 self.publish_terminal_task_state(TaskStateStatus::Completed, None, &task_title)
                     .await;
@@ -4093,7 +4181,13 @@ impl TurnRuntime {
                 .await
             };
             if self.cancel.is_cancelled() || results.iter().any(cancelled_tool_result) {
-                self.finish_cancelled_turn(&task_title).await;
+                self.finish_cancelled_turn(
+                    &task_title,
+                    &total_cost,
+                    &broker.metrics,
+                    &broker.calibration,
+                )
+                .await;
                 return Ok(());
             }
             last_tool_round_summary = tool_round_failure_summary(&results);
@@ -4285,44 +4379,26 @@ impl TurnRuntime {
             context_compaction,
             token_calibration,
         } = input;
-        let mut state = self.conversation_state.lock().await;
-        state.conversation = conversation.to_vec();
-        state.previous_response_id = if self.config.store_responses {
-            response_id.clone()
-        } else {
-            None
-        };
-        state.transcript.push(user);
-        state.transcript.push(assistant.clone());
-        // Pins added concurrently to this turn (via /pin) are pushed into
-        // `state.context_compaction.pinned` under the same lock. Merge them
-        // into the locally tracked compaction state so the pre-turn clone
-        // does not silently clobber a pin landed mid-turn.
-        let mut merged_compaction = context_compaction;
-        merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
-        state.context_compaction = merged_compaction;
-        merge_cost(&mut state.cost, cost);
-        state.metrics.merge_turn(metrics);
-        state.redactions += metrics.redactions;
-        state.token_calibration = token_calibration.clone();
-        if let Some(session) = &self.session_log {
-            let _ = session.write_resume_state(&state.to_resume_state());
-            let calibration_for_metadata = state.token_calibration.clone();
-            let _ = session.update_metadata(|metadata| {
-                metadata.cost = state.cost.clone();
-                metadata.metrics = state.metrics.clone();
-                metadata.redactions = state.redactions;
-                metadata.resume_available = true;
-                metadata.mode = load_session_mode(&self.session_mode);
-                metadata.token_calibration = calibration_for_metadata;
-            });
+        {
+            let mut state = self.conversation_state.lock().await;
+            state.conversation = conversation.to_vec();
+            state.previous_response_id = if self.config.store_responses {
+                response_id.clone()
+            } else {
+                None
+            };
+            state.transcript.push(user);
+            state.transcript.push(assistant.clone());
+            // Pins added concurrently to this turn (via /pin) are pushed into
+            // `state.context_compaction.pinned` under the same lock. Merge them
+            // into the locally tracked compaction state so the pre-turn clone
+            // does not silently clobber a pin landed mid-turn.
+            let mut merged_compaction = context_compaction;
+            merge_concurrent_pins(&mut merged_compaction, &state.context_compaction.pinned);
+            state.context_compaction = merged_compaction;
         }
-        // Mirror the calibration into the cross-session file so brand-new
-        // sessions (no resume metadata yet) seed off a recent ratio rather
-        // than the per-provider defaults. Failures are silent — the global
-        // file is a warm-start cache, not a source of truth.
-        let _ = SessionStore::open(&self.config).save_global_calibration(&state.token_calibration);
-        drop(state);
+        self.persist_turn_accounting(cost, metrics, &token_calibration, true)
+            .await;
         let summary = self.current_task_summary().await.unwrap_or_else(|| {
             if assistant.content.trim().is_empty() {
                 "assistant completed".to_string()
@@ -4377,7 +4453,60 @@ impl TurnRuntime {
         .await;
     }
 
-    async fn finish_cancelled_turn(&self, task_title: &str) {
+    /// Merge per-turn cost/metrics/redactions and the latest token
+    /// calibration into the conversation state and mirror them into the
+    /// session metadata file.
+    ///
+    /// `mark_resume_available` is only `true` on the success path: a
+    /// cancelled or failed turn must not flip the resume flag, since the
+    /// conversation slice was not advanced. `previous_response_id` is left
+    /// alone for the same reason — the provider-side response chain must
+    /// not jump past a turn we never persisted.
+    async fn persist_turn_accounting(
+        &self,
+        cost: &CostSnapshot,
+        metrics: &TurnMetrics,
+        token_calibration: &squeezy_llm::TokenCalibration,
+        mark_resume_available: bool,
+    ) {
+        let calibration_for_global = {
+            let mut state = self.conversation_state.lock().await;
+            merge_cost(&mut state.cost, cost);
+            state.metrics.merge_turn(metrics);
+            state.redactions += metrics.redactions;
+            state.token_calibration = token_calibration.clone();
+            if let Some(session) = &self.session_log {
+                let _ = session.write_resume_state(&state.to_resume_state());
+                let calibration_for_metadata = state.token_calibration.clone();
+                let _ = session.update_metadata(|metadata| {
+                    metadata.cost = state.cost.clone();
+                    metadata.metrics = state.metrics.clone();
+                    metadata.redactions = state.redactions;
+                    if mark_resume_available {
+                        metadata.resume_available = true;
+                    }
+                    metadata.mode = load_session_mode(&self.session_mode);
+                    metadata.token_calibration = calibration_for_metadata;
+                });
+            }
+            state.token_calibration.clone()
+        };
+        // Mirror the calibration into the cross-session file so brand-new
+        // sessions (no resume metadata yet) seed off a recent ratio rather
+        // than the per-provider defaults. Failures are silent — the global
+        // file is a warm-start cache, not a source of truth.
+        let _ = SessionStore::open(&self.config).save_global_calibration(&calibration_for_global);
+    }
+
+    async fn finish_cancelled_turn(
+        &self,
+        task_title: &str,
+        cost: &CostSnapshot,
+        metrics: &TurnMetrics,
+        token_calibration: &squeezy_llm::TokenCalibration,
+    ) {
+        self.persist_turn_accounting(cost, metrics, token_calibration, false)
+            .await;
         self.publish_terminal_task_state(
             TaskStateStatus::Cancelled,
             Some("turn cancelled".to_string()),
@@ -5405,6 +5534,8 @@ async fn run_subagent_loop(
                         assistant_message.push_str(&chunk.text);
                     }
                 }
+                LlmEvent::ReasoningDelta { .. } => {}
+                LlmEvent::ReasoningDone(_) => {}
                 LlmEvent::ToolCall(tool_call) => {
                     tool_calls.push(ToolCall {
                         call_id: tool_call.call_id,
@@ -7310,7 +7441,10 @@ Working target: {:?}",
             LlmEvent::TextDelta(delta) => text.push_str(&delta),
             LlmEvent::Completed { .. } => break,
             LlmEvent::Cancelled => return None,
-            LlmEvent::Started | LlmEvent::ToolCall(_) => {}
+            LlmEvent::Started
+            | LlmEvent::ToolCall(_)
+            | LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_) => {}
         }
     }
     Some(parse_classifier_verdict(&text))
@@ -7839,6 +7973,10 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
                 shape.function_outputs += 1;
                 shape.tool_output_bytes += output.len();
             }
+            LlmInputItem::Reasoning(payload) => {
+                shape.reasoning_items += 1;
+                shape.reasoning_bytes += payload.display_text().len();
+            }
         }
     }
     shape
@@ -8098,6 +8236,58 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         LlmInputItem::FunctionCallOutput { call_id, output } => LlmInputItem::FunctionCallOutput {
             call_id,
             output: redactor.redact(&output).text,
+        },
+        // Reasoning payloads are model-signed blobs. Redacting the opaque
+        // bytes would break replay; redact only the human-readable summary
+        // fields so secrets that surface in the chain-of-thought are hidden
+        // from the TUI without invalidating the signature.
+        LlmInputItem::Reasoning(payload) => {
+            LlmInputItem::Reasoning(redact_reasoning_payload(payload, redactor))
+        }
+    }
+}
+
+fn redact_reasoning_payload(payload: ReasoningPayload, redactor: &Redactor) -> ReasoningPayload {
+    match payload {
+        ReasoningPayload::OpenAi {
+            item_id,
+            summary,
+            encrypted_content,
+        } => ReasoningPayload::OpenAi {
+            item_id,
+            summary: summary
+                .into_iter()
+                .map(|text| redactor.redact(&text).text)
+                .collect(),
+            encrypted_content,
+        },
+        ReasoningPayload::Anthropic { blocks } => ReasoningPayload::Anthropic {
+            blocks: blocks
+                .into_iter()
+                .map(|block| {
+                    let text = if block.text.is_empty() {
+                        block.text
+                    } else {
+                        redactor.redact(&block.text).text
+                    };
+                    squeezy_core::AnthropicThinkingBlock {
+                        kind: block.kind,
+                        text,
+                        signature: block.signature,
+                        data: block.data,
+                    }
+                })
+                .collect(),
+        },
+        ReasoningPayload::Google {
+            summary,
+            thought_signature,
+        } => ReasoningPayload::Google {
+            summary: summary
+                .into_iter()
+                .map(|text| redactor.redact(&text).text)
+                .collect(),
+            thought_signature,
         },
     }
 }
@@ -8536,6 +8726,7 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
         LlmInputItem::FunctionCallOutput { call_id, output } => {
             ResumeItem::FunctionCallOutput { call_id, output }
         }
+        LlmInputItem::Reasoning(payload) => ResumeItem::Reasoning { payload },
     }
 }
 
@@ -8560,6 +8751,7 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
         ResumeItem::FunctionCallOutput { call_id, output } => {
             LlmInputItem::FunctionCallOutput { call_id, output }
         }
+        ResumeItem::Reasoning { payload } => LlmInputItem::Reasoning(payload),
     }
 }
 
@@ -8719,6 +8911,21 @@ pub enum AgentEvent {
     AssistantDelta {
         turn_id: TurnId,
         delta: String,
+    },
+    /// Incremental reasoning/thinking tokens emitted by the model. Rendered
+    /// in the TUI as a grey transient block; not part of the visible
+    /// assistant message.
+    ReasoningDelta {
+        turn_id: TurnId,
+        delta: String,
+    },
+    /// A reasoning block has finished streaming. Carries the provider-tagged
+    /// payload so the TUI can store the segment as its own collapsible
+    /// transcript entry and clear the live "thinking..." buffer before the
+    /// next block (or tool call, or text) starts.
+    ReasoningSegment {
+        turn_id: TurnId,
+        snapshot: ReasoningSnapshot,
     },
     ToolCallQueued {
         turn_id: TurnId,

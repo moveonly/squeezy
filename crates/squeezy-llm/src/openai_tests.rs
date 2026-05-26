@@ -30,7 +30,7 @@ fn request_body_uses_responses_streaming_shape() {
         store: true,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["model"], "gpt-test");
     assert_eq!(body["instructions"], "be brief");
@@ -77,7 +77,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["input"][0]["type"], "function_call");
     assert_eq!(body["input"][0]["arguments"], r#"{"pattern":"needle"}"#);
@@ -114,7 +114,7 @@ fn request_body_preserves_function_tool_order() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert!(body.get("max_output_tokens").is_none());
     assert_eq!(body["tools"][0]["name"], "write_file");
@@ -136,10 +136,13 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
 
     assert_eq!(body["text"]["verbosity"], "high");
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+    // store=false → request encrypted_content so replay works statelessly.
+    assert_eq!(body["include"][0], "reasoning.encrypted_content");
 }
 
 #[test]
@@ -162,7 +165,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             store: false,
         };
 
-        let body = OpenAiProvider::request_body(&request);
+        let body = OpenAiProvider::request_body(&request, "openai");
 
         assert_eq!(body["text"]["verbosity"], openai);
     }
@@ -183,7 +186,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
     assert_eq!(body["prompt_cache_key"], "squeezy::session-1");
 }
 
@@ -202,7 +205,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         store: false,
     };
 
-    let body = OpenAiProvider::request_body(&request);
+    let body = OpenAiProvider::request_body(&request, "openai");
     assert!(body.get("prompt_cache_key").is_none());
 }
 
@@ -320,4 +323,68 @@ fn parser_surfaces_incomplete_events() {
     .expect_err("incomplete response is a stream error");
 
     assert!(err.to_string().contains("max_output_tokens"));
+}
+
+#[test]
+fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
+    let summary_delta = parse_openai_event(
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing options"}"#,
+    )
+    .expect("valid summary delta");
+    assert_eq!(
+        summary_delta,
+        Some(LlmEvent::ReasoningDelta {
+            text: "weighing options".to_string(),
+            kind: crate::ReasoningKind::Summary,
+        })
+    );
+
+    let done = parse_openai_event(
+        r#"{
+          "type":"response.output_item.done",
+          "item":{
+            "type":"reasoning",
+            "id":"rs_abc",
+            "summary":[{"type":"summary_text","text":"weighed options"}],
+            "encrypted_content":"OPAQUE"
+          }
+        }"#,
+    )
+    .expect("valid done");
+    assert_eq!(
+        done,
+        Some(LlmEvent::ReasoningDone(crate::ReasoningPayload::OpenAi {
+            item_id: "rs_abc".to_string(),
+            summary: vec!["weighed options".to_string()],
+            encrypted_content: Some("OPAQUE".to_string()),
+        }))
+    );
+}
+
+#[test]
+fn input_item_round_trips_openai_reasoning_blob() {
+    let payload = crate::ReasoningPayload::OpenAi {
+        item_id: "rs_abc".to_string(),
+        summary: vec!["weighed options".to_string()],
+        encrypted_content: Some("OPAQUE".to_string()),
+    };
+    let value = openai_input_item(&LlmInputItem::Reasoning(payload))
+        .expect("OpenAI reasoning replays to OpenAI");
+    assert_eq!(value["type"], "reasoning");
+    assert_eq!(value["id"], "rs_abc");
+    assert_eq!(value["encrypted_content"], "OPAQUE");
+    assert_eq!(value["summary"][0]["text"], "weighed options");
+}
+
+#[test]
+fn anthropic_reasoning_is_dropped_when_replaying_to_openai() {
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![crate::AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Thinking,
+            text: "thinking".to_string(),
+            signature: Some("sig".to_string()),
+            data: None,
+        }],
+    };
+    assert!(openai_input_item(&LlmInputItem::Reasoning(payload)).is_none());
 }

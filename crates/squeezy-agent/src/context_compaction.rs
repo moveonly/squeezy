@@ -307,6 +307,7 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
             arguments,
         } => call_id.len() + name.len() + arguments.to_string().len(),
         LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
+        LlmInputItem::Reasoning(payload) => payload.display_text().len(),
     }
 }
 
@@ -574,6 +575,10 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
                 "- tool output {call_id}: {}",
                 compact_text(output, COMPACTION_TOOL_OUTPUT_MAX_CHARS)
             )),
+            // Reasoning items are durable context only insofar as the
+            // assistant text that follows captures the conclusion; the raw
+            // chain-of-thought is intentionally excluded from the summary.
+            LlmInputItem::Reasoning(_) => None,
         })
         .take(COMPACTION_DURABLE_LINES_LIMIT)
         .collect()

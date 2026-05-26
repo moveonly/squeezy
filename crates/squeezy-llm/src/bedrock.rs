@@ -10,16 +10,20 @@ use aws_sdk_bedrockruntime::{
     primitives::event_stream::EventReceiver,
     types::{
         ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, Message,
-        SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock,
-        ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+        ReasoningContentBlock, ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock,
+        Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+        ToolSpecification, ToolUseBlock,
     },
 };
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
 use squeezy_core::{BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
-use crate::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec};
+use crate::{
+    AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
+    LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
+};
 
 #[derive(Debug, Clone)]
 pub struct BedrockProvider {
@@ -87,7 +91,7 @@ impl LlmProvider for BedrockProvider {
             };
             let client = client_result?;
             let model = request.model.to_string();
-            let mut builder = client.converse_stream().model_id(model);
+            let mut builder = client.converse_stream().model_id(&model);
             for block in system_blocks(&request.instructions) {
                 builder = builder.system(block);
             }
@@ -96,6 +100,30 @@ impl LlmProvider for BedrockProvider {
             }
             if let Some(config) = tool_configuration(&request.tools)? {
                 builder = builder.tool_config(config);
+            }
+            if let Some(effort) = request.reasoning_effort
+                && crate::capabilities_for("bedrock", &model)
+                    .is_some_and(|caps| caps.reasoning_effort)
+            {
+                let budget = i128::from(effort.thinking_budget_tokens());
+                let thinking = Document::Object(
+                    [
+                        (
+                            "type".to_string(),
+                            Document::String("enabled".to_string()),
+                        ),
+                        (
+                            "budget_tokens".to_string(),
+                            Document::Number(Number::PosInt(budget as u64)),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                let extra = Document::Object(
+                    [("thinking".to_string(), thinking)].into_iter().collect(),
+                );
+                builder = builder.additional_model_request_fields(extra);
             }
 
             let send_result = tokio::select! {
@@ -121,7 +149,7 @@ impl LlmProvider for BedrockProvider {
                 };
                 let event = polled?;
                 let Some(event) = event else { break; };
-                if let Some(llm_event) = handle_bedrock_event(event, &mut state)? {
+                for llm_event in handle_bedrock_event(event, &mut state)? {
                     yield llm_event;
                 }
             }
@@ -129,6 +157,9 @@ impl LlmProvider for BedrockProvider {
                 Err(SqueezyError::ProviderStream(
                     "Bedrock stream ended without messageStop".to_string(),
                 ))?;
+            }
+            if let Some(payload) = state.flush_reasoning() {
+                yield LlmEvent::ReasoningDone(payload);
             }
             yield LlmEvent::Completed {
                 response_id: None,
@@ -157,6 +188,8 @@ struct BedrockStreamState {
     cache_read_input_tokens: Option<u64>,
     cache_write_input_tokens: Option<u64>,
     tool_blocks: HashMap<i32, PartialToolUse>,
+    reasoning_blocks: HashMap<i32, AnthropicThinkingBlock>,
+    finished_reasoning: Vec<AnthropicThinkingBlock>,
     saw_message_stop: bool,
 }
 
@@ -171,6 +204,15 @@ impl BedrockStreamState {
             estimated_usd_micros: None,
         }
     }
+
+    fn flush_reasoning(&mut self) -> Option<ReasoningPayload> {
+        if self.finished_reasoning.is_empty() {
+            return None;
+        }
+        Some(ReasoningPayload::Anthropic {
+            blocks: std::mem::take(&mut self.finished_reasoning),
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -183,12 +225,12 @@ struct PartialToolUse {
 fn handle_bedrock_event(
     event: ConverseStreamOutput,
     state: &mut BedrockStreamState,
-) -> Result<Option<LlmEvent>> {
+) -> Result<Vec<LlmEvent>> {
     match event {
-        ConverseStreamOutput::MessageStart(_) => Ok(None),
+        ConverseStreamOutput::MessageStart(_) => Ok(Vec::new()),
         ConverseStreamOutput::ContentBlockStart(start) => {
             let Some(ContentBlockStart::ToolUse(tool)) = start.start else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             state.tool_blocks.insert(
                 start.content_block_index,
@@ -198,21 +240,64 @@ fn handle_bedrock_event(
                     input_json: String::new(),
                 },
             );
-            Ok(None)
+            Ok(Vec::new())
         }
-        ConverseStreamOutput::ContentBlockDelta(delta) => match delta.delta {
-            Some(ContentBlockDelta::Text(text)) => Ok(Some(LlmEvent::TextDelta(text))),
-            Some(ContentBlockDelta::ToolUse(tool_delta)) => {
-                if let Some(tool) = state.tool_blocks.get_mut(&delta.content_block_index) {
-                    tool.input_json.push_str(&tool_delta.input);
+        ConverseStreamOutput::ContentBlockDelta(delta) => {
+            match delta.delta {
+                Some(ContentBlockDelta::Text(text)) => Ok(vec![LlmEvent::TextDelta(text)]),
+                Some(ContentBlockDelta::ToolUse(tool_delta)) => {
+                    if let Some(tool) = state.tool_blocks.get_mut(&delta.content_block_index) {
+                        tool.input_json.push_str(&tool_delta.input);
+                    }
+                    Ok(Vec::new())
                 }
-                Ok(None)
+                Some(ContentBlockDelta::ReasoningContent(reasoning)) => {
+                    let index = delta.content_block_index;
+                    let block = state.reasoning_blocks.entry(index).or_insert_with(|| {
+                        AnthropicThinkingBlock {
+                            kind: AnthropicThinkingKind::Thinking,
+                            text: String::new(),
+                            signature: None,
+                            data: None,
+                        }
+                    });
+                    match reasoning {
+                        ReasoningContentBlockDelta::Text(text) => {
+                            block.text.push_str(&text);
+                            if text.is_empty() {
+                                Ok(Vec::new())
+                            } else {
+                                Ok(vec![LlmEvent::ReasoningDelta {
+                                    text,
+                                    kind: ReasoningKind::Text,
+                                }])
+                            }
+                        }
+                        ReasoningContentBlockDelta::Signature(sig) => {
+                            match block.signature.as_mut() {
+                                Some(existing) => existing.push_str(&sig),
+                                None => block.signature = Some(sig),
+                            }
+                            Ok(Vec::new())
+                        }
+                        ReasoningContentBlockDelta::RedactedContent(blob) => {
+                            block.kind = AnthropicThinkingKind::Redacted;
+                            block.data = Some(hex_encode(&blob));
+                            Ok(Vec::new())
+                        }
+                        _ => Ok(Vec::new()),
+                    }
+                }
+                _ => Ok(Vec::new()),
             }
-            _ => Ok(None),
-        },
+        }
         ConverseStreamOutput::ContentBlockStop(stop) => {
+            if let Some(reasoning) = state.reasoning_blocks.remove(&stop.content_block_index) {
+                state.finished_reasoning.push(reasoning);
+                return Ok(Vec::new());
+            }
             let Some(tool) = state.tool_blocks.remove(&stop.content_block_index) else {
-                return Ok(None);
+                return Ok(Vec::new());
             };
             let arguments = if tool.input_json.trim().is_empty() {
                 Value::Object(Default::default())
@@ -223,15 +308,15 @@ fn handle_bedrock_event(
                     ))
                 })?
             };
-            Ok(Some(LlmEvent::ToolCall(LlmToolCall {
+            Ok(vec![LlmEvent::ToolCall(LlmToolCall {
                 call_id: tool.tool_use_id,
                 name: tool.name,
                 arguments,
-            })))
+            })])
         }
         ConverseStreamOutput::MessageStop(_) => {
             state.saw_message_stop = true;
-            Ok(None)
+            Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {
             if let Some(usage) = meta.usage {
@@ -244,10 +329,29 @@ fn handle_bedrock_event(
                     .cache_write_input_tokens
                     .and_then(|n| u64::try_from(n).ok());
             }
-            Ok(None)
+            Ok(Vec::new())
         }
-        _ => Ok(None),
+        _ => Ok(Vec::new()),
     }
+}
+
+fn hex_encode(blob: &Blob) -> String {
+    let bytes = blob.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
 }
 
 pub(crate) fn system_blocks(instructions: &str) -> Vec<SystemContentBlock> {
@@ -311,6 +415,39 @@ pub(crate) fn conversation_messages(input: &[LlmInputItem]) -> Result<Vec<Messag
                     ContentBlock::ToolResult(tool_result),
                 )?;
             }
+            LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
+                for block in blocks {
+                    let reasoning = match block.kind {
+                        AnthropicThinkingKind::Thinking => {
+                            let mut builder = ReasoningTextBlock::builder().text(&block.text);
+                            if let Some(sig) = &block.signature {
+                                builder = builder.signature(sig);
+                            }
+                            let text_block = builder.build().map_err(|err| {
+                                SqueezyError::ProviderRequest(format!(
+                                    "failed to build Bedrock reasoning text: {err}"
+                                ))
+                            })?;
+                            ReasoningContentBlock::ReasoningText(text_block)
+                        }
+                        AnthropicThinkingKind::Redacted => {
+                            let data = block
+                                .data
+                                .as_deref()
+                                .and_then(hex_decode)
+                                .unwrap_or_default();
+                            ReasoningContentBlock::RedactedContent(Blob::new(data))
+                        }
+                    };
+                    push_message(
+                        &mut messages,
+                        ConversationRole::Assistant,
+                        ContentBlock::ReasoningContent(reasoning),
+                    )?;
+                }
+            }
+            // Reasoning items from other providers are dropped when replaying to Bedrock.
+            LlmInputItem::Reasoning(_) => {}
         }
     }
     Ok(messages)

@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     credentials::resolve_api_key,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -140,7 +140,9 @@ impl OpenAiCompatibleProvider {
             } else {
                 None
             };
-            messages.push(chat_message(item, attach_cache_control));
+            if let Some(msg) = chat_message(item, attach_cache_control) {
+                messages.push(msg);
+            }
         }
         let mut body = json!({
             "model": &*request.model,
@@ -290,8 +292,8 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 }
 
-fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Value {
-    match item {
+fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Value> {
+    Some(match item {
         LlmInputItem::UserText(text) => {
             if let Some(cc) = cache_control {
                 json!({
@@ -337,7 +339,10 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Value {
             "tool_call_id": call_id,
             "content": output,
         }),
-    }
+        // Chat Completions has no signed reasoning replay format. Reasoning
+        // items are rendered in the UI but skipped when replaying.
+        LlmInputItem::Reasoning(_) => return None,
+    })
 }
 
 fn preset_default_headers(preset: OpenAiCompatiblePreset) -> BTreeMap<String, String> {
@@ -458,6 +463,17 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     if let Some(choices) = choices {
         for choice in choices {
             if let Some(delta) = choice.get("delta") {
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(Value::as_str)
+                    && !reasoning.is_empty()
+                {
+                    events.push(LlmEvent::ReasoningDelta {
+                        text: reasoning.to_string(),
+                        kind: ReasoningKind::Summary,
+                    });
+                }
                 if let Some(content) = delta.get("content").and_then(Value::as_str)
                     && !content.is_empty()
                 {

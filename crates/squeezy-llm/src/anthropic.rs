@@ -9,7 +9,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
+    LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
     credentials::resolve_api_key,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
 };
@@ -67,6 +68,17 @@ impl AnthropicProvider {
             "max_tokens": max_tokens,
             "stream": true,
         });
+        if let Some(effort) = request.reasoning_effort
+            && crate::capabilities_for("anthropic", &request.model)
+                .is_some_and(|caps| caps.reasoning_effort)
+        {
+            let budget =
+                u64::from(effort.thinking_budget_tokens()).min(max_tokens.saturating_sub(1));
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget,
+            });
+        }
         if !request.tools.is_empty() {
             let mut tool_values: Vec<Value> = request
                 .tools
@@ -144,6 +156,34 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
                     "content": output,
                 })],
             ),
+            LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
+                let blocks_json: Vec<Value> = blocks
+                    .iter()
+                    .map(|block| match block.kind {
+                        AnthropicThinkingKind::Thinking => {
+                            let mut obj = json!({
+                                "type": "thinking",
+                                "thinking": block.text,
+                            });
+                            if let Some(signature) = &block.signature {
+                                obj["signature"] = json!(signature);
+                            }
+                            obj
+                        }
+                        AnthropicThinkingKind::Redacted => {
+                            json!({
+                                "type": "redacted_thinking",
+                                "data": block.data.clone().unwrap_or_default(),
+                            })
+                        }
+                    })
+                    .collect();
+                if !blocks_json.is_empty() {
+                    push_anthropic_message(&mut messages, "assistant", blocks_json);
+                }
+            }
+            // Reasoning items from other providers are dropped when replaying to Anthropic.
+            LlmInputItem::Reasoning(_) => {}
         }
     }
     if prompt_caching {
@@ -237,7 +277,7 @@ impl LlmProvider for AnthropicProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    if let Some(llm_event) = parse_anthropic_event(&event, &mut state)? {
+                    for llm_event in parse_anthropic_event(&event, &mut state)? {
                         if matches!(llm_event, LlmEvent::Completed { .. }) {
                             saw_completed = true;
                         }
@@ -247,7 +287,7 @@ impl LlmProvider for AnthropicProvider {
             }
 
             for event in decoder.finish() {
-                if let Some(llm_event) = parse_anthropic_event(&event, &mut state)? {
+                for llm_event in parse_anthropic_event(&event, &mut state)? {
                     if matches!(llm_event, LlmEvent::Completed { .. }) {
                         saw_completed = true;
                     }
@@ -273,6 +313,9 @@ struct AnthropicStreamState {
     cache_creation_input_tokens: Option<u64>,
     stop_reason: Option<String>,
     tool_blocks: BTreeMap<u64, PartialToolCall>,
+    thinking_blocks: BTreeMap<u64, AnthropicThinkingBlock>,
+    finished_thinking: Vec<AnthropicThinkingBlock>,
+    emitted_reasoning_done: bool,
 }
 
 impl AnthropicStreamState {
@@ -354,13 +397,16 @@ fn decode_sse_event(bytes: &[u8]) -> Option<String> {
     }
 }
 
-fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result<Option<LlmEvent>> {
+fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
     let event_type = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+
+    let single = |evt: LlmEvent| Ok(vec![evt]);
+    let none = || Ok(Vec::new());
 
     match event_type {
         "message_start" => {
@@ -371,63 +417,124 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     .map(str::to_string);
                 merge_usage(state, message.get("usage"));
             }
-            Ok(None)
+            none()
         }
         "content_block_start" => {
             let Some(block) = value.get("content_block") else {
-                return Ok(None);
+                return none();
             };
-            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
-                return Ok(None);
-            }
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
-            let call_id = block
-                .get("id")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    SqueezyError::ProviderStream("Anthropic tool_use missing id".to_string())
-                })?
-                .to_string();
-            let name = block
-                .get("name")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    SqueezyError::ProviderStream("Anthropic tool_use missing name".to_string())
-                })?
-                .to_string();
-            let arguments_json = block
-                .get("input")
-                .filter(|input| !input.as_object().is_some_and(serde_json::Map::is_empty))
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|err| {
-                    SqueezyError::ProviderStream(format!(
-                        "failed to serialize Anthropic tool_use input: {err}"
-                    ))
-                })?
-                .unwrap_or_default();
-            state.tool_blocks.insert(
-                index,
-                PartialToolCall {
-                    call_id,
-                    name,
-                    arguments_json,
-                },
-            );
-            Ok(None)
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    let call_id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            SqueezyError::ProviderStream(
+                                "Anthropic tool_use missing id".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            SqueezyError::ProviderStream(
+                                "Anthropic tool_use missing name".to_string(),
+                            )
+                        })?
+                        .to_string();
+                    let arguments_json = block
+                        .get("input")
+                        .filter(|input| !input.as_object().is_some_and(serde_json::Map::is_empty))
+                        .map(serde_json::to_string)
+                        .transpose()
+                        .map_err(|err| {
+                            SqueezyError::ProviderStream(format!(
+                                "failed to serialize Anthropic tool_use input: {err}"
+                            ))
+                        })?
+                        .unwrap_or_default();
+                    state.tool_blocks.insert(
+                        index,
+                        PartialToolCall {
+                            call_id,
+                            name,
+                            arguments_json,
+                        },
+                    );
+                    none()
+                }
+                Some("thinking") => {
+                    let initial_text = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let initial_signature = block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    state.thinking_blocks.insert(
+                        index,
+                        AnthropicThinkingBlock {
+                            kind: AnthropicThinkingKind::Thinking,
+                            text: initial_text.clone(),
+                            signature: initial_signature,
+                            data: None,
+                        },
+                    );
+                    if initial_text.is_empty() {
+                        none()
+                    } else {
+                        single(LlmEvent::ReasoningDelta {
+                            text: initial_text,
+                            kind: ReasoningKind::Text,
+                        })
+                    }
+                }
+                Some("redacted_thinking") => {
+                    let data = block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    state.thinking_blocks.insert(
+                        index,
+                        AnthropicThinkingBlock {
+                            kind: AnthropicThinkingKind::Redacted,
+                            text: String::new(),
+                            signature: None,
+                            data,
+                        },
+                    );
+                    none()
+                }
+                _ => none(),
+            }
         }
         "content_block_delta" => {
             let Some(delta) = value.get("delta") else {
-                return Ok(None);
+                return none();
             };
             match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") => Ok(Some(LlmEvent::TextDelta(
-                    delta
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                ))),
+                Some("text_delta") => {
+                    let mut events = Vec::new();
+                    if !state.finished_thinking.is_empty() && !state.emitted_reasoning_done {
+                        let blocks = std::mem::take(&mut state.finished_thinking);
+                        state.emitted_reasoning_done = true;
+                        events.push(LlmEvent::ReasoningDone(ReasoningPayload::Anthropic {
+                            blocks,
+                        }));
+                    }
+                    events.push(LlmEvent::TextDelta(
+                        delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ));
+                    Ok(events)
+                }
                 Some("input_json_delta") => {
                     let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
                     if let Some(tool_call) = state.tool_blocks.get_mut(&index)
@@ -436,15 +543,53 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     {
                         tool_call.arguments_json.push_str(partial_json);
                     }
-                    Ok(None)
+                    none()
                 }
-                _ => Ok(None),
+                Some("thinking_delta") => {
+                    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let text = delta
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(block) = state.thinking_blocks.get_mut(&index) {
+                        block.text.push_str(&text);
+                    }
+                    if text.is_empty() {
+                        none()
+                    } else {
+                        single(LlmEvent::ReasoningDelta {
+                            text,
+                            kind: ReasoningKind::Text,
+                        })
+                    }
+                }
+                Some("signature_delta") => {
+                    let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let signature = delta
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(block) = state.thinking_blocks.get_mut(&index) {
+                        match block.signature.as_mut() {
+                            Some(existing) => existing.push_str(&signature),
+                            None => block.signature = Some(signature),
+                        }
+                    }
+                    none()
+                }
+                _ => none(),
             }
         }
         "content_block_stop" => {
             let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if let Some(thinking) = state.thinking_blocks.remove(&index) {
+                state.finished_thinking.push(thinking);
+                return none();
+            }
             let Some(tool_call) = state.tool_blocks.remove(&index) else {
-                return Ok(None);
+                return none();
             };
             let arguments = if tool_call.arguments_json.trim().is_empty() {
                 Value::Object(Default::default())
@@ -455,11 +600,20 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     ))
                 })?
             };
-            Ok(Some(LlmEvent::ToolCall(LlmToolCall {
+            let mut events = Vec::new();
+            if !state.finished_thinking.is_empty() && !state.emitted_reasoning_done {
+                let blocks = std::mem::take(&mut state.finished_thinking);
+                state.emitted_reasoning_done = true;
+                events.push(LlmEvent::ReasoningDone(ReasoningPayload::Anthropic {
+                    blocks,
+                }));
+            }
+            events.push(LlmEvent::ToolCall(LlmToolCall {
                 call_id: tool_call.call_id,
                 name: tool_call.name,
                 arguments,
-            })))
+            }));
+            Ok(events)
         }
         "message_delta" => {
             if let Some(delta) = value.get("delta") {
@@ -469,7 +623,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     .map(str::to_string);
             }
             merge_usage(state, value.get("usage"));
-            Ok(None)
+            none()
         }
         "message_stop" => {
             if state.stop_reason.as_deref() == Some("max_tokens") {
@@ -477,10 +631,19 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                     "Anthropic response stopped after max_tokens".to_string(),
                 ));
             }
-            Ok(Some(LlmEvent::Completed {
+            let mut events = Vec::new();
+            if !state.finished_thinking.is_empty() && !state.emitted_reasoning_done {
+                let blocks = std::mem::take(&mut state.finished_thinking);
+                state.emitted_reasoning_done = true;
+                events.push(LlmEvent::ReasoningDone(ReasoningPayload::Anthropic {
+                    blocks,
+                }));
+            }
+            events.push(LlmEvent::Completed {
                 response_id: state.response_id.clone(),
                 cost: state.cost(),
-            }))
+            });
+            Ok(events)
         }
         "error" => {
             let message = value
@@ -490,7 +653,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                 .unwrap_or("Anthropic stream error");
             Err(SqueezyError::ProviderStream(message.to_string()))
         }
-        _ => Ok(None),
+        _ => none(),
     }
 }
 

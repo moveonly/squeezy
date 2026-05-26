@@ -242,6 +242,7 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
             LlmInputItem::FunctionCall { arguments, .. } => serde_json::to_vec(arguments)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0),
+            LlmInputItem::Reasoning(payload) => payload.display_text().len() as u64,
         });
     }
     for spec in request.tools.iter() {

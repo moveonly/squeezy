@@ -1053,6 +1053,9 @@ pub enum ResumeItem {
         call_id: String,
         output: String,
     },
+    Reasoning {
+        payload: squeezy_core::ReasoningPayload,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

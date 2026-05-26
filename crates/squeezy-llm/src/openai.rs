@@ -11,7 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
+    ReasoningPayload,
     credentials::resolve_api_key,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -70,7 +71,7 @@ impl OpenAiProvider {
         })
     }
 
-    fn request_body(request: &LlmRequest) -> Value {
+    fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
@@ -90,8 +91,25 @@ impl OpenAiProvider {
         if let Some(response_verbosity) = request.response_verbosity {
             body["text"] = json!({ "verbosity": openai_text_verbosity(response_verbosity) });
         }
-        if let Some(reasoning_effort) = request.reasoning_effort {
-            body["reasoning"] = json!({ "effort": reasoning_effort.as_str() });
+        // The o-series and gpt-5.x models reason internally regardless of
+        // whether the caller picks an effort level; the API just won't stream
+        // a summary or expose `encrypted_content` for replay unless we ask
+        // for it. Request both whenever the model registry says this model
+        // supports reasoning, and only forward `effort` when the caller
+        // explicitly set one (else the provider uses its own per-model
+        // default).
+        let reasoning_capable = crate::capabilities_for(provider_name, &request.model)
+            .is_some_and(|caps| caps.reasoning_effort);
+        if reasoning_capable || request.reasoning_effort.is_some() {
+            let mut reasoning = serde_json::Map::new();
+            reasoning.insert("summary".to_string(), json!("auto"));
+            if let Some(effort) = request.reasoning_effort {
+                reasoning.insert("effort".to_string(), json!(effort.as_str()));
+            }
+            body["reasoning"] = Value::Object(reasoning);
+            if !request.store {
+                body["include"] = json!(["reasoning.encrypted_content"]);
+            }
         }
         if !request.tools.is_empty() {
             body["tools"] = json!(
@@ -137,7 +155,7 @@ impl LlmProvider for OpenAiProvider {
             url.push_str("?api-version=");
             url.push_str(api_version);
         }
-        let body = Self::request_body(&request);
+        let body = Self::request_body(&request, provider_name);
 
         Box::pin(try_stream! {
             let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
@@ -219,6 +237,7 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
 
     match event_type {
         "response.output_text.delta" => {
@@ -229,8 +248,33 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .to_string();
             Ok(Some(LlmEvent::TextDelta(delta)))
         }
+        "response.reasoning_summary_text.delta" => {
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(Some(LlmEvent::ReasoningDelta {
+                text: delta,
+                kind: ReasoningKind::Summary,
+            }))
+        }
+        "response.reasoning_text.delta" => {
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(Some(LlmEvent::ReasoningDelta {
+                text: delta,
+                kind: ReasoningKind::Text,
+            }))
+        }
         "response.output_item.done" => {
-            if let Some(tool_call) = parse_tool_call(value.get("item"))? {
+            let item = value.get("item");
+            if let Some(payload) = parse_reasoning_item(item) {
+                Ok(Some(LlmEvent::ReasoningDone(payload)))
+            } else if let Some(tool_call) = parse_tool_call(item)? {
                 Ok(Some(LlmEvent::ToolCall(tool_call)))
             } else {
                 Ok(None)
@@ -266,7 +310,14 @@ fn parse_openai_event(data: &str) -> Result<Option<LlmEvent>> {
                 .unwrap_or("OpenAI stream error");
             Err(SqueezyError::ProviderStream(message.to_string()))
         }
-        _ => Ok(None),
+        _ => {
+            tracing::debug!(
+                target: "squeezy_llm::openai",
+                event_type,
+                "unhandled OpenAI SSE event"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -275,11 +326,11 @@ fn openai_input(input: &[LlmInputItem]) -> Value {
         return json!(text);
     }
 
-    Value::Array(input.iter().map(openai_input_item).collect())
+    Value::Array(input.iter().filter_map(openai_input_item).collect())
 }
 
-fn openai_input_item(item: &LlmInputItem) -> Value {
-    match item {
+fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
+    Some(match item {
         LlmInputItem::UserText(text) => json!({
             "role": "user",
             "content": text,
@@ -303,7 +354,61 @@ fn openai_input_item(item: &LlmInputItem) -> Value {
             "call_id": call_id,
             "output": output,
         }),
+        LlmInputItem::Reasoning(ReasoningPayload::OpenAi {
+            item_id,
+            summary,
+            encrypted_content,
+        }) => {
+            let summary_value = Value::Array(
+                summary
+                    .iter()
+                    .map(|text| json!({ "type": "summary_text", "text": text }))
+                    .collect(),
+            );
+            let mut obj = json!({
+                "type": "reasoning",
+                "id": item_id,
+                "summary": summary_value,
+            });
+            if let Some(encrypted) = encrypted_content {
+                obj["encrypted_content"] = json!(encrypted);
+            }
+            obj
+        }
+        // Reasoning items from other providers are dropped when replaying to OpenAI.
+        LlmInputItem::Reasoning(_) => return None,
+    })
+}
+
+fn parse_reasoning_item(item: Option<&Value>) -> Option<ReasoningPayload> {
+    let item = item?;
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return None;
     }
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let summary = item
+        .get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let encrypted_content = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Some(ReasoningPayload::OpenAi {
+        item_id,
+        summary,
+        encrypted_content,
+    })
 }
 
 fn parse_tool_call(item: Option<&Value>) -> Result<Option<LlmToolCall>> {

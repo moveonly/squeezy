@@ -468,8 +468,11 @@ are resolved against the project root (the directory holding `squeezy.toml`).
   Codex-style inline viewport with real terminal scrollback,
   `alternate_screen = "always"` forces the dedicated full-screen transcript
   buffer, `alternate_screen = "never"` also uses the inline viewport, and
-  `show_reasoning_usage` hides or shows provider-reported reasoning-token
-  accounting when available.
+  `show_reasoning_usage` controls both the provider-reported reasoning-token
+  count in the status line and the grey, collapsible reasoning content block
+  rendered above each assistant message when the model emitted thinking
+  (OpenAI o-series, Anthropic extended thinking, Gemini 2.5 thinking,
+  Bedrock Claude reasoning).
 
 Legacy top-level `provider`, `model`, and `profile` keys remain accepted, but
 new configuration should use `[model]`.

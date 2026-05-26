@@ -1651,6 +1651,16 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
         }
     }
+
+    /// Anthropic-style thinking budget in tokens for this effort level.
+    pub const fn thinking_budget_tokens(self) -> u32 {
+        match self {
+            Self::Low => 4_096,
+            Self::Medium => 16_384,
+            Self::High => 32_768,
+            Self::XHigh => 60_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -7125,10 +7135,98 @@ pub enum Role {
     System,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningKind {
+    Summary,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicThinkingKind {
+    Thinking,
+    Redacted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnthropicThinkingBlock {
+    pub kind: AnthropicThinkingKind,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+pub enum ReasoningPayload {
+    OpenAi {
+        item_id: String,
+        summary: Vec<String>,
+        encrypted_content: Option<String>,
+    },
+    Anthropic {
+        blocks: Vec<AnthropicThinkingBlock>,
+    },
+    Google {
+        summary: Vec<String>,
+        thought_signature: Option<String>,
+    },
+}
+
+impl ReasoningPayload {
+    pub fn provider_name(&self) -> &'static str {
+        match self {
+            ReasoningPayload::OpenAi { .. } => "openai",
+            ReasoningPayload::Anthropic { .. } => "anthropic",
+            ReasoningPayload::Google { .. } => "google",
+        }
+    }
+
+    pub fn display_text(&self) -> String {
+        match self {
+            ReasoningPayload::OpenAi { summary, .. } => summary.join("\n\n"),
+            ReasoningPayload::Anthropic { blocks } => blocks
+                .iter()
+                .map(|block| match block.kind {
+                    AnthropicThinkingKind::Thinking => block.text.clone(),
+                    AnthropicThinkingKind::Redacted => "[redacted reasoning]".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            ReasoningPayload::Google { summary, .. } => summary.join("\n\n"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningSnapshot {
+    pub display_text: String,
+    pub payload: ReasoningPayload,
+}
+
+impl ReasoningSnapshot {
+    pub fn from_payload(payload: ReasoningPayload) -> Self {
+        let display_text = payload.display_text();
+        Self {
+            display_text,
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptItem {
     pub role: Role,
     pub content: String,
+    /// Boxed to keep `TranscriptItem` small: it sits inside `AgentEvent`
+    /// variants and the unboxed snapshot is large enough to trip clippy's
+    /// `large_enum_variant` threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Box<ReasoningSnapshot>>,
 }
 
 impl TranscriptItem {
@@ -7136,6 +7234,7 @@ impl TranscriptItem {
         Self {
             role: Role::User,
             content: content.into(),
+            reasoning: None,
         }
     }
 
@@ -7143,6 +7242,18 @@ impl TranscriptItem {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            reasoning: None,
+        }
+    }
+
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        reasoning: Option<ReasoningSnapshot>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: content.into(),
+            reasoning: reasoning.map(Box::new),
         }
     }
 
@@ -7150,6 +7261,7 @@ impl TranscriptItem {
         Self {
             role: Role::System,
             content: content.into(),
+            reasoning: None,
         }
     }
 }

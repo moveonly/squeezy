@@ -9,7 +9,8 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
+    ReasoningPayload,
     credentials::resolve_api_key,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
 };
@@ -54,6 +55,19 @@ impl GoogleProvider {
         });
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["generationConfig"]["maxOutputTokens"] = json!(max_output_tokens);
+        }
+        // Gemini 2.5 thinks by default; the API just won't return thought
+        // summaries unless `includeThoughts` is on. Mirror OpenAI: request
+        // summaries whenever the model is reasoning-capable, and only set
+        // an explicit `thinkingBudget` when the caller picked an effort.
+        let reasoning_capable = crate::capabilities_for("google", &request.model)
+            .is_some_and(|caps| caps.reasoning_effort);
+        if reasoning_capable || request.reasoning_effort.is_some() {
+            let mut thinking = json!({ "includeThoughts": true });
+            if let Some(effort) = request.reasoning_effort {
+                thinking["thinkingBudget"] = json!(effort.thinking_budget_tokens());
+            }
+            body["generationConfig"]["thinkingConfig"] = thinking;
         }
         if !request.tools.is_empty() {
             body["tools"] = json!([{
@@ -113,6 +127,7 @@ impl LlmProvider for GoogleProvider {
             let mut decoder = SseDecoder::default();
             let mut last_cost = CostSnapshot::default();
             let mut saw_any = false;
+            let mut reasoning_buf = GoogleReasoningBuffer::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -129,19 +144,22 @@ impl LlmProvider for GoogleProvider {
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     saw_any = true;
-                    for llm_event in parse_google_event(&event, &mut last_cost)? {
+                    for llm_event in parse_google_event(&event, &mut last_cost, &mut reasoning_buf)? {
                         yield llm_event;
                     }
                 }
             }
             for event in decoder.finish() {
                 saw_any = true;
-                for llm_event in parse_google_event(&event, &mut last_cost)? {
+                for llm_event in parse_google_event(&event, &mut last_cost, &mut reasoning_buf)? {
                     yield llm_event;
                 }
             }
             if !saw_any {
                 Err(SqueezyError::ProviderStream("Google stream ended without events".to_string()))?;
+            }
+            if let Some(payload) = reasoning_buf.flush() {
+                yield LlmEvent::ReasoningDone(payload);
             }
             yield LlmEvent::Completed {
                 response_id: None,
@@ -192,9 +210,64 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 }}],
                 }));
             }
+            LlmInputItem::Reasoning(ReasoningPayload::Google {
+                summary,
+                thought_signature,
+            }) => {
+                let parts: Vec<Value> = summary
+                    .iter()
+                    .map(|text| {
+                        let mut part = json!({
+                            "text": text,
+                            "thought": true,
+                        });
+                        if let Some(sig) = thought_signature {
+                            part["thoughtSignature"] = json!(sig);
+                        }
+                        part
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    contents.push(json!({
+                        "role": "model",
+                        "parts": parts,
+                    }));
+                }
+            }
+            // Reasoning items from other providers are dropped when replaying to Google.
+            LlmInputItem::Reasoning(_) => {}
         }
     }
     Value::Array(contents)
+}
+
+#[derive(Debug, Default)]
+struct GoogleReasoningBuffer {
+    summary: Vec<String>,
+    signature: Option<String>,
+}
+
+impl GoogleReasoningBuffer {
+    fn push(&mut self, text: &str, signature: Option<&str>) {
+        if !text.is_empty() {
+            self.summary.push(text.to_string());
+        }
+        if let Some(sig) = signature {
+            self.signature = Some(sig.to_string());
+        }
+    }
+
+    fn flush(&mut self) -> Option<ReasoningPayload> {
+        if self.summary.is_empty() && self.signature.is_none() {
+            return None;
+        }
+        let summary = std::mem::take(&mut self.summary);
+        let thought_signature = self.signature.take();
+        Some(ReasoningPayload::Google {
+            summary,
+            thought_signature,
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,7 +313,11 @@ fn decode_sse_event(bytes: &[u8]) -> Option<String> {
     }
 }
 
-fn parse_google_event(data: &str, cost: &mut CostSnapshot) -> Result<Vec<LlmEvent>> {
+fn parse_google_event(
+    data: &str,
+    cost: &mut CostSnapshot,
+    reasoning_buf: &mut GoogleReasoningBuffer,
+) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
     if let Some(error) = value.get("error") {
@@ -254,6 +331,7 @@ fn parse_google_event(data: &str, cost: &mut CostSnapshot) -> Result<Vec<LlmEven
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);
         cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
         cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
+        cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
     }
     let mut events = Vec::new();
     let parts = value
@@ -267,12 +345,31 @@ fn parse_google_event(data: &str, cost: &mut CostSnapshot) -> Result<Vec<LlmEven
         return Ok(events);
     };
     for (index, part) in parts.iter().enumerate() {
+        let is_thought = part
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if let Some(text) = part.get("text").and_then(Value::as_str)
             && !text.is_empty()
         {
+            if is_thought {
+                let signature = part.get("thoughtSignature").and_then(Value::as_str);
+                reasoning_buf.push(text, signature);
+                events.push(LlmEvent::ReasoningDelta {
+                    text: text.to_string(),
+                    kind: ReasoningKind::Summary,
+                });
+                continue;
+            }
+            if let Some(payload) = reasoning_buf.flush() {
+                events.push(LlmEvent::ReasoningDone(payload));
+            }
             events.push(LlmEvent::TextDelta(text.to_string()));
         }
         if let Some(function_call) = part.get("functionCall") {
+            if let Some(payload) = reasoning_buf.flush() {
+                events.push(LlmEvent::ReasoningDone(payload));
+            }
             let name = function_call
                 .get("name")
                 .and_then(Value::as_str)

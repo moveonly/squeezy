@@ -130,6 +130,7 @@ fn request_body_preserves_function_response_name() {
 #[test]
 fn parser_extracts_text_tool_calls_and_usage() {
     let mut cost = CostSnapshot::default();
+    let mut reasoning_buf = GoogleReasoningBuffer::default();
     let events = parse_google_event(
         r#"{
           "candidates":[{
@@ -145,6 +146,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
           }
         }"#,
         &mut cost,
+        &mut reasoning_buf,
     )
     .expect("valid event");
 

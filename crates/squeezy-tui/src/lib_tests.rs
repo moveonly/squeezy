@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
-use squeezy_agent::{JobKind, JobStatus};
+use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
@@ -168,6 +168,116 @@ async fn proposed_plan_block_opens_post_plan_choice_prompt() {
     assert!(rendered.contains("[r] Refine"));
     assert!(rendered.contains("[d] Discard"));
     assert!(rendered.contains("[v] View"));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn completed_transcript_is_plan_free_after_stream_extraction() {
+    let root = temp_workspace("completed_plan_free");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "intro narration <proposed_plan>\nstep 1\nstep 2\n</proposed_plan> tail narration"
+            .to_string(),
+    })
+    .await
+    .expect("send delta");
+    // The agent strips the block before constructing the Completed
+    // TranscriptItem; this mirrors that behaviour. If the TUI ever
+    // regresses to re-injecting the block (e.g. via leftover) the
+    // assertion below catches it.
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("intro narration  tail narration".to_string()),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let plan_cards = app
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry.kind, TranscriptEntryKind::PlanCard(_)))
+        .count();
+    assert_eq!(plan_cards, 1, "expected exactly one plan card");
+
+    for entry in &app.transcript {
+        if let TranscriptEntryKind::Message(item) = &entry.kind {
+            assert!(
+                !item.content.contains("<proposed_plan>"),
+                "transcript message must not contain raw proposed_plan markup: {:?}",
+                item.content
+            );
+            assert!(
+                !item.content.contains("step 1"),
+                "transcript message must not contain plan body: {:?}",
+                item.content
+            );
+        }
+    }
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "pending_assistant must be empty after Completed; held {:?}",
+        app.pending_assistant.text()
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
+    let root = temp_workspace("unterminated_no_duplicate");
+    let config = test_config_with_root(SessionMode::Plan, root.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Plan);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::AssistantDelta {
+        turn_id: TurnId::new(1),
+        delta: "intro <proposed_plan>\nstep 1\nstep 2 (no close tag)".to_string(),
+    })
+    .await
+    .expect("send delta");
+    tx.send(AgentEvent::Completed {
+        turn_id: TurnId::new(1),
+        message: TranscriptItem::assistant("intro".to_string()),
+        response_id: None,
+        cost: CostSnapshot::default(),
+        metrics: TurnMetrics::default(),
+        context_estimate: ContextEstimate::default(),
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.pending_assistant.trim_is_empty(),
+        "unterminated block must not leak back into pending_assistant: {:?}",
+        app.pending_assistant.text()
+    );
+    for entry in &app.transcript {
+        if let TranscriptEntryKind::Message(item) = &entry.kind {
+            assert!(
+                !item.content.contains("<proposed_plan>"),
+                "transcript must not surface the raw open tag: {:?}",
+                item.content
+            );
+            assert!(
+                !item.content.contains("step 1"),
+                "transcript must not surface body of unterminated block: {:?}",
+                item.content
+            );
+        }
+    }
 
     let _ = fs::remove_dir_all(&root);
 }
@@ -1709,8 +1819,89 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
         output.contains("provider_tokens input=- output=-"),
         "{output}"
     );
-    assert!(output.contains("tools calls=0"), "{output}");
+    // Empty buckets are suppressed so a fresh session is a short report,
+    // not a wall of zero-valued counters.
+    assert!(!output.contains("tools calls="), "{output}");
+    assert!(!output.contains("subagents calls="), "{output}");
+    assert!(!output.contains("receipts stub_hits="), "{output}");
+    assert!(!output.contains("spills writes="), "{output}");
+    assert!(!output.contains("\nio bytes_read="), "{output}");
+    assert!(!output.contains("\nredactions="), "{output}");
     assert!(app.jobs.is_empty());
+}
+
+#[test]
+fn format_cost_command_renders_active_buckets() {
+    use squeezy_agent::{
+        AttachmentShape, ConversationShape, SessionAccountingSnapshot, TranscriptShape,
+    };
+    use squeezy_core::{CostSnapshot, SessionMetrics, SessionMode};
+    use squeezy_llm::{RequestTokenEstimate, TokenizerKind};
+
+    let estimate = RequestTokenEstimate {
+        input_tokens: 0,
+        context_window_tokens: None,
+        effective_context_window_tokens: None,
+        headroom_tokens: None,
+        max_output_tokens: None,
+        input_budget_tokens: None,
+        remaining_input_tokens: None,
+        used_input_percent_x100: None,
+        tokenizer: TokenizerKind::OpenAiCompatible,
+        estimated: true,
+    };
+
+    let metrics = SessionMetrics {
+        tool_calls: 4,
+        tool_successes: 3,
+        tool_errors: 1,
+        bytes_read: 12_345,
+        subagent_calls: 1,
+        subagent_provider: CostSnapshot {
+            input_tokens: Some(900),
+            output_tokens: Some(120),
+            estimated_usd_micros: Some(7_500),
+            ..CostSnapshot::default()
+        },
+        receipt_stub_hits: 2,
+        spill_writes: 1,
+        ..SessionMetrics::default()
+    };
+
+    let snapshot = SessionAccountingSnapshot {
+        session_id: Some("sess-1".to_string()),
+        provider: "scripted",
+        model: "gpt-5.5".to_string(),
+        mode: SessionMode::Build,
+        store_responses: false,
+        previous_response_id: None,
+        cost: CostSnapshot {
+            input_tokens: Some(1_200),
+            output_tokens: Some(340),
+            estimated_usd_micros: Some(415_300),
+            ..CostSnapshot::default()
+        },
+        metrics,
+        redactions: 2,
+        transcript: TranscriptShape::default(),
+        conversation: ConversationShape::default(),
+        attachments: AttachmentShape::default(),
+        transmitted_request: estimate,
+        full_history_request: estimate,
+    };
+
+    let output = commands::format_cost_command(&snapshot);
+    assert!(output.contains("estimated_usd=$0.415300"), "{output}");
+    assert!(output.contains("provider_tokens input=1200"), "{output}");
+    assert!(
+        output.contains("tools calls=4 successes=3 errors=1"),
+        "{output}"
+    );
+    assert!(output.contains("subagents calls=1"), "{output}");
+    assert!(output.contains("receipts stub_hits=2"), "{output}");
+    assert!(output.contains("spills writes=1"), "{output}");
+    assert!(output.contains("io bytes_read=12345"), "{output}");
+    assert!(output.contains("redactions=2"), "{output}");
 }
 
 #[tokio::test]
@@ -2363,6 +2554,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
         ToolOutputVerbosity::Normal,
         MessageOutcome::Normal,
         Some(120),
+        true,
     );
     let output = lines
         .iter()
@@ -2430,6 +2622,7 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
         ToolOutputVerbosity::Normal,
         MessageOutcome::Normal,
         Some(120),
+        true,
     );
     let rendered = lines_to_plain_text(&lines);
     assert!(!rendered.contains("diff --git"), "{rendered}");
@@ -3418,6 +3611,85 @@ fn failed_assistant_marker_uses_error_color() {
 }
 
 #[test]
+fn accounting_block_colors_labels_values_and_dollar_amounts() {
+    let content = "Cost accounting\n\
+session=abc\n\
+provider=openai model=gpt-5.5 mode=build\n\
+estimated_usd=$0.415300 (estimated from provider-reported usage and local pricing metadata)\n\
+provider_tokens input=1200 output=340 reasoning=- cached_input=0 cache_write_input=-\n\
+tools calls=4 successes=3 errors=1 denials=0 cancellations=0 budget_denials=0\n\
+accuracy=provider token counters are provider-reported when available.";
+    let item = TranscriptItem::system(content);
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    assert_eq!(lines.len(), 7, "{lines:?}");
+
+    let span_for = |line: &Line<'static>, text: &str| -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.as_ref() == text)
+            .unwrap_or_else(|| panic!("missing span {text:?} in {line:?}"))
+            .style
+    };
+
+    // Header still renders the `• Noted` chrome plus the bolded
+    // "Cost accounting" body, in GOLD.
+    let header_style = span_for(&lines[0], "Cost accounting");
+    assert_eq!(header_style.fg, Some(GOLD));
+    assert!(header_style.add_modifier.contains(Modifier::BOLD));
+
+    // `session=` is the dim label, `abc` is the bright value.
+    let session_line = &lines[1];
+    assert_eq!(span_for(session_line, "session=").fg, Some(QUIET));
+    assert_eq!(span_for(session_line, "abc").fg, None);
+
+    // The dollar amount pops in AMBER; the trailing parenthetical fades.
+    let usd_line = &lines[3];
+    assert_eq!(span_for(usd_line, "estimated_usd=").fg, Some(QUIET));
+    assert_eq!(span_for(usd_line, "$0.415300").fg, Some(AMBER));
+    assert_eq!(span_for(usd_line, "(estimated").fg, Some(QUIET));
+
+    // Zero / dash values fade so real numbers carry the eye.
+    let tokens_line = &lines[4];
+    assert_eq!(span_for(tokens_line, "provider_tokens").fg, Some(GOLD));
+    assert_eq!(span_for(tokens_line, "1200").fg, None);
+    assert_eq!(span_for(tokens_line, "-").fg, Some(QUIET));
+    assert_eq!(span_for(tokens_line, "0").fg, Some(QUIET));
+
+    // The leading group word on tool rows is GOLD.
+    let tools_line = &lines[5];
+    assert_eq!(span_for(tools_line, "tools").fg, Some(GOLD));
+    assert_eq!(span_for(tools_line, "4").fg, None);
+
+    // The accuracy epilogue is wholly dimmed.
+    let accuracy_line = &lines[6];
+    assert!(
+        accuracy_line
+            .spans
+            .iter()
+            .all(|span| span.style.fg.is_none()
+                || span.style.fg == Some(QUIET)
+                || span.content.as_ref().chars().all(char::is_whitespace)),
+        "{accuracy_line:?}"
+    );
+}
+
+#[test]
+fn accounting_block_dispatch_skips_unrelated_system_messages() {
+    let item = TranscriptItem::system("Random system note\nwith multiple\nlines");
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    // The unrelated content keeps the default single-style rendering: the
+    // header gets the standard `• Noted` chrome, the body lines fall
+    // through to `action_text_lines_styled` with no per-token coloring.
+    assert!(!lines.is_empty());
+    let header_has_noted = lines[0]
+        .spans
+        .iter()
+        .any(|span| span.content.as_ref() == "Noted");
+    assert!(header_has_noted, "{lines:?}");
+}
+
+#[test]
 fn pending_assistant_uses_rotating_coin_marker() {
     let mut app = test_app(SessionMode::Build);
     app.pending_assistant.push_delta("streaming");
@@ -3621,8 +3893,14 @@ fn submitted_prompt_keeps_prompt_surface_and_working_line() {
 fn submitted_prompt_surface_extends_to_render_width() {
     let item = TranscriptItem::user("find getFoo");
 
-    let lines =
-        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(40));
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(40),
+        true,
+    );
     let rendered = lines[1]
         .spans
         .iter()
@@ -3653,8 +3931,14 @@ fn submitted_prompt_surface_extends_to_render_width() {
 fn submitted_prompt_preserves_empty_lines() {
     let item = TranscriptItem::user("one\n\nthree\n");
 
-    let lines =
-        format_message_entry_with_width(&item, false, false, MessageOutcome::Normal, Some(30));
+    let lines = format_message_entry_with_width(
+        &item,
+        false,
+        false,
+        MessageOutcome::Normal,
+        Some(30),
+        true,
+    );
     let rendered = lines
         .iter()
         .map(|line| {
@@ -5982,6 +6266,86 @@ fn json_patch_preview_parser_emits_events_per_patch() {
     if let PatchPreviewEvent::Complete { count } = complete {
         assert_eq!(*count, 2);
     }
+}
+
+#[tokio::test]
+async fn cost_warning_event_renders_exactly_once() {
+    // CostWarning previously pushed the same notice into both the
+    // transcript and the log pane; both render in the same stream so the
+    // line appeared twice back-to-back. Now the system transcript entry
+    // is the single source of truth.
+    let mut app = test_app(SessionMode::Build);
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::CostWarning {
+        turn_id: TurnId::new(1),
+        status: CostCapStatus {
+            spent_usd_micros: 80_000,
+            cap_usd_micros: 100_000,
+            percent: 80,
+        },
+    })
+    .await
+    .expect("send cost warning");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    let needle = "session cost crossed warning threshold";
+    let occurrences = app
+        .transcript
+        .iter()
+        .filter(|entry| match &entry.kind {
+            TranscriptEntryKind::Message(item) => item.content.contains(needle),
+            TranscriptEntryKind::Log(message) => message.contains(needle),
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "CostWarning must render exactly once; transcript: {:?}",
+        app.transcript
+    );
+}
+
+#[test]
+fn assistant_repeated_shell_output_dedups_even_with_glued_fence() {
+    // Real-world regression: the model emitted the opening fence glued to
+    // the prose ("...metadata.```text") rather than on its own line. The
+    // fence-aware dedup scanned line-by-line and missed the duplicate, so
+    // the entire `ls -la` body was rendered both in the tool card and
+    // again inside the assistant message. `normalize_fence_boundaries`
+    // breaks the fence onto its own line before the strip helpers run.
+    let mut app = test_app(SessionMode::Build);
+    let body = "total 328\ndrwxr-xr-x@  32 abbassabra  staff   1024 May 26 17:05 .\ndrwxr-xr-x@   3 abbassabra  staff     96 May 23 01:01 .cargo\n-rw-r--r--@   1 abbassabra  staff    892 May 23 01:01 .gitignore\n-rw-r--r--@   1 abbassabra  staff   3252 May 23 01:01 AGENTS.md\n-rw-r--r--@   1 abbassabra  staff  89483 May 23 01:01 Cargo.lock\ndrwxr-xr-x@  42 abbassabra  staff   1344 May 23 01:01 src";
+    let mut result = sample_tool_result("shell", "");
+    result.content = serde_json::json!({
+        "command": "ls -la",
+        "exit_code": 0,
+        "stdout": body,
+        "stderr": "",
+    });
+    app.push_tool_result(result);
+
+    let assistant =
+        format!("I'll list the repository root with detailed file metadata.```text\n{body}\n```");
+    let item = TranscriptItem::assistant(assistant.clone());
+    let deduped = super::dedupe_assistant_repeated_tool_output(&app, item)
+        .expect("deduped item should remain (intro prose survives)");
+    assert!(
+        !deduped.content.contains("total 328"),
+        "shell body must not appear inside the assistant message after dedup; got:\n{}",
+        deduped.content
+    );
+    assert!(
+        !deduped.content.contains("AGENTS.md"),
+        "shell body must not survive dedup; got:\n{}",
+        deduped.content
+    );
+    assert!(
+        deduped.content.contains("detailed file metadata"),
+        "intro prose should survive: {}",
+        deduped.content
+    );
 }
 
 #[test]

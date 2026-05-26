@@ -672,7 +672,9 @@ async fn run_agent_with_config(
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
             AgentEvent::CostWarning { .. }
             | AgentEvent::CostUpdate { .. }
-            | AgentEvent::ToolProgress { .. } => {}
+            | AgentEvent::ToolProgress { .. }
+            | AgentEvent::ReasoningDelta { .. }
+            | AgentEvent::ReasoningSegment { .. } => {}
         }
     }
     let _ = fs::remove_dir_all(&root);

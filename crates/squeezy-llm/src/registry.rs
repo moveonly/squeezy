@@ -441,6 +441,10 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
                 .saturating_add(estimate_text_tokens(output, bytes_per_token))
                 .saturating_add(12)
         }
+        LlmInputItem::Reasoning(payload) => {
+            let text = payload.display_text();
+            estimate_text_tokens(&text, bytes_per_token).saturating_add(8)
+        }
     }
 }
 

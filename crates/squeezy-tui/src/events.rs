@@ -32,7 +32,24 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 AgentEvent::Started { .. } => {
                     app.status = "thinking".to_string();
                     app.turn_visual = TurnVisualState::Running;
+                    app.pending_reasoning.clear();
                     app.note_turn_started();
+                }
+                AgentEvent::ReasoningDelta { delta, .. } => {
+                    if app.show_reasoning_usage {
+                        app.pending_reasoning.push_str(&delta);
+                    }
+                }
+                AgentEvent::ReasoningSegment { snapshot, .. } => {
+                    // Each reasoning block ends with its own segment event.
+                    // Drop the live "thinking..." buffer (the next block will
+                    // start fresh) and persist the segment as its own
+                    // collapsible transcript entry so the user can still
+                    // read it after tools or text move on.
+                    app.pending_reasoning.clear();
+                    if app.show_reasoning_usage && !snapshot.display_text.trim().is_empty() {
+                        app.push_reasoning_segment(snapshot);
+                    }
                 }
                 AgentEvent::AssistantDelta { delta, .. } => {
                     let extracted = app.proposed_plan.feed(&delta);
@@ -268,6 +285,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.push_transcript_item(message);
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.context_estimate = context_estimate;
                     app.cancelled_prompt = None;
@@ -300,8 +318,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         status.cap_usd_micros as f64 / 1_000_000.0,
                         status.percent
                     );
-                    app.push_transcript_item(TranscriptItem::system(notice.clone()));
-                    app.push_log(notice);
+                    app.push_transcript_item(TranscriptItem::system(notice));
                 }
                 AgentEvent::CostUpdate {
                     tool_count,
@@ -340,6 +357,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.last_turn_had_edits = false;
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
@@ -361,6 +379,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         app.last_turn_had_edits = false;
                     }
                     app.pending_assistant.clear();
+                    app.pending_reasoning.clear();
                     finalize_proposed_plan(app);
                     app.clear_active_tools();
                     app.pending_mcp_elicitation = None;
@@ -433,14 +452,16 @@ pub(crate) fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
     ));
 }
 
-/// Flush any straggler bytes held by the `<proposed_plan>` extractor at
-/// turn boundaries. Unterminated blocks are folded back into the
-/// transcript so the user can see what the model attempted; the extractor
-/// itself is rebuilt fresh for the next turn.
+/// Reset the `<proposed_plan>` extractor at a turn boundary. The
+/// agent's Completed message is the single rendered artifact for the
+/// turn — re-injecting leftover bytes from an unterminated block here
+/// duplicated content that the assistant message already contained. If
+/// the extractor was still inside an open block we log an advisory so
+/// the model-output bug is visible without polluting the transcript.
 pub(crate) fn finalize_proposed_plan(app: &mut TuiApp) {
     let leftover = app.proposed_plan.finalize();
     if !leftover.is_empty() {
-        app.pending_assistant.push_delta(&leftover);
+        app.push_log("ignored unterminated <proposed_plan> block from the model".to_string());
     }
     app.proposed_plan = proposed_plan::ProposedPlanExtractor::new();
 }

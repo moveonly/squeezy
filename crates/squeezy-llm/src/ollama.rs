@@ -225,6 +225,8 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             LlmInputItem::FunctionCallOutput { call_id: _, output } => {
                 messages.push(json!({ "role": "tool", "content": output }));
             }
+            // Ollama has no signed reasoning replay format. Skip on replay.
+            LlmInputItem::Reasoning(_) => {}
         }
     }
     Value::Array(messages)

@@ -1016,6 +1016,7 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::ReasoningDelta { .. } | AgentEvent::ReasoningSegment { .. } => {}
                 AgentEvent::Completed {
                     turn_id,
                     cost,

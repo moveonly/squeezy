@@ -1092,6 +1092,13 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
 async fn handle_paste(app: &mut TuiApp, agent: &mut Agent, text: String) -> Result<()> {
     let normalized = normalize_pasted_text(&text);
+    // The config screen owns its own set of focusable text inputs (secret
+    // entry, search, picker filter, field editor). Route paste there
+    // instead of attaching it as transcript context when the screen is up.
+    if let Some(state) = app.config_screen.as_mut() {
+        config_screen::handle_paste(state, &normalized);
+        return Ok(());
+    }
     if app
         .pending_mcp_elicitation
         .as_ref()
@@ -3753,6 +3760,7 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
+            app.show_reasoning_usage,
         ));
     }
     lines
@@ -3764,10 +3772,11 @@ fn format_transcript_entry_expanded(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
         TranscriptEntryKind::Message(item) => {
-            format_message_entry_with_width(item, false, selected, outcome, width)
+            format_message_entry_with_width(item, false, selected, outcome, width, show_reasoning)
         }
         TranscriptEntryKind::ToolResult(tool) => {
             format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
@@ -3775,6 +3784,15 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::Log(message) => format_log_entry(message, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, false);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -3796,7 +3814,11 @@ fn transcript_lines_for_render(
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             width,
+            app.show_reasoning_usage,
         ));
+    }
+    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
     }
     if let Some(pending_assistant) = pending_assistant_display_content(app) {
         lines.extend(assistant_text_lines(
@@ -3810,10 +3832,32 @@ fn transcript_lines_for_render(
     lines
 }
 
+fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
+    for raw in text.lines() {
+        lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
-    pending_assistant_display_content(app)
-        .map(|content| assistant_text_lines(false, turn_coin_span(app), &content, Style::default()))
-        .unwrap_or_default()
+    let mut lines = Vec::new();
+    if app.show_reasoning_usage && !app.pending_reasoning.trim().is_empty() {
+        lines.extend(streaming_reasoning_lines(&app.pending_reasoning));
+    }
+    if let Some(content) = pending_assistant_display_content(app) {
+        lines.extend(assistant_text_lines(
+            false,
+            turn_coin_span(app),
+            &content,
+            Style::default(),
+        ));
+    }
+    lines
 }
 
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -3975,7 +4019,7 @@ fn format_transcript_entry(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
-    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None)
+    format_transcript_entry_with_width(entry, selected, tool_output_verbosity, outcome, None, true)
 }
 
 fn format_transcript_entry_with_width(
@@ -3984,11 +4028,17 @@ fn format_transcript_entry_with_width(
     tool_output_verbosity: ToolOutputVerbosity,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     match &entry.kind {
-        TranscriptEntryKind::Message(item) => {
-            format_message_entry_with_width(item, entry.collapsed, selected, outcome, width)
-        }
+        TranscriptEntryKind::Message(item) => format_message_entry_with_width(
+            item,
+            entry.collapsed,
+            selected,
+            outcome,
+            width,
+            show_reasoning,
+        ),
         TranscriptEntryKind::ToolResult(tool) => format_tool_result_entry(
             tool,
             entry.collapsed,
@@ -3999,6 +4049,15 @@ fn format_transcript_entry_with_width(
         TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
+        TranscriptEntryKind::Reasoning(snapshot) => {
+            if show_reasoning {
+                let mut lines = reasoning_block_lines(&snapshot.display_text, entry.collapsed);
+                lines.push(Line::from(""));
+                lines
+            } else {
+                Vec::new()
+            }
+        }
     }
 }
 
@@ -4192,7 +4251,7 @@ pub(crate) fn dedupe_assistant_repeated_tool_output(
 }
 
 fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -> String {
-    let mut content = content.to_string();
+    let mut content = normalize_fence_boundaries(content);
     let outputs = recent_shell_tool_outputs(app);
     for output in &outputs {
         if let Some(stripped) = strip_repeated_fenced_tool_output(&content, output) {
@@ -4206,6 +4265,32 @@ fn assistant_content_without_repeated_tool_output(app: &TuiApp, content: &str) -
         return String::new();
     }
     content
+}
+
+/// Insert a newline before any ```` ``` ```` that's glued to non-whitespace
+/// on the same line. Models occasionally emit `"prose.```text\nbody\n```"`
+/// without breaking the line before the opening fence; the fence-aware
+/// dedup helpers below scan line-by-line and would miss the duplicate.
+fn normalize_fence_boundaries(content: &str) -> String {
+    const FENCE: &str = "```";
+    let mut out = String::with_capacity(content.len());
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(FENCE.as_bytes()) {
+            let preceded_by_break = matches!(out.chars().last(), None | Some('\n'));
+            if !preceded_by_break {
+                out.push('\n');
+            }
+            out.push_str(FENCE);
+            i += FENCE.len();
+            continue;
+        }
+        let ch = content[i..].chars().next().expect("non-empty");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn pending_assistant_display_content(app: &TuiApp) -> Option<String> {
@@ -4469,7 +4554,7 @@ fn format_message_entry(
     selected: bool,
     outcome: MessageOutcome,
 ) -> Vec<Line<'static>> {
-    format_message_entry_with_width(item, collapsed, selected, outcome, None)
+    format_message_entry_with_width(item, collapsed, selected, outcome, None, true)
 }
 
 fn format_message_entry_with_width(
@@ -4478,12 +4563,13 @@ fn format_message_entry_with_width(
     selected: bool,
     outcome: MessageOutcome,
     width: Option<u16>,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     if item.role == Role::User {
         return format_user_prompt_entry(item, selected, width);
     }
     if item.role == Role::Assistant {
-        return format_assistant_message_entry(item, collapsed, selected, outcome);
+        return format_assistant_message_entry(item, collapsed, selected, outcome, show_reasoning);
     }
     let (action, color) = role_action(&item.role);
     let failed = outcome == MessageOutcome::Failed;
@@ -4501,6 +4587,12 @@ fn format_message_entry_with_width(
             content_style,
         )];
     }
+    if item.role == Role::System
+        && !failed
+        && let Some(lines) = format_accounting_block_entry(selected, &item.content)
+    {
+        return lines;
+    }
     action_text_lines_styled(
         selected,
         "• ",
@@ -4510,6 +4602,103 @@ fn format_message_entry_with_width(
         &item.content,
         content_style,
     )
+}
+
+/// Render the `/cost` and `/context` outputs with per-token coloring:
+/// group words pop in `GOLD`, `key=` labels dim to `QUIET`, dollar values
+/// pop in `AMBER`, and zero/dash/unknown values fade to `QUIET` so the
+/// real numbers carry the eye. Returns `None` for any system message that
+/// is not an accounting block — the caller falls through to the default
+/// single-style renderer.
+fn format_accounting_block_entry(selected: bool, content: &str) -> Option<Vec<Line<'static>>> {
+    let mut iter = content.lines();
+    let header = iter.next()?;
+    if header != "Cost accounting" && header != "Context accounting" {
+        return None;
+    }
+    let header_span = Span::styled(
+        header.to_string(),
+        Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+    );
+    let mut lines = Vec::with_capacity(content.lines().count());
+    lines.push(action_line_spans(
+        selected,
+        "• ",
+        GOLD,
+        "Noted",
+        GOLD,
+        vec![header_span],
+    ));
+    for body in iter {
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(accounting_body_spans(body));
+        lines.push(Line::from(spans));
+    }
+    Some(lines)
+}
+
+fn accounting_body_spans(line: &str) -> Vec<Span<'static>> {
+    // Sentences without any `key=value` token are dimmed wholesale (the
+    // accuracy epilogue, the `provider_stored_context=...` narrative line).
+    if !line.contains('=') || line.starts_with("accuracy=") {
+        return vec![Span::styled(line.to_string(), Style::default().fg(QUIET))];
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut first_token = true;
+    for token in line.split_inclusive(' ') {
+        let (text, trailing) = if let Some(stripped) = token.strip_suffix(' ') {
+            (stripped, " ")
+        } else {
+            (token, "")
+        };
+        if let Some(eq_idx) = text.find('=') {
+            let (key, rest) = text.split_at(eq_idx);
+            let value = &rest[1..];
+            spans.push(Span::styled(format!("{key}="), Style::default().fg(QUIET)));
+            spans.push(Span::styled(
+                value.to_string(),
+                accounting_value_style(value),
+            ));
+        } else {
+            // A bare word — the leading group label (`tools`,
+            // `subagents`, `transmitted_request`, …) or a trailing
+            // parenthetical like `(estimated from ...)`.
+            let style = if first_token {
+                Style::default().fg(GOLD)
+            } else {
+                Style::default().fg(QUIET)
+            };
+            spans.push(Span::styled(text.to_string(), style));
+        }
+        if !trailing.is_empty() {
+            spans.push(Span::raw(trailing));
+        }
+        first_token = false;
+    }
+    spans
+}
+
+fn accounting_value_style(value: &str) -> Style {
+    if value.is_empty() {
+        return Style::default().fg(QUIET);
+    }
+    if value.starts_with('$') {
+        return Style::default().fg(AMBER);
+    }
+    // Values that signal absence/zero fade so the eye lands on the real
+    // numbers. Percent strings like `0.00%` count as zero too.
+    let is_zero_percent = value
+        .strip_suffix('%')
+        .and_then(|prefix| prefix.parse::<f64>().ok())
+        .is_some_and(|value| value == 0.0);
+    if matches!(
+        value,
+        "-" | "0" | "unknown" | "inactive" | "absent" | "false"
+    ) || is_zero_percent
+    {
+        return Style::default().fg(QUIET);
+    }
+    Style::default()
 }
 
 fn format_user_prompt_entry(
@@ -4594,28 +4783,69 @@ fn format_assistant_message_entry(
     collapsed: bool,
     selected: bool,
     outcome: MessageOutcome,
+    show_reasoning: bool,
 ) -> Vec<Line<'static>> {
     let color = if outcome == MessageOutcome::Failed {
         ERROR_RED
     } else {
         SUCCESS_GREEN
     };
-    let mut lines = if collapsed {
-        vec![assistant_line(
+    let mut lines = Vec::new();
+    if show_reasoning
+        && let Some(snapshot) = item.reasoning.as_ref()
+        && !snapshot.display_text.trim().is_empty()
+    {
+        lines.extend(reasoning_block_lines(&snapshot.display_text, collapsed));
+    }
+    if collapsed {
+        lines.push(assistant_line(
             selected,
             assistant_static_span(color),
             collapsed_content_summary(&item.content),
             Style::default(),
-        )]
+        ));
     } else {
-        assistant_text_lines(
+        lines.extend(assistant_text_lines(
             selected,
             assistant_static_span(color),
             &item.content,
             Style::default(),
-        )
-    };
+        ));
+    }
     lines.push(Line::from(""));
+    lines
+}
+
+fn reasoning_block_lines(text: &str, collapsed: bool) -> Vec<Line<'static>> {
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC);
+    let mut lines = Vec::new();
+    let body_lines: Vec<&str> = text.lines().collect();
+    if collapsed {
+        let summary = body_lines
+            .first()
+            .copied()
+            .map(|first| compact_text(first, 120))
+            .unwrap_or_default();
+        let suffix = if body_lines.len() > 1 {
+            format!(" … +{} lines (Ctrl-E to expand)", body_lines.len() - 1)
+        } else {
+            String::new()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("▸ reasoning: {summary}{suffix}"),
+            style,
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("▾ reasoning ({} lines)", body_lines.len().max(1)),
+            style,
+        )));
+        for raw in body_lines {
+            lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+        }
+    }
     lines
 }
 
@@ -7509,6 +7739,10 @@ pub(crate) struct TuiApp {
     pub(crate) next_entry_id: u64,
     pub(crate) transcript_scroll_from_bottom: u16,
     pub(crate) pending_assistant: streaming::StreamingController,
+    /// Streaming buffer for reasoning/thinking deltas emitted during the
+    /// current turn. Rendered as a grey transient block above the
+    /// assistant text; cleared at turn completion.
+    pub(crate) pending_reasoning: String,
     pub(crate) proposed_plan: proposed_plan::ProposedPlanExtractor,
     pub(crate) workspace_root: PathBuf,
     /// Session id assigned by the agent. Plan-mode IO (persist, prune,
@@ -7719,6 +7953,7 @@ impl TuiApp {
             next_entry_id,
             transcript_scroll_from_bottom: 0,
             pending_assistant: streaming::StreamingController::new(),
+            pending_reasoning: String::new(),
             proposed_plan: proposed_plan::ProposedPlanExtractor::new(),
             workspace_root: config.workspace_root.clone(),
             session_id: None,
@@ -7916,6 +8151,15 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::diff_card(id, data));
     }
 
+    pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::reasoning(
+            id,
+            snapshot,
+            self.transcript_default,
+        ));
+    }
+
     fn push_entry(&mut self, entry: TranscriptEntry) {
         self.transcript.push(entry);
     }
@@ -8022,6 +8266,19 @@ impl TranscriptEntry {
         }
     }
 
+    fn reasoning(
+        id: u64,
+        snapshot: squeezy_core::ReasoningSnapshot,
+        _transcript_default: TranscriptDefault,
+    ) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::Reasoning(Box::new(snapshot)),
+            // Always collapsed at first; the user can expand with Ctrl-E.
+            collapsed: true,
+        }
+    }
+
     fn matches_category(&self, category: TranscriptCategory) -> bool {
         match category {
             TranscriptCategory::All => true,
@@ -8066,6 +8323,9 @@ impl TranscriptEntry {
             TranscriptEntryKind::Diff(data) => {
                 vec![format!("diff ({})\n{}", data.summary, data.plain)]
             }
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                vec![format!("reasoning: {}", snapshot.display_text)]
+            }
         }
     }
 
@@ -8089,6 +8349,9 @@ impl TranscriptEntry {
             TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
+            TranscriptEntryKind::Reasoning(snapshot) => {
+                text_has_collapsible_content(&snapshot.display_text)
+            }
         }
     }
 
@@ -8119,6 +8382,11 @@ impl TranscriptEntry {
                 data.plain.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::Reasoning(snapshot) => (
+                "reasoning".to_string(),
+                snapshot.display_text.clone(),
+                format!("transcript:{}", self.id),
+            ),
         }
     }
 }
@@ -8137,6 +8405,10 @@ enum TranscriptEntryKind {
     /// rendered as pre-styled lines using `render::diff`. Stored
     /// pre-rendered so per-frame work is constant.
     Diff(Box<DiffCardData>),
+    /// A finalized reasoning segment from the model. Stored separately
+    /// so each reasoning block becomes its own grey collapsible entry
+    /// instead of being pinned to the next assistant message.
+    Reasoning(Box<squeezy_core::ReasoningSnapshot>),
 }
 
 /// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
@@ -8542,6 +8814,7 @@ fn inline_history_lines_for_flush(
             app.tool_output_verbosity,
             message_outcome(&app.transcript, index),
             Some(width),
+            app.show_reasoning_usage,
         ));
     }
     lines

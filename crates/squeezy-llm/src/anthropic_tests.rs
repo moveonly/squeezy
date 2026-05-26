@@ -322,7 +322,7 @@ fn parser_extracts_text_delta() {
     )
     .expect("valid event");
 
-    assert_eq!(event, Some(LlmEvent::TextDelta("hello".to_string())));
+    assert_eq!(event, vec![LlmEvent::TextDelta("hello".to_string())]);
 }
 
 #[test]
@@ -349,11 +349,11 @@ fn parser_extracts_streamed_tool_call() {
 
     assert_eq!(
         event,
-        Some(LlmEvent::ToolCall(LlmToolCall {
+        vec![LlmEvent::ToolCall(LlmToolCall {
             call_id: "toolu_1".to_string(),
             name: "read_file".to_string(),
             arguments: serde_json::json!({ "path": "src/lib.rs" }),
-        }))
+        })]
     );
 }
 
@@ -389,7 +389,7 @@ fn parser_extracts_completed_response_id_and_usage() {
 
     assert_eq!(
         event,
-        Some(LlmEvent::Completed {
+        vec![LlmEvent::Completed {
             response_id: Some("msg_123".to_string()),
             cost: CostSnapshot {
                 input_tokens: Some(10),
@@ -399,7 +399,7 @@ fn parser_extracts_completed_response_id_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
-        })
+        }]
     );
 }
 
@@ -428,4 +428,70 @@ fn parser_surfaces_max_tokens_stop() {
         .expect_err("max_tokens is a stream error");
 
     assert!(err.to_string().contains("max_tokens"));
+}
+
+#[test]
+fn parser_accumulates_thinking_block_with_signature() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+        &mut state,
+    )
+    .expect("start");
+    let delta = parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    assert_eq!(
+        delta,
+        vec![LlmEvent::ReasoningDelta {
+            text: "weigh".to_string(),
+            kind: crate::ReasoningKind::Text,
+        }]
+    );
+    parse_anthropic_event(
+        r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}"#,
+        &mut state,
+    )
+    .expect("signature");
+    parse_anthropic_event(r#"{"type":"content_block_stop","index":0}"#, &mut state).expect("stop");
+
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+    let payload = match events.first() {
+        Some(LlmEvent::ReasoningDone(payload)) => payload.clone(),
+        other => panic!("expected ReasoningDone first, got {other:?}"),
+    };
+    match payload {
+        crate::ReasoningPayload::Anthropic { blocks } => {
+            assert_eq!(blocks.len(), 1);
+            assert_eq!(blocks[0].text, "weigh");
+            assert_eq!(blocks[0].signature.as_deref(), Some("SIG"));
+        }
+        other => panic!("expected Anthropic payload, got {other:?}"),
+    }
+}
+
+#[test]
+fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
+    let payload = crate::ReasoningPayload::Anthropic {
+        blocks: vec![crate::AnthropicThinkingBlock {
+            kind: crate::AnthropicThinkingKind::Thinking,
+            text: "deliberated".to_string(),
+            signature: Some("SIG".to_string()),
+            data: None,
+        }],
+    };
+    let input = vec![
+        LlmInputItem::Reasoning(payload),
+        LlmInputItem::AssistantText("answer".to_string()),
+    ];
+    let messages = anthropic_messages(&input, false);
+    let arr = messages.as_array().expect("array");
+    assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
+    let content = arr[0]["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["signature"], "SIG");
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "answer");
 }

@@ -5,7 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use squeezy_core::SessionMode;
 
 use super::{
-    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode, latest_plan_path,
+    CURRENT_POINTER_FILE, PLAN_DIR, PLAN_MODE_INSTRUCTIONS, instructions_for_mode,
+    latest_plan_path, strip_proposed_plan_blocks,
 };
 
 const TEST_SESSION_ID: &str = "test-sess-abc";
@@ -182,6 +183,58 @@ fn latest_plan_path_isolates_sessions() {
     assert!(latest_plan_path(&root, Some(sid_a)).is_some());
     assert!(latest_plan_path(&root, Some(sid_b)).is_none());
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn strip_proposed_plan_blocks_removes_closed_block() {
+    let input =
+        "intro paragraph\n\n<proposed_plan>\nstep 1\nstep 2\n</proposed_plan>\n\ntail paragraph";
+    let out = strip_proposed_plan_blocks(input);
+    assert!(!out.contains("<proposed_plan>"));
+    assert!(!out.contains("step 1"));
+    assert!(out.contains("intro paragraph"));
+    assert!(out.contains("tail paragraph"));
+}
+
+#[test]
+fn strip_proposed_plan_blocks_drops_unterminated_tail() {
+    let input = "intro\n<proposed_plan>\nstep 1\nstep 2\n(no close tag)";
+    let out = strip_proposed_plan_blocks(input);
+    assert!(!out.contains("<proposed_plan>"));
+    assert!(!out.contains("step 1"));
+    assert_eq!(out.trim(), "intro");
+}
+
+#[test]
+fn strip_proposed_plan_blocks_removes_multiple_blocks() {
+    let input = "a <proposed_plan>plan A</proposed_plan> b <proposed_plan>plan B</proposed_plan> c";
+    let out = strip_proposed_plan_blocks(input);
+    assert!(!out.contains("plan A"));
+    assert!(!out.contains("plan B"));
+    assert!(out.contains("a "));
+    assert!(out.contains("c"));
+}
+
+#[test]
+fn strip_proposed_plan_blocks_collapses_blank_line_run() {
+    let input = "intro\n\n\n<proposed_plan>body</proposed_plan>\n\n\ntail";
+    let out = strip_proposed_plan_blocks(input);
+    let blank_runs = out
+        .split('\n')
+        .collect::<Vec<_>>()
+        .windows(3)
+        .filter(|w| w.iter().all(|line| line.trim().is_empty()))
+        .count();
+    assert_eq!(
+        blank_runs, 0,
+        "should not contain 3+ consecutive blank lines: {out:?}"
+    );
+}
+
+#[test]
+fn strip_proposed_plan_blocks_returns_empty_when_only_block() {
+    let out = strip_proposed_plan_blocks("<proposed_plan>plan body</proposed_plan>");
+    assert!(out.is_empty(), "expected empty, got {out:?}");
 }
 
 #[test]

@@ -1852,6 +1852,7 @@ async fn run_prompt(
                 eprintln!("cancelled");
                 break;
             }
+            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
         }
     }
 
