@@ -35,8 +35,7 @@ use ratatui::{
 use squeezy_agent::RequestUserInputChoice;
 use squeezy_agent::{
     Agent, AgentEvent, JobEvent, JobId, JobNotification, JobSnapshot, MAX_JOB_NOTIFICATIONS,
-    MAX_JOBS_RETAINED, RequestUserInputRequest, RequestUserInputResponse,
-    SessionAccountingSnapshot, ToolApprovalDecision, ToolApprovalRequest,
+    RequestUserInputRequest, RequestUserInputResponse, ToolApprovalDecision, ToolApprovalRequest,
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
@@ -44,8 +43,8 @@ use squeezy_core::{
     TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
     TuiAlternateScreen,
 };
-use squeezy_llm::{LlmProvider, RequestTokenEstimate};
-use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery, parse_bug_report_section};
+use squeezy_llm::LlmProvider;
+use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -56,8 +55,11 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod approval;
+mod commands;
 mod config_screen;
+mod events;
 mod history;
+mod input;
 mod mention;
 mod notification;
 mod overlay;
@@ -69,6 +71,22 @@ mod streaming;
 mod streaming_patch;
 pub use render::markdown::render_markdown;
 pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+
+#[cfg(test)]
+pub(crate) use events::apply_mcp_status_update;
+pub(crate) use events::{drain_agent_events, drain_job_events};
+#[cfg(test)]
+pub(crate) use input::set_input;
+pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
+use input::{
+    clear_input, complete_selected_slash_command, delete_at_cursor, delete_before_cursor,
+    delete_next_word, delete_previous_word, delete_to_line_end, delete_to_line_start,
+    handle_mention_popup_key, handle_overlay_key, handle_request_user_input_key, input_cursor,
+    insert_input_char, insert_input_text, move_input_cursor_left, move_input_cursor_line_end,
+    move_input_cursor_line_start, move_input_cursor_right, move_input_cursor_word_left,
+    move_input_cursor_word_right, move_slash_menu_selection, push_input_history,
+    recall_prompt_history, reject_unknown_slash_command, slash_suggestions,
+};
 
 use notification::{NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
@@ -91,7 +109,6 @@ const SLASH_MENU_MAX_ITEMS: usize = 5;
 const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l";
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
-const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
 const TITLE_NOTIFICATION_GLYPH: &str = "●";
@@ -104,7 +121,7 @@ const TITLE_NOTIFICATION_GLYPH: &str = "●";
 /// notification glyph once it finishes, and a clear once the user has
 /// interacted again.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TerminalTitleState {
+pub(crate) enum TerminalTitleState {
     Cleared,
     Working,
     Notification,
@@ -187,128 +204,6 @@ impl Command for DisableModifyOtherKeys {
     #[cfg(windows)]
     fn is_ansi_code_supported(&self) -> bool {
         true
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SlashCommand {
-    name: &'static str,
-    description: &'static str,
-    available_during_task: bool,
-    parameter_hint: Option<&'static str>,
-}
-
-const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
-    SlashCommand {
-        name,
-        description,
-        available_during_task: true,
-        parameter_hint: None,
-    }
-}
-
-const fn slash_locked(name: &'static str, description: &'static str) -> SlashCommand {
-    SlashCommand {
-        name,
-        description,
-        available_during_task: false,
-        parameter_hint: None,
-    }
-}
-
-const fn slash_args(
-    name: &'static str,
-    description: &'static str,
-    available_during_task: bool,
-    parameter_hint: &'static str,
-) -> SlashCommand {
-    SlashCommand {
-        name,
-        description,
-        available_during_task,
-        parameter_hint: Some(parameter_hint),
-    }
-}
-
-const SLASH_COMMANDS: &[SlashCommand] = &[
-    slash("/help", "show local Squeezy help topics"),
-    slash_args(
-        "/config",
-        "open the config screen (or pass a section name)",
-        true,
-        "[section]",
-    ),
-    slash("/model", "open config focused on provider and model"),
-    slash("/permissions", "open config focused on permissions"),
-    slash_args(
-        "/plan",
-        "switch to Plan mode (optionally with a prompt to run)",
-        false,
-        "[prompt]",
-    ),
-    slash_args(
-        "/build",
-        "switch to Build mode (optionally with a prompt to run)",
-        false,
-        "[prompt]",
-    ),
-    slash_args(
-        "/plans",
-        "manage persisted plan-mode artifacts (list/show/delete/set-active/open)",
-        true,
-        "[list|show|delete|set-active|open] [<id>]",
-    ),
-    slash("/cost", "show token and cost accounting"),
-    slash("/context", "show context budget and compaction state"),
-    slash_args(
-        "/attach",
-        "attach a file as prompt context",
-        false,
-        "<path>",
-    ),
-    slash("/attachments", "list attached context"),
-    slash("/copy", "copy last answer or transcript"),
-    slash_locked(
-        "/compact",
-        "compact conversation context now (use '/compact undo' to restore)",
-    ),
-    slash("/collapse", "collapse transcript entries"),
-    slash("/expand", "expand transcript entries"),
-    slash("/jobs", "list background jobs"),
-    slash_args("/job", "show a background job", true, "<id>"),
-    slash_args("/job-cancel", "cancel a background job", true, "<id>"),
-    slash_args("/pin", "pin transcript context", false, "<id>"),
-    slash("/pins", "list pinned context"),
-    slash_args("/unpin", "remove pinned context", false, "<id>"),
-    slash("/feedback", "preview or send product feedback"),
-    slash("/report", "preview or send a bug report"),
-    slash("/sessions", "list recent sessions"),
-    slash_args("/session", "show a saved session", true, "<id>"),
-    slash_args("/resume", "resume a saved session", false, "<id>"),
-    slash_args("/session-export", "export a saved session", false, "<id>"),
-    slash_locked("/session-cleanup", "remove old sessions"),
-    slash("/checkpoints", "list local checkpoints"),
-    slash_args("/checkpoint", "show a local checkpoint", true, "<id>"),
-    slash_locked("/undo", "undo the latest checkpoint"),
-    slash_locked("/revert-turn", "revert a turn checkpoint"),
-    slash_args(
-        "/verbosity",
-        "open config focused on response verbosity (or set inline)",
-        false,
-        "[concise|normal|verbose]",
-    ),
-    slash_args(
-        "/tool-verbosity",
-        "open config focused on tool output verbosity (or set inline)",
-        false,
-        "[compact|normal|verbose]",
-    ),
-    slash_args("/detach", "remove attached context", false, "<id>"),
-];
-
-impl SlashCommand {
-    fn is_dimmed(&self, task_in_progress: bool) -> bool {
-        task_in_progress && !self.available_during_task
     }
 }
 
@@ -467,372 +362,6 @@ async fn run_inner(
     Ok(())
 }
 
-async fn drain_agent_events(app: &mut TuiApp) {
-    if let Some(mut rx) = app.turn_rx.take() {
-        let mut keep_rx = true;
-        while let Ok(event) = rx.try_recv() {
-            match event {
-                AgentEvent::UserMessage { message, .. } => {
-                    app.push_transcript_item(message);
-                    app.pending_assistant.clear();
-                    app.transcript_scroll_from_bottom = 0;
-                }
-                AgentEvent::Started { .. } => {
-                    app.status = "thinking".to_string();
-                    app.turn_visual = TurnVisualState::Running;
-                    app.note_turn_started();
-                }
-                AgentEvent::AssistantDelta { delta, .. } => {
-                    let extracted = app.proposed_plan.feed(&delta);
-                    if !extracted.passthrough.is_empty() {
-                        app.pending_assistant.push_delta(&extracted.passthrough);
-                    }
-                    for plan_body in extracted.completed {
-                        let sid = app.plan_session_id().to_string();
-                        // A non-None `current_plan_id` at the time a
-                        // fresh block lands means this body is a
-                        // refinement of the active plan, not a first-
-                        // time draft. Captured for the styled card /
-                        // diff renderer (PR-F).
-                        let parent_plan_id = app.current_plan_id.clone();
-                        let meta = proposed_plan::PlanMeta {
-                            parent_plan_id: parent_plan_id.clone(),
-                            model: Some(app.model.clone()),
-                        };
-                        match proposed_plan::persist_plan(
-                            &app.workspace_root,
-                            &sid,
-                            &plan_body,
-                            &meta,
-                        ) {
-                            Ok((plan_id, path)) => {
-                                app.current_plan_id = Some(plan_id.clone());
-                                app.push_plan_card(render::plan_card::PlanCardData {
-                                    plan_id: plan_id.clone(),
-                                    path: path.clone(),
-                                    parent_plan_id,
-                                });
-                                app.pending_plan_choice = Some(PendingPlanChoice {
-                                    plan_id,
-                                    plan_path: path,
-                                    selection_index: 0,
-                                });
-                            }
-                            Err(err) => app.push_log(format!(
-                                "proposed plan (could not persist under {}/{}: {err}):\n{plan_body}",
-                                proposed_plan::PLAN_DIR,
-                                sid
-                            )),
-                        }
-                    }
-                    // Intentionally preserve `transcript_scroll_from_bottom`
-                    // here: if the user paged up to read history we would
-                    // otherwise yank them back to the bottom on every delta.
-                    // The End key (or any tool/status event that explicitly
-                    // resets) brings them back to live view.
-                }
-                AgentEvent::ToolCallQueued { call, .. } => {
-                    if is_control_tool_name(&call.name) {
-                        app.status = "planning".to_string();
-                    } else {
-                        app.status = format!("queued {}", tool_call_label(&call));
-                        app.remember_active_tool_call(call);
-                    }
-                }
-                AgentEvent::ToolCallStarted { call, .. } => {
-                    if is_control_tool_name(&call.name) {
-                        app.status = "planning".to_string();
-                    } else {
-                        app.status = format!("running {}", tool_call_label(&call));
-                        app.remember_active_tool_call(call);
-                    }
-                }
-                AgentEvent::ToolCallCompleted { result, .. } => {
-                    app.status = tool_result_status_text(&result);
-                    if result.status == ToolStatus::Success
-                        && matches!(result.tool_name.as_str(), "apply_patch" | "write_file")
-                    {
-                        app.last_turn_had_edits = true;
-                        // First successful edit after a Plan→Build handoff
-                        // means the plan is "in motion" — re-attaching it
-                        // on later Build turns is just noise. Clear the
-                        // handoff so the marker stops firing (issue 16).
-                        if app.mode == SessionMode::Build && app.pending_plan_handoff.is_some() {
-                            app.pending_plan_handoff = None;
-                            app.plan_handoff_turns_seen = 0;
-                            app.push_log("plan handoff cleared: plan is in motion".to_string());
-                        }
-                        // Plan-mode in-place refinement (issue 2): the model
-                        // edited the active plan file via apply_patch. Re-
-                        // surface the post-plan choice prompt so the user
-                        // sees Execute/Refine/Discard/View against the new
-                        // body without having to wait for another
-                        // <proposed_plan> emission.
-                        if app.mode == SessionMode::Plan
-                            && let Some(plan_id) = app.current_plan_id.clone()
-                        {
-                            let sid = app.plan_session_id().to_string();
-                            let plan_path =
-                                proposed_plan::plan_file_for(&app.workspace_root, &sid, &plan_id);
-                            if plan_path.exists() {
-                                app.push_log(format!(
-                                    "plan {plan_id} refined in place (apply_patch)"
-                                ));
-                                app.pending_plan_choice = Some(PendingPlanChoice {
-                                    plan_id,
-                                    plan_path,
-                                    selection_index: 0,
-                                });
-                            }
-                        }
-                    }
-                    let call = app.active_tool_calls.remove(&result.call_id);
-                    app.refresh_active_tool_name();
-                    app.push_tool_result_with_call(result, call);
-                }
-                AgentEvent::TaskStateUpdated { snapshot, .. } => {
-                    app.task_state = Some(snapshot);
-                    if app.active_tool_calls.is_empty() {
-                        app.status = "planning".to_string();
-                    }
-                }
-                AgentEvent::McpStatusUpdated { snapshot, .. } => {
-                    apply_mcp_status_update(app, snapshot);
-                }
-                AgentEvent::JobUpdated { job } => {
-                    apply_job_update(app, job);
-                }
-                AgentEvent::JobNotification { notification } => {
-                    apply_job_notification(app, notification);
-                }
-                AgentEvent::ContextCompacted { report, .. } => {
-                    app.context_compaction.last = Some(report.record.clone());
-                    app.context_compaction.generation = report.record.generation;
-                    app.context_compaction.summary = Some(report.summary.clone());
-                    app.context_compaction.history.push(report.record.clone());
-                    app.context_estimate = report.record.after.clone();
-                    app.context_compaction_nudge_shown = false;
-                    app.status = compaction_status_line(&report.record);
-                    app.push_log(format!(
-                        "context compacted gen={} trigger={} items={} tok {}->{}",
-                        report.record.generation,
-                        report.record.trigger.as_str(),
-                        report.record.dropped_items,
-                        report.record.before.estimated_tokens,
-                        report.record.after.estimated_tokens
-                    ));
-                }
-                AgentEvent::SubagentStarted { agent, prompt, .. } => {
-                    app.status = format!("{agent} subagent running");
-                    app.push_log(format!("{agent} subagent started: {prompt}"));
-                }
-                AgentEvent::SubagentCompleted {
-                    agent,
-                    summary,
-                    metrics,
-                    ..
-                } => {
-                    app.status = format!("{agent} subagent completed");
-                    app.push_log(format!(
-                        "{agent} subagent completed tools={} bytes={} summary={}",
-                        metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        compact_text(&summary, 180)
-                    ));
-                }
-                AgentEvent::SubagentFailed {
-                    agent,
-                    error,
-                    metrics,
-                    ..
-                } => {
-                    app.status = format!("{agent} subagent failed");
-                    app.push_log(format!(
-                        "{agent} subagent failed tools={} bytes={} error={}",
-                        metrics.subagent_tool_calls.max(metrics.tool_calls),
-                        metrics.subagent_bytes_read.max(metrics.bytes_read),
-                        compact_text(&error, 180)
-                    ));
-                }
-                AgentEvent::AiReviewerTripped { reason, .. } => {
-                    app.status = "approval review paused".to_string();
-                    app.push_log(format!("AI approval reviewer paused: {reason}"));
-                }
-                AgentEvent::ApprovalRequested {
-                    request,
-                    decision_tx,
-                    ..
-                } => {
-                    app.status = format_approval_status_line(&request);
-                    app.approval_selection_index = 0;
-                    app.pending_approval = Some(PendingApproval {
-                        request,
-                        decision_tx,
-                    });
-                    break;
-                }
-                AgentEvent::McpElicitationRequested {
-                    request,
-                    response_tx,
-                    ..
-                } => {
-                    if let Some(previous) = app.pending_mcp_elicitation.take() {
-                        let _ = previous.response_tx.send(McpElicitationResponse::cancel());
-                    }
-                    app.status = format_mcp_elicitation_status_line(&request);
-                    app.mcp_elicitation_selection_index = 0;
-                    app.pending_mcp_elicitation = Some(PendingMcpElicitation {
-                        request,
-                        response_tx,
-                    });
-                    break;
-                }
-                AgentEvent::RequestUserInputRequested {
-                    request,
-                    response_tx,
-                    ..
-                } => {
-                    if let Some(previous) = app.pending_request_user_input.take() {
-                        let _ = previous
-                            .response_tx
-                            .send(RequestUserInputResponse::cancelled());
-                    }
-                    app.status = format!("plan-mode question: {}", request.question);
-                    app.pending_request_user_input = Some(PendingRequestUserInput {
-                        request,
-                        response_tx,
-                        selection_index: 0,
-                    });
-                    break;
-                }
-                AgentEvent::Completed {
-                    message,
-                    cost,
-                    metrics,
-                    context_estimate,
-                    ..
-                } => {
-                    if let Some(message) = dedupe_assistant_repeated_tool_output(app, message) {
-                        app.push_transcript_item(message);
-                    }
-                    app.pending_assistant.clear();
-                    finalize_proposed_plan(app);
-                    app.context_estimate = context_estimate;
-                    app.cancelled_prompt = None;
-                    if app.last_turn_had_edits {
-                        app.push_log(
-                            "turn complete · /diff to inspect changes · /undo to revert this turn"
-                                .to_string(),
-                        );
-                        app.last_turn_had_edits = false;
-                    }
-                    maybe_push_context_compaction_nudge(app);
-                    app.cost = cost;
-                    app.metrics = metrics;
-                    app.status = "ready".to_string();
-                    app.turn_visual = TurnVisualState::Succeeded;
-                    app.clear_active_tools();
-                    app.pending_mcp_elicitation = None;
-                    cancel_pending_request_user_input(app);
-                    app.note_turn_finished();
-                    // Preserve the user's scroll position; if they paged up
-                    // mid-turn we shouldn't snap them down on completion.
-                    app.cancel = None;
-                    keep_rx = false;
-                    break;
-                }
-                AgentEvent::CostWarning { status, .. } => {
-                    let notice = format!(
-                        "session cost crossed warning threshold: spent ${:.4} of ${:.2} cap ({}%)",
-                        status.spent_usd_micros as f64 / 1_000_000.0,
-                        status.cap_usd_micros as f64 / 1_000_000.0,
-                        status.percent
-                    );
-                    app.push_transcript_item(TranscriptItem::system(notice.clone()));
-                    app.push_log(notice);
-                }
-                AgentEvent::CostUpdate {
-                    tool_count,
-                    input_tokens,
-                    micro_usd,
-                    ..
-                } => {
-                    // Surface progressive per-turn cost in the log only; the
-                    // transcript stays clean since the turn footer already
-                    // reports the final totals.
-                    app.push_log(format!(
-                        "running this turn: {} input tokens · ${:.4} (after {} tools)",
-                        input_tokens,
-                        micro_usd as f64 / 1_000_000.0,
-                        tool_count
-                    ));
-                }
-                AgentEvent::ToolProgress {
-                    tool_name,
-                    elapsed_ms,
-                    ..
-                } => {
-                    // The "running tool" line in the status bar is driven
-                    // by the active-tool tracker; log a heartbeat so the
-                    // event isn't silently dropped.
-                    app.push_log(format!(
-                        "{tool_name} still running ({:.1}s)",
-                        elapsed_ms as f64 / 1000.0
-                    ));
-                }
-                AgentEvent::Cancelled { .. } => {
-                    let mut message = "cancelled; edit prompt or retry".to_string();
-                    if app.last_turn_had_edits {
-                        message.push_str(" · /undo to revert this turn's edits");
-                    }
-                    app.status = message;
-                    app.turn_visual = TurnVisualState::Failed;
-                    app.push_log("turn cancelled".to_string());
-                    if app.last_turn_had_edits {
-                        app.push_log(
-                            "/diff to inspect changes · /undo to revert this turn".to_string(),
-                        );
-                        app.last_turn_had_edits = false;
-                    }
-                    app.pending_assistant.clear();
-                    finalize_proposed_plan(app);
-                    app.clear_active_tools();
-                    app.pending_mcp_elicitation = None;
-                    cancel_pending_request_user_input(app);
-                    app.note_turn_finished();
-                    app.cancel = None;
-                    keep_rx = false;
-                    break;
-                }
-                AgentEvent::Failed { error, .. } => {
-                    let mut status = format_error_status(&error);
-                    if app.last_turn_had_edits {
-                        status.push_str(" · /undo to revert this turn's edits");
-                    }
-                    app.status = status;
-                    app.turn_visual = TurnVisualState::Failed;
-                    app.push_log(format!("turn failed: {}", app.status));
-                    if app.last_turn_had_edits {
-                        app.last_turn_had_edits = false;
-                    }
-                    app.pending_assistant.clear();
-                    finalize_proposed_plan(app);
-                    app.clear_active_tools();
-                    app.pending_mcp_elicitation = None;
-                    cancel_pending_request_user_input(app);
-                    app.note_turn_finished();
-                    app.cancel = None;
-                    keep_rx = false;
-                    break;
-                }
-            }
-        }
-        if keep_rx {
-            app.turn_rx = Some(rx);
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ResumeStartup {
     Use(String),
@@ -885,34 +414,6 @@ fn restore_cancelled_prompt(app: &mut TuiApp) -> bool {
     app.input_cursor = app.input.len();
     app.status = "restored last prompt — edit and Enter to retry".to_string();
     true
-}
-
-/// Update `app` for an MCP status snapshot. The transcript log line is
-/// pushed only when the status text actually changed AND either the new
-/// or prior snapshot had configured servers — without that gate, users
-/// with no MCP configured see "mcp status none" stamped on every turn.
-fn apply_mcp_status_update(app: &mut TuiApp, snapshot: McpStatusSnapshot) {
-    let summary = format_mcp_status_snapshot(&snapshot);
-    let prior_summary = app.mcp_status.as_ref().map(format_mcp_status_snapshot);
-    let prior_had_servers = app
-        .mcp_status
-        .as_ref()
-        .is_some_and(|prior| !prior.per_server.is_empty());
-    let now_has_servers = !snapshot.per_server.is_empty();
-    app.mcp_status = Some(snapshot);
-    app.status = format!("mcp {summary}");
-    let changed = prior_summary.as_deref() != Some(&summary);
-    if changed && (now_has_servers || prior_had_servers) {
-        app.push_log(format!("mcp status {summary}"));
-    }
-}
-
-fn cancel_pending_request_user_input(app: &mut TuiApp) {
-    if let Some(pending) = app.pending_request_user_input.take() {
-        let _ = pending
-            .response_tx
-            .send(RequestUserInputResponse::cancelled());
-    }
 }
 
 async fn handle_plan_choice_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
@@ -1062,193 +563,6 @@ async fn apply_plan_choice(
             next.selection_index = 0;
             app.pending_plan_choice = Some(next);
         }
-    }
-}
-
-fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    let Some(mut pending) = app.pending_request_user_input.take() else {
-        return false;
-    };
-    let choice_count = pending.request.choices.len();
-    match key.code {
-        KeyCode::Up => {
-            if choice_count > 0 {
-                pending.selection_index = pending.selection_index.saturating_sub(1);
-            }
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Down => {
-            if choice_count > 0 {
-                pending.selection_index =
-                    (pending.selection_index + 1).min(choice_count.saturating_sub(1));
-            }
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Enter => {
-            if choice_count > 0
-                && let Some(choice) = pending.request.choices.get(pending.selection_index)
-            {
-                let response = RequestUserInputResponse::choice(choice.value.clone());
-                let _ = pending.response_tx.send(response);
-                app.status = format!("answered: {}", choice.label);
-                return true;
-            }
-            if pending.request.allow_freeform && !app.input.trim().is_empty() {
-                let text = std::mem::take(&mut app.input);
-                app.input_cursor = 0;
-                let _ = pending
-                    .response_tx
-                    .send(RequestUserInputResponse::freeform(text));
-                app.status = "answered with free-form text".to_string();
-                return true;
-            }
-            // Nothing to send yet — keep the modal up.
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Esc => {
-            let _ = pending
-                .response_tx
-                .send(RequestUserInputResponse::cancelled());
-            app.status = "plan-mode question cancelled".to_string();
-            true
-        }
-        KeyCode::Backspace if pending.request.allow_freeform => {
-            delete_before_cursor(app);
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Delete if pending.request.allow_freeform => {
-            delete_at_cursor(app);
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Left if pending.request.allow_freeform => {
-            move_input_cursor_left(app);
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Right if pending.request.allow_freeform => {
-            move_input_cursor_right(app);
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        KeyCode::Char(ch)
-            if pending.request.allow_freeform
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
-        {
-            insert_input_char(app, ch);
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-        _ => {
-            app.pending_request_user_input = Some(pending);
-            true
-        }
-    }
-}
-
-/// Push a one-shot system transcript advisory when the post-turn context
-/// estimate is closing in on the auto-compaction threshold. We surface
-/// this *before* the next turn so the user has a chance to `/pin` or
-/// `/compact` deliberately rather than discovering after the fact that
-/// the conversation has been rewritten.
-fn maybe_push_context_compaction_nudge(app: &mut TuiApp) {
-    if app.context_compaction_threshold == 0 || app.context_compaction_nudge_shown {
-        return;
-    }
-    let pct = context_window_pct(
-        app.context_estimate.estimated_tokens,
-        app.context_compaction_threshold,
-    );
-    if pct < CONTEXT_NUDGE_PCT {
-        return;
-    }
-    app.context_compaction_nudge_shown = true;
-    app.push_log(format!(
-        "context window {pct}% full ({used}/{threshold} tok) — /pin to keep important context · /compact to summarize before the next turn",
-        used = app.context_estimate.estimated_tokens,
-        threshold = app.context_compaction_threshold,
-    ));
-}
-
-/// Flush any straggler bytes held by the `<proposed_plan>` extractor at
-/// turn boundaries. Unterminated blocks are folded back into the
-/// transcript so the user can see what the model attempted; the extractor
-/// itself is rebuilt fresh for the next turn.
-fn finalize_proposed_plan(app: &mut TuiApp) {
-    let leftover = app.proposed_plan.finalize();
-    if !leftover.is_empty() {
-        app.pending_assistant.push_delta(&leftover);
-    }
-    app.proposed_plan = proposed_plan::ProposedPlanExtractor::new();
-}
-
-fn drain_job_events(app: &mut TuiApp) {
-    loop {
-        let event = match app.job_rx.as_mut() {
-            Some(rx) => rx.try_recv(),
-            None => return,
-        };
-        match event {
-            Ok(JobEvent::Updated(job)) => apply_job_update(app, job),
-            Ok(JobEvent::Notification(notification)) => apply_job_notification(app, notification),
-            Err(broadcast::error::TryRecvError::Empty) => break,
-            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                app.status = format!("skipped {skipped} job updates");
-            }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                app.job_rx = None;
-                break;
-            }
-        }
-    }
-}
-
-fn apply_job_update(app: &mut TuiApp, job: JobSnapshot) {
-    app.jobs.insert(job.id, job);
-    prune_tui_jobs(&mut app.jobs);
-}
-
-fn prune_tui_jobs(jobs: &mut BTreeMap<JobId, JobSnapshot>) {
-    if jobs.len() <= MAX_JOBS_RETAINED {
-        return;
-    }
-    let mut terminal: Vec<(JobId, u64)> = jobs
-        .iter()
-        .filter(|(_, job)| job.status.is_terminal())
-        .map(|(id, job)| (*id, job.ended_at_ms.unwrap_or(0)))
-        .collect();
-    terminal.sort_by_key(|(_, ended_at)| *ended_at);
-    let mut to_remove = jobs.len().saturating_sub(MAX_JOBS_RETAINED);
-    for (id, _) in terminal {
-        if to_remove == 0 {
-            break;
-        }
-        jobs.remove(&id);
-        to_remove -= 1;
-    }
-}
-
-fn apply_job_notification(app: &mut TuiApp, notification: JobNotification) {
-    app.status = format!(
-        "job {} {}: {}",
-        notification.job_id,
-        notification.status.as_str(),
-        notification.summary
-    );
-    if app.notifications.back().is_some_and(|previous| {
-        previous.job_id == notification.job_id
-            && previous.status == notification.status
-            && previous.summary == notification.summary
-    }) {
-        return;
-    }
-    app.notifications.push_back(notification);
-    while app.notifications.len() > MAX_JOB_NOTIFICATIONS {
-        app.notifications.pop_front();
     }
 }
 
@@ -1693,386 +1007,6 @@ fn is_inline_paste(text: &str) -> bool {
     text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectionDirection {
-    Previous,
-    Next,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HistoryDirection {
-    Previous,
-    Next,
-}
-
-fn note_input_edited(app: &mut TuiApp) {
-    app.input_history_index = None;
-    app.input_history_draft.clear();
-    app.selected_entry = None;
-    clamp_slash_menu_index(app);
-    refresh_mention_popup(app);
-}
-
-fn refresh_mention_popup(app: &mut TuiApp) {
-    let Some(query) = mention::detect_mention(&app.input, app.input_cursor) else {
-        app.mention_popup = None;
-        return;
-    };
-    if app.workspace_files.is_none() {
-        let root = std::path::Path::new(&app.directory).to_path_buf();
-        let files = mention::load_workspace_files(&root);
-        app.workspace_files = Some(Arc::new(files));
-    }
-    let matches = app
-        .workspace_files
-        .as_ref()
-        .map(|files| mention::rank_files(&query.query, files))
-        .unwrap_or_default();
-    if matches.is_empty() {
-        app.mention_popup = None;
-        return;
-    }
-    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches));
-}
-
-fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    let Some(overlay) = app.overlay.as_mut() else {
-        return false;
-    };
-    match key.code {
-        KeyCode::Esc => {
-            app.overlay = None;
-            app.status = "overlay cancelled".to_string();
-            true
-        }
-        KeyCode::Up => {
-            overlay.move_up();
-            true
-        }
-        KeyCode::Down => {
-            overlay.move_down();
-            true
-        }
-        KeyCode::Enter => {
-            apply_overlay_selection(app);
-            true
-        }
-        _ => false,
-    }
-}
-
-fn apply_overlay_selection(app: &mut TuiApp) {
-    let Some(overlay) = app.overlay.take() else {
-        return;
-    };
-    match overlay {
-        overlay::Overlay::Model(picker) => {
-            if let Some(entry) = picker.selected() {
-                let provider = entry.provider;
-                let id = entry.id;
-                app.provider_name = provider;
-                app.model = id.to_string();
-                app.status = format!("selected model {provider}:{id}");
-                app.push_transcript_item(TranscriptItem::system(format!(
-                    "Model set to {provider}:{id} (restart the session to apply)"
-                )));
-            }
-        }
-        overlay::Overlay::Verbosity(picker) => {
-            if let Some(entry) = picker.selected() {
-                app.response_verbosity = entry.0;
-                app.status = format!("response verbosity {}", entry.0.as_str());
-            }
-        }
-        overlay::Overlay::ToolVerbosity(picker) => {
-            if let Some(entry) = picker.selected() {
-                app.tool_output_verbosity = entry.0;
-                app.status = format!("tool output verbosity {}", entry.0.as_str());
-            }
-        }
-        overlay::Overlay::Permissions(_) => {
-            app.status = "permission overlay closed".to_string();
-        }
-    }
-}
-
-fn handle_mention_popup_key(app: &mut TuiApp, key: KeyEvent) -> bool {
-    if app.mention_popup.is_none() {
-        return false;
-    }
-    match key.code {
-        KeyCode::Esc => {
-            app.mention_popup = None;
-            true
-        }
-        KeyCode::Up => {
-            if let Some(popup) = app.mention_popup.as_mut() {
-                popup.move_up();
-            }
-            true
-        }
-        KeyCode::Down => {
-            if let Some(popup) = app.mention_popup.as_mut() {
-                popup.move_down();
-            }
-            true
-        }
-        KeyCode::Tab | KeyCode::Enter => apply_mention_popup(app),
-        _ => false,
-    }
-}
-
-fn apply_mention_popup(app: &mut TuiApp) -> bool {
-    let popup = match app.mention_popup.as_ref() {
-        Some(p) if !p.is_empty() => p.clone(),
-        _ => return false,
-    };
-    if let Some((new_input, new_cursor)) = popup.apply(&app.input) {
-        app.input = new_input;
-        app.input_cursor = new_cursor;
-        app.mention_popup = None;
-        clamp_slash_menu_index(app);
-        return true;
-    }
-    false
-}
-
-fn clear_input(app: &mut TuiApp) {
-    app.input.clear();
-    app.input_cursor = 0;
-    clamp_slash_menu_index(app);
-}
-
-fn set_input(app: &mut TuiApp, input: String) {
-    app.input = input;
-    app.input_cursor = app.input.len();
-    clamp_input_cursor(app);
-    clamp_slash_menu_index(app);
-}
-
-fn input_cursor(app: &TuiApp) -> usize {
-    text_cursor(&app.input, app.input_cursor)
-}
-
-fn clamp_input_cursor(app: &mut TuiApp) {
-    app.input_cursor = text_cursor(&app.input, app.input_cursor);
-}
-
-fn text_cursor(text: &str, cursor: usize) -> usize {
-    let mut cursor = cursor.min(text.len());
-    while cursor > 0 && !text.is_char_boundary(cursor) {
-        cursor -= 1;
-    }
-    cursor
-}
-
-fn insert_input_char(app: &mut TuiApp, ch: char) {
-    clamp_input_cursor(app);
-    app.input.insert(app.input_cursor, ch);
-    app.input_cursor += ch.len_utf8();
-    note_input_edited(app);
-}
-
-fn insert_input_text(app: &mut TuiApp, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    clamp_input_cursor(app);
-    app.input.insert_str(app.input_cursor, text);
-    app.input_cursor += text.len();
-    note_input_edited(app);
-}
-
-fn delete_before_cursor(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    if cursor == 0 {
-        app.input_cursor = 0;
-        return;
-    }
-    let previous = app.input[..cursor]
-        .char_indices()
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-    app.input.drain(previous..cursor);
-    app.input_cursor = previous;
-    note_input_edited(app);
-}
-
-fn delete_at_cursor(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    if cursor >= app.input.len() {
-        app.input_cursor = app.input.len();
-        return;
-    }
-    let next = cursor
-        + app.input[cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-    app.input.drain(cursor..next);
-    app.input_cursor = cursor;
-    note_input_edited(app);
-}
-
-fn delete_to_line_start(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    let start = line_start_before_cursor(&app.input, cursor);
-    if start >= cursor {
-        if cursor > 0 && app.input[..cursor].ends_with('\n') {
-            delete_before_cursor(app);
-        } else {
-            app.input_cursor = cursor;
-        }
-        return;
-    }
-    app.input.drain(start..cursor);
-    app.input_cursor = start;
-    note_input_edited(app);
-}
-
-fn delete_to_line_end(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    let end = line_end_after_cursor(&app.input, cursor);
-    if end <= cursor {
-        if cursor < app.input.len() {
-            delete_at_cursor(app);
-        } else {
-            app.input_cursor = app.input.len();
-        }
-        return;
-    }
-    app.input.drain(cursor..end);
-    app.input_cursor = cursor;
-    note_input_edited(app);
-}
-
-fn delete_previous_word(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    let start = previous_word_start(&app.input, cursor);
-    if start >= cursor {
-        app.input_cursor = cursor;
-        return;
-    }
-    app.input.drain(start..cursor);
-    app.input_cursor = start;
-    note_input_edited(app);
-}
-
-fn delete_next_word(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    let end = next_word_end(&app.input, cursor);
-    if end <= cursor {
-        app.input_cursor = cursor;
-        return;
-    }
-    app.input.drain(cursor..end);
-    app.input_cursor = cursor;
-    note_input_edited(app);
-}
-
-fn move_input_cursor_left(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    app.input_cursor = app.input[..cursor]
-        .char_indices()
-        .last()
-        .map(|(index, _)| index)
-        .unwrap_or(0);
-}
-
-fn move_input_cursor_right(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    if cursor >= app.input.len() {
-        app.input_cursor = app.input.len();
-        return;
-    }
-    app.input_cursor = cursor
-        + app.input[cursor..]
-            .chars()
-            .next()
-            .map(char::len_utf8)
-            .unwrap_or(0);
-}
-
-fn move_input_cursor_line_start(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    app.input_cursor = line_start_before_cursor(&app.input, cursor);
-}
-
-fn move_input_cursor_line_end(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    app.input_cursor = line_end_after_cursor(&app.input, cursor);
-}
-
-fn move_input_cursor_word_left(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    app.input_cursor = previous_word_start(&app.input, cursor);
-}
-
-fn move_input_cursor_word_right(app: &mut TuiApp) {
-    let cursor = input_cursor(app);
-    app.input_cursor = next_word_end(&app.input, cursor);
-}
-
-fn line_start_before_cursor(text: &str, cursor: usize) -> usize {
-    let cursor = text_cursor(text, cursor);
-    text[..cursor]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0)
-}
-
-fn line_end_after_cursor(text: &str, cursor: usize) -> usize {
-    let cursor = text_cursor(text, cursor);
-    text[cursor..]
-        .find('\n')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len())
-}
-
-fn previous_word_start(text: &str, cursor: usize) -> usize {
-    let cursor = text_cursor(text, cursor);
-    let prefix = &text[..cursor];
-    let Some((mut start, ch)) = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| !ch.is_whitespace())
-    else {
-        return 0;
-    };
-    let separator = is_word_separator(ch);
-    for (index, ch) in prefix[..start].char_indices().rev() {
-        if ch.is_whitespace() || is_word_separator(ch) != separator {
-            break;
-        }
-        start = index;
-    }
-    start
-}
-
-fn next_word_end(text: &str, cursor: usize) -> usize {
-    let cursor = text_cursor(text, cursor);
-    let suffix = &text[cursor..];
-    let Some((first_offset, first)) = suffix.char_indices().find(|(_, ch)| !ch.is_whitespace())
-    else {
-        return text.len();
-    };
-    let separator = is_word_separator(first);
-    let mut end = cursor + first_offset + first.len_utf8();
-    for (offset, ch) in suffix[first_offset + first.len_utf8()..].char_indices() {
-        if ch.is_whitespace() || is_word_separator(ch) != separator {
-            break;
-        }
-        end = cursor + first_offset + first.len_utf8() + offset + ch.len_utf8();
-    }
-    end
-}
-
-fn is_word_separator(ch: char) -> bool {
-    WORD_SEPARATORS.contains(ch)
-}
-
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
     app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(lines);
 }
@@ -2086,128 +1020,6 @@ fn should_route_plain_arrow_to_scroll(app: &TuiApp) -> bool {
         && app.input_history_index.is_none()
         && !app.transcript.is_empty()
         && (app.transcript_scroll_from_bottom > 0 || !app.input.trim().is_empty())
-}
-
-fn push_input_history(app: &mut TuiApp, input: String) {
-    if input.trim().is_empty() || input.starts_with('/') {
-        return;
-    }
-    if app.input_history.last().is_some_and(|last| last == &input) {
-        return;
-    }
-    app.input_history.push(input);
-    if app.input_history.len() > 100 {
-        app.input_history.remove(0);
-    }
-}
-
-fn reject_unknown_slash_command(app: &mut TuiApp, input: &str) -> bool {
-    if !input.starts_with('/') {
-        return false;
-    }
-    app.status = "unknown command; use Up/Down to choose a / command".to_string();
-    true
-}
-
-fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirection) {
-    if app.input_history.is_empty() {
-        app.status = "no prompt history".to_string();
-        return;
-    }
-    if app.input_history_index.is_none() && !app.input.trim().is_empty() {
-        return;
-    }
-    let last = app.input_history.len() - 1;
-    let next = match (app.input_history_index, direction) {
-        (None, HistoryDirection::Previous) => {
-            app.input_history_draft = if app.input.trim().is_empty() {
-                String::new()
-            } else {
-                app.input.clone()
-            };
-            Some(last)
-        }
-        (None, HistoryDirection::Next) => return,
-        (Some(0), HistoryDirection::Previous) => Some(0),
-        (Some(index), HistoryDirection::Previous) => Some(index - 1),
-        (Some(index), HistoryDirection::Next) if index >= last => {
-            set_input(app, app.input_history_draft.clone());
-            app.input_history_draft.clear();
-            app.input_history_index = None;
-            app.slash_menu_index = 0;
-            return;
-        }
-        (Some(index), HistoryDirection::Next) => Some(index + 1),
-    };
-    if let Some(index) = next {
-        set_input(app, app.input_history[index].clone());
-        app.input_history_index = Some(index);
-        app.selected_entry = None;
-        app.slash_menu_index = 0;
-    }
-}
-
-fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
-    if !is_slash_completion_input(input) {
-        return Vec::new();
-    }
-    let prefix = input.trim();
-    let mut suggestions = SLASH_COMMANDS
-        .iter()
-        .copied()
-        .filter(|command| command.name.starts_with(prefix))
-        .collect::<Vec<_>>();
-    suggestions.sort_by(|left, right| left.name.cmp(right.name));
-    suggestions
-}
-
-fn is_slash_completion_input(input: &str) -> bool {
-    let trimmed = input.trim();
-    trimmed.starts_with('/')
-        && !trimmed[1..].contains(char::is_whitespace)
-        && !trimmed.contains('\n')
-}
-
-fn clamp_slash_menu_index(app: &mut TuiApp) {
-    let count = slash_suggestions(&app.input).len();
-    if count == 0 {
-        app.slash_menu_index = 0;
-    } else if app.slash_menu_index >= count {
-        app.slash_menu_index = count - 1;
-    }
-}
-
-fn move_slash_menu_selection(app: &mut TuiApp, direction: SelectionDirection) -> bool {
-    let count = slash_suggestions(&app.input).len();
-    if count == 0 {
-        return false;
-    }
-    app.slash_menu_index = match direction {
-        SelectionDirection::Previous => {
-            if app.slash_menu_index == 0 {
-                count - 1
-            } else {
-                app.slash_menu_index - 1
-            }
-        }
-        SelectionDirection::Next => (app.slash_menu_index + 1) % count,
-    };
-    true
-}
-
-fn complete_selected_slash_command(app: &mut TuiApp) -> bool {
-    let suggestions = slash_suggestions(&app.input);
-    if suggestions.is_empty() {
-        return false;
-    }
-    let selected = suggestions[app.slash_menu_index.min(suggestions.len() - 1)];
-    if app.input.trim() == selected.name {
-        return false;
-    }
-    set_input(app, format!("{} ", selected.name));
-    app.slash_menu_index = 0;
-    app.status = format!("selected {}", selected.name);
-    true
 }
 
 fn request_turn_interrupt(app: &mut TuiApp) -> bool {
@@ -2305,13 +1117,17 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         "/cost" => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "cost snapshot".to_string();
-            app.push_transcript_item(TranscriptItem::system(format_cost_command(&snapshot)));
+            app.push_transcript_item(TranscriptItem::system(commands::format_cost_command(
+                &snapshot,
+            )));
             return true;
         }
         "/context" => {
             let snapshot = agent.session_accounting_snapshot().await;
             app.status = "context snapshot".to_string();
-            app.push_transcript_item(TranscriptItem::system(format_context_command(&snapshot)));
+            app.push_transcript_item(TranscriptItem::system(commands::format_context_command(
+                &snapshot,
+            )));
             return true;
         }
         "/help" => {
@@ -3054,13 +1870,14 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             app.status = "report cancelled".to_string();
         }
         _ => {
-            let (session_id, excluded_sections) = match parse_report_preview_args(agent, rest) {
-                Ok(value) => value,
-                Err(error) => {
-                    app.status = error;
-                    return;
-                }
-            };
+            let (session_id, excluded_sections) =
+                match commands::parse_report_preview_args(agent, rest) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        app.status = error;
+                        return;
+                    }
+                };
             let options = BugReportOptions {
                 excluded_sections,
                 ..BugReportOptions::default()
@@ -3077,35 +1894,6 @@ async fn handle_report_command(app: &mut TuiApp, agent: &Agent, rest: &str) {
             }
         }
     }
-}
-
-fn parse_report_preview_args(
-    agent: &Agent,
-    rest: &str,
-) -> std::result::Result<(String, BTreeSet<String>), String> {
-    let mut session_id = None;
-    let mut excluded_sections = BTreeSet::new();
-    for part in rest.split_whitespace() {
-        if let Some(raw) = part.strip_prefix("exclude=") {
-            for section in raw.split(',').filter(|section| !section.trim().is_empty()) {
-                let Some(parsed) = parse_bug_report_section(section) else {
-                    return Err(format!("unknown report section {section:?}"));
-                };
-                excluded_sections.insert(parsed.to_string());
-            }
-        } else if session_id.is_none() {
-            session_id = Some(part.to_string());
-        } else {
-            return Err(
-                "usage: /report [session_id] [exclude=a,b] | /report send | /report cancel"
-                    .to_string(),
-            );
-        }
-    }
-    let session_id = session_id
-        .or_else(|| agent.session_id())
-        .ok_or_else(|| "usage: /report <session_id> [exclude=a,b]".to_string())?;
-    Ok((session_id, excluded_sections))
 }
 
 fn attachment_update_status(
@@ -3157,186 +1945,6 @@ fn format_attachment_line(attachment: &ContextAttachment) -> String {
     )
 }
 
-fn format_cost_command(snapshot: &SessionAccountingSnapshot) -> String {
-    let cost = &snapshot.cost;
-    let metrics = &snapshot.metrics;
-    format!(
-        "Cost accounting\n\
-session={}\n\
-provider={} model={} mode={}\n\
-estimated_usd={} (estimated from provider-reported usage and local pricing metadata)\n\
-provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
-tools calls={} successes={} errors={} denials={} cancellations={} budget_denials={}\n\
-subagents calls={} failures={} estimated_usd={} input={} output={} tool_calls={} budget_denials={}\n\
-receipts stub_hits={} negative_stub_hits={} total_hits={}\n\
-spills writes={} reads={}\n\
-io bytes_read={} files_scanned={} matches_returned={} model_output_bytes={} subagent_bytes_read={} subagent_files_scanned={} subagent_model_output_bytes={}\n\
-redactions={}\n\
-accuracy=provider token counters are provider-reported when available; USD is an estimate, not a billing authority.",
-        snapshot.session_id.as_deref().unwrap_or("-"),
-        snapshot.provider,
-        snapshot.model,
-        snapshot.mode.as_str(),
-        format_cost(cost),
-        format_optional_u64(cost.input_tokens),
-        format_optional_u64(cost.output_tokens),
-        format_optional_u64(cost.reasoning_output_tokens),
-        format_optional_u64(cost.cached_input_tokens),
-        format_optional_u64(cost.cache_write_input_tokens),
-        metrics.tool_calls,
-        metrics.tool_successes,
-        metrics.tool_errors,
-        metrics.tool_denials,
-        metrics.tool_cancellations,
-        metrics.budget_denials,
-        metrics.subagent_calls,
-        metrics.subagent_failures,
-        format_cost(&metrics.subagent_provider),
-        format_optional_u64(metrics.subagent_provider.input_tokens),
-        format_optional_u64(metrics.subagent_provider.output_tokens),
-        metrics.subagent_tool_calls,
-        metrics.subagent_budget_denials,
-        metrics.receipt_stub_hits,
-        metrics.negative_receipt_hits,
-        metrics.receipt_stub_hits + metrics.negative_receipt_hits,
-        metrics.spill_writes,
-        metrics.spill_reads,
-        metrics.bytes_read,
-        metrics.files_scanned,
-        metrics.matches_returned,
-        metrics.model_output_bytes,
-        metrics.subagent_bytes_read,
-        metrics.subagent_files_scanned,
-        metrics.subagent_model_output_bytes,
-        snapshot.redactions,
-    )
-}
-
-fn format_context_command(snapshot: &SessionAccountingSnapshot) -> String {
-    let response_state = if snapshot.store_responses {
-        if snapshot.previous_response_id.is_some() {
-            "store_responses=true previous_response_id=present"
-        } else {
-            "store_responses=true previous_response_id=absent"
-        }
-    } else {
-        "store_responses=false"
-    };
-    let provider_gap = if snapshot.provider_stored_context_active() {
-        "provider_stored_context=active; exact provider-side current-window use is unknown, so compare transmitted request with the local full-history estimate"
-    } else {
-        "provider_stored_context=inactive"
-    };
-    format!(
-        "Context accounting\n\
-session={}\n\
-provider={} model={} mode={}\n\
-response_state={}\n\
-{}\n\
-completed_turns={} provider_tokens input={} output={} reasoning={} cached_input={} cache_write_input={}\n\
-transcript items={} user={} assistant={} system={} bytes={}\n\
-local_history items={} user_text={} assistant_text={} function_calls={} function_outputs={} text_bytes={} tool_output_bytes={}\n\
-attached_context total={} active={} removed={} unsupported={} stored_bytes={} redactions={}\n\
-tool_volume calls={} results={} receipt_hits={} spill_writes={} spill_reads={} budget_denials={}\n\
-subagent_volume calls={} failures={} tool_calls={} bytes_read={} files_scanned={} model_output_bytes={} budget_denials={}\n\
-{}\n\
-{}\n\
-accuracy=context tokens are deterministic local estimates of assembled request content; percentages and remaining input budget are shown only when a model context limit is known.",
-        snapshot.session_id.as_deref().unwrap_or("-"),
-        snapshot.provider,
-        snapshot.model,
-        snapshot.mode.as_str(),
-        response_state,
-        provider_gap,
-        snapshot.metrics.turns,
-        format_optional_u64(snapshot.cost.input_tokens),
-        format_optional_u64(snapshot.cost.output_tokens),
-        format_optional_u64(snapshot.cost.reasoning_output_tokens),
-        format_optional_u64(snapshot.cost.cached_input_tokens),
-        format_optional_u64(snapshot.cost.cache_write_input_tokens),
-        snapshot.transcript.items,
-        snapshot.transcript.user,
-        snapshot.transcript.assistant,
-        snapshot.transcript.system,
-        snapshot.transcript.bytes,
-        snapshot.conversation.items,
-        snapshot.conversation.user_text,
-        snapshot.conversation.assistant_text,
-        snapshot.conversation.function_calls,
-        snapshot.conversation.function_outputs,
-        snapshot.conversation.text_bytes,
-        snapshot.conversation.tool_output_bytes,
-        snapshot.attachments.total,
-        snapshot.attachments.active,
-        snapshot.attachments.removed,
-        snapshot.attachments.unsupported,
-        snapshot.attachments.stored_bytes,
-        snapshot.attachments.redactions,
-        snapshot.metrics.tool_calls,
-        snapshot.metrics.tool_successes
-            + snapshot.metrics.tool_errors
-            + snapshot.metrics.tool_denials
-            + snapshot.metrics.tool_cancellations,
-        snapshot.metrics.receipt_stub_hits + snapshot.metrics.negative_receipt_hits,
-        snapshot.metrics.spill_writes,
-        snapshot.metrics.spill_reads,
-        snapshot.metrics.budget_denials,
-        snapshot.metrics.subagent_calls,
-        snapshot.metrics.subagent_failures,
-        snapshot.metrics.subagent_tool_calls,
-        snapshot.metrics.subagent_bytes_read,
-        snapshot.metrics.subagent_files_scanned,
-        snapshot.metrics.subagent_model_output_bytes,
-        snapshot.metrics.subagent_budget_denials,
-        format_request_estimate("transmitted_request", &snapshot.transmitted_request),
-        format_request_estimate("local_full_history", &snapshot.full_history_request),
-    )
-}
-
-fn format_request_estimate(label: &str, estimate: &RequestTokenEstimate) -> String {
-    let mut output = format!(
-        "{} input_tokens={} tokenizer={} accuracy={}",
-        label,
-        estimate.input_tokens,
-        estimate.tokenizer.as_str(),
-        if estimate.estimated {
-            "estimated"
-        } else {
-            "exact"
-        }
-    );
-    if let Some(context_window) = estimate.context_window_tokens {
-        output.push_str(&format!(" context_window={context_window}"));
-    } else {
-        output.push_str(" context_window=unknown");
-    }
-    if let Some(max_output) = estimate.max_output_tokens {
-        output.push_str(&format!(" max_output_reserve={max_output}"));
-    } else {
-        output.push_str(" max_output_reserve=unknown");
-    }
-    if let Some(input_budget) = estimate.input_budget_tokens {
-        output.push_str(&format!(" input_budget={input_budget}"));
-    } else {
-        output.push_str(" input_budget=unknown");
-    }
-    if let Some(remaining) = estimate.remaining_input_tokens {
-        output.push_str(&format!(" remaining_input_budget={remaining}"));
-    } else {
-        output.push_str(" remaining_input_budget=unknown");
-    }
-    if let Some(percent) = estimate.used_input_percent_x100 {
-        output.push_str(&format!(" used={}", format_percent_x100(percent)));
-    } else {
-        output.push_str(" used=unknown");
-    }
-    output
-}
-
-fn format_percent_x100(value: u32) -> String {
-    format!("{}.{:02}%", value / 100, value % 100)
-}
-
 fn format_pin_list(context: &ContextCompactionState) -> String {
     if context.pinned.is_empty() {
         return "No pinned context.".to_string();
@@ -3356,7 +1964,7 @@ fn format_pin_list(context: &ContextCompactionState) -> String {
         .join("\n")
 }
 
-fn compaction_status_line(record: &ContextCompactionRecord) -> String {
+pub(crate) fn compaction_status_line(record: &ContextCompactionRecord) -> String {
     format!(
         "compacted context {}->{} tok",
         record.before.estimated_tokens, record.after.estimated_tokens
@@ -5187,7 +3795,7 @@ fn is_failure_log(message: &str) -> bool {
     lower.contains("failed") || lower.contains("error") || lower.contains("cancelled")
 }
 
-fn dedupe_assistant_repeated_tool_output(
+pub(crate) fn dedupe_assistant_repeated_tool_output(
     app: &TuiApp,
     mut message: TranscriptItem,
 ) -> Option<TranscriptItem> {
@@ -6361,7 +4969,7 @@ fn tool_call_label_or_name(tool: &ToolTranscript) -> String {
         .unwrap_or_else(|| tool.result.tool_name.clone())
 }
 
-fn tool_call_label(call: &ToolCall) -> String {
+pub(crate) fn tool_call_label(call: &ToolCall) -> String {
     match call.name.as_str() {
         "shell" | "verify" => string_arg(&call.arguments, "command")
             .or_else(|| string_arg(&call.arguments, "description"))
@@ -6445,7 +5053,7 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     spans
 }
 
-fn is_control_tool_name(name: &str) -> bool {
+pub(crate) fn is_control_tool_name(name: &str) -> bool {
     matches!(name, "update_task_state" | "load_tool_schema")
 }
 
@@ -7297,7 +5905,7 @@ fn tool_result_error_detail(result: &ToolResult) -> String {
     }
 }
 
-fn tool_result_status_text(result: &ToolResult) -> String {
+pub(crate) fn tool_result_status_text(result: &ToolResult) -> String {
     if cargo_manifest_missing_result(result) {
         return format!("{} not run: no Cargo.toml found", result.tool_name);
     }
@@ -7438,7 +6046,7 @@ fn is_retryable_tool_result(result: &ToolResult) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnVisualState {
+pub(crate) enum TurnVisualState {
     Idle,
     Running,
     Succeeded,
@@ -7505,7 +6113,7 @@ fn prompt_cursor_span() -> Span<'static> {
     Span::styled("┃", Style::default().fg(GOLD).bg(PROMPT_BG))
 }
 
-fn compact_text(text: &str, limit: usize) -> String {
+pub(crate) fn compact_text(text: &str, limit: usize) -> String {
     truncate_bytes(&text.replace('\n', " "), limit)
 }
 
@@ -7960,7 +6568,7 @@ pub(crate) fn context_window_pct(used: u64, threshold: u64) -> u64 {
 }
 
 const CONTEXT_BUDGET_HINT_PCT: u64 = 85;
-const CONTEXT_NUDGE_PCT: u64 = 95;
+pub(crate) const CONTEXT_NUDGE_PCT: u64 = 95;
 
 fn format_status_hints(app: &TuiApp) -> String {
     if let Some(pending) = app.pending_request_user_input.as_ref() {
@@ -8020,7 +6628,7 @@ fn format_mcp_status(app: &TuiApp) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String {
+pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String {
     let total = snapshot.per_server.len();
     if total == 0 {
         return "none".to_string();
@@ -8070,17 +6678,7 @@ fn reasoning_status_fragment(app: &TuiApp) -> String {
         .unwrap_or_default()
 }
 
-fn format_optional_u64(value: Option<u64>) -> String {
-    value.map_or("-".to_string(), |value| value.to_string())
-}
-
-fn format_cost(cost: &squeezy_core::CostSnapshot) -> String {
-    cost.estimated_usd_micros.map_or("-".to_string(), |value| {
-        format!("${:.6}", value as f64 / 1_000_000.0)
-    })
-}
-
-fn format_error_status(error: &SqueezyError) -> String {
+pub(crate) fn format_error_status(error: &SqueezyError) -> String {
     match error {
         SqueezyError::ProviderNotConfigured(_) => {
             format!("{error}; configure provider credentials or pick another provider")
@@ -8299,141 +6897,141 @@ impl TelemetryStatus {
     }
 }
 
-struct TuiApp {
-    provider_name: &'static str,
-    version: &'static str,
-    model: String,
-    directory: String,
-    language_summary: String,
-    mode: SessionMode,
-    config_sources: String,
-    status_verbosity: StatusVerbosity,
-    response_verbosity: ResponseVerbosity,
-    tool_output_verbosity: ToolOutputVerbosity,
-    transcript_default: TranscriptDefault,
-    show_reasoning_usage: bool,
-    repo: RepoStatus,
-    permissions: PermissionStatus,
-    telemetry: TelemetryStatus,
-    input: String,
-    input_cursor: usize,
-    input_history: Vec<String>,
-    input_history_index: Option<usize>,
-    input_history_draft: String,
-    slash_menu_index: usize,
-    mention_popup: Option<mention::MentionPopup>,
-    workspace_files: Option<Arc<Vec<PathBuf>>>,
-    overlay: Option<overlay::Overlay>,
-    alternate_scroll_enabled: bool,
-    attachments: Vec<ContextAttachment>,
-    context_compaction: ContextCompactionState,
+pub(crate) struct TuiApp {
+    pub(crate) provider_name: &'static str,
+    pub(crate) version: &'static str,
+    pub(crate) model: String,
+    pub(crate) directory: String,
+    pub(crate) language_summary: String,
+    pub(crate) mode: SessionMode,
+    pub(crate) config_sources: String,
+    pub(crate) status_verbosity: StatusVerbosity,
+    pub(crate) response_verbosity: ResponseVerbosity,
+    pub(crate) tool_output_verbosity: ToolOutputVerbosity,
+    pub(crate) transcript_default: TranscriptDefault,
+    pub(crate) show_reasoning_usage: bool,
+    pub(crate) repo: RepoStatus,
+    pub(crate) permissions: PermissionStatus,
+    pub(crate) telemetry: TelemetryStatus,
+    pub(crate) input: String,
+    pub(crate) input_cursor: usize,
+    pub(crate) input_history: Vec<String>,
+    pub(crate) input_history_index: Option<usize>,
+    pub(crate) input_history_draft: String,
+    pub(crate) slash_menu_index: usize,
+    pub(crate) mention_popup: Option<mention::MentionPopup>,
+    pub(crate) workspace_files: Option<Arc<Vec<PathBuf>>>,
+    pub(crate) overlay: Option<overlay::Overlay>,
+    pub(crate) alternate_scroll_enabled: bool,
+    pub(crate) attachments: Vec<ContextAttachment>,
+    pub(crate) context_compaction: ContextCompactionState,
     /// Token threshold above which auto-compaction triggers. Captured at
     /// startup from `config.context_compaction.estimated_tokens` so the
     /// status line can express usage as a percentage of the local cap
     /// (Squeezy's cost thesis cares about the configured budget, not the
     /// raw model window).
-    context_compaction_threshold: u64,
+    pub(crate) context_compaction_threshold: u64,
     /// Whether the "compaction imminent" advisory has been pushed for the
     /// current pre-compaction window. Reset when compaction lands so the
     /// nudge can fire again on the next approach to the threshold.
-    context_compaction_nudge_shown: bool,
-    context_estimate: ContextEstimate,
-    transcript: Vec<TranscriptEntry>,
-    selected_entry: Option<usize>,
-    next_entry_id: u64,
-    transcript_scroll_from_bottom: u16,
-    pending_assistant: streaming::StreamingController,
-    proposed_plan: proposed_plan::ProposedPlanExtractor,
-    workspace_root: PathBuf,
+    pub(crate) context_compaction_nudge_shown: bool,
+    pub(crate) context_estimate: ContextEstimate,
+    pub(crate) transcript: Vec<TranscriptEntry>,
+    pub(crate) selected_entry: Option<usize>,
+    pub(crate) next_entry_id: u64,
+    pub(crate) transcript_scroll_from_bottom: u16,
+    pub(crate) pending_assistant: streaming::StreamingController,
+    pub(crate) proposed_plan: proposed_plan::ProposedPlanExtractor,
+    pub(crate) workspace_root: PathBuf,
     /// Session id assigned by the agent. Plan-mode IO (persist, prune,
     /// resolve-active) is scoped under
     /// `<workspace_root>/.squeezy/plans/<session_id>/` so concurrent
     /// sessions cannot see each other's plans. `None` until the agent
     /// hands one back; in that window plan IO falls back to
     /// [`proposed_plan::FALLBACK_SESSION_ID`].
-    session_id: Option<String>,
+    pub(crate) session_id: Option<String>,
     /// Plan id of the most recent `<proposed_plan>` block persisted under
     /// `.squeezy/plans/`. Used by Build-mode handoff and refinement turns
     /// to identify which plan file is active without scanning the dir.
-    current_plan_id: Option<String>,
+    pub(crate) current_plan_id: Option<String>,
     /// Path to a plan file that should be re-attached to upcoming Build-mode
     /// turns. Set when the user switches Plan→Build while a plan is active.
     /// Cleared on Build→Plan switch, on plan discard, and on the first
     /// successful apply_patch / write_file in Build mode (the plan is "in
     /// motion" — re-attaching it from there is just noise).
-    pending_plan_handoff: Option<PathBuf>,
+    pub(crate) pending_plan_handoff: Option<PathBuf>,
     /// Number of Build-mode turns since the current `pending_plan_handoff`
     /// was queued. Turn 0 receives the full plan body as a prefix; turns
     /// 1+ receive a lighter `[plan still in effect — <path>]` marker so
     /// the model is reminded the plan applies without re-paying the
     /// body's tokens on every turn (issue 16).
-    plan_handoff_turns_seen: u32,
+    pub(crate) plan_handoff_turns_seen: u32,
     /// Interactive Execute/Refine/Discard/View prompt rendered right after a
     /// `<proposed_plan>` block lands. Set once on persist; cleared by an
     /// explicit user choice. Blocks other input while present.
-    pending_plan_choice: Option<PendingPlanChoice>,
+    pub(crate) pending_plan_choice: Option<PendingPlanChoice>,
     /// Pause/resume state for Build-mode plan execution (PR-G item 6).
     /// Set when the user presses Shift+Tab while a Build turn is in
     /// flight and an active plan exists: the turn is cancelled, the
     /// captured plan id rides through Plan-mode, and the next Plan→
     /// Build crossing surfaces a resume marker telling the model
     /// whether the plan was refined while paused.
-    plan_pause: Option<PlanPauseState>,
+    pub(crate) plan_pause: Option<PlanPauseState>,
     /// One-shot resume marker queued during a Plan→Build crossing that
     /// resumes from a pause. Consumed by [`take_pending_plan_prefix`]
     /// on the first Build turn after the crossing so the marker rides
     /// alongside the plan body.
-    plan_resume_marker: Option<String>,
-    task_state: Option<TaskStateSnapshot>,
-    mcp_status: Option<McpStatusSnapshot>,
-    task_panel_collapsed: bool,
-    active_tool: Option<String>,
-    status: String,
-    turn_visual: TurnVisualState,
-    turn_started_at: Option<Instant>,
-    last_turn_duration: Option<Duration>,
+    pub(crate) plan_resume_marker: Option<String>,
+    pub(crate) task_state: Option<TaskStateSnapshot>,
+    pub(crate) mcp_status: Option<McpStatusSnapshot>,
+    pub(crate) task_panel_collapsed: bool,
+    pub(crate) active_tool: Option<String>,
+    pub(crate) status: String,
+    pub(crate) turn_visual: TurnVisualState,
+    pub(crate) turn_started_at: Option<Instant>,
+    pub(crate) last_turn_duration: Option<Duration>,
     /// Set when a terminal resize event arrives so the next draw can wipe
     /// the inline viewport before ratatui's autoresize scrolls stale frame
     /// content up into the scrollback above the new viewport.
-    pending_resize: bool,
-    terminal_title_state: TerminalTitleState,
+    pub(crate) pending_resize: bool,
+    pub(crate) terminal_title_state: TerminalTitleState,
     /// Last OSC title we wrote, so that repeated identical writes are
     /// suppressed and emitter logic stays idempotent across redraws.
-    last_terminal_title: Option<String>,
-    animation_tick: u64,
-    animation_tick_rate: Duration,
-    exit_confirm_armed: bool,
-    active_tool_calls: BTreeMap<String, ToolCall>,
-    cost: squeezy_core::CostSnapshot,
+    pub(crate) last_terminal_title: Option<String>,
+    pub(crate) animation_tick: u64,
+    pub(crate) animation_tick_rate: Duration,
+    pub(crate) exit_confirm_armed: bool,
+    pub(crate) active_tool_calls: BTreeMap<String, ToolCall>,
+    pub(crate) cost: squeezy_core::CostSnapshot,
     /// Session-level cap in USD micros, sourced from
     /// `AppConfig.max_session_cost_usd_micros`. `None` (or a zero cap)
     /// means the status bar renders the legacy `cost $X` segment
     /// unchanged.
-    cost_cap_usd_micros: Option<u64>,
-    metrics: squeezy_core::TurnMetrics,
-    turn_rx: Option<mpsc::Receiver<AgentEvent>>,
-    job_rx: Option<broadcast::Receiver<JobEvent>>,
-    jobs: BTreeMap<JobId, JobSnapshot>,
-    notifications: VecDeque<JobNotification>,
-    cancel: Option<CancellationToken>,
-    pending_approval: Option<PendingApproval>,
-    approval_selection_index: usize,
-    pending_mcp_elicitation: Option<PendingMcpElicitation>,
-    pending_request_user_input: Option<PendingRequestUserInput>,
+    pub(crate) cost_cap_usd_micros: Option<u64>,
+    pub(crate) metrics: squeezy_core::TurnMetrics,
+    pub(crate) turn_rx: Option<mpsc::Receiver<AgentEvent>>,
+    pub(crate) job_rx: Option<broadcast::Receiver<JobEvent>>,
+    pub(crate) jobs: BTreeMap<JobId, JobSnapshot>,
+    pub(crate) notifications: VecDeque<JobNotification>,
+    pub(crate) cancel: Option<CancellationToken>,
+    pub(crate) pending_approval: Option<PendingApproval>,
+    pub(crate) approval_selection_index: usize,
+    pub(crate) pending_mcp_elicitation: Option<PendingMcpElicitation>,
+    pub(crate) pending_request_user_input: Option<PendingRequestUserInput>,
     /// Prompt that was in flight when the most recent turn was cancelled
     /// or failed. Surfaced via Ctrl-R so the user can recover from a
     /// typo without retyping. Cleared on successful completion.
-    cancelled_prompt: Option<String>,
+    pub(crate) cancelled_prompt: Option<String>,
     /// True when the in-flight turn has already produced a successful
     /// edit-capable tool call (apply_patch / write_file). Used to surface
     /// `/diff` and `/undo` hints at end-of-turn (success or failure).
-    last_turn_had_edits: bool,
-    mcp_elicitation_selection_index: usize,
-    pending_feedback: Option<PreparedFeedback>,
-    pending_report: Option<BugReportBundle>,
-    clipboard: Box<dyn Clipboard>,
-    app_notifications: NotificationQueue,
-    config_screen: Option<config_screen::ConfigScreenState>,
+    pub(crate) last_turn_had_edits: bool,
+    pub(crate) mcp_elicitation_selection_index: usize,
+    pub(crate) pending_feedback: Option<PreparedFeedback>,
+    pub(crate) pending_report: Option<BugReportBundle>,
+    pub(crate) clipboard: Box<dyn Clipboard>,
+    pub(crate) app_notifications: NotificationQueue,
+    pub(crate) config_screen: Option<config_screen::ConfigScreenState>,
 }
 
 impl TuiApp {
@@ -8441,7 +7039,7 @@ impl TuiApp {
     /// [`proposed_plan::FALLBACK_SESSION_ID`] when the agent has not yet
     /// handed one back so plan-mode IO can still proceed during the
     /// pre-first-turn window.
-    fn plan_session_id(&self) -> &str {
+    pub(crate) fn plan_session_id(&self) -> &str {
         self.session_id
             .as_deref()
             .unwrap_or(proposed_plan::FALLBACK_SESSION_ID)
@@ -8581,7 +7179,7 @@ impl TuiApp {
         }
     }
 
-    fn note_turn_started(&mut self) {
+    pub(crate) fn note_turn_started(&mut self) {
         if self.turn_started_at.is_none() {
             self.turn_started_at = Some(Instant::now());
         }
@@ -8589,14 +7187,14 @@ impl TuiApp {
         self.terminal_title_state = TerminalTitleState::Working;
     }
 
-    fn note_turn_finished(&mut self) {
+    pub(crate) fn note_turn_finished(&mut self) {
         if let Some(started_at) = self.turn_started_at.take() {
             self.last_turn_duration = Some(started_at.elapsed());
         }
         self.terminal_title_state = TerminalTitleState::Notification;
     }
 
-    fn push_transcript_item(&mut self, item: TranscriptItem) {
+    pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::message(id, item, self.transcript_default));
     }
@@ -8606,7 +7204,11 @@ impl TuiApp {
         self.push_tool_result_with_call(result, None);
     }
 
-    fn push_tool_result_with_call(&mut self, result: ToolResult, call: Option<ToolCall>) {
+    pub(crate) fn push_tool_result_with_call(
+        &mut self,
+        result: ToolResult,
+        call: Option<ToolCall>,
+    ) {
         if tool_result_hidden_by_default(&result) {
             return;
         }
@@ -8620,12 +7222,12 @@ impl TuiApp {
         self.push_entry(entry);
     }
 
-    fn push_log(&mut self, message: String) {
+    pub(crate) fn push_log(&mut self, message: String) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
-    fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
+    pub(crate) fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::plan_card(
             id,
@@ -8638,7 +7240,7 @@ impl TuiApp {
         self.transcript.push(entry);
     }
 
-    fn remember_active_tool_call(&mut self, call: ToolCall) {
+    pub(crate) fn remember_active_tool_call(&mut self, call: ToolCall) {
         if is_control_tool_name(&call.name) {
             return;
         }
@@ -8646,7 +7248,7 @@ impl TuiApp {
         self.active_tool_calls.insert(call.call_id.clone(), call);
     }
 
-    fn refresh_active_tool_name(&mut self) {
+    pub(crate) fn refresh_active_tool_name(&mut self) {
         self.active_tool = self
             .active_tool_calls
             .values()
@@ -8654,7 +7256,7 @@ impl TuiApp {
             .map(|call| call.name.clone());
     }
 
-    fn clear_active_tools(&mut self) {
+    pub(crate) fn clear_active_tools(&mut self) {
         self.active_tool = None;
         self.active_tool_calls.clear();
     }
@@ -8887,30 +7489,30 @@ enum TranscriptCategory {
     Assistant,
 }
 
-struct PendingApproval {
-    request: ToolApprovalRequest,
-    decision_tx: oneshot::Sender<ToolApprovalDecision>,
+pub(crate) struct PendingApproval {
+    pub(crate) request: ToolApprovalRequest,
+    pub(crate) decision_tx: oneshot::Sender<ToolApprovalDecision>,
 }
 
-struct PendingMcpElicitation {
-    request: McpElicitationRequest,
-    response_tx: oneshot::Sender<McpElicitationResponse>,
+pub(crate) struct PendingMcpElicitation {
+    pub(crate) request: McpElicitationRequest,
+    pub(crate) response_tx: oneshot::Sender<McpElicitationResponse>,
 }
 
-struct PendingRequestUserInput {
-    request: RequestUserInputRequest,
-    response_tx: oneshot::Sender<RequestUserInputResponse>,
-    selection_index: usize,
+pub(crate) struct PendingRequestUserInput {
+    pub(crate) request: RequestUserInputRequest,
+    pub(crate) response_tx: oneshot::Sender<RequestUserInputResponse>,
+    pub(crate) selection_index: usize,
 }
 
 /// Interactive prompt that appears after a `<proposed_plan>` block lands
 /// and persists. Lets the user execute, refine, discard, or view the
 /// plan file without typing a slash command.
 #[derive(Debug, Clone)]
-struct PendingPlanChoice {
-    plan_id: String,
-    plan_path: PathBuf,
-    selection_index: usize,
+pub(crate) struct PendingPlanChoice {
+    pub(crate) plan_id: String,
+    pub(crate) plan_path: PathBuf,
+    pub(crate) selection_index: usize,
 }
 
 /// Captured plan-execution state at the moment of a Shift+Tab pause

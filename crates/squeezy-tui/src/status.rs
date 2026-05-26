@@ -43,7 +43,7 @@ pub(crate) fn format_cost_segment(
     cost: &squeezy_core::CostSnapshot,
     cap_usd_micros: Option<u64>,
 ) -> String {
-    use crate::format_cost;
+    use crate::commands::format_cost;
     match cap_usd_micros {
         Some(cap) if cap > 0 => {
             let spent = cost.estimated_usd_micros.unwrap_or(0);
@@ -65,7 +65,8 @@ pub(crate) fn format_cost_segment(
 
 pub(crate) mod segments {
     use super::*;
-    use crate::{format_mcp_status, format_optional_u64, reasoning_status_fragment};
+    use crate::commands::format_optional_u64;
+    use crate::{format_mcp_status, reasoning_status_fragment};
 
     pub(crate) fn permissions(app: &TuiApp) -> Option<String> {
         Some(app.permissions.compact())
