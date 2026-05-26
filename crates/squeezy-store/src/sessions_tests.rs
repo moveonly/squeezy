@@ -1862,4 +1862,171 @@ fn hash_payload(payload: &serde_json::Value) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+// `HOME` is process-global; the memory tests below mutate it to point at a
+// temp dir so the user's real `~/.squeezy/memory.md` is never touched. The
+// lock keeps parallel test runners from racing on the env mutation.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let previous = std::env::var_os("HOME");
+    // SAFETY: the lock above serialises HOME mutations across the suite.
+    unsafe {
+        std::env::set_var("HOME", home);
+    }
+    let result = body();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    result
+}
+
+#[test]
+fn remember_and_recall_round_trip_through_user_memory_file() {
+    let home = temp_root("remember-recall-round-trip");
+    with_home(&home, || {
+        let initial = SessionStore::recall(8_192);
+        assert!(initial.is_none(), "fresh HOME must surface no memory body");
+
+        let written = SessionStore::remember("prefers cargo nextest over cargo test")
+            .expect("remember preference");
+        assert_eq!(
+            written,
+            "prefers cargo nextest over cargo test".len() + 1,
+            "first remember writes body + trailing newline only"
+        );
+
+        let recalled = SessionStore::recall(8_192).expect("recall after remember");
+        assert!(recalled.contains("prefers cargo nextest over cargo test"));
+        assert!(
+            recalled.ends_with('\n'),
+            "memory body keeps trailing newline"
+        );
+
+        let written_again =
+            SessionStore::remember("repo uses redb for the graph store").expect("second remember");
+        assert_eq!(
+            written_again,
+            "repo uses redb for the graph store".len() + 1,
+            "follow-up remember skips the leading newline when file already ends with one"
+        );
+
+        let body = SessionStore::recall(8_192).expect("recall after second remember");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "prefers cargo nextest over cargo test",
+                "repo uses redb for the graph store",
+            ],
+            "each remembered line lands on its own row"
+        );
+    });
+}
+
+#[test]
+fn remember_inserts_leading_newline_when_file_lacks_one() {
+    let home = temp_root("remember-fixup-trailing-newline");
+    with_home(&home, || {
+        let memory = SessionStore::memory_path().expect("HOME set");
+        fs::create_dir_all(memory.parent().expect("memory dir")).expect("mkdir");
+        fs::write(&memory, b"manual entry without newline").expect("seed memory.md");
+
+        let written = SessionStore::remember("agent-added entry").expect("remember");
+        // 1 leading newline + body + trailing newline.
+        assert_eq!(written, 1 + "agent-added entry".len() + 1);
+
+        let body = fs::read_to_string(&memory).expect("read");
+        assert_eq!(
+            body, "manual entry without newline\nagent-added entry\n",
+            "leading newline appended when prior file lacked one",
+        );
+    });
+}
+
+#[test]
+fn remember_trims_whitespace_and_drops_empty_input() {
+    let home = temp_root("remember-trim-empty");
+    with_home(&home, || {
+        let zero = SessionStore::remember("   \n\t  ").expect("empty input is ok");
+        assert_eq!(zero, 0, "blank input must not touch the file");
+        let memory = SessionStore::memory_path().expect("HOME set");
+        let initial_body = fs::read_to_string(&memory).unwrap_or_default();
+        assert!(
+            initial_body.is_empty(),
+            "blank remember leaves memory.md absent or empty (got {initial_body:?})",
+        );
+
+        let written =
+            SessionStore::remember("   keep the trimmed body  \n").expect("trim and append");
+        assert_eq!(written, "keep the trimmed body".len() + 1);
+
+        let body = fs::read_to_string(&memory).expect("read");
+        assert_eq!(body, "keep the trimmed body\n");
+    });
+}
+
+#[test]
+fn recall_truncates_at_char_boundary_with_marker() {
+    let home = temp_root("recall-truncates-at-boundary");
+    with_home(&home, || {
+        SessionStore::remember("héllo world — long enough to be truncated")
+            .expect("remember unicode body");
+
+        // Cap=2 lands inside 'é' (a 2-byte char that occupies bytes 1..3 in
+        // the persisted body). The recall must back off to byte 1, which is
+        // the boundary after 'h'.
+        let recalled = SessionStore::recall(2).expect("recall capped");
+        assert_eq!(
+            recalled, "h\n[truncated]",
+            "char-boundary backoff yields a valid prefix plus marker",
+        );
+
+        // Cap >= body length returns the full body untouched.
+        let full = SessionStore::recall(8_192).expect("recall uncapped");
+        assert!(!full.contains("[truncated]"));
+        assert!(full.starts_with("héllo world"));
+    });
+}
+
+#[test]
+fn recall_returns_none_when_max_bytes_zero_or_missing() {
+    let home = temp_root("recall-disabled-or-missing");
+    with_home(&home, || {
+        assert!(
+            SessionStore::recall(0).is_none(),
+            "max_bytes=0 disables recall",
+        );
+        assert!(
+            SessionStore::recall(8_192).is_none(),
+            "missing memory.md surfaces as None",
+        );
+    });
+}
+
+#[test]
+fn memory_path_is_none_when_home_unset() {
+    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+    let path = SessionStore::memory_path();
+    let recall = SessionStore::recall(8_192);
+    let remember = SessionStore::remember("unused");
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(path.is_none(), "HOME unset means no memory path");
+    assert!(recall.is_none(), "HOME unset means no recall body");
+    assert!(
+        remember.is_err(),
+        "remember fails loudly when HOME is unset"
+    );
 }

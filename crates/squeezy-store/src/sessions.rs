@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -82,6 +83,88 @@ impl SessionStore {
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
         write_json(&self.calibration_path(), calibration)
+    }
+
+    /// Path to the user-global memory file. Returns `None` when `HOME` is
+    /// unset — the same condition under which the agent's prompt-side
+    /// ingestion (`ingest_user_memory`) declines to do anything. The file
+    /// itself is the single static memory store described in
+    /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
+    /// new directory or partition scheme.
+    pub fn memory_path() -> Option<PathBuf> {
+        let home = env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+    }
+
+    /// Append one normalized line to the user-global memory file
+    /// (`~/.squeezy/memory.md`). The input is trimmed; empty input is a
+    /// no-op that returns `Ok(0)`. The store ensures the file ends with a
+    /// newline before the append so each `remember` call sits on its own
+    /// line and the byte-cap ingestion path stays predictable. Returns
+    /// the number of bytes appended (line body plus the trailing newline).
+    ///
+    /// This is the canonical cross-session memory write primitive; higher
+    /// layers (e.g. the deferred `memory_append` tool from
+    /// `MEMORY_SCOPE.md`) wrap this rather than re-implement the path or
+    /// the newline discipline.
+    pub fn remember(line: &str) -> Result<usize> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        let Some(path) = Self::memory_path() else {
+            return Err(SqueezyError::Agent(
+                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
+            ));
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let needs_leading_newline = match fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 => !memory_file_ends_with_newline(&path)?,
+            _ => false,
+        };
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut written = 0;
+        if needs_leading_newline {
+            file.write_all(b"\n")?;
+            written += 1;
+        }
+        file.write_all(trimmed.as_bytes())?;
+        file.write_all(b"\n")?;
+        written += trimmed.len() + 1;
+        Ok(written)
+    }
+
+    /// Read the user-global memory file (`~/.squeezy/memory.md`) and
+    /// return its body truncated to `max_bytes` at a char boundary,
+    /// appending `\n[truncated]` when the file is larger than the cap.
+    /// Matches the semantics of the agent's prompt-side
+    /// `ingest_user_memory` so call sites can rely on a single source of
+    /// truth for the recall shape. Returns `None` when ingestion is
+    /// disabled (`max_bytes == 0`), `HOME` is unset, or the file is
+    /// absent / empty / unreadable. Errors are silent on purpose — recall
+    /// is best-effort enrichment, never load-bearing.
+    pub fn recall(max_bytes: usize) -> Option<String> {
+        if max_bytes == 0 {
+            return None;
+        }
+        let path = Self::memory_path()?;
+        let body = fs::read_to_string(&path).ok()?;
+        if body.is_empty() {
+            return None;
+        }
+        if body.len() <= max_bytes {
+            return Some(body);
+        }
+        let mut end = max_bytes;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = String::with_capacity(end + "\n[truncated]".len());
+        truncated.push_str(&body[..end]);
+        truncated.push_str("\n[truncated]");
+        Some(truncated)
     }
 
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
@@ -1484,6 +1567,22 @@ fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+/// Return whether the file at `path` ends with a `\n` byte. Used by the
+/// memory append path to keep each remembered line on its own row even
+/// when the user (or an earlier tool) left a trailing-newline-less file.
+fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut buf = [0u8; 1];
+    file.read_exact(&mut buf)?;
+    Ok(buf[0] == b'\n')
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
