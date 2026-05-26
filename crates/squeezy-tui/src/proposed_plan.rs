@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
-pub(crate) const OPEN_TAG: &str = "<proposed_plan>";
-pub(crate) const CLOSE_TAG: &str = "</proposed_plan>";
+pub(crate) const OPEN_TAG: &str = squeezy_agent::PROPOSED_PLAN_OPEN_TAG;
+pub(crate) const CLOSE_TAG: &str = squeezy_agent::PROPOSED_PLAN_CLOSE_TAG;
 
 /// Short marker prepended to Build-mode turns 2+ after a Plan→Build
 /// handoff, while the same plan is still in effect. The full plan body
