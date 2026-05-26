@@ -78,7 +78,7 @@ pub(crate) fn prune_plan_dir(workspace_root: &Path) -> usize {
     if plans.len() <= PLAN_RETENTION_LIMIT {
         return 0;
     }
-    plans.sort_by(|a, b| b.0.cmp(&a.0));
+    plans.sort_by_key(|(stem, _)| std::cmp::Reverse(*stem));
     let mut deleted = 0;
     for (_, path) in plans.into_iter().skip(PLAN_RETENTION_LIMIT) {
         if fs::remove_file(&path).is_ok() {

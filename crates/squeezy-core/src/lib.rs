@@ -292,7 +292,7 @@ impl AppConfig {
             "anthropic" | "claude" => ProviderConfig::Anthropic(AnthropicConfig {
                 api_key_env: get_var("ANTHROPIC_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "anthropic", "api_key_env"))
-                    .unwrap_or_else(|| "ANTHROPIC_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_ANTHROPIC_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "anthropic", "api_key_keychain")
                     .or_else(|| Some("squeezy:anthropic".to_string())),
                 base_url: get_var("ANTHROPIC_BASE_URL")
@@ -303,7 +303,7 @@ impl AppConfig {
             "google" | "gemini" => ProviderConfig::Google(GoogleConfig {
                 api_key_env: get_var("GOOGLE_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "google", "api_key_env"))
-                    .unwrap_or_else(|| "GEMINI_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_GOOGLE_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "google", "api_key_keychain")
                     .or_else(|| Some("squeezy:google".to_string())),
                 base_url: get_var("GOOGLE_BASE_URL")
@@ -316,7 +316,7 @@ impl AppConfig {
                     api_key_env: get_var("AZURE_OPENAI_API_KEY_ENV")
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_key_env"))
                         .or_else(|| provider_setting(&providers, "azure", "api_key_env"))
-                        .unwrap_or_else(|| "AZURE_OPENAI_API_KEY".to_string()),
+                        .unwrap_or_else(|| "SQUEEZY_AZURE_OPENAI_KEY".to_string()),
                     api_key_keychain: provider_setting(
                         &providers,
                         "azure_openai",
@@ -355,7 +355,7 @@ impl AppConfig {
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
                 api_key_env: get_var("OPENAI_API_KEY_ENV")
                     .or_else(|| provider_setting(&providers, "openai", "api_key_env"))
-                    .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+                    .unwrap_or_else(|| "SQUEEZY_OPENAI_KEY".to_string()),
                 api_key_keychain: provider_setting(&providers, "openai", "api_key_keychain")
                     .or_else(|| Some("squeezy:openai".to_string())),
                 base_url: get_var("OPENAI_BASE_URL")
@@ -5633,6 +5633,12 @@ impl TierSource {
 
 /// The three tier files plus the effective merged config. Used by the config
 /// screen to compute per-leaf inheritance badges.
+///
+/// Field naming intentionally mirrors the internal load order
+/// (`user → project → repo`). User-facing labels in the TUI map differently:
+/// `project` = the committed `./squeezy.toml` ("Repo" in the screen) and
+/// `repo` = the per-machine `~/.squeezy/projects/<hash>/settings.toml`
+/// ("Local" in the screen).
 #[derive(Debug, Clone)]
 pub struct SeparatedSources {
     pub user: Option<TierSource>,
@@ -5640,6 +5646,7 @@ pub struct SeparatedSources {
     pub repo: Option<TierSource>,
     pub user_path_default: PathBuf,
     pub project_path_default: PathBuf,
+    pub repo_path_default: PathBuf,
 }
 
 /// Loads each tier separately so the UI can compute inheritance per leaf.
@@ -5669,6 +5676,7 @@ pub fn load_separated_settings_sources() -> Result<SeparatedSources> {
         repo,
         user_path_default: user_path,
         project_path_default,
+        repo_path_default: repo_path,
     })
 }
 

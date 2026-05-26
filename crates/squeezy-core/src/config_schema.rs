@@ -62,12 +62,17 @@ pub enum FieldSource {
 }
 
 impl FieldSource {
+    /// User-facing badge label. The screen exposes three scopes:
+    ///   User → ~/.squeezy/settings.toml
+    ///   Repo  → ./squeezy.toml          (internal tier name: `project`)
+    ///   Local → ~/.squeezy/projects/<hash>/settings.toml
+    ///                                   (internal tier name: `repo`)
     pub const fn badge(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::User => "user",
-            Self::Project => "project",
-            Self::Repo => "repo",
+            Self::Project => "repo",
+            Self::Repo => "local",
             Self::Env => "env",
         }
     }
@@ -267,6 +272,11 @@ pub enum SectionId {
     McpServers,
     ShellSandbox,
     PermissionRules,
+    /// Synthetic section that hosts tier-wide reset actions ("delete the
+    /// user file", "delete the repo file", "delete the local file"). Has
+    /// no `FieldMeta` entries — the TUI renders an action list and runs
+    /// each action against `SeparatedSources` directly.
+    Reset,
 }
 
 impl SectionId {
@@ -292,6 +302,7 @@ impl SectionId {
             Self::McpServers => "mcp-servers",
             Self::ShellSandbox => "shell-sandbox",
             Self::PermissionRules => "permission-rules",
+            Self::Reset => "reset",
         }
     }
 }
@@ -1306,6 +1317,13 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
             },
         ],
     },
+    ConfigSectionMeta {
+        id: SectionId::Reset,
+        label: "Reset",
+        description: "Delete a tier's settings file. Inherited values from \
+                      other tiers then take over — no other tab is touched.",
+        fields: &[],
+    },
 ];
 
 // ─── getters / setters ────────────────────────────────────────────────────────
@@ -1328,25 +1346,25 @@ fn set_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static s
     let transport = ProviderTransportConfig::default();
     cfg.provider = match s {
         "openai" => ProviderConfig::OpenAi(OpenAiConfig {
-            api_key_env: "OPENAI_API_KEY".to_string(),
+            api_key_env: "SQUEEZY_OPENAI_KEY".to_string(),
             api_key_keychain: None,
             base_url: DEFAULT_OPENAI_BASE_URL.to_string(),
             transport,
         }),
         "anthropic" => ProviderConfig::Anthropic(AnthropicConfig {
-            api_key_env: "ANTHROPIC_API_KEY".to_string(),
+            api_key_env: "SQUEEZY_ANTHROPIC_KEY".to_string(),
             api_key_keychain: None,
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_string(),
             transport,
         }),
         "google" => ProviderConfig::Google(GoogleConfig {
-            api_key_env: "GOOGLE_API_KEY".to_string(),
+            api_key_env: "SQUEEZY_GOOGLE_KEY".to_string(),
             api_key_keychain: None,
             base_url: DEFAULT_GOOGLE_BASE_URL.to_string(),
             transport,
         }),
         "azure_openai" => ProviderConfig::AzureOpenAi(AzureOpenAiConfig {
-            api_key_env: "AZURE_OPENAI_API_KEY".to_string(),
+            api_key_env: "SQUEEZY_AZURE_OPENAI_KEY".to_string(),
             api_key_keychain: None,
             base_url: DEFAULT_AZURE_OPENAI_BASE_URL.to_string(),
             api_version: DEFAULT_AZURE_OPENAI_API_VERSION.to_string(),

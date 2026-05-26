@@ -94,37 +94,50 @@ fn filter_orders_newest_first_and_caps_at_max() {
     assert_eq!(ids, vec!["s0", "s1", "s2", "s3", "s4"]);
 }
 
+fn summary(id: &str) -> SessionSummary {
+    SessionSummary {
+        session_id: id.to_string(),
+        started_at_ms: 0,
+        first_user_task: Some(format!("task for {id}")),
+        latest_summary: None,
+        turn_count: 0,
+    }
+}
+
 #[test]
-fn picker_enter_resumes_highlighted_session() {
-    let candidates = vec![
-        SessionSummary {
-            session_id: "first".to_string(),
-            started_at_ms: 0,
-            first_user_task: Some("a".to_string()),
-            latest_summary: None,
-        },
-        SessionSummary {
-            session_id: "second".to_string(),
-            started_at_ms: 0,
-            first_user_task: Some("b".to_string()),
-            latest_summary: None,
-        },
-    ];
-    let mut state = ResumePickerState::new(candidates);
-    assert!(state.dispatch(press(KeyCode::Down)).is_none());
-    assert_eq!(state.cursor, 1);
-    let outcome = state.dispatch(press(KeyCode::Enter));
-    assert_eq!(outcome, Some(ResumeChoice::Resume("second".to_string())));
+fn picker_opens_with_start_fresh_selected() {
+    let state = ResumePickerState::new(vec![summary("first"), summary("second")]);
+    // Start fresh sits at row 0 so the safe default is pre-selected.
+    assert_eq!(state.cursor, 0);
+    assert_eq!(state.start_fresh_index(), 0);
+}
+
+#[test]
+fn picker_enter_on_start_fresh_starts_fresh() {
+    let mut state = ResumePickerState::new(vec![summary("first")]);
+    assert_eq!(
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::StartFresh)
+    );
+}
+
+#[test]
+fn picker_enter_on_candidate_resumes_that_session() {
+    let mut state = ResumePickerState::new(vec![summary("first"), summary("second")]);
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 1); // first candidate (row 1)
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 2); // second candidate (row 2)
+    assert_eq!(
+        state.dispatch(press(KeyCode::Enter)),
+        Some(ResumeChoice::Resume("second".to_string()))
+    );
 }
 
 #[test]
 fn picker_esc_starts_fresh() {
-    let mut state = ResumePickerState::new(vec![SessionSummary {
-        session_id: "first".to_string(),
-        started_at_ms: 0,
-        first_user_task: None,
-        latest_summary: None,
-    }]);
+    let mut state = ResumePickerState::new(vec![summary("first")]);
+    state.dispatch(press(KeyCode::Down)); // cursor on candidate
     assert_eq!(
         state.dispatch(press(KeyCode::Esc)),
         Some(ResumeChoice::StartFresh)
@@ -133,12 +146,7 @@ fn picker_esc_starts_fresh() {
 
 #[test]
 fn picker_q_quits() {
-    let mut state = ResumePickerState::new(vec![SessionSummary {
-        session_id: "first".to_string(),
-        started_at_ms: 0,
-        first_user_task: None,
-        latest_summary: None,
-    }]);
+    let mut state = ResumePickerState::new(vec![summary("first")]);
     assert_eq!(
         state.dispatch(press(KeyCode::Char('q'))),
         Some(ResumeChoice::Quit)
@@ -146,17 +154,27 @@ fn picker_q_quits() {
 }
 
 #[test]
-fn picker_clamps_arrow_at_bounds() {
-    let mut state = ResumePickerState::new(vec![SessionSummary {
-        session_id: "only".to_string(),
-        started_at_ms: 0,
-        first_user_task: None,
-        latest_summary: None,
-    }]);
+fn picker_arrow_wraps_through_start_fresh_at_top() {
+    // [start_fresh, candidate] — 2 rows total.
+    let mut state = ResumePickerState::new(vec![summary("only")]);
+    assert_eq!(state.cursor, 0); // opens on start_fresh
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 1); // candidate
+    state.dispatch(press(KeyCode::Down));
+    assert_eq!(state.cursor, 0); // wraps back to start_fresh
     state.dispatch(press(KeyCode::Up));
-    state.dispatch(press(KeyCode::Down));
-    state.dispatch(press(KeyCode::Down));
-    assert_eq!(state.cursor, 0);
+    assert_eq!(state.cursor, 1); // wraps up to last row (candidate)
+}
+
+#[test]
+fn turn_indicator_renders_singular_and_plural_correctly() {
+    let mut s = summary("x");
+    s.turn_count = 0;
+    assert_eq!(s.turn_indicator(), "new");
+    s.turn_count = 1;
+    assert_eq!(s.turn_indicator(), "1 prompt");
+    s.turn_count = 7;
+    assert_eq!(s.turn_indicator(), "7 prompts");
 }
 
 #[test]
@@ -166,6 +184,7 @@ fn session_summary_label_truncates_long_prompts() {
         started_at_ms: 0,
         first_user_task: Some("a".repeat(200)),
         latest_summary: None,
+        turn_count: 0,
     };
     let label = summary.label();
     assert!(label.chars().count() <= 80, "label too long: {label}");

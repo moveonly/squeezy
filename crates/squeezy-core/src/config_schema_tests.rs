@@ -3,6 +3,11 @@ use super::*;
 #[test]
 fn every_section_has_at_least_one_field() {
     for section in CONFIG_SECTIONS {
+        // `Reset` is a synthetic action-only section — the TUI renders
+        // tier-delete rows instead of `FieldMeta` entries.
+        if section.id == SectionId::Reset {
+            continue;
+        }
         assert!(
             !section.fields.is_empty(),
             "section {} has no fields",

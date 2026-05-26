@@ -1269,7 +1269,12 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         ]
     );
 
-    for _ in 0..100 {
+    // The menu now wraps top↔bottom on Down/Up, so step exactly to the
+    // last index, then assert one more Down wraps back to the first item.
+    let target = suggestions.len() - 1;
+    let already_at = app.slash_menu_index;
+    let down_count = (target + suggestions.len() - already_at) % suggestions.len();
+    for _ in 0..down_count {
         handle_key(
             &mut app,
             &mut agent,
@@ -1286,8 +1291,24 @@ async fn slash_menu_scrolls_sorted_full_command_list_with_five_visible() {
         KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
     )
     .await
-    .expect("menu down at end");
-    assert_eq!(app.slash_menu_index, suggestions.len() - 1);
+    .expect("menu down past end wraps");
+    assert_eq!(
+        app.slash_menu_index, 0,
+        "Down past the end should wrap to 0"
+    );
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+    )
+    .await
+    .expect("menu up at top wraps");
+    assert_eq!(
+        app.slash_menu_index,
+        suggestions.len() - 1,
+        "Up from 0 should wrap to last"
+    );
 }
 
 #[test]
@@ -5371,8 +5392,9 @@ fn slash_parameter_hint_appears_in_render() {
     set_input(&mut app, "/verbosity".to_string());
     let output = render_to_string(&app, 120, 16);
     assert!(
-        output.contains("quiet|normal|verbose"),
-        "expected parameter hint to render: {output}"
+        output.contains("concise|normal|verbose"),
+        "expected parameter hint to render the response-verbosity options actually accepted \
+         by `/verbosity`: {output}"
     );
 }
 

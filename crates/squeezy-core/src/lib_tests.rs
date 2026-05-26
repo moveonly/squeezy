@@ -163,7 +163,7 @@ fn config_without_env_uses_openai_provider_defaults() {
     );
     match config.provider {
         ProviderConfig::OpenAi(openai) => {
-            assert_eq!(openai.api_key_env, "OPENAI_API_KEY");
+            assert_eq!(openai.api_key_env, "SQUEEZY_OPENAI_KEY");
             assert_eq!(openai.api_key_keychain.as_deref(), Some("squeezy:openai"));
             assert_eq!(openai.base_url, DEFAULT_OPENAI_BASE_URL);
         }
@@ -575,7 +575,7 @@ fn config_can_select_anthropic_provider_defaults() {
     assert_eq!(config.model, DEFAULT_ANTHROPIC_MODEL);
     match config.provider {
         ProviderConfig::Anthropic(anthropic) => {
-            assert_eq!(anthropic.api_key_env, "ANTHROPIC_API_KEY");
+            assert_eq!(anthropic.api_key_env, "SQUEEZY_ANTHROPIC_KEY");
             assert_eq!(anthropic.base_url, DEFAULT_ANTHROPIC_BASE_URL);
         }
         _ => panic!("expected Anthropic provider"),
@@ -2127,6 +2127,7 @@ fn resolve_field_source_uses_repo_then_project_then_user() {
         }),
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
+        repo_path_default: PathBuf::from("/r.toml"),
     };
     let models = &config_schema::CONFIG_SECTIONS[0];
     let provider_field = &models.fields[0]; // provider
@@ -2164,6 +2165,7 @@ fn resolve_field_source_returns_env_when_env_var_set() {
         repo: None,
         user_path_default: PathBuf::from("/u.toml"),
         project_path_default: PathBuf::from("/p.toml"),
+        repo_path_default: PathBuf::from("/r.toml"),
     };
     let provider_field = &config_schema::CONFIG_SECTIONS[0].fields[0];
     assert_eq!(

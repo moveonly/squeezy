@@ -41,20 +41,57 @@ pub fn resolve_api_key_with_store(
     env_var: &str,
     store: &dyn KeyringCredentialStore,
 ) -> Result<String> {
-    if let Ok(value) = env::var(env_var)
-        && !value.trim().is_empty()
+    // Try the configured env var first (env then keychain), then the
+    // common-vendor fallback (e.g. SQUEEZY_OPENAI_KEY → OPENAI_API_KEY)
+    // so users who only have the upstream-vendor name set still work.
+    if let Some(value) = lookup_env_or_keychain(env_var, store)? {
+        return Ok(value);
+    }
+    if let Some(fallback) = fallback_env_var(env_var)
+        && let Some(value) = lookup_env_or_keychain(&fallback, store)?
     {
         return Ok(value);
     }
+    let fallback_note = fallback_env_var(env_var)
+        .map(|name| format!(" or {name}"))
+        .unwrap_or_default();
+    Err(SqueezyError::ProviderNotConfigured(format!(
+        "missing {env_var}{fallback_note}; \
+         also checked keyring service {KEYRING_SERVICE} account {env_var}"
+    )))
+}
+
+fn lookup_env_or_keychain(
+    env_var: &str,
+    store: &dyn KeyringCredentialStore,
+) -> Result<Option<String>> {
+    if let Ok(value) = env::var(env_var)
+        && !value.trim().is_empty()
+    {
+        return Ok(Some(value));
+    }
     match store.load(env_var) {
-        Ok(Some(value)) if !value.trim().is_empty() => Ok(value),
-        Ok(_) => Err(SqueezyError::ProviderNotConfigured(format!(
-            "missing {env_var}; also checked keyring service {KEYRING_SERVICE} account {env_var}"
-        ))),
+        Ok(Some(value)) if !value.trim().is_empty() => Ok(Some(value)),
+        Ok(_) => Ok(None),
         Err(error) => Err(SqueezyError::ProviderNotConfigured(format!(
-            "missing {env_var}; keyring service {KEYRING_SERVICE} account {env_var} failed: {error}"
+            "keyring service {KEYRING_SERVICE} account {env_var} failed: {error}"
         ))),
     }
+}
+
+/// Translate between Squeezy's `SQUEEZY_<PROVIDER>_KEY` naming and each
+/// vendor's traditional `<PROVIDER>_API_KEY` so either env var resolves
+/// the same secret. Returns `None` when no translation is known.
+pub fn fallback_env_var(env_var: &str) -> Option<String> {
+    if let Some(stripped) = env_var.strip_prefix("SQUEEZY_")
+        && let Some(provider) = stripped.strip_suffix("_KEY")
+    {
+        return Some(format!("{provider}_API_KEY"));
+    }
+    if let Some(provider) = env_var.strip_suffix("_API_KEY") {
+        return Some(format!("SQUEEZY_{provider}_KEY"));
+    }
+    None
 }
 
 pub fn save_api_key_with_store(

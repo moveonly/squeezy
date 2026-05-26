@@ -35,25 +35,28 @@ fn opens_at_models_when_no_focus() {
 }
 
 #[test]
-fn tab_cycles_scope() {
+fn tab_cycles_through_three_scopes() {
     let mut state = ConfigScreenState::new(AppConfig::default(), None);
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
     assert_eq!(state.scope, ConfigScope::User);
+    for expected in [ConfigScope::Repo, ConfigScope::Local, ConfigScope::User] {
+        handle_key(
+            &mut state,
+            &mut agent,
+            &mut q,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.scope, expected);
+    }
+    // BackTab reverses.
     handle_key(
         &mut state,
         &mut agent,
         &mut q,
-        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::empty()),
     );
-    assert_eq!(state.scope, ConfigScope::Project);
-    handle_key(
-        &mut state,
-        &mut agent,
-        &mut q,
-        KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
-    );
-    assert_eq!(state.scope, ConfigScope::User);
+    assert_eq!(state.scope, ConfigScope::Local);
 }
 
 #[test]
@@ -81,20 +84,22 @@ fn arrow_keys_navigate_sections_and_fields() {
 
 #[test]
 fn space_toggles_bool_field() {
-    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Telemetry));
+    // Use a field whose schema declares no env_override so the assertion
+    // can't race with `enter_on_env_shadowed_field_emits_warning_*` setting
+    // SQUEEZY_TELEMETRY in parallel.
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Verbosity));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    let before = state.effective.telemetry.enabled;
-    // first field in Telemetry section is `enabled` (Bool).
+    // show_reasoning_usage is at index 4 in Verbosity: env_override=None, Bool.
+    state.field_index = 4;
+    let before = state.effective.tui.show_reasoning_usage;
     handle_key(
         &mut state,
         &mut agent,
         &mut q,
         KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
     );
-    // Toggling will try to save (which writes to disk) — to keep the test
-    // hermetic we only assert the in-memory effective config flipped.
-    assert_ne!(state.effective.telemetry.enabled, before);
+    assert_ne!(state.effective.tui.show_reasoning_usage, before);
 }
 
 #[test]
@@ -143,7 +148,7 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
     let mut agent = make_agent();
     let mut q = NotificationQueue::new();
-    // The `provider` field is index 0; the `model` field is index 1.
+    // Layout: provider at row 0, model at row 1, synthetic API-key at row 2.
     state.field_index = 1;
     handle_key(
         &mut state,
@@ -183,6 +188,117 @@ async fn enter_on_model_field_opens_picker_and_filter_narrows_matches() {
     assert!(
         after_tab > 0,
         "all-providers + claude filter should match anthropic models"
+    );
+}
+
+#[tokio::test]
+async fn esc_on_model_picker_closes_picker_only() {
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SectionId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1; // model row (synthetic API-key now lives at row 2)
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(state.picker.is_some(), "picker should be open");
+    let outcome = handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+    );
+    assert!(state.picker.is_none(), "Esc should close the picker");
+    assert!(
+        matches!(outcome, KeyOutcome::KeepOpen),
+        "Esc on picker should NOT close the whole screen",
+    );
+}
+
+#[tokio::test]
+async fn space_cycles_model_field_to_next_registry_entry() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_MODEL");
+        std::env::remove_var("SQUEEZY_PROVIDER");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 1; // model row (synthetic API-key now lives at row 2)
+    let before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let after = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String, got {other:?}"),
+    };
+    assert_ne!(
+        before, after,
+        "Space on model should advance to a different registry entry"
+    );
+}
+
+#[tokio::test]
+async fn space_on_non_cyclable_field_emits_hint() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Limits));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // max_parallel_tools is Integer — Space should surface a hint, not silently no-op.
+    state.field_index = 0;
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let current = q.current().expect("hint notification queued");
+    assert!(
+        current.message.contains("Space doesn't cycle"),
+        "expected cycling hint, got: {}",
+        current.message
+    );
+}
+
+#[tokio::test]
+async fn space_cycles_enum_field_to_next_option() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_PROVIDER");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    state.field_index = 0; // provider (Enum)
+    let before = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+        FieldValue::Enum(v) => v,
+        other => panic!("expected enum, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let after = match (CONFIG_SECTIONS[0].fields[0].get)(&state.effective) {
+        FieldValue::Enum(v) => v,
+        other => panic!("expected enum, got {other:?}"),
+    };
+    assert_ne!(
+        before, after,
+        "Space should advance enum to a different value"
     );
 }
 
@@ -286,6 +402,131 @@ fn notification_dismiss_current_and_clear_all() {
     let removed = q.clear_all();
     assert_eq!(removed, 2);
     assert!(q.is_empty());
+}
+
+#[tokio::test]
+async fn space_cycling_provider_resets_model_in_memory() {
+    use squeezy_core::config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId};
+    // SAFETY: tests in this module run single-threaded.
+    unsafe {
+        std::env::remove_var("SQUEEZY_PROVIDER");
+        std::env::remove_var("SQUEEZY_MODEL");
+    }
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Models));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    // provider is row 0
+    state.field_index = 0;
+    let model_before = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String model, got {other:?}"),
+    };
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()),
+    );
+    let model_after = match (CONFIG_SECTIONS[0].fields[1].get)(&state.effective) {
+        FieldValue::String(s) => s,
+        other => panic!("expected String model, got {other:?}"),
+    };
+    assert_ne!(
+        model_before, model_after,
+        "switching provider via Space must also reset the model to that provider's default"
+    );
+}
+
+#[test]
+fn secret_entry_editor_inserts_and_backspaces_multibyte() {
+    let mut entry = SecretEntryState {
+        env_var: "SQUEEZY_OPENAI_KEY".to_string(),
+        provider_label: "OpenAI".to_string(),
+        draft: String::new(),
+        cursor: 0,
+        reveal: false,
+    };
+    for c in ['s', 'k', '-', 'é'] {
+        entry.insert_char(c);
+    }
+    assert_eq!(entry.draft, "sk-é");
+    assert_eq!(entry.cursor, 4);
+    assert_eq!(entry.char_len(), 4);
+    entry.backspace();
+    assert_eq!(entry.draft, "sk-");
+    assert_eq!(entry.cursor, 3);
+    // Cursor mid-string then insert should land between the existing chars.
+    entry.cursor = 1;
+    entry.insert_char('!');
+    assert_eq!(entry.draft, "s!k-");
+    assert_eq!(entry.cursor, 2);
+    entry.wipe();
+    assert!(entry.draft.is_empty());
+    assert_eq!(entry.cursor, 0);
+}
+
+#[test]
+fn reset_preview_reports_changed_fields() {
+    use squeezy_core::{
+        TierSource,
+        config_schema::{CONFIG_SECTIONS, FieldValue, SectionId as SId},
+    };
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Permissions));
+    // Synthesize a User tier that flips `permissions.read` from the
+    // default `allow` to `deny`. The Reset preview for `User` must
+    // include this field (`deny` → `allow`).
+    let toml_text = "[permissions]\nread = \"deny\"\n";
+    state.sources.user = Some(TierSource {
+        path: std::path::PathBuf::from("/virtual/user.toml"),
+        doc: toml_text.parse().expect("valid toml"),
+    });
+    // Bring `state.effective` in line with the tier so before == "deny".
+    let perm_read = CONFIG_SECTIONS
+        .iter()
+        .find(|s| s.id == SId::Permissions)
+        .unwrap()
+        .fields
+        .iter()
+        .find(|f| f.label == "read")
+        .unwrap();
+    (perm_read.set)(&mut state.effective, FieldValue::Enum("deny")).unwrap();
+
+    let preview = state.reset_preview(ConfigScope::User);
+    let entry = preview
+        .iter()
+        .find(|e| e.field_label == "read")
+        .expect("preview should flag permissions.read as changing");
+    assert_eq!(entry.before, "deny");
+    assert_eq!(entry.after, "allow");
+}
+
+#[tokio::test]
+async fn reset_section_enter_arms_confirmation_and_n_cancels() {
+    use squeezy_core::config_schema::SectionId as SId;
+    let mut state = ConfigScreenState::new(AppConfig::default(), Some(SId::Reset));
+    let mut agent = make_agent();
+    let mut q = NotificationQueue::new();
+    assert_eq!(state.field_index, 0);
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+    );
+    assert!(
+        state.reset_confirm.is_some(),
+        "Enter on a Reset row should arm the y/n confirmation"
+    );
+    handle_key(
+        &mut state,
+        &mut agent,
+        &mut q,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+    );
+    assert!(
+        state.reset_confirm.is_none(),
+        "`n` should cancel the confirmation"
+    );
 }
 
 #[test]
