@@ -1,10 +1,11 @@
 ---
 import BaseLayout from "../layouts/BaseLayout.astro";
+import Wip from "../components/Wip.astro";
 import { SITE } from "../config";
 ---
 
 <BaseLayout
-  title="Contact - Squeezy"
+  title="Support · Squeezy"
   description="How to report Squeezy issues, send redacted diagnostics, and follow the repository."
   active="docs"
 >
@@ -29,21 +30,22 @@ import { SITE } from "../config";
           Use issues for reproducible bugs, platform problems, installation
           failures, provider configuration problems, and feature requests.
         </p>
-        <a class="text-link" href={SITE.issuesUrl} data-track-click="contact_issues" data-track-target="github">Open issues</a>
+        <a class="text-link" href={SITE.issuesUrl} data-track-click="support_issues" data-track-target="github">Open issues</a>
       </article>
       <article class="card">
         <span class="label">diagnostics</span>
         <h3>Redacted reports</h3>
         <p>
-          Use `/report` or `squeezy sessions report --preview` to inspect the
+          Use <code>/report</code> or <code>squeezy sessions report --preview</code> to inspect the
           local redacted manifest before uploading a diagnostic archive.
         </p>
-        <a class="text-link" href="/docs/troubleshooting/" data-track-click="contact_troubleshooting">Report workflow</a>
+        <a class="text-link" href="/docs/troubleshooting/" data-track-click="support_troubleshooting">Report workflow</a>
       </article>
       <article class="card">
         <span class="label">security</span>
         <h3>Security</h3>
-        <p>{SITE.securityContactLabel}. Do not put secrets, private code, or report archive contents in public issues.</p>
+        <Wip label="WIP" />
+        <p>{SITE.securityContactLabel} In the meantime, do not put secrets, private code, or report archive contents in public issues.</p>
       </article>
     </div>
   </section>

@@ -158,6 +158,12 @@ pre code {
   backdrop-filter: blur(16px);
 }
 
+.brand-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .brand {
   display: inline-flex;
   align-items: center;
@@ -165,6 +171,25 @@ pre code {
   color: var(--text);
   font-size: 1.08rem;
   font-weight: 700;
+}
+
+.brand-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px dashed var(--faint);
+  border-radius: var(--radius);
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.brand-status:hover {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .brand-mark {
@@ -632,7 +657,7 @@ small {
 
 .flow {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -778,6 +803,26 @@ small {
   color: var(--amber);
 }
 
+.status-pill.wip {
+  border-color: var(--faint);
+  border-style: dashed;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.wip-inline {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.wip-note {
+  color: var(--faint);
+  font-size: 0.94rem;
+}
+
 .matrix {
   display: grid;
   gap: 12px;
@@ -800,6 +845,33 @@ small {
   grid-template-columns: 1fr;
   gap: 8px;
   padding: 14px 0;
+}
+
+.footnote {
+  max-width: 720px;
+  margin-top: 18px;
+  color: var(--faint);
+  font-size: 0.96rem;
+}
+
+.footnote a {
+  color: var(--amber);
+}
+
+.footnote a:hover {
+  color: var(--text);
+}
+
+.example-prompt {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  background: rgba(8, 8, 7, 0.6);
+  color: #efe3c5;
+  font-family: var(--mono);
+  font-size: 0.96rem;
+  font-style: normal;
 }
 
 .roadmap {
@@ -831,6 +903,12 @@ small {
 .site-footer p {
   max-width: 540px;
   margin-top: 12px;
+}
+
+.footer-meta {
+  margin-top: 8px;
+  color: var(--faint);
+  font-size: 0.92rem;
 }
 
 .footer-links {

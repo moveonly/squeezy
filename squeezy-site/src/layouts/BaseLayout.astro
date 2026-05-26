@@ -7,11 +7,29 @@ const {
   title = SITE.name,
   description = SITE.description,
   active = "",
-  ogImage = "/og.svg"
+  ogImage = "/og.svg",
+  jsonLd = false
 } = Astro.props;
 
 const canonicalUrl = new URL(Astro.url.pathname, SITE.url).toString();
 const imageUrl = new URL(ogImage, SITE.url).toString();
+
+const softwareJsonLd = {
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  name: SITE.name,
+  description: SITE.description,
+  applicationCategory: "DeveloperApplication",
+  operatingSystem: "macOS, Linux, Windows",
+  url: SITE.url,
+  downloadUrl: SITE.repoUrl,
+  license: "https://www.apache.org/licenses/LICENSE-2.0",
+  offers: {
+    "@type": "Offer",
+    price: "0",
+    priceCurrency: "USD"
+  }
+};
 
 const navItems = [
   { href: "/how-it-works/", label: "How it works", key: "how" },
@@ -29,7 +47,7 @@ const navItems = [
     <meta charset="UTF-8" />
     <meta name="description" content={description} />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#080a08" />
+    <meta name="theme-color" content="#080807" />
     <link rel="canonical" href={canonicalUrl} />
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <link rel="manifest" href="/site.webmanifest" />
@@ -43,14 +61,25 @@ const navItems = [
     <meta name="twitter:title" content={title} />
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={imageUrl} />
+    {jsonLd && (
+      <script type="application/ld+json" set:html={JSON.stringify(softwareJsonLd)} />
+    )}
     <title>{title}</title>
   </head>
   <body>
     <header class="site-header">
-      <a class="brand" href="/" aria-label="Squeezy home" data-track-click="brand_home">
-        <span class="brand-mark">sq</span>
-        <span>Squeezy</span>
-      </a>
+      <div class="brand-group">
+        <a class="brand" href="/" aria-label="Squeezy home" data-track-click="brand_home">
+          <span class="brand-mark">sq</span>
+          <span>Squeezy</span>
+        </a>
+        <a
+          class="brand-status"
+          href="/roadmap/"
+          aria-label="Squeezy is pre-1.0. See the roadmap."
+          data-track-click="brand_status"
+        >Pre-1.0</a>
+      </div>
       <nav class="site-nav" aria-label="Primary navigation">
         {
           navItems.map((item) => (
@@ -84,15 +113,20 @@ const navItems = [
           <span>Squeezy</span>
         </a>
         <p>
-          CPU-first code understanding for teams that pay for every model token.
+          A terminal coding agent with a local semantic graph at its core.
+        </p>
+        <p class="footer-meta">
+          Squeezy is pre-1.0; some surfaces are marked WIP.
         </p>
       </div>
       <div class="footer-links">
         <a href="/install/" data-track-click="footer_install">Install</a>
-        <a href="/docs/">Docs</a>
-        <a href="/benchmarks/">Cost benchmark</a>
-        <a href="/contact/">Contact</a>
-        <a href={SITE.repoUrl} data-track-click="github_footer" data-track-target="github">GitHub</a>
+        <a href="/docs/" data-track-click="footer_docs">Docs</a>
+        <a href="/benchmarks/" data-track-click="footer_benchmarks">Benchmark</a>
+        <a href="/roadmap/" data-track-click="footer_roadmap">Roadmap</a>
+        <a href="/support/" data-track-click="footer_support">Support</a>
+        <a href="/privacy/" data-track-click="footer_privacy">Privacy</a>
+        <a href={SITE.repoUrl} data-track-click="footer_github" data-track-target="github">GitHub</a>
       </div>
     </footer>
     <script define:vars={{ telemetryEndpoint: SITE.telemetryEndpoint }}>

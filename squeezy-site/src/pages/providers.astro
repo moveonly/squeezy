@@ -4,18 +4,18 @@ import { providerRows } from "../facts";
 ---
 
 <BaseLayout
-  title="Provider Support - Squeezy"
+  title="Providers · Squeezy"
   description="Squeezy provider adapter support for OpenAI, Anthropic, Google, Azure OpenAI, Amazon Bedrock, and Ollama."
   active="providers"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
-      <span class="eyebrow">provider support</span>
+      <span class="eyebrow">providers</span>
       <h1>Bring your model. Keep the optimization local.</h1>
       <p class="lead">
-        Squeezy is not trying to be a model vendor. It keeps the agent runtime,
-        code analysis, permissions, and cost controls local, then connects to
-        hosted or local model providers through one tool loop.
+        Squeezy keeps the agent runtime, code analysis, permissions, and cost
+        controls local, then routes model turns through OpenAI, Anthropic,
+        Google, Azure OpenAI, Amazon Bedrock, or Ollama under one tool loop.
       </p>
     </div>
   </section>
@@ -29,17 +29,23 @@ import { providerRows } from "../facts";
               <h3>{row.name}</h3>
             </div>
             <p>{row.detail}</p>
+            {row.status && <span class="status-pill">{row.status}</span>}
           </article>
         ))
       }
     </div>
+    <p class="footnote">
+      Default models and context windows are seed metadata from the provider
+      registry, used for routing and local accounting. They are not provider
+      billing authority. See <a href="/docs/providers/">the providers doc</a>.
+    </p>
   </section>
 
   <section class="section band">
     <div class="grid-2 align-center">
       <div class="section-header">
         <span class="eyebrow">configuration</span>
-        <h2>Provider selection is configuration, not lock-in.</h2>
+        <h2>Bring your own model. Squeezy stays the agent.</h2>
         <p>
           Squeezy resolves model settings from CLI flags, environment variables,
           project configuration, user settings, and built-in defaults. Hosted

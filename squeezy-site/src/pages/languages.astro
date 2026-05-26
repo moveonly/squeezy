@@ -4,14 +4,14 @@ import { languageRows } from "../facts";
 ---
 
 <BaseLayout
-  title="Language Coverage - Squeezy"
-  description="Squeezy premium graph support across Rust, Python, Java, C#, Go, C, C++, JavaScript, and TypeScript, with bounded fallback for other languages."
+  title="Languages · Squeezy"
+  description="First-class graph navigation across Rust, Python, Java, C#, Go, C, C++, JavaScript, and TypeScript, with bounded fallback for other languages."
   active="languages"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">language coverage</span>
-      <h1>Premium graph support for the languages your teams maintain most.</h1>
+      <h1>First-class graph support for the languages your teams maintain most.</h1>
       <p class="lead">
         Squeezy gives these languages the strongest cost-saving path: local
         graph navigation before broad file reads. Other languages still work
@@ -37,13 +37,42 @@ import { languageRows } from "../facts";
     </div>
   </section>
 
+  <section class="section">
+    <div class="section-header">
+      <span class="eyebrow">known limitations</span>
+      <h2>What graph navigation deliberately does not solve.</h2>
+      <p>
+        Squeezy's graph is local and tree-sitter-based. It is fast and
+        deterministic, but it is not a type checker or a runtime model. The
+        following items stay heuristic, external, or fallback by design.
+      </p>
+    </div>
+    <div class="grid-3">
+      <article class="card">
+        <span class="label">dynamic dispatch</span>
+        <h3>Runtime resolution</h3>
+        <p>Virtual dispatch, interface satisfaction, dynamic attribute access, and reflection-style call resolution stay candidate-grade.</p>
+      </article>
+      <article class="card">
+        <span class="label">type solving</span>
+        <h3>Overloads and inference</h3>
+        <p>Overload resolution, generic constraint solving, and full type inference are out of scope. Squeezy defers to compilers when the task needs them.</p>
+      </article>
+      <article class="card">
+        <span class="label">build systems</span>
+        <h3>Macros, generated code, templates</h3>
+        <p>Macro expansion, code generation, template instantiation, and complex preprocessor state are evidence for fallback, not exact compiler state.</p>
+      </article>
+    </div>
+  </section>
+
   <section class="section band">
     <div class="section-header">
       <span class="eyebrow">graph coverage</span>
-      <h2>Language-aware indexing gives the model a smaller starting packet.</h2>
+      <h2>Language-aware indexing narrows the starting question.</h2>
       <p>
-        Premium language support means Squeezy can answer architecture, impact,
-        and symbol questions from local evidence first: declarations,
+        First-class language support means Squeezy can answer architecture,
+        impact, and symbol questions from local structure first: declarations,
         relationships, calls, references, workspace facts, and changed-code
         context.
       </p>
@@ -51,8 +80,8 @@ import { languageRows } from "../facts";
         <a class="button" href="/docs/semantic-navigation/" data-track-click="languages_graph_docs">
           Graph docs
         </a>
-        <a class="button secondary" href="/docs/cost-receipts/" data-track-click="languages_optimization_docs">
-          Optimization docs
+        <a class="button secondary" href="/docs/cost-receipts/" data-track-click="languages_cost_docs">
+          Cost &amp; receipts
         </a>
       </div>
     </div>

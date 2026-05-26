@@ -3,12 +3,12 @@ import DocsLayout from "../../layouts/DocsLayout.astro";
 ---
 
 <DocsLayout
-  title="Semantic Graph - Squeezy"
+  title="Semantic graph · Squeezy"
   description="How Squeezy builds and refreshes graph-backed static analysis for code navigation."
   activeDoc="/docs/semantic-navigation/"
   eyebrow="semantic graph"
   heading="Squeezy builds a local map before it asks the model to reason."
-  lead="The graph is the main cost-control mechanism: it turns broad repository questions into compact local evidence packets."
+  lead="The graph is the main cost-control mechanism: it turns broad repository questions into narrowed local answers with paths, spans, and confidence."
 >
   <section class="doc-block">
     <h2>What the graph stores</h2>
@@ -52,6 +52,6 @@ read_slice</code></pre>
 
   <section class="doc-block">
     <h2>Coverage labels guide the next action</h2>
-    <p>Generated files, vendor paths, dynamic language features, framework conventions, and external packages stay visible in the evidence packet with labels that tell the agent whether to continue with graph navigation, read an exact slice, search locally, or run a verifier.</p>
+    <p>Generated files, vendor paths, dynamic language features, framework conventions, and external packages stay visible in the result with labels that tell the agent whether to continue with graph navigation, read an exact slice, search locally, or run a verifier.</p>
   </section>
 </DocsLayout>

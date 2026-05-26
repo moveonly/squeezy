@@ -3,18 +3,17 @@ import BaseLayout from "../layouts/BaseLayout.astro";
 ---
 
 <BaseLayout
-  title="Roadmap - Squeezy"
-  description="Squeezy launch readiness and product evidence."
+  title="Roadmap · Squeezy"
+  description="What Squeezy is shipping next: release artifacts, benchmark publication, Windows code signing, and language coverage."
   active="docs"
 >
   <section class="page-hero">
     <div class="page-hero-inner">
       <span class="eyebrow">roadmap</span>
-      <h1>Launch work is focused on evidence and distribution.</h1>
+      <h1>What's shipping next.</h1>
       <p class="lead">
-        The website, install paths, benchmark reports, telemetry pipeline, and
-        demo assets all support the same goal: explain how Squeezy reduces
-        unnecessary model context with local code understanding.
+        Squeezy is pre-1.0. The roadmap is short on purpose: a small number of
+        items the next release should deliver, each with a visible status.
       </p>
     </div>
   </section>
@@ -22,31 +21,38 @@ import BaseLayout from "../layouts/BaseLayout.astro";
   <section class="section">
     <div class="roadmap">
       <article class="roadmap-item">
-        <span class="status-pill ok">current</span>
+        <span class="status-pill ok">shipping</span>
         <div>
-          <h3>Professional static website</h3>
-          <p>Keep the site fast, factual, and focused on CPU-first code understanding and token-aware agent work.</p>
+          <h3>First-class graph coverage across nine languages</h3>
+          <p>Rust, Python, Java, C#, Go, C, C++, JavaScript, and TypeScript share the same navigation surface today: declarations, references, callers, hierarchy, flow, and exact reads.</p>
         </div>
       </article>
       <article class="roadmap-item">
-        <span class="status-pill ok">current</span>
+        <span class="status-pill ok">shipping</span>
         <div>
-          <h3>Visitor tracking through existing telemetry</h3>
-          <p>Track anonymous website visits and CTA clicks through the Cloudflare Worker and PostHog layer without adding a dynamic website backend.</p>
+          <h3>Six provider adapters</h3>
+          <p>OpenAI, Anthropic, Google Gemini, Azure OpenAI, Amazon Bedrock, and Ollama route through one tool loop with shared cost, context, and budget accounting.</p>
         </div>
       </article>
       <article class="roadmap-item">
-        <span class="status-pill">launch</span>
+        <span class="status-pill wip">in progress</span>
         <div>
-          <h3>Release-linked install assets</h3>
-          <p>Connect package-manager and archive install paths to tagged release artifacts.</p>
+          <h3>Release-tagged install artifacts</h3>
+          <p>Pin the curl installer, Homebrew tap, Winget package, and GitHub archives to tagged releases with SHA-256 sidecars and reproducible install flows.</p>
         </div>
       </article>
       <article class="roadmap-item">
-        <span class="status-pill">evidence</span>
+        <span class="status-pill wip">in progress</span>
         <div>
-          <h3>Benchmark-backed cost story</h3>
-          <p>Publish reproducible reports that connect graph navigation, exact reads, receipts, and output shaping to model-context savings.</p>
+          <h3>Reproducible cost-savings benchmark</h3>
+          <p>Publish a benchmark report that pairs navigation quality with measured read bytes, tool calls, provider tokens, and a documented baseline.</p>
+        </div>
+      </article>
+      <article class="roadmap-item">
+        <span class="status-pill wip">in progress</span>
+        <div>
+          <h3>Signed Windows release</h3>
+          <p>Sign the Windows x86_64 archive so SmartScreen stops flagging first runs of a fresh binary.</p>
         </div>
       </article>
     </div>

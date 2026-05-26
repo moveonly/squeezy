@@ -9,9 +9,9 @@
   <circle cx="118" cy="106" r="8" fill="#caa647"/>
   <circle cx="146" cy="106" r="8" fill="#665728"/>
   <circle cx="174" cy="106" r="8" fill="#665728"/>
-  <text x="96" y="224" fill="#caa647" font-family="Menlo, monospace" font-size="30">structure-first agent</text>
-  <text x="96" y="314" fill="#f4eee6" font-family="Inter, Arial, sans-serif" font-size="72" font-weight="800">Understand code</text>
-  <text x="96" y="394" fill="#f4eee6" font-family="Inter, Arial, sans-serif" font-size="72" font-weight="800">before tokens.</text>
-  <text x="96" y="468" fill="#b8b09d" font-family="Inter, Arial, sans-serif" font-size="34">Local static analysis before billable model context.</text>
+  <text x="96" y="224" fill="#caa647" font-family="Menlo, monospace" font-size="30">structure-first coding agent</text>
+  <text x="96" y="314" fill="#f4eee6" font-family="Inter, Arial, sans-serif" font-size="72" font-weight="800">Understand the repo</text>
+  <text x="96" y="394" fill="#f4eee6" font-family="Inter, Arial, sans-serif" font-size="72" font-weight="800">before the tokens.</text>
+  <text x="96" y="468" fill="#b8b09d" font-family="Inter, Arial, sans-serif" font-size="34">Local semantic graph. Bring your own model.</text>
   <text x="96" y="522" fill="#caa647" font-family="Menlo, monospace" font-size="28">squeezyagent.com</text>
 </svg>

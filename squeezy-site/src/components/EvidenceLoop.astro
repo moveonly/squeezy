@@ -1,6 +1,12 @@
-<div class="evidence-loop" aria-label="Animated evidence loop">
-  <canvas id="evidence-loop-canvas" width="960" height="520"></canvas>
-  <div class="evidence-legend">
+<div class="evidence-loop">
+  <canvas
+    id="evidence-loop-canvas"
+    width="960"
+    height="520"
+    role="img"
+    aria-label="Diagram: an intent leads to graph queries, then to narrowed evidence, then to a model call."
+  ></canvas>
+  <div class="evidence-legend" aria-hidden="true">
     <span>intent</span>
     <span>graph</span>
     <span>evidence</span>
@@ -11,6 +17,8 @@
 <script>
   const canvas = document.getElementById("evidence-loop-canvas");
   const context = canvas instanceof HTMLCanvasElement ? canvas.getContext("2d") : null;
+
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 
   if (canvas && context) {
     const nodes = [
@@ -54,7 +62,7 @@
       for (let index = 0; index < points.length; index += 1) {
         const current = points[index];
         const next = points[(index + 1) % points.length];
-        const pulse = (Math.sin(time / 650 + index * 1.4) + 1) / 2;
+        const pulse = reducedMotion ? 0.5 : (Math.sin(time / 650 + index * 1.4) + 1) / 2;
         context.strokeStyle = `rgba(240, 184, 77, ${0.18 + pulse * 0.32})`;
         context.lineWidth = 2;
         context.beginPath();
@@ -71,7 +79,7 @@
       }
 
       for (const point of points) {
-        const radius = 14 + Math.sin(time / 700 + point.px) * 2;
+        const radius = reducedMotion ? 14 : 14 + Math.sin(time / 700 + point.px) * 2;
         context.fillStyle = point.color;
         context.beginPath();
         context.arc(point.px, point.py, radius, 0, Math.PI * 2);
@@ -81,11 +89,22 @@
         context.fillText(point.label, point.px - 34, point.py + 34);
       }
 
-      requestAnimationFrame(draw);
+      if (!reducedMotion) {
+        requestAnimationFrame(draw);
+      }
     };
 
     resize();
-    window.addEventListener("resize", resize);
-    requestAnimationFrame(draw);
+    window.addEventListener("resize", () => {
+      resize();
+      if (reducedMotion) {
+        draw(0);
+      }
+    });
+    if (reducedMotion) {
+      draw(0);
+    } else {
+      requestAnimationFrame(draw);
+    }
   }
 </script>
