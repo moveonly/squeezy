@@ -3505,7 +3505,7 @@ async fn shell_denies_protected_metadata_write_before_spawn() {
 async fn shell_workdir_accepts_configured_extra_root() {
     let root = temp_workspace("shell_extra_workdir");
     let extra = temp_workspace("shell_extra_root");
-    let extra = fs::canonicalize(&extra).expect("canonical extra root");
+    let extra = canonicalize_workspace_root(&extra).expect("canonical extra root");
     let shell_sandbox = squeezy_core::ShellSandboxConfig {
         mode: squeezy_core::ShellSandboxMode::Off,
         write_roots: vec![extra.clone()],
