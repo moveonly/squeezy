@@ -5541,6 +5541,44 @@ fn apply_mcp_status_update_logs_transitions_to_and_from_servers() {
 }
 
 #[test]
+fn terminal_title_for_clears_when_idle() {
+    assert_eq!(
+        terminal_title_for(TerminalTitleState::Cleared, "~/proj", 0),
+        None
+    );
+}
+
+#[test]
+fn terminal_title_for_animates_spinner_while_working() {
+    let early = terminal_title_for(TerminalTitleState::Working, "~/proj", 0)
+        .expect("working state always renders a title");
+    let later = terminal_title_for(
+        TerminalTitleState::Working,
+        "~/proj",
+        TITLE_SPINNER_INTERVAL_MS,
+    )
+    .expect("working state always renders a title");
+    assert!(early.contains("squeezy · ~/proj"), "got: {early}");
+    assert!(later.contains("squeezy · ~/proj"), "got: {later}");
+    assert_ne!(
+        early.chars().next(),
+        later.chars().next(),
+        "spinner frame should advance after one interval"
+    );
+}
+
+#[test]
+fn terminal_title_for_uses_notification_glyph_when_done() {
+    let title = terminal_title_for(TerminalTitleState::Notification, "~/proj", 0)
+        .expect("notification state always renders a title");
+    assert!(
+        title.starts_with(TITLE_NOTIFICATION_GLYPH),
+        "expected notification glyph prefix, got: {title}"
+    );
+    assert!(title.contains("~/proj"), "got: {title}");
+}
+
+#[test]
 fn working_panel_height_is_one_without_detail() {
     let mut app = test_app(SessionMode::Build);
     app.cancel = Some(CancellationToken::new()); // turn in progress

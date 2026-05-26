@@ -93,6 +93,37 @@ const DISABLE_MOUSE_MODES: &str = "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l"
 const CLEAR_SCROLLBACK_AND_VISIBLE: &str = "\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H";
 const RESET_KEYBOARD_ENHANCEMENT_FLAGS: &str = "\x1b[<u";
 const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
+const TITLE_SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const TITLE_SPINNER_INTERVAL_MS: u64 = 100;
+const TITLE_NOTIFICATION_GLYPH: &str = "●";
+
+/// Tracks what we want the terminal window/tab title to convey. Most
+/// terminal emulators surface their own "activity" indicator that
+/// flickers any time stdout sees output, which leaves users staring at
+/// a constantly buzzing tab. Taking the title over ourselves lets us
+/// give honest signal: spinner while a turn is in flight, a
+/// notification glyph once it finishes, and a clear once the user has
+/// interacted again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TerminalTitleState {
+    Cleared,
+    Working,
+    Notification,
+}
+
+fn terminal_title_for(state: TerminalTitleState, label: &str, elapsed_ms: u64) -> Option<String> {
+    match state {
+        TerminalTitleState::Cleared => None,
+        TerminalTitleState::Working => {
+            let idx =
+                ((elapsed_ms / TITLE_SPINNER_INTERVAL_MS) as usize) % TITLE_SPINNER_FRAMES.len();
+            Some(format!("{} squeezy · {label}", TITLE_SPINNER_FRAMES[idx]))
+        }
+        TerminalTitleState::Notification => {
+            Some(format!("{TITLE_NOTIFICATION_GLYPH} squeezy · {label}"))
+        }
+    }
+}
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -420,7 +451,7 @@ async fn run_inner(
     loop {
         app.animation_tick = app.animation_tick.wrapping_add(1);
         app.app_notifications.tick();
-        terminal.draw_app(&app)?;
+        terminal.draw_app(&mut app)?;
 
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
@@ -1237,6 +1268,10 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
             handle_paste(app, agent, text).await?;
             Ok(false)
         }
+        Event::Resize(_, _) => {
+            app.pending_resize = true;
+            Ok(false)
+        }
         _ => Ok(false),
     }
 }
@@ -1255,6 +1290,13 @@ fn handle_mouse(app: &mut TuiApp, kind: MouseEventKind) {
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(false);
+    }
+
+    // Any keypress while a turn-done notification is up counts as the
+    // user acknowledging it — drop the title back to cleared so the
+    // emulator's tab/window stops showing the bulb glyph.
+    if app.terminal_title_state == TerminalTitleState::Notification {
+        app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
     // F11 toggles the config screen from anywhere. Ctrl+C is still honored
@@ -8357,6 +8399,14 @@ struct TuiApp {
     turn_visual: TurnVisualState,
     turn_started_at: Option<Instant>,
     last_turn_duration: Option<Duration>,
+    /// Set when a terminal resize event arrives so the next draw can wipe
+    /// the inline viewport before ratatui's autoresize scrolls stale frame
+    /// content up into the scrollback above the new viewport.
+    pending_resize: bool,
+    terminal_title_state: TerminalTitleState,
+    /// Last OSC title we wrote, so that repeated identical writes are
+    /// suppressed and emitter logic stays idempotent across redraws.
+    last_terminal_title: Option<String>,
     animation_tick: u64,
     animation_tick_rate: Duration,
     exit_confirm_armed: bool,
@@ -8509,6 +8559,9 @@ impl TuiApp {
             turn_visual: TurnVisualState::Idle,
             turn_started_at: None,
             last_turn_duration: None,
+            pending_resize: false,
+            terminal_title_state: TerminalTitleState::Cleared,
+            last_terminal_title: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
             exit_confirm_armed: false,
@@ -8541,12 +8594,14 @@ impl TuiApp {
             self.turn_started_at = Some(Instant::now());
         }
         self.last_turn_duration = None;
+        self.terminal_title_state = TerminalTitleState::Working;
     }
 
     fn note_turn_finished(&mut self) {
         if let Some(started_at) = self.turn_started_at.take() {
             self.last_turn_duration = Some(started_at.elapsed());
         }
+        self.terminal_title_state = TerminalTitleState::Notification;
     }
 
     fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -9012,7 +9067,12 @@ impl TerminalGuard {
         self.exit_hint = exit_hint;
     }
 
-    fn draw_app(&mut self, app: &TuiApp) -> Result<()> {
+    fn draw_app(&mut self, app: &mut TuiApp) -> Result<()> {
+        if app.pending_resize {
+            app.pending_resize = false;
+            self.wipe_inline_viewport_for_resize()?;
+        }
+        self.apply_terminal_title(app)?;
         match self.mode {
             TerminalMode::Inline => {
                 self.flush_history(app)?;
@@ -9022,6 +9082,46 @@ impl TerminalGuard {
         }
         .map(|_| ())
         .map_err(|err| SqueezyError::Terminal(err.to_string()))
+    }
+
+    fn apply_terminal_title(&mut self, app: &mut TuiApp) -> Result<()> {
+        let elapsed_ms = prompt_elapsed_ms(app);
+        let desired = terminal_title_for(app.terminal_title_state, &app.directory, elapsed_ms);
+        if desired == app.last_terminal_title {
+            return Ok(());
+        }
+        let backend = self.terminal.backend_mut();
+        match &desired {
+            Some(title) => write!(backend, "\x1b]0;{title}\x07"),
+            None => write!(backend, "\x1b]0;\x07"),
+        }
+        .and_then(|_| backend.flush())
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        app.last_terminal_title = desired;
+        Ok(())
+    }
+
+    /// Crossterm's autoresize for inline viewports calls `append_lines` to
+    /// shift the previous frame upward before redrawing — leaving the old
+    /// frame's contents (e.g. the "Worked for Ns" divider) stranded as
+    /// scrollback above the new viewport. Wiping from the current viewport
+    /// top down before the next draw means there is nothing stale for the
+    /// scroll to pull up. Alternate-screen mode handles resize cleanly via
+    /// the terminal itself, so the work is inline-only.
+    fn wipe_inline_viewport_for_resize(&mut self) -> Result<()> {
+        if self.mode != TerminalMode::Inline {
+            return Ok(());
+        }
+        let viewport_top = self.terminal.get_frame().area().y;
+        execute!(
+            self.terminal.backend_mut(),
+            MoveTo(0, viewport_top),
+            Clear(ClearType::FromCursorDown)
+        )
+        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+        self.terminal
+            .clear()
+            .map_err(|err| SqueezyError::Terminal(err.to_string()))
     }
 
     fn flush_history(&mut self, app: &TuiApp) -> Result<()> {
@@ -9068,6 +9168,7 @@ impl Drop for TerminalGuard {
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
+                    Print("\x1b]0;\x07"),
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE)
                 );
             }
@@ -9080,6 +9181,7 @@ impl Drop for TerminalGuard {
                     DisableBracketedPaste,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
+                    Print("\x1b]0;\x07"),
                     Clear(ClearType::All),
                     MoveTo(0, 0),
                     LeaveAlternateScreen
