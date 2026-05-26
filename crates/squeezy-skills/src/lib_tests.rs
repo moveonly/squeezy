@@ -728,12 +728,13 @@ api_key_env = "<redacted>"
 #[test]
 fn bundled_doc_paths_exist_on_disk() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let docs_dir = manifest_dir.join("external-docs");
     for path in help::bundled_doc_paths() {
-        let full = workspace_root.join(path);
+        let file_name = path
+            .rsplit('/')
+            .next()
+            .expect("bundled doc path has filename");
+        let full = docs_dir.join(file_name);
         assert!(
             full.is_file(),
             "bundled doc {path} should exist at {}",
@@ -745,10 +746,7 @@ fn bundled_doc_paths_exist_on_disk() {
 #[test]
 fn bundled_docs_are_complete_external_corpus() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
+    let docs_dir = manifest_dir.join("external-docs");
     let bundled = help::bundled_docs();
     let bundled_paths = bundled.iter().map(|doc| doc.path).collect::<BTreeSet<_>>();
 
@@ -765,49 +763,21 @@ fn bundled_docs_are_complete_external_corpus() {
         );
     }
 
-    let external_docs = workspace_root.join("docs/external");
-    for entry in fs::read_dir(&external_docs).expect("read docs/external") {
+    for entry in fs::read_dir(&docs_dir).expect("read external-docs") {
         let entry = entry.expect("external doc entry");
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
             continue;
         }
-        let relative = path
-            .strip_prefix(workspace_root)
-            .expect("relative doc")
+        let file_name = path
+            .file_name()
+            .expect("doc filename")
             .to_string_lossy()
-            .replace('\\', "/");
+            .into_owned();
+        let logical = format!("docs/external/{file_name}");
         assert!(
-            bundled_paths.contains(relative.as_str()),
-            "external doc should be bundled for help: {relative}"
-        );
-    }
-}
-
-#[test]
-fn packaged_help_docs_match_external_docs() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let workspace_root = manifest_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let packaged_root = manifest_dir.join("bundled-docs/external");
-
-    for path in help::bundled_doc_paths() {
-        let relative = path
-            .strip_prefix("docs/external/")
-            .expect("external doc path");
-        let canonical = workspace_root.join(path);
-        let packaged = packaged_root.join(relative);
-        assert!(
-            packaged.is_file(),
-            "packaged help doc should exist: {}",
-            packaged.display()
-        );
-        assert_eq!(
-            fs::read(&packaged).expect("read packaged doc"),
-            fs::read(&canonical).expect("read canonical doc"),
-            "packaged help doc should match canonical docs/external copy: {relative}"
+            bundled_paths.contains(logical.as_str()),
+            "external doc should be bundled for help: {logical}"
         );
     }
 }

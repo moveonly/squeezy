@@ -11,9 +11,12 @@ use squeezy_core::{
     AppConfig, PermissionAction, PermissionRequest, PermissionVerdict, Role, TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
+use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_POLICY: &str = include_str!("../../../docs/external/APPROVAL_POLICY.md");
+fn default_policy() -> &'static str {
+    bundled_doc(APPROVAL_POLICY_DOC_PATH).expect("APPROVAL_POLICY.md missing from bundled docs")
+}
 const MAX_RECENT_TRANSCRIPT_ITEMS: usize = 15;
 const MAX_USER_TOKENS: usize = 800;
 const MAX_OTHER_TOKENS: usize = 400;
@@ -210,7 +213,7 @@ async fn collect_reviewer_text(
 
 fn load_policy(config: &AppConfig) -> Result<String, String> {
     let Some(policy_file) = &config.permissions.ai_reviewer.policy_file else {
-        return Ok(DEFAULT_POLICY.to_string());
+        return Ok(default_policy().to_string());
     };
     let path = if policy_file.is_absolute() {
         policy_file.clone()

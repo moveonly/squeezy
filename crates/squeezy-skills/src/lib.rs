@@ -15,8 +15,8 @@ pub mod implicit;
 pub mod render;
 
 pub use help::{
-    BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp, bundled_doc_paths, bundled_docs,
-    matches_squeezy_help_input,
+    APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp,
+    bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
 };
 pub use render::SkillPreambleRender;
 
