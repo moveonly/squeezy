@@ -3344,6 +3344,7 @@ dependencies = [
  "serde",
  "serde_json",
  "squeezy-core",
+ "squeezy-hooks",
  "squeezy-llm",
  "squeezy-skills",
  "squeezy-store",
@@ -3422,6 +3423,15 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+]
+
+[[package]]
+name = "squeezy-hooks"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

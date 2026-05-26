@@ -27,6 +27,7 @@ use squeezy_core::{
     ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
     context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
 };
+use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
@@ -1076,6 +1077,12 @@ pub struct Agent {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     store: Option<Arc<SqueezyStore>>,
     replay: Option<Arc<ReplayRuntime>>,
+    /// Optional registry of lifecycle hook handlers. Skills and other
+    /// extensions register here; the per-turn LLM call site dispatches
+    /// `HookEvent::PreTurn` before issuing the request when this is
+    /// `Some`. Defaults to `None` for backwards compatibility — callers
+    /// that need hooks install a registry via `set_hooks`.
+    hooks: Option<Arc<HookRegistry>>,
     /// Config save queued from the config screen. Drained before each
     /// `start_turn` so the running turn (if any) finishes on the old config
     /// and the next turn picks up the new one.
@@ -1431,6 +1438,7 @@ impl Agent {
             loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
             store,
             replay,
+            hooks: None,
             pending_swap: None,
         }
     }
@@ -1483,6 +1491,23 @@ impl Agent {
             self.provider = provider;
         }
         Some(swap)
+    }
+
+    /// Install a hook registry. Handlers registered here observe
+    /// `HookEvent::PreTurn` before each turn's LLM request and are
+    /// reserved (variant-only) for the other event kinds. Passing
+    /// `None` clears any previously-installed registry. Wrapped in
+    /// `Arc` so cloned `TurnRuntime`s share the same handler set
+    /// without paying for re-registration on every turn.
+    pub fn set_hooks(&mut self, hooks: Option<Arc<HookRegistry>>) {
+        self.hooks = hooks;
+    }
+
+    /// Borrow the currently-installed hook registry, if any. Returns
+    /// `None` when hooks are disabled (default) so the caller can skip
+    /// dispatch entirely.
+    pub fn hooks(&self) -> Option<&Arc<HookRegistry>> {
+        self.hooks.as_ref()
     }
 
     /// Snapshot of session-scoped permission rules. Primarily intended for
@@ -2356,6 +2381,7 @@ impl Agent {
         let loaded_tool_schemas = self.loaded_tool_schemas.clone();
         let replay = self.replay.clone();
         let subagents = self.subagents.clone();
+        let hooks = self.hooks.clone();
 
         let turn_done = Arc::new(Notify::new());
         let panic_tx = tx.clone();
@@ -2497,6 +2523,7 @@ impl Agent {
                     loaded_tool_schemas,
                     replay,
                     subagents,
+                    hooks,
                 }
                 .run(task_title.clone())
                 .await;
@@ -3314,6 +3341,10 @@ struct TurnRuntime {
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     replay: Option<Arc<ReplayRuntime>>,
     subagents: SubagentRegistry,
+    /// Hook registry shared with `Agent`. `None` when no hooks are
+    /// installed — the per-round LLM call site checks this before
+    /// building a `HookContext`.
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl TurnRuntime {
@@ -3500,6 +3531,43 @@ impl TurnRuntime {
         self.session_log
             .as_ref()
             .map(|handle| format!("squeezy::{}", handle.session_id()))
+    }
+
+    /// Fan out a `HookEvent::PreTurn` to every registered handler when
+    /// a hook registry is installed. Mutation replies are logged but
+    /// not yet applied — that wiring is deferred to a follow-up
+    /// commit so this first hooks foundation stays minimal and
+    /// strictly observational. Returns immediately when no registry
+    /// is configured so the no-hooks path costs zero allocations.
+    fn dispatch_pre_turn(&self) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({ "turn_index": self.turn_id.to_string() });
+        let results = registry.dispatch(HookEvent::PreTurn, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PreTurn handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PreTurn handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
     }
 
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
@@ -3805,6 +3873,11 @@ impl TurnRuntime {
         // (which the TUI can flip mid-turn) varies, and the rare implicit
         // skill append below invalidates this on a revision boundary.
         let mut instructions_cache: [Option<String>; 2] = [None, None];
+        // Fire the PreTurn hook once per user turn, immediately before
+        // the first round's LLM request is built. Mutation replies are
+        // currently observational only — see `dispatch_pre_turn` for
+        // the rationale.
+        self.dispatch_pre_turn();
         for _round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
