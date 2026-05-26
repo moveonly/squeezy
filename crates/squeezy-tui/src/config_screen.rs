@@ -8,7 +8,10 @@
 
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+#[cfg(test)]
+use crossterm::event::KeyModifiers;
+use crossterm::event::{KeyCode, KeyEvent};
+#[cfg(test)]
 use squeezy_agent::Agent;
 use squeezy_core::{
     AppConfig, SeparatedSources,
@@ -19,6 +22,7 @@ use squeezy_core::{
     load_separated_settings_sources,
 };
 
+#[cfg(test)]
 use crate::notification::NotificationQueue;
 
 mod keys;
