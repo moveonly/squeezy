@@ -125,10 +125,10 @@ impl Default for SkillCatalog {
             ambiguous_names: BTreeSet::new(),
             implicit_by_scripts_dir: BTreeMap::new(),
             implicit_by_doc_path: BTreeMap::new(),
-            active_budget_chars: defaults.active_budget_chars,
+            active_budget_chars: defaults.active_budget_effective_chars(),
             active_body_cap_chars: defaults.active_body_cap_chars,
             preamble_enabled: defaults.preamble_enabled,
-            preamble_budget_chars: defaults.preamble_budget_chars,
+            preamble_budget_chars: defaults.preamble_budget_effective_chars(),
         }
     }
 }
@@ -140,10 +140,14 @@ impl SkillCatalog {
 
     pub fn discover(workspace_root: &Path, config: &SkillsConfig) -> Self {
         let mut catalog = Self {
-            active_budget_chars: config.active_budget_chars,
+            // Resolve the active and preamble budgets via the configured
+            // mode so they can scale with `model_context_window`. The
+            // catalog stores the post-resolution chars so render-time stays
+            // a hot, allocation-free char-count comparison.
+            active_budget_chars: config.active_budget_effective_chars(),
             active_body_cap_chars: config.active_body_cap_chars,
             preamble_enabled: config.preamble_enabled,
-            preamble_budget_chars: config.preamble_budget_chars,
+            preamble_budget_chars: config.preamble_budget_effective_chars(),
             ..Self::default()
         };
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);

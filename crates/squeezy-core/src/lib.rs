@@ -196,7 +196,7 @@ pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
     "upstream_flow",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
@@ -586,7 +586,7 @@ impl AppConfig {
             get_var("SQUEEZY_SESSION_MODE"),
             session_settings.mode.unwrap_or_default(),
         );
-        let skills = SkillsConfig::from_settings_and_env_vars(
+        let mut skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
         );
@@ -603,6 +603,10 @@ impl AppConfig {
             settings.context.unwrap_or_default(),
             &mut get_var,
         );
+        // Skills' ContextPercent budget mode reads the same window value as
+        // mid-turn compaction; resolve it here instead of duplicating the
+        // env/file precedence logic.
+        skills.model_context_window = context_compaction.model_context_window;
         let subagents = SubagentConfig::from_settings_and_env(
             settings.subagents.unwrap_or_default(),
             &mut get_var,
@@ -1083,6 +1087,19 @@ impl AppConfig {
             "preamble_budget_chars = {}\n",
             self.skills.preamble_budget_chars
         ));
+        // The mode tables follow the same inline-table shape that
+        // `from_table` accepts, so the inspect output round-trips when
+        // pasted back into a settings file.
+        emit_skills_budget_mode(
+            &mut output,
+            "active_budget_mode",
+            self.skills.active_budget_mode,
+        );
+        emit_skills_budget_mode(
+            &mut output,
+            "preamble_budget_mode",
+            self.skills.preamble_budget_mode,
+        );
         if self.skills.config.is_empty() {
             output.push('\n');
         } else {
@@ -1320,6 +1337,23 @@ fn toml_path_array(values: &[PathBuf]) -> String {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
     toml_string_array(&values)
+}
+
+fn emit_skills_budget_mode(output: &mut String, key: &str, mode: SkillsBudgetMode) {
+    match mode {
+        SkillsBudgetMode::Chars { chars } => {
+            output.push_str(&format!("{key} = {{ chars = {chars} }}\n"));
+        }
+        SkillsBudgetMode::ContextPercent { percent } => {
+            // `{:?}` on f32 always emits a decimal point, keeping the TOML
+            // parser on the float branch instead of misreading e.g. `2`
+            // as an integer next round-trip.
+            output.push_str(&format!(
+                "{key} = {{ context_percent = {:?} }}\n",
+                percent as f64
+            ));
+        }
+    }
 }
 
 fn toml_bare_or_quoted_key(key: &str) -> String {
@@ -1664,7 +1698,7 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SettingsFile {
     pub provider: Option<String>,
     pub profile: Option<String>,
@@ -4905,7 +4939,7 @@ impl WebSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SkillsSettings {
     pub user_dir: Option<PathBuf>,
     pub compat_user_dir: Option<PathBuf>,
@@ -4913,6 +4947,8 @@ pub struct SkillsSettings {
     pub active_body_cap_chars: Option<usize>,
     pub preamble_enabled: Option<bool>,
     pub preamble_budget_chars: Option<usize>,
+    pub active_budget_mode: Option<SkillsBudgetMode>,
+    pub preamble_budget_mode: Option<SkillsBudgetMode>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -4927,6 +4963,8 @@ impl SkillsSettings {
                 "active_body_cap_chars",
                 "preamble_enabled",
                 "preamble_budget_chars",
+                "active_budget_mode",
+                "preamble_budget_mode",
                 "config",
             ],
             source,
@@ -4964,6 +5002,18 @@ impl SkillsSettings {
                 source,
                 &field(path, "preamble_budget_chars"),
             )?,
+            active_budget_mode: skills_budget_mode_value(
+                table,
+                "active_budget_mode",
+                source,
+                &field(path, "active_budget_mode"),
+            )?,
+            preamble_budget_mode: skills_budget_mode_value(
+                table,
+                "preamble_budget_mode",
+                source,
+                &field(path, "preamble_budget_mode"),
+            )?,
             config: skill_config_entries_value(table, source, &field(path, "config"))?,
         })
     }
@@ -4975,6 +5025,8 @@ impl SkillsSettings {
         replace_if_some(&mut self.active_body_cap_chars, next.active_body_cap_chars);
         replace_if_some(&mut self.preamble_enabled, next.preamble_enabled);
         replace_if_some(&mut self.preamble_budget_chars, next.preamble_budget_chars);
+        replace_if_some(&mut self.active_budget_mode, next.active_budget_mode);
+        replace_if_some(&mut self.preamble_budget_mode, next.preamble_budget_mode);
         self.config.extend(next.config);
     }
 }
@@ -4983,6 +5035,13 @@ pub const DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS: usize = 4_000;
 pub const DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS: usize = 16_000;
 pub const DEFAULT_SKILLS_PREAMBLE_ENABLED: bool = true;
 pub const DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS: usize = 800;
+/// Default fraction of `model_context_window` (in percent) consumed by the
+/// active and available-skills bundles when no explicit chars budget is set.
+/// Matches the codex reference (`SKILL_METADATA_CONTEXT_WINDOW_PERCENT=2`).
+pub const DEFAULT_SKILLS_BUDGET_CONTEXT_PERCENT: f32 = 2.0;
+/// Conservative chars-per-token used when scaling a token-denominated context
+/// window into a chars budget. Mirrors `CHARS_PER_TOKEN` in `ai_reviewer.rs`.
+pub const SKILLS_CHARS_PER_TOKEN: u64 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillConfigEntry {
@@ -4991,7 +5050,60 @@ pub struct SkillConfigEntry {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Selects how a skills budget is computed at render time.
+///
+/// `Chars` is an absolute cap and ignores the context window. `ContextPercent`
+/// scales the budget to a fraction of `model_context_window` (converted to
+/// chars via [`SKILLS_CHARS_PER_TOKEN`]), so larger-context models get
+/// proportionally more room for skill instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SkillsBudgetMode {
+    /// Absolute character cap, regardless of context window.
+    Chars { chars: usize },
+    /// Percentage of the model context window (0..=100), converted to chars
+    /// via `SKILLS_CHARS_PER_TOKEN`.
+    ContextPercent { percent: f32 },
+}
+
+impl Default for SkillsBudgetMode {
+    fn default() -> Self {
+        Self::ContextPercent {
+            percent: DEFAULT_SKILLS_BUDGET_CONTEXT_PERCENT,
+        }
+    }
+}
+
+impl SkillsBudgetMode {
+    /// Computes the effective character budget for this mode. `Chars(n)` is
+    /// returned verbatim. `ContextPercent(p)` scales `model_context_window`
+    /// (in tokens) to chars and applies `p%`; if the window is unknown, the
+    /// caller's `fallback_chars` is used (typically the legacy
+    /// `*_budget_chars` default).
+    pub fn effective_chars(
+        &self,
+        model_context_window: Option<u64>,
+        fallback_chars: usize,
+    ) -> usize {
+        match *self {
+            Self::Chars { chars } => chars,
+            Self::ContextPercent { percent } => {
+                let Some(window) = model_context_window else {
+                    return fallback_chars;
+                };
+                // Clamp to non-negative and bound the float math: at worst a
+                // 200K-token window with percent=100 yields ~800k chars, well
+                // under f32's safe integer range (~16M).
+                let percent = percent.max(0.0);
+                let chars_per_token = SKILLS_CHARS_PER_TOKEN as f32;
+                let effective = (window as f32) * chars_per_token * percent / 100.0;
+                effective.round().max(0.0) as usize
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
@@ -4999,6 +5111,19 @@ pub struct SkillsConfig {
     pub active_body_cap_chars: usize,
     pub preamble_enabled: bool,
     pub preamble_budget_chars: usize,
+    /// Mode used to compute the active skills bundle budget at render time.
+    /// Falls back to `Chars(active_budget_chars)` when only the legacy field
+    /// is set in user settings.
+    pub active_budget_mode: SkillsBudgetMode,
+    /// Mode used to compute the available-skills preamble budget at render
+    /// time. Falls back to `Chars(preamble_budget_chars)` when only the
+    /// legacy field is set in user settings.
+    pub preamble_budget_mode: SkillsBudgetMode,
+    /// Token budget for the active model, copied from
+    /// `context_compaction.model_context_window`. `None` keeps
+    /// `ContextPercent` modes dormant and forces a fall-back to
+    /// `*_budget_chars`.
+    pub model_context_window: Option<u64>,
     pub config: Vec<SkillConfigEntry>,
 }
 
@@ -5011,6 +5136,31 @@ impl SkillsConfig {
         settings: SkillsSettings,
         mut var: impl FnMut(&str) -> Option<String>,
     ) -> Self {
+        // Legacy `*_budget_chars` keys keep working: if the user only set the
+        // chars field (and not the new mode), treat it as a Chars-mode
+        // override so behavior matches the pre-mode release exactly.
+        let active_budget_chars = settings
+            .active_budget_chars
+            .unwrap_or(DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS);
+        let preamble_budget_chars = settings
+            .preamble_budget_chars
+            .unwrap_or(DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS);
+        let active_budget_mode = settings
+            .active_budget_mode
+            .or_else(|| {
+                settings
+                    .active_budget_chars
+                    .map(|chars| SkillsBudgetMode::Chars { chars })
+            })
+            .unwrap_or_default();
+        let preamble_budget_mode = settings
+            .preamble_budget_mode
+            .or_else(|| {
+                settings
+                    .preamble_budget_chars
+                    .map(|chars| SkillsBudgetMode::Chars { chars })
+            })
+            .unwrap_or_default();
         Self {
             user_dir: expand_home_path(
                 var("SQUEEZY_SKILLS_USER_DIR")
@@ -5024,18 +5174,17 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
-            active_budget_chars: settings
-                .active_budget_chars
-                .unwrap_or(DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS),
+            active_budget_chars,
             active_body_cap_chars: settings
                 .active_body_cap_chars
                 .unwrap_or(DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS),
             preamble_enabled: settings
                 .preamble_enabled
                 .unwrap_or(DEFAULT_SKILLS_PREAMBLE_ENABLED),
-            preamble_budget_chars: settings
-                .preamble_budget_chars
-                .unwrap_or(DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS),
+            preamble_budget_chars,
+            active_budget_mode,
+            preamble_budget_mode,
+            model_context_window: None,
             config: settings
                 .config
                 .into_iter()
@@ -5046,6 +5195,22 @@ impl SkillsConfig {
                 })
                 .collect(),
         }
+    }
+
+    /// Computes the active skills bundle budget for the current context
+    /// window. Falls through to `active_budget_chars` when the mode is
+    /// `ContextPercent` but no window is configured.
+    pub fn active_budget_effective_chars(&self) -> usize {
+        self.active_budget_mode
+            .effective_chars(self.model_context_window, self.active_budget_chars)
+    }
+
+    /// Computes the available-skills preamble budget for the current context
+    /// window. Falls through to `preamble_budget_chars` when the mode is
+    /// `ContextPercent` but no window is configured.
+    pub fn preamble_budget_effective_chars(&self) -> usize {
+        self.preamble_budget_mode
+            .effective_chars(self.model_context_window, self.preamble_budget_chars)
     }
 }
 
@@ -5058,6 +5223,9 @@ impl Default for SkillsConfig {
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
             preamble_enabled: DEFAULT_SKILLS_PREAMBLE_ENABLED,
             preamble_budget_chars: DEFAULT_SKILLS_PREAMBLE_BUDGET_CHARS,
+            active_budget_mode: SkillsBudgetMode::default(),
+            preamble_budget_mode: SkillsBudgetMode::default(),
+            model_context_window: None,
             config: Vec::new(),
         }
     }
@@ -5734,10 +5902,12 @@ pub fn user_settings_template() -> &'static str {
 # [skills]
 # user_dir = "~/.squeezy/skills"
 # compat_user_dir = "~/.agents/skills"
-# active_budget_chars = 4000
+# active_budget_chars = 4000          # legacy absolute cap; used only when active_budget_mode is unset
 # active_body_cap_chars = 16000
 # preamble_enabled = true
-# preamble_budget_chars = 800
+# preamble_budget_chars = 800         # legacy absolute cap; used only when preamble_budget_mode is unset
+# active_budget_mode = { context_percent = 2.0 }   # default; scales with [context].model_context_window
+# preamble_budget_mode = { context_percent = 2.0 } # alternative: active_budget_mode = { chars = 4000 }
 #
 # [[skills.config]]
 # name = "example-skill"
@@ -6752,6 +6922,48 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn skills_budget_mode_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<SkillsBudgetMode>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let entry = value
+        .as_table()
+        .ok_or_else(|| type_error(source, path, "table"))?;
+    reject_unknown_keys(entry, &["chars", "context_percent"], source, path)?;
+    let chars = usize_value(entry, "chars", source, &field(path, "chars"))?;
+    let context_percent = match entry.get("context_percent") {
+        None => None,
+        Some(value) => {
+            let raw = value
+                .as_float()
+                .or_else(|| value.as_integer().map(|integer| integer as f64))
+                .ok_or_else(|| type_error(source, &field(path, "context_percent"), "number"))?;
+            if !raw.is_finite() || raw < 0.0 {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {}: expected a non-negative number",
+                    field(path, "context_percent")
+                )));
+            }
+            Some(raw as f32)
+        }
+    };
+    match (chars, context_percent) {
+        (Some(_), Some(_)) => Err(SqueezyError::Config(format!(
+            "{source}: {path}: set exactly one of `chars` or `context_percent`",
+        ))),
+        (None, None) => Err(SqueezyError::Config(format!(
+            "{source}: {path}: set either `chars` or `context_percent`",
+        ))),
+        (Some(chars), None) => Ok(Some(SkillsBudgetMode::Chars { chars })),
+        (None, Some(percent)) => Ok(Some(SkillsBudgetMode::ContextPercent { percent })),
+    }
 }
 
 fn skill_config_entries_value(

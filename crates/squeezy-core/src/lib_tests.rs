@@ -571,6 +571,97 @@ enabled = true
 }
 
 #[test]
+fn skills_budget_mode_context_percent_scales_with_window() {
+    // 200K-token model with 2% percent: 200_000 * 4 * 0.02 = 16_000.
+    let mode = SkillsBudgetMode::ContextPercent { percent: 2.0 };
+    assert_eq!(mode.effective_chars(Some(200_000), 4_000), 16_000);
+    // 32K-token model with the same percent: 32_000 * 4 * 0.02 = 2_560.
+    assert_eq!(mode.effective_chars(Some(32_000), 4_000), 2_560);
+    // Without a window, the legacy chars cap is used so behavior stays
+    // predictable when the user has not configured the active model size.
+    assert_eq!(mode.effective_chars(None, 4_000), 4_000);
+}
+
+#[test]
+fn skills_budget_mode_chars_ignores_window() {
+    // Explicit Chars override pins the budget regardless of context size.
+    let mode = SkillsBudgetMode::Chars { chars: 8_000 };
+    assert_eq!(mode.effective_chars(Some(32_000), 4_000), 8_000);
+    assert_eq!(mode.effective_chars(Some(200_000), 4_000), 8_000);
+    assert_eq!(mode.effective_chars(None, 4_000), 8_000);
+}
+
+#[test]
+fn skills_default_budget_mode_resolves_to_two_percent_of_context_window() {
+    let config = SkillsConfig {
+        model_context_window: Some(200_000),
+        ..Default::default()
+    };
+    assert!(matches!(
+        config.active_budget_mode,
+        SkillsBudgetMode::ContextPercent { percent } if (percent - 2.0).abs() < f32::EPSILON
+    ));
+    assert_eq!(config.active_budget_effective_chars(), 16_000);
+    assert_eq!(config.preamble_budget_effective_chars(), 16_000);
+}
+
+#[test]
+fn skills_legacy_chars_setting_is_honored_when_mode_unset() {
+    // A user who only set `active_budget_chars` in TOML should keep the
+    // pre-mode behaviour: that field becomes the absolute cap, even when a
+    // 200K-token window is configured.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_chars = 1234
+preamble_budget_chars = 321
+
+[context]
+model_context_window = 200000
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.skills.active_budget_chars, 1234);
+    assert_eq!(config.skills.active_budget_effective_chars(), 1234);
+    assert_eq!(config.skills.preamble_budget_effective_chars(), 321);
+}
+
+#[test]
+fn skills_explicit_mode_table_parses() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_mode = { chars = 9000 }
+preamble_budget_mode = { context_percent = 5.0 }
+
+[context]
+model_context_window = 50000
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(config.skills.active_budget_effective_chars(), 9_000);
+    // 50_000 tokens * 4 chars/token * 0.05 = 10_000 chars.
+    assert_eq!(config.skills.preamble_budget_effective_chars(), 10_000);
+}
+
+#[test]
+fn skills_mode_table_rejects_both_keys() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[skills]
+active_budget_mode = { chars = 9000, context_percent = 2.0 }
+"#,
+        "test",
+    )
+    .expect_err("conflicting keys must error");
+    assert!(err.to_string().contains("set exactly one"));
+}
+
+#[test]
 fn config_can_select_anthropic_provider_defaults() {
     let config = AppConfig::from_env_vars(None, |name| match name {
         "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
