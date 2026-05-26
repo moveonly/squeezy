@@ -227,7 +227,13 @@ impl FieldValue {
             Self::Enum(v) => (*v).to_string(),
             Self::OptionalEnum(Some(v)) => (*v).to_string(),
             Self::OptionalEnum(None) => "—".to_string(),
-            Self::String(s) => s.clone(),
+            Self::String(s) => {
+                if s.is_empty() {
+                    "—".to_string()
+                } else {
+                    s.clone()
+                }
+            }
             Self::Duration(d) => format!("{} ms", d.as_millis()),
             Self::Unset => "—".to_string(),
             Self::StringList(items) => {

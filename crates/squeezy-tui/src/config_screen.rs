@@ -350,7 +350,11 @@ impl ConfigScreenState {
         let section = self.current_section();
         match section.id {
             SectionId::Models => section.fields.len() + 1,
-            SectionId::Reset => RESET_ACTIONS.len(),
+            // The Reset section only ever surfaces the action for the active
+            // scope tab — resetting another tab's file from here would be
+            // confusing and the tier-tab context already disambiguates which
+            // file is being targeted.
+            SectionId::Reset => 1,
             _ => section.fields.len(),
         }
     }
@@ -376,9 +380,11 @@ impl ConfigScreenState {
     }
 
     /// Reset action for the focused row when the active section is `Reset`.
-    pub(crate) fn reset_action_at_row(&self, row: usize) -> Option<&'static ResetAction> {
+    /// There is exactly one row, and it always targets the active scope
+    /// tab's file.
+    pub(crate) fn reset_action_at_row(&self, _row: usize) -> Option<&'static ResetAction> {
         if self.current_section().id == SectionId::Reset {
-            RESET_ACTIONS.get(row)
+            RESET_ACTIONS.iter().find(|a| a.scope == self.scope)
         } else {
             None
         }
@@ -608,12 +614,13 @@ fn tier_value_at_path(tier: &squeezy_core::TierSource, field: &FieldMeta) -> Opt
 ///   - `[env]`                — overridden by an environment variable.
 ///   - `[inherited-default]`  — falls through to the binary defaults.
 ///   - `[inherited-<tier>]`   — falls through to a higher-precedence tier.
-///   - bare tier name         — the value lives in the active tab's file.
+///   - empty string           — the value lives in the active tab's file.
 ///
-/// Treating the binary defaults as `[inherited-default]` on every tab
-/// (including User) keeps the labelling honest: the User tab does not own
-/// a value that nobody has typed, so it shouldn't read as `[default]` as
-/// if it were a deliberate setting.
+/// We deliberately render no badge when the value is owned by the active
+/// tab: the tab strip at the top already says which tier you're editing,
+/// and repeating "user" on every row in the User tab is pure visual
+/// noise. The other badges remain informative because they signal a
+/// value that comes from somewhere other than the file you're looking at.
 pub(crate) fn inheritance_label(active: ConfigScope, source: FieldSource) -> String {
     if source == FieldSource::Env {
         return "[env]".to_string();
@@ -628,7 +635,7 @@ pub(crate) fn inheritance_label(active: ConfigScope, source: FieldSource) -> Str
         FieldSource::Env | FieldSource::Default => unreachable!(),
     };
     if scope_of_source == active {
-        active.label().to_lowercase()
+        String::new()
     } else {
         format!("[inherited-{}]", scope_of_source.label().to_lowercase())
     }
