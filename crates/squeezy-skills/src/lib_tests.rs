@@ -268,6 +268,100 @@ fn active_skill_render_respects_budget_and_uses_stub() {
 }
 
 #[test]
+fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
+    // Three skills, each with body well above the body cap so every skill
+    // starts as a stub. Budget is sized so that the full-description stubs
+    // overflow the active block but the minimum-line stubs all fit — the
+    // redistribute step must keep every skill present and give each a
+    // non-empty description.
+    let root = temp_workspace("skills_active_redistribute");
+    let names = ["alpha-skill", "beta-skill", "gamma-skill"];
+    let descriptions = [
+        "Alpha description that is long enough to occupy several stub characters when budget allows.",
+        "Beta description, also reasonably long so we can verify the redistribute loop allocates across skills.",
+        "Gamma description with comparable length, exercising the third allocation slot of the loop.",
+    ];
+    for (name, description) in names.iter().zip(descriptions.iter()) {
+        write_skill_with_body(
+            &root.join(".squeezy/skills").join(name),
+            name,
+            description,
+            &[],
+            &"body line that exceeds the cap. ".repeat(60),
+        );
+    }
+    // Compute the minimum-stub floor at runtime so the test budget is robust
+    // against temp-path length variation across hosts. The full-description
+    // aggregate is the floor plus the description chars themselves — sit
+    // between the two so the redistribute step is required.
+    let catalog = SkillCatalog::discover(
+        &root,
+        &SkillsConfig {
+            user_dir: root.join("user"),
+            compat_user_dir: root.join("compat"),
+            active_budget_chars: usize::MAX,
+            active_body_cap_chars: 100,
+            ..Default::default()
+        },
+    );
+    let loaded = names
+        .iter()
+        .map(|name| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let full_block = render::render_active_skills(&loaded, usize::MAX, 100)
+        .expect("baseline render with unbounded budget");
+    // Each description is ASCII without XML-special chars so xml_escape is
+    // identity; subtracting the description-char sum from the full render
+    // yields the minimum-stub floor (description text removed, structure
+    // kept).
+    let desc_payload_chars: usize = descriptions
+        .iter()
+        .map(|description| description.chars().count())
+        .sum();
+    let floor = full_block.chars().count() - desc_payload_chars;
+    // Pick a budget strictly between the floor and the full aggregate so the
+    // redistribute branch — not the all-fits-as-is branch and not the
+    // drop-skills branch — is the one exercised.
+    let active_budget_chars = floor + desc_payload_chars / 2;
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_chars,
+        active_body_cap_chars: 100,
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let loaded = names
+        .iter()
+        .map(|name| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let rendered = catalog
+        .render_active_skills(&loaded)
+        .expect("render active skills");
+
+    assert!(rendered.chars().count() <= config.active_budget_chars);
+    for name in &names {
+        let needle = format!("name=\"{name}\"");
+        assert!(
+            rendered.contains(&needle),
+            "redistribute must keep every skill present; missing {name}\n---\n{rendered}\n---"
+        );
+    }
+    // No skill should have a completely empty description tag — the loop
+    // must allocate at least one char to each skill when the budget allows
+    // it. Empty `<description></description>` indicates the skill was kept
+    // at the minimum-stub floor.
+    assert!(
+        !rendered.contains("<description></description>"),
+        "redistribute must allocate at least one description char per skill\n---\n{rendered}\n---"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn available_skills_preamble_respects_budget() {
     let root = temp_workspace("skills_preamble_budget");
     let config = SkillsConfig {
