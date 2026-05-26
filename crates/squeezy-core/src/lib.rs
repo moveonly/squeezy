@@ -1200,6 +1200,10 @@ impl AppConfig {
             toml_string(self.tui.alternate_screen.as_str())
         ));
         output.push_str(&format!(
+            "theme = {}\n",
+            toml_string(self.tui.theme.as_str())
+        ));
+        output.push_str(&format!(
             "show_reasoning_usage = {}\n\n",
             self.tui.show_reasoning_usage
         ));
@@ -5468,6 +5472,36 @@ impl TuiAlternateScreen {
     }
 }
 
+/// User-controlled palette tone for the TUI. `System` defers to the
+/// existing terminal-tone detection (`COLORFGBG`); `Dark` and `Light`
+/// pin the tone regardless of what the terminal reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuiTheme {
+    System,
+    Dark,
+    Light,
+}
+
+impl TuiTheme {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "system" | "auto" => Some(Self::System),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
@@ -5484,6 +5518,8 @@ pub struct TuiConfig {
     /// Color status-line items with their accent palette.
     /// Defaults to `true`.
     pub status_line_use_colors: bool,
+    /// Palette tone preference. `System` defers to terminal detection.
+    pub theme: TuiTheme,
 }
 
 impl TuiConfig {
@@ -5508,6 +5544,7 @@ impl TuiConfig {
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
+            theme: settings.theme.unwrap_or(TuiTheme::System),
         }
     }
 }
@@ -5529,6 +5566,7 @@ pub struct TuiSettings {
     pub show_reasoning_usage: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
+    pub theme: Option<TuiTheme>,
 }
 
 impl TuiSettings {
@@ -5545,6 +5583,7 @@ impl TuiSettings {
                 "show_reasoning_usage",
                 "status_line",
                 "status_line_use_colors",
+                "theme",
             ],
             source,
             path,
@@ -5599,6 +5638,7 @@ impl TuiSettings {
                 source,
                 &field(path, "status_line_use_colors"),
             )?,
+            theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
         })
     }
 
@@ -5615,6 +5655,7 @@ impl TuiSettings {
             &mut self.status_line_use_colors,
             next.status_line_use_colors,
         );
+        replace_if_some(&mut self.theme, next.theme);
     }
 }
 
@@ -7358,6 +7399,22 @@ fn tui_alternate_screen_value(
             "{source}: {path}: invalid TUI alternate screen {value:?}; expected auto, never, or always"
         ))),
     }
+}
+
+fn tui_theme_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<TuiTheme>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    TuiTheme::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid TUI theme {value:?}; expected system, dark, or light"
+        ))
+    })
 }
 
 fn reasoning_effort_value(

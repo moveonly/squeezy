@@ -42,7 +42,7 @@ use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
     PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
     TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
-    TuiAlternateScreen,
+    TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
@@ -289,6 +289,11 @@ async fn run_inner(
     resume_session_id: Option<String>,
     startup: StartupProfile,
 ) -> Result<()> {
+    // Apply the persisted theme preference before the first render so the
+    // initial paint already reflects the user's choice — without this the
+    // first frame uses the auto-detected tone and pops to the override on
+    // the next redraw.
+    render::palette::set_palette_tone_override(theme_to_tone_override(config.tui.theme));
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
@@ -632,6 +637,10 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
             return;
         }
     };
+    // Mirror an external theme edit into the runtime palette override
+    // immediately — the agent's config_snapshot already carries the new
+    // value, but the palette layer reads the override directly.
+    render::palette::set_palette_tone_override(theme_to_tone_override(new_cfg.tui.theme));
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -1239,6 +1248,55 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
     app.status = "/statusline".to_string();
 }
 
+/// Convert a [`TuiTheme`] preference into the runtime palette tone override.
+/// `System` clears the override so terminal detection (`COLORFGBG`) wins.
+fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
+    match theme {
+        TuiTheme::System => None,
+        TuiTheme::Dark => Some(render::palette::PaletteTone::Dark),
+        TuiTheme::Light => Some(render::palette::PaletteTone::Light),
+    }
+}
+
+/// Apply a `/theme` switch: flip the runtime palette override, mirror the
+/// new value into the agent's in-memory config, and persist to the user-
+/// scope settings file so the choice survives a restart. Persistence failures
+/// surface in the status line but the live switch still takes effect — the
+/// user can re-run later to retry the save.
+fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+
+    let mut next = agent.config_snapshot();
+    next.tui.theme = theme;
+    agent.replace_config(next);
+
+    let target_path = squeezy_core::default_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let edits = [SettingsEdit {
+        path: &["tui", "theme"],
+        op: EditOp::SetString(theme.as_str().to_string()),
+    }];
+    match apply_edits(&scope_target, &edits) {
+        Ok(_) => {
+            app.app_notifications.push(
+                format!("theme → {}", theme.as_str()),
+                NotifySeverity::Success,
+            );
+            app.status = format!("theme saved to {}", target_path.display());
+        }
+        Err(err) => {
+            app.app_notifications.push(
+                format!("theme switched but save failed: {err}"),
+                NotifySeverity::Warn,
+            );
+            app.status = format!("theme switched (not persisted): {err}");
+        }
+    }
+    app.needs_redraw = true;
+}
+
 /// Persist the picker's selection to `[tui].status_line` /
 /// `[tui].status_line_use_colors` in the user-scope settings file and
 /// apply it in-memory immediately.
@@ -1592,6 +1650,18 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 agent,
                 Some(squeezy_core::config_schema::SectionId::Verbosity),
             );
+            return true;
+        }
+        "/theme" => {
+            let Some(raw) = parts.next() else {
+                app.status = "usage: /theme [system|dark|light]".to_string();
+                return true;
+            };
+            let Some(theme) = TuiTheme::parse(raw) else {
+                app.status = format!("unknown theme {raw:?}; expected system, dark, or light");
+                return true;
+            };
+            apply_theme_change(app, agent, theme);
             return true;
         }
         "/jobs" => {

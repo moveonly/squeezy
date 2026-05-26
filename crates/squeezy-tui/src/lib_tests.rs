@@ -6000,6 +6000,165 @@ async fn slash_verbosity_opens_config_when_called_without_arg() {
     );
 }
 
+// ---- /theme palette switch ----
+
+/// `/theme dark` and `/theme light` flip the runtime palette override and
+/// mirror the choice into the agent's config so a settings-screen open
+/// reflects the new value.
+#[tokio::test]
+async fn slash_theme_dark_flips_palette_and_config() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Point settings writes at a tempfile so the test never touches HOME.
+    let dir = temp_workspace("theme_dark");
+    let settings_path = dir.join("settings.toml");
+    let _guard = ScopedSettingsPath::new(settings_path.clone());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme dark").await;
+    assert!(ran, "/theme dark should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Dark
+    );
+    let saved = std::fs::read_to_string(&settings_path).expect("settings file written");
+    assert!(
+        saved.contains("theme = \"dark\""),
+        "settings.toml should record the theme; got {saved}"
+    );
+}
+
+/// `/theme light` flips the override to the light tone.
+#[tokio::test]
+async fn slash_theme_light_flips_palette() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_light");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme light").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Light
+    );
+}
+
+/// `/theme system` clears the override so terminal detection wins again.
+#[tokio::test]
+async fn slash_theme_system_clears_override() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_system");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    // Pin to Dark first so the System branch has something visible to clear.
+    palette::set_palette_tone_override(Some(palette::PaletteTone::Dark));
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
+    assert!(ran);
+    // With the override cleared the visible tone is whichever the detector
+    // returns for the current process — we only assert that the override
+    // really was reset back to the detector's value.
+    assert_eq!(palette::palette_tone(), palette::detected_palette_tone());
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::System
+    );
+}
+
+/// Unknown sub-arguments don't mutate anything — the user sees a usage hint
+/// instead of a silent tone change.
+#[tokio::test]
+async fn slash_theme_unknown_value_does_not_change_palette() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_bad");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let before_tone = palette::palette_tone();
+    let before_theme = agent.config_snapshot().tui.theme;
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme zebra").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), before_tone);
+    assert_eq!(agent.config_snapshot().tui.theme, before_theme);
+    assert!(
+        app.status.contains("unknown theme"),
+        "status should mention the bad value, got: {}",
+        app.status
+    );
+}
+
+/// Bare `/theme` (no sub-arg) shows usage — used to remind the user of the
+/// allowed values without forcing them to open the config screen.
+#[tokio::test]
+async fn slash_theme_without_arg_shows_usage() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_usage");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme").await;
+    assert!(ran);
+    assert!(
+        app.status.starts_with("usage:") && app.status.contains("/theme"),
+        "expected usage hint, got: {}",
+        app.status
+    );
+}
+
+/// Serializes `/theme` tests so the process-global palette override and the
+/// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
+static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `SQUEEZY_SETTINGS_PATH` lets tests redirect persistence away from the
+/// real home directory; this guard also resets the runtime palette override
+/// so leftover state from one test doesn't bleed into the next.
+struct ScopedSettingsPath {
+    previous: Option<std::ffi::OsString>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ScopedSettingsPath {
+    fn new(path: PathBuf) -> Self {
+        let lock = THEME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        // Start every theme test from a known palette state — even if a
+        // previous test left an override behind.
+        crate::render::palette::set_palette_tone_override(None);
+        let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
+        // SAFETY: the global mutex above ensures no other theme test is
+        // mutating this env var at the same time.
+        unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", &path) };
+        Self {
+            previous,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for ScopedSettingsPath {
+    fn drop(&mut self) {
+        // SAFETY: see `new`.
+        match self.previous.take() {
+            Some(value) => unsafe { std::env::set_var("SQUEEZY_SETTINGS_PATH", value) },
+            None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
+        }
+        crate::render::palette::set_palette_tone_override(None);
+    }
+}
+
 // ---- F37: @-mention composer ----
 
 #[test]

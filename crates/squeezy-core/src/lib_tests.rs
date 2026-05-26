@@ -2395,6 +2395,70 @@ fn resolve_field_source_returns_env_when_env_var_set() {
 }
 
 #[test]
+fn tui_theme_parses_lowercase_and_aliases_auto_to_system() {
+    assert_eq!(TuiTheme::parse("system"), Some(TuiTheme::System));
+    assert_eq!(TuiTheme::parse("dark"), Some(TuiTheme::Dark));
+    assert_eq!(TuiTheme::parse("light"), Some(TuiTheme::Light));
+    // `auto` is the historical / config-screen equivalent of "system".
+    assert_eq!(TuiTheme::parse("auto"), Some(TuiTheme::System));
+    // Whitespace and uppercase are tolerated so users typing `/theme Dark`
+    // hit the same branch as the canonical `/theme dark` form.
+    assert_eq!(TuiTheme::parse("  Dark  "), Some(TuiTheme::Dark));
+    assert_eq!(TuiTheme::parse("LIGHT"), Some(TuiTheme::Light));
+    assert_eq!(TuiTheme::parse("solarized"), None);
+    assert_eq!(TuiTheme::parse(""), None);
+}
+
+#[test]
+fn tui_theme_round_trips_through_settings_toml() {
+    let parsed = SettingsFile::from_toml_str(
+        r#"
+[tui]
+theme = "dark"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
+    assert_eq!(config.tui.theme, TuiTheme::Dark);
+
+    // Emit and re-parse to confirm the writer persists the field.
+    let emitted = config.inspect_redacted();
+    assert!(
+        emitted.contains("theme = \"dark\""),
+        "inspect should emit the theme leaf, got: {emitted}"
+    );
+    let reparsed = SettingsFile::from_toml_str(&emitted, "round trip").expect("inspect re-parse");
+    let reloaded = AppConfig::from_settings_and_env_vars(reparsed, |_| None);
+    assert_eq!(reloaded.tui.theme, TuiTheme::Dark);
+}
+
+#[test]
+fn tui_theme_defaults_to_system_when_unset() {
+    let parsed =
+        SettingsFile::from_toml_str("[tui]\ntick_rate_ms = 50\n", "test").expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(parsed, |_| None);
+    assert_eq!(config.tui.theme, TuiTheme::System);
+}
+
+#[test]
+fn tui_theme_rejects_unknown_string() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[tui]
+theme = "solarized"
+"#,
+        "test",
+    );
+    let err = result.expect_err("invalid theme should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid TUI theme") || msg.contains("solarized"),
+        "expected invalid-theme diagnostic, got: {msg}"
+    );
+}
+
+#[test]
 fn unknown_fields_are_warned_and_removed_from_settings_file() {
     let dir = std::env::temp_dir().join(format!(
         "squeezy-unknown-fields-{}-{}",
