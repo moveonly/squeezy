@@ -255,11 +255,21 @@ impl AppConfig {
     }
 
     pub fn from_env_and_settings() -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(None)
+        Self::from_default_paths_and_env_with_provider_value(None, None)
     }
 
     pub fn from_env_and_settings_with_provider(provider: &str) -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(Some(provider))
+        Self::from_default_paths_and_env_with_provider_value(Some(provider), None)
+    }
+
+    /// Like `from_env_and_settings`, but applies the named TOML profile
+    /// (`[profiles.<name>]`) on top of the merged base settings before the
+    /// env-var layer is applied. Errors if the profile is not configured.
+    pub fn from_env_and_settings_with_profile(
+        provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_default_paths_and_env_with_provider_value(provider, profile)
     }
 
     pub fn from_settings_path_and_env(path: PathBuf) -> Result<Self> {
@@ -676,8 +686,15 @@ impl AppConfig {
         })
     }
 
-    fn from_default_paths_and_env_with_provider_value(provider: Option<&str>) -> Result<Self> {
-        let (settings, sources) = load_default_settings_sources()?;
+    fn from_default_paths_and_env_with_provider_value(
+        provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        let (mut settings, mut sources) = load_default_settings_sources()?;
+        if let Some(name) = profile {
+            settings.apply_profile(name)?;
+            sources.push(format!("profile:{name}"));
+        }
         Self::try_from_settings_and_env_vars_with_sources(settings, sources, provider, |name| {
             env::var(name).ok()
         })
@@ -1761,6 +1778,12 @@ pub struct SettingsFile {
     pub tui: Option<TuiSettings>,
     pub mcp: Option<McpSettings>,
     pub hardening: Option<HardeningSettings>,
+    /// Named configuration profiles. A `[profiles.<name>]` TOML section
+    /// accepts the same leaves as the root settings file and is merged on
+    /// top of the base settings when the user selects `<name>` via
+    /// `--profile`. The `profiles` and `profile` leaves of the inner table
+    /// are stripped so a profile cannot recursively select another profile.
+    pub profiles: Option<BTreeMap<String, SettingsFile>>,
 }
 
 impl SettingsFile {
@@ -1831,6 +1854,7 @@ impl SettingsFile {
                 "tui",
                 "mcp",
                 "hardening",
+                "profiles",
             ],
             source,
             "",
@@ -1903,7 +1927,29 @@ impl SettingsFile {
         settings.hardening = optional_table(table, "hardening", source)?
             .map(|table| HardeningSettings::from_table(table, source, "hardening"))
             .transpose()?;
+        settings.profiles = parse_profiles_map(table, source)?;
         Ok(settings)
+    }
+
+    /// Merges the named `[profiles.<name>]` section on top of the base
+    /// settings. Returns an error if `name` isn't present in `profiles`.
+    /// After application, the `profiles` map is cleared so downstream
+    /// merging and `inspect` paths don't re-emit it.
+    pub fn apply_profile(&mut self, name: &str) -> Result<()> {
+        let Some(profile_map) = self.profiles.take() else {
+            return Err(SqueezyError::Config(format!(
+                "profile {name:?} not found; no `[profiles.*]` sections are configured"
+            )));
+        };
+        let Some(profile) = profile_map.get(name).cloned() else {
+            let mut available: Vec<&String> = profile_map.keys().collect();
+            available.sort();
+            return Err(SqueezyError::Config(format!(
+                "profile {name:?} not found; available profiles: {available:?}"
+            )));
+        };
+        self.merge(profile);
+        Ok(())
     }
 
     fn merge(&mut self, next: Self) {
@@ -1953,6 +1999,7 @@ impl SettingsFile {
             next.hardening,
             HardeningSettings::merge,
         );
+        merge_profiles_maps(&mut self.profiles, next.profiles);
     }
 }
 
@@ -6872,6 +6919,31 @@ fn providers_settings(
     Ok(Some(result))
 }
 
+fn parse_profiles_map(
+    table: &toml::value::Table,
+    source: &str,
+) -> Result<Option<BTreeMap<String, SettingsFile>>> {
+    let Some(profiles) = optional_table(table, "profiles", source)? else {
+        return Ok(None);
+    };
+    let mut result = BTreeMap::new();
+    for (name, value) in profiles {
+        let inner = value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field("profiles", name), "table"))?;
+        let mut parsed =
+            SettingsFile::from_toml_table(inner, &format!("{source}.profiles.{name}"))?;
+        // Profiles are leaves: an inner `[profiles.<name>.profiles]` or
+        // `profile = …` selector inside a named profile would invite
+        // surprising recursion, so drop them silently here. The TOML parser
+        // has already rejected truly-unknown keys via reject_unknown_keys.
+        parsed.profiles = None;
+        parsed.profile = None;
+        result.insert(name.clone(), parsed);
+    }
+    Ok(Some(result))
+}
+
 thread_local! {
     /// Dotted paths of unknown fields seen during the most recent
     /// `SettingsFile::from_toml_str` call. The file loader clears this
@@ -7693,6 +7765,22 @@ fn merge_provider_maps(
             .entry(name)
             .and_modify(|existing| existing.merge(provider.clone()))
             .or_insert(provider);
+    }
+}
+
+fn merge_profiles_maps(
+    target: &mut Option<BTreeMap<String, SettingsFile>>,
+    next: Option<BTreeMap<String, SettingsFile>>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let target = target.get_or_insert_with(BTreeMap::new);
+    for (name, profile) in next {
+        target
+            .entry(name)
+            .and_modify(|existing| existing.merge(profile.clone()))
+            .or_insert(profile);
     }
 }
 
