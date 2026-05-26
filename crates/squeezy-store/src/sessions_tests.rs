@@ -1622,3 +1622,244 @@ fn unarchive_round_trip_restores_session() {
         .expect("unarchived session in default list");
     assert_eq!(found.status, SessionStatus::Completed);
 }
+
+#[test]
+fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
+    let (_root, store, config) = open_test_store("rollout-trace-empty");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle empty trace");
+    assert!(bundle.is_empty());
+}
+
+#[test]
+fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
+    let (_root, store, config) = open_test_store("rollout-trace-events-only");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            Some("turn-1".to_string()),
+            Some("find payment bug".to_string()),
+            json!({}),
+        ))
+        .expect("append user");
+    handle
+        .append_event(SessionEvent::new(
+            "assistant_completed",
+            Some("turn-1".to_string()),
+            Some("looking at payments".to_string()),
+            json!({"response_id": "resp_1"}),
+        ))
+        .expect("append assistant");
+    handle.flush_events().expect("flush events");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle");
+    assert_eq!(bundle.len(), 2);
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.source == RolloutEventSource::Event)
+    );
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.schema_version == ROLLOUT_TRACE_SCHEMA_VERSION)
+    );
+    assert_eq!(bundle[0].kind, "user_message");
+    assert_eq!(bundle[1].kind, "assistant_completed");
+    // Replay-side fields stay absent for event-sourced rows so consumers can
+    // pattern-match on `source` without re-checking discriminators.
+    assert!(bundle.iter().all(|entry| entry.replay_kind.is_none()));
+    assert!(bundle.iter().all(|entry| entry.payload_sha256.is_none()));
+    // Typed event_kind is populated when the discriminator matches.
+    assert!(matches!(
+        bundle[0].event_kind,
+        Some(SessionEventKind::UserMessage { .. })
+    ));
+    assert!(matches!(
+        bundle[1].event_kind,
+        Some(SessionEventKind::AssistantCompleted { .. })
+    ));
+}
+
+#[test]
+fn bundle_rollout_trace_emits_replay_when_no_events() {
+    let (_root, store, config) = open_test_store("rollout-trace-replay-only");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::UserMessage,
+            Some("turn-1".to_string()),
+            json!({"input": "find a bug"}),
+        ))
+        .expect("append user replay");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelStarted,
+            Some("turn-1".to_string()),
+            json!({"model": "gpt-test"}),
+        ))
+        .expect("append model started");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelCompleted,
+            Some("turn-1".to_string()),
+            json!({"response_id": "resp_1"}),
+        ))
+        .expect("append model completed");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle");
+    assert_eq!(bundle.len(), 3);
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.source == RolloutEventSource::Replay)
+    );
+    // Sequence is preserved end-to-end so a downstream reducer can pair
+    // model_started/model_completed without re-deriving the order.
+    let sequences: Vec<u64> = bundle.iter().map(|entry| entry.sequence).collect();
+    assert_eq!(sequences, vec![1, 2, 3]);
+    assert!(bundle.iter().all(|entry| {
+        entry
+            .payload_sha256
+            .as_deref()
+            .is_some_and(|d| !d.is_empty())
+    }));
+    assert!(matches!(
+        bundle[0].replay_kind,
+        Some(SessionReplayEventKind::UserMessage)
+    ));
+    assert!(matches!(
+        bundle[2].replay_kind,
+        Some(SessionReplayEventKind::ModelCompleted)
+    ));
+    // event_kind is left empty for replay-sourced rows.
+    assert!(bundle.iter().all(|entry| entry.event_kind.is_none()));
+}
+
+#[test]
+fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
+    let (_root, store, config) = open_test_store("rollout-trace-merge");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+
+    // Fabricate both logs with controlled timestamps so the merge order is
+    // deterministic — `now_ms()` resolution is one millisecond and a tight
+    // sequence of appends would otherwise alias into the same bucket.
+    let event_line = |event: &SessionEvent| {
+        let mut bytes = serde_json::to_vec(event).expect("serialise event");
+        bytes.push(b'\n');
+        bytes
+    };
+    let events_path = session_dir.join("events.jsonl");
+    let replay_path = session_dir.join("replay.jsonl");
+
+    let mut events_jsonl = Vec::new();
+    events_jsonl.extend(event_line(&SessionEvent {
+        ts_unix_ms: 100,
+        kind: "user_message".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        summary: Some("find a bug".to_string()),
+        payload: json!({"text": "find a bug"}),
+    }));
+    events_jsonl.extend(event_line(&SessionEvent {
+        ts_unix_ms: 300,
+        kind: "assistant_completed".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        summary: Some("done".to_string()),
+        payload: json!({"text": "done", "response_id": "resp_1"}),
+    }));
+    fs::write(&events_path, events_jsonl).expect("write events.jsonl");
+
+    let replay_line = |event: &SessionReplayEvent| {
+        let mut bytes = serde_json::to_vec(event).expect("serialise replay");
+        bytes.push(b'\n');
+        bytes
+    };
+    // Manually-stamped replay rows with controlled sequences. The constructor
+    // would call `now_ms()` and overwrite sequence at append time, so we go
+    // around it for deterministic ordering.
+    let mut replay_jsonl = Vec::new();
+    let replay_event_start = SessionReplayEvent {
+        schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+        ts_unix_ms: 200,
+        sequence: 1,
+        kind: SessionReplayEventKind::ModelStarted,
+        turn_id: Some("turn-1".to_string()),
+        payload_sha256: String::new(),
+        payload: json!({"model": "gpt-test"}),
+    };
+    let replay_event_start = SessionReplayEvent {
+        payload_sha256: hash_payload(&replay_event_start.payload),
+        ..replay_event_start
+    };
+    let replay_event_completed = SessionReplayEvent {
+        schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+        ts_unix_ms: 300, // same ms as the assistant_completed event
+        sequence: 2,
+        kind: SessionReplayEventKind::ModelCompleted,
+        turn_id: Some("turn-1".to_string()),
+        payload_sha256: String::new(),
+        payload: json!({"response_id": "resp_1"}),
+    };
+    let replay_event_completed = SessionReplayEvent {
+        payload_sha256: hash_payload(&replay_event_completed.payload),
+        ..replay_event_completed
+    };
+    replay_jsonl.extend(replay_line(&replay_event_start));
+    replay_jsonl.extend(replay_line(&replay_event_completed));
+    fs::write(&replay_path, replay_jsonl).expect("write replay.jsonl");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle merged trace");
+    // Expected order:
+    //   ts=100 Event user_message
+    //   ts=200 Replay ModelStarted
+    //   ts=300 Replay ModelCompleted (replay sorts before event on ties)
+    //   ts=300 Event assistant_completed
+    assert_eq!(bundle.len(), 4);
+    assert_eq!(
+        (bundle[0].source, bundle[0].kind.as_str()),
+        (RolloutEventSource::Event, "user_message"),
+    );
+    assert_eq!(
+        (bundle[1].source, bundle[1].kind.as_str()),
+        (RolloutEventSource::Replay, "model_started"),
+    );
+    assert_eq!(
+        (bundle[2].source, bundle[2].kind.as_str()),
+        (RolloutEventSource::Replay, "model_completed"),
+        "replay row wins ties within the same millisecond",
+    );
+    assert_eq!(
+        (bundle[3].source, bundle[3].kind.as_str()),
+        (RolloutEventSource::Event, "assistant_completed"),
+    );
+    // Timestamps are non-decreasing across the whole bundle.
+    let timestamps: Vec<u64> = bundle.iter().map(|entry| entry.ts_unix_ms).collect();
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+fn hash_payload(payload: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}

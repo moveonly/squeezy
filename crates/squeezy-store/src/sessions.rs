@@ -22,6 +22,11 @@ use squeezy_core::{
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
+/// Schema version stamped onto every `RolloutEvent` emitted by
+/// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
+/// `events.jsonl` + `replay.jsonl`, so bumping this only requires changing
+/// the merge logic or the wire shape of `RolloutEvent` itself.
+pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
@@ -292,6 +297,31 @@ impl SessionStore {
         // so downstream `read_*` calls produce a consistent "not found"
         // error rather than a spurious archive-tree error message.
         live
+    }
+
+    /// Merge the session's `events.jsonl` and `replay.jsonl` into a single
+    /// ordered, normalized [`RolloutEvent`] stream. Stable-sorted on
+    /// `(ts_unix_ms, source, sequence_or_insertion)`; within a tied
+    /// millisecond the replay tape sorts before the lifecycle event.
+    pub fn bundle_rollout_trace(&self, session_id: &str) -> Result<Vec<RolloutEvent>> {
+        let dir = self.locate_session_dir(session_id);
+        let (events, _event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
+        let (replay, _replay_warnings) = read_replay_jsonl(&dir.join("replay.jsonl"))?;
+
+        let mut bundle: Vec<RolloutEvent> = Vec::with_capacity(events.len() + replay.len());
+        for (insertion, event) in events.into_iter().enumerate() {
+            bundle.push(RolloutEvent::from_session_event(event, insertion));
+        }
+        for replay_event in replay {
+            bundle.push(RolloutEvent::from_replay_event(replay_event));
+        }
+        bundle.sort_by(|left, right| {
+            left.ts_unix_ms
+                .cmp(&right.ts_unix_ms)
+                .then_with(|| left.source_order().cmp(&right.source_order()))
+                .then_with(|| left.tie_breaker().cmp(&right.tie_breaker()))
+        });
+        Ok(bundle)
     }
 
     pub fn export(&self, session_id: &str) -> Result<Value> {
@@ -1007,6 +1037,120 @@ pub struct SessionReplayTape {
     pub session_id: String,
     pub events: Vec<SessionReplayEvent>,
     pub warnings: u64,
+}
+
+/// Discriminator for [`RolloutEvent`] — tells consumers which of the two
+/// underlying logs (`events.jsonl` vs `replay.jsonl`) the entry originated
+/// from. Stored as a tag in the serialised form so JSONL exports remain
+/// self-describing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutEventSource {
+    /// Originated from `events.jsonl` (coarse session-lifecycle events).
+    Event,
+    /// Originated from `replay.jsonl` (fine-grained per-turn replay tape).
+    Replay,
+}
+
+/// Normalized rollout-trace entry: one item per row in the merged
+/// `events.jsonl` + `replay.jsonl` stream, with its provenance preserved.
+///
+/// `RolloutEvent` is the output shape of [`SessionStore::bundle_rollout_trace`].
+/// The `payload` keeps the raw JSON Squeezy already persisted; the typed
+/// `event_kind` / `replay_kind` enums are populated when the row's
+/// discriminator matches a known variant so consumers don't have to re-parse
+/// the payload to dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutEvent {
+    pub schema_version: u32,
+    pub source: RolloutEventSource,
+    pub ts_unix_ms: u64,
+    /// Strictly-monotonic sequence assigned by the replay writer. Zero for
+    /// entries that came from `events.jsonl` (which has no sequence column).
+    pub sequence: u64,
+    pub turn_id: Option<String>,
+    pub summary: Option<String>,
+    /// Free-form discriminator from the source log. Mirrors
+    /// `SessionEvent.kind` for events and the snake_case rendering of
+    /// `SessionReplayEventKind` for replay rows. Always populated.
+    pub kind: String,
+    /// Typed view of the row when it came from `events.jsonl` and the
+    /// discriminator matched a known [`SessionEventKind`] variant.
+    pub event_kind: Option<SessionEventKind>,
+    /// Typed view of the row when it came from `replay.jsonl`.
+    pub replay_kind: Option<SessionReplayEventKind>,
+    /// Content-addressed digest of `payload`, only present on replay rows
+    /// (events.jsonl entries do not carry one).
+    pub payload_sha256: Option<String>,
+    pub payload: Value,
+}
+
+impl RolloutEvent {
+    /// Sort key for the source discriminator. Replay rows sort before events
+    /// in the same millisecond so the granular per-turn flow precedes the
+    /// coarse lifecycle summary it produced.
+    fn source_order(&self) -> u8 {
+        match self.source {
+            RolloutEventSource::Replay => 0,
+            RolloutEventSource::Event => 1,
+        }
+    }
+
+    /// Secondary sort key. Replay rows already carry a strictly-monotonic
+    /// `sequence`; event rows fall back to their insertion index so the
+    /// `events.jsonl` order is preserved.
+    fn tie_breaker(&self) -> u64 {
+        self.sequence
+    }
+
+    fn from_session_event(event: SessionEvent, insertion: usize) -> Self {
+        let kind = event.kind.clone();
+        let event_kind = SessionEventKind::try_from_event(&event);
+        Self {
+            schema_version: ROLLOUT_TRACE_SCHEMA_VERSION,
+            source: RolloutEventSource::Event,
+            ts_unix_ms: event.ts_unix_ms,
+            sequence: insertion as u64,
+            turn_id: event.turn_id,
+            summary: event.summary,
+            kind,
+            event_kind,
+            replay_kind: None,
+            payload_sha256: None,
+            payload: event.payload,
+        }
+    }
+
+    fn from_replay_event(event: SessionReplayEvent) -> Self {
+        Self {
+            schema_version: ROLLOUT_TRACE_SCHEMA_VERSION,
+            source: RolloutEventSource::Replay,
+            ts_unix_ms: event.ts_unix_ms,
+            sequence: event.sequence,
+            turn_id: event.turn_id,
+            summary: None,
+            kind: replay_kind_discriminator(event.kind).to_string(),
+            event_kind: None,
+            replay_kind: Some(event.kind),
+            payload_sha256: Some(event.payload_sha256),
+            payload: event.payload,
+        }
+    }
+}
+
+fn replay_kind_discriminator(kind: SessionReplayEventKind) -> &'static str {
+    match kind {
+        SessionReplayEventKind::UserMessage => "user_message",
+        SessionReplayEventKind::ModelRequest => "model_request",
+        SessionReplayEventKind::ModelStarted => "model_started",
+        SessionReplayEventKind::ModelTextDelta => "model_text_delta",
+        SessionReplayEventKind::ModelToolCall => "model_tool_call",
+        SessionReplayEventKind::ModelCompleted => "model_completed",
+        SessionReplayEventKind::ModelCancelled => "model_cancelled",
+        SessionReplayEventKind::ToolCall => "tool_call",
+        SessionReplayEventKind::ToolResult => "tool_result",
+        SessionReplayEventKind::CostDecision => "cost_decision",
+    }
 }
 
 impl SessionEvent {
