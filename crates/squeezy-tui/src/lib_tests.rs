@@ -3117,6 +3117,8 @@ fn compact_status_surfaces_context_without_dense_counters() {
         changed_files: 2,
         operation: None,
         available: true,
+        pull_request: None,
+        branch_changes: None,
     };
     app.status = "running search".to_string();
 
@@ -3129,7 +3131,7 @@ fn compact_status_surfaces_context_without_dense_counters() {
     assert!(status.contains("feature"), "{status}");
     assert!(!status.contains("feature*2"), "{status}");
     assert!(!status.contains("running search"), "{status}");
-    assert!(!status.contains("openai:gpt-test"), "{status}");
+    assert!(!status.contains("scripted:gpt-test"), "{status}");
     assert!(!status.contains("perm="), "{status}");
     assert!(!status.contains("sandbox"), "{status}");
     assert!(!status.contains("telemetry"), "{status}");
@@ -3226,6 +3228,8 @@ fn render_uses_two_line_status_footer() {
         changed_files: 0,
         operation: None,
         available: true,
+        pull_request: None,
+        branch_changes: None,
     };
 
     let output = render_to_string(&app, 140, 18);
@@ -6442,4 +6446,91 @@ fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
         assert_eq!(span.content.as_ref(), "●");
         assert_eq!(span.style.fg, Some(crate::render::palette::AMBER));
     }
+}
+
+#[test]
+fn status_line_unset_keeps_legacy_two_row_layout() {
+    let app = test_app(SessionMode::Build);
+    // No /statusline configured ⇒ row 2 is the hints line, not a detail
+    // line. Existing users see no visible change until they opt in.
+    let lines = format_status_lines(&app, 120);
+    assert_eq!(lines.len(), 2);
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(row2.contains("Enter send"), "row 2 should be hints: {row2}");
+    assert!(
+        !row2.contains("openai:"),
+        "row 2 should not include the detail line: {row2}"
+    );
+}
+
+#[test]
+fn status_line_configured_renders_detail_before_hints() {
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = Some(vec![
+        StatusLineItem::ProviderAndModel,
+        StatusLineItem::CurrentDir,
+    ]);
+    app.status_line_use_colors = true;
+    let lines = format_status_lines(&app, 200);
+    assert_eq!(lines.len(), 2);
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    // Detail items render with " · " separator and precede the hints,
+    // which are still appended after another " · " separator.
+    assert!(row2.contains("scripted:gpt-test"), "{row2}");
+    assert!(row2.contains(" · "), "{row2}");
+    assert!(row2.contains("Enter send"), "{row2}");
+    // Provider-and-Model lives in the Model accent group, so the span
+    // carrying it should be styled with the cyan fallback color when
+    // theme colors are enabled.
+    let provider_span = lines[1]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("scripted:gpt-test"))
+        .expect("provider span");
+    assert_eq!(
+        provider_span.style.fg,
+        Some(crate::render::palette::ACCENT_CYAN),
+        "provider-and-model should paint with the Model accent (cyan)"
+    );
+}
+
+#[test]
+fn status_line_empty_list_disables_detail() {
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = Some(Vec::new());
+    let lines = format_status_lines(&app, 120);
+    assert_eq!(lines.len(), 2);
+    let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(row2.contains("Enter send"), "{row2}");
+    assert!(!row2.contains(" · openai:"), "{row2}");
+}
+
+#[test]
+fn status_line_item_round_trips_through_slug() {
+    use crate::status::StatusLineItem;
+    for item in StatusLineItem::ALL {
+        let parsed: StatusLineItem = item
+            .slug()
+            .parse()
+            .unwrap_or_else(|_| panic!("slug {} should parse back to its item", item.slug()));
+        assert_eq!(parsed, *item);
+    }
+}
+
+#[test]
+fn status_line_codex_aliases_parse() {
+    use crate::status::StatusLineItem;
+    assert_eq!(
+        "codex-version".parse::<StatusLineItem>().unwrap(),
+        StatusLineItem::SqueezyVersion
+    );
+    assert_eq!(
+        "status".parse::<StatusLineItem>().unwrap(),
+        StatusLineItem::RunState
+    );
+    assert_eq!(
+        "project".parse::<StatusLineItem>().unwrap(),
+        StatusLineItem::ProjectName
+    );
 }

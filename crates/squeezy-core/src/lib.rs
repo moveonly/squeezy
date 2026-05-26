@@ -5321,7 +5321,7 @@ impl TuiAlternateScreen {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
     pub status_verbosity: StatusVerbosity,
@@ -5330,6 +5330,13 @@ pub struct TuiConfig {
     pub transcript_default: TranscriptDefault,
     pub alternate_screen: TuiAlternateScreen,
     pub show_reasoning_usage: bool,
+    /// Ordered list of status-line item identifiers. `None` means
+    /// "use the built-in default list"; an empty list means the user
+    /// deliberately disabled the detail line.
+    pub status_line: Option<Vec<String>>,
+    /// Color status-line items with their accent palette.
+    /// Defaults to `true`.
+    pub status_line_use_colors: bool,
 }
 
 impl TuiConfig {
@@ -5352,6 +5359,8 @@ impl TuiConfig {
                 .alternate_screen
                 .unwrap_or(TuiAlternateScreen::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
+            status_line: settings.status_line,
+            status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
         }
     }
 }
@@ -5371,6 +5380,8 @@ pub struct TuiSettings {
     pub transcript_default: Option<TranscriptDefault>,
     pub alternate_screen: Option<TuiAlternateScreen>,
     pub show_reasoning_usage: Option<bool>,
+    pub status_line: Option<Vec<String>>,
+    pub status_line_use_colors: Option<bool>,
 }
 
 impl TuiSettings {
@@ -5385,6 +5396,8 @@ impl TuiSettings {
                 "transcript_default",
                 "alternate_screen",
                 "show_reasoning_usage",
+                "status_line",
+                "status_line_use_colors",
             ],
             source,
             path,
@@ -5427,6 +5440,18 @@ impl TuiSettings {
                 source,
                 &field(path, "show_reasoning_usage"),
             )?,
+            status_line: string_array_value(
+                table,
+                "status_line",
+                source,
+                &field(path, "status_line"),
+            )?,
+            status_line_use_colors: bool_value(
+                table,
+                "status_line_use_colors",
+                source,
+                &field(path, "status_line_use_colors"),
+            )?,
         })
     }
 
@@ -5438,6 +5463,11 @@ impl TuiSettings {
         replace_if_some(&mut self.transcript_default, next.transcript_default);
         replace_if_some(&mut self.alternate_screen, next.alternate_screen);
         replace_if_some(&mut self.show_reasoning_usage, next.show_reasoning_usage);
+        replace_if_some(&mut self.status_line, next.status_line);
+        replace_if_some(
+            &mut self.status_line_use_colors,
+            next.status_line_use_colors,
+        );
     }
 }
 

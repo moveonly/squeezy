@@ -69,6 +69,7 @@ mod render;
 mod resume_picker;
 mod settings_watcher;
 mod status;
+mod status_line_setup;
 mod streaming;
 mod streaming_patch;
 pub use render::markdown::render_markdown;
@@ -743,6 +744,27 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
+    // `/statusline` overlay swallows all keys until closed.
+    if app.status_line_setup.is_some() {
+        let outcome = app
+            .status_line_setup
+            .as_mut()
+            .expect("checked above")
+            .handle_key(key);
+        match outcome {
+            status_line_setup::KeyOutcome::Continue => {}
+            status_line_setup::KeyOutcome::Cancel => {
+                app.status_line_setup = None;
+                app.status = "/statusline cancelled".to_string();
+            }
+            status_line_setup::KeyOutcome::Save { items, use_colors } => {
+                app.status_line_setup = None;
+                save_status_line(app, agent, items, use_colors);
+            }
+        }
+        return Ok(false);
+    }
+
     // `n` dismisses the current notification, `N` clears all. Only fires
     // when the prompt is empty so we don't eat keystrokes the user is
     // typing into the input area.
@@ -1191,6 +1213,64 @@ fn toggle_config_screen(
     app.status = "config".to_string();
 }
 
+fn toggle_status_line_setup(app: &mut TuiApp) {
+    if app.status_line_setup.is_some() {
+        app.status_line_setup = None;
+        app.status = "/statusline closed".to_string();
+        return;
+    }
+    app.status_line_setup = Some(status_line_setup::StatusLineSetupState::new(
+        app.status_line_items.as_deref(),
+        app.status_line_use_colors,
+    ));
+    app.status = "/statusline".to_string();
+}
+
+/// Persist the picker's selection to `[tui].status_line` /
+/// `[tui].status_line_use_colors` in the user-scope settings file and
+/// apply it in-memory immediately.
+fn save_status_line(
+    app: &mut TuiApp,
+    agent: &mut Agent,
+    items: Vec<status::StatusLineItem>,
+    use_colors: bool,
+) {
+    use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
+
+    let target_path = squeezy_core::default_settings_path();
+    let scope_target = SettingsScope::user(&target_path);
+    let slug_list: Vec<String> = items.iter().map(|i| i.slug().to_string()).collect();
+    let edits = [
+        SettingsEdit {
+            path: &["tui", "status_line"],
+            op: EditOp::SetArrayOfStrings(slug_list.clone()),
+        },
+        SettingsEdit {
+            path: &["tui", "status_line_use_colors"],
+            op: EditOp::SetBool(use_colors),
+        },
+    ];
+    match apply_edits(&scope_target, &edits) {
+        Ok(_) => {
+            // Apply immediately in-memory.
+            let mut cfg = agent.config_snapshot();
+            cfg.tui.status_line = if slug_list.is_empty() {
+                None
+            } else {
+                Some(slug_list)
+            };
+            cfg.tui.status_line_use_colors = use_colors;
+            agent.replace_config(cfg);
+            app.status_line_items = Some(items);
+            app.status_line_use_colors = use_colors;
+            app.status = format!("status line saved to {}", target_path.display());
+        }
+        Err(err) => {
+            app.status = format!("/statusline save failed: {err}");
+        }
+    }
+}
+
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
@@ -1215,6 +1295,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 squeezy_core::config_schema::section_from_slug(rest)
             };
             toggle_config_screen(app, agent, section);
+            return true;
+        }
+        "/statusline" => {
+            toggle_status_line_setup(app);
             return true;
         }
         "/plan" => {
@@ -3159,6 +3243,22 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
     if app.transcript_overlay.is_some() {
         render_transcript_overlay(frame, area, app);
+        return;
+    }
+    if let Some(state) = &app.status_line_setup {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        status_line_setup::render(frame, chunks[0], state, app);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
         return;
     }
     if let Some(state) = &app.config_screen {
@@ -7107,8 +7207,7 @@ fn mode_status_color(mode: SessionMode) -> Color {
 }
 
 fn render_status(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let paragraph =
-        Paragraph::new(format_status_lines(app, area.width)).style(Style::default().fg(QUIET));
+    let paragraph = Paragraph::new(format_status_lines(app, area.width));
     frame.render_widget(paragraph, area);
 }
 
@@ -7125,24 +7224,56 @@ fn format_status_tokens(app: &TuiApp) -> String {
 }
 
 fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        format_status_overview_line(app, width),
-        Line::from(Span::styled(
-            format_status_hints(app),
-            Style::default().fg(QUIET),
-        )),
-    ];
-    if app.status_verbosity == StatusVerbosity::Verbose {
-        lines[1] = Line::from(Span::styled(
+    let mut lines = vec![format_status_overview_line(app, width)];
+    let hints_span = Span::styled(format_status_hints(app), Style::default().fg(QUIET));
+    // Only render the codex-style detail line when the user has explicitly
+    // configured `[tui].status_line` via /statusline. When the key is unset
+    // the default is the original two-row layout (overview + hints).
+    let detail = configured_status_line_items(app).and_then(|items| {
+        status::render_status_detail_line(app, &items, app.status_line_use_colors)
+    });
+    if let Some(mut line) = detail {
+        line.spans.push(Span::styled(
+            " · ",
+            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
+        ));
+        line.spans.push(hints_span);
+        lines.push(line);
+    } else if app.status_verbosity == StatusVerbosity::Verbose {
+        lines.push(Line::from(Span::styled(
             format!(
                 "{} · {}",
                 format_status_details(app),
                 format_status_hints(app)
             ),
             Style::default().fg(QUIET),
-        ));
+        )));
+    } else {
+        lines.push(Line::from(hints_span));
     }
     lines
+}
+
+/// User-configured `[tui].status_line`. `None` when the TOML key is unset
+/// (so the renderer falls back to the historical hints-only second row)
+/// or when the user deliberately set an empty list (also "no detail row").
+fn configured_status_line_items(app: &TuiApp) -> Option<Vec<status::StatusLineItem>> {
+    match &app.status_line_items {
+        Some(list) if list.is_empty() => None,
+        Some(list) => Some(list.clone()),
+        None => None,
+    }
+}
+
+/// Parse the TOML-side `[tui].status_line` list into typed items, dropping
+/// unknown identifiers. Returns `None` when the TOML key was unset.
+fn parse_status_line_items(raw: Option<&[String]>) -> Option<Vec<status::StatusLineItem>> {
+    let raw = raw?;
+    Some(
+        raw.iter()
+            .filter_map(|s| s.parse::<status::StatusLineItem>().ok())
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -7217,7 +7348,7 @@ fn format_status_hints(app: &TuiApp) -> String {
     base
 }
 
-fn format_mcp_status(app: &TuiApp) -> String {
+pub(crate) fn format_mcp_status(app: &TuiApp) -> String {
     app.mcp_status
         .as_ref()
         .map(format_mcp_status_snapshot)
@@ -7264,7 +7395,7 @@ pub(crate) fn format_mcp_status_snapshot(snapshot: &McpStatusSnapshot) -> String
     parts.join(" ")
 }
 
-fn reasoning_status_fragment(app: &TuiApp) -> String {
+pub(crate) fn reasoning_status_fragment(app: &TuiApp) -> String {
     if !app.show_reasoning_usage {
         return String::new();
     }
@@ -7365,6 +7496,13 @@ struct RepoStatus {
     changed_files: usize,
     operation: Option<String>,
     available: bool,
+    /// Open pull request number for the current branch, when `gh` reports
+    /// one. Populated at startup via [`probe_pull_request`]; `None` when
+    /// `gh` is missing, no PR exists, or the probe fails.
+    pull_request: Option<u64>,
+    /// `(added, removed)` line counts of the current branch relative to
+    /// the repository's default branch. Populated via `git diff --shortstat`.
+    branch_changes: Option<(u32, u32)>,
 }
 
 impl RepoStatus {
@@ -7376,14 +7514,21 @@ impl RepoStatus {
         if snapshot.vcs.kind != VcsKind::Git {
             return Self::none();
         }
+        let branch = snapshot
+            .vcs
+            .branch
+            .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head)));
+        let pull_request = branch
+            .as_deref()
+            .and_then(|b| probe_pull_request(&config.workspace_root, b));
+        let branch_changes = probe_branch_changes(&config.workspace_root);
         Self {
-            branch: snapshot
-                .vcs
-                .branch
-                .or_else(|| snapshot.vcs.head.map(|head| short_commit(&head))),
+            branch,
             changed_files: snapshot.summary.files_changed,
             operation: snapshot.vcs.operation_state,
             available: true,
+            pull_request,
+            branch_changes,
         }
     }
 
@@ -7393,6 +7538,8 @@ impl RepoStatus {
             changed_files: 0,
             operation: None,
             available: false,
+            pull_request: None,
+            branch_changes: None,
         }
     }
 
@@ -7418,6 +7565,80 @@ impl RepoStatus {
 
 fn short_commit(head: &str) -> String {
     head.chars().take(7).collect()
+}
+
+/// Look up the open pull-request number for `branch` via the `gh` CLI.
+/// Returns `None` if `gh` is missing, unauthenticated, or no open PR exists.
+/// Runs at startup; users see the result update across TUI restarts.
+fn probe_pull_request(workspace_root: &std::path::Path, branch: &str) -> Option<u64> {
+    use std::process::Command;
+    let output = Command::new("gh")
+        .arg("pr")
+        .arg("view")
+        .arg(branch)
+        .arg("--json")
+        .arg("number")
+        .arg("-q")
+        .arg(".number")
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.trim().parse::<u64>().ok()
+}
+
+/// Parse `git diff --shortstat <default>...HEAD` into `(added, removed)`.
+/// Returns `None` if not in a git repo, the default branch can't be
+/// determined, or git fails for any reason.
+fn probe_branch_changes(workspace_root: &std::path::Path) -> Option<(u32, u32)> {
+    use std::process::Command;
+    let default_branch = Command::new("git")
+        .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+        .current_dir(workspace_root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let output = Command::new("git")
+        .args(["diff", "--shortstat"])
+        .arg(format!("{default_branch}...HEAD"))
+        .current_dir(workspace_root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_shortstat(&stdout)
+}
+
+/// Parse a `git diff --shortstat` line like
+/// ` 3 files changed, 47 insertions(+), 9 deletions(-)`.
+fn parse_shortstat(text: &str) -> Option<(u32, u32)> {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for chunk in text.split(',') {
+        let trimmed = chunk.trim();
+        if let Some(rest) = trimmed.strip_suffix(" insertions(+)") {
+            added = rest.parse().unwrap_or(0);
+        } else if let Some(rest) = trimmed.strip_suffix(" insertion(+)") {
+            added = rest.parse().unwrap_or(0);
+        } else if let Some(rest) = trimmed.strip_suffix(" deletions(-)") {
+            removed = rest.parse().unwrap_or(0);
+        } else if let Some(rest) = trimmed.strip_suffix(" deletion(-)") {
+            removed = rest.parse().unwrap_or(0);
+        }
+    }
+    if added == 0 && removed == 0 && !text.contains("changed") {
+        None
+    } else {
+        Some((added, removed))
+    }
 }
 
 fn compact_path(path: &std::path::Path) -> String {
@@ -7651,6 +7872,18 @@ pub(crate) struct TuiApp {
     pub(crate) clipboard: Box<dyn Clipboard>,
     pub(crate) app_notifications: NotificationQueue,
     pub(crate) config_screen: Option<config_screen::ConfigScreenState>,
+    /// Configured status-bar items (`[tui].status_line`). `None` means
+    /// "use the built-in default list"; `Some(empty)` means the user
+    /// disabled the detail line entirely.
+    pub(crate) status_line_items: Option<Vec<status::StatusLineItem>>,
+    /// Whether status-bar items render with accent colors. Defaults to
+    /// `true`.
+    pub(crate) status_line_use_colors: bool,
+    /// Interactive `/statusline` overlay. `None` = closed.
+    pub(crate) status_line_setup: Option<status_line_setup::StatusLineSetupState>,
+    /// Latest mid-turn task-progress text surfaced by the agent.
+    /// Drives the `task-progress` status item.
+    pub(crate) latest_plan_progress: Option<String>,
 }
 
 impl TuiApp {
@@ -7802,6 +8035,10 @@ impl TuiApp {
             clipboard,
             app_notifications: NotificationQueue::new(),
             config_screen: None,
+            status_line_items: parse_status_line_items(config.tui.status_line.as_deref()),
+            status_line_use_colors: config.tui.status_line_use_colors,
+            status_line_setup: None,
+            latest_plan_progress: None,
         }
     }
 

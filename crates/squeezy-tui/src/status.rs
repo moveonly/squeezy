@@ -1,15 +1,482 @@
-//! Status-bar segment composition.
+//! Status-bar items, accent grouping, and styled-line renderer.
 //!
-//! Replaces the previous monolithic `format_status_details` with a list of
-//! per-concern segment functions. Each segment returns `Option<String>`
-//! (None = hide this frame); the composer joins the present segments with
-//! the existing `"  "` separator. Adding a new status field is a one-file
-//! change here.
+//! Each item is an opt-in segment a user can enable through `/statusline`.
+//! Items are grouped into [`StatusLineAccent`] families so the configured
+//! list paints with the same color vocabulary as the codex sibling
+//! (see `codex-rs/tui/src/bottom_pane/status_line_style.rs`).
+//!
+//! The legacy `render_status_details` plain-text path is kept for tests and
+//! for the historical verbose detail line that fires when no
+//! `[tui].status_line` is configured AND `status_verbosity = verbose`.
 
+use std::str::FromStr;
+
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use crate::render::palette::{ACCENT_CYAN, ACCENT_GREEN, ACCENT_MAGENTA};
 use crate::{TuiApp, context_window_pct};
 
-/// Render the full detail line. Preserves the historical format so existing
-/// tests and consumers keep working.
+/// Separator drawn between rendered items.
+const STATUS_LINE_SEPARATOR: &str = " · ";
+
+/// Default status-bar items when the user hasn't configured `[tui].status_line`.
+/// Mirrors codex's pre-checked picker entries plus `provider-and-model`
+/// (squeezy ships configurable providers, so the provider:model pair carries
+/// more information than the model alone).
+pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
+    StatusLineItem::ProviderAndModel,
+    StatusLineItem::ModelWithReasoning,
+    StatusLineItem::CurrentDir,
+    StatusLineItem::ProjectName,
+    StatusLineItem::GitBranch,
+    StatusLineItem::PullRequestNumber,
+    StatusLineItem::BranchChanges,
+    StatusLineItem::ContextUsed,
+];
+
+/// One configurable status-bar item.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub(crate) enum StatusLineItem {
+    // Model
+    Model,
+    ModelWithReasoning,
+    ProviderAndModel,
+    // Path
+    CurrentDir,
+    ProjectName,
+    // Branch
+    GitBranch,
+    PullRequestNumber,
+    BranchChanges,
+    // State
+    RunState,
+    Mode,
+    // Usage
+    ContextRemaining,
+    ContextUsed,
+    ContextWindowSize,
+    UsedTokens,
+    TotalInputTokens,
+    TotalOutputTokens,
+    CachedTokens,
+    CacheWriteTokens,
+    Tools,
+    BytesRead,
+    // Limit
+    Cost,
+    CostCap,
+    Budget,
+    // Metadata
+    SqueezyVersion,
+    SessionId,
+    ConfigSources,
+    Telemetry,
+    // Mode
+    Permissions,
+    ApprovalMode,
+    Sandbox,
+    Mcp,
+    Redactions,
+    Receipts,
+    // Thread
+    ThreadTitle,
+    Pins,
+    CompactGeneration,
+    // Progress
+    TaskProgress,
+}
+
+impl StatusLineItem {
+    /// Stable kebab-case identifier used in TOML and in the picker UI.
+    pub(crate) const fn slug(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::ModelWithReasoning => "model-with-reasoning",
+            Self::ProviderAndModel => "provider-and-model",
+            Self::CurrentDir => "current-dir",
+            Self::ProjectName => "project-name",
+            Self::GitBranch => "git-branch",
+            Self::PullRequestNumber => "pull-request-number",
+            Self::BranchChanges => "branch-changes",
+            Self::RunState => "run-state",
+            Self::Mode => "mode",
+            Self::ContextRemaining => "context-remaining",
+            Self::ContextUsed => "context-used",
+            Self::ContextWindowSize => "context-window-size",
+            Self::UsedTokens => "used-tokens",
+            Self::TotalInputTokens => "total-input-tokens",
+            Self::TotalOutputTokens => "total-output-tokens",
+            Self::CachedTokens => "cached-tokens",
+            Self::CacheWriteTokens => "cache-write-tokens",
+            Self::Tools => "tools",
+            Self::BytesRead => "bytes-read",
+            Self::Cost => "cost",
+            Self::CostCap => "cost-cap",
+            Self::Budget => "budget",
+            Self::SqueezyVersion => "squeezy-version",
+            Self::SessionId => "session-id",
+            Self::ConfigSources => "config-sources",
+            Self::Telemetry => "telemetry",
+            Self::Permissions => "permissions",
+            Self::ApprovalMode => "approval-mode",
+            Self::Sandbox => "sandbox",
+            Self::Mcp => "mcp",
+            Self::Redactions => "redactions",
+            Self::Receipts => "receipts",
+            Self::ThreadTitle => "thread-title",
+            Self::Pins => "pins",
+            Self::CompactGeneration => "compact-generation",
+            Self::TaskProgress => "task-progress",
+        }
+    }
+
+    /// One-line description shown next to the slug in the picker.
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::Model => "Current model name",
+            Self::ModelWithReasoning => "Current model name with reasoning level",
+            Self::ProviderAndModel => "Active provider and model (provider:model)",
+            Self::CurrentDir => "Current working directory",
+            Self::ProjectName => "Project name (omitted when unavailable)",
+            Self::GitBranch => "Current Git branch (omitted when unavailable)",
+            Self::PullRequestNumber => "Open pull request number for the current branch",
+            Self::BranchChanges => "Committed branch changes against the default branch",
+            Self::RunState => "Compact session run-state text (Ready, Working, Thinking)",
+            Self::Mode => "Active session mode (Plan or Build)",
+            Self::ContextRemaining => "Percentage of context budget remaining",
+            Self::ContextUsed => "Percentage of context budget used",
+            Self::ContextWindowSize => "Configured context-window size in tokens",
+            Self::UsedTokens => "Total input + output tokens spent this session",
+            Self::TotalInputTokens => "Total input tokens spent this session",
+            Self::TotalOutputTokens => "Total output tokens spent this session",
+            Self::CachedTokens => "Cached input tokens served from prompt cache",
+            Self::CacheWriteTokens => "Input tokens written to prompt cache this session",
+            Self::Tools => "Number of tool calls this session",
+            Self::BytesRead => "Bytes read from tool outputs this session",
+            Self::Cost => "Spend in USD this session (with cap %)",
+            Self::CostCap => "Session cost cap in USD",
+            Self::Budget => "Budget-denial counter for the active turn",
+            Self::SqueezyVersion => "Running Squeezy version",
+            Self::SessionId => "Current session id",
+            Self::ConfigSources => "Active config tier labels",
+            Self::Telemetry => "Telemetry on/off",
+            Self::Permissions => "Active permission policy summary",
+            Self::ApprovalMode => "Active command approval mode",
+            Self::Sandbox => "Active shell sandbox mode",
+            Self::Mcp => "Connected MCP servers summary",
+            Self::Redactions => "Redactions applied this session",
+            Self::Receipts => "Receipt stub + negative receipt cache hits",
+            Self::ThreadTitle => "Current thread title",
+            Self::Pins => "Number of pinned context items",
+            Self::CompactGeneration => "Compaction generation counter",
+            Self::TaskProgress => "Latest mid-turn task progress",
+        }
+    }
+
+    /// All items, in the order shown in the picker (matches codex's
+    /// fixed order for codex-compatible items, then squeezy-only extras).
+    pub(crate) const ALL: &'static [StatusLineItem] = &[
+        Self::ProviderAndModel,
+        Self::ModelWithReasoning,
+        Self::Model,
+        Self::CurrentDir,
+        Self::ProjectName,
+        Self::GitBranch,
+        Self::PullRequestNumber,
+        Self::BranchChanges,
+        Self::ThreadTitle,
+        Self::RunState,
+        Self::Mode,
+        Self::ContextRemaining,
+        Self::ContextUsed,
+        Self::ContextWindowSize,
+        Self::UsedTokens,
+        Self::TotalInputTokens,
+        Self::TotalOutputTokens,
+        Self::CachedTokens,
+        Self::CacheWriteTokens,
+        Self::Tools,
+        Self::BytesRead,
+        Self::Cost,
+        Self::CostCap,
+        Self::Budget,
+        Self::Permissions,
+        Self::ApprovalMode,
+        Self::Sandbox,
+        Self::Mcp,
+        Self::Redactions,
+        Self::Receipts,
+        Self::Pins,
+        Self::CompactGeneration,
+        Self::ConfigSources,
+        Self::Telemetry,
+        Self::TaskProgress,
+        Self::SqueezyVersion,
+        Self::SessionId,
+    ];
+}
+
+impl FromStr for StatusLineItem {
+    type Err = ();
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        // Codex/squeezy compatibility aliases.
+        let normalized = match s {
+            "status" => "run-state",
+            "project" | "project-root" => "project-name",
+            "codex-version" => "squeezy-version",
+            "thread-id" => "session-id",
+            "context-usage" => "context-used",
+            "model-name" => "model",
+            other => other,
+        };
+        for item in Self::ALL {
+            if item.slug() == normalized {
+                return Ok(*item);
+            }
+        }
+        Err(())
+    }
+}
+
+/// Color family for an item, mirroring codex's 10-accent palette.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StatusLineAccent {
+    Model,
+    Path,
+    Branch,
+    State,
+    Usage,
+    Limit,
+    Metadata,
+    Mode,
+    Thread,
+    Progress,
+}
+
+impl StatusLineAccent {
+    pub(crate) const fn for_item(item: StatusLineItem) -> Self {
+        match item {
+            StatusLineItem::Model
+            | StatusLineItem::ModelWithReasoning
+            | StatusLineItem::ProviderAndModel => Self::Model,
+            StatusLineItem::CurrentDir | StatusLineItem::ProjectName => Self::Path,
+            StatusLineItem::GitBranch
+            | StatusLineItem::PullRequestNumber
+            | StatusLineItem::BranchChanges => Self::Branch,
+            StatusLineItem::RunState | StatusLineItem::Mode => Self::State,
+            StatusLineItem::ContextRemaining
+            | StatusLineItem::ContextUsed
+            | StatusLineItem::ContextWindowSize
+            | StatusLineItem::UsedTokens
+            | StatusLineItem::TotalInputTokens
+            | StatusLineItem::TotalOutputTokens
+            | StatusLineItem::CachedTokens
+            | StatusLineItem::CacheWriteTokens
+            | StatusLineItem::Tools
+            | StatusLineItem::BytesRead => Self::Usage,
+            StatusLineItem::Cost | StatusLineItem::CostCap | StatusLineItem::Budget => Self::Limit,
+            StatusLineItem::SqueezyVersion
+            | StatusLineItem::SessionId
+            | StatusLineItem::ConfigSources
+            | StatusLineItem::Telemetry => Self::Metadata,
+            StatusLineItem::Permissions
+            | StatusLineItem::ApprovalMode
+            | StatusLineItem::Sandbox
+            | StatusLineItem::Mcp
+            | StatusLineItem::Redactions
+            | StatusLineItem::Receipts => Self::Mode,
+            StatusLineItem::ThreadTitle
+            | StatusLineItem::Pins
+            | StatusLineItem::CompactGeneration => Self::Thread,
+            StatusLineItem::TaskProgress => Self::Progress,
+        }
+    }
+
+    pub(crate) const fn fallback_color(self) -> Color {
+        match self {
+            Self::Model | Self::State | Self::Metadata | Self::Mode => ACCENT_CYAN,
+            Self::Path | Self::Usage | Self::Progress => ACCENT_GREEN,
+            Self::Branch | Self::Limit | Self::Thread => ACCENT_MAGENTA,
+        }
+    }
+}
+
+/// Build the styled detail line. Returns `None` when the configured (or
+/// default) item list produces no rendered segments — the caller decides
+/// whether to fall back to the legacy plain-text detail line or to draw
+/// nothing.
+pub(crate) fn render_status_detail_line(
+    app: &TuiApp,
+    items: &[StatusLineItem],
+    use_theme_colors: bool,
+) -> Option<Line<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for item in items {
+        let Some(text) = resolve_status_item(app, *item) else {
+            continue;
+        };
+        if !spans.is_empty() {
+            spans.push(Span::styled(
+                STATUS_LINE_SEPARATOR,
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        let mut style = if use_theme_colors {
+            Style::default().fg(StatusLineAccent::for_item(*item).fallback_color())
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        if matches!(item, StatusLineItem::PullRequestNumber) {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        spans.push(Span::styled(text, style));
+    }
+    if spans.is_empty() {
+        None
+    } else {
+        Some(Line::from(spans))
+    }
+}
+
+/// Resolve a single item to its display string. `None` hides the item.
+pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<String> {
+    match item {
+        StatusLineItem::Model => Some(app.model.clone()),
+        StatusLineItem::ModelWithReasoning => {
+            let frag = crate::reasoning_status_fragment(app);
+            if frag.is_empty() {
+                Some(app.model.clone())
+            } else {
+                Some(format!("{}{}", app.model, frag))
+            }
+        }
+        StatusLineItem::ProviderAndModel => Some(format!("{}:{}", app.provider_name, app.model)),
+        StatusLineItem::CurrentDir => Some(app.directory.clone()),
+        StatusLineItem::ProjectName => {
+            let name = app
+                .workspace_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string);
+            name.filter(|n| !n.is_empty())
+        }
+        StatusLineItem::GitBranch => app.repo.branch.clone().or_else(|| {
+            if app.repo.available {
+                Some("detached".to_string())
+            } else {
+                None
+            }
+        }),
+        StatusLineItem::PullRequestNumber => {
+            app.repo.pull_request.map(|number| format!("PR #{number}"))
+        }
+        StatusLineItem::BranchChanges => {
+            app.repo.branch_changes.as_ref().map(|(added, removed)| {
+                if *added == 0 && *removed == 0 {
+                    "no branch changes".to_string()
+                } else {
+                    format!("+{added} -{removed}")
+                }
+            })
+        }
+        StatusLineItem::RunState => Some(format_run_state(app)),
+        StatusLineItem::Mode => Some(format!("{:?}", app.mode)),
+        StatusLineItem::ContextRemaining => context_pct(app).map(|pct| {
+            let remaining = 100u64.saturating_sub(pct.min(100));
+            format!("ctx {remaining}% left")
+        }),
+        StatusLineItem::ContextUsed => context_pct(app).map(|pct| format!("ctx {pct}% used")),
+        StatusLineItem::ContextWindowSize => {
+            if app.context_compaction_threshold == 0 {
+                None
+            } else {
+                Some(format!("window {}", app.context_compaction_threshold))
+            }
+        }
+        StatusLineItem::UsedTokens => {
+            let total = app.cost.input_tokens.unwrap_or(0) + app.cost.output_tokens.unwrap_or(0);
+            if total == 0 {
+                None
+            } else {
+                Some(format!("tok {total}"))
+            }
+        }
+        StatusLineItem::TotalInputTokens => {
+            app.cost.input_tokens.map(|tokens| format!("in {tokens}"))
+        }
+        StatusLineItem::TotalOutputTokens => {
+            app.cost.output_tokens.map(|tokens| format!("out {tokens}"))
+        }
+        StatusLineItem::CachedTokens => app
+            .cost
+            .cached_input_tokens
+            .map(|tokens| format!("cached {tokens}")),
+        StatusLineItem::CacheWriteTokens => app
+            .cost
+            .cache_write_input_tokens
+            .map(|tokens| format!("cache_write {tokens}")),
+        StatusLineItem::Tools => Some(format!("tools {}", app.metrics.tool_calls)),
+        StatusLineItem::BytesRead => Some(format!("read {}B", app.metrics.bytes_read)),
+        StatusLineItem::Cost => Some(format_cost_segment(&app.cost, app.cost_cap_usd_micros)),
+        StatusLineItem::CostCap => app
+            .cost_cap_usd_micros
+            .filter(|cap| *cap > 0)
+            .map(|cap| format!("cap ${:.2}", cap as f64 / 1_000_000.0)),
+        StatusLineItem::Budget => Some(format_budget(app)),
+        StatusLineItem::SqueezyVersion => Some(format!("v{}", app.version)),
+        StatusLineItem::SessionId => app.session_id.clone(),
+        StatusLineItem::ConfigSources => Some(format!("cfg {}", app.config_sources)),
+        StatusLineItem::Telemetry => Some(format!("telemetry {}", app.telemetry.as_str())),
+        StatusLineItem::Permissions => Some(app.permissions.compact()),
+        StatusLineItem::ApprovalMode => Some(format!("approval {}", app.permissions.shell)),
+        StatusLineItem::Sandbox => Some(format!("sandbox {}", app.permissions.sandbox)),
+        StatusLineItem::Mcp => Some(format!("mcp {}", crate::format_mcp_status(app))),
+        StatusLineItem::Redactions => Some(format!("redactions {}", app.metrics.redactions)),
+        StatusLineItem::Receipts => Some(format!(
+            "receipts {}",
+            app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits
+        )),
+        StatusLineItem::ThreadTitle => app.session_id.clone(),
+        StatusLineItem::Pins => Some(format!("pins {}", app.context_compaction.pinned.len())),
+        StatusLineItem::CompactGeneration => {
+            Some(format!("compact {}", app.context_compaction.generation))
+        }
+        StatusLineItem::TaskProgress => app.latest_plan_progress.clone(),
+    }
+}
+
+fn context_pct(app: &TuiApp) -> Option<u64> {
+    if app.context_compaction_threshold == 0 {
+        return None;
+    }
+    Some(context_window_pct(
+        app.context_estimate.estimated_tokens,
+        app.context_compaction_threshold,
+    ))
+}
+
+fn format_run_state(app: &TuiApp) -> String {
+    if app.cancel.is_some() {
+        "Working".to_string()
+    } else if app.turn_rx.is_some() {
+        "Thinking".to_string()
+    } else {
+        "Ready".to_string()
+    }
+}
+
+fn format_budget(app: &TuiApp) -> String {
+    if app.metrics.budget_denials == 0 {
+        "budget ok".to_string()
+    } else {
+        format!("budget denied:{}", app.metrics.budget_denials)
+    }
+}
+
+/// Render the legacy comma-separated detail line. Kept for tests and for
+/// the verbose-fallback path used when the user has not yet configured a
+/// status-line list.
 pub(crate) fn render_status_details(app: &TuiApp) -> String {
     let segments: [Option<String>; 18] = [
         segments::permissions(app),
@@ -35,10 +502,7 @@ pub(crate) fn render_status_details(app: &TuiApp) -> String {
     pieces.join("  ")
 }
 
-/// Render the `cost ...` segment with optional cap and percent. Kept as a
-/// free function so unit tests can exercise the format string without
-/// having to construct a full `TuiApp`. When `cap_usd_micros` is `None` or
-/// zero, falls back to the historical `cost $X.XXXXXX` form.
+/// Render the `cost ...` segment with optional cap and percent.
 pub(crate) fn format_cost_segment(
     cost: &squeezy_core::CostSnapshot,
     cap_usd_micros: Option<u64>,

@@ -690,6 +690,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 env_override: None,
                 secret: false,
             },
+            FieldMeta {
+                label: "status_line",
+                toml_path: &["tui", "status_line"],
+                kind: FieldKind::StringList { min: 0, max: 32 },
+                tier: ApplyTier::Immediate,
+                get: get_status_line,
+                set: set_status_line,
+                default_display: "",
+                default: || FieldValue::StringList(Vec::new()),
+                help: "Ordered status-bar items. Configure via /statusline.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "status_line_use_colors",
+                toml_path: &["tui", "status_line_use_colors"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Immediate,
+                get: get_status_line_use_colors,
+                set: set_status_line_use_colors,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Color status-bar items using their accent palette.",
+                env_override: None,
+                secret: false,
+            },
         ],
     },
     ConfigSectionMeta {
@@ -1622,6 +1648,35 @@ fn set_status_verbosity(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'
         _ => return Err("invalid status_verbosity"),
     };
     Ok(())
+}
+
+fn get_status_line(cfg: &AppConfig) -> FieldValue {
+    FieldValue::StringList(cfg.tui.status_line.clone().unwrap_or_default())
+}
+fn set_status_line(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::StringList(items) => {
+            // Empty list = "unset" so the renderer falls back to the built-in
+            // default. Anything else is persisted as-is; the TUI validates
+            // identifiers when constructing the picker state.
+            cfg.tui.status_line = if items.is_empty() { None } else { Some(items) };
+            Ok(())
+        }
+        _ => Err("expects string list"),
+    }
+}
+
+fn get_status_line_use_colors(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.status_line_use_colors)
+}
+fn set_status_line_use_colors(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.status_line_use_colors = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
 }
 
 fn get_transcript_default(cfg: &AppConfig) -> FieldValue {

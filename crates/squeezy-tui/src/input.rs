@@ -151,6 +151,10 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "[compact|normal|verbose]",
     ),
     slash_args("/detach", "remove attached context", false, "<id>"),
+    slash(
+        "/statusline",
+        "configure which items appear in the status bar",
+    ),
 ];
 
 impl SlashCommand {
