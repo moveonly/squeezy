@@ -3098,6 +3098,77 @@ fn highlight_rust_code_block() {
 }
 
 #[test]
+fn highlight_yaml_code_block() {
+    let lines = render::highlight::highlight_code(Some("yaml"), "name: squeezy\nport: 8080\n");
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+    let key = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "name")
+        .expect("yaml key span");
+    let number = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "8080")
+        .expect("yaml number span");
+    assert!(
+        key.style.fg.is_some() && key.style.fg != Some(ratatui::style::Color::White),
+        "yaml key should be styled, got {:?}",
+        key.style.fg
+    );
+    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+}
+
+#[test]
+fn highlight_bash_code_block() {
+    let lines = render::highlight::highlight_code(
+        Some("bash"),
+        "#!/bin/bash\nif [ -f foo ]; then echo hi; fi\n",
+    );
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+    let comment = spans
+        .iter()
+        .find(|span| span.content.as_ref().starts_with("#!"))
+        .expect("bash shebang comment span");
+    let keyword = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "if")
+        .expect("bash keyword span");
+    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
+    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
+}
+
+#[test]
+fn highlight_toml_code_block() {
+    let lines = render::highlight::highlight_code(Some("toml"), "[package]\nname = \"squeezy\"\n");
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+    let string = spans
+        .iter()
+        .find(|span| span.content.as_ref().contains("squeezy"))
+        .expect("toml string span");
+    assert!(
+        string.style.fg.is_some() && string.style.fg != Some(ratatui::style::Color::White),
+        "toml string should be styled, got {:?}",
+        string.style.fg
+    );
+}
+
+#[test]
+fn highlight_unknown_language_falls_back_to_plain() {
+    let lines = render::highlight::highlight_code(Some("klingon"), "qapla'!");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].spans.len(), 1);
+    assert_eq!(lines[0].spans[0].style.fg, None);
+}
+
+#[test]
 fn markdown_renders_heading_and_code() {
     let palette = render::highlight::HighlightPalette::current();
     let lines = render::markdown::render_markdown("# Heading\n\n```rust\nfn foo() {}\n```");

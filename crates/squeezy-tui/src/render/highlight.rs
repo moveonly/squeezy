@@ -2,7 +2,6 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use squeezy_core::LanguageKind;
 use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -239,99 +238,196 @@ struct LanguageSpec {
     injections_query: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighlightLanguage {
+    Bash,
+    C,
+    CSharp,
+    Cpp,
+    Css,
+    Go,
+    Html,
+    Java,
+    JavaScript,
+    Json,
+    Jsx,
+    Lua,
+    Php,
+    Python,
+    Ruby,
+    Rust,
+    Sql,
+    Toml,
+    TypeScript,
+    Tsx,
+    Yaml,
+}
+
 fn language_spec(language_hint: Option<&str>) -> Option<LanguageSpec> {
-    match language_kind(language_hint?) {
-        LanguageKind::C => Some(LanguageSpec {
+    let lang = HighlightLanguage::from_hint(language_hint?)?;
+    Some(match lang {
+        HighlightLanguage::Bash => LanguageSpec {
+            name: "bash",
+            language: tree_sitter_bash::LANGUAGE.into(),
+            highlights_query: tree_sitter_bash::HIGHLIGHT_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::C => LanguageSpec {
             name: "c",
             language: tree_sitter_c::LANGUAGE.into(),
             highlights_query: tree_sitter_c::HIGHLIGHT_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::CSharp => Some(LanguageSpec {
+        },
+        HighlightLanguage::CSharp => LanguageSpec {
             name: "csharp",
             language: tree_sitter_c_sharp::LANGUAGE.into(),
             highlights_query: tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Cpp => Some(LanguageSpec {
+        },
+        HighlightLanguage::Cpp => LanguageSpec {
             name: "cpp",
             language: tree_sitter_cpp::LANGUAGE.into(),
             highlights_query: tree_sitter_cpp::HIGHLIGHT_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Go => Some(LanguageSpec {
+        },
+        HighlightLanguage::Css => LanguageSpec {
+            name: "css",
+            language: tree_sitter_css::LANGUAGE.into(),
+            highlights_query: tree_sitter_css::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::Go => LanguageSpec {
             name: "go",
             language: tree_sitter_go::LANGUAGE.into(),
             highlights_query: tree_sitter_go::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Java => Some(LanguageSpec {
+        },
+        HighlightLanguage::Html => LanguageSpec {
+            name: "html",
+            language: tree_sitter_html::LANGUAGE.into(),
+            highlights_query: tree_sitter_html::HIGHLIGHTS_QUERY,
+            injections_query: tree_sitter_html::INJECTIONS_QUERY,
+        },
+        HighlightLanguage::Java => LanguageSpec {
             name: "java",
             language: tree_sitter_java::LANGUAGE.into(),
             highlights_query: tree_sitter_java::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::JavaScript => Some(LanguageSpec {
+        },
+        HighlightLanguage::JavaScript => LanguageSpec {
             name: "javascript",
             language: tree_sitter_javascript::LANGUAGE.into(),
             highlights_query: tree_sitter_javascript::HIGHLIGHT_QUERY,
             injections_query: tree_sitter_javascript::INJECTIONS_QUERY,
-        }),
-        LanguageKind::Jsx => Some(LanguageSpec {
+        },
+        HighlightLanguage::Json => LanguageSpec {
+            name: "json",
+            language: tree_sitter_json::LANGUAGE.into(),
+            highlights_query: tree_sitter_json::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::Jsx => LanguageSpec {
             name: "jsx",
             language: tree_sitter_javascript::LANGUAGE.into(),
             highlights_query: tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
             injections_query: tree_sitter_javascript::INJECTIONS_QUERY,
-        }),
-        LanguageKind::Python => Some(LanguageSpec {
+        },
+        HighlightLanguage::Lua => LanguageSpec {
+            name: "lua",
+            language: tree_sitter_lua::LANGUAGE.into(),
+            highlights_query: tree_sitter_lua::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::Php => LanguageSpec {
+            name: "php",
+            language: tree_sitter_php::LANGUAGE_PHP.into(),
+            highlights_query: tree_sitter_php::HIGHLIGHTS_QUERY,
+            injections_query: tree_sitter_php::INJECTIONS_QUERY,
+        },
+        HighlightLanguage::Python => LanguageSpec {
             name: "python",
             language: tree_sitter_python::LANGUAGE.into(),
             highlights_query: tree_sitter_python::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Rust => Some(LanguageSpec {
+        },
+        HighlightLanguage::Ruby => LanguageSpec {
+            name: "ruby",
+            language: tree_sitter_ruby::LANGUAGE.into(),
+            highlights_query: tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::Rust => LanguageSpec {
             name: "rust",
             language: tree_sitter_rust::LANGUAGE.into(),
             highlights_query: tree_sitter_rust::HIGHLIGHTS_QUERY,
             injections_query: tree_sitter_rust::INJECTIONS_QUERY,
-        }),
-        LanguageKind::TypeScript => Some(LanguageSpec {
+        },
+        HighlightLanguage::Sql => LanguageSpec {
+            name: "sql",
+            language: tree_sitter_sequel::LANGUAGE.into(),
+            highlights_query: tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::Toml => LanguageSpec {
+            name: "toml",
+            language: tree_sitter_toml_updated::language(),
+            highlights_query: tree_sitter_toml_updated::HIGHLIGHT_QUERY,
+            injections_query: "",
+        },
+        HighlightLanguage::TypeScript => LanguageSpec {
             name: "typescript",
             language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             highlights_query: tree_sitter_typescript::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Tsx => Some(LanguageSpec {
+        },
+        HighlightLanguage::Tsx => LanguageSpec {
             name: "tsx",
             language: tree_sitter_typescript::LANGUAGE_TSX.into(),
             highlights_query: tree_sitter_typescript::HIGHLIGHTS_QUERY,
             injections_query: "",
-        }),
-        LanguageKind::Unsupported | LanguageKind::Unknown => None,
-    }
+        },
+        HighlightLanguage::Yaml => LanguageSpec {
+            name: "yaml",
+            language: tree_sitter_yaml::LANGUAGE.into(),
+            highlights_query: tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            injections_query: "",
+        },
+    })
 }
 
-fn language_kind(hint: &str) -> LanguageKind {
-    let hint = hint
-        .trim()
-        .trim_start_matches('.')
-        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match hint.as_str() {
-        "c#" | "csharp" | "cs" | "csx" => LanguageKind::CSharp,
-        "c++" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => LanguageKind::Cpp,
-        "javascript" | "js" | "mjs" | "cjs" => LanguageKind::JavaScript,
-        "jsx" => LanguageKind::Jsx,
-        "typescript" | "ts" | "mts" | "cts" => LanguageKind::TypeScript,
-        "tsx" => LanguageKind::Tsx,
-        "python" | "py" => LanguageKind::Python,
-        "rust" | "rs" => LanguageKind::Rust,
-        "golang" | "go" => LanguageKind::Go,
-        "java" => LanguageKind::Java,
-        "c" | "h" => LanguageKind::C,
-        other => LanguageKind::from_extension(other),
+impl HighlightLanguage {
+    fn from_hint(hint: &str) -> Option<Self> {
+        let hint = hint
+            .trim()
+            .trim_start_matches('.')
+            .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Some(match hint.as_str() {
+            "bash" | "sh" | "shell" | "zsh" | "ksh" => Self::Bash,
+            "c" | "h" => Self::C,
+            "c#" | "csharp" | "cs" | "csx" => Self::CSharp,
+            "c++" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => Self::Cpp,
+            "css" | "scss" => Self::Css,
+            "go" | "golang" => Self::Go,
+            "html" | "htm" | "xhtml" => Self::Html,
+            "java" => Self::Java,
+            "javascript" | "js" | "mjs" | "cjs" => Self::JavaScript,
+            "json" | "jsonc" | "json5" => Self::Json,
+            "jsx" => Self::Jsx,
+            "lua" => Self::Lua,
+            "php" | "phtml" => Self::Php,
+            "python" | "py" => Self::Python,
+            "ruby" | "rb" => Self::Ruby,
+            "rust" | "rs" => Self::Rust,
+            "sql" | "psql" | "mysql" => Self::Sql,
+            "toml" => Self::Toml,
+            "typescript" | "ts" | "mts" | "cts" => Self::TypeScript,
+            "tsx" => Self::Tsx,
+            "yaml" | "yml" => Self::Yaml,
+            _ => return None,
+        })
     }
 }
 
