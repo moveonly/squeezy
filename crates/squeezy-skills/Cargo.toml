@@ -14,7 +14,7 @@ publish.workspace = true
 include = [
     "Cargo.toml",
     "build.rs",
-    "bundled-docs/external/*.md",
+    "external-docs/*.md",
     "src/**",
     "tests/artifacts/**",
     "../../README.md",

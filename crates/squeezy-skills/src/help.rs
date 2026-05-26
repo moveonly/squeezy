@@ -813,6 +813,15 @@ pub fn bundled_docs() -> Vec<BundledDoc> {
     BUNDLED_DOCS.to_vec()
 }
 
+pub fn bundled_doc(path: &str) -> Option<&'static str> {
+    BUNDLED_DOCS
+        .iter()
+        .find(|doc| doc.path == path)
+        .map(|doc| doc.content)
+}
+
+pub const APPROVAL_POLICY_DOC_PATH: &str = "docs/external/APPROVAL_POLICY.md";
+
 /// Cheap predicate that returns true when [`SqueezyHelp::answer_for_input`] would
 /// produce an answer for `input`. Lets callers (e.g. the agent) skip the cost of
 /// rendering a redacted config snapshot on turns where the help intercept does

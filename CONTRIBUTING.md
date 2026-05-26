@@ -4,8 +4,10 @@ Squeezy is implemented in Rust and targets macOS, Linux, and Windows (x86_64). T
 
 Contributor-facing architecture, validation, benchmark, and deployment notes
 live in [`docs/internal/`](docs/internal/). User-facing product docs live in
-[`docs/external/`](docs/external/) and are embedded into built-in Squeezy help,
-so update them whenever user-visible behavior changes.
+[`crates/squeezy-skills/external-docs/`](crates/squeezy-skills/external-docs/)
+(co-located with the crate that bundles them into the binary at build time)
+and are embedded into built-in Squeezy help, so update them whenever
+user-visible behavior changes.
 
 ## Setup
 

@@ -1,7 +1,4 @@
-use std::{
-    env, fs, io,
-    path::{Path, PathBuf},
-};
+use std::{env, fs, io, path::PathBuf};
 
 const DOCS: &[(&str, &str)] = &[
     ("README.md", "docs/external/README.md"),
@@ -30,7 +27,7 @@ const DOCS: &[(&str, &str)] = &[
 
 fn main() -> io::Result<()> {
     let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
-    let docs_dir = find_docs_dir(&manifest_dir)?;
+    let docs_dir = manifest_dir.join("external-docs");
     println!("cargo:rerun-if-changed={}", docs_dir.display());
 
     let mut generated = String::from("const BUNDLED_DOCS: &[BundledDoc] = &[\n");
@@ -48,24 +45,6 @@ fn main() -> io::Result<()> {
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("out dir"));
     fs::write(out_dir.join("bundled_docs.rs"), generated)
-}
-
-fn find_docs_dir(manifest_dir: &Path) -> io::Result<PathBuf> {
-    for candidate in [
-        manifest_dir.join("../../docs/external"),
-        manifest_dir.join("bundled-docs/external"),
-    ] {
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!(
-            "could not find external docs from {}",
-            manifest_dir.display()
-        ),
-    ))
 }
 
 fn raw_string_literal(content: &str) -> String {
