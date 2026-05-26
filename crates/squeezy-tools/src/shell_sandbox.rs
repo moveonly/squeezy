@@ -879,6 +879,13 @@ pub(crate) fn configure_linux_shell_sandbox(command: &mut Command, plan: &ShellS
                 if enforce_filesystem {
                     linux_landlock_restrict(&read_roots, &write_roots)?;
                 }
+                // The seccomp filter is the last step before exec: it must
+                // not block any of the prctl/unshare/landlock setup, and it
+                // applies to the upcoming `execve` and everything inherited
+                // by the shell. We set `PR_SET_NO_NEW_PRIVS` here as a
+                // safety net in case the landlock branch was skipped — the
+                // kernel requires NNP for an unprivileged seccomp install.
+                linux_seccomp::install_shell_filter()?;
                 Ok(())
             });
         }
@@ -1166,3 +1173,95 @@ pub(crate) fn linux_unshare_supported() -> bool {
 pub(crate) fn linux_unshare_supported() -> bool {
     false
 }
+
+/// Seccomp deny-list applied to the shell child immediately before `exec`.
+///
+/// The Linux unshare + Landlock layers cover filesystem and (when network is
+/// denied) outbound IP traffic, but they do not close pivot paths a malicious
+/// command could use to reach back into the agent itself: `ptrace` against
+/// sibling processes in the same user namespace, `process_vm_readv` /
+/// `process_vm_writev` for cross-process memory, or `socket(AF_UNIX)` for
+/// connecting to abstract or filesystem-backed local sockets the agent runs.
+/// We mirror codex's Linux sandbox by returning `EPERM` for those calls;
+/// the kernel returns the same errno a normal access check would, so a
+/// well-behaved tool degrades to a clean error instead of crashing.
+#[cfg(target_os = "linux")]
+mod linux_seccomp {
+    use std::collections::BTreeMap;
+
+    use seccompiler::{
+        BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch, apply_filter,
+    };
+
+    /// Install the shell-child seccomp filter on the current thread.
+    ///
+    /// Must be called from inside the `pre_exec` hook after fork and before
+    /// `execve` so only the child inherits it. Sets `PR_SET_NO_NEW_PRIVS`
+    /// first because an unprivileged seccomp install requires NNP. Calling
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` twice is harmless if landlock has
+    /// already enabled it on the same thread.
+    pub(super) fn install_shell_filter() -> std::io::Result<()> {
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let program = build_shell_filter().map_err(std::io::Error::other)?;
+        apply_filter(&program).map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    /// Build the BPF program separately so tests can exercise the same
+    /// rule set without going through a `pre_exec` fork dance.
+    pub(super) fn build_shell_filter() -> Result<BpfProgram, seccompiler::Error> {
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        // Unconditional denies: empty rule vec matches every invocation.
+        rules.insert(libc::SYS_ptrace, vec![]);
+        rules.insert(libc::SYS_process_vm_readv, vec![]);
+        rules.insert(libc::SYS_process_vm_writev, vec![]);
+
+        // `socket(AF_UNIX, ...)` and `socketpair(AF_UNIX, ...)`: deny when
+        // arg0 equals AF_UNIX. Other socket families fall through to the
+        // default Allow action because IP-family sockets are governed by
+        // CLONE_NEWNET (handled at unshare time) and ICMP/raw is governed
+        // by capabilities the unprivileged shell does not hold.
+        let unix_match = SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            libc::AF_UNIX as u64,
+        )?])?;
+        rules.insert(libc::SYS_socket, vec![unix_match.clone()]);
+        rules.insert(libc::SYS_socketpair, vec![unix_match]);
+
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM as u32),
+            target_arch(),
+        )?;
+        filter.try_into()
+    }
+
+    /// Pick the seccomp `TargetArch` matching the build host. We only
+    /// support the two architectures squeezy ships Linux binaries for;
+    /// other targets fall through to a build-time `unimplemented!()` so a
+    /// silent miscompilation cannot turn into a no-op filter.
+    fn target_arch() -> TargetArch {
+        #[cfg(target_arch = "x86_64")]
+        {
+            TargetArch::x86_64
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            TargetArch::aarch64
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            unimplemented!("seccomp filter target arch is not supported");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "shell_sandbox_tests.rs"]
+mod tests;
