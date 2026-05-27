@@ -91,6 +91,23 @@ fn registry_with_state_store(root: &Path, store: Arc<SqueezyStore>) -> ToolRegis
     .expect("registry")
 }
 
+fn registry_with_state_store_and_checkpoints(
+    root: &Path,
+    store: Arc<SqueezyStore>,
+) -> ToolRegistry {
+    ToolRegistry::new_with_configs_skills_and_mcp(
+        root,
+        ToolRuntimeConfig {
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+        SkillsConfig::default(),
+        &GraphConfig::default(),
+        ToolRegistryRuntime::new(Some(store), Arc::new(Redactor::default())),
+    )
+    .expect("registry")
+}
+
 #[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
@@ -2421,6 +2438,170 @@ async fn apply_patch_delta_reports_per_op_failure_with_error() {
         // applied and the failure-path assertions don't fire.
         assert_eq!(result.status, ToolStatus::Success);
     }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_expected_sha256_uses_server_side_seen_state() {
+    // F14-cc-server-side-read-state-gate: when the model omits
+    // `expected_sha256` and a prior `read_file` snapshot for the same path
+    // still matches the on-disk hash, apply_patch should proceed exactly as
+    // if the model had threaded the hash back through the patch arguments.
+    let root = temp_workspace("apply_patch_seen_state_ok");
+    let body = "before\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "first_read".to_string(),
+            stable_output_sha256: "output-hash".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: body.to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_no_hash".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-seen-state".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_seen_state_demands_read_first() {
+    // F14-cc-server-side-read-state-gate: when the model never read the file
+    // and omits `expected_sha256`, the server cannot vouch for the model's
+    // view of the file. apply_patch must refuse with a hint that points at
+    // `read_file` instead of writing blind.
+    let root = temp_workspace("apply_patch_seen_state_missing");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_no_snapshot".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-no-snapshot".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    let error = result.content["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("call read_file first"),
+        "expected read_file hint, got: {error}"
+    );
+    // File must be untouched.
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_expected_sha256_detects_external_drift() {
+    // F14-cc-server-side-read-state-gate: when the model has a stale read
+    // snapshot (the file changed on disk between read_file and apply_patch),
+    // the server-side gate must catch the drift and refuse, naming both the
+    // last-seen and current hashes so the model can recover.
+    let root = temp_workspace("apply_patch_seen_state_drift");
+    let prior = "before\n";
+    let current = "before-modified-externally\n";
+    fs::write(root.join("sample.txt"), current).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let prior_sha = sha256_hex(prior.as_bytes());
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "stale_read".to_string(),
+            stable_output_sha256: "output-stale".to_string(),
+            content_sha256: Some(prior_sha.clone()),
+            start_byte: 0,
+            end_byte: prior.len() as u64,
+            content: prior.to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_drift".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before-modified-externally\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-drift".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    let error = result.content["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("file changed since the model last saw it"),
+        "expected drift error, got: {error}"
+    );
+    assert_eq!(result.content["last_seen_sha256"], prior_sha);
+    assert_eq!(result.content["last_read_call_id"], "stale_read");
+    assert_eq!(
+        result.content["current_sha256"],
+        sha256_hex(current.as_bytes())
+    );
+    // File must be untouched.
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        current
+    );
 
     let _ = fs::remove_dir_all(root);
 }

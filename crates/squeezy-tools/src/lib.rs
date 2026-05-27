@@ -2574,6 +2574,79 @@ impl ToolRegistry {
             .filter(|version| !version.is_empty())
     }
 
+    /// Return the most-recent `(content_sha256, call_id)` the model has seen
+    /// for `rel_path` via a `read_file` or `read_slice` receipt in the current
+    /// session. The mutation tools (`apply_patch`, `write_file`) consult this
+    /// to gate edits when the caller omitted `expected_sha256`: if the seen
+    /// hash matches the current file hash the model demonstrably has fresh
+    /// state, so the write can proceed; if it does not match (or no snapshot
+    /// exists) the call short-circuits to `ToolStatus::Stale` with a
+    /// "call read_file first" hint. Returns `None` when no store is wired up
+    /// or no snapshot has been recorded yet.
+    pub(crate) fn latest_seen_sha256_for_path(&self, rel_path: &str) -> Option<(String, String)> {
+        let store = self.state_store.as_deref()?;
+        let snapshots = store.read_snapshots_for_path(rel_path).ok()?;
+        let latest = snapshots
+            .into_iter()
+            .filter(|snap| {
+                matches!(snap.tool_name.as_str(), "read_file" | "read_slice")
+                    && snap.content_sha256.is_some()
+            })
+            .max_by_key(|snap| snap.created_unix_millis)?;
+        Some((latest.content_sha256?, latest.call_id))
+    }
+
+    /// Server-side fallback for the `expected_sha256` staleness gate. Called
+    /// when the model omits `expected_sha256`: if the latest read snapshot
+    /// for `rel_path` matches the current on-disk hash, the model
+    /// demonstrably has fresh state and the caller may proceed (`Ok(())`).
+    /// Otherwise the caller short-circuits to `ToolStatus::Stale` with a
+    /// payload that names the snapshot the model last saw vs the live hash
+    /// and points the model at `read_file` for recovery.
+    #[allow(clippy::result_large_err)]
+    fn gate_on_seen_sha256(
+        &self,
+        call: &ToolCall,
+        index: usize,
+        rel: &str,
+        current_sha256: &str,
+        op_label: &str,
+    ) -> std::result::Result<(), ToolResult> {
+        match self.latest_seen_sha256_for_path(rel) {
+            Some((ref seen_sha, _)) if seen_sha.as_str() == current_sha256 => Ok(()),
+            Some((seen_sha, last_call_id)) => Err(make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": "file changed since the model last saw it; call read_file first",
+                    "path": rel,
+                    "patch_index": index,
+                    "operation": op_label,
+                    "current_sha256": current_sha256,
+                    "last_seen_sha256": seen_sha,
+                    "last_read_call_id": last_call_id,
+                }),
+                ToolCostHint::default(),
+                Some(current_sha256.to_string()),
+            )),
+            None => Err(make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": format!(
+                        "expected_sha256 not provided and no read_file/read_slice snapshot found; call read_file first for {op_label}"
+                    ),
+                    "path": rel,
+                    "patch_index": index,
+                    "operation": op_label,
+                    "current_sha256": current_sha256,
+                }),
+                ToolCostHint::default(),
+                Some(current_sha256.to_string()),
+            )),
+        }
+    }
+
     /// Validate a single operation and append it to the staged plan. On any
     /// validation failure, the returned `Err` is the final tool result the
     /// caller should return verbatim — no writes have happened yet.
@@ -2648,17 +2721,15 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        if let Err(result) = self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for search-replace patches",
-                                "path": rel,
-                                "current_sha256": before_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(before_sha256),
-                        ));
+                            index,
+                            &rel,
+                            &before_sha256,
+                            "search-replace patches",
+                        ) {
+                            return Err(result);
+                        }
                     }
                 }
                 let matches = state.current.match_indices(search.as_str()).count();
@@ -2914,17 +2985,15 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        if let Err(result) = self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for delete_file",
-                                "path": rel,
-                                "current_sha256": current_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(current_sha256),
-                        ));
+                            index,
+                            &rel,
+                            &current_sha256,
+                            "delete_file",
+                        ) {
+                            return Err(result);
+                        }
                     }
                 }
                 staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
@@ -3015,17 +3084,15 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        if let Err(result) = self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for move_file",
-                                "path": rel_from,
-                                "current_sha256": before_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(before_sha256),
-                        ));
+                            index,
+                            &rel_from,
+                            &before_sha256,
+                            "move_file",
+                        ) {
+                            return Err(result);
+                        }
                     }
                 }
                 let mut final_contents = contents.clone();
@@ -3234,18 +3301,31 @@ impl ToolRegistry {
         };
         let before = fs::read(&path).ok();
         let before_sha256 = before.as_ref().map(sha256_hex);
-        if before.is_some() && args.expected_sha256.as_deref() != before_sha256.as_deref() {
-            return make_result(
-                call,
-                ToolStatus::Stale,
-                json!({
-                    "error": "expected_sha256 does not match current file",
-                    "path": rel.to_string_lossy(),
-                    "current_sha256": before_sha256,
-                }),
-                ToolCostHint::default(),
-                before_sha256,
-            );
+        if let Some(current_sha) = before_sha256.clone() {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            match args.expected_sha256.as_deref() {
+                Some(expected) if expected == current_sha => {}
+                Some(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 does not match current file",
+                            "path": rel_str,
+                            "current_sha256": before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        before_sha256,
+                    );
+                }
+                None => {
+                    if let Err(result) =
+                        self.gate_on_seen_sha256(call, 0, &rel_str, &current_sha, "write_file")
+                    {
+                        return result;
+                    }
+                }
+            }
         }
 
         if let Some(parent) = path.parent()
