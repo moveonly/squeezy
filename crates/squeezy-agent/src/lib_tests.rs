@@ -4697,3 +4697,36 @@ async fn shell_sandbox_fallback_counter_emits_per_call() {
 
     let _ = fs::remove_dir_all(temp);
 }
+
+#[test]
+fn effective_tool_choice_downgrades_required_after_round_zero() {
+    assert_eq!(
+        effective_tool_choice(Some("required"), 0),
+        Some("required".to_string()),
+        "round 0 keeps 'required' to force the first tool call"
+    );
+    assert_eq!(
+        effective_tool_choice(Some("required"), 1),
+        Some("auto".to_string()),
+        "round 1+ downgrades so the model can end the turn naturally"
+    );
+    assert_eq!(
+        effective_tool_choice(Some("required"), 47),
+        Some("auto".to_string())
+    );
+}
+
+#[test]
+fn effective_tool_choice_passes_through_other_values_unchanged() {
+    for round in [0_usize, 1, 5] {
+        assert_eq!(
+            effective_tool_choice(Some("auto"), round),
+            Some("auto".to_string())
+        );
+        assert_eq!(
+            effective_tool_choice(Some("none"), round),
+            Some("none".to_string())
+        );
+        assert_eq!(effective_tool_choice(None, round), None);
+    }
+}

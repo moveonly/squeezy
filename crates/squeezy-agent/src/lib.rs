@@ -3380,6 +3380,24 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Resolve the `tool_choice` to send on a given round of a turn.
+///
+/// `"required"` is configured to fix tool-shy models (Qwen via
+/// OpenRouter, smaller MoEs) that emit a chatty preamble + finish
+/// without calling any tool — but applying it on *every* round would
+/// trap the model in an infinite call-tool-then-be-forced-to-call-tool
+/// loop where it can never naturally end the turn with a text answer.
+/// Downgrade to `"auto"` after round 0 so the model can finish once
+/// it has the data it needs. Other configured values (`"auto"`,
+/// `"none"`) pass through unchanged on every round; `None` keeps the
+/// field absent.
+fn effective_tool_choice(configured: Option<&str>, round: usize) -> Option<String> {
+    match configured {
+        Some("required") if round > 0 => Some("auto".to_string()),
+        other => other.map(str::to_string),
+    }
+}
+
 /// Appends a "Pinned context" block to the per-turn instructions.
 ///
 /// Pins are user-curated durable facts. They must be visible to the
@@ -3880,7 +3898,7 @@ impl TurnRuntime {
         // currently observational only — see `dispatch_pre_turn` for
         // the rationale.
         self.dispatch_pre_turn();
-        for _round in 0..MAX_TOOL_ROUNDS {
+        for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
                     &task_title,
@@ -3953,7 +3971,7 @@ impl TurnRuntime {
                     plan_edit_allowed,
                 )),
                 store: self.config.store_responses,
-                tool_choice: self.config.tool_choice.clone(),
+                tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -5685,7 +5703,7 @@ async fn run_subagent_rounds(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
-    for _round in 0..config.subagents.max_model_rounds {
+    for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
         let llm_request = LlmRequest {
             model: Arc::clone(&request_model),
@@ -5698,7 +5716,7 @@ async fn run_subagent_rounds(
             cache_key: None,
             tools: Arc::from(tool_specs),
             store: false,
-            tool_choice: config.tool_choice.clone(),
+            tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
         };
         let mut stream = parent
             .provider
