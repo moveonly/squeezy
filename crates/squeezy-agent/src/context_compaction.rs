@@ -384,13 +384,13 @@ pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmI
     let mut repaired = Vec::with_capacity(items.len());
     for item in items.iter() {
         repaired.push(item.clone());
-        if let LlmInputItem::FunctionCall { call_id, .. } = item {
-            if !answered.contains(call_id.as_str()) {
-                repaired.push(LlmInputItem::FunctionCallOutput {
-                    call_id: call_id.clone(),
-                    output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
-                });
-            }
+        if let LlmInputItem::FunctionCall { call_id, .. } = item
+            && !answered.contains(call_id.as_str())
+        {
+            repaired.push(LlmInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
+            });
         }
     }
     repaired

@@ -1446,6 +1446,7 @@ impl ToolRegistry {
                     .to_string();
                 let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
+                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
                 if let Some(diff) = args
                     .as_ref()
                     .and_then(|args| render_write_file_diff(&args.path, &args.content))
@@ -2728,15 +2729,13 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        if let Err(result) = self.gate_on_seen_sha256(
+                        self.gate_on_seen_sha256(
                             call,
                             index,
                             &rel,
                             &before_sha256,
                             "search-replace patches",
-                        ) {
-                            return Err(result);
-                        }
+                        )?;
                     }
                 }
                 let matches = state.current.match_indices(search.as_str()).count();
@@ -2992,15 +2991,13 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        if let Err(result) = self.gate_on_seen_sha256(
+                        self.gate_on_seen_sha256(
                             call,
                             index,
                             &rel,
                             &current_sha256,
                             "delete_file",
-                        ) {
-                            return Err(result);
-                        }
+                        )?;
                     }
                 }
                 staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
@@ -3091,15 +3088,13 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        if let Err(result) = self.gate_on_seen_sha256(
+                        self.gate_on_seen_sha256(
                             call,
                             index,
                             &rel_from,
                             &before_sha256,
                             "move_file",
-                        ) {
-                            return Err(result);
-                        }
+                        )?;
                     }
                 }
                 let mut final_contents = contents.clone();
@@ -4120,18 +4115,13 @@ struct NotebookEditArgs {
     expected_sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum NotebookEditMode {
+    #[default]
     Replace,
     Insert,
     Delete,
-}
-
-impl Default for NotebookEditMode {
-    fn default() -> Self {
-        Self::Replace
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]

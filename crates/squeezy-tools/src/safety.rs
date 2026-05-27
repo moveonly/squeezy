@@ -81,7 +81,7 @@ pub fn pre_classify_shell(
             let label = segment
                 .split_whitespace()
                 .next()
-                .unwrap_or_else(|| segment.as_str());
+                .unwrap_or(segment.as_str());
             return ShellPreClassification::AutoDeny {
                 reason: format!("destructive verb {label:?}"),
             };

@@ -3529,7 +3529,7 @@ pub struct SubagentConfig {
     /// carries a `transcript` field with the child's assistant + tool
     /// trace. Default `false` — the parent sees only the final `summary`
     /// + `supporting_receipts` + `files_touched`, mirroring clear-code's
-    /// sidechained-by-default shape (`agentToolUtils.ts:276–357`).
+    ///   sidechained-by-default shape (`agentToolUtils.ts:276–357`).
     pub include_transcript: bool,
 }
 

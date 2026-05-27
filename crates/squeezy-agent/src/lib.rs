@@ -1332,10 +1332,10 @@ impl Agent {
             retention_days: config.tool_output_retention_days,
             output_dir: config.cache.tool_outputs.clone(),
         };
-        let provider =
+        let websearch_provider =
             squeezy_tools::WebSearchProvider::parse(&config.websearch_provider).unwrap_or_default();
         let web_config = WebToolConfig {
-            provider,
+            provider: websearch_provider,
             exa_mcp_url: config.exa_mcp_url.clone(),
             exa_api_key: env::var(&config.exa_api_key_env).ok(),
             parallel_mcp_url: config.parallel_mcp_url.clone(),
@@ -8149,6 +8149,7 @@ async fn permission_decision_for_request(
                     action: PermissionAction::Allow,
                     matched_rule: None,
                     reason,
+                    silent: false,
                 };
             }
             ShellPreClassification::AutoDeny { reason } => {
@@ -8169,6 +8170,7 @@ async fn permission_decision_for_request(
                     action: PermissionAction::Deny,
                     matched_rule: None,
                     reason,
+                    silent: false,
                 };
             }
             ShellPreClassification::AskAi => {}
