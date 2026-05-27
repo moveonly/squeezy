@@ -505,6 +505,144 @@ fn build_streamable_http_config_env_headers_override_static_headers() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Drive a real legacy MCP HTTP+SSE handshake against an in-process
+    // listener. The server replies to the worker's GET with a chunked
+    // `text/event-stream` body that carries:
+    //   * `event: endpoint` advertising the POST URL,
+    //   * `event: message` carrying an initialize response so rmcp's
+    //     `serve_client` can complete its handshake.
+    // We then capture the worker's subsequent POST to the advertised
+    // endpoint and assert it carries the configured headers — proving the
+    // SSE arm uses its own transport with `event:` / `data:` parsing rather
+    // than falling through to the streamable HTTP client.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (post_tx, post_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let (get_tx, get_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+    let accept = tokio::spawn(async move {
+        // First connection: the GET that opens the SSE stream.
+        let (mut sse_socket, _) = listener.accept().await.expect("accept sse");
+        let mut buf = vec![0u8; 4096];
+        let n = sse_socket.read(&mut buf).await.unwrap_or(0);
+        buf.truncate(n);
+        let _ = get_tx.send(buf);
+
+        // Reply with an SSE stream: status + headers, then the endpoint
+        // event and an initialize response framed as `event: message`.
+        let endpoint_path = "/sse-messages?sid=session-1";
+        let init_response = r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fixture","version":"0.0.0"}}}"#;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let _ = sse_socket.write_all(headers.as_bytes()).await;
+        // First SSE frame: endpoint URL the worker should POST to.
+        let endpoint_frame = format!("event: endpoint\r\ndata: {endpoint_path}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, endpoint_frame.as_bytes()).await;
+        // Second SSE frame: the initialize response. Without this rmcp's
+        // `serve` future never completes the handshake.
+        let message_frame = format!("event: message\r\ndata: {init_response}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, message_frame.as_bytes()).await;
+
+        // Second connection: the POST the worker sends with the
+        // `initialized` notification once the handshake completes.
+        let (mut post_socket, _) = listener.accept().await.expect("accept post");
+        let mut buf = vec![0u8; 8192];
+        let n = post_socket.read(&mut buf).await.unwrap_or(0);
+        buf.truncate(n);
+        let _ = post_socket
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = post_socket.shutdown().await;
+        let _ = post_tx.send(buf);
+
+        // Hold the SSE socket open just long enough for the worker to
+        // dispatch the POST; the drop closes the connection.
+        drop(sse_socket);
+    });
+
+    let mut server = http_fixture_server();
+    server.transport = McpTransport::Sse;
+    server
+        .http_headers
+        .insert("X-Squeezy-Sse-Test".to_string(), "yes".to_string());
+    server.bearer_token_env_var = Some("SQUEEZY_TEST_SSE_TOKEN".to_string());
+    let sse_url = format!("http://{addr}/sse");
+    server.url = Some(sse_url.clone());
+
+    let handler = SqueezyMcpClientHandler {
+        server_name: "sse-server".to_string(),
+        elicitation_handler: Arc::new(Mutex::new(None)),
+        pause_state: ElicitationPauseState::default(),
+    };
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers("sse-server", &server, |name| match name {
+            "SQUEEZY_TEST_SSE_TOKEN" => Some("fixture-secret".to_string()),
+            _ => None,
+        });
+    let worker =
+        crate::sse::build_sse_worker(sse_url, auth_header, custom_headers).expect("worker built");
+
+    // Serve completes once the handshake exchange finishes; then we drop
+    // the resulting service so its transport-close logic tears down.
+    let serve = tokio::time::timeout(std::time::Duration::from_secs(5), handler.serve(worker));
+    let _service = serve.await.expect("serve future timed out");
+    accept.await.expect("listener task");
+
+    let get_raw = tokio::time::timeout(std::time::Duration::from_secs(2), get_rx)
+        .await
+        .expect("no GET captured")
+        .expect("get channel closed");
+    let post_raw = tokio::time::timeout(std::time::Duration::from_secs(2), post_rx)
+        .await
+        .expect("no POST captured")
+        .expect("post channel closed");
+
+    let get_request = String::from_utf8_lossy(&get_raw);
+    let post_request = String::from_utf8_lossy(&post_raw);
+
+    assert!(
+        get_request.starts_with("GET /sse "),
+        "expected GET against /sse opening the SSE stream; got:\n{get_request}"
+    );
+    assert!(
+        get_request.lines().any(|line| line
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream")),
+        "GET must advertise text/event-stream so the server speaks SSE; got:\n{get_request}"
+    );
+    assert!(
+        post_request.starts_with("POST /sse-messages?sid=session-1 "),
+        "POST must target the URL advertised via `event: endpoint`; got:\n{post_request}"
+    );
+    assert!(
+        post_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("x-squeezy-sse-test: yes")),
+        "POST must carry the static custom header; got:\n{post_request}"
+    );
+    assert!(
+        post_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer fixture-secret")),
+        "POST must carry the resolved bearer token; got:\n{post_request}"
+    );
+}
+
+async fn write_sse_chunk<W: tokio::io::AsyncWriteExt + Unpin>(writer: &mut W, body: &[u8]) {
+    // Minimal chunked-encoding frame: `<size>\r\n<body>\r\n`. We never send a
+    // terminating `0\r\n\r\n` because we want the stream to stay open across
+    // multiple frames for the duration of the test.
+    let header = format!("{:X}\r\n", body.len());
+    let _ = writer.write_all(header.as_bytes()).await;
+    let _ = writer.write_all(body).await;
+    let _ = writer.write_all(b"\r\n").await;
+    let _ = writer.flush().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn streamable_http_transport_sends_authorization_bearer_header() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

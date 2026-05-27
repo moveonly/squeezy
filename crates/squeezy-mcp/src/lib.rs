@@ -27,6 +27,7 @@ use rmcp::{
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -37,6 +38,8 @@ use tokio::{
     sync::{Mutex as TokioMutex, watch},
 };
 use tokio_util::sync::CancellationToken;
+
+mod sse;
 
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
 
@@ -723,9 +726,8 @@ impl McpClientRegistry {
         };
         let entry = match server.transport {
             McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
-            McpTransport::Http | McpTransport::Sse => {
-                start_http_service(server_name, server, handler).await?
-            }
+            McpTransport::Http => start_http_service(server_name, server, handler).await?,
+            McpTransport::Sse => start_sse_service(server_name, server, handler).await?,
         };
         let arc = Arc::new(entry);
         let mut sessions = self.sessions.lock().await;
@@ -1391,20 +1393,60 @@ async fn start_http_service(
     })
 }
 
-/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+/// Start a session against a legacy MCP HTTP+SSE server (2024-11-05 spec).
 ///
-/// Resolves `bearer_token_env_var`, `http_headers`, and `env_http_headers`
+/// The transport opens a GET against `server.url` for the `text/event-stream`
+/// channel, waits for the server's `event: endpoint` frame, then routes
+/// outbound JSON-RPC messages through POSTs to the advertised endpoint. The
+/// stream is parsed via `crate::sse::SseDecoder`, which honours `event:` and
+/// `data:` lines per the HTML SSE grammar — distinct from the 2025-03-26
+/// streamable-HTTP transport, where SSE handling is internal to rmcp.
+async fn start_sse_service(
+    server_name: &str,
+    server: &McpServerConfig,
+    handler: SqueezyMcpClientHandler,
+) -> McpResult<SessionEntry> {
+    let url = server.url.as_ref().ok_or_else(|| McpError::MissingUrl {
+        server: server_name.to_string(),
+        transport: "sse",
+    })?;
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers(server_name, server, |name| std::env::var(name).ok());
+    let worker =
+        sse::build_sse_worker(url.clone(), auth_header, custom_headers).map_err(|err| {
+            McpError::Transport {
+                server: server_name.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+    let service = handler
+        .serve(worker)
+        .await
+        .map_err(|err| McpError::Transport {
+            server: server_name.to_string(),
+            message: err.to_string(),
+        })?;
+    Ok(SessionEntry {
+        service: Arc::new(service),
+        _process: None,
+    })
+}
+
+/// Resolve `bearer_token_env_var`, `http_headers`, and `env_http_headers`
 /// against the supplied env lookup. Missing env vars are skipped (not fatal);
 /// invalid header names/values log a warning and are dropped so a single bad
 /// entry never blocks the whole server from connecting. Env-sourced headers
 /// override the static map on name conflict so secret rotation does not lose
-/// to a stale literal.
-fn build_streamable_http_config<F>(
+/// to a stale literal. Shared by the streamable-HTTP and legacy-SSE clients
+/// so both transports honour the same auth/header config surface.
+fn resolve_http_auth_and_headers<F>(
     server_name: &str,
-    url: String,
     server: &McpServerConfig,
     lookup_env: F,
-) -> StreamableHttpClientTransportConfig
+) -> (
+    Option<String>,
+    std::collections::HashMap<HeaderName, HeaderValue>,
+)
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -1478,7 +1520,21 @@ where
             }
         }
     }
+    (auth_header, custom_headers)
+}
 
+/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+fn build_streamable_http_config<F>(
+    server_name: &str,
+    url: String,
+    server: &McpServerConfig,
+    lookup_env: F,
+) -> StreamableHttpClientTransportConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers(server_name, server, lookup_env);
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
