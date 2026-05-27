@@ -6,11 +6,263 @@ use tree_sitter::{Node, Parser};
 use crate::windows_cmd::is_destructive_windows_segment;
 use crate::{PermissionCapability, PermissionRisk, ShellPermissionAnalysis, collapse_whitespace};
 
+#[cfg(test)]
+#[path = "shell_parse_tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParsedShellCommand {
     pub(crate) segments: Vec<String>,
     pub(crate) dynamic: bool,
     pub(crate) heredoc_prefix: bool,
+}
+
+/// Structured view of one `command` node produced by tree-sitter-bash.
+///
+/// `extract_command_units` walks the parse tree once and returns one record
+/// per `command` node. The five `is_*_shell_segment` classifiers re-split the
+/// segment text on whitespace and lose quote boundaries; consumers that need
+/// structural answers (is `arg[2]` `-f`? does the command write to
+/// `/dev/null`?) should use this typed payload instead.
+///
+/// Currently only the unit tests consume this surface. The follow-up work to
+/// route the existing classifiers through `&CommandUnit` is tracked alongside
+/// the F05-cc-tree-sitter-richer-command-extraction audit finding; until
+/// that lands, the fields are `#[allow(dead_code)]` so the `pub(crate)` API
+/// stays available without tripping the `-D warnings` CI gate.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CommandUnit {
+    /// First `command_name` child, with surrounding quotes stripped. Empty
+    /// when the command begins with a substitution (e.g. `$(echo rm) -rf`).
+    pub(crate) name: String,
+    /// Remaining `argument` children in source order. Outer single or
+    /// double quotes are stripped so `args[1] == "/tmp/x y"` for
+    /// `rm -rf "/tmp/x y"`.
+    pub(crate) args: Vec<String>,
+    /// Leading `NAME=value` assignments attached to the command (the
+    /// `NAME=` form of `env var=val cmd`). Order matches source order.
+    pub(crate) env: Vec<(String, String)>,
+    /// Redirects attached to either the `command` node itself or the
+    /// enclosing `redirected_statement`. `2>/dev/null` becomes
+    /// `Redirect { op: ">", target: "/dev/null", fd: Some(2) }`.
+    pub(crate) redirects: Vec<Redirect>,
+    /// True when the command (or one of its arguments / redirect targets)
+    /// contains a `command_substitution`, `process_substitution`, or
+    /// `expansion` node. Mirrors the `dynamic` flag on `ParsedShellCommand`
+    /// but scoped to this unit.
+    pub(crate) has_substitution: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Redirect {
+    /// Redirect operator as it appears in source, normalised to ASCII:
+    /// `>`, `>>`, `>|`, `<`, `<<`, `<<<`, `&>`, `&>>`, or `<>`.
+    pub(crate) op: String,
+    /// Destination text with outer quotes stripped. For heredoc redirects
+    /// the target is the delimiter word (e.g. `PY`).
+    pub(crate) target: String,
+    /// Explicit file descriptor when present (`2>/dev/null` → `Some(2)`).
+    /// Absent for the implicit fd 1 / fd 0 cases.
+    pub(crate) fd: Option<u32>,
+}
+
+/// Walks the bash parse tree and returns one `CommandUnit` per `command`
+/// node. Returns an empty vector when tree-sitter cannot parse the input.
+/// Mirrors the single-pass extraction surface clear-code exposes via
+/// `extractCommandArguments` + `extractEnvVars` + `parseForSecurityFromAst`.
+#[allow(dead_code)]
+pub(crate) fn extract_command_units(command: &str) -> Vec<CommandUnit> {
+    let mut parser = Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(command, None) else {
+        return Vec::new();
+    };
+    let bytes = command.as_bytes();
+    let mut units = Vec::new();
+    collect_command_units(tree.root_node(), bytes, None, &mut units);
+    units
+}
+
+/// Recursive walker. `enclosing` carries redirects attached to a
+/// `redirected_statement` parent so they appear on the inner command unit
+/// even though the tree-sitter grammar nests them on the wrapper.
+#[allow(dead_code)]
+fn collect_command_units(
+    node: Node<'_>,
+    bytes: &[u8],
+    enclosing: Option<&[Redirect]>,
+    units: &mut Vec<CommandUnit>,
+) {
+    match node.kind() {
+        "command" | "declaration_command" => {
+            let mut unit = build_command_unit(node, bytes);
+            if let Some(extra) = enclosing {
+                for redirect in extra {
+                    unit.redirects.push(redirect.clone());
+                }
+            }
+            units.push(unit);
+        }
+        "redirected_statement" => {
+            // Gather the wrapper-level redirects once, then recurse into the
+            // body command with them attached. The grammar puts redirects on
+            // the `redirected_statement` for forms like `cmd args > out`.
+            let mut wrapper_redirects = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                        if let Some(redirect) = parse_redirect(child, bytes) {
+                            wrapper_redirects.push(redirect);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if !matches!(
+                    child.kind(),
+                    "file_redirect" | "heredoc_redirect" | "herestring_redirect"
+                ) {
+                    collect_command_units(child, bytes, Some(&wrapper_redirects), units);
+                }
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_command_units(child, bytes, enclosing, units);
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn build_command_unit(node: Node<'_>, bytes: &[u8]) -> CommandUnit {
+    let mut unit = CommandUnit::default();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "variable_assignment" => {
+                if let Some((name, value)) = parse_variable_assignment(child, bytes) {
+                    unit.env.push((name, value));
+                } else if child_has_substitution(child) {
+                    unit.has_substitution = true;
+                }
+            }
+            "command_name" => {
+                unit.name = literal_text(child, bytes);
+                if child_has_substitution(child) {
+                    unit.has_substitution = true;
+                }
+            }
+            "file_redirect" | "heredoc_redirect" | "herestring_redirect" => {
+                if let Some(redirect) = parse_redirect(child, bytes) {
+                    unit.redirects.push(redirect);
+                }
+            }
+            _ => {
+                if child_has_substitution(child) {
+                    unit.has_substitution = true;
+                }
+                let text = literal_text(child, bytes);
+                if !text.is_empty() {
+                    unit.args.push(text);
+                }
+            }
+        }
+    }
+    unit
+}
+
+#[allow(dead_code)]
+fn parse_variable_assignment(node: Node<'_>, bytes: &[u8]) -> Option<(String, String)> {
+    let name_node = node.child_by_field_name("name")?;
+    let value_node = node.child_by_field_name("value")?;
+    Some((
+        literal_text(name_node, bytes),
+        literal_text(value_node, bytes),
+    ))
+}
+
+#[allow(dead_code)]
+fn parse_redirect(node: Node<'_>, bytes: &[u8]) -> Option<Redirect> {
+    let fd = node
+        .child_by_field_name("descriptor")
+        .and_then(|d| d.utf8_text(bytes).ok())
+        .and_then(|s| s.parse::<u32>().ok());
+    let op = match node.kind() {
+        "heredoc_redirect" => "<<".to_string(),
+        "herestring_redirect" => "<<<".to_string(),
+        _ => redirect_operator_text(node, bytes).unwrap_or_else(|| ">".to_string()),
+    };
+    let target_node = node
+        .child_by_field_name("destination")
+        .or_else(|| node.child_by_field_name("argument"))
+        .or_else(|| {
+            // Anonymous children carry the operator; the destination is the
+            // first named child after it. Heredoc redirects expose the
+            // delimiter via the `argument` field above; fall back here only
+            // for redirects with neither field populated.
+            let mut cursor = node.walk();
+            node.named_children(&mut cursor).next()
+        })?;
+    let target = literal_text(target_node, bytes);
+    Some(Redirect { op, target, fd })
+}
+
+#[allow(dead_code)]
+fn redirect_operator_text(node: Node<'_>, bytes: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !child.is_named()
+            && let Ok(text) = child.utf8_text(bytes)
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && trimmed.chars().all(|c| matches!(c, '<' | '>' | '&' | '|')) {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract literal text from a node, stripping surrounding quotes when the
+/// node represents a `string` or `raw_string`. Substitution nodes return an
+/// empty string — the caller already records `has_substitution`.
+#[allow(dead_code)]
+fn literal_text(node: Node<'_>, bytes: &[u8]) -> String {
+    match node.kind() {
+        "command_substitution" | "process_substitution" | "expansion" | "simple_expansion" => {
+            String::new()
+        }
+        _ => {
+            let Ok(raw) = node.utf8_text(bytes) else {
+                return String::new();
+            };
+            dequote_token(raw).to_string()
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn child_has_substitution(node: Node<'_>) -> bool {
+    if matches!(
+        node.kind(),
+        "command_substitution" | "process_substitution" | "expansion"
+    ) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).any(child_has_substitution)
 }
 
 pub(crate) fn analyze_shell_command(command: &str) -> ShellPermissionAnalysis {
