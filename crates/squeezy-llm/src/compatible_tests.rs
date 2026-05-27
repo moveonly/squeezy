@@ -35,9 +35,51 @@ fn sample_request() -> LlmRequest {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     }
+}
+
+#[test]
+fn request_body_omits_tool_choice_when_unset() {
+    // Default behavior: no tool_choice field in the body so the
+    // provider applies its default (typically `auto`).
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice must be absent when LlmRequest.tool_choice is None: {body}"
+    );
+}
+
+#[test]
+fn request_body_emits_tool_choice_required_when_set() {
+    // The fix for tool-shy chat-completions models (Qwen via OpenRouter,
+    // smaller MoEs): when `tool_choice = "required"` is configured under
+    // [model], it must be forwarded to the provider so the model is
+    // forced to emit at least one tool call per turn.
+    let mut request = sample_request();
+    request.tool_choice = Some("required".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["tool_choice"], "required");
+}
+
+#[test]
+fn request_body_omits_tool_choice_when_no_tools_advertised() {
+    // No tools → no `tool_choice` field, even when set, since the field
+    // is meaningless without tools and some providers reject it.
+    let mut request = sample_request();
+    request.tools = Arc::from(Vec::<Arc<LlmToolSpec>>::new());
+    request.tool_choice = Some("required".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert!(
+        body.get("tools").is_none(),
+        "tools field must be omitted when empty"
+    );
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice must be omitted when no tools are advertised"
+    );
 }
 
 #[test]
@@ -100,6 +142,7 @@ fn request_body_serialises_assistant_function_call_history() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };

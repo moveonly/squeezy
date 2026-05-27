@@ -25,6 +25,7 @@ fn request_body_uses_chat_stream_shape() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -67,6 +68,7 @@ fn request_body_preserves_function_tool_order() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };

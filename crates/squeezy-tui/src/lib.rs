@@ -2753,6 +2753,29 @@ fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
 }
 
 fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
+    // Prefer the most recent collapsed reasoning entry when one exists.
+    // Without this preference Ctrl-E falls through to the most recent
+    // collapsed *peer* — which after a turn lands is the assistant
+    // message (also collapsed on `transcript_default = compact`). The
+    // assistant body is usually a short single line, so toggling it has
+    // no visible effect and the reasoning chevron the user actually
+    // wanted to expand stays collapsed. Reasoning blocks are by far the
+    // most common Ctrl-E target, so prefer them when the user hasn't
+    // explicitly navigated to a specific entry.
+    let latest_reasoning = app
+        .transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| {
+            matches!(entry.kind, TranscriptEntryKind::Reasoning(_))
+                && entry.collapsed
+                && entry.is_toggleable()
+        })
+        .map(|(index, _)| index);
+    if latest_reasoning.is_some() {
+        return latest_reasoning;
+    }
     app.transcript
         .iter()
         .enumerate()

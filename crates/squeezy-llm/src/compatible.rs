@@ -182,6 +182,18 @@ impl OpenAiCompatibleProvider {
                     })
                     .collect::<Vec<_>>()
             );
+            // Forward `tool_choice` when the caller set one. Omitting the
+            // field leaves the provider's default in place (typically
+            // `auto`), which preserves historical behavior for working
+            // models. Tool-shy models routed through aggregators (Qwen
+            // via OpenRouter, smaller MoEs) ignore `auto` and emit a
+            // chatty preamble with zero tool calls; setting
+            // `tool_choice = "required"` in `[model]` flips them into
+            // calling at least one tool per turn — see opencode's
+            // pass-through pattern in `openai-chat.ts:267`.
+            if let Some(choice) = request.tool_choice.as_deref() {
+                body["tool_choice"] = json!(choice);
+            }
         }
         body
     }
@@ -330,7 +342,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
             if !state.saw_visible_output && !state.completed_emitted {
                 yield LlmEvent::TextDelta(
-                    "_[squeezy] stream ended without producing any content or tool call. The provider may have cut the connection mid-response; retry the turn._".to_string(),
+                    "\n[squeezy] stream ended without producing any content or tool call. The provider may have cut the connection mid-response; retry the turn.\n".to_string(),
                 );
             }
             if !state.completed_emitted {
@@ -661,7 +673,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                                 events.push(reasoning_done);
                             }
                             events.push(LlmEvent::TextDelta(
-                                "_[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt or lower `reasoning_effort`._".to_string(),
+                                "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
                             ));
                         }
                     }
@@ -671,7 +683,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                             events.push(reasoning_done);
                         }
                         events.push(LlmEvent::TextDelta(
-                            "_[squeezy] response truncated by max_output_tokens (finish_reason=length). Raise `providers.<name>.max_output_tokens` or lower `reasoning_effort` and retry._".to_string(),
+                            "\n[squeezy] response truncated by max_output_tokens (finish_reason=length). Raise providers.<name>.max_output_tokens or lower reasoning_effort and retry.\n".to_string(),
                         ));
                     }
                     "content_filter" => {
@@ -680,7 +692,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                             events.push(reasoning_done);
                         }
                         events.push(LlmEvent::TextDelta(
-                            "_[squeezy] response blocked by content filter (finish_reason=content_filter)._".to_string(),
+                            "\n[squeezy] response blocked by content filter (finish_reason=content_filter).\n".to_string(),
                         ));
                     }
                     _ => {}

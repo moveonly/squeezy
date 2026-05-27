@@ -76,6 +76,7 @@ fn build_request(model: &str) -> LlmRequest {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
+        tool_choice: None,
     }
 }
 

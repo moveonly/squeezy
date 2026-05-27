@@ -219,6 +219,13 @@ pub struct AppConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
     pub max_output_tokens: Option<u32>,
+    /// Forwarded as `tool_choice` to providers when tools are advertised.
+    /// `None` omits the field; providers default to `auto`. Set to
+    /// `"required"` to force a tool call every turn — needed for
+    /// chat-completions models that ignore `auto` (Qwen via OpenRouter,
+    /// smaller MoEs). Configured via `[model].tool_choice` in TOML or
+    /// `SQUEEZY_TOOL_CHOICE` env var.
+    pub tool_choice: Option<String>,
     pub stream_idle_timeout: Duration,
     pub tick_rate: Duration,
     pub workspace_root: PathBuf,
@@ -483,6 +490,10 @@ impl AppConfig {
             .filter(|value| *value > 0)
             .or(model_settings.max_output_tokens)
             .or(DEFAULT_MAX_OUTPUT_TOKENS);
+        let tool_choice = get_var("SQUEEZY_TOOL_CHOICE")
+            .map(|raw| raw.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or(model_settings.tool_choice.clone());
         let provider_timeout_keys = provider_settings_keys(&provider);
         let stream_idle_timeout_ms = parse_u64(
             get_var("SQUEEZY_STREAM_IDLE_TIMEOUT_MS")
@@ -655,6 +666,7 @@ impl AppConfig {
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
             max_output_tokens,
+            tool_choice,
             stream_idle_timeout: Duration::from_millis(stream_idle_timeout_ms),
             tick_rate: Duration::from_millis(tui.tick_rate_ms),
             workspace_root,
@@ -2239,6 +2251,14 @@ pub struct ModelSettings {
     pub stream_idle_timeout_ms: Option<u64>,
     pub store_responses: Option<bool>,
     pub selection_version: Option<u32>,
+    /// Forwarded to the provider as `tool_choice` whenever tools are
+    /// advertised on the request. `None` omits the field (provider
+    /// default — typically `auto`). Set to `"required"` for tool-shy
+    /// models routed through chat-completions aggregators (Qwen via
+    /// OpenRouter, smaller MoEs) that otherwise emit a chatty preamble
+    /// and finish with `stop` without calling any tool. Other accepted
+    /// values: `"auto"`, `"none"`.
+    pub tool_choice: Option<String>,
 }
 
 impl ModelSettings {
@@ -2254,6 +2274,7 @@ impl ModelSettings {
                 "stream_idle_timeout_ms",
                 "store_responses",
                 "selection_version",
+                "tool_choice",
             ],
             source,
             path,
@@ -2302,6 +2323,12 @@ impl ModelSettings {
                 source,
                 &field(path, "selection_version"),
             )?,
+            tool_choice: tool_choice_value(
+                table,
+                "tool_choice",
+                source,
+                &field(path, "tool_choice"),
+            )?,
         })
     }
 
@@ -2317,6 +2344,7 @@ impl ModelSettings {
         );
         replace_if_some(&mut self.store_responses, next.store_responses);
         replace_if_some(&mut self.selection_version, next.selection_version);
+        replace_if_some(&mut self.tool_choice, next.tool_choice);
     }
 }
 
@@ -7770,6 +7798,24 @@ fn reasoning_effort_value(
             "{source}: {path}: invalid reasoning effort {value:?}; expected low, medium, high, or xhigh"
         ))
     }).map(Some)
+}
+
+fn tool_choice_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "auto" | "required" | "none" => Ok(Some(normalized)),
+        _ => Err(SqueezyError::Config(format!(
+            "{source}: {path}: invalid tool_choice {value:?}; expected auto, required, or none"
+        ))),
+    }
 }
 
 fn mcp_transport_value(

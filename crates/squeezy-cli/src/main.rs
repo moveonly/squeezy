@@ -1799,6 +1799,7 @@ async fn run_prompt(
             .map(|session| format!("squeezy::{}", session.session_id())),
         tools: Arc::from(Vec::new()),
         store: config.store_responses,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };

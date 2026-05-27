@@ -51,6 +51,7 @@ async fn google_gemini_streaming_costly() -> Result<()> {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };

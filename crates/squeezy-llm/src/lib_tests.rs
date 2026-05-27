@@ -18,6 +18,7 @@ async fn unavailable_provider_reports_configuration_error() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -161,6 +162,7 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -205,6 +207,7 @@ fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -253,6 +256,7 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
