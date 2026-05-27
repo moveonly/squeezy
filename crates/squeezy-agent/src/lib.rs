@@ -120,10 +120,16 @@ const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final as
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
 /// predictable rather than letting a model spawn an unbounded swarm.
 const SUBAGENT_MAX_CONCURRENT: usize = 4;
-// Compaction summary truncation budgets. These are character (not byte)
-// caps because they pass through `compact_text` → `truncate_chars`. They
-// stay collocated so a future audit can read the total summary growth
-// in one place rather than chasing literals across `build_compaction_summary`.
+// Compaction summary truncation budget — survivor policy chunk for the
+// SUMMARY_BLOCK family. Sister budgets live in `context_compaction.rs`;
+// this one stays here because it is *also* used by
+// `instructions_with_pinned_context` to bound the per-turn pinned block
+// inserted into the live instructions, not just the compaction summary.
+//
+/// Cap on a single pin's summary text. ≈ 100 tokens — wide enough for a
+/// one-paragraph user-pinned reminder, narrow enough that a dozen pins fit
+/// inside `model_context_window * threshold_percent` without crowding out
+/// the live conversation.
 pub(crate) const COMPACTION_PIN_SUMMARY_MAX_CHARS: usize = 400;
 
 async fn next_llm_stream_event(

@@ -27,20 +27,81 @@ use crate::{
 #[path = "context_compaction_tests.rs"]
 mod tests;
 
-// Compaction summary truncation budgets. These are character (not byte)
-// caps because they pass through `compact_text` → `truncate_chars`. They
-// stay collocated so a future audit can read the total summary growth
-// in one place rather than chasing literals across `build_compaction_summary`.
+// Compaction summary truncation budgets — survivor policy chunks.
+//
+// These constants are character (not byte) caps because they pass through
+// `compact_text` → `truncate_chars`. They group into four named families
+// matching the structure of `build_compaction_summary`; each family bounds
+// one section of the synthetic head item that replaces the dropped slice.
+// A rough total budget is `previous + pin + (durable_line * durable_lines)
+// + (receipt * receipts) + (unresolved * unresolved_lines) + attachment_preview
+// ≈ 1200 + 400 + 320*24 + 260*12 + 240*8 + 220 ≈ 15.7K chars ≈ 3.9K tokens`,
+// then bounded again by `config.context_compaction.max_summary_bytes` at the
+// end of `build_compaction_summary`.
+//
+// Reference: clear-code names its post-compact "survivor" budgets explicitly
+// (`POST_COMPACT_TOKEN_BUDGET`, `POST_COMPACT_MAX_TOKENS_PER_FILE`, …) at
+// `src/services/compact/compact.ts:122-130`. Squeezy's summary is a single
+// concatenated string rather than a set of post-compact attachments, so the
+// caps below sit inside one family rather than across many message slots.
+
+// --- SUMMARY_BLOCK family: prose carrying over from the prior summary chain ---
+
+/// Cap on the previous-summary block re-inserted at the head of each new
+/// summary. ≈ 300 tokens. Holds ~3 lines of "what mattered last compaction"
+/// after `compact_text` strips whitespace; the chain depth across repeated
+/// compactions ends up fitting comfortably under 4K chars total because each
+/// generation re-truncates here.
 const COMPACTION_PREVIOUS_SUMMARY_MAX_CHARS: usize = 1_200;
+
+// --- DURABLE_FACTS family: per-item lines mined from the dropped slice ---
+
+/// Per-line cap for durable facts (decisions, plans, assumptions, tool
+/// calls). ≈ 80 tokens — wide enough to keep a one-sentence decision intact
+/// without bleeding mid-paragraph text into the summary.
 const COMPACTION_DURABLE_LINE_MAX_CHARS: usize = 320;
+/// Per-line cap for `tool call <name> args=<json>` entries; matches the
+/// shape of a typical 1–2 arg invocation after JSON whitespace collapses.
 const COMPACTION_TOOL_ARGS_MAX_CHARS: usize = 260;
+/// Per-line cap for `tool output <call_id>: <text>` entries. Receipts table
+/// already carries the full output via sha; the line is a teaser.
 const COMPACTION_TOOL_OUTPUT_MAX_CHARS: usize = 260;
-const COMPACTION_RECEIPT_MAX_CHARS: usize = 260;
-const COMPACTION_UNRESOLVED_MAX_CHARS: usize = 240;
-const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
+/// Total lines of durable facts emitted. 24 covers a deep multi-turn
+/// session that still produces ~1 useful decision/tool-call per turn before
+/// auto-compact fires.
 const COMPACTION_DURABLE_LINES_LIMIT: usize = 24;
-const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
+
+// --- TOOL_RECEIPTS family: cross-session receipts from the store ---
+
+/// Per-line cap for tool/file receipt entries in the summary. Same shape
+/// as durable tool outputs above; kept symmetrical so future readers do not
+/// wonder why the two diverge.
+const COMPACTION_RECEIPT_MAX_CHARS: usize = 260;
+/// Cap on the count of receipt lines emitted, newest-first. 12 holds
+/// roughly one round of `read_file` / `grep` / `glob` against a small repo
+/// without dominating the summary.
 const COMPACTION_RECEIPT_LINES_LIMIT: usize = 12;
+
+// --- UNRESOLVED + ATTACHMENT family: open questions + active attachment previews ---
+
+/// Per-line cap for "unresolved questions" (lines containing `?`). ≈ 60
+/// tokens; one open question per architecture layer in a typical 3-tier
+/// app keeps the section readable.
+const COMPACTION_UNRESOLVED_MAX_CHARS: usize = 240;
+/// Maximum unresolved questions surfaced; 8 lines floor matches the
+/// per-layer budget above.
+const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
+/// Cap on attachment preview text. ≈ 55 tokens — just the first paragraph
+/// of an attached file/output so the model can recall its presence and
+/// re-request the full body via `read_file` if needed.
+const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
+
+// --- STATE retention (non-summary) ---
+
+/// In-memory history of compaction records retained on
+/// `ContextCompactionState.history`. 20 entries is enough to render a
+/// session-timeline UI without unbounded growth across long sessions; older
+/// entries fall off via `drain(..excess)`.
 const COMPACTION_MAX_HISTORY: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
