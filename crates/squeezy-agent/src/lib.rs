@@ -5690,6 +5690,16 @@ struct SubagentExecution {
     /// when no JSON tail is present or it failed to parse, in which case
     /// `summary` carries the raw text and callers can fall back to it.
     structured_output: Option<Value>,
+    /// Workspace-relative or absolute paths the subagent read or wrote,
+    /// extracted from tool-call arguments and deduped in iteration order.
+    /// Mirrors clear-code's `agentToolResultSchema` shape so the parent
+    /// can attribute work without reading the supporting-receipt SHAs.
+    files_touched: Vec<String>,
+    /// Full assistant + tool trace when the operator opts in via
+    /// `subagents.include_transcript = true`. Empty by default so the
+    /// parent-visible block stays the synthesized result, not the raw
+    /// child loop history (see `agentToolUtils.ts:276–357`).
+    transcript: Vec<Value>,
 }
 
 /// Bumps the global `subagent_calls` counter and the per-kind bucket so
@@ -5748,6 +5758,8 @@ async fn handle_subagent_call(
                 supporting_receipts: Vec::new(),
                 model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                 structured_output: None,
+                files_touched: Vec::new(),
+                transcript: Vec::new(),
             },
         );
     }
@@ -5767,6 +5779,8 @@ async fn handle_subagent_call(
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                     structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
                 },
             );
         }
@@ -5826,6 +5840,8 @@ async fn handle_subagent_call(
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                     structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
                 },
             );
         }
@@ -6042,6 +6058,8 @@ async fn run_subagent(
             supporting_receipts: Vec::new(),
             model,
             structured_output: None,
+            files_touched: Vec::new(),
+            transcript: Vec::new(),
         };
     }
     let allowed_tool_names = allowed_tools
@@ -6113,7 +6131,84 @@ async fn run_subagent(
     {
         execution.structured_output = parse_subagent_structured_tail(&execution.summary);
     }
+    execution.files_touched = collect_files_touched(&execution.supporting_receipts);
+    if config.subagents.include_transcript {
+        execution.transcript = subagent_transcript(&conversation);
+    }
     execution
+}
+
+/// Filters the subagent's supporting receipts to the read/edit/write
+/// tools and lifts each receipt's `path` field into a deduped, order-
+/// preserving list. Skips receipts without a `path` (e.g. `shell`,
+/// `websearch`) and receipts whose tool was denied — they don't
+/// represent files the subagent actually inspected.
+fn collect_files_touched(supporting_receipts: &[Value]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for receipt in supporting_receipts {
+        let tool = receipt
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            tool,
+            "read_file"
+                | "read_slice"
+                | "write_file"
+                | "apply_patch"
+                | "glob"
+                | "grep"
+                | "reference_search"
+                | "repo_map"
+                | "hierarchy"
+                | "diff_context"
+        ) {
+            continue;
+        }
+        if receipt.get("status").and_then(Value::as_str) == Some("denied") {
+            continue;
+        }
+        let Some(path) = receipt.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(path.to_string()) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// Serializes the subagent's tool-using conversation into a compact
+/// array of `{role, ...}` records so an operator who opts in via
+/// `subagents.include_transcript = true` can replay the child's loop.
+/// Mirrors clear-code's sidechain transcript (`runAgent.ts:792–805`)
+/// but stays in the parent-visible JSON instead of a separate file so
+/// it can be diffed against the synthesized summary in one place.
+fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
+    conversation
+        .iter()
+        .map(|item| match item {
+            LlmInputItem::UserText(text) => json!({ "role": "user", "text": text }),
+            LlmInputItem::AssistantText(text) => json!({ "role": "assistant", "text": text }),
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => json!({
+                "role": "tool_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }),
+            LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+                "role": "tool_result",
+                "call_id": call_id,
+                "output": output,
+            }),
+            other => json!({ "role": "other", "kind": format!("{other:?}") }),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6205,6 +6300,8 @@ async fn run_subagent_loop(
                 supporting_receipts: std::mem::take(supporting_receipts),
                 model,
                 structured_output: None,
+                files_touched: Vec::new(),
+                transcript: Vec::new(),
             }
         }
     }
@@ -6276,6 +6373,8 @@ async fn run_subagent_rounds(
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                         structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
                     };
                 }
             };
@@ -6316,6 +6415,8 @@ async fn run_subagent_rounds(
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                         structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
                     };
                 }
             }
@@ -6397,10 +6498,22 @@ async fn run_subagent_rounds(
         }
         let results = seen_outputs.prepare_results(results);
         let results = pack_tool_results(results, config.max_tool_result_bytes_per_round);
+        // Look up each result's originating call by `call_id` so the
+        // supporting receipt can carry a `path` field for the parent's
+        // `files_touched` summary. Lookup is a linear scan over the
+        // round's tool calls (always small — bounded by the model's
+        // parallel-tool-calls cap), so the extra cost is negligible.
         for pending in &results {
             broker.record_model_result(&pending.result);
             if supporting_receipts.len() < 12 {
-                supporting_receipts.push(subagent_supporting_receipt(&pending.result));
+                let path = tool_calls
+                    .iter()
+                    .find(|call| call.call_id == pending.result.call_id)
+                    .and_then(subagent_tool_call_path);
+                supporting_receipts.push(subagent_supporting_receipt(
+                    &pending.result,
+                    path.as_deref(),
+                ));
             }
         }
         conversation.extend(
@@ -6431,6 +6544,8 @@ async fn run_subagent_rounds(
         supporting_receipts: std::mem::take(supporting_receipts),
         model,
         structured_output: None,
+        files_touched: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 
@@ -6453,6 +6568,8 @@ fn successful_subagent_execution(
         supporting_receipts,
         model,
         structured_output: None,
+        files_touched: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 
@@ -6489,6 +6606,7 @@ fn subagent_control_result(
     kind: SubagentKind,
     execution: SubagentExecution,
 ) -> ToolResult {
+    let provider = &execution.metrics.provider;
     let mut content = json!({
         "ok": execution.status == ToolStatus::Success,
         "agent": kind.as_str(),
@@ -6496,7 +6614,18 @@ fn subagent_control_result(
         "summary": execution.summary,
         "model": execution.model,
         "supporting_receipts": execution.supporting_receipts,
-        "cost": execution.metrics.provider,
+        "files_touched": execution.files_touched,
+        "cost": provider,
+        // Cache breakdown promoted to a top-level block mirroring
+        // clear-code's `agentToolResultSchema.usage` shape so the
+        // parent can answer "how much of this subagent's input was
+        // a cache hit?" without reaching into the nested `cost` map.
+        "cache": {
+            "input_tokens": provider.input_tokens,
+            "output_tokens": provider.output_tokens,
+            "cached_input_tokens": provider.cached_input_tokens,
+            "cache_write_input_tokens": provider.cache_write_input_tokens,
+        },
         "metrics": {
             "tool_calls": execution.metrics.tool_calls,
             "tool_successes": execution.metrics.tool_successes,
@@ -6516,18 +6645,61 @@ fn subagent_control_result(
     if let Some(structured) = execution.structured_output {
         content["structured_output"] = structured;
     }
+    if !execution.transcript.is_empty() {
+        content["transcript"] = json!(execution.transcript);
+    }
     control_tool_result(call, execution.status, content)
 }
 
-fn subagent_supporting_receipt(result: &ToolResult) -> Value {
-    json!({
+fn subagent_supporting_receipt(result: &ToolResult, path: Option<&str>) -> Value {
+    let mut value = json!({
         "tool": result.tool_name,
         "status": tool_status_label(result.status),
         "output_sha256": result.receipt.output_sha256,
         "content_sha256": result.receipt.content_sha256,
         "output_bytes": result.cost_hint.output_bytes,
         "truncated": result.cost_hint.truncated,
-    })
+    });
+    if let Some(path) = path
+        && let Value::Object(map) = &mut value
+    {
+        map.insert("path".to_string(), Value::String(path.to_string()));
+    }
+    value
+}
+
+/// Pulls the most-likely file path out of a tool call's arguments so we
+/// can attribute the subagent's reads/writes to concrete files without
+/// digging into receipt SHAs. Covers the read/edit/search tools the
+/// subagent is allowed to call; unknown shapes return `None` and the
+/// supporting receipt is recorded without a `path` field.
+fn subagent_tool_call_path(call: &ToolCall) -> Option<String> {
+    let arg_str = |key: &str| {
+        call.arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    match call.name.as_str() {
+        "read_file" | "read_slice" | "write_file" | "repo_map" | "hierarchy" | "diff_context" => {
+            arg_str("path")
+        }
+        "grep" | "reference_search" => arg_str("path").or_else(|| arg_str("file")),
+        "glob" => arg_str("path"),
+        "apply_patch" => call
+            .arguments
+            .get("patches")
+            .and_then(Value::as_array)
+            .and_then(|patches| patches.first())
+            .and_then(|patch| patch.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 fn subagent_user_prompt(request: &SubagentRequest) -> String {

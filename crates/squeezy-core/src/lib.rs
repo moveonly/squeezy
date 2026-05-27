@@ -1024,9 +1024,13 @@ impl AppConfig {
             self.subagents.max_summary_tokens
         ));
         match self.subagents.max_runtime_secs {
-            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n\n")),
-            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n\n"),
+            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n")),
+            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n"),
         }
+        output.push_str(&format!(
+            "include_transcript = {}\n\n",
+            self.subagents.include_transcript
+        ));
 
         output.push_str("[budgets]\n");
         output.push_str(&format!(
@@ -3254,6 +3258,7 @@ pub struct SubagentSettings {
     pub max_model_rounds: Option<usize>,
     pub max_summary_tokens: Option<u32>,
     pub max_runtime_secs: Option<u64>,
+    pub include_transcript: Option<bool>,
 }
 
 impl SubagentSettings {
@@ -3270,6 +3275,7 @@ impl SubagentSettings {
                 "max_model_rounds",
                 "max_summary_tokens",
                 "max_runtime_secs",
+                "include_transcript",
             ],
             source,
             path,
@@ -3324,6 +3330,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_runtime_secs"),
             )?,
+            include_transcript: bool_value(
+                table,
+                "include_transcript",
+                source,
+                &field(path, "include_transcript"),
+            )?,
         })
     }
 
@@ -3346,6 +3358,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.max_model_rounds, next.max_model_rounds);
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
         replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
+        replace_if_some(&mut self.include_transcript, next.include_transcript);
     }
 }
 
@@ -3363,6 +3376,12 @@ pub struct SubagentConfig {
     /// `max_runtime_secs = 0` or `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0`)
     /// disables the timeout entirely; cancellation and round caps remain.
     pub max_runtime_secs: Option<u64>,
+    /// When `true`, the structured subagent result returned to the parent
+    /// carries a `transcript` field with the child's assistant + tool
+    /// trace. Default `false` — the parent sees only the final `summary`
+    /// + `supporting_receipts` + `files_touched`, mirroring clear-code's
+    /// sidechained-by-default shape (`agentToolUtils.ts:276–357`).
+    pub include_transcript: bool,
 }
 
 impl SubagentConfig {
@@ -3418,6 +3437,10 @@ impl SubagentConfig {
                     .unwrap_or(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS);
                 if raw == 0 { None } else { Some(raw) }
             },
+            include_transcript: get_var("SQUEEZY_SUBAGENT_INCLUDE_TRANSCRIPT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.include_transcript.unwrap_or(false)),
         }
     }
 }
@@ -3434,6 +3457,7 @@ impl Default for SubagentConfig {
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
             max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
+            include_transcript: false,
         }
     }
 }

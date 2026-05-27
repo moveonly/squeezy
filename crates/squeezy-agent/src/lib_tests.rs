@@ -5521,3 +5521,196 @@ async fn end_turn_stop_reason_completes_successfully() {
     assert!(saw_success, "EndTurn must produce a successful Completed");
     assert!(!saw_failure, "EndTurn must not produce a Failed event");
 }
+
+fn make_subagent_execution(
+    supporting_receipts: Vec<serde_json::Value>,
+    files_touched: Vec<String>,
+    transcript: Vec<serde_json::Value>,
+    provider: CostSnapshot,
+) -> SubagentExecution {
+    SubagentExecution {
+        status: ToolStatus::Success,
+        summary: "ok".to_string(),
+        status_label: "completed",
+        error: None,
+        metrics: TurnMetrics {
+            provider,
+            ..TurnMetrics::default()
+        },
+        supporting_receipts,
+        model: "test-model".to_string(),
+        structured_output: None,
+        files_touched,
+        transcript,
+    }
+}
+
+#[test]
+fn subagent_tool_call_path_extracts_known_tool_args() {
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+        }),
+        Some("src/lib.rs".to_string())
+    );
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c2".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: json!({"patches": [{"path": "a.rs"}, {"path": "b.rs"}]}),
+        }),
+        Some("a.rs".to_string())
+    );
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c3".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "ls"}),
+        }),
+        None
+    );
+}
+
+#[test]
+fn collect_files_touched_dedupes_and_drops_denied_and_pathless() {
+    let receipts = vec![
+        json!({"tool": "read_file", "status": "success", "path": "src/lib.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "src/lib.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "src/main.rs"}),
+        json!({"tool": "read_file", "status": "denied", "path": "secret.env"}),
+        json!({"tool": "shell", "status": "success"}),
+        json!({"tool": "grep", "status": "success"}),
+    ];
+    assert_eq!(
+        collect_files_touched(&receipts),
+        vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]
+    );
+}
+
+#[test]
+fn subagent_result_contains_files_touched() {
+    let call = ToolCall {
+        call_id: "del_1".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "investigate"}),
+    };
+    let supporting_receipts = vec![
+        json!({"tool": "read_file", "status": "success", "path": "crates/a.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "crates/b.rs"}),
+    ];
+    let execution = make_subagent_execution(
+        supporting_receipts,
+        vec!["crates/a.rs".to_string(), "crates/b.rs".to_string()],
+        Vec::new(),
+        CostSnapshot::default(),
+    );
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let files = result
+        .content
+        .get("files_touched")
+        .expect("files_touched key");
+    let files = files.as_array().expect("files_touched is an array");
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0], "crates/a.rs");
+    assert_eq!(files[1], "crates/b.rs");
+}
+
+#[test]
+fn subagent_result_includes_cache_breakdown() {
+    let call = ToolCall {
+        call_id: "del_2".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "with cache"}),
+    };
+    let provider = CostSnapshot {
+        input_tokens: Some(1_000),
+        output_tokens: Some(120),
+        cached_input_tokens: Some(640),
+        cache_write_input_tokens: Some(360),
+        ..CostSnapshot::default()
+    };
+    let execution = make_subagent_execution(Vec::new(), Vec::new(), Vec::new(), provider);
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let cache = result.content.get("cache").expect("cache key");
+    assert_eq!(cache.get("input_tokens"), Some(&json!(1_000)));
+    assert_eq!(cache.get("output_tokens"), Some(&json!(120)));
+    assert_eq!(cache.get("cached_input_tokens"), Some(&json!(640)));
+    assert_eq!(cache.get("cache_write_input_tokens"), Some(&json!(360)));
+}
+
+#[test]
+fn subagent_result_omits_transcript_by_default() {
+    let call = ToolCall {
+        call_id: "del_3".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "no transcript"}),
+    };
+    let execution =
+        make_subagent_execution(Vec::new(), Vec::new(), Vec::new(), CostSnapshot::default());
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    assert!(
+        result.content.get("transcript").is_none(),
+        "transcript leaked into default result: {:?}",
+        result.content
+    );
+}
+
+#[test]
+fn subagent_result_includes_transcript_when_debug_enabled() {
+    let call = ToolCall {
+        call_id: "del_4".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "with transcript"}),
+    };
+    let transcript = vec![
+        json!({"role": "user", "text": "investigate"}),
+        json!({"role": "assistant", "text": "looking..."}),
+    ];
+    let execution = make_subagent_execution(
+        Vec::new(),
+        Vec::new(),
+        transcript.clone(),
+        CostSnapshot::default(),
+    );
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let recorded = result
+        .content
+        .get("transcript")
+        .expect("transcript key when populated");
+    let recorded = recorded.as_array().expect("transcript is an array");
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].get("role"), Some(&json!("user")));
+    assert_eq!(recorded[1].get("role"), Some(&json!("assistant")));
+}
+
+#[test]
+fn subagent_transcript_serializes_conversation_items() {
+    use squeezy_llm::LlmInputItem;
+    let conversation = vec![
+        LlmInputItem::UserText("hello".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: "ok".to_string(),
+        },
+    ];
+    let transcript = subagent_transcript(&conversation);
+    assert_eq!(transcript.len(), 3);
+    assert_eq!(transcript[0].get("role"), Some(&json!("user")));
+    assert_eq!(transcript[0].get("text"), Some(&json!("hello")));
+    assert_eq!(transcript[1].get("role"), Some(&json!("tool_call")));
+    assert_eq!(transcript[1].get("name"), Some(&json!("read_file")));
+    assert_eq!(transcript[2].get("role"), Some(&json!("tool_result")));
+}
+
+#[test]
+fn subagent_config_include_transcript_defaults_false() {
+    let config = SubagentConfig::default();
+    assert!(!config.include_transcript);
+}
