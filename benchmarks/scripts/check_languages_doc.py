@@ -58,7 +58,10 @@ def normalized_cell(cell: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--bench", default="target/debug/squeezy-graph-bench")
-    parser.add_argument("--doc", default="crates/squeezy-skills/external-docs/LANGUAGES.md")
+    parser.add_argument(
+        "--doc",
+        default="crates/squeezy-skills/external-docs/LANGUAGES.md",
+    )
     args = parser.parse_args()
 
     bench = Path(args.bench)

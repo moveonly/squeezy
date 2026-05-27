@@ -29,6 +29,7 @@ fn request_body_uses_messages_streaming_shape() {
             .into(),
         ]),
         store: true,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -77,6 +78,7 @@ fn request_body_preserves_function_tool_order() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -100,6 +102,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -133,6 +136,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -173,6 +177,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         cache_key: Some("squeezy::session-1".to_string()),
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -234,6 +239,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -269,6 +275,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };
@@ -294,6 +301,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
     };

@@ -68,6 +68,15 @@ pub struct LlmRequest {
     pub cache_key: Option<String>,
     pub tools: Arc<[Arc<LlmToolSpec>]>,
     pub store: bool,
+    /// Optional `tool_choice` hint to forward to the provider when tools are
+    /// advertised. `None` omits the field entirely — matches squeezy's
+    /// historical behavior and lets the provider apply its default
+    /// (typically `auto`). Set to `"required"` for tool-shy models like
+    /// Qwen via OpenRouter that otherwise emit a chatty preamble and
+    /// finish with `stop` without calling any tool. Mirrors opencode's
+    /// `lowerToolChoice` pass-through (`openai-chat.ts:172, 267`) and
+    /// clear-code's `options.toolChoice` (`claude.ts:1712`).
+    pub tool_choice: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<LlmOutputSchema>,
     /// When `Some(false)`, force the OpenAI Responses API to issue tool
@@ -95,6 +104,7 @@ impl LlmRequest {
             cache_key: None,
             tools: Arc::from(Vec::new()),
             store: false,
+            tool_choice: None,
             output_schema: None,
             parallel_tool_calls: None,
         }
