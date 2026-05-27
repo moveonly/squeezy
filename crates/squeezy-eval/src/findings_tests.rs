@@ -784,23 +784,32 @@ fn stop_with_intent_text_quiet_on_non_stop_finish() {
 
 #[test]
 fn expect_finish_reason_not_flags_literal_match() {
+    // The mock helper accepts the chat-completions wire string
+    // ("length"), but the rule now matches against the normalized
+    // `StopReason` label ("max_tokens"). Scenarios written after the
+    // StopReason migration use the normalized label directly.
     let events = vec![turn_completed_with(1, "T(1)", Some("length"), false)];
     let ctx = ctx_from_events(events);
     let mut scenario = empty_scenario();
-    scenario.expect.finish_reason_not = vec!["length".into()];
+    scenario.expect.finish_reason_not = vec!["max_tokens".into()];
     let out = ExpectFinishReasonNot.check(&ctx, &scenario);
     assert_eq!(out.len(), 1);
-    assert!(out[0].summary.contains("length"));
+    assert!(out[0].summary.contains("max_tokens"));
 }
 
 #[test]
 fn expect_finish_reason_not_flags_stop_no_action_sentinel() {
+    // No tool call AND no assistant text — pure "model said nothing".
     let events = vec![turn_completed_with(1, "T(1)", Some("stop"), false)];
     let ctx = ctx_from_events(events);
     let mut scenario = empty_scenario();
     scenario.expect.finish_reason_not = vec!["stop_no_action".into()];
     let out = ExpectFinishReasonNot.check(&ctx, &scenario);
-    assert_eq!(out.len(), 1, "stop with zero tool calls is forbidden here");
+    assert_eq!(
+        out.len(),
+        1,
+        "stop with zero tool calls AND no assistant text is forbidden"
+    );
 }
 
 #[test]
@@ -815,5 +824,27 @@ fn expect_finish_reason_not_quiet_when_stop_had_tool_call() {
     assert!(
         ExpectFinishReasonNot.check(&ctx, &scenario).is_empty(),
         "stop with a tool call is the OK path"
+    );
+}
+
+#[test]
+fn expect_finish_reason_not_quiet_when_stop_has_assistant_text() {
+    // Plan-mode-style turn: no tool call but a real assistant message
+    // (the `<proposed_plan>` block). The sentinel must NOT fire here —
+    // the model emitted actionable output, just not via a tool call.
+    let events = vec![
+        assistant_delta(
+            1,
+            "T(1)",
+            "<proposed_plan>\n## Context\nfoo\n</proposed_plan>",
+        ),
+        turn_completed_with(2, "T(1)", Some("stop"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    let mut scenario = empty_scenario();
+    scenario.expect.finish_reason_not = vec!["stop_no_action".into()];
+    assert!(
+        ExpectFinishReasonNot.check(&ctx, &scenario).is_empty(),
+        "stop with assistant text is the OK path even without tool calls"
     );
 }

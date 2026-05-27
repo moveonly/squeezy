@@ -4628,38 +4628,61 @@ impl TurnRuntime {
                     self.record_replay_model_text_delta(&tail);
                 }
 
-                // One-shot "promised tool use but stopped" retry.
+                // One-shot retry for the "model finished without
+                // actionable output" failure modes. Three gating
+                // shapes, each with its own nudge text:
                 //
-                // Tool-shy models (Qwen3-via-PortKey is the canonical
-                // example, but smaller MoE / reasoning-heavy models do
-                // it too) sometimes emit a chatty preamble like
-                // "Let me scan the codebase" or "I'll check that file"
-                // and then end the turn with `finish_reason=stop` and
-                // no tool call. The model thinks it committed to the
-                // follow-up; the user sees a dangling promise.
+                // (1) `reasoning_only_stop` — model burned the round
+                //     entirely on `reasoning_content` and finished
+                //     with stop, no content, no tool call. Canonical
+                //     Qwen3 / DeepSeek-R1 reasoning-mode collapse.
+                //     Fires from any round so plan-mode turns that
+                //     reasoning-out without emitting `<proposed_plan>`
+                //     get a second chance.
                 //
-                // Detect that exact shape — round > 0 so the model has
-                // already used a tool this turn (otherwise this is a
-                // legitimate "I'll do X" preamble before round 0's
-                // tool burst), finish_reason == "stop", and assistant
-                // text matches `(let me|i['']ll|i will|going to|need to)`
-                // + a tool-shaped action verb (scan, search, read, ...).
-                // Push a synthetic user nudge into next_input and
-                // re-enter the round loop once.
-                if !replan_retry_used
+                // (2) "Promised tool use but stopped" — model emitted
+                //     intent text ("Let me scan the codebase") with
+                //     finish_reason=stop and zero tool calls AFTER
+                //     successfully using a tool earlier this turn.
+                //     The exact shape from the user's PortKey+Qwen
+                //     screenshot. Gated on `round > 0` so a chatty
+                //     preamble before round 0's tool burst isn't
+                //     mistaken for the bug.
+                //
+                // Both branches push the assistant's text to
+                // `conversation`, append a mode-aware synthetic user
+                // nudge, and re-enter the round loop once. The retry
+                // is one-shot per turn via `replan_retry_used` so the
+                // model can't trap us in a forever loop.
+                let active_mode = load_session_mode(&self.session_mode);
+                let plan_mode = active_mode == SessionMode::Plan;
+                let reasoning_only_branch = !replan_retry_used
+                    && stop_reason == Some(StopReason::EndTurn)
+                    && reasoning_only_stop;
+                let promised_action_branch = !replan_retry_used
                     && round > 0
                     && stop_reason == Some(StopReason::EndTurn)
-                    && assistant_text_has_unresolved_intent(&assistant_message)
-                {
+                    && assistant_text_has_unresolved_intent(&assistant_message);
+                if reasoning_only_branch || promised_action_branch {
                     let raw_assistant_text = std::mem::take(&mut assistant_message);
                     conversation.push(redact_input_item(
                         LlmInputItem::AssistantText(raw_assistant_text.clone()),
                         &self.redactor,
                     ));
-                    let nudge = "You described a follow-up action but did not call any tool. \
-                                 If you need to call a tool to complete the user's request, \
-                                 call it now. If the previous output is enough, give the final \
-                                 answer directly instead.";
+                    let nudge = if reasoning_only_branch {
+                        if plan_mode {
+                            "You finished thinking but produced no `<proposed_plan>...</proposed_plan>` block. \
+                             Write your plan now in the tag. Skip further reasoning."
+                        } else {
+                            "You finished thinking but produced no visible content or tool call. \
+                             Respond directly to the user now."
+                        }
+                    } else {
+                        "You described a follow-up action but did not call any tool. \
+                         If you need to call a tool to complete the user's request, \
+                         call it now. If the previous output is enough, give the final \
+                         answer directly instead."
+                    };
                     let nudge_item = redact_input_item(
                         LlmInputItem::UserText(nudge.to_string()),
                         &self.redactor,
@@ -4682,8 +4705,15 @@ impl TurnRuntime {
                         target: "squeezy_agent::stop_no_action_retry",
                         round,
                         stop_reason = ?stop_reason,
+                        reasoning_only_stop,
+                        plan_mode,
                         assistant_text_chars = raw_assistant_text.chars().count(),
-                        "model promised tool use but ended turn; retrying once with nudge",
+                        branch = if reasoning_only_branch {
+                            "reasoning_only"
+                        } else {
+                            "promised_action"
+                        },
+                        "retrying turn with mode-aware nudge",
                     );
                     continue;
                 }

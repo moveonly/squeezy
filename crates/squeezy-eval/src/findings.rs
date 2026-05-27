@@ -1190,7 +1190,10 @@ impl Rule for ExpectFinishReasonNot {
                     // actionable — no tool call AND no assistant text.
                     // A normal plan-mode finish (text only, no tool
                     // calls) is a legitimate "stop" and should NOT
-                    // match the sentinel.
+                    // match the sentinel. The trailing
+                    // `assistant_text.trim().is_empty()` check is what
+                    // separates "model gave a final answer" from "model
+                    // ate its budget on reasoning".
                     "stop_no_action" => {
                         *stop_reason == Some(squeezy_llm::StopReason::EndTurn)
                             && tool_count == 0

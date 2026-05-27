@@ -5599,6 +5599,8 @@ async fn repeated_raw_shell_output_is_not_rendered_as_assistant_reply() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");

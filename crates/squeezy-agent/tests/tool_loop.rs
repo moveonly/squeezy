@@ -3333,6 +3333,163 @@ async fn stop_no_action_retry_does_not_fire_when_model_answered_directly() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn reasoning_only_stop_retries_with_plan_mode_nudge() {
+    // Plan-mode round 0: model reasons through the problem but emits
+    // no `<proposed_plan>` block and finishes with `reasoning_only_stop`.
+    // The retry latch should fire on the first round (no `round > 0`
+    // guard for reasoning-only-stop) with a plan-mode nudge. Round 1
+    // produces a real plan.
+    let root = temp_workspace("reasoning_only_stop_plan");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_reasoning_only".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                true,
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "<proposed_plan>\n## Context\nfoo\n</proposed_plan>".to_string(),
+            )),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_plan".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                false,
+            )),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.session_mode = SessionMode::Plan;
+    let agent = Agent::new(config, provider.clone());
+    drain_turn(agent.start_turn("plan a refactor".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "reasoning-only stop should trigger one retry"
+    );
+    let retry = &requests[1];
+    let nudge_present = retry.input.iter().any(|item| match item {
+        LlmInputItem::UserText(text) => text.contains("<proposed_plan>") && text.contains("tag"),
+        _ => false,
+    });
+    assert!(
+        nudge_present,
+        "plan-mode retry nudge must reference the <proposed_plan> tag",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reasoning_only_stop_retries_with_build_mode_nudge() {
+    let root = temp_workspace("reasoning_only_stop_build");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_reasoning_only".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                true,
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Here is the direct answer.".to_string(),
+            )),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_final".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                false,
+            )),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+    drain_turn(agent.start_turn("answer the user".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "reasoning-only stop must trigger a retry"
+    );
+    // Find the nudge by looking for any UserText that contains the
+    // distinctive "finished thinking" marker — the input list also
+    // includes the original user prompt, which would match an
+    // unfiltered `find_map`.
+    let nudge_text = requests[1].input.iter().find_map(|item| match item {
+        LlmInputItem::UserText(text) if text.contains("finished thinking") => Some(text.as_str()),
+        _ => None,
+    });
+    assert!(
+        nudge_text.is_some(),
+        "retry must include a synthetic user nudge"
+    );
+    assert!(
+        !nudge_text.unwrap().contains("<proposed_plan>"),
+        "build-mode nudge must NOT mention <proposed_plan>",
+    );
+    assert!(
+        nudge_text.unwrap().contains("visible content"),
+        "build-mode nudge should ask for visible content"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reasoning_only_stop_does_not_retry_twice_in_one_turn() {
+    // Both rounds end with reasoning_only_stop. The agent must only
+    // retry once — second reasoning-only-stop should NOT trigger
+    // another retry. The turn ends with the agent's "completed
+    // without content" notice as the assistant message.
+    let root = temp_workspace("reasoning_only_no_loop");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_r1".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                true,
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_r2".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                true,
+            )),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+    drain_turn(agent.start_turn("answer".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "second reasoning-only stop must NOT trigger another retry"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {
     request
         .input

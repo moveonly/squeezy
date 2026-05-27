@@ -1644,8 +1644,7 @@ async fn known_help_topic_short_circuits_without_provider_request() {
 
 #[tokio::test]
 async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
-    let provider =
-        Arc::new(MockProvider::new(vec![vec![
+    let provider = Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
         Ok(LlmEvent::TextDelta(
             "Squeezy does not document a quantum-billing flow; see docs/external/CONFIGURATION.md."

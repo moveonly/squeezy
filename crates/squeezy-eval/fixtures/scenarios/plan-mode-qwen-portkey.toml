@@ -1,0 +1,49 @@
+id = "plan-mode-qwen-portkey"
+title = "Plan mode: Qwen3 via PortKey must emit <proposed_plan>"
+description = """
+Verifies the reasoning-only-stop retry against the real PortKey+Qwen
+target. Plan mode + `reasoning_effort = "high"` is the configuration
+where Qwen3 most often "thinks out" the entire response budget and
+returns finish_reason=stop with no `<proposed_plan>` block.
+
+Requires `PORTKEY_API_KEY` in the env. Run with:
+
+    PORTKEY_API_KEY=... cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/plan-mode-qwen-portkey.toml
+
+Inspect:
+  - frames.jsonl: the final turn must contain `<proposed_plan>` in
+    assistant_text. `reasoning_only_stop=true` on round 0 followed by
+    a successful retry shows up as a tracing event under
+    `squeezy_agent::stop_no_action_retry` when running with
+    `RUST_LOG=squeezy_agent=debug`.
+  - findings.jsonl: no `expect_finish_reason` entries; no
+    `stop_with_intent_text_no_tool_call`.
+  - run.json: `totals.findings = 0`.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "qwen/qwen3.6-35b-a3b"
+mode = "plan"
+reasoning_effort = "high"
+max_output_tokens = 32000
+
+[[steps]]
+kind = "prompt"
+text = "Plan a refactor that extracts the language-specific scanning logic in crates/squeezy-parse/src/languages/c_family.rs into a dedicated submodule per language. Keep it under 8 numbered steps."
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["<proposed_plan>"]
+finish_reason_not = ["stop_no_action"]
+no_tool_errors = true
+max_tools_per_turn = 12
+max_wall_clock_seconds = 300
+
+[triage]
+enabled = false
