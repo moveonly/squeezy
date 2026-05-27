@@ -119,5 +119,14 @@ squeezy-workspace = { path = "crates/squeezy-workspace", version = "=0.1.0" }
 
 [profile.release]
 opt-level = 3
+# Keep Cargo's default release path practical for source installs. Cargo's
+# release default is 16 codegen units: enough parallelism for faster builds,
+# with a small optimization tradeoff versus the dist profile's single unit.
+lto = false
+codegen-units = 16
+
+[profile.dist]
+inherits = "release"
+# Distribution artifacts opt into whole-program optimization explicitly.
 lto = true
 codegen-units = 1

@@ -34,23 +34,23 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-15-intel
             archive: squeezy-x86_64-apple-darwin.tar.gz
-            binary-path: target/x86_64-apple-darwin/release/squeezy
+            binary-path: target/x86_64-apple-darwin/dist/squeezy
           - target: aarch64-apple-darwin
             os: macos-15
             archive: squeezy-aarch64-apple-darwin.tar.gz
-            binary-path: target/aarch64-apple-darwin/release/squeezy
+            binary-path: target/aarch64-apple-darwin/dist/squeezy
           - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
             archive: squeezy-x86_64-unknown-linux-musl.tar.gz
-            binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+            binary-path: target/x86_64-unknown-linux-musl/dist/squeezy
           - target: aarch64-unknown-linux-musl
             os: ubuntu-22.04-arm
             archive: squeezy-aarch64-unknown-linux-musl.tar.gz
-            binary-path: target/aarch64-unknown-linux-musl/release/squeezy
+            binary-path: target/aarch64-unknown-linux-musl/dist/squeezy
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: squeezy-x86_64-pc-windows-msvc.zip
-            binary-path: target/x86_64-pc-windows-msvc/release/squeezy.exe
+            binary-path: target/x86_64-pc-windows-msvc/dist/squeezy.exe
 
     steps:
       - name: Validate release tag
@@ -130,7 +130,7 @@ jobs:
               ;;
           esac
 
-          cargo build --release -p squeezy --target "${{ matrix.target }}"
+          cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
 
       - name: Smoke-test release binary
         shell: bash

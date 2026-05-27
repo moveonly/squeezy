@@ -19,12 +19,12 @@ PR CI runs `cargo test` and `cargo clippy` only on the ARM64 runner image
 release smoke-test target, not a continuously tested target. If you rely on
 Intel macOS, validate locally before depending on a release.
 
-Tagged releases build both macOS CPU targets with the workspace `release`
+Tagged releases build both macOS CPU targets with the workspace `dist`
 profile:
 
 ```sh
-cargo build --release -p squeezy --target x86_64-apple-darwin
-cargo build --release -p squeezy --target aarch64-apple-darwin
+cargo build --profile dist -p squeezy --target x86_64-apple-darwin
+cargo build --profile dist -p squeezy --target aarch64-apple-darwin
 ```
 
 CI smoke-tests both debug and release artifacts with:
@@ -60,7 +60,7 @@ CI uses the musl target for Linux validation and artifact upload. The jobs set `
 - `cargo test --workspace --all-targets --target x86_64-unknown-linux-musl`
 - `cargo build -p squeezy --target x86_64-unknown-linux-musl`
 - `cargo llvm-cov --workspace --all-targets --target x86_64-unknown-linux-musl --summary-only` for coverage on pushes to `main` and manual CI runs
-- `cargo build --release -p squeezy --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../.github/workflows/release.yml))
+- `cargo build --profile dist -p squeezy --target x86_64-unknown-linux-musl` for tagged releases (driven by [`.github/workflows/release.yml`](../../.github/workflows/release.yml))
 - `readelf -l` must not report a program interpreter.
 - `readelf -d` must not report dynamic `NEEDED` dependencies.
 - the binary must pass `doctor`, `--version`, and `--help`.

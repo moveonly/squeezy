@@ -417,15 +417,15 @@ jobs:
           - platform: macos
             os: macos-latest
             artifact-name: squeezy-macos
-            binary-path: target/release/squeezy
+            binary-path: target/dist/squeezy
           - platform: linux
             os: ubuntu-22.04
             artifact-name: squeezy-linux-x86_64-musl
-            binary-path: target/x86_64-unknown-linux-musl/release/squeezy
+            binary-path: target/x86_64-unknown-linux-musl/dist/squeezy
           - platform: windows
             os: windows-2022
             artifact-name: squeezy-windows-x86_64
-            binary-path: target/release/squeezy.exe
+            binary-path: target/dist/squeezy.exe
 
     steps:
       - name: Checkout
@@ -456,9 +456,9 @@ jobs:
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
-            cargo build --release -p squeezy --target x86_64-unknown-linux-musl
+            cargo build --profile dist -p squeezy --target x86_64-unknown-linux-musl
           else
-            cargo build --release -p squeezy
+            cargo build --profile dist -p squeezy
           fi
 
       - name: Smoke-test release artifact
