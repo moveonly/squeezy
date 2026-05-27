@@ -575,6 +575,7 @@ pub(crate) fn drain_pending_diff(app: &mut TuiApp) {
     match rx.try_recv() {
         Ok(result) => {
             app.pending_diff = None;
+            app.pending_diff_started_at = None;
             for line in result.logs {
                 app.push_log(line);
             }
@@ -586,6 +587,7 @@ pub(crate) fn drain_pending_diff(app: &mut TuiApp) {
         Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
         Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
             app.pending_diff = None;
+            app.pending_diff_started_at = None;
             app.push_log("/diff: background snapshot task aborted".to_string());
             app.needs_redraw = true;
         }

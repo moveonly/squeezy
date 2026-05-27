@@ -555,6 +555,54 @@ fn changed_large_file_is_reported_but_unchanged_one_is_not() {
 }
 
 #[test]
+fn bulk_patch_splitter_groups_each_file_section() {
+    let raw = b"diff --git a/src/foo.rs b/src/foo.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/foo.rs\n\
++++ b/src/foo.rs\n\
+@@ -1,1 +1,1 @@\n\
+-old\n\
++new\n\
+diff --git a/src/bar.rs b/src/bar.rs\n\
+index 3333333..4444444 100644\n\
+--- a/src/bar.rs\n\
++++ b/src/bar.rs\n\
+@@ -1,1 +1,1 @@\n\
+-a\n\
++b\n";
+    let files = vec!["src/foo.rs".to_string(), "src/bar.rs".to_string()];
+    let map = split_unified_patch(raw, &files, 4096);
+    assert_eq!(map.len(), 2);
+    let foo = map.get("src/foo.rs").expect("foo patch");
+    assert!(foo.text.contains("diff --git a/src/foo.rs"));
+    assert!(foo.text.contains("+new"));
+    assert!(!foo.text.contains("src/bar.rs"));
+    let bar = map.get("src/bar.rs").expect("bar patch");
+    assert!(bar.text.contains("diff --git a/src/bar.rs"));
+    assert!(bar.text.contains("+b"));
+}
+
+#[test]
+fn bulk_patch_splitter_handles_paths_with_spaces() {
+    let raw = b"diff --git a/my file b/my file\n\
+index 0..1 100644\n\
+--- a/my file\n\
++++ b/my file\n\
+@@ -1 +1 @@\n\
+-x\n\
++y\n";
+    let files = vec!["my file".to_string()];
+    let map = split_unified_patch(raw, &files, 4096);
+    assert_eq!(map.len(), 1);
+    assert!(
+        map.get("my file")
+            .expect("spaced patch")
+            .text
+            .contains("+y")
+    );
+}
+
+#[test]
 fn checkpoint_ids_are_unique_under_rapid_creation() {
     use std::collections::HashSet;
     let mut seen = HashSet::new();

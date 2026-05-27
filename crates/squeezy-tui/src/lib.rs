@@ -4158,6 +4158,7 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
 
 fn current_turn_duration(app: &TuiApp) -> Duration {
     app.turn_started_at
+        .or(app.pending_diff_started_at)
         .map(|started_at| started_at.elapsed())
         .unwrap_or_default()
 }
@@ -4727,6 +4728,7 @@ fn handle_slash_diff(app: &mut TuiApp) {
         let _ = tx.send(result);
     });
     app.pending_diff = Some(rx);
+    app.pending_diff_started_at = Some(Instant::now());
     app.needs_redraw = true;
 }
 
@@ -8802,6 +8804,10 @@ pub(crate) struct TuiApp {
     /// `spawn_blocking` and poll this receiver each frame so the input
     /// loop stays responsive. Drives the working spinner while set.
     pub(crate) pending_diff: Option<oneshot::Receiver<PendingDiffResult>>,
+    /// Wall-clock anchor for the in-flight `/diff` snapshot. Drives the
+    /// elapsed-time counter on the Working row so the user can see the
+    /// command is making progress even though the foreground UI is idle.
+    pub(crate) pending_diff_started_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -8968,6 +8974,7 @@ impl TuiApp {
             latest_plan_progress: None,
             keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
             pending_diff: None,
+            pending_diff_started_at: None,
         }
     }
 

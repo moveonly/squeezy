@@ -386,6 +386,30 @@ impl GitVcs {
         }
 
         let mut files = by_path.into_values().collect::<Vec<_>>();
+
+        // Bulk-fetch patches for all tracked files in a single `git diff`
+        // invocation. Spawning git once per file ran the snapshot at
+        // 20-50ms × N files on macOS; one batched call collapses that to
+        // a single subprocess regardless of N.
+        let mut bulk_patches: BTreeMap<String, Patch> = BTreeMap::new();
+        if let Some(refish_str) = refish {
+            let tracked: Vec<String> = files
+                .iter()
+                .filter(|file| file.code != "??")
+                .map(|file| file.path.clone())
+                .collect();
+            if !tracked.is_empty() {
+                bulk_patches = self.patches_bulk(
+                    &git_root,
+                    refish_str,
+                    mode == DiffMode::Index,
+                    &tracked,
+                    options.max_patch_bytes,
+                    &mut errors,
+                );
+            }
+        }
+
         for file in &mut files {
             if file.status == DiffFileStatus::Added
                 && file.code == "??"
@@ -398,7 +422,12 @@ impl GitVcs {
 
             let patch = if file.code == "??" || refish.is_none() {
                 self.patch_untracked(&git_root, &file.path, options.max_patch_bytes)
+            } else if let Some(patch) = bulk_patches.remove(&file.path) {
+                Some(patch)
             } else {
+                // Fall back to a per-file call if the bulk parser missed
+                // this path (unusual filenames that the splitter could
+                // not match back). Preserves behavior for the long tail.
                 self.patch_file(
                     &git_root,
                     refish.unwrap_or("HEAD"),
@@ -737,6 +766,46 @@ impl GitVcs {
         )
         .ok()?;
         parse_numstat(&output.stdout).into_values().next()
+    }
+
+    /// Fetch patches for `files` in a single `git diff` invocation. Splits
+    /// the combined output on each `diff --git a/<path> b/<path>` header,
+    /// caps each per-file slice at `max_bytes`, and returns the result
+    /// keyed by file path. Files that the splitter can't map back to an
+    /// entry in `files` are silently dropped — the caller falls back to
+    /// per-file `patch_file` for those. Errors from git are surfaced as
+    /// warnings via `errors`; on failure the map is empty and the caller
+    /// falls back transparently.
+    fn patches_bulk(
+        &self,
+        git_root: &Path,
+        refish: &str,
+        cached: bool,
+        files: &[String],
+        max_bytes: usize,
+        errors: &mut Vec<String>,
+    ) -> BTreeMap<String, Patch> {
+        let mut args = vec![
+            "diff".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--unified=3".to_string(),
+        ];
+        if cached {
+            args.push("--cached".to_string());
+        }
+        args.push(refish.to_string());
+        args.push("--".to_string());
+        args.extend(files.iter().cloned());
+        let output = match git_output_vec_allow_status(git_root, args, &[0]) {
+            Ok(output) => output,
+            Err(err) => {
+                errors.push(format!("git diff (bulk) failed: {err}"));
+                return BTreeMap::new();
+            }
+        };
+        split_unified_patch(&output.stdout, files, max_bytes)
     }
 
     fn patch_file(
@@ -1894,6 +1963,83 @@ fn parse_count(value: &str) -> u64 {
     } else {
         value.parse().unwrap_or(0)
     }
+}
+
+/// Split combined `git diff --patch` output into per-file slices. The
+/// stream looks like:
+///
+/// ```text
+/// diff --git a/foo b/foo
+/// index ...
+/// --- a/foo
+/// +++ b/foo
+/// @@ ...
+/// diff --git a/bar b/bar
+/// ...
+/// ```
+///
+/// Each `diff --git a/<path> b/<path>` line opens a new file section
+/// that runs until the next such line (or EOF). We match the trailing
+/// `b/<path>` against `expected_files` so paths with embedded spaces
+/// still resolve correctly — git omits the trailing whitespace.
+fn split_unified_patch(
+    bytes: &[u8],
+    expected_files: &[String],
+    max_bytes: usize,
+) -> BTreeMap<String, Patch> {
+    let text = String::from_utf8_lossy(bytes);
+    let expected: BTreeSet<&str> = expected_files.iter().map(String::as_str).collect();
+    let mut out: BTreeMap<String, Patch> = BTreeMap::new();
+    let mut current_path: Option<String> = None;
+    let mut buffer = String::new();
+    let flush = |path: Option<String>, buffer: &mut String, out: &mut BTreeMap<String, Patch>| {
+        if let Some(path) = path {
+            let truncated = buffer.len() > max_bytes;
+            let text = if truncated {
+                buffer[..max_bytes].to_string()
+            } else {
+                std::mem::take(buffer)
+            };
+            out.insert(path, Patch { text, truncated });
+        }
+        buffer.clear();
+    };
+    for line in text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git a/")
+            && let Some(path) = extract_diff_git_path(rest, &expected)
+        {
+            flush(current_path.take(), &mut buffer, &mut out);
+            current_path = Some(path);
+        }
+        buffer.push_str(line);
+    }
+    flush(current_path, &mut buffer, &mut out);
+    out
+}
+
+/// Extract the `b/<path>` half of a `diff --git a/<path> b/<path>` line,
+/// matching against the known file list to handle paths with embedded
+/// spaces. The input is the suffix that follows `diff --git a/`.
+fn extract_diff_git_path<'a>(suffix: &'a str, expected: &BTreeSet<&'a str>) -> Option<String> {
+    let trimmed = suffix.trim_end_matches('\n').trim_end_matches('\r');
+    // The canonical no-spaces form: `<path> b/<path>`. Try it first.
+    if let Some(idx) = trimmed.find(" b/") {
+        let candidate = &trimmed[..idx];
+        if expected.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    // Fallback for paths with spaces: scan every ` b/<known-path>` suffix.
+    for path in expected {
+        let needle = format!(" b/{path}");
+        if trimmed.ends_with(&needle) {
+            let prefix_len = trimmed.len() - needle.len();
+            if trimmed[..prefix_len] == *path.to_string() {
+                return Some((*path).to_string());
+            }
+        }
+    }
+    None
 }
 
 fn capped_patch(bytes: Vec<u8>, max_bytes: usize) -> Patch {
