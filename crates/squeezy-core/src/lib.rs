@@ -177,6 +177,20 @@ pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
 /// When strategy = LayeredFallback, model-assist only kicks in once the
 /// dropped slice exceeds this many tokens; smaller slices stay extractive.
 pub const DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS: u32 = 4_000;
+/// Mid-tier micro-compaction fires below the full-compaction threshold so
+/// the heavy tool-result bodies are reclaimed before the all-or-nothing
+/// summary head replaces the older slice. 60% leaves a 20-percentage-point
+/// band between micro and the 80% full-compaction default, which is the
+/// span where local tool clearing has the highest leverage (one large
+/// `read_file` or `shell` output dwarfs a few text messages).
+pub const DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT: u8 = 60;
+/// Keep this many newest compactable tool results verbatim during
+/// micro-compaction; older results are rewritten to a placeholder. 5
+/// matches clear-code's `TIME_BASED_MC_CONFIG_DEFAULTS.keepRecent`
+/// (`src/services/compact/timeBasedMCConfig.ts:33`), which is enough to
+/// resolve typical "what did the last read of foo.rs show?" follow-ups
+/// without forcing a re-read.
+pub const DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT: usize = 5;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// Tools whose full JSON schema is always sent up-front in every request,
 /// independent of `[tools].lazy_schema_loading`.
@@ -875,9 +889,21 @@ impl AppConfig {
             self.context_compaction.model_assisted_timeout_secs
         ));
         output.push_str(&format!(
-            "layered_fallback_extractive_threshold_tokens = {}\n\n",
+            "layered_fallback_extractive_threshold_tokens = {}\n",
             self.context_compaction
                 .layered_fallback_extractive_threshold_tokens
+        ));
+        output.push_str(&format!(
+            "micro_compaction_enabled = {}\n",
+            self.context_compaction.micro_compaction_enabled
+        ));
+        output.push_str(&format!(
+            "micro_compaction_threshold_percent = {}\n",
+            self.context_compaction.micro_compaction_threshold_percent
+        ));
+        output.push_str(&format!(
+            "micro_compaction_keep_recent = {}\n\n",
+            self.context_compaction.micro_compaction_keep_recent
         ));
 
         output.push_str("[subagents]\n");
@@ -2875,6 +2901,9 @@ pub struct ContextCompactionSettings {
     pub model_assisted_max_output_tokens: Option<u32>,
     pub model_assisted_timeout_secs: Option<u64>,
     pub layered_fallback_extractive_threshold_tokens: Option<u32>,
+    pub micro_compaction_enabled: Option<bool>,
+    pub micro_compaction_threshold_percent: Option<u8>,
+    pub micro_compaction_keep_recent: Option<usize>,
 }
 
 impl ContextCompactionSettings {
@@ -2897,6 +2926,9 @@ impl ContextCompactionSettings {
                 "model_assisted_max_output_tokens",
                 "model_assisted_timeout_secs",
                 "layered_fallback_extractive_threshold_tokens",
+                "micro_compaction_enabled",
+                "micro_compaction_threshold_percent",
+                "micro_compaction_keep_recent",
             ],
             source,
             path,
@@ -2998,6 +3030,24 @@ impl ContextCompactionSettings {
                 source,
                 &field(path, "layered_fallback_extractive_threshold_tokens"),
             )?,
+            micro_compaction_enabled: bool_value(
+                table,
+                "micro_compaction_enabled",
+                source,
+                &field(path, "micro_compaction_enabled"),
+            )?,
+            micro_compaction_threshold_percent: u8_value(
+                table,
+                "micro_compaction_threshold_percent",
+                source,
+                &field(path, "micro_compaction_threshold_percent"),
+            )?,
+            micro_compaction_keep_recent: usize_value(
+                table,
+                "micro_compaction_keep_recent",
+                source,
+                &field(path, "micro_compaction_keep_recent"),
+            )?,
         })
     }
 
@@ -3034,6 +3084,18 @@ impl ContextCompactionSettings {
         replace_if_some(
             &mut self.layered_fallback_extractive_threshold_tokens,
             next.layered_fallback_extractive_threshold_tokens,
+        );
+        replace_if_some(
+            &mut self.micro_compaction_enabled,
+            next.micro_compaction_enabled,
+        );
+        replace_if_some(
+            &mut self.micro_compaction_threshold_percent,
+            next.micro_compaction_threshold_percent,
+        );
+        replace_if_some(
+            &mut self.micro_compaction_keep_recent,
+            next.micro_compaction_keep_recent,
         );
     }
 }
@@ -3304,6 +3366,19 @@ pub struct ContextCompactionConfig {
     pub model_assisted_max_output_tokens: u32,
     pub model_assisted_timeout_secs: u64,
     pub layered_fallback_extractive_threshold_tokens: u32,
+    /// Master switch for the mid-tier "micro" compaction pass. When true
+    /// and `enabled_mid_turn` is also true, the agent attempts to clear
+    /// older `FunctionCallOutput` payloads in place before falling
+    /// through to full compaction. Disabled callers go straight from
+    /// no-op to full compaction.
+    pub micro_compaction_enabled: bool,
+    /// Token-window fraction (0..=100) at which micro-compaction fires.
+    /// Should sit below `threshold_percent` so micro reclaims tool-output
+    /// bytes before the full tier's all-or-nothing summary kicks in.
+    pub micro_compaction_threshold_percent: u8,
+    /// Keep this many newest compactable tool results verbatim; older
+    /// results are rewritten to a structured placeholder.
+    pub micro_compaction_keep_recent: usize,
 }
 
 impl ContextCompactionConfig {
@@ -3395,6 +3470,23 @@ impl ContextCompactionConfig {
             .and_then(|raw| raw.parse::<u32>().ok())
             .or(settings.layered_fallback_extractive_threshold_tokens)
             .unwrap_or(DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS),
+            micro_compaction_enabled: get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_ENABLED")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.micro_compaction_enabled.unwrap_or(true)),
+            micro_compaction_threshold_percent: clamp_percent(
+                get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT")
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<u8>().ok())
+                    .or(settings.micro_compaction_threshold_percent)
+                    .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT),
+            ),
+            micro_compaction_keep_recent: parse_usize(
+                get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_KEEP_RECENT"),
+                settings
+                    .micro_compaction_keep_recent
+                    .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT),
+            ),
         }
     }
 }
@@ -3423,6 +3515,9 @@ impl Default for ContextCompactionConfig {
             model_assisted_timeout_secs: DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
             layered_fallback_extractive_threshold_tokens:
                 DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+            micro_compaction_enabled: true,
+            micro_compaction_threshold_percent: DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT,
+            micro_compaction_keep_recent: DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT,
         }
     }
 }

@@ -66,6 +66,7 @@ mod cancel;
 mod context_compaction;
 mod cost_broker;
 mod exploration_compiler;
+mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
 mod roles;
@@ -80,6 +81,7 @@ use context_compaction::{
 use context_compaction::{build_compaction_summary, compact_conversation};
 use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+use micro_compaction::maybe_micro_compact_mid_turn;
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -4577,13 +4579,54 @@ impl TurnRuntime {
             // gate will trip; PostCompact carries the report's
             // before/after counts when the rewrite landed.
             let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
+            // Mid-tier micro-compaction (F12-cc-microcompaction): rewrite
+            // older `FunctionCallOutput` payloads in place before falling
+            // through to the all-or-nothing full tier. When the
+            // micro-threshold sits below the full-compaction threshold a
+            // successful micro pass can keep the conversation under the
+            // full gate, preserving per-turn tool-call structure. Pass the
+            // provider-reported total when we have one so the gate matches
+            // what the model actually saw.
+            let micro_report = maybe_micro_compact_mid_turn(
+                &mut conversation,
+                &self.config,
+                mid_turn_observed_tokens,
+            );
+            if let Some(report) = micro_report.as_ref() {
+                self.log_event(
+                    "context_micro_compacted",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "mid-turn micro-compaction cleared {} tool outputs, freed {} bytes",
+                        report.cleared_call_ids.len(),
+                        report.bytes_saved,
+                    )),
+                    json!({
+                        "cleared_call_ids": &report.cleared_call_ids,
+                        "bytes_saved": report.bytes_saved,
+                        "before_estimated_tokens": report.before_estimated_tokens,
+                        "after_estimated_tokens": report.after_estimated_tokens,
+                        "phase": "mid_turn",
+                    }),
+                );
+            }
+            // After a micro pass the conversation is smaller; the
+            // provider-reported total reflects the pre-rewrite payload
+            // size and would over-fire the full-tier gate. Switch to the
+            // local estimate so full only fires if micro alone was not
+            // enough.
+            let full_gate_observed_tokens = if micro_report.is_some() {
+                Some(estimate_context(&conversation).estimated_tokens)
+            } else {
+                mid_turn_observed_tokens
+            };
             let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
                 &self.config,
                 &conversation,
-                mid_turn_observed_tokens,
+                full_gate_observed_tokens,
             );
             if mid_turn_compaction_likely {
-                let pre_estimate = mid_turn_observed_tokens
+                let pre_estimate = full_gate_observed_tokens
                     .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
                 self.dispatch_pre_compact(pre_estimate);
             }
@@ -4593,9 +4636,12 @@ impl TurnRuntime {
                 &active_attachments,
                 self.store.as_deref(),
                 &self.config,
-                mid_turn_observed_tokens,
+                full_gate_observed_tokens,
             );
-            let mid_turn_compacted = mid_turn_report.is_some();
+            // Either tier mutates `conversation`, so the response-id reuse
+            // path must invalidate the cached id and resend the full
+            // conversation instead of the per-round outputs.
+            let mid_turn_compacted = mid_turn_report.is_some() || micro_report.is_some();
             if let Some(report) = mid_turn_report {
                 self.dispatch_post_compact(
                     report.record.before.estimated_tokens,
