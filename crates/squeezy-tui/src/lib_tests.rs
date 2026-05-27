@@ -2473,11 +2473,12 @@ async fn slash_fork_branches_into_sibling_session_with_same_transcript() {
     );
     // Visible transcript stays in place — the new session inherits the
     // existing turns rather than the user losing their context. The fork
-    // pushes one announcement on top, so the new length is `before + 1`.
+    // pushes a slash-command echo plus the announcement, so the new
+    // length is `before + 2`.
     assert_eq!(
         app.transcript.len(),
-        transcript_before + 1,
-        "fork preserves prior entries and adds exactly the announcement",
+        transcript_before + 2,
+        "fork preserves prior entries and adds the slash echo plus the announcement",
     );
     let announce = last_message_content(&app).expect("fork announcement");
     assert!(

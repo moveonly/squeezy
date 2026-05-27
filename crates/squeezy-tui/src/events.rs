@@ -564,6 +564,34 @@ pub(crate) fn drain_job_events(app: &mut TuiApp) {
     }
 }
 
+/// Poll the in-flight `/diff` snapshot (if any). The snapshot runs on a
+/// blocking task pool because `vcs.snapshot()` shells out to git; the
+/// result lands here so the diff card / log lines push into the
+/// transcript on the same frame the receiver completes.
+pub(crate) fn drain_pending_diff(app: &mut TuiApp) {
+    let Some(rx) = app.pending_diff.as_mut() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(result) => {
+            app.pending_diff = None;
+            for line in result.logs {
+                app.push_log(line);
+            }
+            if let Some(card) = result.card {
+                app.push_diff_card(card);
+            }
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            app.pending_diff = None;
+            app.push_log("/diff: background snapshot task aborted".to_string());
+            app.needs_redraw = true;
+        }
+    }
+}
+
 pub(crate) fn apply_job_update(app: &mut TuiApp, job: JobSnapshot) {
     app.jobs.insert(job.id, job);
     prune_tui_jobs(&mut app.jobs);

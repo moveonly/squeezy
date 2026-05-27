@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -78,7 +78,7 @@ pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
-pub(crate) use events::{drain_agent_events, drain_job_events};
+pub(crate) use events::{drain_agent_events, drain_job_events, drain_pending_diff};
 #[cfg(test)]
 pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
@@ -424,6 +424,7 @@ async fn run_inner(
         // therefore coalesces into a single frame.
         drain_job_events(&mut app);
         drain_agent_events(&mut app).await;
+        drain_pending_diff(&mut app);
 
         app.animation_tick = app.animation_tick.wrapping_add(1);
         if app.app_notifications.tick() {
@@ -1474,6 +1475,27 @@ fn save_status_line(
     }
 }
 
+/// Whether the transcript should show a styled banner for this slash
+/// command's invocation. Commands that open their own UI overlay
+/// (`/config`, `/statusline`, …) are silenced — the overlay is the
+/// affordance. Commands that route through `start_user_turn` and
+/// already produce a user-message bubble (`/help`) are also silenced
+/// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
+/// when called bare but silently apply a value when given an arg —
+/// echo only the second form. Unrecognized commands are not echoed:
+/// they fall through to be sent as regular user prompts.
+fn should_echo_slash_command(command: &str, rest: &str) -> bool {
+    if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
+        return false;
+    }
+    match command {
+        "/config" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
+        | "/expand" | "/help" => false,
+        "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
+        _ => true,
+    }
+}
+
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let mut parts = input.split_whitespace();
     let Some(command) = parts.next() else {
@@ -1489,6 +1511,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     {
         app.status = format!("{command} unavailable during turn");
         return true;
+    }
+    if should_echo_slash_command(command, rest) {
+        app.push_slash_command_echo(input);
     }
     match command {
         "/config" => {
@@ -2455,8 +2480,8 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         "selected" => app
             .selected_entry
             .and_then(|index| app.transcript.get(index))
-            .or_else(|| app.transcript.last()),
-        "last" => app.transcript.last(),
+            .or_else(|| last_pinnable_entry(app)),
+        "last" => last_pinnable_entry(app),
         _ => return PinSourceResult::UnknownTarget,
     };
     match entry {
@@ -2466,6 +2491,13 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         }
         None => PinSourceResult::NoEntry,
     }
+}
+
+fn last_pinnable_entry(app: &TuiApp) -> Option<&TranscriptEntry> {
+    app.transcript
+        .iter()
+        .rev()
+        .find(|entry| !matches!(entry.kind, TranscriptEntryKind::SlashEcho(_)))
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
@@ -3994,7 +4026,14 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// actionable to show. Returns `None` when the spinner alone suffices —
 /// keeps the working cell single-row in the common case.
 fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
-    // Highest priority: MCP startup in progress.
+    // Highest priority: a `/diff` snapshot is running on the blocking
+    // pool. The user typed `/diff` and is waiting for git to finish.
+    if app.pending_diff.is_some() {
+        return Some(Line::from(Span::styled(
+            "    ↳ computing diff…",
+            Style::default().fg(QUIET),
+        )));
+    }
     if let Some(snapshot) = app.mcp_status.as_ref() {
         let mut starting = 0usize;
         let mut total = 0usize;
@@ -4033,6 +4072,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
 fn turn_in_progress(app: &TuiApp) -> bool {
     app.turn_rx.is_some()
         || app.cancel.is_some()
+        || app.pending_diff.is_some()
         || (app.last_turn_duration.is_none()
             && app
                 .task_state
@@ -4335,6 +4375,7 @@ fn format_transcript_entry_expanded(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
 }
 
@@ -4631,7 +4672,28 @@ fn format_transcript_entry_with_width(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
+}
+
+fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let mut spans = vec![
+        Span::raw(marker),
+        Span::styled(
+            "›  ",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            data.cmd.clone(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !data.args.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(data.args.clone(), Style::default().fg(QUIET)));
+    }
+    Line::from(spans)
 }
 
 fn format_plan_card_entry(
@@ -4654,12 +4716,33 @@ fn format_plan_card_entry(
 /// `disable_output_cap` UX — never truncated, always renderable via the
 /// existing `render::diff` helpers.
 fn handle_slash_diff(app: &mut TuiApp) {
+    if app.pending_diff.is_some() {
+        app.push_log("/diff: already computing — please wait".to_string());
+        return;
+    }
     let workspace_root = app.workspace_root.clone();
-    let vcs = match GitVcs::open(&workspace_root) {
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let result = compute_diff_snapshot(&workspace_root);
+        let _ = tx.send(result);
+    });
+    app.pending_diff = Some(rx);
+    app.needs_redraw = true;
+}
+
+/// Synchronous diff snapshot used by the background task. Returns either
+/// a renderable card or a list of log lines (errors / "no changes" /
+/// "not a git repo"). Kept off the input thread because `vcs.snapshot()`
+/// shells out to `git status` + `git diff` and iterates every changed
+/// file — fine for a background worker, fatal for the UI thread.
+fn compute_diff_snapshot(workspace_root: &Path) -> PendingDiffResult {
+    let vcs = match GitVcs::open(workspace_root) {
         Ok(vcs) => vcs,
         Err(err) => {
-            app.push_log(format!("/diff failed to open workspace VCS: {err}"));
-            return;
+            return PendingDiffResult {
+                logs: vec![format!("/diff failed to open workspace VCS: {err}")],
+                card: None,
+            };
         }
     };
     let snapshot = vcs.snapshot(
@@ -4670,20 +4753,24 @@ fn handle_slash_diff(app: &mut TuiApp) {
         },
     );
     if snapshot.vcs.kind != VcsKind::Git {
-        app.push_log("/diff: workspace is not a git repository".to_string());
-        return;
+        return PendingDiffResult {
+            logs: vec!["/diff: workspace is not a git repository".to_string()],
+            card: None,
+        };
     }
-    if !snapshot.errors.is_empty() {
-        for error in &snapshot.errors {
-            app.push_log(format!("/diff git error: {error}"));
-        }
-    }
+    let mut logs: Vec<String> = snapshot
+        .errors
+        .iter()
+        .map(|e| format!("/diff git error: {e}"))
+        .collect();
     if snapshot.files.is_empty() {
-        app.push_log("/diff: no uncommitted changes".to_string());
-        return;
+        logs.push("/diff: no uncommitted changes".to_string());
+        return PendingDiffResult { logs, card: None };
     }
-    let card = build_diff_card(&snapshot);
-    app.push_diff_card(card);
+    PendingDiffResult {
+        logs,
+        card: Some(build_diff_card(&snapshot)),
+    }
 }
 
 /// Build a renderable diff card from a worktree snapshot. Files are
@@ -8709,6 +8796,18 @@ pub(crate) struct TuiApp {
     /// here and `handle_key` consults it before dispatching to the
     /// legacy hardcoded handlers.
     pub(crate) keymap: keymap::KeymapResolver,
+    /// In-flight `/diff` snapshot work. `vcs.snapshot()` shells out to
+    /// blocking git subprocesses and iterates every changed file, which
+    /// can take seconds on a busy worktree. We offload it to
+    /// `spawn_blocking` and poll this receiver each frame so the input
+    /// loop stays responsive. Drives the working spinner while set.
+    pub(crate) pending_diff: Option<oneshot::Receiver<PendingDiffResult>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingDiffResult {
+    pub(crate) logs: Vec<String>,
+    pub(crate) card: Option<DiffCardData>,
 }
 
 impl TuiApp {
@@ -8868,6 +8967,7 @@ impl TuiApp {
             status_line_setup: None,
             latest_plan_progress: None,
             keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
+            pending_diff: None,
         }
     }
 
@@ -8945,6 +9045,7 @@ impl TuiApp {
     pub(crate) fn has_active_animation(&self) -> bool {
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
+            || self.pending_diff.is_some()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -9026,6 +9127,24 @@ impl TuiApp {
     pub(crate) fn push_diff_card(&mut self, data: DiffCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::diff_card(id, data));
+    }
+
+    /// Echo the slash command the user just ran into the transcript as a
+    /// styled banner. Used by commands that produce in-transcript output
+    /// (cards, logs) so the history retains the invocation that triggered
+    /// them. Skipped for commands that open their own UI overlay — the
+    /// overlay itself is the affordance.
+    pub(crate) fn push_slash_command_echo(&mut self, raw: &str) {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() {
+            return;
+        }
+        let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+            Some((cmd, args)) => (cmd.to_string(), args.trim().to_string()),
+            None => (trimmed.to_string(), String::new()),
+        };
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::slash_echo(id, SlashEchoData { cmd, args }));
     }
 
     pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
@@ -9143,6 +9262,14 @@ impl TranscriptEntry {
         }
     }
 
+    fn slash_echo(id: u64, data: SlashEchoData) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::SlashEcho(data),
+            collapsed: false,
+        }
+    }
+
     fn reasoning(
         id: u64,
         snapshot: squeezy_core::ReasoningSnapshot,
@@ -9168,6 +9295,7 @@ impl TranscriptEntry {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
                 TranscriptEntryKind::PlanCard(_) => true,
+                TranscriptEntryKind::SlashEcho(_) => true,
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
@@ -9207,6 +9335,14 @@ impl TranscriptEntry {
             TranscriptEntryKind::Reasoning(snapshot) => {
                 vec![format!("reasoning: {}", snapshot.display_text)]
             }
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                vec![format!("slash: {body}")]
+            }
         }
     }
 
@@ -9231,6 +9367,7 @@ impl TranscriptEntry {
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
             TranscriptEntryKind::Reasoning(_) => true,
+            TranscriptEntryKind::SlashEcho(_) => false,
         }
     }
 
@@ -9266,6 +9403,18 @@ impl TranscriptEntry {
                 snapshot.display_text.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                (
+                    "slash command".to_string(),
+                    body,
+                    format!("transcript:{}", self.id),
+                )
+            }
         }
     }
 }
@@ -9288,6 +9437,17 @@ enum TranscriptEntryKind {
     /// so each reasoning block becomes its own grey collapsible entry
     /// instead of being pinned to the next assistant message.
     Reasoning(Box<squeezy_core::ReasoningSnapshot>),
+    /// Echo of the slash command the user typed (e.g. `/diff`, `/plan rewrite foo`).
+    /// Renders as a one-line styled banner so the transcript history shows
+    /// the invocation that produced the next card / log entry. Inserted only
+    /// for commands that don't open their own UI overlay.
+    SlashEcho(SlashEchoData),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SlashEchoData {
+    pub(crate) cmd: String,
+    pub(crate) args: String,
 }
 
 /// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
