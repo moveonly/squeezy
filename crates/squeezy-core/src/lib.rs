@@ -109,6 +109,35 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
     )
 }
 
+/// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the
+/// provider-preferred full model ID. Mirrors clear-code's
+/// `getDefaultOpusModel` / `getDefaultSonnetModel` / `getDefaultHaikuModel`
+/// (`src/utils/model/model.ts:105-138`) so `squeezy --model opus` resolves to
+/// `claude-opus-4-7` on Anthropic instead of being sent verbatim and 404-ing
+/// downstream. Lookup is case-insensitive on the alias. Returns `None` for
+/// inputs that don't match any alias, in which case callers should pass the
+/// string through unchanged (it's presumed to be a full model ID).
+pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> {
+    let normalized = alias.trim().to_ascii_lowercase();
+    match (provider, normalized.as_str()) {
+        ("anthropic", "opus") => Some(DEFAULT_ANTHROPIC_MODEL),
+        ("anthropic", "sonnet") => Some("claude-sonnet-4-6"),
+        ("anthropic", "haiku") => Some("claude-haiku-4-5-20251001"),
+        ("anthropic", "best") => Some(DEFAULT_ANTHROPIC_MODEL),
+        ("openai" | "azure_openai", "opus") => Some(DEFAULT_OPENAI_MODEL),
+        ("openai" | "azure_openai", "sonnet") => Some("gpt-5.4-mini"),
+        ("openai" | "azure_openai", "haiku") => Some("gpt-5.4-nano"),
+        ("openai" | "azure_openai", "best") => Some(DEFAULT_OPENAI_MODEL),
+        ("bedrock", "opus" | "best") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "haiku") => Some(DEFAULT_BEDROCK_MODEL),
+        ("google", "opus" | "best") => Some(DEFAULT_GOOGLE_MODEL),
+        ("google", "sonnet") => Some("gemini-2.5-flash"),
+        ("google", "haiku") => Some("gemini-2.5-flash-lite"),
+        _ => None,
+    }
+}
+
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
@@ -549,7 +578,7 @@ impl AppConfig {
             .as_deref()
             .and_then(ModelProfile::parse)
             .unwrap_or_default();
-        let model = get_var("SQUEEZY_MODEL")
+        let raw_model = get_var("SQUEEZY_MODEL")
             .or(model_settings.model)
             .or(settings.model)
             .filter(|value| !value.trim().is_empty())
@@ -558,6 +587,18 @@ impl AppConfig {
             .or(model_settings.small_fast_model.clone())
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        let provider_slug = match &provider {
+            ProviderConfig::OpenAi(_) => "openai",
+            ProviderConfig::Anthropic(_) => "anthropic",
+            ProviderConfig::Google(_) => "google",
+            ProviderConfig::AzureOpenAi(_) => "azure_openai",
+            ProviderConfig::Bedrock(_) => "bedrock",
+            ProviderConfig::Ollama(_) => "ollama",
+            ProviderConfig::OpenAiCompatible(_) => "",
+        };
+        let model = resolve_model_alias(provider_slug, &raw_model)
+            .map(str::to_string)
+            .unwrap_or(raw_model);
         let reasoning_effort = model_settings.reasoning_effort;
         let max_output_tokens = get_var("SQUEEZY_MAX_OUTPUT_TOKENS")
             .and_then(|value| value.parse::<u32>().ok())

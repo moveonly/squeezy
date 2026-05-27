@@ -473,3 +473,7 @@ fn estimate_text_tokens(text: &str, bytes_per_token: f64) -> u64 {
     let estimate = (bytes / bytes_per_token.max(0.1)).ceil() as u64;
     estimate.max(1)
 }
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod tests;

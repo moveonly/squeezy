@@ -847,6 +847,32 @@ fn config_can_select_azure_bedrock_and_ollama_defaults() {
 }
 
 #[test]
+fn config_resolves_opus_alias_to_full_id() {
+    let anthropic = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        "SQUEEZY_MODEL" => Some("opus".to_string()),
+        _ => None,
+    });
+    assert!(matches!(anthropic.provider, ProviderConfig::Anthropic(_)));
+    assert_eq!(anthropic.model, DEFAULT_ANTHROPIC_MODEL);
+
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        "SQUEEZY_MODEL" => Some("opus".to_string()),
+        _ => None,
+    });
+    assert_eq!(openai.model, DEFAULT_OPENAI_MODEL);
+
+    // Full IDs pass through untouched.
+    let passthrough = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        "SQUEEZY_MODEL" => Some("claude-sonnet-4-6".to_string()),
+        _ => None,
+    });
+    assert_eq!(passthrough.model, "claude-sonnet-4-6");
+}
+
+#[test]
 fn permission_mode_parses_expected_values() {
     assert_eq!(PermissionMode::parse("allow"), Some(PermissionMode::Allow));
     assert_eq!(PermissionMode::parse("ASK"), Some(PermissionMode::Ask));

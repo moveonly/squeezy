@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use squeezy_core::{
     AnthropicThinkingBlock, AnthropicThinkingKind, ReasoningKind, ReasoningPayload,
-    ReasoningSnapshot,
+    ReasoningSnapshot, resolve_model_alias,
 };
 use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
