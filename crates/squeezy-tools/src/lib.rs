@@ -70,7 +70,7 @@ use graph_tools::{
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
-    PlanPatchArgs, SearchReplaceFallback,
+    PlanPatchArgs, SearchReplaceFallback, render_apply_patch_diff, render_write_file_diff,
 };
 use schema::compact_tool_parameters;
 pub use shell::direct_user_shell_nonce;
@@ -1399,6 +1399,9 @@ impl ToolRegistry {
                         paths.join(", ")
                     },
                 );
+                if let Some(diff) = args.as_ref().and_then(render_apply_patch_diff) {
+                    metadata.insert("unified_diff".to_string(), diff);
+                }
                 for path in paths.iter().take(5) {
                     suggested_rules.push(PermissionRule::new(
                         "edit",
@@ -1420,6 +1423,12 @@ impl ToolRegistry {
                 let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
                 let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
+                if let Some(diff) = args
+                    .as_ref()
+                    .and_then(|args| render_write_file_diff(&args.path, &args.content))
+                {
+                    metadata.insert("unified_diff".to_string(), diff);
+                }
                 suggested_rules.push(PermissionRule::new(
                     "edit",
                     rule_target.clone(),

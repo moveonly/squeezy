@@ -98,18 +98,33 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
         .cloned()
         .or_else(|| permission.metadata.get("path").cloned())
         .unwrap_or_else(|| permission.target.clone());
-    for path in paths
+    let path_list: Vec<&str> = paths
         .split(['\n', ','])
-        .filter(|s| !s.trim().is_empty())
-        .take(4)
-    {
-        lines.push(plain_white(format!("✎ {}", path.trim())));
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    for path in path_list.iter().copied().take(4) {
+        lines.push(plain_white(format!("✎ {path}")));
     }
     if let Some(root) = permission.metadata.get("write_root") {
         lines.push(dim(format!("write root {root}")));
     }
     if let Some(diff_lines) = permission.metadata.get("diff_lines") {
         lines.push(dim(format!("{diff_lines} diff line(s)")));
+    }
+    if let Some(diff) = permission.metadata.get("unified_diff") {
+        let hint = path_list
+            .first()
+            .copied()
+            .and_then(crate::render::diff::language_hint_from_path)
+            .map(str::to_string);
+        let body = crate::render::diff::render_patch_full_lines(diff, hint.as_deref());
+        for mut line in body {
+            // Indent the diff body two spaces so it aligns with the other
+            // preview lines (`✎`, `context:`, `Allow Project:`).
+            line.spans.insert(0, Span::raw("  "));
+            lines.push(line);
+        }
     }
 }
 

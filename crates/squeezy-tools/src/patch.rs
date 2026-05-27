@@ -154,6 +154,130 @@ pub(crate) struct PostMoveReplace {
     pub(crate) allow_multiple: Option<bool>,
 }
 
+/// Maximum diff-body lines surfaced to the approval preview. Keeps the
+/// prompt area readable on small terminals; the user can always inspect
+/// the full patch via `/diff` after approval.
+pub(crate) const APPROVAL_DIFF_MAX_LINES: usize = 40;
+
+/// Render the `apply_patch` arguments as a unified-diff blob suitable for
+/// the approval preview's gutter+syntax-highlighted renderer.
+///
+/// The blob is a synthesised view: each search/replace pair becomes a
+/// hunk with `-` lines for the old text and `+` lines for the new text;
+/// `create_file` operations show as all-add; `delete_file` as all-delete;
+/// `move_file` becomes a header. The hunk header carries `1` for both
+/// sides because we have no real file state at approval time — the
+/// renderer's gutter still prints sequential numbers that mark *position
+/// within the proposed patch*, which is what the reviewer needs.
+pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
+    let mut out = String::new();
+    let mut remaining = APPROVAL_DIFF_MAX_LINES;
+    let mut emitted_any = false;
+    for patch in &args.patches {
+        if remaining == 0 {
+            break;
+        }
+        append_search_replace_hunk(
+            &mut out,
+            &patch.path,
+            &patch.search,
+            &patch.replace,
+            &mut remaining,
+        );
+        emitted_any = true;
+    }
+    for op in &args.operations {
+        if remaining == 0 {
+            break;
+        }
+        match op {
+            ApplyPatchOperation::SearchReplace {
+                path,
+                search,
+                replace,
+                ..
+            } => {
+                append_search_replace_hunk(&mut out, path, search, replace, &mut remaining);
+            }
+            ApplyPatchOperation::CreateFile { path, contents, .. } => {
+                append_create_or_delete_hunk(&mut out, path, contents, '+', &mut remaining);
+            }
+            ApplyPatchOperation::DeleteFile { path, .. } => {
+                append_create_or_delete_hunk(&mut out, path, "", '-', &mut remaining);
+            }
+            ApplyPatchOperation::MoveFile { from, to, .. } => {
+                out.push_str(&format!("--- a/{from}\n+++ b/{to}\n@@ -1 +1 @@\n"));
+            }
+        }
+        emitted_any = true;
+    }
+    if !emitted_any || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn append_search_replace_hunk(
+    out: &mut String,
+    path: &str,
+    search: &str,
+    replace: &str,
+    remaining: &mut usize,
+) {
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+    for line in search.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("-{line}\n"));
+        *remaining -= 1;
+    }
+    for line in replace.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("+{line}\n"));
+        *remaining -= 1;
+    }
+}
+
+fn append_create_or_delete_hunk(
+    out: &mut String,
+    path: &str,
+    contents: &str,
+    sign: char,
+    remaining: &mut usize,
+) {
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+    for line in contents.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("{sign}{line}\n"));
+        *remaining -= 1;
+    }
+}
+
+/// Render a `write_file` body as an all-add diff. We do not have the prior
+/// file contents at permission-evaluation time, so the preview shows the
+/// proposed contents with `+` gutter markers and the same syntax
+/// highlighting used by the worktree diff card.
+pub(crate) fn render_write_file_diff(path: &str, content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+    for (i, line) in content.lines().enumerate() {
+        if i >= APPROVAL_DIFF_MAX_LINES {
+            break;
+        }
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
 impl ToolRegistry {
     pub(crate) async fn execute_diff_context(&self, call: &ToolCall) -> ToolResult {
         let args = match serde_json::from_value::<DiffContextArgs>(call.arguments.clone()) {
