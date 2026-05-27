@@ -360,7 +360,7 @@ fn parser_surfaces_error_events() {
 #[test]
 fn parser_surfaces_incomplete_events() {
     let mut acc = ReasoningAccumulator::default();
-    let err = parse_openai_event(
+    let event = parse_openai_event(
         r#"{
           "type":"response.incomplete",
           "response":{
@@ -369,9 +369,17 @@ fn parser_surfaces_incomplete_events() {
         }"#,
         &mut acc,
     )
-    .expect_err("incomplete response is a stream error");
+    .expect("incomplete response normalises to Completed with StopReason::MaxTokens")
+    .expect("incomplete event must emit");
 
-    assert!(err.to_string().contains("max_output_tokens"));
+    match event {
+        LlmEvent::Completed { stop_reason, .. } => assert_eq!(
+            stop_reason,
+            Some(crate::StopReason::MaxTokens),
+            "max_output_tokens must surface as StopReason::MaxTokens",
+        ),
+        other => panic!("expected Completed event for incomplete response, got {other:?}"),
+    }
 }
 
 #[test]

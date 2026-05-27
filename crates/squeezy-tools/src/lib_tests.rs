@@ -6137,6 +6137,7 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "notebook_edit",
             "notes_recall",
             "notes_remember",
             "observations",
