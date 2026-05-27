@@ -7212,6 +7212,229 @@ async fn shell_result_records_implicit_skill_activation() {
     let _ = fs::remove_dir_all(root);
 }
 
+fn sample_notebook_bytes() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "cells": [
+            {
+                "cell_type": "code",
+                "id": "alpha",
+                "execution_count": 7,
+                "metadata": {},
+                "outputs": [{"output_type": "stream", "text": "stale\n"}],
+                "source": ["print('old')\n"]
+            },
+            {
+                "cell_type": "markdown",
+                "id": "beta",
+                "metadata": {},
+                "source": ["# heading\n"]
+            }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }))
+    .expect("notebook bytes")
+}
+#[tokio::test]
+async fn notebook_edit_resets_execution_count_for_code_cell() {
+    let root = temp_workspace("notebook_edit_code");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "nb_replace".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "new_source": "print('new')\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nb".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let alpha = &parsed["cells"][0];
+    assert_eq!(alpha["execution_count"], Value::Null);
+    assert_eq!(alpha["outputs"].as_array().expect("outputs").len(), 0);
+    assert_eq!(alpha["source"][0], "print('new')\n");
+    assert_eq!(result.content["edit"]["mode"], "replace");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_replaces_cell_by_id_preserves_outputs_array_for_markdown() {
+    let root = temp_workspace("notebook_edit_md");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_md".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "beta",
+                    "new_source": "# new heading\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let beta = &parsed["cells"][1];
+    // Markdown cells should NOT acquire execution_count/outputs fields.
+    assert!(beta.get("execution_count").is_none());
+    assert!(beta.get("outputs").is_none());
+    assert_eq!(beta["source"][0], "# new heading\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_inserts_new_cell_at_position() {
+    let root = temp_workspace("notebook_edit_insert");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_ins".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "edit_mode": "insert",
+                    "cell_type": "code",
+                    "new_source": "x = 1\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let cells = parsed["cells"].as_array().expect("cells");
+    assert_eq!(cells.len(), 3);
+    assert_eq!(cells[1]["cell_type"], "code");
+    assert_eq!(cells[1]["source"][0], "x = 1\n");
+    assert_eq!(cells[1]["execution_count"], Value::Null);
+    assert!(cells[1]["outputs"].as_array().expect("outputs").is_empty());
+    assert_eq!(result.content["edit"]["cell_index"], 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_deletes_cell_and_writes_valid_json() {
+    let root = temp_workspace("notebook_edit_delete");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_del".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "edit_mode": "delete",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let cells = parsed["cells"].as_array().expect("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0]["id"], "beta");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_refuses_ipynb_with_redirect_to_notebook_edit() {
+    let root = temp_workspace("apply_patch_ipynb");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_nb".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "nb.ipynb",
+                        "search": "old",
+                        "replace": "new",
+                        "expected_sha256": sha256_hex(&bytes),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["suggested_tool"], "notebook_edit");
+    // File untouched.
+    assert_eq!(fs::read(root.join("nb.ipynb")).unwrap(), bytes);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_refuses_ipynb_with_redirect_to_notebook_edit() {
+    let root = temp_workspace("write_file_ipynb");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "write_nb".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "content": "{}",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["suggested_tool"], "notebook_edit");
+    assert_eq!(fs::read(root.join("nb.ipynb")).unwrap(), bytes);
+    let _ = fs::remove_dir_all(root);
+}
+
 fn match_paths(result: &ToolResult) -> Vec<String> {
     result.content["matches"]
         .as_array()

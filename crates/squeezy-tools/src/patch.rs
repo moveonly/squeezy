@@ -626,6 +626,22 @@ impl ToolRegistry {
                 ApplyPatchOperation::MoveFile { from, to, .. } => vec![from.clone(), to.clone()],
             })
             .collect();
+        // Jupyter notebooks have JSON cell structure that text search/replace
+        // (and full overwrite) will silently corrupt. Redirect the model to
+        // `notebook_edit` rather than letting the patch land.
+        if let Some(bad) = touched_paths.iter().find(|p| is_notebook_path(p)) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "use notebook_edit for .ipynb files; apply_patch corrupts notebook JSON",
+                    "path": bad,
+                    "suggested_tool": "notebook_edit",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let patch_paths = normalized_path_set(&touched_paths);
         let locality = patch_locality_json(&patch_paths, &impact_paths);
         let warnings = patch_locality_warnings(&patch_paths, &impact_paths);
@@ -930,6 +946,16 @@ pub(crate) fn audit_delta_summary(entries: &[Value]) -> Vec<Value> {
             summary
         })
         .collect()
+}
+
+/// True when the path's lowercase extension is `.ipynb`. Used to route
+/// notebook edits to the dedicated `notebook_edit` tool from
+/// `apply_patch`/`write_file` so the JSON cell structure stays intact.
+pub(crate) fn is_notebook_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
 }
 
 pub(crate) fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {

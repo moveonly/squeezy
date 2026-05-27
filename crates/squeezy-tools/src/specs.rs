@@ -681,7 +681,7 @@ pub(crate) fn apply_patch_spec() -> ToolSpec {
 pub(crate) fn write_file_spec() -> ToolSpec {
     ToolSpec {
         name: "write_file".to_string(),
-        description: "Replace a workspace file with exact content. For existing files either pass expected_sha256 from read_file or rely on the most recent read_file/read_slice snapshot for the path; write_file refuses when the file has changed since that snapshot.".to_string(),
+        description: "Replace a workspace file with exact content. For existing files either pass expected_sha256 from read_file or rely on the most recent read_file/read_slice snapshot for the path; write_file refuses when the file has changed since that snapshot. For Jupyter notebooks (.ipynb) use notebook_edit instead so cell structure and outputs are preserved.".to_string(),
         capability: PermissionCapability::Edit,
         parameters: json!({
             "type": "object",
@@ -692,6 +692,27 @@ pub(crate) fn write_file_spec() -> ToolSpec {
                 "expected_sha256": {"type": "string", "description": "Optional sha256 of the current file content. When omitted for an existing file, write_file checks that the latest read_file/read_slice snapshot still matches on-disk content."}
             },
             "required": ["path", "content"]
+        }),
+    }
+}
+
+pub(crate) fn notebook_edit_spec() -> ToolSpec {
+    ToolSpec {
+        name: "notebook_edit".to_string(),
+        description: "Edit a single cell of a Jupyter notebook (.ipynb). Supports replace/insert/delete on cells located by id or by zero-based `cell-N` index. Code-cell modifications reset execution_count and outputs so the file stays consistent with what the model wrote.".to_string(),
+        capability: PermissionCapability::Edit,
+        parameters: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative path to a .ipynb file."},
+                "cell_id": {"type": "string", "description": "Target cell id; falls back to numeric `cell-N` index (0-based). Required for replace/delete; for insert it locates the anchor cell and the new cell is placed immediately after it (omit to prepend at index 0)."},
+                "new_source": {"type": "string", "description": "Replacement cell source for replace/insert. Ignored for delete."},
+                "cell_type": {"type": "string", "enum": ["code", "markdown"], "description": "Cell type. Required for insert; for replace, when provided it overrides the existing cell type."},
+                "edit_mode": {"type": "string", "enum": ["replace", "insert", "delete"], "description": "Edit mode. Default replace."},
+                "expected_sha256": {"type": "string", "description": "sha256 of the notebook file as currently on disk (from read_file)."}
+            },
+            "required": ["path", "expected_sha256"]
         }),
     }
 }

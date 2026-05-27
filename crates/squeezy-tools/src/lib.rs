@@ -71,7 +71,8 @@ use graph_tools::{
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
-    PlanPatchArgs, SearchReplaceFallback, render_apply_patch_diff, render_write_file_diff,
+    PlanPatchArgs, SearchReplaceFallback, is_notebook_path, render_apply_patch_diff,
+    render_write_file_diff,
 };
 pub use safety::{ShellPreClassification, pre_classify_shell};
 use schema::compact_tool_parameters;
@@ -95,8 +96,8 @@ use specs::{
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec,
-    read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
+    mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
+    plan_patch_spec, read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
     refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
     upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
@@ -1235,6 +1236,7 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            notebook_edit_spec(),
             plan_patch_spec(),
             read_file_spec(),
             read_slice_spec(),
@@ -1335,7 +1337,7 @@ impl ToolRegistry {
         }
         match call.name.as_str() {
             "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
-            "write_file" => PermissionScope::Edit,
+            "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
             "mcp_read_resource" => PermissionScope::Mcp,
@@ -1435,9 +1437,13 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::High,
             ),
-            "write_file" => {
-                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
-                let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
+            "write_file" | "notebook_edit" => {
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string();
                 let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
                 if let Some(diff) = args
@@ -2023,6 +2029,7 @@ impl ToolRegistry {
                         .await
                 }
                 "verify" => self.execute_verify(&call, cancel, &group_id).await,
+                "notebook_edit" => self.execute_notebook_edit(&call, &group_id).await,
                 "write_file" => self.execute_write_file(&call, &group_id).await,
                 "shell" => {
                     self.execute_shell(&call, cancel, &group_id, options.shell_ask_approver.clone())
@@ -3262,6 +3269,19 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        if is_notebook_path(&args.path) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "use notebook_edit for .ipynb files; write_file would replace the entire notebook JSON",
+                    "path": args.path,
+                    "suggested_tool": "notebook_edit",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
             return make_result(
                 call,
@@ -3350,6 +3370,161 @@ impl ToolRegistry {
             "before_sha256": before_sha256,
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            checkpoint_before.as_ref(),
+            call,
+            group_id,
+            ToolStatus::Success,
+            Vec::new(),
+        );
+        make_result(call, ToolStatus::Success, content, cost, Some(after_sha256))
+    }
+
+    async fn execute_notebook_edit(&self, call: &ToolCall, group_id: &str) -> ToolResult {
+        let args = match serde_json::from_value::<NotebookEditArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        if !is_notebook_path(&args.path) {
+            return tool_error(call, "notebook_edit only operates on .ipynb files");
+        }
+        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({
+                    "error": err.message(),
+                    "path": args.path,
+                    "reason": err.code(),
+                    "permission_denied": true,
+                    "policy_denied": true,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+        let path = match self.resolve_existing(&args.path) {
+            Ok(path) => path,
+            Err(err) => return tool_error(call, err),
+        };
+        let rel = self.relative(&path).to_string_lossy().to_string();
+        if is_secret_path(Path::new(&rel))
+            || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                .is_some()
+        {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({ "error": "refusing to edit a likely secret or protected metadata file" }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        let mode = args.edit_mode.unwrap_or_default();
+        let before = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => return tool_error(call, format!("failed to read notebook {rel}: {err}")),
+        };
+        let before_sha256 = sha256_hex(&before);
+        if args.expected_sha256 != before_sha256 {
+            return make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": "expected_sha256 does not match current file",
+                    "path": rel,
+                    "current_sha256": before_sha256,
+                }),
+                ToolCostHint::default(),
+                Some(before_sha256),
+            );
+        }
+        let mut notebook: Value = match serde_json::from_slice(&before) {
+            Ok(value) => value,
+            Err(err) => return tool_error(call, format!("notebook is not valid JSON: {err}")),
+        };
+        let Some(cells) = notebook.get_mut("cells").and_then(Value::as_array_mut) else {
+            return tool_error(call, "notebook missing a `cells` array");
+        };
+        let target_idx = match notebook_locate_cell(cells, args.cell_id.as_deref()) {
+            Ok(idx) => idx,
+            Err(err) => return tool_error(call, err),
+        };
+        let summary = match mode {
+            NotebookEditMode::Replace => {
+                let Some(idx) = target_idx else {
+                    return tool_error(call, "replace requires cell_id");
+                };
+                let new_source = args.new_source.unwrap_or_default();
+                let cell = &mut cells[idx];
+                if let Some(obj) = cell.as_object_mut() {
+                    if let Some(ct) = args.cell_type {
+                        obj.insert("cell_type".into(), Value::String(ct.as_str().into()));
+                    }
+                    obj.insert("source".into(), notebook_source_lines(&new_source));
+                }
+                notebook_reset_outputs(cell);
+                json!({"mode": "replace", "cell_index": idx})
+            }
+            NotebookEditMode::Insert => {
+                let Some(ct) = args.cell_type else {
+                    return tool_error(call, "insert requires cell_type");
+                };
+                let new_source = args.new_source.unwrap_or_default();
+                let insert_at = target_idx.map(|i| i + 1).unwrap_or(0);
+                let mut new_cell = json!({
+                    "cell_type": ct.as_str(),
+                    "metadata": {},
+                    "source": notebook_source_lines(&new_source),
+                });
+                notebook_reset_outputs(&mut new_cell);
+                cells.insert(insert_at, new_cell);
+                json!({"mode": "insert", "cell_index": insert_at})
+            }
+            NotebookEditMode::Delete => {
+                let Some(idx) = target_idx else {
+                    return tool_error(call, "delete requires cell_id");
+                };
+                cells.remove(idx);
+                json!({"mode": "delete", "cell_index": idx})
+            }
+        };
+
+        let checkpoint_before = match self.track_checkpoint_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
+        // Mirror Jupyter's default: single-space indent so per-cell diffs stay
+        // small. `to_vec_pretty` would default to four spaces.
+        let mut buf = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        if let Err(err) = notebook.serialize(&mut ser) {
+            return tool_error(call, format!("failed to serialise notebook: {err}"));
+        }
+        // Notebooks conventionally end with a trailing newline.
+        if buf.last() != Some(&b'\n') {
+            buf.push(b'\n');
+        }
+        if let Err(err) = fs::write(&path, &buf) {
+            return tool_error(call, err);
+        }
+        self.invalidate_diff_cache();
+        let after_sha256 = sha256_hex(&buf);
+        let cost = ToolCostHint {
+            bytes_read: before.len() as u64,
+            output_bytes: buf.len() as u64,
+            ..ToolCostHint::default()
+        };
+        let mut content = json!({
+            "path": rel,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": buf.len(),
+            "edit": summary,
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -3843,6 +4018,60 @@ struct ObservationsArgs {
     limit: Option<u32>,
 }
 
+/// Locate a notebook cell by its `id` or the `cell-N` numeric-index
+/// convention. `Ok(None)` means no id was supplied.
+fn notebook_locate_cell(
+    cells: &[Value],
+    cell_id: Option<&str>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(cell_id) = cell_id else {
+        return Ok(None);
+    };
+    if let Some((idx, _)) = cells.iter().enumerate().find(|(_, cell)| {
+        cell.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == cell_id)
+    }) {
+        return Ok(Some(idx));
+    }
+    if let Some(rest) = cell_id.strip_prefix("cell-")
+        && let Ok(idx) = rest.parse::<usize>()
+        && idx < cells.len()
+    {
+        return Ok(Some(idx));
+    }
+    Err(format!("cell_id {cell_id:?} not found"))
+}
+
+/// Emit a notebook cell `source` array of line-fragments (matches Jupyter's
+/// writer; keeps per-line diffs small).
+fn notebook_source_lines(source: &str) -> Value {
+    Value::Array(
+        source
+            .split_inclusive('\n')
+            .map(|line| Value::String(line.to_string()))
+            .collect(),
+    )
+}
+
+/// Code-cell modifications drop execution_count/outputs (the model has not
+/// run the new source); markdown cells must not carry those fields.
+fn notebook_reset_outputs(cell: &mut Value) {
+    let is_code = cell
+        .get("cell_type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "code");
+    if let Some(obj) = cell.as_object_mut() {
+        if is_code {
+            obj.insert("execution_count".to_string(), Value::Null);
+            obj.insert("outputs".to_string(), Value::Array(Vec::new()));
+        } else {
+            obj.remove("execution_count");
+            obj.remove("outputs");
+        }
+    }
+}
+
 fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "preference" => Some(ObservationKind::Preference),
@@ -3874,6 +4103,51 @@ struct WriteFileArgs {
     path: String,
     content: String,
     expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotebookEditArgs {
+    path: String,
+    #[serde(default)]
+    cell_id: Option<String>,
+    #[serde(default)]
+    new_source: Option<String>,
+    #[serde(default)]
+    cell_type: Option<NotebookCellType>,
+    #[serde(default)]
+    edit_mode: Option<NotebookEditMode>,
+    expected_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NotebookEditMode {
+    Replace,
+    Insert,
+    Delete,
+}
+
+impl Default for NotebookEditMode {
+    fn default() -> Self {
+        Self::Replace
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NotebookCellType {
+    Code,
+    Markdown,
+}
+
+impl NotebookCellType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Markdown => "markdown",
+        }
+    }
 }
 
 fn grep_include_ignored(arguments: &Value) -> bool {
