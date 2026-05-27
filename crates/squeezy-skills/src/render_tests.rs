@@ -1,5 +1,5 @@
 use super::*;
-use crate::{SkillSource, SkillSummary};
+use crate::{SkillContextMode, SkillSource, SkillSummary};
 use std::path::PathBuf;
 
 fn skill(name: &str, body: &str) -> LoadedSkill {
@@ -12,6 +12,7 @@ fn skill(name: &str, body: &str) -> LoadedSkill {
             location: PathBuf::from(format!(".squeezy/skills/{name}/SKILL.md")),
             disabled: false,
             manifest: None,
+            context_mode: SkillContextMode::Inline,
         },
         base_dir: PathBuf::from(format!(".squeezy/skills/{name}")),
         body: body.to_string(),

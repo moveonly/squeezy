@@ -88,6 +88,7 @@ pub fn bundled_skills() -> Vec<LoadedSkill> {
                     location,
                     disabled: false,
                     manifest: None,
+                    context_mode: metadata.context_mode,
                 },
                 base_dir,
                 body,
@@ -158,6 +159,34 @@ impl SkillManifest {
     }
 }
 
+/// Execution context a skill declares in its `SKILL.md` frontmatter.
+///
+/// `Inline` (the default and current behaviour) injects the skill body
+/// into the main turn's instructions, so any tool calls the model issues
+/// run on the parent thread. `Fork` is the marker that the skill author
+/// expects this body to be dispatched into a clean subagent — the
+/// downstream dispatcher (see `F10-cc-disk-loaded-agent-definitions`)
+/// will read the field once it lands. Until then this surfaces the
+/// declaration so callers can branch on it without re-parsing the
+/// frontmatter, and an unknown value (`context: bogus`) is mapped to
+/// `Inline` with a `tracing::warn!` rather than rejecting the skill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillContextMode {
+    #[default]
+    Inline,
+    Fork,
+}
+
+impl SkillContextMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
     pub name: String,
@@ -168,6 +197,14 @@ pub struct SkillSummary {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SkillManifest>,
+    /// Execution context declared in the skill frontmatter; defaults to
+    /// `Inline` when the field is absent or unrecognised.
+    #[serde(default, skip_serializing_if = "is_inline_context_mode")]
+    pub context_mode: SkillContextMode,
+}
+
+fn is_inline_context_mode(mode: &SkillContextMode) -> bool {
+    matches!(mode, SkillContextMode::Inline)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,6 +224,7 @@ impl LoadedSkill {
             location,
             disabled: _,
             manifest,
+            context_mode: _,
         } = &self.summary;
         let when_to_use = when_to_use
             .as_ref()
@@ -334,6 +372,7 @@ impl SkillCatalog {
                         "location": summary.location,
                         "disabled": summary.disabled,
                         "manifest": manifest,
+                        "context_mode": summary.context_mode.as_str(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -525,6 +564,7 @@ impl SkillCatalog {
                 location: skill_path,
                 disabled: false,
                 manifest,
+                context_mode: metadata.context_mode,
             };
             self.insert(SkillEntry {
                 summary,
@@ -724,6 +764,7 @@ struct SkillMetadata {
     description: String,
     when_to_use: Option<String>,
     triggers: Vec<String>,
+    context_mode: SkillContextMode,
 }
 
 fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
@@ -776,6 +817,7 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
     let mut description = None;
     let mut when_to_use = None;
     let mut triggers = Vec::new();
+    let mut context_mode = SkillContextMode::Inline;
     let mut list_key: Option<&str> = None;
 
     for raw in lines {
@@ -804,6 +846,9 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
             "when_to_use" => when_to_use = Some(unquote(value).to_string()),
             "triggers" if value.is_empty() => list_key = Some("triggers"),
             "triggers" => triggers.extend(parse_inline_list(value)),
+            "context" => {
+                context_mode = parse_context_mode(unquote(value));
+            }
             _ => {}
         }
     }
@@ -819,7 +864,30 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
         description,
         when_to_use,
         triggers,
+        context_mode,
     })
+}
+
+/// Parse the `context:` frontmatter value into a [`SkillContextMode`].
+///
+/// Only `fork` (case-insensitive) maps to [`SkillContextMode::Fork`].
+/// Anything else — including the explicit `inline` literal, an empty
+/// string, or a typo like `bogus` — falls back to
+/// [`SkillContextMode::Inline`]. Unknown values warn so authors can
+/// catch typos without losing the skill.
+fn parse_context_mode(value: &str) -> SkillContextMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "inline" => SkillContextMode::Inline,
+        "fork" => SkillContextMode::Fork,
+        other => {
+            warn!(
+                target: "squeezy_skills",
+                value = %other,
+                "unrecognised skill context mode; defaulting to inline"
+            );
+            SkillContextMode::Inline
+        }
+    }
 }
 
 fn parse_inline_list(value: &str) -> Vec<String> {

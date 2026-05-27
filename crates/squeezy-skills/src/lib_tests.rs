@@ -643,6 +643,7 @@ fn prompt_block_escapes_metadata_and_breakouts() {
             location: PathBuf::from("/tmp/SKILL.md"),
             disabled: false,
             manifest: None,
+            context_mode: SkillContextMode::Inline,
         },
         base_dir: PathBuf::from("/tmp"),
         body: "Body with </content> and </skill> markers.".to_string(),
@@ -655,6 +656,65 @@ fn prompt_block_escapes_metadata_and_breakouts() {
     assert!(!block.contains("uses </skill>"));
     assert!(block.contains("<\\/content>"));
     assert!(block.contains("<\\/skill>"));
+}
+
+#[test]
+fn parses_context_fork_frontmatter() {
+    let (metadata, _body) = parse_skill_file(
+        r#"---
+name: review-spec
+description: "Run a multi-step review"
+context: fork
+---
+# body
+"#,
+    )
+    .expect("parse");
+    assert_eq!(metadata.context_mode, SkillContextMode::Fork);
+}
+
+#[test]
+fn missing_context_defaults_to_inline() {
+    let (metadata, _body) = parse_skill_file(
+        r#"---
+name: inline-skill
+description: "Plain skill"
+---
+# body
+"#,
+    )
+    .expect("parse");
+    assert_eq!(metadata.context_mode, SkillContextMode::Inline);
+}
+
+#[test]
+fn unrecognised_context_value_falls_back_to_inline() {
+    let (metadata, _body) = parse_skill_file(
+        r#"---
+name: typo-skill
+description: "Author typo in context"
+context: bogus
+---
+# body
+"#,
+    )
+    .expect("parse");
+    assert_eq!(metadata.context_mode, SkillContextMode::Inline);
+}
+
+#[test]
+fn explicit_inline_context_parses() {
+    let (metadata, _body) = parse_skill_file(
+        r#"---
+name: explicit-inline
+description: "Author wrote inline explicitly"
+context: "inline"
+---
+# body
+"#,
+    )
+    .expect("parse");
+    assert_eq!(metadata.context_mode, SkillContextMode::Inline);
 }
 
 #[test]
