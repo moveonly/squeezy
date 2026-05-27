@@ -576,6 +576,8 @@ async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint(
         server_name: "sse-server".to_string(),
         elicitation_handler: Arc::new(Mutex::new(None)),
         pause_state: ElicitationPauseState::default(),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
     };
     let (auth_header, custom_headers) =
         resolve_http_auth_and_headers("sse-server", &server, |name| match name {
