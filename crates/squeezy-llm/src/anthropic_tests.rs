@@ -310,6 +310,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -360,6 +361,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);

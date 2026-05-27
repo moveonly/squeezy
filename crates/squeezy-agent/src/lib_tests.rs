@@ -3306,6 +3306,7 @@ async fn subagent_request_instructions_omit_agents_md() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_parent_omit_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Subagent round 1: end immediately with a short text answer.
@@ -3315,6 +3316,7 @@ async fn subagent_request_instructions_omit_agents_md() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_sub_omit_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Parent round 2: close the turn after consuming the subagent result.
@@ -3324,6 +3326,7 @@ async fn subagent_request_instructions_omit_agents_md() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_parent_omit_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3825,6 +3828,7 @@ async fn pretooluse_hook_denies_tool_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -3833,6 +3837,7 @@ async fn pretooluse_hook_denies_tool_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3904,6 +3909,7 @@ async fn pretooluse_hook_allow_lets_tool_run() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -3912,6 +3918,7 @@ async fn pretooluse_hook_allow_lets_tool_run() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));

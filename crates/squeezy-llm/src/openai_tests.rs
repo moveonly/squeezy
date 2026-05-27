@@ -620,6 +620,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         output_schema: None,
         parallel_tool_calls: Some(false),
         tool_choice: None,
+        beta_headers: Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -643,6 +644,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             output_schema: None,
             parallel_tool_calls: value,
             tool_choice: None,
+            beta_headers: Arc::from(Vec::new()),
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");

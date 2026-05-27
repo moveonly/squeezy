@@ -2108,6 +2108,7 @@ async fn silent_deny_omits_reason_from_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2116,6 +2117,7 @@ async fn silent_deny_omits_reason_from_tool_result() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2177,6 +2179,7 @@ async fn non_silent_deny_rule_still_carries_explanation_to_the_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2185,6 +2188,7 @@ async fn non_silent_deny_rule_still_carries_explanation_to_the_model() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2235,6 +2239,7 @@ async fn silent_deny_does_not_emit_approval_requested() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2243,6 +2248,7 @@ async fn silent_deny_does_not_emit_approval_requested() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));

@@ -99,6 +99,7 @@ fn ask_format_json_emits_one_object_per_line() {
         LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: squeezy_core::CostSnapshot::default(),
+            stop_reason: None,
         },
     ];
     let mut buf = String::new();

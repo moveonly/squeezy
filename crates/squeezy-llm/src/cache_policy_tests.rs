@@ -20,6 +20,7 @@ fn request_with_cache_key(model: &str, cache_key: Option<&str>) -> LlmRequest {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: Arc::from(Vec::new()),
     }
 }
 

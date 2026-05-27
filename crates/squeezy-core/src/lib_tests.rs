@@ -3046,6 +3046,18 @@ fn small_fast_model_reads_toml_setting() {
 [model]
 provider = "anthropic"
 small_fast_model = "claude-haiku-from-toml"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.small_fast_model.as_deref(),
+        Some("claude-haiku-from-toml")
+    );
+}
+
+#[test]
 fn config_rejects_http_base_url_for_non_loopback_host() {
     let settings = SettingsFile::from_toml_str(
         r#"
@@ -3058,12 +3070,6 @@ base_url = "http://attacker.example.com/v1"
         "test",
     )
     .expect("settings parse");
-    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
-    assert_eq!(
-        config.small_fast_model.as_deref(),
-        Some("claude-haiku-from-toml")
-    );
-
     let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
         .expect_err("non-loopback http base_url must be rejected");
     let msg = error.to_string();
