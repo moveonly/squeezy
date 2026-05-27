@@ -23,6 +23,10 @@ use crate::{
     log_session_event, tool_result_summary, unix_timestamp_millis,
 };
 
+#[cfg(test)]
+#[path = "context_compaction_tests.rs"]
+mod tests;
+
 // Compaction summary truncation budgets. These are character (not byte)
 // caps because they pass through `compact_text` → `truncate_chars`. They
 // stay collocated so a future audit can read the total summary growth
@@ -148,7 +152,25 @@ pub(crate) fn compact_conversation(
     let older = conversation[..split].to_vec();
     let recent = conversation[split..].to_vec();
     let generation = state.generation.saturating_add(1);
-    let summary = build_compaction_summary(generation, state, &older, attachments, store, config);
+    // Replace embedded base64 image/document data URIs in tool outputs
+    // with `[image]`/`[document]` markers before any summarizer (extractive
+    // or model-assisted) reads them. The summary feeds the model-assisted
+    // prompt at `compact_conversation_with_strategy`, and chains forward
+    // into the next compaction's `Previous compacted summary` block; a
+    // base64 PNG that survives `compact_text` truncation can otherwise
+    // bloat the summary chain and push the compaction API call itself
+    // toward prompt-too-long. The substitution is local to the summary
+    // input; the persisted `dropped` checkpoint still receives `older`
+    // verbatim so undo restores the original bytes.
+    let older_for_summary = strip_media_for_compaction(&older);
+    let summary = build_compaction_summary(
+        generation,
+        state,
+        &older_for_summary,
+        attachments,
+        store,
+        config,
+    );
     // `snap_compaction_split` handles *consecutive* leading orphan outputs,
     // but parallel tool calls produce a `[FC(A), FC(B), FCO(A), FCO(B)]`
     // shape. If the split lands between the two calls, snap stops at the
@@ -311,6 +333,135 @@ pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmI
         }
     }
     repaired
+}
+
+/// Substring marker the summarizer should see in place of a stripped
+/// image data URI. Mirrors clear-code's `'[image]'` token from
+/// `stripImagesFromMessages`.
+const IMAGE_DATA_URI_PLACEHOLDER: &str = "[image]";
+/// Same, for PDF or other document data URIs.
+const DOCUMENT_DATA_URI_PLACEHOLDER: &str = "[document]";
+/// Skip scanning outputs shorter than this. A real base64 data URI prefix
+/// (`data:image/png;base64,` alone is 22 bytes) cannot fit a meaningful
+/// payload below this threshold; scanning every short tool output would
+/// be pure overhead.
+const STRIP_MEDIA_MIN_LEN: usize = 100;
+
+/// Replace `data:image/<png|jpg|jpeg|gif|webp|bmp|svg+xml>;base64,...` and
+/// `data:application/pdf;base64,...` substrings inside every
+/// `FunctionCallOutput.output` with a short placeholder before the slice
+/// reaches a summarizer (extractive or model-assisted). Returns a fresh
+/// `Vec<LlmInputItem>`; the input is not mutated. Items other than
+/// `FunctionCallOutput` are cloned through unchanged.
+///
+/// The strip is prophylactic. Squeezy's `LlmInputItem` is text-only today,
+/// but Anthropic Vision, Gemini, and most MCP browser/screenshot tools
+/// deliver images on-wire as base64 data URIs inside a tool result string.
+/// Carrying that string through `build_compaction_summary` and onward to
+/// the model-assisted summarizer is the failure mode CC-1180 catalogues:
+/// the compaction request itself hits prompt-too-long because a 200-300 KB
+/// PNG was inlined verbatim. We strip before the summarizer reads.
+pub(crate) fn strip_media_for_compaction(items: &[LlmInputItem]) -> Vec<LlmInputItem> {
+    items
+        .iter()
+        .map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                if output.len() < STRIP_MEDIA_MIN_LEN {
+                    item.clone()
+                } else {
+                    LlmInputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: strip_media_data_uris(output),
+                    }
+                }
+            }
+            _ => item.clone(),
+        })
+        .collect()
+}
+
+/// Replace every `data:<mime>;base64,<payload>` substring in `text` with
+/// a short placeholder. The base64 payload is scanned greedily over the
+/// standard base64 alphabet (`A-Za-z0-9+/=`); the scan stops at the first
+/// character outside that alphabet, so trailing prose survives intact.
+fn strip_media_data_uris(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(prefix_end) = match_data_uri_prefix(bytes, i) {
+            let payload_end = scan_base64_payload(bytes, prefix_end);
+            // Pick the placeholder based on the MIME family. Anything not
+            // `application/...` is treated as an image-class media block;
+            // PDFs and other application/* documents are tagged separately
+            // so downstream summarisers can tell them apart.
+            let placeholder = if bytes[i..prefix_end].starts_with(b"data:application/") {
+                DOCUMENT_DATA_URI_PLACEHOLDER
+            } else {
+                IMAGE_DATA_URI_PLACEHOLDER
+            };
+            out.push_str(placeholder);
+            i = payload_end;
+        } else {
+            // Push a single UTF-8 char so we never split a multi-byte
+            // scalar. `bytes` is borrowed from `text`, so `text[i..]` is
+            // always at a valid char boundary on entry to this branch.
+            let ch = text[i..].chars().next().expect("non-empty remainder");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// If `bytes[start..]` begins with a `data:<mime>;base64,` prefix, return
+/// the index just past the comma; otherwise return `None`. The `<mime>`
+/// segment must be ASCII without whitespace and contain a `/`.
+fn match_data_uri_prefix(bytes: &[u8], start: usize) -> Option<usize> {
+    const HEAD: &[u8] = b"data:";
+    if !bytes[start..].starts_with(HEAD) {
+        return None;
+    }
+    let mut idx = start + HEAD.len();
+    let mut saw_slash = false;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b';' => break,
+            b'/' => {
+                saw_slash = true;
+                idx += 1;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') => {
+                idx += 1;
+            }
+            _ => return None,
+        }
+    }
+    if !saw_slash {
+        return None;
+    }
+    const TAIL: &[u8] = b";base64,";
+    if bytes[idx..].starts_with(TAIL) {
+        Some(idx + TAIL.len())
+    } else {
+        None
+    }
+}
+
+/// Advance past the base64 payload that follows a `;base64,` marker. The
+/// scan terminates at the first character outside the standard base64
+/// alphabet (`A-Za-z0-9+/=`) or at end-of-input.
+fn scan_base64_payload(bytes: &[u8], start: usize) -> usize {
+    let mut idx = start;
+    while idx < bytes.len() {
+        let c = bytes[idx];
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=') {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
 }
 
 pub(crate) fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
