@@ -112,6 +112,9 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
+pub const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
+pub const DEFAULT_PARALLEL_API_KEY_ENV: &str = "PARALLEL_API_KEY";
+pub const DEFAULT_WEBSEARCH_PROVIDER: &str = "exa";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<u32> = None;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
@@ -304,6 +307,11 @@ pub struct AppConfig {
     pub tool_output_retention_days: u64,
     pub exa_mcp_url: String,
     pub exa_api_key_env: String,
+    pub parallel_mcp_url: String,
+    pub parallel_api_key_env: String,
+    /// Websearch backend identifier; expected values are "exa" or "parallel".
+    /// Stored as a string so squeezy-core has no dependency on squeezy-tools.
+    pub websearch_provider: String,
     pub max_tool_calls_per_turn: u64,
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
@@ -584,6 +592,15 @@ impl AppConfig {
         let exa_api_key_env = get_var("SQUEEZY_EXA_API_KEY_ENV")
             .or(web.exa_api_key_env)
             .unwrap_or_else(|| DEFAULT_EXA_API_KEY_ENV.to_string());
+        let parallel_mcp_url = get_var("SQUEEZY_PARALLEL_MCP_URL")
+            .or(web.parallel_mcp_url)
+            .unwrap_or_else(|| DEFAULT_PARALLEL_MCP_URL.to_string());
+        let parallel_api_key_env = get_var("SQUEEZY_PARALLEL_API_KEY_ENV")
+            .or(web.parallel_api_key_env)
+            .unwrap_or_else(|| DEFAULT_PARALLEL_API_KEY_ENV.to_string());
+        let websearch_provider = get_var("SQUEEZY_WEBSEARCH_PROVIDER")
+            .or(web.websearch_provider)
+            .unwrap_or_else(|| DEFAULT_WEBSEARCH_PROVIDER.to_string());
         let requested_store_responses = get_var("SQUEEZY_STORE_RESPONSES")
             .as_deref()
             .map(parse_enabled_bool)
@@ -751,6 +768,9 @@ impl AppConfig {
             tool_output_retention_days,
             exa_mcp_url,
             exa_api_key_env,
+            parallel_mcp_url,
+            parallel_api_key_env,
+            websearch_provider,
             max_tool_calls_per_turn,
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
@@ -1216,10 +1236,19 @@ impl AppConfig {
 
         output.push_str("[web]\n");
         output.push_str(&format!(
+            "websearch_provider = {}\n",
+            toml_string(&self.websearch_provider)
+        ));
+        output.push_str(&format!(
             "exa_mcp_url = {}\n",
             toml_string(&self.exa_mcp_url)
         ));
-        output.push_str("exa_api_key_env = \"<redacted>\"\n\n");
+        output.push_str("exa_api_key_env = \"<redacted>\"\n");
+        output.push_str(&format!(
+            "parallel_mcp_url = {}\n",
+            toml_string(&self.parallel_mcp_url)
+        ));
+        output.push_str("parallel_api_key_env = \"<redacted>\"\n\n");
 
         output.push_str("[skills]\n");
         output.push_str(&format!(
@@ -5383,11 +5412,27 @@ const DEFAULT_REDACTION_PATTERNS: &[(&str, &str)] = &[
 pub struct WebSettings {
     pub exa_mcp_url: Option<String>,
     pub exa_api_key_env: Option<String>,
+    pub parallel_mcp_url: Option<String>,
+    pub parallel_api_key_env: Option<String>,
+    /// Pluggable websearch backend selector. Mirrors OpenCode's
+    /// `OPENCODE_WEBSEARCH_PROVIDER`; valid values: `exa`, `parallel`.
+    pub websearch_provider: Option<String>,
 }
 
 impl WebSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["exa_mcp_url", "exa_api_key_env"], source, path)?;
+        reject_unknown_keys(
+            table,
+            &[
+                "exa_mcp_url",
+                "exa_api_key_env",
+                "parallel_mcp_url",
+                "parallel_api_key_env",
+                "websearch_provider",
+            ],
+            source,
+            path,
+        )?;
         Ok(Self {
             exa_mcp_url: string_value(table, "exa_mcp_url", source, &field(path, "exa_mcp_url"))?,
             exa_api_key_env: string_value(
@@ -5396,12 +5441,33 @@ impl WebSettings {
                 source,
                 &field(path, "exa_api_key_env"),
             )?,
+            parallel_mcp_url: string_value(
+                table,
+                "parallel_mcp_url",
+                source,
+                &field(path, "parallel_mcp_url"),
+            )?,
+            parallel_api_key_env: string_value(
+                table,
+                "parallel_api_key_env",
+                source,
+                &field(path, "parallel_api_key_env"),
+            )?,
+            websearch_provider: string_value(
+                table,
+                "websearch_provider",
+                source,
+                &field(path, "websearch_provider"),
+            )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.exa_mcp_url, next.exa_mcp_url);
         replace_if_some(&mut self.exa_api_key_env, next.exa_api_key_env);
+        replace_if_some(&mut self.parallel_mcp_url, next.parallel_mcp_url);
+        replace_if_some(&mut self.parallel_api_key_env, next.parallel_api_key_env);
+        replace_if_some(&mut self.websearch_provider, next.websearch_provider);
     }
 }
 
@@ -6471,8 +6537,11 @@ pub fn user_settings_template() -> &'static str {
 # custom_patterns = []
 
 # [web]
+# websearch_provider = "exa"          # "exa" or "parallel"
 # exa_mcp_url = "https://mcp.exa.ai/mcp"
 # exa_api_key_env = "EXA_API_KEY"
+# parallel_mcp_url = "https://search.parallel.ai/mcp"
+# parallel_api_key_env = "PARALLEL_API_KEY"
 
 # [skills]
 # user_dir = "~/.squeezy/skills"

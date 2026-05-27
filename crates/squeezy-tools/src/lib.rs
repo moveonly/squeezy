@@ -116,6 +116,7 @@ use shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
 };
 use truncate::truncate_middle_bytes;
+pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
 pub(crate) use web::{
     MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, extract_http_urls, html_to_text,
@@ -514,33 +515,47 @@ impl ToolOutputConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebToolConfig {
+    pub provider: WebSearchProvider,
     pub exa_mcp_url: String,
     pub exa_api_key: Option<String>,
+    pub parallel_mcp_url: String,
+    pub parallel_api_key: Option<String>,
 }
 
 impl Default for WebToolConfig {
     fn default() -> Self {
         Self {
+            provider: WebSearchProvider::default(),
             exa_mcp_url: DEFAULT_EXA_MCP_URL.to_string(),
             exa_api_key: None,
+            parallel_mcp_url: DEFAULT_PARALLEL_MCP_URL.to_string(),
+            parallel_api_key: None,
         }
     }
 }
 
 impl WebToolConfig {
     fn normalized(self) -> Self {
-        let exa_mcp_url = self.exa_mcp_url.trim();
-        let exa_mcp_url = if exa_mcp_url.is_empty() {
-            DEFAULT_EXA_MCP_URL.to_string()
-        } else {
-            exa_mcp_url.to_string()
-        };
+        fn trimmed_or(value: &str, fallback: &str) -> String {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                fallback.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        fn trimmed_opt(value: Option<String>) -> Option<String> {
+            value.and_then(|raw| {
+                let raw = raw.trim().to_string();
+                (!raw.is_empty()).then_some(raw)
+            })
+        }
         Self {
-            exa_mcp_url,
-            exa_api_key: self.exa_api_key.and_then(|key| {
-                let key = key.trim();
-                (!key.is_empty()).then(|| key.to_string())
-            }),
+            provider: self.provider,
+            exa_mcp_url: trimmed_or(&self.exa_mcp_url, DEFAULT_EXA_MCP_URL),
+            exa_api_key: trimmed_opt(self.exa_api_key),
+            parallel_mcp_url: trimmed_or(&self.parallel_mcp_url, DEFAULT_PARALLEL_MCP_URL),
+            parallel_api_key: trimmed_opt(self.parallel_api_key),
         }
     }
 }

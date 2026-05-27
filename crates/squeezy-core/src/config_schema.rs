@@ -14,15 +14,16 @@ use crate::{
     DEFAULT_FEEDBACK_ENDPOINT, DEFAULT_FEEDBACK_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
     DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
-    DEFAULT_OPENAI_MODEL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
-    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS, DEFAULT_SESSION_LOG_RETENTION_DAYS,
-    DEFAULT_SESSION_MAX_EVENT_BYTES, DEFAULT_SESSION_MAX_SESSION_BYTES,
-    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
-    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
-    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
-    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, OpenAiCompatiblePreset, PermissionMode,
-    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity,
-    ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    DEFAULT_OPENAI_MODEL, DEFAULT_PARALLEL_API_KEY_ENV, DEFAULT_PARALLEL_MCP_URL,
+    DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES, DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
+    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
+    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
+    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
+    DEFAULT_WEBSEARCH_PROVIDER, OpenAiCompatiblePreset, PermissionMode, ProviderConfig,
+    ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity, ToolOutputVerbosity,
+    TranscriptDefault, TuiAlternateScreen,
 };
 
 /// When a save takes effect.
@@ -1371,8 +1372,21 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
     ConfigSectionMeta {
         id: SectionId::Web,
         label: "Web",
-        description: "Exa web search and fetch",
+        description: "Pluggable websearch backend and fetch",
         fields: &[
+            FieldMeta {
+                label: "websearch_provider",
+                toml_path: &["web", "websearch_provider"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_websearch_provider,
+                set: set_websearch_provider,
+                default_display: DEFAULT_WEBSEARCH_PROVIDER,
+                default: || FieldValue::String(DEFAULT_WEBSEARCH_PROVIDER.to_string()),
+                help: "Websearch backend: \"exa\" or \"parallel\".",
+                env_override: Some("SQUEEZY_WEBSEARCH_PROVIDER"),
+                secret: false,
+            },
             FieldMeta {
                 label: "exa_mcp_url",
                 toml_path: &["web", "exa_mcp_url"],
@@ -1397,6 +1411,32 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 default: || FieldValue::String(DEFAULT_EXA_API_KEY_ENV.to_string()),
                 help: "Env var that holds the Exa API key. Use `squeezy auth set exa` to write the value.",
                 env_override: Some("SQUEEZY_EXA_API_KEY_ENV"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "parallel_mcp_url",
+                toml_path: &["web", "parallel_mcp_url"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_parallel_mcp_url,
+                set: set_parallel_mcp_url,
+                default_display: DEFAULT_PARALLEL_MCP_URL,
+                default: || FieldValue::String(DEFAULT_PARALLEL_MCP_URL.to_string()),
+                help: "Endpoint for the Parallel Search MCP web tool.",
+                env_override: Some("SQUEEZY_PARALLEL_MCP_URL"),
+                secret: false,
+            },
+            FieldMeta {
+                label: "parallel_api_key_env",
+                toml_path: &["web", "parallel_api_key_env"],
+                kind: FieldKind::String { multiline: false },
+                tier: ApplyTier::NextPrompt,
+                get: get_parallel_api_key_env,
+                set: set_parallel_api_key_env,
+                default_display: DEFAULT_PARALLEL_API_KEY_ENV,
+                default: || FieldValue::String(DEFAULT_PARALLEL_API_KEY_ENV.to_string()),
+                help: "Env var that holds the Parallel Search API key.",
+                env_override: Some("SQUEEZY_PARALLEL_API_KEY_ENV"),
                 secret: false,
             },
         ],
@@ -2401,6 +2441,52 @@ fn set_exa_api_key_env(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'s
             Ok(())
         }
         FieldValue::String(_) => Err("env var name cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_parallel_mcp_url(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.parallel_mcp_url.clone())
+}
+fn set_parallel_mcp_url(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.parallel_mcp_url = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("parallel_mcp_url cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_parallel_api_key_env(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.parallel_api_key_env.clone())
+}
+fn set_parallel_api_key_env(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) if !s.trim().is_empty() => {
+            cfg.parallel_api_key_env = s;
+            Ok(())
+        }
+        FieldValue::String(_) => Err("env var name cannot be empty"),
+        _ => Err("expects string"),
+    }
+}
+
+fn get_websearch_provider(cfg: &AppConfig) -> FieldValue {
+    FieldValue::String(cfg.websearch_provider.clone())
+}
+fn set_websearch_provider(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::String(s) => {
+            let trimmed = s.trim().to_ascii_lowercase();
+            if trimmed == "exa" || trimmed == "parallel" {
+                cfg.websearch_provider = trimmed;
+                Ok(())
+            } else {
+                Err("websearch_provider must be \"exa\" or \"parallel\"")
+            }
+        }
         _ => Err("expects string"),
     }
 }

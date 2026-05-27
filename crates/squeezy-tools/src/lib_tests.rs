@@ -4810,13 +4810,18 @@ fn unstructured_shape_dedupes_identical_signal_lines() {
 #[test]
 fn web_tool_config_normalizes_blank_values() {
     let config = WebToolConfig {
+        provider: WebSearchProvider::Exa,
         exa_mcp_url: "  ".to_string(),
         exa_api_key: Some("  secret-token  ".to_string()),
+        parallel_mcp_url: "  ".to_string(),
+        parallel_api_key: Some("  bearer  ".to_string()),
     }
     .normalized();
 
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key.as_deref(), Some("secret-token"));
+    assert_eq!(config.parallel_mcp_url, DEFAULT_PARALLEL_MCP_URL);
+    assert_eq!(config.parallel_api_key.as_deref(), Some("bearer"));
 }
 
 #[test]
@@ -4915,6 +4920,7 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
         WebToolConfig {
             exa_mcp_url: "https://search.example/mcp".to_string(),
             exa_api_key: Some("secret-token".to_string()),
+            ..WebToolConfig::default()
         },
         http.clone(),
     )
@@ -4954,6 +4960,58 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
         "rust async"
     );
     assert_eq!(requests[0].body["params"]["arguments"]["numResults"], 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_parallel_provider_dispatches_parallel_mcp_request() {
+    let root = temp_workspace("websearch_parallel");
+    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"parallel results"}]}}"#;
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response("application/json", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig {
+            provider: WebSearchProvider::Parallel,
+            parallel_mcp_url: "https://search.parallel.example/mcp".to_string(),
+            parallel_api_key: Some("parallel-token".to_string()),
+            ..WebToolConfig::default()
+        },
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_parallel".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust async"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["provider"], "parallel");
+    assert_eq!(result.content["result"], "parallel results");
+    let requests = http.post_requests.lock().expect("post requests");
+    assert_eq!(requests[0].url, "https://search.parallel.example/mcp");
+    assert!(requests[0].headers.contains(&(
+        "authorization".to_string(),
+        "Bearer parallel-token".to_string()
+    )));
+    assert_eq!(requests[0].body["params"]["name"], "web_search");
+    assert_eq!(
+        requests[0].body["params"]["arguments"]["objective"],
+        "rust async"
+    );
+    assert_eq!(
+        requests[0].body["params"]["arguments"]["search_queries"][0],
+        "rust async"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
