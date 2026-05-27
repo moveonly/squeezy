@@ -80,3 +80,67 @@ fn history_cell_trait_default_is_not_animating() {
     assert_eq!(cell.desired_height(80), 1);
     assert_eq!(cell.render(80).len(), 1);
 }
+
+#[test]
+fn history_cell_default_has_no_subscription() {
+    let cell = StubCell::new("plain");
+    assert!(cell.subscribe().is_none());
+}
+
+struct StreamingStubCell {
+    text: std::sync::Mutex<String>,
+    tx: tokio::sync::watch::Sender<()>,
+    rx: tokio::sync::watch::Receiver<()>,
+}
+
+impl StreamingStubCell {
+    fn new(text: &str) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(());
+        Self {
+            text: std::sync::Mutex::new(text.to_string()),
+            tx,
+            rx,
+        }
+    }
+
+    fn push_delta(&self, more: &str) {
+        self.text.lock().unwrap().push_str(more);
+        let _ = self.tx.send(());
+    }
+}
+
+impl HistoryCell for StreamingStubCell {
+    fn desired_height(&self, _width: u16) -> u16 {
+        1
+    }
+
+    fn render(&self, _width: u16) -> Vec<Line<'static>> {
+        vec![Line::from(self.text.lock().unwrap().clone())]
+    }
+
+    fn subscribe(&self) -> Option<HistoryCellUpdateStream> {
+        Some(self.rx.clone())
+    }
+}
+
+#[test]
+fn history_cell_subscription_ticks_on_source_change() {
+    let cell = StreamingStubCell::new("initial");
+    let mut rx = cell.subscribe().expect("streaming cell exposes a watcher");
+    rx.mark_unchanged();
+
+    cell.push_delta(" + delta");
+    assert!(
+        rx.has_changed().expect("watch sender still live"),
+        "subscription must signal a tick after push_delta"
+    );
+
+    let rendered = cell.render(80);
+    assert_eq!(rendered.len(), 1);
+    let row = rendered[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert_eq!(row, "initial + delta");
+}
