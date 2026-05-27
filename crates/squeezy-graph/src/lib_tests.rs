@@ -3545,10 +3545,7 @@ fn js_ts_namespace_import_lands_in_wildcard_aliased_bucket() {
         "package.json",
         r#"{"name":"ns-case","exports":{".":"./src/helpers.ts"}}"#,
     );
-    let helpers = ts_record(
-        "src/helpers.ts",
-        "export function helper() { return 1; }\n",
-    );
+    let helpers = ts_record("src/helpers.ts", "export function helper() { return 1; }\n");
     let app = ts_record(
         "src/app.ts",
         r#"

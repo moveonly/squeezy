@@ -4176,7 +4176,7 @@ impl TurnRuntime {
                 )),
                 store: self.config.store_responses,
                 output_schema: None,
-            parallel_tool_calls: None,
+                parallel_tool_calls: None,
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -4561,9 +4561,8 @@ impl TurnRuntime {
                 mid_turn_observed_tokens,
             );
             if mid_turn_compaction_likely {
-                let pre_estimate = mid_turn_observed_tokens.unwrap_or_else(|| {
-                    estimate_context(&conversation).estimated_tokens
-                });
+                let pre_estimate = mid_turn_observed_tokens
+                    .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
                 self.dispatch_pre_compact(pre_estimate);
             }
             let mid_turn_report = maybe_compact_mid_turn(
@@ -9549,8 +9548,8 @@ fn mid_turn_compaction_will_fire(
     let threshold = window
         .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
         .saturating_div(100);
-    let observed = last_total_tokens
-        .unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
+    let observed =
+        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
     observed >= threshold
 }
 

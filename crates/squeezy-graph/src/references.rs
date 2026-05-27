@@ -67,10 +67,7 @@ impl SemanticGraph {
             .get(&symbol.name)
             .map(|indexes| indexes.as_slice())
             .unwrap_or(&[]);
-        for index in by_target
-            .iter()
-            .chain(self.wildcard_aliased_imports.iter())
-        {
+        for index in by_target.iter().chain(self.wildcard_aliased_imports.iter()) {
             let Some(import) = self.imports.get(*index) else {
                 continue;
             };

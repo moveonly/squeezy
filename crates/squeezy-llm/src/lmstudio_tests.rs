@@ -100,7 +100,10 @@ fn parser_collects_text_deltas_into_completed() {
     )
     .expect("finish");
     // finish_reason with no pending tool calls drains nothing.
-    assert!(events.is_empty(), "finish reason emits no events on its own");
+    assert!(
+        events.is_empty(),
+        "finish reason emits no events on its own"
+    );
 
     let events = parse_chat_event("[DONE]", &mut state).expect("done");
     assert_eq!(events.len(), 1);
@@ -148,11 +151,8 @@ fn parser_accumulates_tool_call_arguments_across_deltas() {
 #[test]
 fn parser_surfaces_server_errors() {
     let mut state = StreamState::default();
-    let err = parse_chat_event(
-        r#"{"error":{"message":"model not loaded"}}"#,
-        &mut state,
-    )
-    .expect_err("error event");
+    let err = parse_chat_event(r#"{"error":{"message":"model not loaded"}}"#, &mut state)
+        .expect_err("error event");
     let SqueezyError::ProviderStream(message) = err else {
         panic!("expected ProviderStream");
     };

@@ -2156,10 +2156,7 @@ fn format_reviewer_command_lists_recent_decisions_newest_first() {
     let deny_idx = output.find("deny edit").expect("deny line present");
     let allow_idx = output.find("allow shell").expect("allow line present");
     assert!(deny_idx < allow_idx, "{output}");
-    assert!(
-        output.contains("target=path:secrets.env"),
-        "{output}"
-    );
+    assert!(output.contains("target=path:secrets.env"), "{output}");
     assert!(
         output.contains("reason: writing into protected secrets path"),
         "{output}"
@@ -4552,10 +4549,7 @@ fn working_cell_shows_current_tool() {
     let output = render_to_string(&app, 140, 16);
 
     assert!(output.contains("• Working ("), "{output}");
-    assert!(
-        output.contains("Shell: cargo test --workspace"),
-        "{output}"
-    );
+    assert!(output.contains("Shell: cargo test --workspace"), "{output}");
 }
 
 #[test]
@@ -4572,10 +4566,7 @@ fn working_cell_appends_per_tool_elapsed_after_heartbeat() {
 
     let output = render_to_string(&app, 140, 16);
 
-    assert!(
-        output.contains("Shell: cargo test --workspace"),
-        "{output}"
-    );
+    assert!(output.contains("Shell: cargo test --workspace"), "{output}");
     assert!(output.contains(" · 4s"), "{output}");
 }
 

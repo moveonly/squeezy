@@ -82,11 +82,17 @@ fn slash_commands_declare_expected_capabilities() {
     );
     assert_eq!(
         find_command("/undo").capabilities,
-        &[PermissionCapability::Edit, PermissionCapability::Destructive]
+        &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive
+        ]
     );
     assert_eq!(
         find_command("/revert-turn").capabilities,
-        &[PermissionCapability::Edit, PermissionCapability::Destructive]
+        &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive
+        ]
     );
 }
 

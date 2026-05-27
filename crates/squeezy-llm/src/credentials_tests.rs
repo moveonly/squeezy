@@ -123,7 +123,10 @@ fn delete_round_trips_with_set_table_entry() {
     .expect("set");
 
     let after_set = std::fs::read_to_string(&path).expect("read after set");
-    assert!(after_set.contains("api_key = \"sk-roundtrip\""), "{after_set}");
+    assert!(
+        after_set.contains("api_key = \"sk-roundtrip\""),
+        "{after_set}"
+    );
 
     // Stage 2: delete via the new helper.
     let removed = delete_api_key("openai", &scope).expect("delete");

@@ -120,10 +120,7 @@ pub fn delete_api_key(provider_section: &str, scope: &SettingsScope) -> Result<b
         },
     };
     let outcome = apply_edits(scope, &[edit]).map_err(|err| {
-        SqueezyError::Config(format!(
-            "failed to write {}: {err}",
-            scope.path.display()
-        ))
+        SqueezyError::Config(format!("failed to write {}: {err}", scope.path.display()))
     })?;
     Ok(outcome.edits_applied > 0)
 }

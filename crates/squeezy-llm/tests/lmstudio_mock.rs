@@ -66,9 +66,7 @@ fn build_request(model: &str) -> LlmRequest {
     LlmRequest {
         model: Arc::from(model),
         instructions: Arc::from("be brief"),
-        input: Arc::from(vec![LlmInputItem::UserText(
-            "say hello world".to_string(),
-        )]),
+        input: Arc::from(vec![LlmInputItem::UserText("say hello world".to_string())]),
         max_output_tokens: Some(32),
         response_verbosity: None,
         reasoning_effort: None,
@@ -94,13 +92,17 @@ async fn lmstudio_streaming_completion_against_mock_server() {
         },
     });
 
-    let stream = provider.stream_response(build_request("openai/gpt-oss-20b"), CancellationToken::new());
-    let events: Vec<LlmEvent> = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
-        .await
-        .expect("stream must complete within timeout")
-        .into_iter()
-        .map(|res| res.expect("stream must not surface an error"))
-        .collect();
+    let stream = provider.stream_response(
+        build_request("openai/gpt-oss-20b"),
+        CancellationToken::new(),
+    );
+    let events: Vec<LlmEvent> =
+        tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+            .await
+            .expect("stream must complete within timeout")
+            .into_iter()
+            .map(|res| res.expect("stream must not surface an error"))
+            .collect();
 
     let text: String = events
         .iter()

@@ -6328,7 +6328,10 @@ fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
     }
     let mut spans = vec![
         name_span,
-        Span::styled(": ", Style::default().fg(AMBER).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            ": ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
     ];
     if matches!(call.name.as_str(), "shell" | "verify") {
         spans.extend(command_spans(&compact_text(&args, 80)));
@@ -6385,14 +6388,12 @@ fn active_tool_args(call: &ToolCall) -> String {
             }
             parts.join(" ")
         }
-        "definition_search"
-        | "reference_search"
-        | "symbol_context"
-        | "grep"
-        | "websearch" => string_arg(&call.arguments, "query")
-            .or_else(|| string_arg(&call.arguments, "pattern"))
-            .or_else(|| string_arg(&call.arguments, "symbol_id"))
-            .unwrap_or_default(),
+        "definition_search" | "reference_search" | "symbol_context" | "grep" | "websearch" => {
+            string_arg(&call.arguments, "query")
+                .or_else(|| string_arg(&call.arguments, "pattern"))
+                .or_else(|| string_arg(&call.arguments, "symbol_id"))
+                .unwrap_or_default()
+        }
         "glob" => string_arg(&call.arguments, "pattern").unwrap_or_default(),
         "read_file" | "read_slice" | "write_file" => {
             string_arg(&call.arguments, "path").unwrap_or_default()

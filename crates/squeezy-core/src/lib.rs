@@ -3655,10 +3655,7 @@ impl AiReviewerSettings {
         replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
         replace_if_some(&mut self.policy_file, next.policy_file);
         replace_if_some(&mut self.timeout_secs, next.timeout_secs);
-        replace_if_some(
-            &mut self.max_transcript_tokens,
-            next.max_transcript_tokens,
-        );
+        replace_if_some(&mut self.max_transcript_tokens, next.max_transcript_tokens);
     }
 }
 

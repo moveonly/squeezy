@@ -135,11 +135,7 @@ fn render_parsed_lines(lines: &[DiffLine], language_hint: Option<&str>) -> Vec<L
         .collect()
 }
 
-fn render_line(
-    line: &DiffLine,
-    gutter_width: usize,
-    language_hint: Option<&str>,
-) -> Line<'static> {
+fn render_line(line: &DiffLine, gutter_width: usize, language_hint: Option<&str>) -> Line<'static> {
     if line.kind == DiffLineKind::Hunk {
         return Line::from(vec![
             Span::styled(
@@ -332,10 +328,7 @@ mod tests {
         }
     }
 
-    fn find_span<'a>(
-        lines: &'a [Line<'static>],
-        starts_with: &str,
-    ) -> &'a Span<'static> {
+    fn find_span<'a>(lines: &'a [Line<'static>], starts_with: &str) -> &'a Span<'static> {
         lines
             .iter()
             .flat_map(|line| line.spans.iter())
@@ -371,10 +364,7 @@ mod tests {
 
     #[test]
     fn context_lines_have_no_background_tint() {
-        let file = sample_file(
-            "src/lib.rs",
-            "@@ -1,3 +1,3 @@\n context\n-old\n+new\n",
-        );
+        let file = sample_file("src/lib.rs", "@@ -1,3 +1,3 @@\n context\n-old\n+new\n");
         let lines = render_diff_file(&file);
 
         // context line content begins with a literal space, then the body.
@@ -443,11 +433,7 @@ mod tests {
                     .iter()
                     .any(|span| span.content.as_ref().starts_with('+'))
             })
-            .and_then(|line| {
-                line.spans
-                    .iter()
-                    .find(|span| span.content.as_ref() == "fn")
-            })
+            .and_then(|line| line.spans.iter().find(|span| span.content.as_ref() == "fn"))
             .expect("`fn` keyword span on the added line");
         assert_eq!(
             add_fn_span.style.fg,
@@ -460,10 +446,7 @@ mod tests {
 
     #[test]
     fn unknown_extension_falls_back_to_diff_foreground() {
-        let file = sample_file(
-            "notes.unknownext",
-            "@@ -1 +1 @@\n-old line\n+new line\n",
-        );
+        let file = sample_file("notes.unknownext", "@@ -1 +1 @@\n-old line\n+new line\n");
         let lines = render_diff_file(&file);
 
         let add_content = lines

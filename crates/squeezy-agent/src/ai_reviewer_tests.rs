@@ -40,8 +40,7 @@ fn bounded_transcript_compacts_older_into_summary() {
         history_version: 0,
         items,
     };
-    let rendered =
-        bounded_transcript(&snapshot, None, DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS);
+    let rendered = bounded_transcript(&snapshot, None, DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS);
     assert!(rendered.contains("summary of"));
     assert!(rendered.contains("earlier turn(s)"));
     assert!(rendered.contains("latest follow-up"));

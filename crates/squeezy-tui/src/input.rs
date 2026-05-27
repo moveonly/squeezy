@@ -267,14 +267,20 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "undo the latest checkpoint",
         available_during_task: false,
         parameter_hint: None,
-        capabilities: &[PermissionCapability::Edit, PermissionCapability::Destructive],
+        capabilities: &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive,
+        ],
     },
     SlashCommand {
         name: "/revert-turn",
         description: "revert a turn checkpoint",
         available_during_task: false,
         parameter_hint: None,
-        capabilities: &[PermissionCapability::Edit, PermissionCapability::Destructive],
+        capabilities: &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive,
+        ],
     },
     slash_args_caps(
         "/verbosity",
