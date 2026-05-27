@@ -369,8 +369,8 @@
       "json_mode": true,
       "vision": false,
       "response_state": false,
-      "reasoning_tokens": false,
-      "reasoning_effort": false,
+      "reasoning_tokens": true,
+      "reasoning_effort": true,
       "text_verbosity": false,
       "prompt_caching": true
     },
