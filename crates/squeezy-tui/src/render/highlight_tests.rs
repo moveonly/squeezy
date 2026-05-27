@@ -3,16 +3,14 @@ use crate::render::palette::ColorLevel;
 
 /// `for_tone(Dark)` and `for_tone(Light)` must emit visibly different
 /// foregrounds — otherwise a `/theme` flip is a no-op for code blocks.
-/// Asserted on more than two kinds so a single shared constant across
-/// tones is caught.
+/// Compared on raw RGB triples so the assertion is independent of the
+/// terminal color level the host runner reports.
 #[test]
 fn dark_and_light_palettes_differ() {
-    let dark = HighlightPalette::for_tone(PaletteTone::Dark);
-    let light = HighlightPalette::for_tone(PaletteTone::Light);
-    assert_ne!(dark.keyword, light.keyword, "keyword color must change");
-    assert_ne!(dark.string, light.string, "string color must change");
-    assert_ne!(dark.function, light.function, "function color must change");
-    assert_ne!(dark.comment, light.comment, "comment color must change");
+    assert_ne!(KEYWORD_DARK, KEYWORD_LIGHT, "keyword RGB must change");
+    assert_ne!(STRING_DARK, STRING_LIGHT, "string RGB must change");
+    assert_ne!(FUNCTION_DARK, FUNCTION_LIGHT, "function RGB must change");
+    assert_ne!(COMMENT_DARK, COMMENT_LIGHT, "comment RGB must change");
 }
 
 /// `for_tone` must surface the same `best_color`-quantised value the

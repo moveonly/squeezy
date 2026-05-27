@@ -3842,8 +3842,10 @@ impl TurnRuntime {
         // mirrors the report's before/after counts so observers can
         // measure the rewrite. The no-hook path stays allocation-free.
         let pre_compaction_estimate = estimate_context(&conversation);
+        let keep = self.config.context_compaction.recent_items.max(1);
         let compaction_likely = self.config.context_compaction.enabled
             && pre_compaction_estimate.items >= self.config.context_compaction.min_items
+            && pre_compaction_estimate.items > keep
             && pre_compaction_estimate.estimated_tokens
                 >= self.config.context_compaction.estimated_tokens;
         if compaction_likely {

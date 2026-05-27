@@ -3555,7 +3555,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
         vec![
             Ok(LlmEvent::Started),
             Ok(LlmEvent::TextDelta(
-                "first reply long enough to estimate as tokens".to_string(),
+                "first reply long enough to estimate as tokens. ".repeat(40),
             )),
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
