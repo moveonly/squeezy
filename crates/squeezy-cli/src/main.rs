@@ -274,6 +274,8 @@ enum SessionsCommand {
     Show { id: String },
     #[command(about = "Resume a local session in the TUI")]
     Resume { id: String },
+    #[command(about = "Fork a local session into a new child and resume it in the TUI")]
+    Fork { id: String },
     #[command(about = "Replay a recorded local session deterministically")]
     Replay {
         id: String,
@@ -1068,6 +1070,18 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
         SessionsCommand::Resume { id } => {
             let provider = provider_from_app_config(&config);
             squeezy_tui::resume(config, provider, id.clone()).await
+        }
+        SessionsCommand::Fork { id } => {
+            // Offline fork: stamp a child with the parent's resume state
+            // on disk, then drop into the TUI resuming the child. The
+            // parent session is preserved so `squeezy sessions resume
+            // <parent>` still works.
+            let provider = provider_from_app_config(&config);
+            let child_metadata = SessionMetadata::new(&config, provider.name());
+            let child = store.fork_session(id, child_metadata)?;
+            let child_id = child.session_id().to_string();
+            drop(child);
+            squeezy_tui::resume(config, provider, child_id).await
         }
         SessionsCommand::Replay { id, json } => {
             let report = Agent::replay_session(config, id).await?;

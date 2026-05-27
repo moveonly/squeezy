@@ -220,6 +220,64 @@ impl SessionStore {
         }
     }
 
+    /// Create a child session that branches off `parent_session_id`. The
+    /// new session copies the parent's resume state (conversation +
+    /// transcript) and any context attachments so the user can keep
+    /// talking from the same point without disturbing the parent. The
+    /// child's metadata carries `parent_id = Some(parent_session_id)` so
+    /// the TUI session list can render fork chains. Used by `squeezy
+    /// sessions fork <id>` for the offline fork path; the in-process
+    /// `Agent::fork_current` writes the same `parent_id` directly on the
+    /// metadata it constructs.
+    pub fn fork_session(
+        &self,
+        parent_session_id: &str,
+        mut metadata: SessionMetadata,
+    ) -> Result<SessionHandle> {
+        let parent_dir = self.session_dir(parent_session_id);
+        if !parent_dir.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "fork_session: parent {parent_session_id} not found at {}",
+                parent_dir.display()
+            )));
+        }
+        let parent_resume: SessionResumeState = read_json(&parent_dir.join("resume_state.json"))
+            .or_else(|_| {
+                // Fall back to a replay when the snapshot is missing or
+                // corrupt — matches `Agent::resume`'s recovery path so an
+                // intact event log keeps forks possible.
+                let handle = self.open_session(parent_session_id.to_string());
+                handle.replay_resume_state()
+            })?;
+        metadata.parent_id = Some(parent_session_id.to_string());
+        let handle = self.start_session(metadata)?;
+        let dir = self.session_dir(handle.session_id());
+        write_json(&dir.join("resume_state.json"), &parent_resume)?;
+        let parent_attachments = parent_dir.join("attachments");
+        if parent_attachments.exists() {
+            let child_attachments = dir.join("attachments");
+            fs::create_dir_all(&child_attachments)?;
+            for entry in fs::read_dir(&parent_attachments)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let from = entry.path();
+                let Some(name) = from.file_name() else {
+                    continue;
+                };
+                fs::copy(&from, child_attachments.join(name))?;
+            }
+        }
+        handle.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!("forked from {parent_session_id}")),
+            json!({ "parent_session_id": parent_session_id }),
+        ))?;
+        Ok(handle)
+    }
+
     pub fn list(&self, query: &SessionQuery) -> Result<Vec<SessionMetadata>> {
         let mut sessions = Vec::new();
         if !self.root.exists() {
@@ -1017,6 +1075,14 @@ pub struct SessionMetadata {
     /// files compatible.
     #[serde(default)]
     pub token_calibration: squeezy_llm::TokenCalibration,
+    /// Set on sessions created by `Agent::fork_current` or
+    /// `squeezy sessions fork`: the parent's session id. `None` for any
+    /// other origin (fresh start, resume of a top-level session). The
+    /// structured field lets the TUI session list render fork chains
+    /// without re-parsing `session_forked` events. `serde(default)` so
+    /// pre-fork `metadata.json` files keep deserializing.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 impl SessionMetadata {

@@ -1959,6 +1959,7 @@ impl Agent {
             metrics: state.metrics,
             redactions: state.redactions,
             token_calibration: state.token_calibration,
+            parent_id: Some(parent_session_id.clone()),
             ..SessionMetadata::new(&self.config, self.provider.name())
         };
         let child = store.start_session(metadata)?;

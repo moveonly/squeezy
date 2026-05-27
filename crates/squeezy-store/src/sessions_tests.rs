@@ -60,6 +60,55 @@ fn session_store_lists_filters_and_exports_sessions() {
 }
 
 #[test]
+fn fork_creates_child_with_parent_id() {
+    let root = temp_root("fork-creates-child");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let parent = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start parent");
+    parent
+        .write_resume_state(&SessionResumeState {
+            resume_available: true,
+            conversation: vec![ResumeItem::UserText {
+                text: "carry me forward".to_string(),
+            }],
+            ..SessionResumeState::default()
+        })
+        .expect("write parent resume");
+    let parent_id = parent.session_id().to_string();
+
+    let child = store
+        .fork_session(&parent_id, SessionMetadata::new(&config, "test-provider"))
+        .expect("fork session");
+    let child_metadata = child.metadata().expect("child metadata");
+    assert_eq!(
+        child_metadata.parent_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    assert_ne!(child.session_id(), parent_id);
+
+    let child_resume = child.read_resume_state().expect("child resume");
+    assert!(matches!(
+        child_resume.conversation.first(),
+        Some(ResumeItem::UserText { text }) if text == "carry me forward"
+    ));
+
+    // Parent session must still exist intact on disk so a later
+    // `squeezy sessions resume <parent_id>` works.
+    let parent_record = store.show(&parent_id).expect("parent show");
+    assert_eq!(parent_record.metadata.session_id, parent_id);
+    assert!(parent_record.metadata.parent_id.is_none());
+}
+
+#[test]
 fn session_export_preserves_task_state_events() {
     let root = temp_root("task-state-export");
     let config = AppConfig {
