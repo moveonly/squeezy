@@ -3189,6 +3189,150 @@ async fn cancelled_turn_persists_partial_cost_and_metrics() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn stop_no_action_retry_fires_when_model_promised_tool_use() {
+    // Reproduces the Qwen3 "I'll do X then stop" pattern. Round 0 the
+    // model successfully calls `read_file`. Round 1 it emits a chatty
+    // preamble ("Let me scan the codebase") with finish_reason=stop and
+    // zero tool calls. The agent should NOT end the turn here — it
+    // should push a synthetic user nudge and retry, giving the model
+    // one more shot. Round 2 the model finishes properly with a final
+    // answer.
+    let root = temp_workspace("stop_no_action_retry");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        // Round 0: legitimate tool call.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_tools".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::ToolUse),
+                false,
+            )),
+        ],
+        // Round 1: chatty preamble + stop with no tool call. Agent
+        // should detect this and retry.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "Let me scan the codebase to find more context.".to_string(),
+            )),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_stopped".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                false,
+            )),
+        ],
+        // Round 2: after the nudge, model gives the real answer.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "src.rs defines a single `needle` function.".to_string(),
+            )),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_final".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                false,
+            )),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+
+    let mut rx = agent.start_turn(
+        "look at src.rs and tell me what it defines".to_string(),
+        CancellationToken::new(),
+    );
+    let mut final_message = String::new();
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { message, .. } = event {
+            final_message = message.content;
+        }
+    }
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "agent should have issued 3 LLM requests (round 0 tool + round 1 stop + retry)"
+    );
+    // The retry request must include the synthetic user nudge in its
+    // input. When store_responses is off (the default for tests), the
+    // full conversation is replayed.
+    let retry_request = &requests[2];
+    let has_nudge = retry_request.input.iter().any(|item| match item {
+        LlmInputItem::UserText(text) => text.contains("did not call any tool"),
+        _ => false,
+    });
+    assert!(
+        has_nudge,
+        "retry request must include the 'you described a follow-up action' nudge in its input",
+    );
+    assert!(
+        final_message.contains("needle"),
+        "final assistant message must come from round 2, got {final_message:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn stop_no_action_retry_does_not_fire_when_model_answered_directly() {
+    // Inverse of the previous test: round 0 the model calls a tool,
+    // round 1 it gives the final answer (no intent text, no
+    // unresolved promise). The retry latch must NOT fire — turn ends
+    // after 2 LLM requests.
+    let root = temp_workspace("stop_no_action_no_retry");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_tools".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::ToolUse),
+                false,
+            )),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "src.rs defines a `needle` function and nothing else.".to_string(),
+            )),
+            Ok(LlmEvent::completed_with_reason(
+                Some("resp_final".to_string()),
+                CostSnapshot::default(),
+                Some(squeezy_llm::StopReason::EndTurn),
+                false,
+            )),
+        ],
+    ]));
+    let agent = Agent::new(config_for(root.clone()), provider.clone());
+    drain_turn(agent.start_turn("describe src.rs".to_string(), CancellationToken::new())).await;
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "direct answer should NOT trigger the retry latch (expected 2 requests, got {})",
+        requests.len()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 fn function_outputs(request: &LlmRequest) -> Vec<(&str, Value)> {
     request
         .input

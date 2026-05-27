@@ -4167,6 +4167,16 @@ impl TurnRuntime {
         // currently observational only — see `dispatch_pre_turn` for
         // the rationale.
         self.dispatch_pre_turn();
+        // One-shot "the model promised follow-up tool use but stopped"
+        // recovery latch. Set when a round ends with `finish_reason=stop`,
+        // zero tool calls, AND the assistant text contains an intent
+        // phrase that named a tool action (the canonical Qwen3 chatty-
+        // preamble pattern). Forces one extra round with a synthetic
+        // user nudge ("Continue. Call the tool you described, or give
+        // the final answer.") before letting the turn end. Capped at
+        // one retry per turn to prevent infinite loops if the model
+        // ignores the nudge.
+        let mut replan_retry_used = false;
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -4604,11 +4614,78 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
+                // Flush any tail still buffered by the stream redactor
+                // BEFORE the retry check — `assistant_text_has_unresolved_intent`
+                // needs the complete assistant text, including the last
+                // chunk the redactor was holding for cross-chunk redaction
+                // scans. The downstream end-of-turn path also wants the
+                // flushed text, so we move the flush up unconditionally
+                // and re-use it for both branches.
                 if let Some(tail) = self
                     .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
                     .await
                 {
                     self.record_replay_model_text_delta(&tail);
+                }
+
+                // One-shot "promised tool use but stopped" retry.
+                //
+                // Tool-shy models (Qwen3-via-PortKey is the canonical
+                // example, but smaller MoE / reasoning-heavy models do
+                // it too) sometimes emit a chatty preamble like
+                // "Let me scan the codebase" or "I'll check that file"
+                // and then end the turn with `finish_reason=stop` and
+                // no tool call. The model thinks it committed to the
+                // follow-up; the user sees a dangling promise.
+                //
+                // Detect that exact shape — round > 0 so the model has
+                // already used a tool this turn (otherwise this is a
+                // legitimate "I'll do X" preamble before round 0's
+                // tool burst), finish_reason == "stop", and assistant
+                // text matches `(let me|i['']ll|i will|going to|need to)`
+                // + a tool-shaped action verb (scan, search, read, ...).
+                // Push a synthetic user nudge into next_input and
+                // re-enter the round loop once.
+                if !replan_retry_used
+                    && round > 0
+                    && stop_reason == Some(StopReason::EndTurn)
+                    && assistant_text_has_unresolved_intent(&assistant_message)
+                {
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    conversation.push(redact_input_item(
+                        LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                        &self.redactor,
+                    ));
+                    let nudge = "You described a follow-up action but did not call any tool. \
+                                 If you need to call a tool to complete the user's request, \
+                                 call it now. If the previous output is enough, give the final \
+                                 answer directly instead.";
+                    let nudge_item = redact_input_item(
+                        LlmInputItem::UserText(nudge.to_string()),
+                        &self.redactor,
+                    );
+                    conversation.push(nudge_item.clone());
+                    // Keep the stored-responses chain anchored on the
+                    // round we just observed; the next round's request
+                    // sends only the nudge as the delta. When not
+                    // using stored responses, replay the full
+                    // conversation including the nudge.
+                    if self.config.store_responses {
+                        previous_response_id = response_id.clone();
+                        next_input = vec![nudge_item];
+                    } else {
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                    }
+                    replan_retry_used = true;
+                    tracing::debug!(
+                        target: "squeezy_agent::stop_no_action_retry",
+                        round,
+                        stop_reason = ?stop_reason,
+                        assistant_text_chars = raw_assistant_text.chars().count(),
+                        "model promised tool use but ended turn; retrying once with nudge",
+                    );
+                    continue;
                 }
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
@@ -7170,6 +7247,97 @@ fn is_control_tool_name(name: &str) -> bool {
         name,
         TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
     )
+}
+
+/// Heuristic: does the assistant text contain an intent phrase that
+/// implies the model promised follow-up tool work it never delivered?
+///
+/// True when ALL of the following hold:
+///   1. The text is non-empty (an actually visible message, not just whitespace).
+///   2. The text contains at least one intent phrase (`let me`, `i'll`,
+///      `i will`, `going to`, `i need to`, etc.).
+///   3. The intent phrase is followed within ~40 chars by an action verb
+///      that maps to a tool the model has access to (`scan`, `search`,
+///      `read`, `explore`, `find`, ...).
+///
+/// Skipped when the text contains a `<proposed_plan>` block (plan-mode
+/// output is a legitimate finish_reason=stop) or a fenced final-answer
+/// marker (`final answer:`, `here is the answer:`).
+fn assistant_text_has_unresolved_intent(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    // Plan-mode output: a `<proposed_plan>` block is the expected
+    // end-of-turn shape; not a chatty-stop bug.
+    if lower.contains("<proposed_plan>") {
+        return false;
+    }
+    // Final-answer markers: model is signaling "this is my answer".
+    const FINAL_MARKERS: &[&str] = &[
+        "final answer:",
+        "here is the answer:",
+        "in summary:",
+        "to summarize:",
+    ];
+    if FINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    const INTENT_PATTERNS: &[&str] = &[
+        "let me ",
+        "let's ",
+        "i'll ",
+        "i will ",
+        "now i'll ",
+        "now i ",
+        "next i'll ",
+        "next i ",
+        "next, i ",
+        "i need to ",
+        "i can ",
+        "first, i ",
+        "going to ",
+        "i'm going to ",
+        "we should ",
+    ];
+    const ACTION_PATTERNS: &[&str] = &[
+        "scan ",
+        "search ",
+        "explore ",
+        "find ",
+        "read ",
+        "look ",
+        "check ",
+        "inspect ",
+        "grep ",
+        "map ",
+        "list ",
+        "open ",
+        "fetch ",
+        "load ",
+        "fix ",
+        "edit ",
+        "modify ",
+        "write ",
+        "create ",
+        "rename ",
+        "investigate ",
+        "trace ",
+        "follow ",
+        "delegate ",
+        "run ",
+    ];
+    for intent in INTENT_PATTERNS {
+        if let Some(idx) = lower.find(intent) {
+            let tail_start = idx + intent.len();
+            let tail_end = (tail_start + 40).min(lower.len());
+            let tail = &lower[tail_start..tail_end];
+            if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {

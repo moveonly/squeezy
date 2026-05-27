@@ -6104,3 +6104,53 @@ fn subagent_config_include_transcript_defaults_false() {
     let config = SubagentConfig::default();
     assert!(!config.include_transcript);
 }
+
+#[test]
+fn assistant_text_has_unresolved_intent_detects_let_me_scan() {
+    assert!(assistant_text_has_unresolved_intent(
+        "Let me scan the codebase to find a good candidate.",
+    ));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_detects_ill_with_action() {
+    assert!(assistant_text_has_unresolved_intent(
+        "I'll read src/lib.rs and then we'll see what to do.",
+    ));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_skips_chitchat() {
+    assert!(!assistant_text_has_unresolved_intent(
+        "I'm doing well, thanks for asking. What can I help you with?",
+    ));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_skips_final_answer() {
+    // Intent phrase present but the model is signaling end of work.
+    assert!(!assistant_text_has_unresolved_intent(
+        "Let me summarize. In summary: the bug is in lib.rs.",
+    ));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_skips_proposed_plan_block() {
+    // Plan-mode legitimate finish_reason=stop.
+    let text = "I'll start with the planner.\n<proposed_plan>\n## Context\nfoo\n</proposed_plan>";
+    assert!(!assistant_text_has_unresolved_intent(text));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_skips_empty() {
+    assert!(!assistant_text_has_unresolved_intent(""));
+    assert!(!assistant_text_has_unresolved_intent("   \n\n"));
+}
+
+#[test]
+fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
+    // Phrase like "let me think" without a tool verb shouldn't fire.
+    assert!(!assistant_text_has_unresolved_intent(
+        "Let me think about this. The answer depends on what you mean by X.",
+    ));
+}

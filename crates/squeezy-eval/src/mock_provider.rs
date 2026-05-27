@@ -43,6 +43,7 @@ pub struct MockTurn {
     /// the `LlmEvent::Completed` event, normalized through
     /// `StopReason`. Lets mock scenarios exercise the finish-reason
     /// aware code paths (the agent's stop-no-action retry, the eval
+    /// `stop_with_intent_text_no_tool_call` finding and
     /// `expect_finish_reason` rule) without needing a live
     /// chat-completions provider.
     #[serde(default)]

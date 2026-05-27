@@ -1,0 +1,52 @@
+id = "modernize-one-file-qwen-portkey"
+title = "Qwen3 via PortKey: 'modernize one file' must not stop after preamble"
+description = """
+Replays the exact prompt from the user's reported screenshot:
+"work to modernize one file in this repo, to use newer rust features".
+
+The Qwen3-via-PortKey trace ended with `finish_reason=stop` after the
+model emitted "Let me scan the codebase..." but never called a follow-up
+tool. With the Phase 3 stop_no_action retry in place, the agent should
+inject the synthetic nudge and produce a useful follow-up tool call or
+final answer — `stop_with_intent_text_no_tool_call` must NOT fire.
+
+Requires `PORTKEY_API_KEY` in the env. The model id `qwen/qwen3.6-35b-a3b`
+mirrors what the user pasted; PortKey's `@openrouter/...` prefix is
+applied automatically when the integration is configured at the
+PortKey side. Run with:
+
+    PORTKEY_API_KEY=... cargo run -p squeezy-eval -- run \\
+        crates/squeezy-eval/fixtures/scenarios/modernize-one-file-qwen-portkey.toml
+
+Inspect the resulting trace + frames to confirm:
+  - frames.jsonl: at least one turn has `finish_reason="stop"` AND a
+    non-zero tool_calls list (or the retry's synthetic nudge in the
+    next round's input).
+  - findings.jsonl: no `stop_with_intent_text_no_tool_call` entries.
+  - run.json: `totals.findings` is empty.
+"""
+
+[workspace]
+local = "."
+snapshot = true
+
+[squeezy]
+provider = "portkey"
+model = "qwen/qwen3.6-35b-a3b"
+mode = "build"
+permission_mode = "ask"
+max_output_tokens = 32000
+
+[[steps]]
+kind = "prompt"
+text = "work to modernize one file in this repo, to use newer rust features"
+wait_for = "turn_completed"
+
+[expect]
+finish_reason_not = ["stop_no_action"]
+no_tool_errors = false
+max_tools_per_turn = 12
+max_wall_clock_seconds = 300
+
+[triage]
+enabled = false

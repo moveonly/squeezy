@@ -1,0 +1,63 @@
+id = "stop-no-action-mock"
+title = "Deterministic regression: chatty-stop after a tool call triggers retry"
+description = """
+Mocks the canonical Qwen3-via-PortKey failure: the model successfully
+calls a tool in round 0, then in round 1 emits a chatty preamble
+("Let me look at...") with finish_reason=stop and zero tool calls.
+The Phase 3 retry latch should inject the synthetic nudge, drive a
+third round, and produce a real final answer.
+
+Runs entirely offline against the mock provider, so this is the
+regression test that proves the retry path survives future changes.
+The `stop_with_intent_text_no_tool_call` and `expect_finish_reason`
+findings must NOT fire when the retry succeeds.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "look at src.rs and tell me what it defines"
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["needle"]
+finish_reason_not = ["stop_no_action"]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+# Round 0: legitimate tool call.
+[[mock.turns]]
+text = ""
+input_tokens = 40
+output_tokens = 4
+finish_reason = "tool_calls"
+
+[[mock.turns.tool_calls]]
+name = "grep"
+arguments = { pattern = "needle", include = ["*.rs"] }
+
+# Round 1: model emits chatty preamble with stop. Retry should fire.
+[[mock.turns]]
+text = "Let me read src.rs and see what it defines."
+input_tokens = 50
+output_tokens = 10
+finish_reason = "stop"
+
+# Round 2: after the nudge, model gives the real answer.
+[[mock.turns]]
+text = "src.rs defines a single `needle` function and nothing else."
+input_tokens = 60
+output_tokens = 14
+finish_reason = "stop"
+
+[triage]
+enabled = false
