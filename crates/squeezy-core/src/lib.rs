@@ -511,6 +511,7 @@ impl AppConfig {
                 )));
             }
         };
+        validate_provider_base_urls(&provider)?;
         let default_model = match &provider {
             ProviderConfig::OpenAi(_) => provider_setting(&providers, "openai", "default_model")
                 .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string()),
@@ -6847,6 +6848,65 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
+    match provider {
+        ProviderConfig::OpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "openai"),
+        ProviderConfig::Anthropic(cfg) => check_base_url_scheme(&cfg.base_url, "anthropic"),
+        ProviderConfig::Google(cfg) => check_base_url_scheme(&cfg.base_url, "google"),
+        ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
+        ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
+        ProviderConfig::OpenAiCompatible(cfg) => {
+            check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
+        }
+        ProviderConfig::Bedrock(cfg) => match &cfg.base_url {
+            Some(url) => check_base_url_scheme(url, "bedrock"),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Refuses an HTTP `base_url` unless the host is a loopback identifier
+/// (`localhost`, `127.0.0.0/8`, or `[::1]`). Anything else (LAN IPs, public
+/// hostnames) must use HTTPS so a misconfigured config file cannot silently
+/// exfiltrate API keys + prompt content to an attacker-controlled origin.
+fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
+    let trimmed = base_url.trim();
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        // Empty, https://, or any non-http scheme: the existing emptiness +
+        // reachability checks elsewhere handle these. We only police http.
+        return Ok(());
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host_only = host
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']'))
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(""));
+    if is_loopback_host(host_only) {
+        return Ok(());
+    }
+    Err(SqueezyError::Config(format!(
+        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
+         API keys and prompt content would otherwise transit in cleartext"
+    )))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
 }
 
 fn build_openai_compatible_config(

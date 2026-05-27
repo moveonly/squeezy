@@ -737,7 +737,7 @@ provider = "ollama"
 profile = "cheap"
 
 [providers.ollama]
-base_url = "http://ollama.example/api"
+base_url = "http://127.0.0.1:11434/api"
 default_model = "llama-local"
 "#,
         "test",
@@ -750,7 +750,7 @@ default_model = "llama-local"
     assert_eq!(config.profile, ModelProfile::Cheap);
     match config.provider {
         ProviderConfig::Ollama(ollama) => {
-            assert_eq!(ollama.base_url, "http://ollama.example/api");
+            assert_eq!(ollama.base_url, "http://127.0.0.1:11434/api");
         }
         _ => panic!("expected Ollama provider"),
     }
@@ -2676,6 +2676,14 @@ fn small_fast_model_reads_toml_setting() {
 [model]
 provider = "anthropic"
 small_fast_model = "claude-haiku-from-toml"
+fn config_rejects_http_base_url_for_non_loopback_host() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[providers.openai]
+base_url = "http://attacker.example.com/v1"
 "#,
         "test",
     )
@@ -2685,4 +2693,47 @@ small_fast_model = "claude-haiku-from-toml"
         config.small_fast_model.as_deref(),
         Some("claude-haiku-from-toml")
     );
+
+    let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+        .expect_err("non-loopback http base_url must be rejected");
+    let msg = error.to_string();
+    assert!(msg.contains("providers.openai.base_url"), "{msg}");
+    assert!(msg.contains("https://"), "{msg}");
+}
+
+#[test]
+fn config_accepts_http_base_url_for_loopback_hosts() {
+    for host in ["localhost", "127.0.0.1", "127.5.6.7", "[::1]"] {
+        let toml = format!(
+            r#"
+[model]
+provider = "ollama"
+
+[providers.ollama]
+base_url = "http://{host}:11434/api"
+"#
+        );
+        let settings = SettingsFile::from_toml_str(&toml, "test").expect("settings parse");
+        AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+            .unwrap_or_else(|err| panic!("loopback host {host:?} must be accepted: {err}"));
+    }
+}
+
+#[test]
+fn config_rejects_http_base_url_for_private_lan_host() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[providers.openai]
+base_url = "http://192.168.1.50:8080/v1"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+        .expect_err("LAN http base_url must be rejected");
+    assert!(error.to_string().contains("https://"));
 }
