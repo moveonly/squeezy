@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
+    anthropic_betas::anthropic_header_value,
     cache_policy::{CachePolicy, json_markers, should_apply_caching},
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
@@ -226,6 +227,7 @@ impl LlmProvider for AnthropicProvider {
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
         let body = Self::request_body(&request);
+        let beta_header = anthropic_header_value(&request.beta_headers);
         let transport = self.transport;
 
         let attempt_cancel = cancel.clone();
@@ -235,6 +237,7 @@ impl LlmProvider for AnthropicProvider {
                 api_key.clone(),
                 url.clone(),
                 body.clone(),
+                beta_header.clone(),
                 transport,
                 attempt_cancel.clone(),
             )
@@ -254,16 +257,20 @@ fn anthropic_stream_attempt(
     api_key: String,
     url: String,
     body: Value,
+    beta_header: Option<String>,
     transport: ProviderTransportConfig,
     cancel: CancellationToken,
 ) -> LlmStream {
     Box::pin(try_stream! {
         let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-            client
+            let mut builder = client
                 .post(&url)
                 .header("x-api-key", api_key.clone())
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .json(&body)
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(value) = beta_header.as_deref() {
+                builder = builder.header("anthropic-beta", value);
+            }
+            builder.json(&body)
         }).await?;
 
         let status = response.status();

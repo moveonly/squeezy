@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
-    cache_policy::should_apply_caching,
+    anthropic_betas::bedrock_extra_body_betas, cache_policy::should_apply_caching,
 };
 
 #[derive(Debug, Clone)]
@@ -103,6 +103,8 @@ impl LlmProvider for BedrockProvider {
             if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
                 builder = builder.tool_config(config);
             }
+            let mut extra_fields: std::collections::HashMap<String, Document> =
+                std::collections::HashMap::new();
             if let Some(effort) = request.reasoning_effort
                 && crate::capabilities_for("bedrock", &model)
                     .is_some_and(|caps| caps.reasoning_effort)
@@ -122,10 +124,19 @@ impl LlmProvider for BedrockProvider {
                     .into_iter()
                     .collect(),
                 );
-                let extra = Document::Object(
-                    [("thinking".to_string(), thinking)].into_iter().collect(),
-                );
-                builder = builder.additional_model_request_fields(extra);
+                extra_fields.insert("thinking".to_string(), thinking);
+            }
+            let body_betas = bedrock_extra_body_betas(&request.beta_headers);
+            if !body_betas.is_empty() {
+                let beta_array = body_betas
+                    .iter()
+                    .map(|beta| Document::String(beta.as_ref().to_string()))
+                    .collect();
+                extra_fields.insert("anthropic_beta".to_string(), Document::Array(beta_array));
+            }
+            if !extra_fields.is_empty() {
+                builder =
+                    builder.additional_model_request_fields(Document::Object(extra_fields));
             }
 
             let send_result = tokio::select! {

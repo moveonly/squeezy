@@ -63,6 +63,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());

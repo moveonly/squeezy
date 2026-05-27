@@ -15,6 +15,7 @@ pub const INVALID_TOOL_ARGUMENTS_ERROR_KEY: &str = "__squeezy_parse_error";
 pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
 mod anthropic;
+mod anthropic_betas;
 mod bedrock;
 mod cache_policy;
 mod compatible;
@@ -88,6 +89,20 @@ pub struct LlmRequest {
     /// place. Only the OpenAI provider currently reads this; other
     /// providers ignore it.
     pub parallel_tool_calls: Option<bool>,
+    /// Anthropic beta opt-ins (e.g. `context-1m-2025-08-07`,
+    /// `interleaved-thinking-2025-05-14`). Empty by default. The
+    /// Anthropic provider joins these into an `anthropic-beta` HTTP
+    /// header; the Bedrock provider partitions them and forwards only
+    /// the body-param-eligible subset via
+    /// `additional_model_request_fields.anthropic_beta`. Mirrors
+    /// clear-code's per-provider routing (`constants/betas.ts` +
+    /// `claude.ts:272-331`). Other providers ignore the field.
+    #[serde(default = "empty_beta_headers")]
+    pub beta_headers: Arc<[Arc<str>]>,
+}
+
+fn empty_beta_headers() -> Arc<[Arc<str>]> {
+    Arc::from(Vec::new())
 }
 
 impl LlmRequest {
@@ -111,6 +126,7 @@ impl LlmRequest {
             tool_choice: None,
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: empty_beta_headers(),
         }
     }
 }

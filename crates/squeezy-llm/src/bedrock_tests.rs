@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aws_sdk_bedrockruntime::types::{
     CachePointType, ContentBlock, ConversationRole, SystemContentBlock, ToolInputSchema,
 };
@@ -5,6 +7,7 @@ use aws_smithy_types::{Document, Number};
 use serde_json::json;
 
 use super::{conversation_messages, json_to_document, system_blocks, tool_configuration};
+use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
 
 #[test]
@@ -254,4 +257,23 @@ fn json_to_document_preserves_numeric_kinds() {
         panic!("expected array document");
     };
     assert_eq!(arr.len(), 2);
+}
+
+#[test]
+fn beta_headers_route_into_extra_body_params_on_bedrock() {
+    // Bedrock's gateway strips non-standard HTTP headers; the routing
+    // helper must keep only the body-param-eligible subset, which the
+    // provider then attaches to `additional_model_request_fields`.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("context-1m-2025-08-07"),
+        Arc::<str>::from("interleaved-thinking-2025-05-14"),
+        Arc::<str>::from("claude-code-20250219"),
+    ]);
+    let body_betas = bedrock_extra_body_betas(&betas);
+    let body_strs: Vec<&str> = body_betas.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(
+        body_strs,
+        vec!["context-1m-2025-08-07", "interleaved-thinking-2025-05-14"],
+        "Bedrock subset must drop header-only betas (claude-code-*) and preserve order",
+    );
 }

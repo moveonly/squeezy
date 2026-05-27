@@ -1,4 +1,5 @@
 use super::*;
+use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ fn request_body_uses_messages_streaming_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -81,6 +83,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -105,6 +108,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -139,6 +143,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -180,6 +185,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -242,6 +248,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -386,6 +393,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -412,6 +420,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -723,4 +732,78 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
     assert_eq!(content[0]["signature"], "SIG");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "answer");
+}
+
+#[test]
+fn beta_headers_route_into_http_header() {
+    // The Anthropic provider does not embed beta headers in the JSON
+    // body — they go on the `anthropic-beta` HTTP header. We assert the
+    // routing helper produces the comma-joined value the provider
+    // attaches on the outbound request.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("context-1m-2025-08-07"),
+        Arc::<str>::from("interleaved-thinking-2025-05-14"),
+    ]);
+    let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
+    assert_eq!(
+        header,
+        "context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+    );
+
+    // The request body must not carry the betas — they belong on the
+    // header for the 1P Anthropic transport.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "sys".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: betas,
+    };
+    let body = AnthropicProvider::request_body(&request);
+    assert!(
+        body.get("anthropic_beta").is_none(),
+        "1P Anthropic transport sends betas via header, never inside the JSON body",
+    );
+}
+
+#[test]
+fn beta_headers_route_into_extra_body_params_on_bedrock() {
+    // Bedrock uses converse_stream and the AWS gateway strips
+    // non-standard HTTP headers, so the routing helper partitions out
+    // the body-param-eligible subset for `additional_model_request_fields`.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("context-1m-2025-08-07"),
+        Arc::<str>::from("claude-code-20250219"),
+    ]);
+    let body_betas = bedrock_extra_body_betas(&betas);
+    let body_strs: Vec<&str> = body_betas.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(
+        body_strs,
+        vec!["context-1m-2025-08-07"],
+        "header-only betas (claude-code-*) must be dropped before reaching Bedrock",
+    );
+}
+
+#[test]
+fn beta_headers_dedup_when_capability_and_request_overlap() {
+    // Future capability-derived betas can overlap with the
+    // caller-supplied list; the routing helper must deduplicate so the
+    // wire value carries each beta exactly once.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("a"),
+        Arc::<str>::from("b"),
+        Arc::<str>::from("b"),
+        Arc::<str>::from("c"),
+    ]);
+    let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
+    assert_eq!(header, "a,b,c");
 }

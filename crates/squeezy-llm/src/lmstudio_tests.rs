@@ -36,6 +36,7 @@ fn sample_request() -> LlmRequest {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     }
 }

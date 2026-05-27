@@ -137,6 +137,7 @@ fn build_request(model: &str) -> LlmRequest {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     }
 }
 

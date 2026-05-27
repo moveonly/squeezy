@@ -28,6 +28,7 @@ fn request_body_uses_chat_stream_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -71,6 +72,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OllamaProvider::request_body(&request);

@@ -38,6 +38,7 @@ fn sample_request() -> LlmRequest {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     }
 }
 
@@ -145,6 +146,7 @@ fn request_body_serialises_assistant_function_call_history() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let body = OpenAiCompatibleProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");

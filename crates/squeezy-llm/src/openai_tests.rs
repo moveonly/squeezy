@@ -31,6 +31,7 @@ fn request_body_uses_responses_streaming_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -85,6 +86,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -125,6 +127,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -150,6 +153,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -182,6 +186,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             tool_choice: None,
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -206,6 +211,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -228,6 +234,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -520,6 +527,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         tools: Arc::from(Vec::new()),
         store: false,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         output_schema: Some(LlmOutputSchema {
             name: "answer_with_confidence".to_string(),
             schema: schema.clone(),
@@ -553,6 +561,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     };
 
@@ -585,6 +594,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
             strict: false,
         }),
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     };
 

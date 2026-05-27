@@ -1832,6 +1832,7 @@ impl Agent {
             tool_choice: self.config.tool_choice.clone(),
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -4207,6 +4208,7 @@ impl TurnRuntime {
                 tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
                 output_schema: None,
                 parallel_tool_calls: None,
+                beta_headers: std::sync::Arc::from(Vec::new()),
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -6189,6 +6191,7 @@ async fn run_subagent_rounds(
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         };
         let mut stream = parent
             .provider
@@ -8356,6 +8359,7 @@ Working target: {:?}",
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
