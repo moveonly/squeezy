@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     pin::Pin,
@@ -4051,6 +4051,134 @@ fn subagent_kind_role_does_not_overlay_delegate() {
     assert_eq!(
         SubagentKind::Review.role(),
         Some(roles::SubagentRole::Reviewer)
+    );
+}
+
+/// Parent tool advertisement that mixes typical read/search tools with a
+/// representative mutating tool for every non-read capability. The mutating
+/// names cover the audit's named risks (`write_file`, `shell`, `apply_patch`)
+/// plus one per remaining `PermissionCapability` variant so a new capability
+/// added later cannot leak in unnoticed.
+fn parent_tools_with_mutators() -> Vec<AdvertisedTool> {
+    vec![
+        // Read/search tools every subagent role allow-list mentions.
+        test_advertised_tool("read_file", PermissionCapability::Read),
+        test_advertised_tool("read_slice", PermissionCapability::Read),
+        test_advertised_tool("grep", PermissionCapability::Search),
+        test_advertised_tool("glob", PermissionCapability::Search),
+        test_advertised_tool("repo_map", PermissionCapability::Search),
+        test_advertised_tool("decl_search", PermissionCapability::Search),
+        test_advertised_tool("definition_search", PermissionCapability::Search),
+        test_advertised_tool("reference_search", PermissionCapability::Search),
+        test_advertised_tool("hierarchy", PermissionCapability::Search),
+        test_advertised_tool("symbol_context", PermissionCapability::Search),
+        test_advertised_tool("upstream_flow", PermissionCapability::Search),
+        test_advertised_tool("downstream_flow", PermissionCapability::Search),
+        test_advertised_tool("diff_context", PermissionCapability::Read),
+        // Mutating tools the audit calls out by name plus one per remaining
+        // non-read capability.
+        test_advertised_tool("write_file", PermissionCapability::Edit),
+        test_advertised_tool("apply_patch", PermissionCapability::Edit),
+        test_advertised_tool("shell", PermissionCapability::Shell),
+        test_advertised_tool("webfetch", PermissionCapability::Network),
+        test_advertised_tool("mcp__remote__call", PermissionCapability::Mcp),
+        test_advertised_tool("git_commit", PermissionCapability::Git),
+        test_advertised_tool("cargo_build", PermissionCapability::Compiler),
+        test_advertised_tool("rm_rf", PermissionCapability::Destructive),
+    ]
+}
+
+#[test]
+fn explore_subagent_cannot_call_write_file() {
+    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the explorer
+    // role is read-only by construction. `subagent_allowed_tools` filters the
+    // parent tool advertisement down to Read|Search capability, so even when
+    // the parent advertises `write_file`, `apply_patch`, and `shell`, the
+    // explore subagent must never see them.
+    let parent_tools = parent_tools_with_mutators();
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Explore);
+    let allowed_names: BTreeSet<&str> =
+        allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
+
+    assert!(
+        !allowed_names.contains("write_file"),
+        "explore subagent must not see write_file: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("apply_patch"),
+        "explore subagent must not see apply_patch: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("shell"),
+        "explore subagent must not see shell: {allowed_names:?}"
+    );
+    // Read/search tools the explorer needs must survive the filter.
+    assert!(
+        allowed_names.contains("read_file"),
+        "explore subagent should keep read_file: {allowed_names:?}"
+    );
+    assert!(
+        allowed_names.contains("grep"),
+        "explore subagent should keep grep: {allowed_names:?}"
+    );
+}
+
+#[test]
+fn typed_subagents_filter_to_read_search_capability() {
+    // The capability filter is the load-bearing safety guarantee. Iterate
+    // every non-DocHelp role kind and assert that no tool of a capability
+    // outside `{Read, Search}` survives the filter. Captures explorer,
+    // planner, and reviewer — extending to any future typed subagent kind
+    // requires updating this matrix.
+    let parent_tools = parent_tools_with_mutators();
+    for kind in [
+        SubagentKind::Delegate,
+        SubagentKind::Explore,
+        SubagentKind::Plan,
+        SubagentKind::Review,
+    ] {
+        let allowed = subagent_allowed_tools(&parent_tools, kind);
+        for tool in &allowed {
+            assert!(
+                matches!(
+                    tool.capability,
+                    PermissionCapability::Read | PermissionCapability::Search
+                ),
+                "subagent kind {:?} leaked non-read/search tool {:?} with capability {:?}",
+                kind,
+                tool.spec.name,
+                tool.capability
+            );
+        }
+    }
+}
+
+#[test]
+fn reviewer_subagent_cannot_call_apply_patch_or_shell() {
+    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the reviewer
+    // role reviews diffs and must not be able to mutate the working tree or
+    // run shell commands, even if the parent advertisement contains those
+    // tools.
+    let parent_tools = parent_tools_with_mutators();
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Review);
+    let allowed_names: BTreeSet<&str> =
+        allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
+
+    assert!(
+        !allowed_names.contains("write_file"),
+        "reviewer subagent must not see write_file: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("apply_patch"),
+        "reviewer subagent must not see apply_patch: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("shell"),
+        "reviewer subagent must not see shell: {allowed_names:?}"
+    );
+    assert!(
+        allowed_names.contains("diff_context"),
+        "reviewer subagent should keep diff_context: {allowed_names:?}"
     );
 }
 
