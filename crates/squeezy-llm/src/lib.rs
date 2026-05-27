@@ -16,6 +16,7 @@ pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
 mod anthropic;
 mod bedrock;
+mod cache_policy;
 mod compatible;
 mod credentials;
 mod google;

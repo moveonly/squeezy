@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
+    cache_policy::{CachePolicy, json_markers, should_apply_caching},
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
 };
@@ -50,9 +51,8 @@ impl AnthropicProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
-        let prompt_caching = request.cache_key.is_some()
-            && crate::capabilities_for("anthropic", &request.model)
-                .is_some_and(|capabilities| capabilities.prompt_caching);
+        let policy = CachePolicy::AUTO;
+        let prompt_caching = should_apply_caching("anthropic", request);
         let max_tokens = request
             .max_output_tokens
             .map(u64::from)
@@ -64,8 +64,8 @@ impl AnthropicProvider {
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
         let mut body = json!({
             "model": request.model,
-            "system": anthropic_system(&request.instructions, prompt_caching),
-            "messages": anthropic_messages(&request.input, prompt_caching),
+            "system": anthropic_system(&request.instructions, prompt_caching && policy.system),
+            "messages": anthropic_messages(&request.input, prompt_caching, policy),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -92,10 +92,8 @@ impl AnthropicProvider {
                     })
                 })
                 .collect();
-            if prompt_caching
-                && let Some(obj) = tool_values.last_mut().and_then(Value::as_object_mut)
-            {
-                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+            if prompt_caching && policy.tools {
+                json_markers::mark_last_tool(&mut tool_values);
             }
             body["tools"] = Value::Array(tool_values);
         }
@@ -107,14 +105,10 @@ fn anthropic_system(instructions: &str, prompt_caching: bool) -> Value {
     if !prompt_caching {
         return json!(instructions);
     }
-    json!([{
-        "type": "text",
-        "text": instructions,
-        "cache_control": { "type": "ephemeral" },
-    }])
+    json_markers::system_array_with_marker(instructions)
 }
 
-fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
+fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: CachePolicy) -> Value {
     let mut messages = Vec::new();
     for item in input {
         match item {
@@ -188,26 +182,13 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
         }
     }
     if prompt_caching {
-        mark_last_user_block_for_cache(&mut messages);
+        match policy.messages {
+            crate::cache_policy::MessageStrategy::LatestUserMessage => {
+                json_markers::mark_last_user_block(&mut messages);
+            }
+        }
     }
     Value::Array(messages)
-}
-
-fn mark_last_user_block_for_cache(messages: &mut [Value]) {
-    for message in messages.iter_mut().rev() {
-        if message.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        if let Some(block) = message
-            .get_mut("content")
-            .and_then(Value::as_array_mut)
-            .and_then(|content| content.last_mut())
-            .and_then(Value::as_object_mut)
-        {
-            block.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-        }
-        return;
-    }
 }
 
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {

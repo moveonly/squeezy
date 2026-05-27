@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
+    cache_policy::should_apply_caching,
 };
 
 #[derive(Debug, Clone)]
@@ -91,9 +92,7 @@ impl LlmProvider for BedrockProvider {
             };
             let client = client_result?;
             let model = request.model.to_string();
-            let prompt_caching = request.cache_key.is_some()
-                && crate::capabilities_for("bedrock", &model)
-                    .is_some_and(|caps| caps.prompt_caching);
+            let prompt_caching = should_apply_caching("bedrock", &request);
             let mut builder = client.converse_stream().model_id(&model);
             for block in system_blocks(&request.instructions, prompt_caching)? {
                 builder = builder.system(block);

@@ -557,7 +557,7 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
         LlmInputItem::Reasoning(payload),
         LlmInputItem::AssistantText("answer".to_string()),
     ];
-    let messages = anthropic_messages(&input, false);
+    let messages = anthropic_messages(&input, false, CachePolicy::AUTO);
     let arr = messages.as_array().expect("array");
     assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
     let content = arr[0]["content"].as_array().expect("content array");
