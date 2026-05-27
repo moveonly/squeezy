@@ -2571,11 +2571,14 @@ fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
 
     toggle_selected_transcript_entry(&mut app);
     assert!(!app.transcript[0].collapsed);
-    assert_eq!(app.status, "expanded transcript entry 1");
+    assert_eq!(app.status, "expanded transcript entry 1 · Alt+E expand all");
 
     toggle_selected_transcript_entry(&mut app);
     assert!(app.transcript[0].collapsed);
-    assert_eq!(app.status, "collapsed transcript entry 1");
+    assert_eq!(
+        app.status,
+        "collapsed transcript entry 1 · Alt+E expand all"
+    );
 }
 
 #[test]
@@ -2590,7 +2593,116 @@ fn ctrl_e_without_selection_skips_prompt_rows_and_expands_collapsed_content() {
     toggle_selected_transcript_entry(&mut app);
 
     assert!(!app.transcript[0].collapsed);
-    assert_eq!(app.status, "expanded transcript entry 1");
+    assert_eq!(app.status, "expanded transcript entry 1 · Alt+E expand all");
+}
+
+#[test]
+fn toggle_expand_all_expands_every_collapsed_entry_when_any_are_collapsed() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_tool_result(sample_tool_result("read", "file body"));
+    app.push_tool_result(sample_tool_result("glob", "file list"));
+
+    assert!(app.transcript.iter().all(|e| e.collapsed));
+
+    toggle_expand_all_transcript_entries(&mut app);
+
+    assert!(
+        app.transcript.iter().all(|e| !e.collapsed),
+        "every toggleable entry should be expanded"
+    );
+    assert!(app.status.contains("expanded 3 of 3"));
+}
+
+#[test]
+fn toggle_expand_all_collapses_all_when_already_expanded() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_tool_result(sample_tool_result("read", "file body"));
+
+    toggle_expand_all_transcript_entries(&mut app);
+    assert!(app.transcript.iter().all(|e| !e.collapsed));
+
+    toggle_expand_all_transcript_entries(&mut app);
+    assert!(
+        app.transcript.iter().all(|e| e.collapsed),
+        "second press should collapse every entry"
+    );
+    assert!(app.status.contains("collapsed 2 of 2"));
+}
+
+#[test]
+fn toggle_expand_all_reports_nothing_to_expand_when_transcript_empty() {
+    let mut app = test_app(SessionMode::Build);
+    app.push_transcript_item(TranscriptItem::user("just a prompt"));
+
+    toggle_expand_all_transcript_entries(&mut app);
+    assert_eq!(app.status, "nothing expandable yet");
+}
+
+#[test]
+fn failed_tool_result_starts_expanded_so_error_is_visible() {
+    // The auto-expand-on-failure behavior is the user-visible payoff for
+    // the "every red ✖ shows raw error inline" UX fix. Build a tool
+    // result whose status is Error, then check that the constructor
+    // chose `collapsed = false`.
+    let mut app = test_app(SessionMode::Build);
+    let mut failed = sample_tool_result("delegate", "missing required string field: prompt");
+    failed.status = ToolStatus::Error;
+    app.push_tool_result(failed);
+    assert!(
+        !app.transcript[0].collapsed,
+        "failed tool result should not be collapsed by default"
+    );
+}
+
+#[tokio::test]
+async fn alt_e_dispatches_expand_all() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    app.push_tool_result(sample_tool_result("read", "file body"));
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+    )
+    .await
+    .expect("alt+e fires expand-all");
+
+    assert!(
+        app.transcript.iter().all(|e| !e.collapsed),
+        "Alt+E should expand both transcript entries"
+    );
+    assert!(app.status.contains("expanded"));
+}
+
+#[tokio::test]
+async fn ctrl_e_with_composer_text_keeps_line_end_and_emits_hint() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    set_input(&mut app, "abc".to_string());
+    app.input_cursor = 0;
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("ctrl-e with text moves cursor and emits hint");
+
+    assert_eq!(app.input_cursor, app.input.len(), "cursor moved to end");
+    assert!(
+        app.transcript[0].collapsed,
+        "transcript should not change when composer has text"
+    );
+    assert!(
+        app.status.contains("Alt+E"),
+        "status should hint Alt+E for transcript expansion"
+    );
 }
 
 #[tokio::test]

@@ -979,15 +979,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         // fall through — the keystroke still performs its normal action
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        if app.input.is_empty() {
-            toggle_selected_transcript_entry(app);
-        } else {
-            move_input_cursor_line_end(app);
-        }
-        return Ok(false);
-    }
-
     // The transcript-overlay open/close action is dispatched up top
     // by `dispatch_keymap_action`. While the overlay is open we still
     // need to forward navigation keys to its own handler before the
@@ -1017,6 +1008,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
         move_input_cursor_line_start(app);
+        return Ok(false);
+    }
+
+    // Readline-style line-end. The `ExpandSelectedTranscriptEntry`
+    // keymap action handles Ctrl+E when the composer is empty; when
+    // text is present it returns `false` after setting a hint status,
+    // and we end up here so the cursor-move semantics still work.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
+        move_input_cursor_line_end(app);
         return Ok(false);
     }
 
@@ -1400,6 +1400,58 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             } else {
                 false
             }
+        }
+        keymap::Action::ExpandSelectedTranscriptEntry => {
+            // Trace every press so a user running with
+            // `RUST_LOG=squeezy_tui=debug` can see exactly which branch
+            // fires (composer state, overlay state, etc.). Cheap to
+            // emit; only active when a subscriber is attached.
+            tracing::debug!(
+                target: "squeezy_tui::keymap",
+                action = "expand_selected_transcript_entry",
+                composer_empty = app.input.is_empty(),
+                config_screen_open = app.config_screen.is_some(),
+                status_line_setup_open = app.status_line_setup.is_some(),
+                key_modifiers = ?key.modifiers,
+                key_code = ?key.code,
+                "Ctrl+E dispatched"
+            );
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            // Match the existing TranscriptHome/TranscriptEnd dual-mode
+            // semantics: when the composer has text, fall through so
+            // readline `move_input_cursor_line_end` keeps working.
+            // Otherwise expand the selected (or latest collapsed)
+            // transcript entry.
+            if !app.input.is_empty() {
+                // Helpful one-shot status hint so the user knows why
+                // Ctrl+E didn't expand — composer state is the most
+                // common reason this surface appears "broken".
+                app.status =
+                    "Ctrl+E moves to end-of-line in the composer · clear input or press Alt+E to expand transcript"
+                        .to_string();
+                return false;
+            }
+            toggle_selected_transcript_entry(app);
+            true
+        }
+        keymap::Action::ExpandAllTranscriptEntries => {
+            tracing::debug!(
+                target: "squeezy_tui::keymap",
+                action = "expand_all_transcript_entries",
+                composer_empty = app.input.is_empty(),
+                config_screen_open = app.config_screen.is_some(),
+                status_line_setup_open = app.status_line_setup.is_some(),
+                key_modifiers = ?key.modifiers,
+                key_code = ?key.code,
+                "Alt+E dispatched"
+            );
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            toggle_expand_all_transcript_entries(app);
+            true
         }
     }
 }
@@ -2957,7 +3009,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         .or_else(|| latest_collapsed_transcript_entry(app))
         .or_else(|| latest_toggleable_transcript_entry(app))
     else {
-        app.status = "nothing expandable yet".to_string();
+        app.status = "nothing expandable yet · Alt+E expand all".to_string();
         return;
     };
     let Some(entry) = app.transcript.get_mut(index) else {
@@ -2967,7 +3019,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
     };
     entry.collapsed = !entry.collapsed;
     app.status = format!(
-        "{} transcript entry {}",
+        "{} transcript entry {} · Alt+E expand all",
         if entry.collapsed {
             "collapsed"
         } else {
@@ -2975,6 +3027,49 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
         },
         entry.id + 1
     );
+}
+
+/// Bulk expand / collapse across every toggleable transcript entry.
+///
+/// Semantics: if any toggleable entry is currently collapsed, expand
+/// all of them; otherwise (everything already expanded), collapse all
+/// back to default. One-shot toggle so the user can rapidly switch
+/// between "show me everything" and "back to compact" states.
+///
+/// Reports the count operated on via `app.status` so the user always
+/// gets feedback — silent UI is the whole reason the original
+/// transcript expand surface felt broken on small screens.
+fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
+    let mut total_toggleable = 0usize;
+    let mut total_collapsed = 0usize;
+    for entry in &app.transcript {
+        if entry.is_toggleable() {
+            total_toggleable += 1;
+            if entry.collapsed {
+                total_collapsed += 1;
+            }
+        }
+    }
+    if total_toggleable == 0 {
+        app.status = "nothing expandable yet".to_string();
+        return;
+    }
+    let target_collapsed = total_collapsed == 0;
+    let mut changed = 0usize;
+    for entry in app.transcript.iter_mut() {
+        if !entry.is_toggleable() {
+            continue;
+        }
+        if entry.collapsed != target_collapsed {
+            entry.collapsed = target_collapsed;
+            changed += 1;
+        }
+    }
+    app.status = if target_collapsed {
+        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+E expand one")
+    } else {
+        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+E collapse one")
+    };
 }
 
 fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
@@ -8847,7 +8942,7 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Up/Down choose · Enter select · Y approve · A always approve repo · N deny · Esc cancel"
             .to_string();
     } else if app.cancel.is_some() {
-        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Ctrl-T transcript · Ctrl-Y copy · /help"
+        return "Ctrl-C/Esc interrupt · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help"
             .to_string();
     } else if app.exit_confirm_armed {
         return "Ctrl+C or Y to exit · any other key to cancel".to_string();
@@ -8858,10 +8953,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0
@@ -9867,11 +9962,20 @@ impl TranscriptEntry {
         call: Option<ToolCall>,
         _transcript_default: TranscriptDefault,
     ) -> Self {
-        // Tool results are now uniformly collapsed-by-default: the new
-        // codex-style head-tail preview caps each card at ~5 lines (50
-        // for direct `!`-shell). `TranscriptDefault::Normal|Compact`
-        // still gates messages and logs but no longer the tool card,
-        // because the cap itself is the whole point of the preview.
+        // Tool results are uniformly collapsed-by-default for the happy
+        // path: the codex-style head-tail preview caps each card at ~5
+        // lines (50 for direct `!`-shell).
+        //
+        // Failed tool calls are the exception. The preview hides the
+        // actual error message under "Ctrl-E to expand", which is
+        // exactly the failure mode the user complained about — a row
+        // of red ✖ "Failed X" with no visible reason. Auto-expand on
+        // failure so the diagnostic is inline, without forcing a
+        // keypress per error to read it.
+        let collapsed_default = !matches!(
+            result.status,
+            ToolStatus::Error | ToolStatus::Denied | ToolStatus::Cancelled
+        );
         Self {
             id,
             kind: TranscriptEntryKind::ToolResult(Box::new(ToolTranscript {
@@ -9879,7 +9983,7 @@ impl TranscriptEntry {
                 result,
                 repeat_count: 1,
             })),
-            collapsed: true,
+            collapsed: collapsed_default,
         }
     }
 
