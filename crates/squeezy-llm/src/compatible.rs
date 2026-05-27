@@ -165,6 +165,17 @@ impl OpenAiCompatibleProvider {
             body["reasoning_effort"] = json!(effort_str);
             body["reasoning"] = json!({ "effort": effort_str });
         }
+        if let Some(cache_key) = &request.cache_key {
+            // OpenAI's Chat Completions / Responses APIs honor a top-level
+            // `prompt_cache_key` that groups requests for prompt-cache
+            // affinity. OpenRouter forwards the field verbatim to OpenAI-
+            // hosted models (`openai/*`), and other aggregator routes ignore
+            // unknown body fields, so emitting it unconditionally costs
+            // nothing and recovers cached-input billing for OpenAI-via-
+            // OpenRouter traffic that the Anthropic-only `cache_control`
+            // path above does not cover.
+            body["prompt_cache_key"] = json!(cache_key);
+        }
         if !request.tools.is_empty() {
             body["tools"] = json!(
                 request
@@ -252,10 +263,16 @@ impl LlmProvider for OpenAiCompatibleProvider {
             let response = if status == StatusCode::OK {
                 response
             } else {
-                let message = response
+                let raw_body = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "failed to read error response".to_string());
+                let message = match serde_json::from_str::<Value>(&raw_body) {
+                    Ok(value) if value.get("error").is_some() => {
+                        format_chat_error(&value, &raw_body)
+                    }
+                    _ => raw_body.clone(),
+                };
                 // PortKey returns 400 about `x-portkey-*` whenever it
                 // can't figure out which upstream to dial. The most
                 // common cause on integration-style PortKey accounts is
@@ -346,9 +363,11 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 );
             }
             if !state.completed_emitted {
+                let stop_reason = state.finish_reason.as_deref().map(chat_stop_reason);
                 yield LlmEvent::Completed {
                     response_id: state.response_id.take(),
                     cost: state.cost.clone(),
+                    stop_reason,
                 };
             }
         })
@@ -444,6 +463,10 @@ struct StreamState {
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     completed_emitted: bool,
+    /// Captured OpenAI chat-completions `finish_reason` from the last
+    /// streamed choice, so the agent's turn loop sees a normalized
+    /// stop reason for compatibility providers too.
+    finish_reason: Option<String>,
     /// Accumulates `reasoning_content` / `reasoning` text streamed across
     /// chat-completions deltas. Drained into a `ReasoningDone` event when
     /// the stream finishes so the agent loop persists the segment to the
@@ -543,6 +566,19 @@ impl StreamState {
 /// a generic carrier — the chat-completions replay path drops
 /// `LlmInputItem::Reasoning` items entirely, so the variant choice only
 /// affects display, never the wire format on the next turn.
+/// Map OpenAI Chat-Completions `finish_reason` strings to the normalized
+/// [`crate::StopReason`]. Shared by the Responses-style streaming path and
+/// the legacy chat-completions path in this provider.
+fn chat_stop_reason(value: &str) -> crate::StopReason {
+    match value {
+        "stop" => crate::StopReason::EndTurn,
+        "tool_calls" | "function_call" => crate::StopReason::ToolUse,
+        "length" => crate::StopReason::MaxTokens,
+        "content_filter" => crate::StopReason::Refusal,
+        other => crate::StopReason::Other(other.to_string()),
+    }
+}
+
 fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
     let text = std::mem::take(&mut state.reasoning_buf);
     if text.trim().is_empty() {
@@ -586,6 +622,36 @@ fn collect_delta_text(value: Option<&Value>) -> String {
     }
 }
 
+/// Format a Chat-Completions `{ "error": { message, type, code, … } }` envelope
+/// into a single human-readable string. Surfaces `type` and `code` (Anthropic's
+/// `rate_limit_error`, OpenAI's `invalid_request_error` / `context_length_exceeded`,
+/// OpenRouter / aggregator-specific codes) which the upstream caller needs to
+/// distinguish retryable failures from auth failures from prompt-shape bugs.
+/// Falls back to `default_message` only when `error` is missing or empty.
+fn format_chat_error(value: &Value, default_message: &str) -> String {
+    let error = value.get("error");
+    let message = error
+        .and_then(|err| err.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| error.and_then(Value::as_str))
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(default_message);
+    let kind = error
+        .and_then(|err| err.get("type"))
+        .and_then(Value::as_str);
+    let code = error.and_then(|err| err.get("code")).and_then(|c| {
+        c.as_str()
+            .map(str::to_string)
+            .or_else(|| c.as_i64().map(|n| n.to_string()))
+    });
+    match (kind, code.as_deref()) {
+        (Some(kind), Some(code)) => format!("{message} (type={kind}, code={code})"),
+        (Some(kind), None) => format!("{message} (type={kind})"),
+        (None, Some(code)) => format!("{message} (code={code})"),
+        (None, None) => message.to_string(),
+    }
+}
+
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
@@ -593,9 +659,11 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
             events.push(reasoning_done);
         }
         if !state.completed_emitted {
+            let stop_reason = state.finish_reason.as_deref().map(chat_stop_reason);
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.take(),
                 cost: state.cost.clone(),
+                stop_reason,
             });
             state.completed_emitted = true;
         }
@@ -605,14 +673,11 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid SSE JSON: {err}")))?;
 
-    if let Some(error) = value.get("error") {
-        let message = error
-            .get("message")
-            .and_then(Value::as_str)
-            .or_else(|| error.as_str())
-            .unwrap_or("chat completions stream error")
-            .to_string();
-        return Err(SqueezyError::ProviderStream(message));
+    if value.get("error").is_some() {
+        return Err(SqueezyError::ProviderStream(format_chat_error(
+            &value,
+            "chat completions stream error",
+        )));
     }
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
@@ -651,6 +716,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 }
             }
             if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                state.finish_reason = Some(finish_reason.to_string());
                 match finish_reason {
                     "tool_calls" | "function_call" => {
                         events.extend(state.drain_tool_calls()?);

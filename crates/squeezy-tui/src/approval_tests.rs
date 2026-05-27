@@ -45,6 +45,7 @@ fn request_with(
         matched_rule: None,
         reason: "test".to_string(),
         context: None,
+        preview: Vec::new(),
     }
 }
 
@@ -230,5 +231,50 @@ fn approval_menu_labels_name_capability_scope() {
     assert!(
         git_menu.contains("Deny") && git_menu.contains("Deny for this session"),
         "deny options missing: {git_menu}"
+    );
+}
+
+#[test]
+fn edit_preview_renders_unified_diff_with_gutter() {
+    // Approvals for `apply_patch` / `write_file` ship a `unified_diff`
+    // metadata key when the tool registry can synthesise one; the
+    // preview must thread that body through the same gutter +
+    // syntax-highlighted renderer used by `/diff`. Reviewers approve
+    // patches more confidently when sign characters and the diff
+    // colouring reach the screen, not just a path list.
+    let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old line\n+new line\n";
+    let req = request_with(
+        "apply_patch",
+        PermissionCapability::Edit,
+        "path:src/lib.rs",
+        &[("paths", "src/lib.rs"), ("unified_diff", diff)],
+    );
+    let lines = render_preview(&req);
+    let out = flatten(&lines);
+    assert!(out.contains("-old line"), "missing remove line: {out}");
+    assert!(out.contains("+new line"), "missing add line: {out}");
+}
+
+#[test]
+fn edit_preview_without_diff_keeps_legacy_layout() {
+    // When the tool registry cannot synthesise a `unified_diff`
+    // (e.g. `checkpoint_undo`, or an `apply_patch` with no patches /
+    // operations), the preview must stay as the path-only block —
+    // the gutter renderer is opt-in via the metadata key.
+    let req = request_with(
+        "write_file",
+        PermissionCapability::Edit,
+        "path:foo.rs",
+        &[("path", "foo.rs")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(out.contains("✎ foo.rs"), "path missing: {out}");
+    assert!(
+        !out.contains("+"),
+        "stray add gutter in legacy layout: {out}"
+    );
+    assert!(
+        !out.contains("-"),
+        "stray remove gutter in legacy layout: {out}"
     );
 }

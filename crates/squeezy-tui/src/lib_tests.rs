@@ -3522,6 +3522,56 @@ fn reasoning_usage_status_is_hidden_when_disabled() {
 }
 
 #[test]
+fn reasoning_delta_renders_with_dim_italic() {
+    let expected_modifiers = Modifier::DIM | Modifier::ITALIC;
+
+    let block = reasoning_block_lines("first thought\nsecond thought", false, false);
+    assert!(
+        block.len() >= 2,
+        "expanded reasoning emits header and at least one body line: {block:?}"
+    );
+    for line in &block {
+        for span in &line.spans {
+            assert!(
+                span.style.add_modifier.contains(expected_modifiers),
+                "reasoning span missing dim+italic: {span:?}"
+            );
+            assert!(
+                span.style.fg.is_none(),
+                "reasoning style should not pin a foreground colour: {span:?}"
+            );
+        }
+    }
+    let body_text: String = block
+        .iter()
+        .skip(1)
+        .flat_map(|line| line.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    assert!(
+        body_text.contains("▏ first thought") && body_text.contains("▏ second thought"),
+        "reasoning body should use ▏ left-indent marker: {body_text}",
+    );
+
+    let streaming = streaming_reasoning_lines("partial thinking");
+    let header = streaming
+        .first()
+        .expect("streaming reasoning emits a header line");
+    assert!(
+        header.spans.iter().any(|s| s.content.contains("thinking…")
+            && s.style.add_modifier.contains(expected_modifiers)),
+        "streaming header missing dim+italic: {header:?}",
+    );
+    let body = streaming
+        .get(1)
+        .expect("streaming reasoning emits a body line");
+    let body_text: String = body.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        body_text.starts_with("▏ "),
+        "streaming body should use ▏ left-indent marker: {body_text}",
+    );
+}
+
+#[test]
 fn approval_prompt_renders_actionable_menu_without_metadata_dump() {
     let request = sample_approval_request();
 
@@ -3562,6 +3612,7 @@ fn approval_status_line_is_compact_single_line() {
         matched_rule: None,
         reason: "default shell permission is ask".to_string(),
         context: None,
+        preview: Vec::new(),
     };
     let line = format_approval_status_line(&request);
     assert!(!line.contains('\n'), "status line must be single line");
@@ -3959,6 +4010,16 @@ fn exit_hint_points_to_session_resume_command() {
         Some("Squeezy session saved. Resume with: squeezy sessions resume session-123")
     );
     assert!(exit_hint(None).is_none());
+}
+
+#[test]
+fn cross_project_resume_hint_quotes_target_cwd_and_command() {
+    let hint = cross_project_resume_hint("session-abc", "/work/other");
+    assert!(hint.contains("/work/other"), "{hint}");
+    assert!(
+        hint.contains("squeezy sessions resume session-abc"),
+        "{hint}"
+    );
 }
 
 #[test]
@@ -5026,27 +5087,27 @@ async fn slash_jobs_lists_and_shows_jobs() {
     });
     app.jobs.insert(job.id, job.clone());
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
-    assert_eq!(app.status, "1 jobs");
+    assert!(handle_slash_command(&mut app, &mut agent, "/tasks").await);
+    assert_eq!(app.status, "1 tasks");
     assert!(
         last_message_content(&app).is_some_and(|content| content.contains("checkpoint_list")),
-        "expected jobs list to include checkpoint_list"
+        "expected tasks list to include checkpoint_list"
     );
 
-    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job {}", job.id)).await);
-    assert!(app.status.starts_with(&format!("job {} ", job.id)));
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/task {}", job.id)).await);
+    assert!(app.status.starts_with(&format!("task {} ", job.id)));
     let detail = last_message_content(&app).unwrap_or_default().to_string();
     assert!(
         detail.contains("output_handle=-"),
-        "expected job detail to include output handle placeholder: {detail}"
+        "expected task detail to include output handle placeholder: {detail}"
     );
     assert!(
         detail.contains("tool=checkpoint_list"),
-        "expected job detail to include tool name: {detail}"
+        "expected task detail to include tool name: {detail}"
     );
     assert!(
         detail.contains("call_id=test-checkpoints"),
-        "expected job detail to include call_id: {detail}"
+        "expected task detail to include call_id: {detail}"
     );
 }
 
@@ -5061,10 +5122,10 @@ async fn slash_job_cancel_cancels_active_job() {
     });
     app.jobs.insert(job.id, job.clone());
 
-    assert!(handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await);
+    assert!(handle_slash_command(&mut app, &mut agent, &format!("/task-cancel {}", job.id)).await);
     assert!(
-        app.status.starts_with("cancelling job ")
-            || app.status.starts_with(&format!("job {} ", job.id)),
+        app.status.starts_with("cancelling task ")
+            || app.status.starts_with(&format!("task {} ", job.id)),
         "expected cancel acknowledgement, got {}",
         app.status
     );
@@ -5074,9 +5135,9 @@ async fn slash_job_cancel_cancels_active_job() {
     let mut saw_inactive = false;
     for _ in 0..max_attempts {
         assert!(
-            handle_slash_command(&mut app, &mut agent, &format!("/job-cancel {}", job.id)).await
+            handle_slash_command(&mut app, &mut agent, &format!("/task-cancel {}", job.id)).await
         );
-        if app.status == format!("job {} not active", job.id) {
+        if app.status == format!("task {} not active", job.id) {
             saw_inactive = true;
             break;
         }
@@ -5084,7 +5145,7 @@ async fn slash_job_cancel_cancels_active_job() {
     }
     assert!(
         saw_inactive,
-        "job never reported as inactive: {}",
+        "task never reported as inactive: {}",
         app.status
     );
 }
@@ -5094,11 +5155,55 @@ async fn slash_job_cancel_rejects_non_numeric_id() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel abc").await);
-    assert_eq!(app.status, "job id must be a number");
+    assert!(handle_slash_command(&mut app, &mut agent, "/task-cancel abc").await);
+    assert_eq!(app.status, "task id must be a number");
 
-    assert!(handle_slash_command(&mut app, &mut agent, "/job-cancel").await);
-    assert_eq!(app.status, "usage: /job-cancel <job_id>");
+    assert!(handle_slash_command(&mut app, &mut agent, "/task-cancel").await);
+    assert_eq!(app.status, "usage: /task-cancel <id>");
+}
+
+// `/jobs`, `/job`, `/job-cancel` are kept as aliases for one release. The
+// canonical name is `/tasks` — see F07-cc-tasks-and-background-jobs.
+mod slash_commands {
+    pub(super) mod tasks {
+        use super::super::*;
+
+        #[tokio::test]
+        async fn lists_jobs_and_reviewer() {
+            let mut agent = test_agent(SessionMode::Build);
+            let mut app = test_app(SessionMode::Build);
+            // An in-flight (Queued / Running) job belongs to the listing.
+            let job = agent.start_local_tool_job(ToolCall {
+                call_id: "test-tasks".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: serde_json::json!({}),
+            });
+            app.jobs.insert(job.id, job.clone());
+
+            assert!(handle_slash_command(&mut app, &mut agent, "/tasks").await);
+            let body = last_message_content(&app).unwrap_or_default().to_string();
+            assert!(
+                body.contains("checkpoint_list"),
+                "expected /tasks output to include the in-flight job: {body}"
+            );
+            assert!(
+                body.contains("reviewer"),
+                "expected /tasks output to include a reviewer line: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn jobs_alias_renders_same_surface() {
+            let mut agent = test_agent(SessionMode::Build);
+            let mut app = test_app(SessionMode::Build);
+            assert!(handle_slash_command(&mut app, &mut agent, "/jobs").await);
+            let body = last_message_content(&app).unwrap_or_default().to_string();
+            assert!(
+                body.contains("reviewer"),
+                "expected /jobs alias to render the /tasks surface: {body}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -6196,6 +6301,7 @@ fn sample_approval_request() -> ToolApprovalRequest {
         matched_rule: None,
         reason: "default compiler permission is ask".to_string(),
         context: None,
+        preview: Vec::new(),
     }
 }
 
@@ -6523,6 +6629,58 @@ async fn slash_verbosity_with_inline_arg_applies_immediately() {
     );
 }
 
+// ---- /effort session-level reasoning-effort setter ----
+
+#[tokio::test]
+async fn slash_effort_low_sets_session_reasoning_effort() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(agent.config_snapshot().reasoning_effort.is_none());
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort low").await;
+    assert!(ran);
+    assert_eq!(
+        agent.config_snapshot().reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Low),
+    );
+}
+
+#[tokio::test]
+async fn slash_effort_auto_clears_session_reasoning_effort() {
+    let mut agent = test_agent(SessionMode::Build);
+    // Pre-seed a value so `auto` has something to clear.
+    let mut seeded = agent.config_snapshot();
+    seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::High);
+    agent.replace_config(seeded);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort auto").await;
+    assert!(ran);
+    assert!(agent.config_snapshot().reasoning_effort.is_none());
+}
+
+#[tokio::test]
+async fn slash_effort_rejects_unknown_value() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut seeded = agent.config_snapshot();
+    seeded.reasoning_effort = Some(squeezy_core::ReasoningEffort::Medium);
+    agent.replace_config(seeded);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/effort bogus").await;
+    assert!(ran);
+    // Original value preserved on bad input.
+    assert_eq!(
+        agent.config_snapshot().reasoning_effort,
+        Some(squeezy_core::ReasoningEffort::Medium),
+    );
+    assert!(
+        app.status.contains("unknown effort"),
+        "expected error status, got {}",
+        app.status,
+    );
+}
+
 #[tokio::test]
 async fn slash_verbosity_opens_config_when_called_without_arg() {
     let mut agent = test_agent(SessionMode::Build);
@@ -6654,6 +6812,70 @@ async fn slash_theme_without_arg_shows_usage() {
         "expected usage hint, got: {}",
         app.status
     );
+}
+
+/// `/theme catppuccin` pins the Dark tone *and* flips the accent variant
+/// so the working-shimmer and prompt cursor render in mauve. Verifies that
+/// each named theme drives both the tone and the accent override — the two
+/// must move together or the result is a mismatched palette.
+#[tokio::test]
+async fn slash_theme_catppuccin_pins_dark_tone_and_mauve_accent() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_catppuccin");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme catppuccin").await;
+    assert!(ran, "/theme catppuccin should dispatch");
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Dark);
+    assert_eq!(
+        palette::accent_variant(),
+        palette::AccentVariant::Catppuccin
+    );
+    assert_ne!(
+        palette::accent_primary(),
+        palette::AMBER,
+        "catppuccin must override the amber default to the mauve accent",
+    );
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::Catppuccin
+    );
+}
+
+/// `/theme high-contrast` pins the Light tone with a bright accessibility
+/// accent. Validates the hyphenated-argument path users will type and that
+/// the accent override flips to HighContrast independently of `dark`/
+/// `light` so reverting via `/theme system` restores the default.
+#[tokio::test]
+async fn slash_theme_high_contrast_pins_light_tone_and_yellow_accent() {
+    use crate::render::palette;
+
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let dir = temp_workspace("theme_hc");
+    let _guard = ScopedSettingsPath::new(dir.join("settings.toml"));
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme high-contrast").await;
+    assert!(ran);
+    assert_eq!(palette::palette_tone(), palette::PaletteTone::Light);
+    assert_eq!(
+        palette::accent_variant(),
+        palette::AccentVariant::HighContrast
+    );
+    assert_eq!(
+        agent.config_snapshot().tui.theme,
+        squeezy_core::TuiTheme::HighContrast,
+    );
+
+    // Reverting clears both overrides so the next session paints the
+    // detector-derived tone with the amber/gold default again.
+    let ran = handle_slash_command(&mut app, &mut agent, "/theme system").await;
+    assert!(ran);
+    assert_eq!(palette::accent_variant(), palette::AccentVariant::Default);
+    assert_eq!(palette::accent_primary(), palette::AMBER);
 }
 
 /// `/keymap` lists the current bindings — even with no overrides it
@@ -6800,6 +7022,7 @@ impl ScopedSettingsPath {
         // Start every theme test from a known palette state — even if a
         // previous test left an override behind.
         crate::render::palette::set_palette_tone_override(None);
+        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
         let previous = std::env::var_os("SQUEEZY_SETTINGS_PATH");
         // SAFETY: the global mutex above ensures no other theme test is
         // mutating this env var at the same time.
@@ -6819,6 +7042,7 @@ impl Drop for ScopedSettingsPath {
             None => unsafe { std::env::remove_var("SQUEEZY_SETTINGS_PATH") },
         }
         crate::render::palette::set_palette_tone_override(None);
+        crate::render::palette::set_accent_variant(crate::render::palette::AccentVariant::Default);
     }
 }
 
@@ -6828,7 +7052,7 @@ impl Drop for ScopedSettingsPath {
 fn mention_popup_opens_after_typing_at_word() {
     let mut app = test_app(SessionMode::Build);
     // Seed workspace files so the popup doesn't trigger a real crawl.
-    app.workspace_files = Some(Arc::new(vec![
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("docs/readme.md"),
     ]));
@@ -6847,9 +7071,9 @@ fn mention_popup_opens_after_typing_at_word() {
 async fn mention_popup_inserts_path_on_enter() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
-        "crates/squeezy-graph/src/lib.rs",
-    )]));
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
 
     insert_input_text(&mut app, "@graph");
     assert!(app.mention_popup.is_some());
@@ -6870,9 +7094,9 @@ async fn mention_popup_inserts_path_on_enter() {
 async fn mention_popup_escapes_on_esc() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
-    app.workspace_files = Some(Arc::new(vec![PathBuf::from(
-        "crates/squeezy-graph/src/lib.rs",
-    )]));
+    app.workspace_file_cache = Some(mention::WorkspaceFileCache::from_paths_for_tests(vec![
+        PathBuf::from("crates/squeezy-graph/src/lib.rs"),
+    ]));
 
     insert_input_text(&mut app, "@graph");
     handle_key(
@@ -7216,6 +7440,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/session-cleanup",
         "/undo",
         "/revert-turn",
+        "/effort",
         "/verbosity",
         "/tool-verbosity",
     ];
@@ -7894,4 +8119,128 @@ fn frame_rate_limiter_coalesces_burst_into_one_emit() {
         denied, 5,
         "all five follow-up events inside the budget must be denied"
     );
+}
+
+#[tokio::test]
+async fn alt_one_resumes_most_recent_non_active_session() {
+    // Seed two extra sessions for the workspace and assert Alt+1 lands on
+    // the more recently started one (the active session is excluded so
+    // slot 1 picks the next-newest peer).
+    let root = temp_workspace("quick_switch");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+
+    let older = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed older session");
+    let newer = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed newer session");
+    // Force an explicit ordering so the test does not depend on
+    // back-to-back `now_ms()` calls landing on different millisecond
+    // boundaries.
+    older
+        .update_metadata(|metadata| metadata.started_at_ms = 1_000)
+        .expect("backdate older");
+    newer
+        .update_metadata(|metadata| metadata.started_at_ms = 2_000)
+        .expect("backdate newer");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 should claim the press when a peer session exists"
+    );
+    assert_eq!(
+        agent.session_id().as_deref(),
+        Some(newer.session_id()),
+        "Alt+1 must land on the newer peer; status={}",
+        app.status,
+    );
+    assert!(
+        app.status.contains("resumed session"),
+        "status should report the resume: {}",
+        app.status,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn alt_nine_reports_no_session_when_slot_is_empty() {
+    // With only one peer session in the store, Alt+9 has nothing to land
+    // on; the handler still claims the keypress (so it doesn't fall
+    // through to other Alt handlers) but reports the empty slot.
+    let root = temp_workspace("quick_switch_empty");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    let only = store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed only peer");
+    let only_id = only.session_id().to_string();
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let active_before = agent.session_id();
+
+    assert!(
+        handle_session_quick_switch(&mut app, &mut agent, 9).await,
+        "Alt+9 must claim the press even when no slot 9 exists"
+    );
+    assert_eq!(
+        agent.session_id(),
+        active_before,
+        "agent must stay on its current session when slot 9 is empty",
+    );
+    assert!(
+        app.status.contains("no recent session"),
+        "status should surface the empty-slot message: {}",
+        app.status,
+    );
+    // Sanity check that the seeded peer actually exists; otherwise the
+    // empty-slot assertion would pass for the wrong reason.
+    let listed = agent
+        .list_sessions(&squeezy_store::SessionQuery::default())
+        .expect("list sessions");
+    assert!(
+        listed.iter().any(|meta| meta.session_id == only_id),
+        "seeded peer must appear in list",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn alt_one_skips_when_an_approval_is_pending() {
+    // Modal-blocking states (approval, plan choice, config screen, …)
+    // must not consume the Alt+1 press so the user can still type into
+    // the prompt; the handler returns `false` and leaves status alone.
+    let root = temp_workspace("quick_switch_blocked");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let store = squeezy_store::SessionStore::open(&config);
+    store
+        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .expect("seed peer session");
+
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+    app.pending_approval = Some(PendingApproval {
+        request: sample_approval_request(),
+        decision_tx,
+    });
+    let status_before = app.status.clone();
+
+    assert!(
+        !handle_session_quick_switch(&mut app, &mut agent, 1).await,
+        "Alt+1 must fall through while an approval is pending",
+    );
+    assert_eq!(
+        app.status, status_before,
+        "blocked Alt+1 must not overwrite status"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }

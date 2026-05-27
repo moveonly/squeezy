@@ -11,8 +11,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
+    anthropic_betas::anthropic_header_value,
+    cache_policy::{CachePolicy, json_markers, should_apply_caching},
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
+    sse::SseDecoder,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -50,9 +53,8 @@ impl AnthropicProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
-        let prompt_caching = request.cache_key.is_some()
-            && crate::capabilities_for("anthropic", &request.model)
-                .is_some_and(|capabilities| capabilities.prompt_caching);
+        let policy = CachePolicy::AUTO;
+        let prompt_caching = should_apply_caching("anthropic", request);
         let max_tokens = request
             .max_output_tokens
             .map(u64::from)
@@ -64,8 +66,8 @@ impl AnthropicProvider {
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
         let mut body = json!({
             "model": request.model,
-            "system": anthropic_system(&request.instructions, prompt_caching),
-            "messages": anthropic_messages(&request.input, prompt_caching),
+            "system": anthropic_system(&request.instructions, prompt_caching && policy.system),
+            "messages": anthropic_messages(&request.input, prompt_caching, policy),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -92,10 +94,18 @@ impl AnthropicProvider {
                     })
                 })
                 .collect();
-            if prompt_caching
-                && let Some(obj) = tool_values.last_mut().and_then(Value::as_object_mut)
-            {
-                obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+            if prompt_caching && policy.tools {
+                let breakpoint_idx = request
+                    .tools
+                    .iter()
+                    .rposition(|tool| !tool.name.starts_with("mcp__"))
+                    .unwrap_or(request.tools.len().saturating_sub(1));
+                if let Some(obj) = tool_values
+                    .get_mut(breakpoint_idx)
+                    .and_then(Value::as_object_mut)
+                {
+                    obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
+                }
             }
             body["tools"] = Value::Array(tool_values);
         }
@@ -107,14 +117,10 @@ fn anthropic_system(instructions: &str, prompt_caching: bool) -> Value {
     if !prompt_caching {
         return json!(instructions);
     }
-    json!([{
-        "type": "text",
-        "text": instructions,
-        "cache_control": { "type": "ephemeral" },
-    }])
+    json_markers::system_array_with_marker(instructions)
 }
 
-fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
+fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: CachePolicy) -> Value {
     let mut messages = Vec::new();
     for item in input {
         match item {
@@ -188,26 +194,13 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool) -> Value {
         }
     }
     if prompt_caching {
-        mark_last_user_block_for_cache(&mut messages);
+        match policy.messages {
+            crate::cache_policy::MessageStrategy::LatestUserMessage => {
+                json_markers::mark_last_user_block(&mut messages);
+            }
+        }
     }
     Value::Array(messages)
-}
-
-fn mark_last_user_block_for_cache(messages: &mut [Value]) {
-    for message in messages.iter_mut().rev() {
-        if message.get("role").and_then(Value::as_str) != Some("user") {
-            continue;
-        }
-        if let Some(block) = message
-            .get_mut("content")
-            .and_then(Value::as_array_mut)
-            .and_then(|content| content.last_mut())
-            .and_then(Value::as_object_mut)
-        {
-            block.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-        }
-        return;
-    }
 }
 
 fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut blocks: Vec<Value>) {
@@ -235,6 +228,7 @@ impl LlmProvider for AnthropicProvider {
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
         let body = Self::request_body(&request);
+        let beta_header = anthropic_header_value(&request.beta_headers);
         let transport = self.transport;
 
         let attempt_cancel = cancel.clone();
@@ -244,6 +238,7 @@ impl LlmProvider for AnthropicProvider {
                 api_key.clone(),
                 url.clone(),
                 body.clone(),
+                beta_header.clone(),
                 transport,
                 attempt_cancel.clone(),
             )
@@ -263,16 +258,20 @@ fn anthropic_stream_attempt(
     api_key: String,
     url: String,
     body: Value,
+    beta_header: Option<String>,
     transport: ProviderTransportConfig,
     cancel: CancellationToken,
 ) -> LlmStream {
     Box::pin(try_stream! {
         let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-            client
+            let mut builder = client
                 .post(&url)
                 .header("x-api-key", api_key.clone())
-                .header("anthropic-version", ANTHROPIC_VERSION)
-                .json(&body)
+                .header("anthropic-version", ANTHROPIC_VERSION);
+            if let Some(value) = beta_header.as_deref() {
+                builder = builder.header("anthropic-beta", value);
+            }
+            builder.json(&body)
         }).await?;
 
         let status = response.status();
@@ -365,65 +364,6 @@ struct PartialToolCall {
     call_id: String,
     name: String,
     arguments_json: String,
-}
-
-#[derive(Debug, Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(bytes);
-        let mut events = Vec::new();
-
-        while let Some((index, len)) = find_event_boundary(&self.buffer) {
-            let event = self.buffer.drain(..index + len).collect::<Vec<_>>();
-            if let Some(data) = decode_sse_event(&event) {
-                events.push(data);
-            }
-        }
-
-        events
-    }
-
-    fn finish(&mut self) -> Vec<String> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-
-        let event = std::mem::take(&mut self.buffer);
-        decode_sse_event(&event).into_iter().collect()
-    }
-}
-
-fn find_event_boundary(bytes: &[u8]) -> Option<(usize, usize)> {
-    let lf = bytes
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .map(|index| (index, 2));
-    let crlf = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|index| (index, 4));
-
-    [lf, crlf].into_iter().flatten().min_by_key(|b| b.0)
-}
-
-fn decode_sse_event(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut data_lines = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start());
-        }
-    }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
-    }
 }
 
 fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result<Vec<LlmEvent>> {
@@ -655,11 +595,16 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             none()
         }
         "message_stop" => {
-            if state.stop_reason.as_deref() == Some("max_tokens") {
-                return Err(SqueezyError::ProviderStream(
-                    "Anthropic response stopped after max_tokens".to_string(),
-                ));
-            }
+            // Surface `stop_reason` to the agent instead of converting
+            // `max_tokens` into a transport error here. The agent's turn
+            // loop branches on the normalized `StopReason` so all providers
+            // share one recovery path (max-tokens truncation, refusal,
+            // empty end_turn, etc.) rather than each provider failing in
+            // its own dialect.
+            let stop_reason = state
+                .stop_reason
+                .as_deref()
+                .map(crate::StopReason::from_anthropic);
             let mut events = Vec::new();
             if !state.finished_thinking.is_empty() && !state.emitted_reasoning_done {
                 let blocks = std::mem::take(&mut state.finished_thinking);
@@ -671,6 +616,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.clone(),
                 cost: state.cost(),
+                stop_reason,
             });
             Ok(events)
         }

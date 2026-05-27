@@ -8,7 +8,7 @@ use std::{
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use futures_util::StreamExt;
 use squeezy_agent::Agent;
 use squeezy_core::{
@@ -24,19 +24,34 @@ use squeezy_llm::{
 
 mod auth;
 mod doctor;
+mod providers;
 mod update;
 use auth::handle_auth_command;
 use doctor::DoctorArgs;
+use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent, SessionMetadata,
-    SessionQuery, SessionResumeState, SessionStatus, SessionStore, default_bug_report_path,
-    ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent,
+    SessionMetadata, SessionQuery, SessionResumeState, SessionStatus, SessionStore,
+    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
+
+/// Output framing for `--prompt`. `Default` matches the historical
+/// human-readable text-delta stream; `Json` emits one
+/// `serde_json`-serialized `LlmEvent` per line so callers can pipe to `jq`
+/// or capture the per-event cost surface programmatically. The line schema
+/// follows the `LlmEvent` enum tag/data shape declared in
+/// `crates/squeezy-llm/src/lib.rs` (`type` + `data`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum PromptFormat {
+    Default,
+    Json,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "squeezy", version, about = "Cost-aware coding agent TUI")]
@@ -69,6 +84,13 @@ struct Cli {
     prompt: Option<String>,
     #[arg(
         long,
+        value_name = "FORMAT",
+        help = "Non-interactive output format for --prompt: 'default' (text deltas) or 'json' (one event per line). Experimental; schema may change.",
+        default_value = "default"
+    )]
+    format: PromptFormat,
+    #[arg(
+        long,
         help = "Ignore saved provider/model defaults and run startup selection again"
     )]
     no_default: bool,
@@ -77,6 +99,18 @@ struct Cli {
         help = "Skip the startup picker that offers to resume a recent session for this directory"
     )]
     no_resume_picker: bool,
+    #[arg(
+        long = "continue",
+        conflicts_with = "session",
+        help = "Resume the most recent resumable session for the current directory; falls back to a fresh session if none exists"
+    )]
+    continue_session: bool,
+    #[arg(
+        long = "session",
+        value_name = "ID",
+        help = "Resume an explicit session id"
+    )]
+    session: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -118,6 +152,11 @@ enum Command {
         about = "Refresh the cached live model catalog from one or more OpenAI-compatible providers"
     )]
     RefreshModels(RefreshModelsArgs),
+    #[command(about = "List and inspect the built-in provider registry")]
+    Providers {
+        #[command(subcommand)]
+        command: ProvidersCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -235,6 +274,8 @@ enum SessionsCommand {
     Show { id: String },
     #[command(about = "Resume a local session in the TUI")]
     Resume { id: String },
+    #[command(about = "Fork a local session into a new child and resume it in the TUI")]
+    Fork { id: String },
     #[command(about = "Replay a recorded local session deterministically")]
     Replay {
         id: String,
@@ -245,10 +286,21 @@ enum SessionsCommand {
     Export { id: String },
     #[command(about = "Preview, save, or send a redacted bug-report archive")]
     Report(SessionReportArgs),
-    #[command(about = "Remove expired sessions or explicit session ids")]
+    #[command(
+        about = "Soft-archive expired sessions or explicit ids (default), or --purge to hard-delete"
+    )]
     Cleanup {
         #[arg(long = "id")]
         ids: Vec<String>,
+        /// Explicitly soft-archive — the default — kept as a flag so
+        /// scripts can be self-documenting alongside `--purge`.
+        #[arg(long, conflicts_with = "purge")]
+        archive: bool,
+        /// Hard-delete instead of soft-archiving. Live sessions skip the
+        /// `archived/` tree entirely; archived sessions named in `--id`
+        /// are removed without waiting for archive retention.
+        #[arg(long)]
+        purge: bool,
     },
     #[command(about = "Soft-archive a session so it survives retention sweeps")]
     Archive { id: String },
@@ -317,6 +369,12 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if cli.format == PromptFormat::Json && cli.prompt.is_none() {
+        return Err(SqueezyError::Config(
+            "--format json requires --prompt; interactive sessions and subcommands only emit human-formatted output"
+                .to_string(),
+        ));
+    }
     match &cli.command {
         Some(Command::Config { command }) => return handle_config_command(command, &cli),
         Some(Command::Repo { command }) => return handle_repo_command(command, &cli),
@@ -339,6 +397,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::RefreshModels(args)) => {
             return handle_refresh_models(args).await;
         }
+        Some(Command::Providers { command }) => return handle_providers_command(command),
         None => {}
     }
 
@@ -401,6 +460,28 @@ async fn main() -> squeezy_core::Result<()> {
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
     let provider = provider_from_app_config(&config);
+    let resume_flag = if cli.continue_session {
+        ResumeFlag::Continue
+    } else if let Some(id) = cli.session.as_deref() {
+        ResumeFlag::Explicit(id)
+    } else {
+        ResumeFlag::None
+    };
+    let resume_resolution = if matches!(resume_flag, ResumeFlag::None) {
+        ResumeResolution {
+            session_id: None,
+            note: None,
+        }
+    } else {
+        let sessions = SessionStore::open(&config)
+            .list(&SessionQuery::default())
+            .unwrap_or_default();
+        let cwd_str = config.workspace_root.display().to_string();
+        resolve_resume_session(resume_flag, &sessions, &cwd_str)
+    };
+    if let Some(note) = &resume_resolution.note {
+        eprintln!("{note}");
+    }
     if let Some(prompt) = cli.prompt {
         // Non-interactive prompt mode has no TUI to seed the summary into,
         // so surface it on stderr before the streamed completion lands on
@@ -409,7 +490,14 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompt(config, provider, prompt).await;
+        let result = run_prompt(
+            config,
+            provider,
+            prompt,
+            cli.format,
+            resume_resolution.session_id,
+        )
+        .await;
         let _ = telemetry.flush().await;
         return result;
     }
@@ -419,14 +507,17 @@ async fn main() -> squeezy_core::Result<()> {
     // startups; the banner stays quiet unless GitHub reports a new release
     // we haven't already nagged the user about.
     let update_banner = update::banner_for_startup(&update::check_for_update().await);
+    let resume_session_id = resume_resolution.session_id;
+    let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
         config,
         provider,
         squeezy_tui::StartupProfile {
             onboarding_summary: onboarding.visible_summary,
             languages: onboarding.language_summary,
-            skip_resume_picker: cli.no_resume_picker,
+            skip_resume_picker,
             update_banner,
+            resume_session_id,
         },
     )
     .await;
@@ -991,6 +1082,18 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let provider = provider_from_app_config(&config);
             squeezy_tui::resume(config, provider, id.clone()).await
         }
+        SessionsCommand::Fork { id } => {
+            // Offline fork: stamp a child with the parent's resume state
+            // on disk, then drop into the TUI resuming the child. The
+            // parent session is preserved so `squeezy sessions resume
+            // <parent>` still works.
+            let provider = provider_from_app_config(&config);
+            let child_metadata = SessionMetadata::new(&config, provider.name());
+            let child = store.fork_session(id, child_metadata)?;
+            let child_id = child.session_id().to_string();
+            drop(child);
+            squeezy_tui::resume(config, provider, child_id).await
+        }
         SessionsCommand::Replay { id, json } => {
             let report = Agent::replay_session(config, id).await?;
             if *json {
@@ -1020,8 +1123,20 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
         SessionsCommand::Report(args) => handle_session_report_command(args, &config).await,
-        SessionsCommand::Cleanup { ids } => {
-            let report = store.cleanup(ids)?;
+        SessionsCommand::Cleanup {
+            ids,
+            archive: _,
+            purge,
+        } => {
+            let mode = if *purge {
+                CleanupMode::Purge
+            } else {
+                CleanupMode::Archive
+            };
+            let report = store.cleanup_with(ids, None, mode)?;
+            for id in report.archived {
+                println!("archived {id}");
+            }
             for id in report.removed {
                 println!("removed {id}");
             }
@@ -1744,6 +1859,68 @@ fn session_query_from_args(args: &SessionListArgs) -> squeezy_core::Result<Sessi
     })
 }
 
+/// What the `--continue` / `--session` pair (or neither) requests for
+/// startup. `Continue` resolves to the most-recent resumable session in
+/// `cwd_str`; `Explicit` is taken at face value and downstream
+/// errors-out if the id is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeFlag<'a> {
+    None,
+    Continue,
+    Explicit(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResumeResolution {
+    /// `Some(id)` requests resuming that session; `None` means start
+    /// fresh.
+    session_id: Option<String>,
+    /// Human-readable note to print on stderr (e.g. fallback warning).
+    note: Option<String>,
+}
+
+/// Pure: pick the session id to resume given the parsed flags, a
+/// snapshot of `SessionStore::list(&SessionQuery::default())`, and the
+/// caller's cwd. `sessions` is expected to be sorted newest-first by
+/// `started_at_ms`, which is what `SessionStore::list` already
+/// guarantees.
+fn resolve_resume_session(
+    flag: ResumeFlag<'_>,
+    sessions: &[SessionMetadata],
+    cwd_str: &str,
+) -> ResumeResolution {
+    match flag {
+        ResumeFlag::None => ResumeResolution {
+            session_id: None,
+            note: None,
+        },
+        ResumeFlag::Explicit(id) => ResumeResolution {
+            session_id: Some(id.to_string()),
+            note: None,
+        },
+        ResumeFlag::Continue => {
+            let pick = sessions
+                .iter()
+                .find(|meta| meta.resume_available && meta.cwd == cwd_str)
+                .map(|meta| meta.session_id.clone());
+            if pick.is_some() {
+                ResumeResolution {
+                    session_id: pick,
+                    note: None,
+                }
+            } else {
+                ResumeResolution {
+                    session_id: None,
+                    note: Some(
+                        "squeezy: --continue: no resumable session found for this directory; starting fresh"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    }
+}
+
 fn parse_session_status(value: &str) -> squeezy_core::Result<SessionStatus> {
     match value.trim().to_ascii_lowercase().as_str() {
         "running" => Ok(SessionStatus::Running),
@@ -1766,11 +1943,31 @@ async fn run_prompt(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
     prompt: String,
+    format: PromptFormat,
+    resume_session_id: Option<String>,
 ) -> squeezy_core::Result<()> {
     let redactor = config.redaction.redactor()?;
-    let session = SessionStore::open(&config)
-        .start_session(SessionMetadata::new(&config, provider.name()))
-        .ok();
+    let store = SessionStore::open(&config);
+    // When `--continue` or `--session` resolved to an existing session,
+    // append onto it instead of spawning a fresh row. The previous
+    // response id (if any) is fed back so a server-side conversation
+    // thread carries over even though prompt mode runs single-shot.
+    let (session, previous_response_id) = if let Some(id) = resume_session_id {
+        let handle = store.open_session(id);
+        let previous = store
+            .show(handle.session_id())
+            .ok()
+            .and_then(|record| record.resume_state)
+            .and_then(|state| state.previous_response_id);
+        (Some(handle), previous)
+    } else {
+        (
+            store
+                .start_session(SessionMetadata::new(&config, provider.name()))
+                .ok(),
+            None,
+        )
+    };
     let mut redactions: u64 = 0;
     let redacted_prompt = redactor.redact(&prompt);
     redactions = redactions.saturating_add(redacted_prompt.redactions);
@@ -1793,7 +1990,7 @@ async fn run_prompt(
         max_output_tokens: config.max_output_tokens,
         response_verbosity: request_response_verbosity(&config, provider.name()),
         reasoning_effort: request_reasoning_effort(&config, provider.name()),
-        previous_response_id: None,
+        previous_response_id,
         cache_key: session
             .as_ref()
             .map(|session| format!("squeezy::{}", session.session_id())),
@@ -1802,28 +1999,51 @@ async fn run_prompt(
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());
     let mut stdout = io::stdout().lock();
     let mut assistant = String::new();
 
     while let Some(event) = stream.next().await {
-        match event? {
+        let event = event?;
+        if format == PromptFormat::Json {
+            // Emit one JSON object per line for every event. The schema is
+            // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
+            // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
+            // Newline-delimited so callers can `jq -c` or `read -r` line
+            // by line; flushing on every line keeps the pipe responsive
+            // when the consumer is a long-running script.
+            let line = serde_json::to_string(&event).map_err(|err| {
+                SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
+            })?;
+            writeln!(stdout, "{line}")?;
+            stdout.flush()?;
+        }
+        match event {
             LlmEvent::Started => {}
             LlmEvent::TextDelta(delta) => {
                 assistant.push_str(&delta);
-                write!(stdout, "{delta}")?;
-                stdout.flush()?;
+                if format == PromptFormat::Default {
+                    write!(stdout, "{delta}")?;
+                    stdout.flush()?;
+                }
             }
             LlmEvent::ToolCall(tool_call) => {
-                eprintln!(
-                    "tool call requested but prompt mode has no tools: {}",
-                    tool_call.name
-                );
+                if format == PromptFormat::Default {
+                    eprintln!(
+                        "tool call requested but prompt mode has no tools: {}",
+                        tool_call.name
+                    );
+                }
             }
-            LlmEvent::Completed { response_id, cost } => {
-                writeln!(stdout)?;
-                stdout.flush()?;
+            LlmEvent::Completed {
+                response_id, cost, ..
+            } => {
+                if format == PromptFormat::Default {
+                    writeln!(stdout)?;
+                    stdout.flush()?;
+                }
                 let redacted_assistant = redactor.redact(&assistant);
                 redactions = redactions.saturating_add(redacted_assistant.redactions);
                 let redacted_assistant = redacted_assistant.text;
@@ -1862,17 +2082,21 @@ async fn run_prompt(
                     let _ =
                         session.finish(SessionStatus::Completed, cost.clone(), metrics, redactions);
                 }
-                eprintln!(
-                    "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
-                    format_token(cost.input_tokens),
-                    format_token(cost.output_tokens),
-                    format_token(cost.cached_input_tokens),
-                    format_token(cost.cache_write_input_tokens),
-                    format_usd_micros(cost.estimated_usd_micros)
-                );
+                if format == PromptFormat::Default {
+                    eprintln!(
+                        "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
+                        format_token(cost.input_tokens),
+                        format_token(cost.output_tokens),
+                        format_token(cost.cached_input_tokens),
+                        format_token(cost.cache_write_input_tokens),
+                        format_usd_micros(cost.estimated_usd_micros)
+                    );
+                }
             }
             LlmEvent::Cancelled => {
-                eprintln!("cancelled");
+                if format == PromptFormat::Default {
+                    eprintln!("cancelled");
+                }
                 break;
             }
             LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}

@@ -11,7 +11,13 @@ fn match_slash_command_prefix_returns_command_length() {
 
 #[test]
 fn match_slash_command_prefix_prefers_longest_match() {
-    // `/job-cancel foo` must resolve to `/job-cancel`, not `/job`.
+    // `/task-cancel foo` must resolve to `/task-cancel`, not `/task`.
+    assert_eq!(
+        match_slash_command_prefix("/task-cancel abc"),
+        Some("/task-cancel".len())
+    );
+    // The legacy `/job-cancel` alias must still resolve to itself for the
+    // grace-release window.
     assert_eq!(
         match_slash_command_prefix("/job-cancel abc"),
         Some("/job-cancel".len())
@@ -98,12 +104,16 @@ fn slash_commands_declare_expected_capabilities() {
 
 #[test]
 fn purely_informational_slash_commands_declare_no_capabilities() {
-    // `/cost`, `/context`, `/jobs`, `/pin`, etc. only read in-memory state.
+    // `/cost`, `/context`, `/tasks`, `/pin`, etc. only read in-memory state.
     // Showing capability badges on them would dilute the signal for commands
-    // that actually touch the world.
+    // that actually touch the world. `/jobs`/`/job`/`/job-cancel` are kept as
+    // aliases for one release; they share the no-badges contract.
     for name in [
         "/cost",
         "/context",
+        "/tasks",
+        "/task",
+        "/task-cancel",
         "/jobs",
         "/job",
         "/job-cancel",

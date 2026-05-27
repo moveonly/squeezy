@@ -28,6 +28,38 @@ pub(crate) const DEFAULT_WEB_SEARCH_RESULTS: usize = 8;
 pub(crate) const MAX_WEB_SEARCH_RESULTS: usize = 20;
 pub(crate) const DEFAULT_WEB_SEARCH_CONTEXT_CHARS: usize = 10_000;
 pub(crate) const MAX_WEB_SEARCH_CONTEXT_CHARS: usize = 50_000;
+/// Parallel Search MCP endpoint. Mirrors OpenCode's `PARALLEL_URL` in
+/// `packages/opencode/src/tool/mcp-websearch.ts`; both Exa and Parallel
+/// speak the same JSON-RPC `tools/call` protocol so the dispatcher only
+/// varies URL, auth, tool name, and argument shape.
+pub const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
+
+/// Selects which remote MCP-style websearch backend handles a query. The
+/// finding (squeezy-1ro.41) calls for pluggable providers so users can pick
+/// based on price/quality; defaulting to Exa preserves prior behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WebSearchProvider {
+    #[default]
+    Exa,
+    Parallel,
+}
+
+impl WebSearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exa => "exa",
+            Self::Parallel => "parallel",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "exa" => Some(Self::Exa),
+            "parallel" => Some(Self::Parallel),
+            _ => None,
+        }
+    }
+}
 pub(crate) const DEFAULT_WEB_SEARCH_TIMEOUT_MS: u64 = 25_000;
 pub(crate) const DEFAULT_WEB_SEARCH_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) const DEFAULT_WEB_SEARCH_OUTPUT_BYTE_CAP: usize = 32_000;
@@ -199,27 +231,51 @@ impl ToolRegistry {
         let search_type = args.search_type.unwrap_or_default();
         let livecrawl = args.livecrawl.unwrap_or_default();
 
+        let provider = self.web_config.provider;
         let mut request_headers = vec![(
             "accept".to_string(),
             "application/json, text/event-stream".to_string(),
         )];
-        if let Some(api_key) = self.web_config.exa_api_key.as_deref() {
-            request_headers.push(("x-api-key".to_string(), api_key.to_string()));
-        }
+        let (endpoint_url, tool_name, arguments) = match provider {
+            WebSearchProvider::Exa => {
+                if let Some(api_key) = self.web_config.exa_api_key.as_deref() {
+                    request_headers.push(("x-api-key".to_string(), api_key.to_string()));
+                }
+                (
+                    self.web_config.exa_mcp_url.as_str(),
+                    "web_search_exa",
+                    json!({
+                        "query": args.query,
+                        "type": search_type.as_str(),
+                        "numResults": num_results,
+                        "livecrawl": livecrawl.as_str(),
+                        "contextMaxCharacters": context_max_characters,
+                    }),
+                )
+            }
+            WebSearchProvider::Parallel => {
+                if let Some(api_key) = self.web_config.parallel_api_key.as_deref() {
+                    request_headers
+                        .push(("authorization".to_string(), format!("Bearer {api_key}")));
+                }
+                (
+                    self.web_config.parallel_mcp_url.as_str(),
+                    "web_search",
+                    json!({
+                        "objective": args.query,
+                        "search_queries": [args.query],
+                    }),
+                )
+            }
+        };
 
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "web_search_exa",
-                "arguments": {
-                    "query": args.query,
-                    "type": search_type.as_str(),
-                    "numResults": num_results,
-                    "livecrawl": livecrawl.as_str(),
-                    "contextMaxCharacters": context_max_characters,
-                },
+                "name": tool_name,
+                "arguments": arguments,
             },
         });
         let request_sha256 = sha256_hex(serde_json::to_vec(&body).unwrap_or_default());
@@ -227,7 +283,7 @@ impl ToolRegistry {
             let response = self
                 .http
                 .post_json(
-                    &self.web_config.exa_mcp_url,
+                    endpoint_url,
                     request_headers,
                     body.clone(),
                     DEFAULT_WEB_SEARCH_MAX_RESPONSE_BYTES,
@@ -297,8 +353,8 @@ impl ToolRegistry {
             call,
             ToolStatus::Success,
             json!({
-                "provider": "exa",
-                "query": body["params"]["arguments"]["query"],
+                "provider": provider.as_str(),
+                "query": args.query,
                 "result": quote,
                 "source_urls": source_urls,
                 "retrieved_at_unix_ms": retrieved_at_unix_ms,

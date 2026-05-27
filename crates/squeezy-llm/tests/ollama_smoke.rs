@@ -44,6 +44,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
 
     let provider = OllamaProvider::from_config(&OllamaConfig {
         base_url: base_url.clone(),
+        route_style: Default::default(),
         transport: ProviderTransportConfig::default(),
     });
     let model = env::var(MODEL_ENV).unwrap_or_else(|_| DEFAULT_OLLAMA_MODEL.to_string());
@@ -63,6 +64,7 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let mut stream = provider.stream_response(request, CancellationToken::new());

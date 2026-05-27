@@ -118,6 +118,7 @@ impl LlmProvider for MockProvider {
         events.push(Ok(LlmEvent::Completed {
             response_id: None,
             cost,
+            stop_reason: None,
         }));
         Box::pin(stream::iter(events))
     }

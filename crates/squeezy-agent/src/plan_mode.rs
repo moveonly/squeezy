@@ -8,6 +8,15 @@
 //! The overlay below is appended to the per-turn instructions when the
 //! session is in Plan mode. The text is intentionally tiny — the F07 audit
 //! flagged Codex's 4.5 KB `plan.md` as overkill for Squeezy's cost thesis.
+//!
+//! Design anti-pattern, reaffirmed by the clear-code comparison audit
+//! (`audits/clear-code-comparison-2026-05-25/07-ux-and-workflows.md`,
+//! F07-cc-plan-mode-tool-prompt-budget): do not promote Plan mode to a
+//! model-callable `EnterPlanMode` tool. Clear-code's tool ships ~165 lines
+//! of "when to use" prompt with the spec every turn the tool is in scope;
+//! the session-level switch driven by the user (Shift+Tab / `/plan`) pays
+//! the overlay cost only while Plan mode is active and keeps mode entry
+//! out of the model's hands.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;

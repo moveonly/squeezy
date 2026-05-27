@@ -9,7 +9,7 @@
 
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -46,6 +46,14 @@ pub(crate) struct SessionSummary {
     /// `SessionMetrics::turns` — when 0 we render "new session" so the row
     /// reads naturally for sessions that recorded nothing.
     pub(crate) turn_count: u64,
+    /// cwd recorded on the source `SessionMetadata`, kept so the picker can
+    /// (a) hide cross-project entries until the user opts in via Tab and
+    /// (b) annotate the row with a short directory hint when the entry's
+    /// cwd differs from the current process cwd.
+    pub(crate) cwd: String,
+    /// Optional repo-root label shown alongside cross-project entries so
+    /// the user can disambiguate sibling clones with similar prompts.
+    pub(crate) repo_root: Option<String>,
 }
 
 impl SessionSummary {
@@ -56,6 +64,8 @@ impl SessionSummary {
             first_user_task: metadata.first_user_task.clone(),
             latest_summary: metadata.latest_summary.clone(),
             turn_count: metadata.metrics.turns,
+            cwd: metadata.cwd.clone(),
+            repo_root: metadata.repo_root.clone(),
         }
     }
 
@@ -80,6 +90,18 @@ impl SessionSummary {
             .unwrap_or("(no prompt recorded)");
         truncate(task, 80)
     }
+
+    /// Short directory hint shown when the entry lives outside the current
+    /// cwd. Prefers the repo-root basename so sibling clones disambiguate,
+    /// otherwise falls back to the cwd's tail path component.
+    pub(crate) fn project_hint(&self) -> String {
+        let raw = self.repo_root.as_deref().unwrap_or(&self.cwd);
+        let tail = Path::new(raw)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(raw);
+        truncate(tail, 24)
+    }
 }
 
 fn truncate(input: &str, limit: usize) -> String {
@@ -95,23 +117,49 @@ fn truncate(input: &str, limit: usize) -> String {
 pub(crate) enum ResumeChoice {
     StartFresh,
     Resume(String),
+    /// Selected session lives outside the current cwd. The TUI exits without
+    /// chdir-ing and surfaces the `squeezy sessions resume <id>` invocation
+    /// the user should run from `target_cwd` — silently relocating the
+    /// process would surprise users juggling sibling repos.
+    CrossProject {
+        session_id: String,
+        target_cwd: String,
+    },
     Quit,
 }
 
 /// Pure filter applied to the raw session list. Returns the most-recent
 /// resumable sessions whose cwd matches the current working directory and
 /// that started within [`RECENT_WINDOW_MS`].
+#[cfg(test)]
 pub(crate) fn filter_candidates(
     sessions: &[SessionMetadata],
     cwd: &Path,
     now_ms: u64,
 ) -> Vec<SessionSummary> {
     let cwd_str = cwd.display().to_string();
+    filter_inner(sessions, now_ms, |meta| meta.cwd == cwd_str)
+}
+
+/// Cross-project view: drop the cwd filter so sessions from sibling repos
+/// surface in the picker. The recency and resumable filters still apply.
+pub(crate) fn filter_candidates_all_projects(
+    sessions: &[SessionMetadata],
+    now_ms: u64,
+) -> Vec<SessionSummary> {
+    filter_inner(sessions, now_ms, |_| true)
+}
+
+fn filter_inner(
+    sessions: &[SessionMetadata],
+    now_ms: u64,
+    extra: impl Fn(&SessionMetadata) -> bool,
+) -> Vec<SessionSummary> {
     let mut out: Vec<SessionSummary> = sessions
         .iter()
         .filter(|meta| meta.resume_available)
-        .filter(|meta| meta.cwd == cwd_str)
         .filter(|meta| now_ms.saturating_sub(meta.started_at_ms) <= RECENT_WINDOW_MS)
+        .filter(|meta| extra(meta))
         .map(SessionSummary::from_metadata)
         .collect();
     // `SessionStore::list` already sorts newest-first, but we re-sort here
@@ -124,15 +172,32 @@ pub(crate) fn filter_candidates(
 /// State machine driving the picker. Pure — owns no IO.
 #[derive(Debug, Clone)]
 pub(crate) struct ResumePickerState {
+    /// Currently-visible rows, derived from `all_sessions` and the
+    /// `show_all_projects` toggle. Recomputed every time the toggle flips.
     pub(crate) candidates: Vec<SessionSummary>,
+    /// Full recent list across every cwd; the cwd-scoped view is a filter
+    /// over this. Kept on the state so Tab can re-derive `candidates`
+    /// without re-reading the session store.
+    all_sessions: Vec<SessionSummary>,
     pub(crate) cursor: usize,
+    pub(crate) show_all_projects: bool,
+    cwd: PathBuf,
 }
 
 impl ResumePickerState {
-    pub(crate) fn new(candidates: Vec<SessionSummary>) -> Self {
+    /// Build a picker over a pre-filtered set of sessions. `all_sessions`
+    /// must already be recency-filtered (see `filter_candidates_all_projects`)
+    /// so the toggle can flip between scoped and unscoped views without
+    /// re-applying the recency filter.
+    pub(crate) fn new(all_sessions: Vec<SessionSummary>, cwd: PathBuf) -> Self {
+        let cwd_str = cwd.display().to_string();
+        let candidates = scoped_view(&all_sessions, &cwd_str);
         Self {
             candidates,
+            all_sessions,
             cursor: 0,
+            show_all_projects: false,
+            cwd,
         }
     }
 
@@ -146,6 +211,36 @@ impl ResumePickerState {
     /// pre-selected when the picker opens.
     pub(crate) const fn start_fresh_index(&self) -> usize {
         0
+    }
+
+    /// Flip the project scope and re-derive `candidates`. The cursor is
+    /// reset to "Start fresh" so the user does not act on a row that
+    /// silently moved under them.
+    pub(crate) fn toggle_all_projects(&mut self) {
+        self.show_all_projects = !self.show_all_projects;
+        self.candidates = if self.show_all_projects {
+            self.all_sessions.clone()
+        } else {
+            scoped_view(&self.all_sessions, &self.cwd.display().to_string())
+        };
+        self.cursor = 0;
+    }
+
+    fn select_at_cursor(&self) -> Option<ResumeChoice> {
+        if self.cursor == self.start_fresh_index() {
+            return Some(ResumeChoice::StartFresh);
+        }
+        // candidate rows live at indices 1..=N.
+        let summary = self.candidates.get(self.cursor - 1)?;
+        let cwd_str = self.cwd.display().to_string();
+        if summary.cwd == cwd_str {
+            Some(ResumeChoice::Resume(summary.session_id.clone()))
+        } else {
+            Some(ResumeChoice::CrossProject {
+                session_id: summary.session_id.clone(),
+                target_cwd: summary.cwd.clone(),
+            })
+        }
     }
 
     pub(crate) fn dispatch(&mut self, key: KeyEvent) -> Option<ResumeChoice> {
@@ -165,16 +260,11 @@ impl ResumePickerState {
                 self.cursor = (self.cursor + 1) % self.row_count().max(1);
                 None
             }
-            (KeyCode::Enter, _) => {
-                if self.cursor == self.start_fresh_index() {
-                    Some(ResumeChoice::StartFresh)
-                } else {
-                    // candidate rows live at indices 1..=N.
-                    self.candidates
-                        .get(self.cursor - 1)
-                        .map(|summary| ResumeChoice::Resume(summary.session_id.clone()))
-                }
+            (KeyCode::Tab, _) => {
+                self.toggle_all_projects();
+                None
             }
+            (KeyCode::Enter, _) => self.select_at_cursor(),
             (KeyCode::Esc, _) | (KeyCode::Char('n'), _) | (KeyCode::Char('N'), _) => {
                 Some(ResumeChoice::StartFresh)
             }
@@ -185,9 +275,15 @@ impl ResumePickerState {
     }
 }
 
-/// Pull recent resumable sessions for the configured cwd. On error we
-/// log to stderr and start fresh — the picker is a convenience, not a
-/// hard dependency.
+fn scoped_view(all: &[SessionSummary], cwd_str: &str) -> Vec<SessionSummary> {
+    all.iter().filter(|s| s.cwd == cwd_str).cloned().collect()
+}
+
+/// Pull recent resumable sessions across every cwd. The picker filters
+/// down to the current cwd by default but keeps the broader list around
+/// so Tab can flip into a cross-project view without a second store read.
+/// On error we log to stderr and start fresh — the picker is a convenience,
+/// not a hard dependency.
 pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
     let store = SessionStore::open(config);
     let sessions = match store.list(&SessionQuery::default()) {
@@ -199,7 +295,7 @@ pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
         }
     };
     let now_ms = current_unix_ms();
-    filter_candidates(&sessions, &config.workspace_root, now_ms)
+    filter_candidates_all_projects(&sessions, now_ms)
 }
 
 fn current_unix_ms() -> u64 {
@@ -210,15 +306,19 @@ fn current_unix_ms() -> u64 {
 }
 
 /// Drive the resume picker on an existing terminal. Returns the user's
-/// choice or `StartFresh` if `candidates` is empty.
+/// choice or `StartFresh` when nothing in `all_sessions` is a viable resume
+/// target (either the list is empty or every entry is cross-project — the
+/// scoped default view is empty and we want the user to opt in via Tab
+/// rather than surprise them with foreign sessions on first run).
 pub(crate) fn run_picker<W: io::Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
-    candidates: Vec<SessionSummary>,
+    all_sessions: Vec<SessionSummary>,
+    cwd: PathBuf,
 ) -> io::Result<ResumeChoice> {
-    if candidates.is_empty() {
+    let mut state = ResumePickerState::new(all_sessions, cwd);
+    if state.candidates.is_empty() && state.all_sessions.is_empty() {
         return Ok(ResumeChoice::StartFresh);
     }
-    let mut state = ResumePickerState::new(candidates);
     loop {
         terminal.draw(|frame| render_picker(frame, &state))?;
         match event::read()? {
@@ -270,16 +370,18 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
         ])
         .split(inner);
 
+    let scope = if state.show_all_projects {
+        " recent session{} across all projects"
+    } else {
+        " recent session{} for this directory"
+    };
     let intro = Paragraph::new(Line::from(vec![
         Span::styled(
             format!("{}", state.candidates.len()),
             Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(
-                " recent session{} for this directory",
-                if state.candidates.len() == 1 { "" } else { "s" }
-            ),
+            scope.replace("{}", if state.candidates.len() == 1 { "" } else { "s" }),
             Style::default().fg(QUIET),
         ),
     ]))
@@ -288,6 +390,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
 
     // Start fresh leads the list as the safe default (cursor opens on it),
     // followed by each candidate session at index 1..=N.
+    let cwd_str = state.cwd.display().to_string();
     let mut rows: Vec<Line<'_>> = Vec::with_capacity(state.candidates.len() + 1);
     rows.push(render_start_fresh_row(
         state.cursor == state.start_fresh_index(),
@@ -295,17 +398,25 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     rows.extend(state.candidates.iter().enumerate().map(|(idx, summary)| {
         // candidates start at row 1; active row uses the cursor offset.
         let row_idx = idx + 1;
-        render_candidate_row(idx, summary, row_idx == state.cursor)
+        let cross_project = summary.cwd != cwd_str;
+        render_candidate_row(idx, summary, row_idx == state.cursor, cross_project)
     }));
 
     let body = Paragraph::new(rows);
     frame.render_widget(body, layout[2]);
 
+    let tab_hint = if state.show_all_projects {
+        "this dir"
+    } else {
+        "all projects"
+    };
     let footer = Paragraph::new(Line::from(vec![
         Span::styled("↑/↓ ", Style::default().fg(GOLD)),
         Span::styled("move  ", Style::default().fg(QUIET)),
         Span::styled("Enter ", Style::default().fg(GOLD)),
         Span::styled("confirm  ", Style::default().fg(QUIET)),
+        Span::styled("Tab ", Style::default().fg(GOLD)),
+        Span::styled(format!("{tab_hint}  "), Style::default().fg(QUIET)),
         Span::styled("Esc ", Style::default().fg(GOLD)),
         Span::styled("start fresh  ", Style::default().fg(QUIET)),
         Span::styled("Q ", Style::default().fg(GOLD)),
@@ -315,7 +426,12 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, state: &ResumePickerState) {
     frame.render_widget(footer, layout[4]);
 }
 
-fn render_candidate_row(_idx: usize, summary: &SessionSummary, active: bool) -> Line<'static> {
+fn render_candidate_row(
+    _idx: usize,
+    summary: &SessionSummary,
+    active: bool,
+    cross_project: bool,
+) -> Line<'static> {
     let (prefix_color, label_style) = if active {
         (
             AMBER,
@@ -330,14 +446,22 @@ fn render_candidate_row(_idx: usize, summary: &SessionSummary, active: bool) -> 
     } else {
         Style::default().fg(QUIET)
     };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(prefix, Style::default().fg(prefix_color)),
         Span::styled(format_started_at(summary.started_at_ms), timestamp_style),
         Span::styled("  ", Style::default()),
         Span::styled(format!("{:>10}", summary.turn_indicator()), timestamp_style),
         Span::styled("  ", Style::default()),
         Span::styled(summary.label(), label_style),
-    ])
+    ];
+    if cross_project {
+        spans.push(Span::styled("  · ", Style::default().fg(QUIET)));
+        spans.push(Span::styled(
+            summary.project_hint(),
+            Style::default().fg(MODE_PURPLE),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_start_fresh_row(active: bool) -> Line<'static> {

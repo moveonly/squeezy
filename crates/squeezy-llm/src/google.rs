@@ -13,6 +13,7 @@ use crate::{
     ReasoningPayload,
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
+    sse::SseDecoder,
 };
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ impl LlmProvider for GoogleProvider {
             yield LlmEvent::Started;
             let mut decoder = SseDecoder::default();
             let mut last_cost = CostSnapshot::default();
+            let mut last_finish_reason: Option<String> = None;
             let mut saw_any = false;
             let mut reasoning_buf = GoogleReasoningBuffer::default();
             let mut bytes = response.bytes_stream();
@@ -145,14 +147,14 @@ impl LlmProvider for GoogleProvider {
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     saw_any = true;
-                    for llm_event in parse_google_event(&event, &mut last_cost, &mut reasoning_buf)? {
+                    for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
                         yield llm_event;
                     }
                 }
             }
             for event in decoder.finish() {
                 saw_any = true;
-                for llm_event in parse_google_event(&event, &mut last_cost, &mut reasoning_buf)? {
+                for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
                     yield llm_event;
                 }
             }
@@ -165,6 +167,9 @@ impl LlmProvider for GoogleProvider {
             yield LlmEvent::Completed {
                 response_id: None,
                 cost: last_cost,
+                stop_reason: last_finish_reason
+                    .as_deref()
+                    .map(crate::StopReason::from_google),
             };
         })
     }
@@ -271,52 +276,10 @@ impl GoogleReasoningBuffer {
     }
 }
 
-#[derive(Debug, Default)]
-struct SseDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseDecoder {
-    fn push(&mut self, bytes: &[u8]) -> Vec<String> {
-        self.buffer.extend_from_slice(bytes);
-        let mut events = Vec::new();
-        while let Some(index) = self.buffer.windows(2).position(|window| window == b"\n\n") {
-            let event = self.buffer.drain(..index + 2).collect::<Vec<_>>();
-            if let Some(data) = decode_sse_event(&event) {
-                events.push(data);
-            }
-        }
-        events
-    }
-
-    fn finish(&mut self) -> Vec<String> {
-        if self.buffer.is_empty() {
-            return Vec::new();
-        }
-        let event = std::mem::take(&mut self.buffer);
-        decode_sse_event(&event).into_iter().collect()
-    }
-}
-
-fn decode_sse_event(bytes: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut data_lines = Vec::new();
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(data) = line.strip_prefix("data:") {
-            data_lines.push(data.trim_start());
-        }
-    }
-    if data_lines.is_empty() {
-        None
-    } else {
-        Some(data_lines.join("\n"))
-    }
-}
-
 fn parse_google_event(
     data: &str,
     cost: &mut CostSnapshot,
+    last_finish_reason: &mut Option<String>,
     reasoning_buf: &mut GoogleReasoningBuffer,
 ) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
@@ -333,6 +296,15 @@ fn parse_google_event(
         cost.output_tokens = usage.get("candidatesTokenCount").and_then(Value::as_u64);
         cost.cached_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
         cost.reasoning_output_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    }
+    if let Some(reason) = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.get("finishReason"))
+        .and_then(Value::as_str)
+    {
+        *last_finish_reason = Some(reason.to_string());
     }
     let mut events = Vec::new();
     let parts = value

@@ -1,4 +1,5 @@
 use super::*;
+use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
 use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ fn request_body_uses_messages_streaming_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -81,6 +83,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -105,6 +108,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -139,6 +143,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -180,6 +185,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -242,6 +248,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -251,6 +258,116 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         tools[0].get("cache_control").is_none(),
         "earlier tool must not carry a cache breakpoint"
     );
+    assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tools_trail() {
+    // Two first-party tools followed by two MCP tools (the partition the
+    // tool registry enforces). The breakpoint must sit on the last first
+    // -party tool so the cached prefix survives an MCP `tools/list`
+    // refresh that mutates only the trailing MCP block.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "apply_patch".to_string(),
+                description: "edit".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "read_file".to_string(),
+                description: "read".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__create_issue".to_string(),
+                description: "create issue".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__list_issues".to_string(),
+                description: "list issues".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 4);
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(
+        tools[1]["cache_control"]["type"], "ephemeral",
+        "breakpoint must sit on the last first-party tool"
+    );
+    assert!(tools[2].get("cache_control").is_none());
+    assert!(tools[3].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
+    // Edge case: only MCP tools are advertised (no stable first-party
+    // prefix to anchor). Fall back to the unconditional last tool so
+    // caching is still attempted — losing the cache on every MCP refresh
+    // is no worse than the pre-change behavior, but caching the prefix
+    // when MCP tools are stable for many turns is still a win.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "mcp__linear__create_issue".to_string(),
+                description: "create issue".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "mcp__linear__list_issues".to_string(),
+                description: "list issues".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 2);
+    assert!(tools[0].get("cache_control").is_none());
     assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
 }
 
@@ -278,6 +395,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -304,6 +422,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -423,6 +542,7 @@ fn parser_extracts_completed_response_id_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
+            stop_reason: Some(crate::StopReason::EndTurn),
         }]
     );
 }
@@ -470,6 +590,7 @@ fn parser_populates_both_cache_counters_from_usage() {
                 cache_write_input_tokens: Some(29),
                 estimated_usd_micros: None,
             },
+            stop_reason: Some(crate::StopReason::EndTurn),
         }]
     );
 }
@@ -495,10 +616,58 @@ fn parser_surfaces_max_tokens_stop() {
     )
     .expect("delta");
 
-    let err = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state)
-        .expect_err("max_tokens is a stream error");
+    let events = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect(
+        "message_stop is no longer an early stream error; stop_reason is surfaced to the agent",
+    );
 
-    assert!(err.to_string().contains("max_tokens"));
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::MaxTokens));
+}
+
+#[test]
+fn parser_normalizes_end_turn_stop_reason() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let events =
+        parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop event");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::EndTurn));
+}
+
+#[test]
+fn parser_normalizes_refusal_stop_reason() {
+    let mut state = AnthropicStreamState::default();
+    parse_anthropic_event(
+        r#"{"type":"message_delta","delta":{"stop_reason":"refusal"}}"#,
+        &mut state,
+    )
+    .expect("delta");
+    let events =
+        parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop event");
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            LlmEvent::Completed { stop_reason, .. } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .expect("Completed event emitted");
+    assert_eq!(completed, Some(crate::StopReason::Refusal));
 }
 
 #[test]
@@ -557,7 +726,7 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
         LlmInputItem::Reasoning(payload),
         LlmInputItem::AssistantText("answer".to_string()),
     ];
-    let messages = anthropic_messages(&input, false);
+    let messages = anthropic_messages(&input, false, CachePolicy::AUTO);
     let arr = messages.as_array().expect("array");
     assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
     let content = arr[0]["content"].as_array().expect("content array");
@@ -565,4 +734,78 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
     assert_eq!(content[0]["signature"], "SIG");
     assert_eq!(content[1]["type"], "text");
     assert_eq!(content[1]["text"], "answer");
+}
+
+#[test]
+fn beta_headers_route_into_http_header() {
+    // The Anthropic provider does not embed beta headers in the JSON
+    // body — they go on the `anthropic-beta` HTTP header. We assert the
+    // routing helper produces the comma-joined value the provider
+    // attaches on the outbound request.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("context-1m-2025-08-07"),
+        Arc::<str>::from("interleaved-thinking-2025-05-14"),
+    ]);
+    let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
+    assert_eq!(
+        header,
+        "context-1m-2025-08-07,interleaved-thinking-2025-05-14"
+    );
+
+    // The request body must not carry the betas — they belong on the
+    // header for the 1P Anthropic transport.
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "sys".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: betas,
+    };
+    let body = AnthropicProvider::request_body(&request);
+    assert!(
+        body.get("anthropic_beta").is_none(),
+        "1P Anthropic transport sends betas via header, never inside the JSON body",
+    );
+}
+
+#[test]
+fn beta_headers_route_into_extra_body_params_on_bedrock() {
+    // Bedrock uses converse_stream and the AWS gateway strips
+    // non-standard HTTP headers, so the routing helper partitions out
+    // the body-param-eligible subset for `additional_model_request_fields`.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("context-1m-2025-08-07"),
+        Arc::<str>::from("claude-code-20250219"),
+    ]);
+    let body_betas = bedrock_extra_body_betas(&betas);
+    let body_strs: Vec<&str> = body_betas.iter().map(|b| b.as_ref()).collect();
+    assert_eq!(
+        body_strs,
+        vec!["context-1m-2025-08-07"],
+        "header-only betas (claude-code-*) must be dropped before reaching Bedrock",
+    );
+}
+
+#[test]
+fn beta_headers_dedup_when_capability_and_request_overlap() {
+    // Future capability-derived betas can overlap with the
+    // caller-supplied list; the routing helper must deduplicate so the
+    // wire value carries each beta exactly once.
+    let betas: Arc<[Arc<str>]> = Arc::from(vec![
+        Arc::<str>::from("a"),
+        Arc::<str>::from("b"),
+        Arc::<str>::from("b"),
+        Arc::<str>::from("c"),
+    ]);
+    let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
+    assert_eq!(header, "a,b,c");
 }

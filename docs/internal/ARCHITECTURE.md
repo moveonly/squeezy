@@ -80,6 +80,28 @@ in the same commit that the release tag points at. Pushing a tag whose
 version disagrees with `Cargo.toml` will fail the workflow before any
 artifacts are built or published.
 
+### Release Binary Hygiene
+
+The `[profile.release]` block in the root `Cargo.toml` sets
+`strip = "symbols"`. Release binaries shipped from `release.yml` therefore
+carry no Rust symbol table and no DWARF debug info. The reasons:
+
+- Symbol names leak module paths (`squeezy_agent::Agent::run_turn`),
+  build-host absolute source paths, and private type structure that
+  Squeezy does not commit to as a public API.
+- A stripped binary is a smaller release artifact and shrinks the
+  surface for symbol-name-based vulnerability fingerprinting.
+- User crash reports should rely on `squeezy doctor`, `--version`, and
+  redacted session ids rather than on raw backtraces. Any future
+  symbolicated telemetry must emit debug sidecars (`*.dSYM`, `*.dwp`,
+  `*.pdb`) that are uploaded to a private symbol store, never bundled
+  into the public release tarball or the Homebrew bottle.
+
+Do not weaken this to `strip = "debuginfo"` or remove the `strip`
+directive without updating this section. If backtraces in user reports
+become a hard requirement, prefer adding private debug sidecars over
+re-enabling symbols in the public binary.
+
 ## Provider SDK Policy
 
 An earlier rule of thumb said Squeezy should not depend on any vendor SDK

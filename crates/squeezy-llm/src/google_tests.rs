@@ -44,6 +44,7 @@ fn request_body_uses_generate_content_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -89,6 +90,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -126,6 +128,7 @@ fn request_body_preserves_function_response_name() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -139,6 +142,7 @@ fn request_body_preserves_function_response_name() {
 #[test]
 fn parser_extracts_text_tool_calls_and_usage() {
     let mut cost = CostSnapshot::default();
+    let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
     let events = parse_google_event(
         r#"{
@@ -155,6 +159,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
           }
         }"#,
         &mut cost,
+        &mut last_finish_reason,
         &mut reasoning_buf,
     )
     .expect("valid event");

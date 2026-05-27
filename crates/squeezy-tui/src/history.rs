@@ -17,6 +17,18 @@
 #![allow(dead_code)]
 
 use ratatui::text::Line;
+use tokio::sync::watch;
+
+/// Watch receiver a cell hands the redraw loop so it can re-render only
+/// the affected row when an upstream event lands (`JobNotification`
+/// stdout deltas, bash output stream, plan-approval state machine, …).
+///
+/// Mirrors clear-code's `progressMessagesForMessage` subscription in
+/// `src/components/messages/AssistantToolUseMessage.tsx`, but uses a
+/// `watch::Receiver<()>` ticker rather than carrying payload through the
+/// channel — the cell already owns the source data and a tick just
+/// means "your cached layout is stale, recompute on next frame".
+pub(crate) type HistoryCellUpdateStream = watch::Receiver<()>;
 
 /// Anything that renders a contiguous block of lines into the transcript.
 pub(crate) trait HistoryCell {
@@ -37,6 +49,16 @@ pub(crate) trait HistoryCell {
 
     /// Clear any cached layout. Called when source data changes.
     fn invalidate(&mut self) {}
+
+    /// Opt-in subscription for cells whose source mutates after the
+    /// initial render — running tool calls collecting stdout, plan
+    /// approvals advancing through states, bash streams. Returning
+    /// `Some(rx)` tells the redraw loop to watch `rx` and, on each
+    /// tick, call [`HistoryCell::invalidate`] and re-render only this
+    /// cell. Returning `None` (default) keeps the cell in static mode.
+    fn subscribe(&self) -> Option<HistoryCellUpdateStream> {
+        None
+    }
 }
 
 /// Width-keyed line cache shared by `HistoryCell` implementors.

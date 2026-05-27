@@ -8,6 +8,13 @@ use std::{
 
 use ratatui::style::Color;
 
+/// Default accent values for the amber/gold family. The active accent is
+/// resolved through [`accent_primary`] / [`accent_secondary`] and friends
+/// so themes (`catppuccin`, `high-contrast`) can replace them at runtime
+/// without touching the ~150 surfaces that already reference `AMBER`/
+/// `GOLD` as their accent token. The const remains the visual default
+/// (`TuiTheme::System|Dark|Light`); themed variants flip an atomic
+/// override that the accent accessors consult on every read.
 pub(crate) const AMBER: Color = Color::Rgb(252, 211, 77);
 pub(crate) const GOLD: Color = Color::Rgb(254, 240, 138);
 pub(crate) const MODE_PURPLE: Color = Color::Rgb(216, 180, 254);
@@ -35,6 +42,19 @@ pub(crate) enum PaletteTone {
     Light,
 }
 
+/// Active accent family. `Default` keeps the amber/gold identity (matches
+/// the previous single-palette behaviour). `Catppuccin` swaps the primary
+/// accent for mauve and the secondary for soft lavender, intended to ride
+/// the `Dark` tone. `HighContrast` swaps to a white/bright-yellow pair on
+/// the `Light` tone so accessibility-strict configs keep WCAG-grade
+/// foreground contrast against the prompt and status surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccentVariant {
+    Default,
+    Catppuccin,
+    HighContrast,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColorLevel {
     NoColor,
@@ -51,6 +71,15 @@ static TONE_OVERRIDE: AtomicU8 = AtomicU8::new(0);
 const TONE_OVERRIDE_UNSET: u8 = 0;
 const TONE_OVERRIDE_DARK: u8 = 1;
 const TONE_OVERRIDE_LIGHT: u8 = 2;
+
+/// Runtime accent family override. `0 = Default (amber/gold)`,
+/// `1 = Catppuccin`, `2 = HighContrast`. The default value matches the
+/// pre-themed behaviour so unconfigured installs render exactly as before.
+static ACCENT_OVERRIDE: AtomicU8 = AtomicU8::new(0);
+
+const ACCENT_DEFAULT: u8 = 0;
+const ACCENT_CATPPUCCIN: u8 = 1;
+const ACCENT_HIGH_CONTRAST: u8 = 2;
 
 pub(crate) fn palette_tone() -> PaletteTone {
     match TONE_OVERRIDE.load(Ordering::Relaxed) {
@@ -77,6 +106,48 @@ pub(crate) fn set_palette_tone_override(tone: Option<PaletteTone>) {
         Some(PaletteTone::Light) => TONE_OVERRIDE_LIGHT,
     };
     TONE_OVERRIDE.store(encoded, Ordering::Relaxed);
+}
+
+/// Read the active accent variant. The default keeps the amber/gold
+/// identity matching the existing palette.
+pub(crate) fn accent_variant() -> AccentVariant {
+    match ACCENT_OVERRIDE.load(Ordering::Relaxed) {
+        ACCENT_CATPPUCCIN => AccentVariant::Catppuccin,
+        ACCENT_HIGH_CONTRAST => AccentVariant::HighContrast,
+        _ => AccentVariant::Default,
+    }
+}
+
+/// Pin the runtime accent variant. Subsequent renders see the change.
+pub(crate) fn set_accent_variant(variant: AccentVariant) {
+    let encoded = match variant {
+        AccentVariant::Default => ACCENT_DEFAULT,
+        AccentVariant::Catppuccin => ACCENT_CATPPUCCIN,
+        AccentVariant::HighContrast => ACCENT_HIGH_CONTRAST,
+    };
+    ACCENT_OVERRIDE.store(encoded, Ordering::Relaxed);
+}
+
+/// Primary accent — the AMBER-equivalent. Surfaces that opt into theming
+/// (working-shimmer base, prompt activity ring) read this instead of
+/// `AMBER` so a `/theme` switch is visible on the most-used cues. The
+/// default keeps the AMBER value unchanged.
+pub(crate) fn accent_primary() -> Color {
+    match accent_variant() {
+        AccentVariant::Default => AMBER,
+        AccentVariant::Catppuccin => Color::Rgb(203, 166, 247), // catppuccin mauve
+        AccentVariant::HighContrast => Color::Rgb(255, 255, 0), // pure yellow
+    }
+}
+
+/// Working-shimmer highlight. Default keeps the warm beige cue; themed
+/// variants shift to a hue that pops against their own primary accent.
+pub(crate) fn accent_working_highlight() -> Color {
+    match accent_variant() {
+        AccentVariant::Default => WORKING_SHIMMER_HIGHLIGHT,
+        AccentVariant::Catppuccin => Color::Rgb(245, 224, 220), // catppuccin rosewater
+        AccentVariant::HighContrast => Color::Rgb(255, 255, 255),
+    }
 }
 
 pub(crate) fn color_level() -> ColorLevel {

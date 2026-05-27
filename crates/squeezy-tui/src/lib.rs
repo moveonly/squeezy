@@ -45,7 +45,7 @@ use squeezy_core::{
     TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
-use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
+use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
     McpElicitationKind, McpElicitationRequest, McpElicitationResponse, McpServerStatus,
@@ -73,6 +73,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod toast;
 pub use render::markdown::render_markdown;
 pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
@@ -95,10 +96,11 @@ use input::{
 use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
     self, AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
-    WORKING_SHIMMER_HIGHLIGHT, blend_color,
+    blend_color,
 };
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
+use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
@@ -235,6 +237,12 @@ pub struct StartupProfile {
     /// transcript quiet. The TUI flushes this through `push_log` at
     /// startup so it lands above the first agent turn.
     pub update_banner: Option<String>,
+    /// Pre-resolved session id to resume directly without showing the
+    /// picker. Populated by the CLI when `--continue` or
+    /// `--session <id>` selected an explicit target; behaves like a
+    /// `squeezy sessions resume <id>` invocation but keeps the rest of
+    /// the startup banner pipeline intact.
+    pub resume_session_id: Option<String>,
 }
 
 /// Maximum draw rate enforced by the event loop. 60 FPS keeps animations
@@ -295,6 +303,7 @@ pub async fn run_with_onboarding(
             languages: String::new(),
             skip_resume_picker: false,
             update_banner: None,
+            resume_session_id: None,
         },
     )
     .await
@@ -305,7 +314,12 @@ pub async fn run_with_startup_profile(
     provider: Arc<dyn LlmProvider>,
     startup: StartupProfile,
 ) -> Result<()> {
-    run_inner(config, provider, None, startup).await
+    // Resume target carried inside the profile (`--continue` /
+    // `--session`) wins over the picker; surface it to `run_inner` as
+    // the canonical resume id so the rest of the boot path is identical
+    // to `squeezy_tui::resume`.
+    let resume = startup.resume_session_id.clone();
+    run_inner(config, provider, resume, startup).await
 }
 
 pub async fn resume(
@@ -334,7 +348,7 @@ async fn run_inner(
     // initial paint already reflects the user's choice — without this the
     // first frame uses the auto-detected tone and pops to the override on
     // the next redraw.
-    render::palette::set_palette_tone_override(theme_to_tone_override(config.tui.theme));
+    apply_theme_overrides(config.tui.theme);
     let mut terminal = TerminalGuard::enter(config.tui.alternate_screen)?;
     let resume_session_id =
         match maybe_pick_resume_session(&mut terminal, &config, resume_session_id, &startup)? {
@@ -430,6 +444,9 @@ async fn run_inner(
         if app.app_notifications.tick() {
             app.needs_redraw = true;
         }
+        if app.toasts.tick() {
+            app.needs_redraw = true;
+        }
         if app.animation_tick.is_multiple_of(settings_poll_every)
             && app.config_screen.is_none()
             && settings_watcher.poll()
@@ -501,13 +518,33 @@ fn maybe_pick_resume_session(
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice = resume_picker::run_picker(&mut terminal.terminal, candidates)
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let choice = resume_picker::run_picker(
+        &mut terminal.terminal,
+        candidates,
+        config.workspace_root.clone(),
+    )
+    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        resume_picker::ResumeChoice::CrossProject {
+            session_id,
+            target_cwd,
+        } => {
+            // Silently switching cwd would surprise users juggling sibling
+            // repos; instead exit with the exact recommended invocation in
+            // the exit hint so they can re-run from the target directory.
+            terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
+            Ok(ResumeStartup::Quit)
+        }
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
+}
+
+/// Format the exit hint printed when the user picks a cross-project
+/// resume target. Exposed at module scope so tests can lock the wording.
+fn cross_project_resume_hint(session_id: &str, target_cwd: &str) -> String {
+    format!("Cross-project resume — run from {target_cwd}:\n  squeezy sessions resume {session_id}")
 }
 
 /// Restore the most recently cancelled prompt into the composer. Only
@@ -702,7 +739,7 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
     // Mirror an external theme edit into the runtime palette override
     // immediately — the agent's config_snapshot already carries the new
     // value, but the palette layer reads the override directly.
-    render::palette::set_palette_tone_override(theme_to_tone_override(new_cfg.tui.theme));
+    apply_theme_overrides(new_cfg.tui.theme);
     let old_provider = agent.provider_name();
     let new_provider = squeezy_llm::provider_name(&new_cfg.provider);
     if old_provider == new_provider {
@@ -745,6 +782,68 @@ fn apply_external_settings_reload(app: &mut TuiApp, agent: &mut Agent) {
                 Severity::Error,
             );
         }
+    }
+}
+
+/// Pick the `slot`-th (1-based) most recent session for this workspace,
+/// excluding the active session, and resume into it. Returns `false` when
+/// the press should fall through to other key handlers (modals/active
+/// turn block the switch); status messages are written for every other
+/// outcome including "no session at this slot" so the user sees feedback.
+async fn handle_session_quick_switch(app: &mut TuiApp, agent: &mut Agent, slot: usize) -> bool {
+    if app.turn_rx.is_some()
+        || app.pending_approval.is_some()
+        || app.pending_mcp_elicitation.is_some()
+        || app.pending_plan_choice.is_some()
+        || app.config_screen.is_some()
+        || app.status_line_setup.is_some()
+        || app.overlay.is_some()
+        || app.transcript_overlay.is_some()
+    {
+        return false;
+    }
+    let sessions = match agent.list_sessions(&SessionQuery::default()) {
+        Ok(list) => list,
+        Err(error) => {
+            app.status = format!("session quick-switch failed: {error}");
+            return true;
+        }
+    };
+    let active = agent.session_id();
+    let target = sessions
+        .into_iter()
+        .filter(|meta| active.as_deref() != Some(meta.session_id.as_str()))
+        .nth(slot - 1);
+    let Some(target) = target else {
+        app.status = format!("no recent session at slot {slot}");
+        return true;
+    };
+    let session_id = target.session_id.clone();
+    switch_to_session(app, agent, &session_id).await;
+    true
+}
+
+/// Replace the current session with `session_id` and rebuild the in-memory
+/// transcript from the persisted log. Used by both `/resume` and the
+/// Alt+1-9 quick-switch handler so the two paths stay in lockstep.
+async fn switch_to_session(app: &mut TuiApp, agent: &mut Agent, session_id: &str) {
+    match agent.resume_current(session_id) {
+        Ok(transcript) => {
+            app.transcript.clear();
+            app.selected_entry = None;
+            app.next_entry_id = 0;
+            for item in transcript {
+                app.push_transcript_item(item);
+            }
+            app.attachments = agent.context_attachments_snapshot().await;
+            app.pending_assistant.clear();
+            app.task_state = None;
+            app.task_panel_collapsed = false;
+            app.turn_rx = None;
+            app.cancel = None;
+            app.status = format!("resumed session {session_id}");
+        }
+        Err(error) => app.status = format!("resume failed: {error}"),
     }
 }
 
@@ -968,6 +1067,15 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
 
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d') {
         delete_next_word(app);
+        return Ok(false);
+    }
+
+    if key.modifiers == KeyModifiers::ALT
+        && let KeyCode::Char(ch) = key.code
+        && let Some(slot) = ch.to_digit(10)
+        && (1..=9).contains(&slot)
+        && handle_session_quick_switch(app, agent, slot as usize).await
+    {
         return Ok(false);
     }
 
@@ -1365,13 +1473,34 @@ fn toggle_status_line_setup(app: &mut TuiApp) {
 }
 
 /// Convert a [`TuiTheme`] preference into the runtime palette tone override.
-/// `System` clears the override so terminal detection (`COLORFGBG`) wins.
+/// `System` clears the override so terminal detection (`COLORFGBG`) wins;
+/// `Catppuccin` pins Dark and `HighContrast` pins Light because each named
+/// theme expects a specific background tone for its accent palette to read
+/// correctly.
 fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTone> {
     match theme {
         TuiTheme::System => None,
-        TuiTheme::Dark => Some(render::palette::PaletteTone::Dark),
-        TuiTheme::Light => Some(render::palette::PaletteTone::Light),
+        TuiTheme::Dark | TuiTheme::Catppuccin => Some(render::palette::PaletteTone::Dark),
+        TuiTheme::Light | TuiTheme::HighContrast => Some(render::palette::PaletteTone::Light),
     }
+}
+
+/// Map a [`TuiTheme`] to the accent family it owns. The amber/gold default
+/// is shared by `System`, `Dark`, and `Light`; only the named themes flip
+/// the accent.
+fn theme_to_accent_variant(theme: TuiTheme) -> render::palette::AccentVariant {
+    match theme {
+        TuiTheme::Catppuccin => render::palette::AccentVariant::Catppuccin,
+        TuiTheme::HighContrast => render::palette::AccentVariant::HighContrast,
+        _ => render::palette::AccentVariant::Default,
+    }
+}
+
+/// Apply both the tone and accent overrides for `theme` in one shot so
+/// callers don't accidentally update one and forget the other.
+fn apply_theme_overrides(theme: TuiTheme) {
+    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+    render::palette::set_accent_variant(theme_to_accent_variant(theme));
 }
 
 /// Apply a `/theme` switch: flip the runtime palette override, mirror the
@@ -1382,7 +1511,7 @@ fn theme_to_tone_override(theme: TuiTheme) -> Option<render::palette::PaletteTon
 fn apply_theme_change(app: &mut TuiApp, agent: &mut Agent, theme: TuiTheme) {
     use squeezy_core::settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits};
 
-    render::palette::set_palette_tone_override(theme_to_tone_override(theme));
+    apply_theme_overrides(theme);
 
     let mut next = agent.config_snapshot();
     next.tui.theme = theme;
@@ -1777,6 +1906,10 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             handle_slash_diff(app);
             return true;
         }
+        "/effort" => {
+            handle_slash_effort(app, agent, parts.next());
+            return true;
+        }
         "/verbosity" => {
             // Back-compat: `/verbosity concise|normal|verbose` still works as
             // a quick set. Without an arg, opens the config screen on the
@@ -1824,11 +1957,14 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
         }
         "/theme" => {
             let Some(raw) = parts.next() else {
-                app.status = "usage: /theme [system|dark|light]".to_string();
+                app.status =
+                    "usage: /theme [system|dark|light|catppuccin|high-contrast]".to_string();
                 return true;
             };
             let Some(theme) = TuiTheme::parse(raw) else {
-                app.status = format!("unknown theme {raw:?}; expected system, dark, or light");
+                app.status = format!(
+                    "unknown theme {raw:?}; expected system, dark, light, catppuccin, or high-contrast",
+                );
                 return true;
             };
             apply_theme_change(app, agent, theme);
@@ -1849,20 +1985,20 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             app.push_transcript_item(TranscriptItem::system(body));
             return true;
         }
-        "/jobs" => {
+        "/tasks" | "/jobs" => {
             sync_jobs_from_agent(app, agent);
-            let jobs = format_jobs_list(app);
-            app.status = format!("{} jobs", app.jobs.len());
-            app.push_transcript_item(TranscriptItem::system(jobs));
+            let body = format_tasks_list(app, agent);
+            app.status = format!("{} tasks", app.jobs.len());
+            app.push_transcript_item(TranscriptItem::system(body));
             return true;
         }
-        "/job" => {
+        "/task" | "/job" => {
             let Some(raw_id) = parts.next() else {
-                app.status = "usage: /job <job_id>".to_string();
+                app.status = format!("usage: {command} <id>");
                 return true;
             };
             let Some(id) = parse_job_id(raw_id) else {
-                app.status = "job id must be a number".to_string();
+                app.status = "task id must be a number".to_string();
                 return true;
             };
             sync_jobs_from_agent(app, agent);
@@ -1873,27 +2009,27 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 .or_else(|| agent.job_snapshot(id))
             {
                 Some(job) => {
-                    app.status = format!("job {} {}", job.id, job.status.as_str());
+                    app.status = format!("task {} {}", job.id, job.status.as_str());
                     app.push_transcript_item(TranscriptItem::system(format_job_detail(&job)));
                 }
-                None => app.status = format!("job {id} not found"),
+                None => app.status = format!("task {id} not found"),
             }
             return true;
         }
-        "/job-cancel" => {
+        "/task-cancel" | "/job-cancel" => {
             let Some(raw_id) = parts.next() else {
-                app.status = "usage: /job-cancel <job_id>".to_string();
+                app.status = format!("usage: {command} <id>");
                 return true;
             };
             let Some(id) = parse_job_id(raw_id) else {
-                app.status = "job id must be a number".to_string();
+                app.status = "task id must be a number".to_string();
                 return true;
             };
             if agent.cancel_job(id) {
-                app.status = format!("cancelling job {id}");
+                app.status = format!("cancelling task {id}");
                 sync_jobs_from_agent(app, agent);
             } else {
-                app.status = format!("job {id} not active");
+                app.status = format!("task {id} not active");
             }
             return true;
         }
@@ -1970,24 +2106,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                 app.status = "usage: /resume <session_id>".to_string();
                 return true;
             };
-            match agent.resume_current(session_id) {
-                Ok(transcript) => {
-                    app.transcript.clear();
-                    app.selected_entry = None;
-                    app.next_entry_id = 0;
-                    for item in transcript {
-                        app.push_transcript_item(item);
-                    }
-                    app.attachments = agent.context_attachments_snapshot().await;
-                    app.pending_assistant.clear();
-                    app.task_state = None;
-                    app.task_panel_collapsed = false;
-                    app.turn_rx = None;
-                    app.cancel = None;
-                    app.status = format!("resumed session {session_id}");
-                }
-                Err(error) => app.status = format!("resume failed: {error}"),
-            }
+            switch_to_session(app, agent, session_id).await;
             return true;
         }
         "/session-export" => {
@@ -2007,9 +2126,28 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/session-cleanup" => {
-            let ids = parts.map(str::to_string).collect::<Vec<_>>();
-            match agent.cleanup_sessions(&ids) {
-                Ok(report) => app.status = format!("removed {} sessions", report.removed.len()),
+            // Pull the mode flag out of the args before the id list so
+            // `--archive` / `--purge` can appear anywhere on the line.
+            // `--archive` is the default; `--purge` switches to
+            // hard-delete (live sessions skip the archive tree,
+            // already-archived ids named here are removed immediately).
+            let mut mode = CleanupMode::Archive;
+            let mut ids = Vec::new();
+            for token in parts {
+                match token {
+                    "--archive" => mode = CleanupMode::Archive,
+                    "--purge" => mode = CleanupMode::Purge,
+                    other => ids.push(other.to_string()),
+                }
+            }
+            match agent.cleanup_sessions_with(&ids, mode) {
+                Ok(report) => {
+                    app.status = format!(
+                        "archived {} removed {}",
+                        report.archived.len(),
+                        report.removed.len()
+                    );
+                }
                 Err(error) => app.status = format!("session cleanup failed: {error}"),
             }
             return true;
@@ -2513,11 +2651,13 @@ fn parse_job_id(raw: &str) -> Option<JobId> {
     raw.parse().ok()
 }
 
-fn format_jobs_list(app: &TuiApp) -> String {
-    if app.jobs.is_empty() {
-        return "no jobs".to_string();
-    }
-    app.jobs
+/// Render the `/tasks` view: every background job followed by a `reviewer`
+/// line so the AI reviewer surfaces alongside ordinary jobs even though it
+/// does not yet have its own task type. Each line is "{id} {status} {kind}
+/// {title}"; reviewer uses `reviewer` for both id and kind.
+fn format_tasks_list(app: &TuiApp, agent: &Agent) -> String {
+    let mut lines: Vec<String> = app
+        .jobs
         .values()
         .rev()
         .take(MAX_JOB_NOTIFICATIONS)
@@ -2530,8 +2670,21 @@ fn format_jobs_list(app: &TuiApp) -> String {
                 sanitize_inline(&job.title)
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    lines.push(format_reviewer_task_line(agent));
+    lines.join("\n")
+}
+
+fn format_reviewer_task_line(agent: &Agent) -> String {
+    let entries = agent.reviewer_audit_snapshot();
+    if entries.is_empty() {
+        "reviewer idle ai-reviewer no decisions yet".to_string()
+    } else {
+        format!(
+            "reviewer ready ai-reviewer {} recent decision(s)",
+            entries.len()
+        )
+    }
 }
 
 fn format_job_detail(job: &JobSnapshot) -> String {
@@ -2647,6 +2800,55 @@ fn parse_tool_output_verbosity(value: &str) -> Option<ToolOutputVerbosity> {
         "normal" => Some(ToolOutputVerbosity::Normal),
         "verbose" => Some(ToolOutputVerbosity::Verbose),
         _ => None,
+    }
+}
+
+/// `/effort` sets `model.reasoning_effort` in the live in-memory config so the
+/// next turn picks it up via `request_reasoning_effort`. `auto` (or `clear`,
+/// `unset`, `none`) drops the override and falls back to the model default. The
+/// command is session-scoped — to persist across runs, edit `model.reasoning_effort`
+/// via `/config`. `SQUEEZY_REASONING_EFFORT` env var still wins on next load, so
+/// surface that fact when set.
+fn handle_slash_effort(app: &mut TuiApp, agent: &mut Agent, value: Option<&str>) {
+    let Some(raw) = value else {
+        let current = agent.config_snapshot().reasoning_effort.map_or_else(
+            || "unset (model default)".to_string(),
+            |e| e.as_str().to_string(),
+        );
+        app.status = format!("reasoning effort: {current}");
+        app.push_transcript_item(TranscriptItem::system(format!(
+            "reasoning effort = {current}\nusage: /effort [low|medium|high|xhigh|auto]"
+        )));
+        return;
+    };
+    let next_effort = match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" | "clear" | "unset" | "none" => None,
+        other => match squeezy_core::ReasoningEffort::parse(other) {
+            Some(effort) => Some(effort),
+            None => {
+                app.status =
+                    format!("unknown effort {raw:?}; expected low, medium, high, xhigh, or auto");
+                return;
+            }
+        },
+    };
+    let mut next = agent.config_snapshot();
+    next.reasoning_effort = next_effort;
+    agent.replace_config(next);
+    let label = next_effort.map_or_else(
+        || "auto (model default)".to_string(),
+        |e| e.as_str().to_string(),
+    );
+    app.app_notifications.push(
+        format!("reasoning effort → {label}"),
+        NotifySeverity::Success,
+    );
+    app.status = format!("reasoning effort → {label}");
+    if std::env::var("SQUEEZY_REASONING_EFFORT").is_ok() {
+        app.app_notifications.push(
+            "SQUEEZY_REASONING_EFFORT overrides this on next load".to_string(),
+            NotifySeverity::Warn,
+        );
     }
 }
 
@@ -3854,6 +4056,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     // Flexible filler keeps the prompt/status block attached to the transcript
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
+    render_toast_overlay(frame, area, app);
 }
 
 fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -3893,6 +4096,49 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Style::default().fg(QUIET),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Overlay the corner-toast stack on the top-right of `area`. Each visible
+/// toast renders as a single-line tinted glyph + message. Toasts draw
+/// after every other surface so they sit on top of the transcript and
+/// modal flows; layout-wise they reserve zero rows in the constraint
+/// solver and simply clip whatever pixels they overlap.
+fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+    let visible = app.toasts.visible();
+    if visible.is_empty() || area.width < 8 || area.height == 0 {
+        return;
+    }
+    let max_width = area.width.saturating_sub(2).clamp(8, 40);
+    for (row_offset, toast) in visible.iter().enumerate() {
+        if row_offset as u16 >= area.height {
+            break;
+        }
+        let label = format!("{} {}", toast.variant.glyph(), toast.message);
+        let visual: String = label.chars().take(max_width as usize).collect();
+        let line_width = visual.chars().count() as u16;
+        let x = area.right().saturating_sub(line_width + 1).max(area.left());
+        let y = area.top() + row_offset as u16;
+        let rect = Rect {
+            x,
+            y,
+            width: line_width.min(area.right().saturating_sub(x)),
+            height: 1,
+        };
+        if rect.width == 0 {
+            continue;
+        }
+        let style = Style::default()
+            .fg(toast.variant.color())
+            .add_modifier(Modifier::BOLD);
+        let span = Span::styled(visual, style);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(Line::from(span)), rect);
+    }
 }
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -4011,6 +4257,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         index += 1;
     }
     render_status(frame, chunks[index], app);
+    render_toast_overlay(frame, area, app);
 }
 
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
@@ -4124,7 +4371,11 @@ fn turn_in_progress(app: &TuiApp) -> bool {
 
 fn working_line(app: &TuiApp) -> Line<'static> {
     let interrupting = app.status == "interrupting";
-    let activity_color = if interrupting { ERROR_RED } else { AMBER };
+    let activity_color = if interrupting {
+        ERROR_RED
+    } else {
+        render::palette::accent_primary()
+    };
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
@@ -4191,7 +4442,11 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
                 0.0
             };
             let style = Style::default()
-                .fg(blend_color(AMBER, WORKING_SHIMMER_HIGHLIGHT, intensity))
+                .fg(blend_color(
+                    render::palette::accent_primary(),
+                    render::palette::accent_working_highlight(),
+                    intensity,
+                ))
                 .add_modifier(Modifier::BOLD);
             Span::styled(ch.to_string(), style)
         })
@@ -4495,12 +4750,10 @@ fn transcript_lines_for_render(
 }
 
 fn streaming_reasoning_lines(text: &str) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let mut lines = vec![Line::from(Span::styled("▾ thinking…".to_string(), style))];
     for raw in text.lines() {
-        lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+        lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
     }
     lines.push(Line::from(""));
     lines
@@ -5575,9 +5828,7 @@ fn reasoning_block_lines_with_extras(
     selected: bool,
     extras: usize,
 ) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(palette::muted_fg())
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();
@@ -5610,7 +5861,7 @@ fn reasoning_block_lines_with_extras(
         };
         lines.push(Line::from(Span::styled(header, style)));
         for raw in body_lines {
-            lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
+            lines.push(Line::from(Span::styled(format!("▏ {}", raw), style)));
         }
     }
     lines
@@ -8998,7 +9249,7 @@ pub(crate) struct TuiApp {
     pub(crate) input_history_draft: String,
     pub(crate) slash_menu_index: usize,
     pub(crate) mention_popup: Option<mention::MentionPopup>,
-    pub(crate) workspace_files: Option<Arc<Vec<PathBuf>>>,
+    pub(crate) workspace_file_cache: Option<mention::WorkspaceFileCache>,
     pub(crate) overlay: Option<overlay::Overlay>,
     /// Full-screen transcript overlay (Ctrl+T) that renders every entry
     /// in its uncapped form. `None` = closed; `Some(state)` = open with
@@ -9136,6 +9387,12 @@ pub(crate) struct TuiApp {
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     pub(crate) app_notifications: NotificationQueue,
+    /// Corner toast stack — short-lived overlays for fire-and-forget
+    /// status events (telemetry flush, MCP connect, index ready). Kept
+    /// separate from `app_notifications` because that surface is an
+    /// inline rotating banner; toasts overlay the top-right and stack up
+    /// to three at a time.
+    pub(crate) toasts: ToastQueue,
     /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
     /// default; flips on via `[tui].desktop_notifications`.
     pub(crate) desktop_notifier: DesktopNotifier,
@@ -9218,6 +9475,7 @@ impl TuiApp {
                 languages: String::new(),
                 skip_resume_picker: false,
                 update_banner: None,
+                resume_session_id: None,
             },
             clipboard,
         )
@@ -9260,7 +9518,7 @@ impl TuiApp {
             input_history_draft: String::new(),
             slash_menu_index: 0,
             mention_popup: None,
-            workspace_files: None,
+            workspace_file_cache: None,
             overlay: None,
             transcript_overlay: None,
             alternate_scroll_enabled: TerminalMode::from(config.tui.alternate_screen)
@@ -9325,6 +9583,7 @@ impl TuiApp {
             pending_report: None,
             clipboard,
             app_notifications: NotificationQueue::new(),
+            toasts: ToastQueue::new(),
             desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
             status_line_items: parse_status_line_items(config.tui.status_line.as_deref()),

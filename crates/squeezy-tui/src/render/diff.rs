@@ -4,7 +4,7 @@ use ratatui::{
 };
 use squeezy_vcs::DiffFile;
 
-use crate::render::{highlight, palette};
+use crate::render::{cache, highlight, palette};
 
 #[derive(Debug, Clone)]
 struct DiffLine {
@@ -39,7 +39,12 @@ pub(crate) fn render_diff_file(file: &DiffFile) -> Vec<Line<'static>> {
             Style::default().fg(palette::QUIET),
         ))];
     };
-    render_patch(patch, language_hint_from_path(&file.path))
+    // Key on `(path, patch_hash)` so identical patches against different
+    // paths still produce separate cache entries (the diff renderer
+    // applies path-derived syntax highlighting).
+    cache::get_or_compute_diff(&file.path, patch, || {
+        render_patch(patch, language_hint_from_path(&file.path))
+    })
 }
 
 pub(crate) fn render_patch_full_lines(

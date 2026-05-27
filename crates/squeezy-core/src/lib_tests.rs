@@ -737,7 +737,7 @@ provider = "ollama"
 profile = "cheap"
 
 [providers.ollama]
-base_url = "http://ollama.example/api"
+base_url = "http://127.0.0.1:11434/api"
 default_model = "llama-local"
 "#,
         "test",
@@ -750,7 +750,7 @@ default_model = "llama-local"
     assert_eq!(config.profile, ModelProfile::Cheap);
     match config.provider {
         ProviderConfig::Ollama(ollama) => {
-            assert_eq!(ollama.base_url, "http://ollama.example/api");
+            assert_eq!(ollama.base_url, "http://127.0.0.1:11434/api");
         }
         _ => panic!("expected Ollama provider"),
     }
@@ -844,6 +844,32 @@ fn config_can_select_azure_bedrock_and_ollama_defaults() {
     });
     assert!(matches!(ollama.provider, ProviderConfig::Ollama(_)));
     assert_eq!(ollama.model, DEFAULT_OLLAMA_MODEL);
+}
+
+#[test]
+fn config_resolves_opus_alias_to_full_id() {
+    let anthropic = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        "SQUEEZY_MODEL" => Some("opus".to_string()),
+        _ => None,
+    });
+    assert!(matches!(anthropic.provider, ProviderConfig::Anthropic(_)));
+    assert_eq!(anthropic.model, DEFAULT_ANTHROPIC_MODEL);
+
+    let openai = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("openai".to_string()),
+        "SQUEEZY_MODEL" => Some("opus".to_string()),
+        _ => None,
+    });
+    assert_eq!(openai.model, DEFAULT_OPENAI_MODEL);
+
+    // Full IDs pass through untouched.
+    let passthrough = AppConfig::from_env_vars(None, |name| match name {
+        "SQUEEZY_PROVIDER" => Some("anthropic".to_string()),
+        "SQUEEZY_MODEL" => Some("claude-sonnet-4-6".to_string()),
+        _ => None,
+    });
+    assert_eq!(passthrough.model, "claude-sonnet-4-6");
 }
 
 #[test]
@@ -1036,6 +1062,111 @@ fn permission_policy_downgrades_allow_on_bare_star_runtime_safety_net() {
         "verdict reason should explain downgrade: {}",
         verdict.reason,
     );
+}
+
+#[test]
+fn silent_rule_evaluates_to_silent_deny() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "destructive"
+target = "rm:-rf:/"
+action = "deny"
+source = "user"
+silent = true
+reason = "absolute deny rule for rm -rf /"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let request = PermissionRequest {
+        call_id: "call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Destructive,
+        target: "rm:-rf:/".to_string(),
+        risk: PermissionRisk::High,
+        summary: "rm -rf /".to_string(),
+        metadata: BTreeMap::new(),
+        suggested_rules: Vec::new(),
+    };
+
+    let verdict = config.permissions.evaluate(&request);
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(verdict.silent, "silent rule must produce silent verdict");
+    assert_eq!(
+        verdict.matched_rule.as_ref().map(|rule| rule.silent),
+        Some(true),
+    );
+    assert!(
+        verdict.reason.contains("absolute deny"),
+        "verdict reason should retain rule reason: {}",
+        verdict.reason,
+    );
+}
+
+#[test]
+fn non_silent_deny_rule_leaves_verdict_silent_false() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "cargo test:*"
+action = "deny"
+source = "user"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    let verdict = config.permissions.evaluate(&shell_request("cargo test:*"));
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(
+        !verdict.silent,
+        "deny rule without silent=true must not produce a silent verdict",
+    );
+}
+
+#[test]
+fn silent_true_on_non_deny_rule_is_rejected_at_load_time() {
+    let result = SettingsFile::from_toml_str(
+        r#"
+[[permissions.rules]]
+capability = "shell"
+target = "ls:*"
+action = "ask"
+source = "user"
+silent = true
+"#,
+        "test",
+    );
+    let err = result.expect_err("silent=true on ask rule must fail to load");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("silent = true is only valid on Deny rules"),
+        "unexpected message: {msg}",
+    );
+}
+
+#[test]
+fn silent_deny_propagates_via_session_layer_in_evaluate_with_extra() {
+    let policy = PermissionPolicy::default();
+    let session_rule = PermissionRule::new(
+        "shell",
+        "shred:*",
+        PermissionAction::Deny,
+        PermissionRuleSource::Session,
+        Some("policy: shred is forbidden".to_string()),
+    )
+    .with_silent(true);
+    let verdict = policy.evaluate_with_extra(
+        &shell_request("shred:*"),
+        std::slice::from_ref(&session_rule),
+    );
+    assert_eq!(verdict.action, PermissionAction::Deny);
+    assert!(verdict.silent);
 }
 
 fn try_app_config(toml: &str) -> Result<AppConfig> {
@@ -2024,6 +2155,188 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
+fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_workers_ai".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_workers_ai"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("workers AI config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_workers_ai must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.preset,
+        OpenAiCompatiblePreset::CloudflareWorkersAi
+    );
+    assert_eq!(
+        compatible.base_url,
+        "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1"
+    );
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
+    assert_eq!(config.model, DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL);
+}
+
+#[test]
+fn cloudflare_workers_ai_preset_rejects_missing_account_id() {
+    let settings = SettingsFile::default();
+    let error =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("cloudflare_workers_ai"), |_| {
+            None
+        })
+        .expect_err("workers AI requires account_id");
+    assert!(
+        format!("{error}").contains("cloudflare_account_id"),
+        "error must explain the missing field, got: {error}"
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            cloudflare_gateway_id: Some("my-gateway".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            "CF_AIG_TOKEN" => Some("gateway-secret".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.preset,
+        OpenAiCompatiblePreset::CloudflareAiGateway
+    );
+    assert_eq!(
+        compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat"
+    );
+    // Dual auth: standard bearer goes through `api_key_env`; gateway token is
+    // injected as `cf-aig-authorization` so the compat layer authenticates
+    // both the upstream provider and the gateway itself.
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
+    assert_eq!(
+        compatible
+            .extra_headers
+            .get("cf-aig-authorization")
+            .map(String::as_str),
+        Some("Bearer gateway-secret"),
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway falls back to the `default` gateway id");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/default/compat"
+    );
+    // No CF_AIG_TOKEN supplied → no `cf-aig-authorization` header injected;
+    // the gateway runs in "open" / upstream-auth-only mode.
+    assert!(
+        !compatible
+            .extra_headers
+            .contains_key("cf-aig-authorization")
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_user_supplied_header_wins_over_env_token() {
+    let mut providers = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "cf-aig-authorization".to_string(),
+        "Bearer user-supplied".to_string(),
+    );
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            headers: Some(headers),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            "CF_AIG_TOKEN" => Some("env-token-should-lose".to_string()),
+            _ => None,
+        },
+    )
+    .expect("config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible
+            .extra_headers
+            .get("cf-aig-authorization")
+            .map(String::as_str),
+        Some("Bearer user-supplied"),
+    );
+}
+
+#[test]
 fn aliases_map_to_compatible_presets() {
     for (alias, expected) in [
         ("vercel_ai", OpenAiCompatiblePreset::Vercel),
@@ -2032,6 +2345,13 @@ fn aliases_map_to_compatible_presets() {
         ("port_key", OpenAiCompatiblePreset::PortKey),
         ("vertex_ai", OpenAiCompatiblePreset::Vertex),
         ("google_vertex", OpenAiCompatiblePreset::Vertex),
+        ("workers_ai", OpenAiCompatiblePreset::CloudflareWorkersAi),
+        ("cf_workers_ai", OpenAiCompatiblePreset::CloudflareWorkersAi),
+        ("ai_gateway", OpenAiCompatiblePreset::CloudflareAiGateway),
+        (
+            "cloudflare_gateway",
+            OpenAiCompatiblePreset::CloudflareAiGateway,
+        ),
         ("custom", OpenAiCompatiblePreset::Custom),
     ] {
         // Some presets need extra fields filled in before the config can
@@ -2054,6 +2374,25 @@ fn aliases_map_to_compatible_presets() {
                 ProviderSettings {
                     vertex_project: Some("alias-project".to_string()),
                     vertex_location: Some("us-central1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        if expected == OpenAiCompatiblePreset::CloudflareWorkersAi {
+            providers.insert(
+                "cloudflare_workers_ai".to_string(),
+                ProviderSettings {
+                    cloudflare_account_id: Some("alias-acct".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        if expected == OpenAiCompatiblePreset::CloudflareAiGateway {
+            providers.insert(
+                "cloudflare_ai_gateway".to_string(),
+                ProviderSettings {
+                    cloudflare_account_id: Some("alias-acct".to_string()),
+                    cloudflare_gateway_id: Some("alias-gw".to_string()),
                     ..Default::default()
                 },
             );
@@ -2412,6 +2751,19 @@ fn tui_theme_parses_lowercase_and_aliases_auto_to_system() {
     assert_eq!(TuiTheme::parse("light"), Some(TuiTheme::Light));
     // `auto` is the historical / config-screen equivalent of "system".
     assert_eq!(TuiTheme::parse("auto"), Some(TuiTheme::System));
+    // Named themes with distinct accent identities; aliases keep the slash
+    // command forgiving when users guess hyphen / underscore variants.
+    assert_eq!(TuiTheme::parse("catppuccin"), Some(TuiTheme::Catppuccin));
+    assert_eq!(TuiTheme::parse("mauve"), Some(TuiTheme::Catppuccin));
+    assert_eq!(
+        TuiTheme::parse("high-contrast"),
+        Some(TuiTheme::HighContrast),
+    );
+    assert_eq!(
+        TuiTheme::parse("high_contrast"),
+        Some(TuiTheme::HighContrast),
+    );
+    assert_eq!(TuiTheme::parse("hc"), Some(TuiTheme::HighContrast));
     // Whitespace and uppercase are tolerated so users typing `/theme Dark`
     // hit the same branch as the canonical `/theme dark` form.
     assert_eq!(TuiTheme::parse("  Dark  "), Some(TuiTheme::Dark));
@@ -2442,6 +2794,24 @@ theme = "dark"
     let reparsed = SettingsFile::from_toml_str(&emitted, "round trip").expect("inspect re-parse");
     let reloaded = AppConfig::from_settings_and_env_vars(reparsed, |_| None);
     assert_eq!(reloaded.tui.theme, TuiTheme::Dark);
+}
+
+#[test]
+fn tui_theme_as_str_round_trips_through_parse_for_every_variant() {
+    for theme in [
+        TuiTheme::System,
+        TuiTheme::Dark,
+        TuiTheme::Light,
+        TuiTheme::Catppuccin,
+        TuiTheme::HighContrast,
+    ] {
+        let s = theme.as_str();
+        assert_eq!(
+            TuiTheme::parse(s),
+            Some(theme),
+            "as_str→parse must round-trip for {theme:?} (got {s:?})",
+        );
+    }
 }
 
 #[test]
@@ -2595,4 +2965,151 @@ fn memory_scope_doc_records_deferred_tool_decision() {
         body.contains("memory_append"),
         "scope doc must name the staged tool surface for future adoption"
     );
+}
+
+#[test]
+fn small_fast_model_resolves_per_provider_default() {
+    assert_eq!(
+        small_fast_model_for_provider("anthropic"),
+        Some(ANTHROPIC_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("openai"),
+        Some(OPENAI_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("google"),
+        Some(GOOGLE_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("bedrock"),
+        Some(BEDROCK_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("azure_openai"),
+        Some(AZURE_OPENAI_SMALL_FAST_MODEL)
+    );
+    assert_eq!(
+        small_fast_model_for_provider("openrouter"),
+        Some(OPENROUTER_SMALL_FAST_MODEL)
+    );
+    // Ollama serves a single local model; no separate cheap tier.
+    assert_eq!(small_fast_model_for_provider("ollama"), None);
+    assert_eq!(small_fast_model_for_provider("unknown"), None);
+}
+
+#[test]
+fn resolved_small_fast_model_prefers_config_override() {
+    let mut config = AppConfig::from_env_vars(Some("anthropic"), |_| None);
+    config.small_fast_model = Some("claude-haiku-custom".to_string());
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some("claude-haiku-custom")
+    );
+}
+
+#[test]
+fn resolved_small_fast_model_falls_back_to_provider_default() {
+    let config = AppConfig::from_env_vars(Some("anthropic"), |_| None);
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some(ANTHROPIC_SMALL_FAST_MODEL)
+    );
+}
+
+#[test]
+fn resolved_small_fast_model_returns_none_for_ollama_without_override() {
+    let config = AppConfig::from_env_vars(Some("ollama"), |_| None);
+    assert_eq!(config.resolved_small_fast_model(), None);
+}
+
+#[test]
+fn small_fast_model_reads_env_var() {
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(
+        "SQUEEZY_SMALL_FAST_MODEL".to_string(),
+        "haiku-from-env".to_string(),
+    );
+    overrides.insert("SQUEEZY_PROVIDER".to_string(), "anthropic".to_string());
+    let config = AppConfig::from_env_vars(None, |name| overrides.get(name).cloned());
+    assert_eq!(config.small_fast_model.as_deref(), Some("haiku-from-env"));
+    assert_eq!(
+        config.resolved_small_fast_model().as_deref(),
+        Some("haiku-from-env")
+    );
+}
+
+#[test]
+fn small_fast_model_reads_toml_setting() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "anthropic"
+small_fast_model = "claude-haiku-from-toml"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+    assert_eq!(
+        config.small_fast_model.as_deref(),
+        Some("claude-haiku-from-toml")
+    );
+}
+
+#[test]
+fn config_rejects_http_base_url_for_non_loopback_host() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[providers.openai]
+base_url = "http://attacker.example.com/v1"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+        .expect_err("non-loopback http base_url must be rejected");
+    let msg = error.to_string();
+    assert!(msg.contains("providers.openai.base_url"), "{msg}");
+    assert!(msg.contains("https://"), "{msg}");
+}
+
+#[test]
+fn config_accepts_http_base_url_for_loopback_hosts() {
+    for host in ["localhost", "127.0.0.1", "127.5.6.7", "[::1]"] {
+        let toml = format!(
+            r#"
+[model]
+provider = "ollama"
+
+[providers.ollama]
+base_url = "http://{host}:11434/api"
+"#
+        );
+        let settings = SettingsFile::from_toml_str(&toml, "test").expect("settings parse");
+        AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+            .unwrap_or_else(|err| panic!("loopback host {host:?} must be accepted: {err}"));
+    }
+}
+
+#[test]
+fn config_rejects_http_base_url_for_private_lan_host() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[model]
+provider = "openai"
+
+[providers.openai]
+base_url = "http://192.168.1.50:8080/v1"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let error = AppConfig::try_from_settings_and_env_vars(settings, None, |_| None)
+        .expect_err("LAN http base_url must be rejected");
+    assert!(error.to_string().contains("https://"));
 }

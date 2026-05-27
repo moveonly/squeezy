@@ -213,12 +213,28 @@ impl LlmProvider for LMStudioProvider {
                 yield emitted;
             }
             if !state.completed_emitted {
+                let stop_reason = state.finish_reason.as_deref().map(lmstudio_stop_reason);
                 yield LlmEvent::Completed {
                     response_id: state.response_id.take(),
                     cost: state.cost.clone(),
+                    stop_reason,
                 };
             }
         })
+    }
+}
+
+/// Map OpenAI chat-completions `finish_reason` strings observed via
+/// LM Studio into the normalized [`crate::StopReason`]. Mirrors
+/// `compatible.rs::chat_stop_reason`; kept inline so the two providers
+/// stay independent.
+fn lmstudio_stop_reason(value: &str) -> crate::StopReason {
+    match value {
+        "stop" => crate::StopReason::EndTurn,
+        "tool_calls" | "function_call" => crate::StopReason::ToolUse,
+        "length" => crate::StopReason::MaxTokens,
+        "content_filter" => crate::StopReason::Refusal,
+        other => crate::StopReason::Other(other.to_string()),
     }
 }
 
@@ -302,6 +318,9 @@ pub(crate) struct StreamState {
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     completed_emitted: bool,
+    /// Captured OpenAI chat-completions `finish_reason` from the last
+    /// streamed choice; mapped to [`crate::StopReason`] at completion.
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -364,9 +383,11 @@ pub(crate) fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Ve
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
         if !state.completed_emitted {
+            let stop_reason = state.finish_reason.as_deref().map(lmstudio_stop_reason);
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.take(),
                 cost: state.cost.clone(),
+                stop_reason,
             });
             state.completed_emitted = true;
         }
@@ -411,13 +432,14 @@ pub(crate) fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Ve
                     }
                 }
             }
-            if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str)
-                && matches!(
+            if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                state.finish_reason = Some(finish_reason.to_string());
+                if matches!(
                     finish_reason,
                     "tool_calls" | "function_call" | "stop" | "length" | "content_filter"
-                )
-            {
-                events.extend(state.drain_tool_calls()?);
+                ) {
+                    events.extend(state.drain_tool_calls()?);
+                }
             }
         }
     }

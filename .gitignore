@@ -30,3 +30,4 @@ node_modules/
 
 # Coverage reports
 /target/llvm-cov/
+.claude/

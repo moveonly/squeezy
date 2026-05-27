@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
-    with_stream_retry,
+    parse_retry_after, with_stream_retry,
 };
 use crate::{LlmEvent, LlmStream};
 
@@ -88,6 +88,7 @@ fn full_event_sequence() -> Vec<LlmEvent> {
         LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         },
     ]
 }
@@ -337,4 +338,45 @@ fn jitter_sample_is_not_constant() {
         }
     }
     assert!(saw_different, "jitter sample appears deterministic");
+}
+
+#[test]
+fn retry_after_ms_header_is_preferred_over_retry_after_seconds() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after-ms", "250".parse().expect("header value"));
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "1".parse().expect("header value"),
+    );
+    assert_eq!(
+        parse_retry_after(&headers),
+        Some(Duration::from_millis(250))
+    );
+}
+
+#[test]
+fn retry_after_seconds_used_when_ms_header_absent() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "2".parse().expect("header value"),
+    );
+    assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(2)));
+}
+
+#[test]
+fn retry_after_falls_back_when_ms_header_is_unparseable() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("retry-after-ms", "soon".parse().expect("header value"));
+    headers.insert(
+        reqwest::header::RETRY_AFTER,
+        "3".parse().expect("header value"),
+    );
+    assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(3)));
+}
+
+#[test]
+fn retry_after_returns_none_when_no_headers_present() {
+    let headers = reqwest::header::HeaderMap::new();
+    assert_eq!(parse_retry_after(&headers), None);
 }

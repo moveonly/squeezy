@@ -87,7 +87,7 @@ pub(crate) struct ApplyPatchArgs {
     #[serde(default)]
     pub(crate) patches: Vec<SearchReplacePatch>,
     #[serde(default)]
-    operations: Vec<ApplyPatchOperation>,
+    pub(crate) operations: Vec<ApplyPatchOperation>,
     impact_paths: Option<Vec<String>>,
     plan_id: Option<String>,
     dry_run: Option<bool>,
@@ -99,8 +99,8 @@ pub(crate) struct ApplyPatchArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchReplacePatch {
     pub(crate) path: String,
-    search: String,
-    replace: String,
+    pub(crate) search: String,
+    pub(crate) replace: String,
     expected_sha256: Option<String>,
     allow_multiple: Option<bool>,
     #[serde(default)]
@@ -152,6 +152,130 @@ pub(crate) struct PostMoveReplace {
     pub(crate) replace: String,
     #[serde(default)]
     pub(crate) allow_multiple: Option<bool>,
+}
+
+/// Maximum diff-body lines surfaced to the approval preview. Keeps the
+/// prompt area readable on small terminals; the user can always inspect
+/// the full patch via `/diff` after approval.
+pub(crate) const APPROVAL_DIFF_MAX_LINES: usize = 40;
+
+/// Render the `apply_patch` arguments as a unified-diff blob suitable for
+/// the approval preview's gutter+syntax-highlighted renderer.
+///
+/// The blob is a synthesised view: each search/replace pair becomes a
+/// hunk with `-` lines for the old text and `+` lines for the new text;
+/// `create_file` operations show as all-add; `delete_file` as all-delete;
+/// `move_file` becomes a header. The hunk header carries `1` for both
+/// sides because we have no real file state at approval time — the
+/// renderer's gutter still prints sequential numbers that mark *position
+/// within the proposed patch*, which is what the reviewer needs.
+pub(crate) fn render_apply_patch_diff(args: &ApplyPatchArgs) -> Option<String> {
+    let mut out = String::new();
+    let mut remaining = APPROVAL_DIFF_MAX_LINES;
+    let mut emitted_any = false;
+    for patch in &args.patches {
+        if remaining == 0 {
+            break;
+        }
+        append_search_replace_hunk(
+            &mut out,
+            &patch.path,
+            &patch.search,
+            &patch.replace,
+            &mut remaining,
+        );
+        emitted_any = true;
+    }
+    for op in &args.operations {
+        if remaining == 0 {
+            break;
+        }
+        match op {
+            ApplyPatchOperation::SearchReplace {
+                path,
+                search,
+                replace,
+                ..
+            } => {
+                append_search_replace_hunk(&mut out, path, search, replace, &mut remaining);
+            }
+            ApplyPatchOperation::CreateFile { path, contents, .. } => {
+                append_create_or_delete_hunk(&mut out, path, contents, '+', &mut remaining);
+            }
+            ApplyPatchOperation::DeleteFile { path, .. } => {
+                append_create_or_delete_hunk(&mut out, path, "", '-', &mut remaining);
+            }
+            ApplyPatchOperation::MoveFile { from, to, .. } => {
+                out.push_str(&format!("--- a/{from}\n+++ b/{to}\n@@ -1 +1 @@\n"));
+            }
+        }
+        emitted_any = true;
+    }
+    if !emitted_any || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+fn append_search_replace_hunk(
+    out: &mut String,
+    path: &str,
+    search: &str,
+    replace: &str,
+    remaining: &mut usize,
+) {
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+    for line in search.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("-{line}\n"));
+        *remaining -= 1;
+    }
+    for line in replace.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("+{line}\n"));
+        *remaining -= 1;
+    }
+}
+
+fn append_create_or_delete_hunk(
+    out: &mut String,
+    path: &str,
+    contents: &str,
+    sign: char,
+    remaining: &mut usize,
+) {
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n"));
+    for line in contents.lines() {
+        if *remaining == 0 {
+            return;
+        }
+        out.push_str(&format!("{sign}{line}\n"));
+        *remaining -= 1;
+    }
+}
+
+/// Render a `write_file` body as an all-add diff. We do not have the prior
+/// file contents at permission-evaluation time, so the preview shows the
+/// proposed contents with `+` gutter markers and the same syntax
+/// highlighting used by the worktree diff card.
+pub(crate) fn render_write_file_diff(path: &str, content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -0,0 +1 @@\n");
+    for (i, line) in content.lines().enumerate() {
+        if i >= APPROVAL_DIFF_MAX_LINES {
+            break;
+        }
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
 }
 
 impl ToolRegistry {
@@ -502,6 +626,22 @@ impl ToolRegistry {
                 ApplyPatchOperation::MoveFile { from, to, .. } => vec![from.clone(), to.clone()],
             })
             .collect();
+        // Jupyter notebooks have JSON cell structure that text search/replace
+        // (and full overwrite) will silently corrupt. Redirect the model to
+        // `notebook_edit` rather than letting the patch land.
+        if let Some(bad) = touched_paths.iter().find(|p| is_notebook_path(p)) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "use notebook_edit for .ipynb files; apply_patch corrupts notebook JSON",
+                    "path": bad,
+                    "suggested_tool": "notebook_edit",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         let patch_paths = normalized_path_set(&touched_paths);
         let locality = patch_locality_json(&patch_paths, &impact_paths);
         let warnings = patch_locality_warnings(&patch_paths, &impact_paths);
@@ -806,6 +946,16 @@ pub(crate) fn audit_delta_summary(entries: &[Value]) -> Vec<Value> {
             summary
         })
         .collect()
+}
+
+/// True when the path's lowercase extension is `.ipynb`. Used to route
+/// notebook edits to the dedicated `notebook_edit` tool from
+/// `apply_patch`/`write_file` so the JSON cell structure stays intact.
+pub(crate) fn is_notebook_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ipynb"))
 }
 
 pub(crate) fn normalized_path_set(paths: &[String]) -> BTreeSet<String> {

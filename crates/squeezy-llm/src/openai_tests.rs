@@ -31,6 +31,7 @@ fn request_body_uses_responses_streaming_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -49,8 +50,12 @@ fn request_body_uses_responses_streaming_shape() {
 
 #[test]
 fn parser_extracts_text_delta() {
-    let event = parse_openai_event(r#"{"type":"response.output_text.delta","delta":"hello"}"#)
-        .expect("valid event");
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(
+        r#"{"type":"response.output_text.delta","delta":"hello"}"#,
+        &mut acc,
+    )
+    .expect("valid event");
 
     assert_eq!(event, Some(LlmEvent::TextDelta("hello".to_string())));
 }
@@ -81,6 +86,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -121,6 +127,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -146,6 +153,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -178,6 +186,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             tool_choice: None,
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -202,6 +211,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -224,6 +234,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -232,6 +243,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 
 #[test]
 fn parser_extracts_function_call_from_output_item_done() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type": "response.output_item.done",
@@ -242,6 +254,7 @@ fn parser_extracts_function_call_from_output_item_done() {
             "arguments": "{\"pattern\":\"needle\"}"
           }
         }"#,
+        &mut acc,
     )
     .expect("valid event");
 
@@ -257,6 +270,7 @@ fn parser_extracts_function_call_from_output_item_done() {
 
 #[test]
 fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type": "response.output_item.done",
@@ -267,6 +281,7 @@ fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
             "arguments": "{\"query\":\"getFoo"
           }
         }"#,
+        &mut acc,
     )
     .expect("malformed arguments stay recoverable");
 
@@ -291,6 +306,7 @@ fn parser_preserves_malformed_function_arguments_as_tool_error_payload() {
 
 #[test]
 fn parser_extracts_completed_response_id_and_usage() {
+    let mut acc = ReasoningAccumulator::default();
     let event = parse_openai_event(
         r#"{
           "type":"response.completed",
@@ -304,6 +320,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             }
           }
         }"#,
+        &mut acc,
     )
     .expect("valid event");
 
@@ -319,37 +336,58 @@ fn parser_extracts_completed_response_id_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
+            // `response.completed` without `incomplete_details` is a
+            // successful end-of-turn signal in the Responses API; the
+            // provider normalizes this to `EndTurn` so the agent's loop
+            // sees a uniform stop reason across providers.
+            stop_reason: Some(crate::StopReason::EndTurn),
         })
     );
 }
 
 #[test]
 fn parser_surfaces_error_events() {
-    let err = parse_openai_event(r#"{"type":"error","error":{"message":"bad request"}}"#)
-        .expect_err("stream error");
+    let mut acc = ReasoningAccumulator::default();
+    let err = parse_openai_event(
+        r#"{"type":"error","error":{"message":"bad request"}}"#,
+        &mut acc,
+    )
+    .expect_err("stream error");
 
     assert!(err.to_string().contains("bad request"));
 }
 
 #[test]
 fn parser_surfaces_incomplete_events() {
-    let err = parse_openai_event(
+    let mut acc = ReasoningAccumulator::default();
+    let event = parse_openai_event(
         r#"{
           "type":"response.incomplete",
           "response":{
             "incomplete_details":{"reason":"max_output_tokens"}
           }
         }"#,
+        &mut acc,
     )
-    .expect_err("incomplete response is a stream error");
+    .expect("incomplete response normalises to Completed with StopReason::MaxTokens")
+    .expect("incomplete event must emit");
 
-    assert!(err.to_string().contains("max_output_tokens"));
+    match event {
+        LlmEvent::Completed { stop_reason, .. } => assert_eq!(
+            stop_reason,
+            Some(crate::StopReason::MaxTokens),
+            "max_output_tokens must surface as StopReason::MaxTokens",
+        ),
+        other => panic!("expected Completed event for incomplete response, got {other:?}"),
+    }
 }
 
 #[test]
 fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
+    let mut acc = ReasoningAccumulator::default();
     let summary_delta = parse_openai_event(
         r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing options"}"#,
+        &mut acc,
     )
     .expect("valid summary delta");
     assert_eq!(
@@ -370,6 +408,7 @@ fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
             "encrypted_content":"OPAQUE"
           }
         }"#,
+        &mut acc,
     )
     .expect("valid done");
     assert_eq!(
@@ -378,6 +417,69 @@ fn parser_extracts_reasoning_summary_delta_and_done_with_encrypted_blob() {
             item_id: "rs_abc".to_string(),
             summary: vec!["weighed options".to_string()],
             encrypted_content: Some("OPAQUE".to_string()),
+        }))
+    );
+}
+
+#[test]
+fn parser_backfills_empty_summary_from_streamed_deltas() {
+    let mut acc = ReasoningAccumulator::default();
+    // Stream two summary deltas (no `summary_text` will land in the item).
+    parse_openai_event(
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"weighing "}"#,
+        &mut acc,
+    )
+    .expect("valid summary delta");
+    parse_openai_event(
+        r#"{"type":"response.reasoning_summary_text.delta","delta":"options"}"#,
+        &mut acc,
+    )
+    .expect("valid summary delta");
+
+    // `output_item.done` arrives with `summary: []` (Responses sometimes ships
+    // the close event without the aggregated summary parts).
+    let done = parse_openai_event(
+        r#"{
+          "type":"response.output_item.done",
+          "item":{
+            "type":"reasoning",
+            "id":"rs_abc",
+            "summary":[],
+            "encrypted_content":"OPAQUE"
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect("valid done");
+    assert_eq!(
+        done,
+        Some(LlmEvent::ReasoningDone(crate::ReasoningPayload::OpenAi {
+            item_id: "rs_abc".to_string(),
+            summary: vec!["weighing options".to_string()],
+            encrypted_content: Some("OPAQUE".to_string()),
+        }))
+    );
+
+    // Accumulator must be drained so the next item starts clean.
+    let next_done = parse_openai_event(
+        r#"{
+          "type":"response.output_item.done",
+          "item":{
+            "type":"reasoning",
+            "id":"rs_def",
+            "summary":[],
+            "encrypted_content":null
+          }
+        }"#,
+        &mut acc,
+    )
+    .expect("valid done");
+    assert_eq!(
+        next_done,
+        Some(LlmEvent::ReasoningDone(crate::ReasoningPayload::OpenAi {
+            item_id: "rs_def".to_string(),
+            summary: Vec::new(),
+            encrypted_content: None,
         }))
     );
 }
@@ -433,6 +535,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         tools: Arc::from(Vec::new()),
         store: false,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         output_schema: Some(LlmOutputSchema {
             name: "answer_with_confidence".to_string(),
             schema: schema.clone(),
@@ -466,6 +569,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     };
 
@@ -498,6 +602,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
             strict: false,
         }),
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     };
 
@@ -523,6 +628,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         output_schema: None,
         parallel_tool_calls: Some(false),
         tool_choice: None,
+        beta_headers: Arc::from(Vec::new()),
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -546,6 +652,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             output_schema: None,
             parallel_tool_calls: value,
             tool_choice: None,
+            beta_headers: Arc::from(Vec::new()),
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");

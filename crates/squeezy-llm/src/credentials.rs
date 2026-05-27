@@ -21,6 +21,11 @@ pub enum KeySource {
     Env,
     /// Fallback env var pair (e.g. `SQUEEZY_OPENAI_KEY` ↔ `OPENAI_API_KEY`).
     FallbackEnv,
+    /// `SQUEEZY_CREDENTIALS_JSON` env var carrying the whole credentials
+    /// JSON document in one shot. The CI/CD injection point — a single
+    /// secret in the runner config covers every provider the workflow
+    /// touches.
+    JsonEnv,
 }
 
 #[derive(Debug, Clone)]
@@ -39,7 +44,10 @@ pub fn resolve_api_key_with_inline(inline: Option<&str>, env_var: &str) -> Resul
     // env vars so an explicit `credentials.json` entry can override a
     // stale exported env var. Env vars still resolve when neither
     // settings nor file are present so existing shells and CI exports
-    // keep working.
+    // keep working. `SQUEEZY_CREDENTIALS_JSON` sits at the bottom of
+    // the chain because it's a CI/CD broadcast channel — the user's
+    // own settings, file, or named env vars should still win when the
+    // CI runner has happened to inject the JSON blob too.
     if let Some(value) = inline
         && !value.trim().is_empty()
     {
@@ -66,6 +74,12 @@ pub fn resolve_api_key_with_inline(inline: Option<&str>, env_var: &str) -> Resul
         return Ok(ResolvedKey {
             value,
             source: KeySource::FallbackEnv,
+        });
+    }
+    if let Some(value) = read_credentials_json_env_for(env_var) {
+        return Ok(ResolvedKey {
+            value,
+            source: KeySource::JsonEnv,
         });
     }
     let fallback_note = fallback_env_var(env_var)
@@ -254,6 +268,111 @@ fn warn_once(path: &Path, msg: String) {
         Err(poison) => poison.into_inner(),
     };
     if set.insert(path.to_path_buf()) {
+        tracing::warn!("{msg}");
+    }
+}
+
+/// CI/CD injection point: the whole credentials document carried in a
+/// single env var. Equivalent to `~/.squeezy/credentials.json` but
+/// avoids writing a file to the runner's home directory. Two shapes
+/// are accepted so authors can pick whichever fits their secret store:
+///
+/// 1. Provider-keyed (preferred): `{"providers":{"openai":"sk-…",
+///    "anthropic":"sk-…"}}`. The provider name is derived from the
+///    requested env var by stripping the `SQUEEZY_…_KEY` or
+///    `…_API_KEY` framing and lower-casing the remainder.
+/// 2. Flat env-var-keyed: `{"OPENAI_API_KEY":"sk-…",
+///    "SQUEEZY_ANTHROPIC_KEY":"sk-…"}`. Mirrors the on-disk
+///    `credentials.json` schema so a workflow can `cat` the file into
+///    the env var without restructuring.
+fn read_credentials_json_env_for(env_var: &str) -> Option<String> {
+    let raw = env::var("SQUEEZY_CREDENTIALS_JSON").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(err) => {
+            warn_json_env_once(format!("SQUEEZY_CREDENTIALS_JSON is not valid JSON: {err}"));
+            return None;
+        }
+    };
+    let object = match value.as_object() {
+        Some(map) => map,
+        None => {
+            warn_json_env_once(
+                "SQUEEZY_CREDENTIALS_JSON must be a JSON object at the top level".to_string(),
+            );
+            return None;
+        }
+    };
+
+    // Provider-keyed shape: `{"providers": {...}}`. Take the first hit
+    // among (canonical env var → provider name) and (fallback env var
+    // → provider name) so either naming style resolves the same blob.
+    if let Some(providers) = object.get("providers").and_then(|v| v.as_object()) {
+        let candidates = [
+            provider_section_for_env(env_var),
+            fallback_env_var(env_var).and_then(|name| provider_section_for_env(&name)),
+        ];
+        for candidate in candidates.iter().flatten() {
+            if let Some(value) = providers.get(candidate).and_then(|v| v.as_str())
+                && !value.trim().is_empty()
+            {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    // Flat env-var-keyed shape: matches the on-disk `credentials.json`
+    // schema. Tried after the nested shape so a workflow that mixes
+    // both still resolves predictably.
+    if let Some(value) = object.get(env_var).and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+    if let Some(fallback) = fallback_env_var(env_var)
+        && let Some(value) = object.get(&fallback).and_then(|v| v.as_str())
+        && !value.trim().is_empty()
+    {
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// Derive the `providers.<name>` lookup key from a credential env var
+/// name. `SQUEEZY_OPENAI_KEY` → `openai`, `ANTHROPIC_API_KEY` →
+/// `anthropic`. Returns `None` for env var names that don't match
+/// either framing — those callers must use the flat env-var-keyed
+/// shape.
+fn provider_section_for_env(env_var: &str) -> Option<String> {
+    if let Some(stripped) = env_var.strip_prefix("SQUEEZY_")
+        && let Some(provider) = stripped.strip_suffix("_KEY")
+        && !provider.is_empty()
+    {
+        return Some(provider.to_ascii_lowercase());
+    }
+    if let Some(provider) = env_var.strip_suffix("_API_KEY")
+        && !provider.is_empty()
+    {
+        return Some(provider.to_ascii_lowercase());
+    }
+    None
+}
+
+/// One-shot warn for `SQUEEZY_CREDENTIALS_JSON` parse failures. Same
+/// suppression contract as `warn_once` but keyed on the message so
+/// distinct failure modes (bad JSON, wrong top-level shape) each
+/// surface once.
+fn warn_json_env_once(msg: String) {
+    static GUARD: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let set = GUARD.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut set = match set.lock() {
+        Ok(g) => g,
+        Err(poison) => poison.into_inner(),
+    };
+    if set.insert(msg.clone()) {
         tracing::warn!("{msg}");
     }
 }

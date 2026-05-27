@@ -156,7 +156,21 @@ fn seed() -> u64 {
 }
 
 async fn retry_after_delay(response: &Response) -> Option<Duration> {
-    let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    parse_retry_after(response.headers())
+}
+
+/// Honors `Retry-After-Ms` (preferred, millisecond precision used by Anthropic
+/// and some OpenAI Responses endpoints under sub-second throttling) before
+/// falling back to the seconds-granularity `Retry-After`. Without the
+/// preference we'd sleep a full second when the server is telling us 250 ms
+/// is enough.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(value) = headers.get("retry-after-ms")
+        && let Some(millis) = value.to_str().ok().and_then(|s| s.parse::<u64>().ok())
+    {
+        return Some(Duration::from_millis(millis));
+    }
+    let value = headers.get(reqwest::header::RETRY_AFTER)?;
     let seconds = value.to_str().ok()?.parse::<u64>().ok()?;
     Some(Duration::from_secs(seconds))
 }
@@ -262,9 +276,15 @@ impl SkipCursor {
                     Some(LlmEvent::ToolCall(call))
                 }
             }
-            LlmEvent::Completed { response_id, cost } => {
-                Some(LlmEvent::Completed { response_id, cost })
-            }
+            LlmEvent::Completed {
+                response_id,
+                cost,
+                stop_reason,
+            } => Some(LlmEvent::Completed {
+                response_id,
+                cost,
+                stop_reason,
+            }),
             LlmEvent::Cancelled => Some(LlmEvent::Cancelled),
         }
     }

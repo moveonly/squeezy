@@ -18,30 +18,29 @@ use serde_json::{Value, json};
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextAttachmentSource, ContextAttachmentStatus,
     ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
-    ContextPin, CostSnapshot, DEFAULT_ANTHROPIC_MODEL, DEFAULT_AZURE_OPENAI_MODEL,
-    DEFAULT_BEDROCK_MODEL, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_GOOGLE_MODEL,
-    DEFAULT_OLLAMA_MODEL, DEFAULT_OPENAI_MODEL, PROJECT_SETTINGS_FILE, PermissionAction,
-    PermissionCapability, PermissionRequest, PermissionRule, PermissionRuleSource, PermissionScope,
-    PermissionVerdict, ProviderConfig, Redactor, ResponseVerbosity, Role, SessionMetrics,
-    SessionMode, SqueezyError, StreamRedactor, SubagentConfig, TaskStateSnapshot, TaskStateStatus,
-    ToolSchemaConfig, TranscriptItem, TurnId, TurnMetrics, context_attachment_preview,
-    context_attachment_storage_text, default_settings_path, detect_context_attachment_kind,
+    ContextPin, CostSnapshot, DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES, DEFAULT_OLLAMA_MODEL,
+    PROJECT_SETTINGS_FILE, PermissionAction, PermissionCapability, PermissionRequest,
+    PermissionRule, PermissionRuleSource, PermissionScope, PermissionVerdict, ProviderConfig,
+    Redactor, ResponseVerbosity, Role, SessionMetrics, SessionMode, SqueezyError, StreamRedactor,
+    SubagentConfig, TaskStateSnapshot, TaskStateStatus, ToolSchemaConfig, TranscriptItem, TurnId,
+    TurnMetrics, context_attachment_preview, context_attachment_storage_text,
+    default_settings_path, detect_context_attachment_kind,
 };
 use squeezy_hooks::{HookEvent, HookRegistry};
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
-    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, capabilities_for, estimate_cost,
-    estimate_request_context_calibrated, fetch_ollama_context_window,
+    ReasoningPayload, ReasoningSnapshot, RequestTokenEstimate, StopReason, capabilities_for,
+    estimate_cost, estimate_request_context_calibrated, fetch_ollama_context_window,
 };
 use squeezy_skills::{
     BundledDoc, HelpAnswer, HelpStatus, SqueezyHelp, bundled_docs, matches_squeezy_help_input,
 };
 use squeezy_store::{
-    BugReportBundle, BugReportOptions, CleanupReport, ResumeItem, SessionEvent, SessionEventKind,
-    SessionHandle, SessionMetadata, SessionQuery, SessionRecord, SessionReplayEvent,
-    SessionReplayEventKind, SessionReplayTape, SessionResumeState, SessionStatus, SessionStore,
-    SqueezyStore,
+    BugReportBundle, BugReportOptions, CleanupMode, CleanupReport, ResumeItem, SessionEvent,
+    SessionEventKind, SessionHandle, SessionMetadata, SessionQuery, SessionRecord,
+    SessionReplayEvent, SessionReplayEventKind, SessionReplayTape, SessionResumeState,
+    SessionStatus, SessionStore, SqueezyStore,
 };
 use squeezy_telemetry::{
     ErrorKind, FeedbackClient, FeedbackSubmitResult, PreparedFeedback, ReportUpload,
@@ -50,10 +49,11 @@ use squeezy_telemetry::{
 };
 use squeezy_tools::{
     McpElicitationHandler, McpElicitationRequest, McpElicitationResponse, McpStatusSnapshot,
-    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback, ToolCall,
-    ToolCostHint, ToolExecutionOptions, ToolOutputConfig, ToolReceipt, ToolRegistry,
-    ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec, ToolStatus, WebToolConfig,
-    sha256_hex, shell_best_effort_fallback_from_result,
+    ShellAskApprover, ShellAskDecision, ShellAskRequest, ShellBestEffortFallback,
+    ShellPreClassification, ToolCall, ToolCostHint, ToolExecutionOptions, ToolOutputConfig,
+    ToolReceipt, ToolRegistry, ToolRegistryRuntime, ToolResult, ToolRuntimeConfig, ToolSpec,
+    ToolStatus, WebToolConfig, pre_classify_shell, sha256_hex,
+    shell_best_effort_fallback_from_result,
 };
 use tokio::{
     sync::{Mutex, Notify, broadcast, mpsc, oneshot},
@@ -66,6 +66,7 @@ mod cancel;
 mod context_compaction;
 mod cost_broker;
 mod exploration_compiler;
+mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
 mod roles;
@@ -74,12 +75,13 @@ use cancel::{CancelErr, OrCancelExt};
 use context_compaction::{
     PendingToolResult, SeenToolOutputs, compact_conversation_with_strategy,
     drop_orphan_function_call_outputs, estimate_context, maybe_compact_conversation,
-    maybe_compact_mid_turn, next_context_pin_id, pack_tool_results,
+    maybe_compact_mid_turn, next_context_pin_id, pack_tool_results, repair_orphan_function_calls,
 };
 #[cfg(test)]
 use context_compaction::{build_compaction_summary, compact_conversation};
 use cost_broker::{CostBroker, format_cap_reached_reason, llm_request_input_bytes};
 use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
+use micro_compaction::maybe_micro_compact_mid_turn;
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
@@ -119,10 +121,16 @@ const SUBAGENT_JSON_TAIL_INSTRUCTION: &str = "Output contract: end your final as
 /// in-flight subagent finishes (lease drops). Keeps fanout flat and
 /// predictable rather than letting a model spawn an unbounded swarm.
 const SUBAGENT_MAX_CONCURRENT: usize = 4;
-// Compaction summary truncation budgets. These are character (not byte)
-// caps because they pass through `compact_text` → `truncate_chars`. They
-// stay collocated so a future audit can read the total summary growth
-// in one place rather than chasing literals across `build_compaction_summary`.
+// Compaction summary truncation budget — survivor policy chunk for the
+// SUMMARY_BLOCK family. Sister budgets live in `context_compaction.rs`;
+// this one stays here because it is *also* used by
+// `instructions_with_pinned_context` to bound the per-turn pinned block
+// inserted into the live instructions, not just the compaction summary.
+//
+/// Cap on a single pin's summary text. ≈ 100 tokens — wide enough for a
+/// one-paragraph user-pinned reminder, narrow enough that a dozen pins fit
+/// inside `model_context_window * threshold_percent` without crowding out
+/// the live conversation.
 pub(crate) const COMPACTION_PIN_SUMMARY_MAX_CHARS: usize = 400;
 
 async fn next_llm_stream_event(
@@ -278,7 +286,14 @@ impl ReplayRuntime {
                         event.payload.get("cost").cloned().unwrap_or(Value::Null),
                     )
                     .unwrap_or_default();
-                    events.push(LlmEvent::Completed { response_id, cost });
+                    // Replay logs predate the stop_reason surface; mark
+                    // replayed completions as `None` so consumers can tell
+                    // a synthesized completion from a fresh provider one.
+                    events.push(LlmEvent::Completed {
+                        response_id,
+                        cost,
+                        stop_reason: None,
+                    });
                     return Ok(events);
                 }
                 SessionReplayEventKind::ModelCancelled => {
@@ -1317,9 +1332,14 @@ impl Agent {
             retention_days: config.tool_output_retention_days,
             output_dir: config.cache.tool_outputs.clone(),
         };
+        let websearch_provider =
+            squeezy_tools::WebSearchProvider::parse(&config.websearch_provider).unwrap_or_default();
         let web_config = WebToolConfig {
+            provider: websearch_provider,
             exa_mcp_url: config.exa_mcp_url.clone(),
             exa_api_key: env::var(&config.exa_api_key_env).ok(),
+            parallel_mcp_url: config.parallel_mcp_url.clone(),
+            parallel_api_key: env::var(&config.parallel_api_key_env).ok(),
         };
         // Compile the redactor exactly once and share it with the tool
         // registry. Pattern compilation can never fail here because the
@@ -1824,6 +1844,7 @@ impl Agent {
             tool_choice: self.config.tool_choice.clone(),
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         }
     }
 
@@ -1890,6 +1911,18 @@ impl Agent {
     }
 
     pub fn cleanup_sessions(&self, ids: &[String]) -> squeezy_core::Result<CleanupReport> {
+        self.cleanup_sessions_with(ids, CleanupMode::Archive)
+    }
+
+    /// Like [`Self::cleanup_sessions`] but lets the caller pick between the
+    /// soft-archive default and the hard-delete [`CleanupMode::Purge`]. The
+    /// TUI `/session-cleanup --purge` and CLI `sessions cleanup --purge`
+    /// thread the mode through this entry point.
+    pub fn cleanup_sessions_with(
+        &self,
+        ids: &[String],
+        mode: CleanupMode,
+    ) -> squeezy_core::Result<CleanupReport> {
         // Refuse to delete the session that this agent is currently writing
         // to. Removing it under our feet would orphan future event writes and
         // leave a session that no longer exists on disk but still appears in
@@ -1902,7 +1935,7 @@ impl Agent {
                 "refusing to clean up the active session {active_id}; finish or exit first"
             )));
         }
-        SessionStore::open(&self.config).cleanup_excluding(ids, active.as_deref())
+        SessionStore::open(&self.config).cleanup_with(ids, active.as_deref(), mode)
     }
 
     pub fn resume_current(
@@ -1950,6 +1983,7 @@ impl Agent {
             metrics: state.metrics,
             redactions: state.redactions,
             token_calibration: state.token_calibration,
+            parent_id: Some(parent_session_id.clone()),
             ..SessionMetadata::new(&self.config, self.provider.name())
         };
         let child = store.start_session(metadata)?;
@@ -2156,7 +2190,10 @@ impl Agent {
                     debug: format!("{:?}", snap),
                 }
             }
-            "jobs" => {
+            // `tasks` is the canonical name; `jobs` is kept as an alias for
+            // one release so eval traces with the old vocabulary still work.
+            // See F07-cc-tasks-and-background-jobs.
+            "tasks" | "jobs" => {
                 let jobs = self.jobs_snapshot();
                 CommandOutcome::JobsList { count: jobs.len() }
             }
@@ -4199,6 +4236,7 @@ impl TurnRuntime {
                 tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
                 output_schema: None,
                 parallel_tool_calls: None,
+                beta_headers: std::sync::Arc::from(Vec::new()),
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -4210,6 +4248,7 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            let mut stop_reason: Option<StopReason> = None;
             let mut round_text_started = false;
 
             while let Some(event) =
@@ -4359,6 +4398,7 @@ impl TurnRuntime {
                     LlmEvent::Completed {
                         response_id: id,
                         mut cost,
+                        stop_reason: completion_stop_reason,
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
@@ -4382,6 +4422,7 @@ impl TurnRuntime {
                         merge_cost(&mut total_cost, &cost);
                         completed_cost = cost;
                         response_id = id;
+                        stop_reason = completion_stop_reason;
                         completed = true;
                         break;
                     }
@@ -4450,6 +4491,96 @@ impl TurnRuntime {
                     .await;
                 self.finish_turn(&broker.metrics).await;
                 return Ok(());
+            }
+
+            // Explicit `stop_reason` branches. Truncation (max-tokens,
+            // context-window-exceeded) and refusal previously surfaced
+            // either as a provider transport error (Anthropic raised
+            // `ProviderStream("max_tokens")` directly) or as a silent
+            // empty assistant message; either way the user lost the
+            // distinction. Route each through `AgentEvent::Failed` with a
+            // descriptive error so the TUI can render a recovery hint
+            // and future compaction-retry logic can hook in here without
+            // touching every provider. `EndTurn` and `ToolUse` fall
+            // through to the existing tool-calls / completion logic.
+            match &stop_reason {
+                Some(StopReason::MaxTokens) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("response truncated by max_tokens".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model response stopped after max_tokens before completing; lower reasoning_effort, raise the provider's max_output_tokens, or run /compact and retry".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                Some(StopReason::ContextWindowExceeded) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("context window exceeded".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model reported the context window was exceeded; run /compact and retry".to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                Some(StopReason::Refusal) => {
+                    if let Some(tail) = self
+                        .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
+                        .await
+                    {
+                        self.record_replay_model_text_delta(&tail);
+                    }
+                    self.publish_terminal_task_state(
+                        TaskStateStatus::Failed,
+                        Some("model refused the request".to_string()),
+                        &task_title,
+                    )
+                    .await;
+                    let _ = self
+                        .tx
+                        .send(AgentEvent::Failed {
+                            turn_id: self.turn_id,
+                            error: SqueezyError::Agent(
+                                "model refused to produce a response (provider safety filter)"
+                                    .to_string(),
+                            ),
+                        })
+                        .await;
+                    self.finish_turn(&broker.metrics).await;
+                    return Ok(());
+                }
+                _ => {}
             }
 
             if tool_calls.is_empty() {
@@ -4609,13 +4740,54 @@ impl TurnRuntime {
             // gate will trip; PostCompact carries the report's
             // before/after counts when the rewrite landed.
             let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
+            // Mid-tier micro-compaction (F12-cc-microcompaction): rewrite
+            // older `FunctionCallOutput` payloads in place before falling
+            // through to the all-or-nothing full tier. When the
+            // micro-threshold sits below the full-compaction threshold a
+            // successful micro pass can keep the conversation under the
+            // full gate, preserving per-turn tool-call structure. Pass the
+            // provider-reported total when we have one so the gate matches
+            // what the model actually saw.
+            let micro_report = maybe_micro_compact_mid_turn(
+                &mut conversation,
+                &self.config,
+                mid_turn_observed_tokens,
+            );
+            if let Some(report) = micro_report.as_ref() {
+                self.log_event(
+                    "context_micro_compacted",
+                    Some(self.turn_id),
+                    Some(format!(
+                        "mid-turn micro-compaction cleared {} tool outputs, freed {} bytes",
+                        report.cleared_call_ids.len(),
+                        report.bytes_saved,
+                    )),
+                    json!({
+                        "cleared_call_ids": &report.cleared_call_ids,
+                        "bytes_saved": report.bytes_saved,
+                        "before_estimated_tokens": report.before_estimated_tokens,
+                        "after_estimated_tokens": report.after_estimated_tokens,
+                        "phase": "mid_turn",
+                    }),
+                );
+            }
+            // After a micro pass the conversation is smaller; the
+            // provider-reported total reflects the pre-rewrite payload
+            // size and would over-fire the full-tier gate. Switch to the
+            // local estimate so full only fires if micro alone was not
+            // enough.
+            let full_gate_observed_tokens = if micro_report.is_some() {
+                Some(estimate_context(&conversation).estimated_tokens)
+            } else {
+                mid_turn_observed_tokens
+            };
             let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
                 &self.config,
                 &conversation,
-                mid_turn_observed_tokens,
+                full_gate_observed_tokens,
             );
             if mid_turn_compaction_likely {
-                let pre_estimate = mid_turn_observed_tokens
+                let pre_estimate = full_gate_observed_tokens
                     .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
                 self.dispatch_pre_compact(pre_estimate);
             }
@@ -4625,9 +4797,12 @@ impl TurnRuntime {
                 &active_attachments,
                 self.store.as_deref(),
                 &self.config,
-                mid_turn_observed_tokens,
+                full_gate_observed_tokens,
             );
-            let mid_turn_compacted = mid_turn_report.is_some();
+            // Either tier mutates `conversation`, so the response-id reuse
+            // path must invalidate the cached id and resend the full
+            // conversation instead of the per-round outputs.
+            let mid_turn_compacted = mid_turn_report.is_some() || micro_report.is_some();
             if let Some(report) = mid_turn_report {
                 self.dispatch_post_compact(
                     report.record.before.estimated_tokens,
@@ -5155,7 +5330,7 @@ struct ToolExecutionContext<'a> {
     hooks: Option<Arc<HookRegistry>>,
 }
 
-impl ToolExecutionContext<'_> {
+impl<'a> ToolExecutionContext<'a> {
     /// Session id derived from the session log handle, used by plan-mode
     /// path-scoped write exception (issue 17). `None` when the session
     /// has not yet been assigned an id (pre-first-turn window) or has no
@@ -5164,6 +5339,43 @@ impl ToolExecutionContext<'_> {
         self.session_log
             .as_ref()
             .map(|handle| handle.session_id().to_string())
+    }
+
+    /// Build a sibling `ToolExecutionContext` rooted at `cancel`.
+    ///
+    /// `handle_subagent_call` derives a child `CancellationToken` from
+    /// the parent's token and registers it in `SubagentRegistry` as the
+    /// subagent's logical cancel handle. The subagent body must run on
+    /// that child token so every nested `child_token()` — for the LLM
+    /// stream, downstream tool calls, and any sub-subagents — hangs off
+    /// the subagent's own node in the tree. Cancelling the subagent
+    /// slot then cascades into the body; cancelling the parent turn
+    /// still reaches it through the child relationship.
+    fn with_cancel(&self, cancel: CancellationToken) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            turn_id: self.turn_id,
+            origin: self.origin,
+            provider: self.provider.clone(),
+            tools: self.tools,
+            jobs: self.jobs,
+            config: self.config,
+            telemetry: self.telemetry.clone(),
+            redactor: self.redactor.clone(),
+            tx: self.tx.clone(),
+            cancel,
+            approval_ids: self.approval_ids.clone(),
+            session_rules: self.session_rules.clone(),
+            ai_reviewer_state: self.ai_reviewer_state.clone(),
+            session_mode: self.session_mode.clone(),
+            session_log: self.session_log.clone(),
+            conversation_state: self.conversation_state.clone(),
+            task_state: self.task_state.clone(),
+            subagents: self.subagents.clone(),
+            all_tool_specs: self.all_tool_specs,
+            loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+            exploration_state: self.exploration_state.clone(),
+            hooks: self.hooks.clone(),
+        }
     }
 }
 
@@ -5525,6 +5737,16 @@ struct SubagentExecution {
     /// when no JSON tail is present or it failed to parse, in which case
     /// `summary` carries the raw text and callers can fall back to it.
     structured_output: Option<Value>,
+    /// Workspace-relative or absolute paths the subagent read or wrote,
+    /// extracted from tool-call arguments and deduped in iteration order.
+    /// Mirrors clear-code's `agentToolResultSchema` shape so the parent
+    /// can attribute work without reading the supporting-receipt SHAs.
+    files_touched: Vec<String>,
+    /// Full assistant + tool trace when the operator opts in via
+    /// `subagents.include_transcript = true`. Empty by default so the
+    /// parent-visible block stays the synthesized result, not the raw
+    /// child loop history (see `agentToolUtils.ts:276–357`).
+    transcript: Vec<Value>,
 }
 
 /// Bumps the global `subagent_calls` counter and the per-kind bucket so
@@ -5583,6 +5805,8 @@ async fn handle_subagent_call(
                 supporting_receipts: Vec::new(),
                 model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                 structured_output: None,
+                files_touched: Vec::new(),
+                transcript: Vec::new(),
             },
         );
     }
@@ -5602,6 +5826,8 @@ async fn handle_subagent_call(
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                     structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
                 },
             );
         }
@@ -5661,6 +5887,8 @@ async fn handle_subagent_call(
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
                     structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
                 },
             );
         }
@@ -5691,7 +5919,14 @@ async fn handle_subagent_call(
         })
         .await;
 
-    let execution = run_subagent(context, kind, request).await;
+    // Root the subagent body at `child_cancel` so every nested
+    // `child_token()` derives from the subagent's registered token.
+    // Cancelling either the parent turn (which `child_cancel` inherits
+    // from) or the subagent slot directly now cascades through its LLM
+    // stream, nested tool calls, and any sub-subagents — a real
+    // cancellation tree instead of a flat sibling list under the turn.
+    let child_context = context.with_cancel(child_cancel.clone());
+    let execution = run_subagent(&child_context, kind, request).await;
     drop(lease);
     broker
         .metrics
@@ -5870,6 +6105,8 @@ async fn run_subagent(
             supporting_receipts: Vec::new(),
             model,
             structured_output: None,
+            files_touched: Vec::new(),
+            transcript: Vec::new(),
         };
     }
     let allowed_tool_names = allowed_tools
@@ -5941,7 +6178,84 @@ async fn run_subagent(
     {
         execution.structured_output = parse_subagent_structured_tail(&execution.summary);
     }
+    execution.files_touched = collect_files_touched(&execution.supporting_receipts);
+    if config.subagents.include_transcript {
+        execution.transcript = subagent_transcript(&conversation);
+    }
     execution
+}
+
+/// Filters the subagent's supporting receipts to the read/edit/write
+/// tools and lifts each receipt's `path` field into a deduped, order-
+/// preserving list. Skips receipts without a `path` (e.g. `shell`,
+/// `websearch`) and receipts whose tool was denied — they don't
+/// represent files the subagent actually inspected.
+fn collect_files_touched(supporting_receipts: &[Value]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut paths = Vec::new();
+    for receipt in supporting_receipts {
+        let tool = receipt
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(
+            tool,
+            "read_file"
+                | "read_slice"
+                | "write_file"
+                | "apply_patch"
+                | "glob"
+                | "grep"
+                | "reference_search"
+                | "repo_map"
+                | "hierarchy"
+                | "diff_context"
+        ) {
+            continue;
+        }
+        if receipt.get("status").and_then(Value::as_str) == Some("denied") {
+            continue;
+        }
+        let Some(path) = receipt.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(path.to_string()) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
+}
+
+/// Serializes the subagent's tool-using conversation into a compact
+/// array of `{role, ...}` records so an operator who opts in via
+/// `subagents.include_transcript = true` can replay the child's loop.
+/// Mirrors clear-code's sidechain transcript (`runAgent.ts:792–805`)
+/// but stays in the parent-visible JSON instead of a separate file so
+/// it can be diffed against the synthesized summary in one place.
+fn subagent_transcript(conversation: &[LlmInputItem]) -> Vec<Value> {
+    conversation
+        .iter()
+        .map(|item| match item {
+            LlmInputItem::UserText(text) => json!({ "role": "user", "text": text }),
+            LlmInputItem::AssistantText(text) => json!({ "role": "assistant", "text": text }),
+            LlmInputItem::FunctionCall {
+                call_id,
+                name,
+                arguments,
+            } => json!({
+                "role": "tool_call",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }),
+            LlmInputItem::FunctionCallOutput { call_id, output } => json!({
+                "role": "tool_result",
+                "call_id": call_id,
+                "output": output,
+            }),
+            other => json!({ "role": "other", "kind": format!("{other:?}") }),
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6033,6 +6347,8 @@ async fn run_subagent_loop(
                 supporting_receipts: std::mem::take(supporting_receipts),
                 model,
                 structured_output: None,
+                files_touched: Vec::new(),
+                transcript: Vec::new(),
             }
         }
     }
@@ -6076,6 +6392,7 @@ async fn run_subagent_rounds(
             tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: std::sync::Arc::from(Vec::new()),
         };
         let mut stream = parent
             .provider
@@ -6103,6 +6420,8 @@ async fn run_subagent_rounds(
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                         structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
                     };
                 }
             };
@@ -6143,6 +6462,8 @@ async fn run_subagent_rounds(
                         supporting_receipts: std::mem::take(supporting_receipts),
                         model,
                         structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
                     };
                 }
             }
@@ -6224,10 +6545,22 @@ async fn run_subagent_rounds(
         }
         let results = seen_outputs.prepare_results(results);
         let results = pack_tool_results(results, config.max_tool_result_bytes_per_round);
+        // Look up each result's originating call by `call_id` so the
+        // supporting receipt can carry a `path` field for the parent's
+        // `files_touched` summary. Lookup is a linear scan over the
+        // round's tool calls (always small — bounded by the model's
+        // parallel-tool-calls cap), so the extra cost is negligible.
         for pending in &results {
             broker.record_model_result(&pending.result);
             if supporting_receipts.len() < 12 {
-                supporting_receipts.push(subagent_supporting_receipt(&pending.result));
+                let path = tool_calls
+                    .iter()
+                    .find(|call| call.call_id == pending.result.call_id)
+                    .and_then(subagent_tool_call_path);
+                supporting_receipts.push(subagent_supporting_receipt(
+                    &pending.result,
+                    path.as_deref(),
+                ));
             }
         }
         conversation.extend(
@@ -6258,6 +6591,8 @@ async fn run_subagent_rounds(
         supporting_receipts: std::mem::take(supporting_receipts),
         model,
         structured_output: None,
+        files_touched: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 
@@ -6280,6 +6615,8 @@ fn successful_subagent_execution(
         supporting_receipts,
         model,
         structured_output: None,
+        files_touched: Vec::new(),
+        transcript: Vec::new(),
     }
 }
 
@@ -6316,6 +6653,7 @@ fn subagent_control_result(
     kind: SubagentKind,
     execution: SubagentExecution,
 ) -> ToolResult {
+    let provider = &execution.metrics.provider;
     let mut content = json!({
         "ok": execution.status == ToolStatus::Success,
         "agent": kind.as_str(),
@@ -6323,7 +6661,18 @@ fn subagent_control_result(
         "summary": execution.summary,
         "model": execution.model,
         "supporting_receipts": execution.supporting_receipts,
-        "cost": execution.metrics.provider,
+        "files_touched": execution.files_touched,
+        "cost": provider,
+        // Cache breakdown promoted to a top-level block mirroring
+        // clear-code's `agentToolResultSchema.usage` shape so the
+        // parent can answer "how much of this subagent's input was
+        // a cache hit?" without reaching into the nested `cost` map.
+        "cache": {
+            "input_tokens": provider.input_tokens,
+            "output_tokens": provider.output_tokens,
+            "cached_input_tokens": provider.cached_input_tokens,
+            "cache_write_input_tokens": provider.cache_write_input_tokens,
+        },
         "metrics": {
             "tool_calls": execution.metrics.tool_calls,
             "tool_successes": execution.metrics.tool_successes,
@@ -6343,18 +6692,61 @@ fn subagent_control_result(
     if let Some(structured) = execution.structured_output {
         content["structured_output"] = structured;
     }
+    if !execution.transcript.is_empty() {
+        content["transcript"] = json!(execution.transcript);
+    }
     control_tool_result(call, execution.status, content)
 }
 
-fn subagent_supporting_receipt(result: &ToolResult) -> Value {
-    json!({
+fn subagent_supporting_receipt(result: &ToolResult, path: Option<&str>) -> Value {
+    let mut value = json!({
         "tool": result.tool_name,
         "status": tool_status_label(result.status),
         "output_sha256": result.receipt.output_sha256,
         "content_sha256": result.receipt.content_sha256,
         "output_bytes": result.cost_hint.output_bytes,
         "truncated": result.cost_hint.truncated,
-    })
+    });
+    if let Some(path) = path
+        && let Value::Object(map) = &mut value
+    {
+        map.insert("path".to_string(), Value::String(path.to_string()));
+    }
+    value
+}
+
+/// Pulls the most-likely file path out of a tool call's arguments so we
+/// can attribute the subagent's reads/writes to concrete files without
+/// digging into receipt SHAs. Covers the read/edit/search tools the
+/// subagent is allowed to call; unknown shapes return `None` and the
+/// supporting receipt is recorded without a `path` field.
+fn subagent_tool_call_path(call: &ToolCall) -> Option<String> {
+    let arg_str = |key: &str| {
+        call.arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    match call.name.as_str() {
+        "read_file" | "read_slice" | "write_file" | "repo_map" | "hierarchy" | "diff_context" => {
+            arg_str("path")
+        }
+        "grep" | "reference_search" => arg_str("path").or_else(|| arg_str("file")),
+        "glob" => arg_str("path"),
+        "apply_patch" => call
+            .arguments
+            .get("patches")
+            .and_then(Value::as_array)
+            .and_then(|patches| patches.first())
+            .and_then(|patch| patch.get("path"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 fn subagent_user_prompt(request: &SubagentRequest) -> String {
@@ -6417,27 +6809,34 @@ fn subagent_model_for_kind(provider: &str, config: &AppConfig, kind: SubagentKin
         .map(|role| role_config(role).model_policy)
         .unwrap_or(RoleModelPolicy::Parent);
     match (kind, policy) {
-        (SubagentKind::Explore, _) => config.subagents.explore_model.clone().unwrap_or_else(|| {
-            default_cheap_model_for_provider(provider)
-                .unwrap_or(&parent_model)
-                .to_string()
-        }),
+        (SubagentKind::Explore, _) => {
+            config.subagents.explore_model.clone().unwrap_or_else(|| {
+                cheap_model_for(provider, config).unwrap_or(parent_model.clone())
+            })
+        }
         (SubagentKind::DocHelp, _) => parent_model,
         (_, RoleModelPolicy::Parent) => parent_model,
-        (_, RoleModelPolicy::Cheap) => default_cheap_model_for_provider(provider)
-            .unwrap_or(&parent_model)
-            .to_string(),
+        (_, RoleModelPolicy::Cheap) => cheap_model_for(provider, config).unwrap_or(parent_model),
     }
 }
 
-fn default_cheap_model_for_provider(provider: &str) -> Option<&'static str> {
+/// Resolves the cheap-tier model for `provider`, honoring an explicit
+/// `[model].small_fast_model` config override before falling back to the
+/// per-provider built-in (Anthropic Haiku, OpenAI Nano, Gemini Flash Lite,
+/// etc.). Returns `None` when the provider has no curated cheap tier; the
+/// caller falls back to the parent model in that case. The Ollama default
+/// (`qwen3-coder`) is the only model a local Ollama install is guaranteed
+/// to have, so it is returned verbatim rather than pretending a separate
+/// cheap tier exists.
+fn cheap_model_for(provider: &str, config: &AppConfig) -> Option<String> {
+    if let Some(model) = config.small_fast_model.clone() {
+        return Some(model);
+    }
+    if let Some(model) = squeezy_core::small_fast_model_for_provider(provider) {
+        return Some(model.to_string());
+    }
     match provider {
-        "openai" => Some(DEFAULT_OPENAI_MODEL),
-        "anthropic" => Some(DEFAULT_ANTHROPIC_MODEL),
-        "google" => Some(DEFAULT_GOOGLE_MODEL),
-        "azure_openai" => Some(DEFAULT_AZURE_OPENAI_MODEL),
-        "bedrock" => Some(DEFAULT_BEDROCK_MODEL),
-        "ollama" => Some(DEFAULT_OLLAMA_MODEL),
+        "ollama" => Some(DEFAULT_OLLAMA_MODEL.to_string()),
         _ => None,
     }
 }
@@ -7215,18 +7614,18 @@ async fn flush_parallel_batch(
 }
 
 /// Fan out a `HookEvent::PreToolUse` to every registered handler when
-/// a hook registry is installed. Mutation and deny replies are logged
-/// but not yet applied — mirrors the observational contract of
-/// [`TurnRuntime::dispatch_pre_turn`] so a follow-up commit can wire
-/// enforcement without changing the call site. Returns immediately
-/// when no registry is configured so the no-hooks path costs zero
+/// a hook registry is installed. Returns the first handler-supplied
+/// deny message (in registration order) so the caller can short-circuit
+/// the tool execution with `ToolStatus::Denied`. Mutation replies are
+/// still observational — applying them is left to a follow-up commit
+/// that wires the per-tool input pipeline. Returns `None` when no
+/// registry is configured, when the registry is empty, or when every
+/// handler returned `allow=true`, so the no-hooks path costs zero
 /// allocations.
-fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
-    let Some(registry) = context.hooks.as_ref() else {
-        return;
-    };
+fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) -> Option<String> {
+    let registry = context.hooks.as_ref()?;
     if registry.is_empty() {
-        return;
+        return None;
     }
     let payload = json!({
         "turn_id": context.turn_id.to_string(),
@@ -7234,6 +7633,7 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
         "call_id": call.call_id,
     });
     let results = registry.dispatch(HookEvent::PreToolUse, payload);
+    let mut deny_message: Option<String> = None;
     for (idx, result) in results.iter().enumerate() {
         if let Some(mutate) = result.mutate.as_ref() {
             tracing::debug!(
@@ -7246,18 +7646,24 @@ fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
                 "PreToolUse handler proposed a mutation (not yet applied)"
             );
         }
-        if !result.allow {
-            tracing::debug!(
+        if !result.allow && deny_message.is_none() {
+            let reason = result
+                .message
+                .clone()
+                .unwrap_or_else(|| "tool call denied by PreToolUse hook".to_string());
+            tracing::info!(
                 target: "squeezy::hooks",
                 turn_id = %context.turn_id,
                 tool_name = %call.name,
                 call_id = %call.call_id,
                 handler_index = idx,
-                message = result.message.as_deref().unwrap_or(""),
-                "PreToolUse handler returned allow=false (not yet enforced)"
+                message = %reason,
+                "PreToolUse handler denied tool call"
             );
+            deny_message = Some(reason);
         }
     }
+    deny_message
 }
 
 /// Fan out a `HookEvent::PostToolUse` to every registered handler after
@@ -7392,38 +7798,57 @@ async fn run_one_tool(
     let progress_call_id = call_for_telemetry.call_id.clone();
     let progress_tool_name = call_for_telemetry.name.clone();
     // Fire the PreToolUse hook once per executed tool call, immediately
-    // before the tool registry takes ownership of the call. Mutation /
-    // deny replies are currently observational — see
-    // `dispatch_pre_tool_use` for the contract that will tighten when
-    // enforcement lands.
-    dispatch_pre_tool_use(&context, &call_for_telemetry);
-    let exec_future = context.tools.execute_for_group_with_options(
-        call,
-        tracked_job
-            .as_ref()
-            .map(|(_, cancel)| cancel.clone())
-            .unwrap_or_else(|| context.cancel.clone()),
-        context.turn_id.to_string(),
-        ToolExecutionOptions { shell_ask_approver },
-    );
-    tokio::pin!(exec_future);
-    let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
-    // `interval` fires immediately on first poll; skip that tick so the
-    // heartbeat only fires once the tool has actually been running.
-    progress_ticker.tick().await;
-    let result = loop {
-        tokio::select! {
-            r = &mut exec_future => break r,
-            _ = progress_ticker.tick() => {
-                let _ = context
-                    .tx
-                    .send(AgentEvent::ToolProgress {
-                        turn_id: context.turn_id,
-                        call_id: progress_call_id.clone(),
-                        tool_name: progress_tool_name.clone(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    })
-                    .await;
+    // before the tool registry takes ownership of the call. A handler
+    // returning `allow=false` short-circuits the execution with
+    // `ToolStatus::Denied`; the handler-supplied message becomes the
+    // denial reason surfaced to the model. Mutation replies remain
+    // observational for now.
+    let result = if let Some(reason) = dispatch_pre_tool_use(&context, &call_for_telemetry) {
+        log_session_event(
+            context.session_log.as_ref(),
+            &context.redactor,
+            "pretooluse_hook_denied",
+            Some(context.turn_id),
+            Some(format!(
+                "PreToolUse hook denied {} ({})",
+                call_for_telemetry.name, reason
+            )),
+            json!({
+                "tool_name": call_for_telemetry.name,
+                "call_id": call_for_telemetry.call_id,
+                "reason": reason,
+            }),
+        );
+        ToolResult::denied(&call_for_telemetry, reason)
+    } else {
+        let exec_future = context.tools.execute_for_group_with_options(
+            call,
+            tracked_job
+                .as_ref()
+                .map(|(_, cancel)| cancel.clone())
+                .unwrap_or_else(|| context.cancel.clone()),
+            context.turn_id.to_string(),
+            ToolExecutionOptions { shell_ask_approver },
+        );
+        tokio::pin!(exec_future);
+        let mut progress_ticker = tokio::time::interval(TOOL_PROGRESS_INTERVAL);
+        // `interval` fires immediately on first poll; skip that tick so the
+        // heartbeat only fires once the tool has actually been running.
+        progress_ticker.tick().await;
+        loop {
+            tokio::select! {
+                r = &mut exec_future => break r,
+                _ = progress_ticker.tick() => {
+                    let _ = context
+                        .tx
+                        .send(AgentEvent::ToolProgress {
+                            turn_id: context.turn_id,
+                            call_id: progress_call_id.clone(),
+                            tool_name: progress_tool_name.clone(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        })
+                        .await;
+                }
             }
         }
     };
@@ -7726,13 +8151,63 @@ async fn permission_decision_for_request(
     );
     if let Some(verdict) = mode_permission_verdict(active_mode, &request, active_plan.as_deref()) {
         log_permission_verdict(&request, &verdict);
-        return ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text);
+        return ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict));
     }
     let session_rules = snapshot_session_rules(&context.session_rules);
     let mut verdict = context
         .config
         .permissions
         .evaluate_with_extra(&request, &session_rules);
+    if verdict.action == PermissionAction::Ask
+        && request.tool_name == "shell"
+        && let Some(command) = request.metadata.get("command")
+    {
+        match pre_classify_shell(command, &context.config.permissions.shell_sandbox) {
+            ShellPreClassification::AutoAllow { reason } => {
+                let reason = format!("pre-classifier auto-allow: {reason}");
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_pre_classifier_allow",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = PermissionVerdict {
+                    action: PermissionAction::Allow,
+                    matched_rule: None,
+                    reason,
+                    silent: false,
+                };
+            }
+            ShellPreClassification::AutoDeny { reason } => {
+                let reason = format!("pre-classifier auto-deny: {reason}");
+                log_session_event(
+                    context.session_log.as_ref(),
+                    &context.redactor,
+                    "permission_pre_classifier_deny",
+                    Some(context.turn_id),
+                    Some(reason.clone()),
+                    json!({
+                        "reason": reason,
+                        "capability": request.capability.as_str(),
+                        "target": request.target.clone(),
+                    }),
+                );
+                verdict = PermissionVerdict {
+                    action: PermissionAction::Deny,
+                    matched_rule: None,
+                    reason,
+                    silent: false,
+                };
+            }
+            ShellPreClassification::AskAi => {}
+        }
+    }
     if verdict.action == PermissionAction::Ask && context.config.permissions.ai_reviewer.enabled {
         let transcript = if let Some(conversation_state) = &context.conversation_state {
             let state = conversation_state.lock().await;
@@ -7825,13 +8300,17 @@ async fn permission_decision_for_request(
     match verdict.action {
         PermissionAction::Allow => ApprovalDecision::Approved,
         PermissionAction::Deny => {
-            ApprovalDecision::Denied(context.redactor.redact(&verdict.reason).text)
+            if verdict.silent {
+                log_silent_deny(context, &request, &verdict);
+            }
+            ApprovalDecision::Denied(verdict_deny_reason_for_model(context, &verdict))
         }
         PermissionAction::Ask => {
             let (decision_tx, decision_rx) = oneshot::channel();
             let approval_context =
                 approval_context_from_state(context.conversation_state.as_ref(), &context.redactor)
                     .await;
+            let preview = context.tools.preview_for(call, &request);
             let approval_request = ToolApprovalRequest {
                 id: context.approval_ids.fetch_add(1, Ordering::Relaxed),
                 call_id: call.call_id.clone(),
@@ -7841,6 +8320,7 @@ async fn permission_decision_for_request(
                 matched_rule: verdict.matched_rule,
                 reason: context.redactor.redact(&verdict.reason).text,
                 context: approval_context,
+                preview,
             };
             log_session_event(
                 context.session_log.as_ref(),
@@ -8114,6 +8594,7 @@ pub(crate) fn mode_permission_verdict(
         action: PermissionAction::Deny,
         matched_rule: None,
         reason,
+        silent: false,
     })
 }
 
@@ -8185,10 +8666,63 @@ fn log_permission_verdict(request: &PermissionRequest, verdict: &PermissionVerdi
         target = %request.target,
         risk = %request.risk.as_str(),
         action = %verdict.action.as_str(),
+        silent = verdict.silent,
         matched_source,
         matched_target,
         reason = %verdict.reason,
         "permission verdict",
+    );
+}
+
+/// Static placeholder sent to the model when a silent-deny rule fires. Kept
+/// deliberately short so boilerplate policy denials (e.g. an absolute deny
+/// rule for `rm -rf /`) do not burn tool-result tokens with a structured
+/// `capability=...; target=...; risk=...` line on every retry. The audit
+/// JSONL still receives the full `verdict.reason` via [`log_silent_deny`].
+const SILENT_DENY_MODEL_MESSAGE: &str = "action denied by policy";
+
+/// Build the deny reason the model sees on its tool-result message. For
+/// silent rules, returns the minimal [`SILENT_DENY_MODEL_MESSAGE`]; otherwise
+/// returns the redacted full reason. The full reason is preserved in the
+/// audit JSONL by [`log_silent_deny`] before this returns.
+fn verdict_deny_reason_for_model(
+    context: &PermissionDecisionContext,
+    verdict: &PermissionVerdict,
+) -> String {
+    if verdict.silent {
+        SILENT_DENY_MODEL_MESSAGE.to_string()
+    } else {
+        context.redactor.redact(&verdict.reason).text
+    }
+}
+
+/// Write a `permission_denied_silent` audit event with the full reason and
+/// matched-rule shape. The model only sees `SILENT_DENY_MODEL_MESSAGE`, so
+/// this is the only place the rich diagnostics land for these rules.
+fn log_silent_deny(
+    context: &PermissionDecisionContext,
+    request: &PermissionRequest,
+    verdict: &PermissionVerdict,
+) {
+    let matched = verdict.matched_rule.as_ref();
+    log_session_event(
+        context.session_log.as_ref(),
+        &context.redactor,
+        "permission_denied_silent",
+        Some(context.turn_id),
+        Some(verdict.reason.clone()),
+        json!({
+            "reason": verdict.reason.clone(),
+            "tool": request.tool_name.clone(),
+            "capability": request.capability.as_str(),
+            "target": request.target.clone(),
+            "risk": request.risk.as_str(),
+            "matched_rule": matched.map(|rule| json!({
+                "capability": rule.capability.clone(),
+                "target": rule.target.clone(),
+                "source": rule.source.as_str(),
+            })),
+        }),
     );
 }
 
@@ -8236,6 +8770,7 @@ Working target: {:?}",
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
@@ -8270,6 +8805,7 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             action: PermissionAction::Deny,
             matched_rule: None,
             reason: format!("shell classifier denied command: {reason_excerpt}"),
+            silent: false,
         },
         // Allow from the classifier is intentionally disallowed - we keep the
         // verdict at Ask so a human still confirms.
@@ -8277,6 +8813,7 @@ pub(crate) fn parse_classifier_verdict(text: &str) -> PermissionVerdict {
             action: PermissionAction::Ask,
             matched_rule: None,
             reason: format!("shell classifier requires approval: {reason_excerpt}"),
+            silent: false,
         },
     }
 }
@@ -8940,7 +9477,7 @@ fn tool_schema_index(
     // keeps the rendered `<tools_index>` byte-stable across rounds even if
     // the registry's iteration order shifts, which matters for provider-side
     // prompt-prefix caching. Note: the Anthropic provider marks the last
-    // tool definition with `cache_control: ephemeral` (see
+    // first-party tool definition with `cache_control: ephemeral` (see
     // `crates/squeezy-llm/src/anthropic.rs` `request_body`), so byte-stable
     // tool specs are load-bearing for that prefix cache as well.
     rows.sort();
@@ -9099,20 +9636,25 @@ fn redact_reasoning_payload(payload: ReasoningPayload, redactor: &Redactor) -> R
 }
 
 /// Normalize a vector of `LlmInputItem`s so every entry satisfies the
-/// "already redacted" invariant and the conversation does not contain
-/// any orphan `FunctionCallOutput` whose declaring `FunctionCall` is
+/// "already redacted" invariant and the conversation has no orphan
+/// `FunctionCallOutput` whose declaring `FunctionCall` is missing AND
+/// no orphan `FunctionCall` whose answering `FunctionCallOutput` is
 /// missing. Used to upgrade conversation state loaded from a resume
 /// tape that may pre-date either invariant (insertion-time redaction
-/// or compaction's orphan-drop). The orphan check is a last-resort
-/// safety net: OpenAI 400s the whole turn with *"No tool call found
-/// for function call output with call_id …"* if an orphan reaches the
-/// provider, and the failure is sticky.
+/// or compaction's orphan-drop). The pairing checks are last-resort
+/// safety nets: OpenAI 400s the turn with *"No tool call found for
+/// function call output with call_id …"* on orphan outputs, and the
+/// Anthropic Messages API rejects the turn with *"tool_use blocks must
+/// be followed by a tool_result"* on orphan calls. Both failures are
+/// sticky — every retry hits the same wedged conversation until the
+/// user `/clear`s.
 fn redact_llm_input_items(input: Vec<LlmInputItem>, redactor: &Redactor) -> Vec<LlmInputItem> {
     let redacted: Vec<LlmInputItem> = input
         .into_iter()
         .map(|item| redact_input_item(item, redactor))
         .collect();
-    drop_orphan_function_call_outputs(redacted)
+    let without_orphan_outputs = drop_orphan_function_call_outputs(redacted);
+    repair_orphan_function_calls(without_orphan_outputs)
 }
 
 /// Scrub the user/UI-facing surfaces of a `PermissionRequest` so an approval
@@ -9631,6 +10173,12 @@ pub struct ToolApprovalRequest {
     /// being run. `None` when no assistant message is available (e.g.
     /// the very first turn or subagent contexts without a transcript).
     pub context: Option<String>,
+    /// Per-tool structured preview lines (diff, syntax-highlighted command,
+    /// host vs URL, etc.) produced by `ToolRegistry::preview_for`. The TUI
+    /// renders each variant with its own style (Diff -> red/green,
+    /// Highlighted -> palette, Warning -> orange). Empty when no preview
+    /// is available for the tool.
+    pub preview: Vec<squeezy_tools::preview::PreviewLine>,
 }
 
 impl ToolApprovalRequest {

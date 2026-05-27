@@ -60,8 +60,9 @@ The TUI supports local commands for common work without requiring a model turn:
 - `/sessions`, `/session <id>`, `/resume <id>`, `/session-export`,
   `/session-cleanup`: inspect, resume, export, or clean up sessions.
 - `/feedback`, `/report`: prepare consented maintainer feedback or bug reports.
-- `/copy`, `/collapse`, `/expand`, `/verbosity`, `/tool-verbosity`, `/jobs`:
-  local TUI display and job controls.
+- `/copy`, `/collapse`, `/expand`, `/verbosity`, `/tool-verbosity`, `/tasks`:
+  local TUI display and background-task controls. (`/jobs` remains a
+  one-release alias for `/tasks`.)
 
 The exact available tool set can change with mode, configuration, permissions,
 and enabled MCP servers. Use `squeezy config inspect` to inspect the effective

@@ -23,20 +23,85 @@ use crate::{
     log_session_event, tool_result_summary, unix_timestamp_millis,
 };
 
-// Compaction summary truncation budgets. These are character (not byte)
-// caps because they pass through `compact_text` → `truncate_chars`. They
-// stay collocated so a future audit can read the total summary growth
-// in one place rather than chasing literals across `build_compaction_summary`.
+#[cfg(test)]
+#[path = "context_compaction_tests.rs"]
+mod tests;
+
+// Compaction summary truncation budgets — survivor policy chunks.
+//
+// These constants are character (not byte) caps because they pass through
+// `compact_text` → `truncate_chars`. They group into four named families
+// matching the structure of `build_compaction_summary`; each family bounds
+// one section of the synthetic head item that replaces the dropped slice.
+// A rough total budget is `previous + pin + (durable_line * durable_lines)
+// + (receipt * receipts) + (unresolved * unresolved_lines) + attachment_preview
+// ≈ 1200 + 400 + 320*24 + 260*12 + 240*8 + 220 ≈ 15.7K chars ≈ 3.9K tokens`,
+// then bounded again by `config.context_compaction.max_summary_bytes` at the
+// end of `build_compaction_summary`.
+//
+// Reference: clear-code names its post-compact "survivor" budgets explicitly
+// (`POST_COMPACT_TOKEN_BUDGET`, `POST_COMPACT_MAX_TOKENS_PER_FILE`, …) at
+// `src/services/compact/compact.ts:122-130`. Squeezy's summary is a single
+// concatenated string rather than a set of post-compact attachments, so the
+// caps below sit inside one family rather than across many message slots.
+
+// --- SUMMARY_BLOCK family: prose carrying over from the prior summary chain ---
+
+/// Cap on the previous-summary block re-inserted at the head of each new
+/// summary. ≈ 300 tokens. Holds ~3 lines of "what mattered last compaction"
+/// after `compact_text` strips whitespace; the chain depth across repeated
+/// compactions ends up fitting comfortably under 4K chars total because each
+/// generation re-truncates here.
 const COMPACTION_PREVIOUS_SUMMARY_MAX_CHARS: usize = 1_200;
+
+// --- DURABLE_FACTS family: per-item lines mined from the dropped slice ---
+
+/// Per-line cap for durable facts (decisions, plans, assumptions, tool
+/// calls). ≈ 80 tokens — wide enough to keep a one-sentence decision intact
+/// without bleeding mid-paragraph text into the summary.
 const COMPACTION_DURABLE_LINE_MAX_CHARS: usize = 320;
+/// Per-line cap for `tool call <name> args=<json>` entries; matches the
+/// shape of a typical 1–2 arg invocation after JSON whitespace collapses.
 const COMPACTION_TOOL_ARGS_MAX_CHARS: usize = 260;
+/// Per-line cap for `tool output <call_id>: <text>` entries. Receipts table
+/// already carries the full output via sha; the line is a teaser.
 const COMPACTION_TOOL_OUTPUT_MAX_CHARS: usize = 260;
-const COMPACTION_RECEIPT_MAX_CHARS: usize = 260;
-const COMPACTION_UNRESOLVED_MAX_CHARS: usize = 240;
-const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
+/// Total lines of durable facts emitted. 24 covers a deep multi-turn
+/// session that still produces ~1 useful decision/tool-call per turn before
+/// auto-compact fires.
 const COMPACTION_DURABLE_LINES_LIMIT: usize = 24;
-const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
+
+// --- TOOL_RECEIPTS family: cross-session receipts from the store ---
+
+/// Per-line cap for tool/file receipt entries in the summary. Same shape
+/// as durable tool outputs above; kept symmetrical so future readers do not
+/// wonder why the two diverge.
+const COMPACTION_RECEIPT_MAX_CHARS: usize = 260;
+/// Cap on the count of receipt lines emitted, newest-first. 12 holds
+/// roughly one round of `read_file` / `grep` / `glob` against a small repo
+/// without dominating the summary.
 const COMPACTION_RECEIPT_LINES_LIMIT: usize = 12;
+
+// --- UNRESOLVED + ATTACHMENT family: open questions + active attachment previews ---
+
+/// Per-line cap for "unresolved questions" (lines containing `?`). ≈ 60
+/// tokens; one open question per architecture layer in a typical 3-tier
+/// app keeps the section readable.
+const COMPACTION_UNRESOLVED_MAX_CHARS: usize = 240;
+/// Maximum unresolved questions surfaced; 8 lines floor matches the
+/// per-layer budget above.
+const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
+/// Cap on attachment preview text. ≈ 55 tokens — just the first paragraph
+/// of an attached file/output so the model can recall its presence and
+/// re-request the full body via `read_file` if needed.
+const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
+
+// --- STATE retention (non-summary) ---
+
+/// In-memory history of compaction records retained on
+/// `ContextCompactionState.history`. 20 entries is enough to render a
+/// session-timeline UI without unbounded growth across long sessions; older
+/// entries fall off via `drain(..excess)`.
 const COMPACTION_MAX_HISTORY: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +213,25 @@ pub(crate) fn compact_conversation(
     let older = conversation[..split].to_vec();
     let recent = conversation[split..].to_vec();
     let generation = state.generation.saturating_add(1);
-    let summary = build_compaction_summary(generation, state, &older, attachments, store, config);
+    // Replace embedded base64 image/document data URIs in tool outputs
+    // with `[image]`/`[document]` markers before any summarizer (extractive
+    // or model-assisted) reads them. The summary feeds the model-assisted
+    // prompt at `compact_conversation_with_strategy`, and chains forward
+    // into the next compaction's `Previous compacted summary` block; a
+    // base64 PNG that survives `compact_text` truncation can otherwise
+    // bloat the summary chain and push the compaction API call itself
+    // toward prompt-too-long. The substitution is local to the summary
+    // input; the persisted `dropped` checkpoint still receives `older`
+    // verbatim so undo restores the original bytes.
+    let older_for_summary = strip_media_for_compaction(&older);
+    let summary = build_compaction_summary(
+        generation,
+        state,
+        &older_for_summary,
+        attachments,
+        store,
+        config,
+    );
     // `snap_compaction_split` handles *consecutive* leading orphan outputs,
     // but parallel tool calls produce a `[FC(A), FC(B), FCO(A), FCO(B)]`
     // shape. If the split lands between the two calls, snap stops at the
@@ -282,6 +365,166 @@ pub(crate) fn drop_orphan_function_call_outputs(items: Vec<LlmInputItem>) -> Vec
         .collect()
 }
 
+/// Insert a synthetic `FunctionCallOutput` after any `FunctionCall`
+/// whose `call_id` is never answered by a later `FunctionCallOutput`.
+/// Mirrors `drop_orphan_function_call_outputs` in the opposite direction:
+/// a cancel mid-tool-call, an executor panic, or an externally-recorded
+/// resume tape can leave a bare `FunctionCall` in the conversation; the
+/// Anthropic Messages API then rejects the whole turn with
+/// *"tool_use blocks must be followed by a tool_result"* and the failure
+/// is sticky until `/clear`. Order is preserved.
+pub(crate) fn repair_orphan_function_calls(items: Vec<LlmInputItem>) -> Vec<LlmInputItem> {
+    let answered: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut repaired = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        repaired.push(item.clone());
+        if let LlmInputItem::FunctionCall { call_id, .. } = item
+            && !answered.contains(call_id.as_str())
+        {
+            repaired.push(LlmInputItem::FunctionCallOutput {
+                call_id: call_id.clone(),
+                output: "{\"error\":\"tool call interrupted\",\"is_error\":true}".to_string(),
+            });
+        }
+    }
+    repaired
+}
+
+/// Substring marker the summarizer should see in place of a stripped
+/// image data URI. Mirrors clear-code's `'[image]'` token from
+/// `stripImagesFromMessages`.
+const IMAGE_DATA_URI_PLACEHOLDER: &str = "[image]";
+/// Same, for PDF or other document data URIs.
+const DOCUMENT_DATA_URI_PLACEHOLDER: &str = "[document]";
+/// Skip scanning outputs shorter than this. A real base64 data URI prefix
+/// (`data:image/png;base64,` alone is 22 bytes) cannot fit a meaningful
+/// payload below this threshold; scanning every short tool output would
+/// be pure overhead.
+const STRIP_MEDIA_MIN_LEN: usize = 100;
+
+/// Replace `data:image/<png|jpg|jpeg|gif|webp|bmp|svg+xml>;base64,...` and
+/// `data:application/pdf;base64,...` substrings inside every
+/// `FunctionCallOutput.output` with a short placeholder before the slice
+/// reaches a summarizer (extractive or model-assisted). Returns a fresh
+/// `Vec<LlmInputItem>`; the input is not mutated. Items other than
+/// `FunctionCallOutput` are cloned through unchanged.
+///
+/// The strip is prophylactic. Squeezy's `LlmInputItem` is text-only today,
+/// but Anthropic Vision, Gemini, and most MCP browser/screenshot tools
+/// deliver images on-wire as base64 data URIs inside a tool result string.
+/// Carrying that string through `build_compaction_summary` and onward to
+/// the model-assisted summarizer is the failure mode CC-1180 catalogues:
+/// the compaction request itself hits prompt-too-long because a 200-300 KB
+/// PNG was inlined verbatim. We strip before the summarizer reads.
+pub(crate) fn strip_media_for_compaction(items: &[LlmInputItem]) -> Vec<LlmInputItem> {
+    items
+        .iter()
+        .map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, output } => {
+                if output.len() < STRIP_MEDIA_MIN_LEN {
+                    item.clone()
+                } else {
+                    LlmInputItem::FunctionCallOutput {
+                        call_id: call_id.clone(),
+                        output: strip_media_data_uris(output),
+                    }
+                }
+            }
+            _ => item.clone(),
+        })
+        .collect()
+}
+
+/// Replace every `data:<mime>;base64,<payload>` substring in `text` with
+/// a short placeholder. The base64 payload is scanned greedily over the
+/// standard base64 alphabet (`A-Za-z0-9+/=`); the scan stops at the first
+/// character outside that alphabet, so trailing prose survives intact.
+fn strip_media_data_uris(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(prefix_end) = match_data_uri_prefix(bytes, i) {
+            let payload_end = scan_base64_payload(bytes, prefix_end);
+            // Pick the placeholder based on the MIME family. Anything not
+            // `application/...` is treated as an image-class media block;
+            // PDFs and other application/* documents are tagged separately
+            // so downstream summarisers can tell them apart.
+            let placeholder = if bytes[i..prefix_end].starts_with(b"data:application/") {
+                DOCUMENT_DATA_URI_PLACEHOLDER
+            } else {
+                IMAGE_DATA_URI_PLACEHOLDER
+            };
+            out.push_str(placeholder);
+            i = payload_end;
+        } else {
+            // Push a single UTF-8 char so we never split a multi-byte
+            // scalar. `bytes` is borrowed from `text`, so `text[i..]` is
+            // always at a valid char boundary on entry to this branch.
+            let ch = text[i..].chars().next().expect("non-empty remainder");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// If `bytes[start..]` begins with a `data:<mime>;base64,` prefix, return
+/// the index just past the comma; otherwise return `None`. The `<mime>`
+/// segment must be ASCII without whitespace and contain a `/`.
+fn match_data_uri_prefix(bytes: &[u8], start: usize) -> Option<usize> {
+    const HEAD: &[u8] = b"data:";
+    if !bytes[start..].starts_with(HEAD) {
+        return None;
+    }
+    let mut idx = start + HEAD.len();
+    let mut saw_slash = false;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b';' => break,
+            b'/' => {
+                saw_slash = true;
+                idx += 1;
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') => {
+                idx += 1;
+            }
+            _ => return None,
+        }
+    }
+    if !saw_slash {
+        return None;
+    }
+    const TAIL: &[u8] = b";base64,";
+    if bytes[idx..].starts_with(TAIL) {
+        Some(idx + TAIL.len())
+    } else {
+        None
+    }
+}
+
+/// Advance past the base64 payload that follows a `;base64,` marker. The
+/// scan terminates at the first character outside the standard base64
+/// alphabet (`A-Za-z0-9+/=`) or at end-of-input.
+fn scan_base64_payload(bytes: &[u8], start: usize) -> usize {
+    let mut idx = start;
+    while idx < bytes.len() {
+        let c = bytes[idx];
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'/' | b'=') {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
 pub(crate) fn estimate_context(conversation: &[LlmInputItem]) -> ContextEstimate {
     let bytes = conversation
         .iter()
@@ -356,13 +599,22 @@ pub(crate) async fn compact_conversation_with_strategy(
     {
         return Some(report);
     }
-    let Some(model) = config.context_compaction.model_assisted_model.clone() else {
+    let Some(model) = config
+        .context_compaction
+        .model_assisted_model
+        .clone()
+        .or_else(|| config.resolved_small_fast_model())
+    else {
         log_session_event(
             session,
             redactor,
             "compaction_fallback",
             None,
-            Some("model_assisted_model not configured; using extractive output".to_string()),
+            Some(
+                "model_assisted_model not configured and no small_fast_model default; \
+                 using extractive output"
+                    .to_string(),
+            ),
             json!({ "reason": "missing_model", "strategy": strategy.as_str() }),
         );
         return Some(report);
@@ -391,6 +643,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let cancel = CancellationToken::new();
     let mut stream = provider.stream_response(request, cancel);

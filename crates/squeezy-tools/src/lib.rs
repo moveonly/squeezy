@@ -48,6 +48,7 @@ mod file_ops;
 mod graph_tools;
 mod ipc;
 mod patch;
+pub mod preview;
 mod safety;
 mod schema;
 mod shell;
@@ -70,8 +71,10 @@ use graph_tools::{
 pub use ipc::{IpcEndpoint, IpcStream};
 use patch::{
     ApplyPatchArgs, ApplyPatchOperation, DiffContextArgs, PATCH_SNIPPET_MAX_CHARS, PatchPlan,
-    PlanPatchArgs, SearchReplaceFallback,
+    PlanPatchArgs, SearchReplaceFallback, is_notebook_path, render_apply_patch_diff,
+    render_write_file_diff,
 };
+pub use safety::{ShellPreClassification, pre_classify_shell};
 use schema::compact_tool_parameters;
 pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
@@ -93,8 +96,8 @@ use specs::{
     checkpoint_undo_spec, decl_search_spec, definition_search_spec, diff_context_spec,
     downstream_flow_spec, glob_spec, grep_spec, hierarchy_spec, list_skills_spec, load_skill_spec,
     mcp_list_resource_templates_spec, mcp_list_resources_spec, mcp_read_resource_spec,
-    mcp_tool_spec, notes_recall_spec, notes_remember_spec, observations_spec, plan_patch_spec,
-    read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
+    mcp_tool_spec, notebook_edit_spec, notes_recall_spec, notes_remember_spec, observations_spec,
+    plan_patch_spec, read_file_spec, read_slice_spec, read_tool_output_spec, reference_search_spec,
     refresh_compiler_facts_spec, repo_map_spec, shell_spec, symbol_context_spec,
     upstream_flow_spec, verify_spec, webfetch_spec, websearch_spec, write_file_spec,
 };
@@ -115,6 +118,7 @@ use shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_direct_fallback_reason,
 };
 use truncate::truncate_middle_bytes;
+pub use web::{DEFAULT_PARALLEL_MCP_URL, WebSearchProvider};
 #[cfg(test)]
 pub(crate) use web::{
     MAX_WEB_REDIRECTS, WebHttpFuture, WebHttpResponse, extract_http_urls, html_to_text,
@@ -513,33 +517,47 @@ impl ToolOutputConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebToolConfig {
+    pub provider: WebSearchProvider,
     pub exa_mcp_url: String,
     pub exa_api_key: Option<String>,
+    pub parallel_mcp_url: String,
+    pub parallel_api_key: Option<String>,
 }
 
 impl Default for WebToolConfig {
     fn default() -> Self {
         Self {
+            provider: WebSearchProvider::default(),
             exa_mcp_url: DEFAULT_EXA_MCP_URL.to_string(),
             exa_api_key: None,
+            parallel_mcp_url: DEFAULT_PARALLEL_MCP_URL.to_string(),
+            parallel_api_key: None,
         }
     }
 }
 
 impl WebToolConfig {
     fn normalized(self) -> Self {
-        let exa_mcp_url = self.exa_mcp_url.trim();
-        let exa_mcp_url = if exa_mcp_url.is_empty() {
-            DEFAULT_EXA_MCP_URL.to_string()
-        } else {
-            exa_mcp_url.to_string()
-        };
+        fn trimmed_or(value: &str, fallback: &str) -> String {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                fallback.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        fn trimmed_opt(value: Option<String>) -> Option<String> {
+            value.and_then(|raw| {
+                let raw = raw.trim().to_string();
+                (!raw.is_empty()).then_some(raw)
+            })
+        }
         Self {
-            exa_mcp_url,
-            exa_api_key: self.exa_api_key.and_then(|key| {
-                let key = key.trim();
-                (!key.is_empty()).then(|| key.to_string())
-            }),
+            provider: self.provider,
+            exa_mcp_url: trimmed_or(&self.exa_mcp_url, DEFAULT_EXA_MCP_URL),
+            exa_api_key: trimmed_opt(self.exa_api_key),
+            parallel_mcp_url: trimmed_or(&self.parallel_mcp_url, DEFAULT_PARALLEL_MCP_URL),
+            parallel_api_key: trimmed_opt(self.parallel_api_key),
         }
     }
 }
@@ -1218,6 +1236,7 @@ impl ToolRegistry {
             glob_spec(),
             grep_spec(),
             hierarchy_spec(),
+            notebook_edit_spec(),
             plan_patch_spec(),
             read_file_spec(),
             read_slice_spec(),
@@ -1262,7 +1281,19 @@ impl ToolRegistry {
         // `mcp_tool_spec` already compacts at construction; append after the
         // first-party loop to avoid double work.
         specs.extend(self.mcp.tools().into_iter().map(mcp_tool_spec));
-        specs.sort_by(|left, right| left.name.cmp(&right.name));
+        // Partition first-party before MCP, alphabetic within each group. The
+        // contiguous first-party prefix lets the Anthropic adapter place its
+        // tools-array `cache_control` breakpoint on the last first-party tool
+        // (clear-code's `assembleToolPool` invariant in `src/tools.ts:345-367`),
+        // so a mid-session MCP `tools/list` refresh churns only bytes after the
+        // breakpoint instead of invalidating the cached prefix for every turn.
+        specs.sort_by(|left, right| {
+            let left_mcp = left.name.starts_with("mcp__");
+            let right_mcp = right.name.starts_with("mcp__");
+            left_mcp
+                .cmp(&right_mcp)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         specs
     }
 
@@ -1306,7 +1337,7 @@ impl ToolRegistry {
         }
         match call.name.as_str() {
             "apply_patch" | "checkpoint_undo" | "checkpoint_revert" => PermissionScope::Edit,
-            "write_file" => PermissionScope::Edit,
+            "write_file" | "notebook_edit" => PermissionScope::Edit,
             "shell" | "verify" | "refresh_compiler_facts" => PermissionScope::Shell,
             "webfetch" | "websearch" => PermissionScope::Web,
             "mcp_read_resource" => PermissionScope::Mcp,
@@ -1387,6 +1418,9 @@ impl ToolRegistry {
                         paths.join(", ")
                     },
                 );
+                if let Some(diff) = args.as_ref().and_then(render_apply_patch_diff) {
+                    metadata.insert("unified_diff".to_string(), diff);
+                }
                 for path in paths.iter().take(5) {
                     suggested_rules.push(PermissionRule::new(
                         "edit",
@@ -1403,11 +1437,22 @@ impl ToolRegistry {
                 "workspace:*".to_string(),
                 PermissionRisk::High,
             ),
-            "write_file" => {
-                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
-                let path = args.as_ref().map(|args| args.path.as_str()).unwrap_or("*");
+            "write_file" | "notebook_edit" => {
+                let path = call
+                    .arguments
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or("*")
+                    .to_string();
                 let rule_target = format!("path:{path}");
                 metadata.insert("path".to_string(), path.to_string());
+                let args = serde_json::from_value::<WriteFileArgs>(call.arguments.clone()).ok();
+                if let Some(diff) = args
+                    .as_ref()
+                    .and_then(|args| render_write_file_diff(&args.path, &args.content))
+                {
+                    metadata.insert("unified_diff".to_string(), diff);
+                }
                 suggested_rules.push(PermissionRule::new(
                     "edit",
                     rule_target.clone(),
@@ -1658,6 +1703,17 @@ impl ToolRegistry {
             metadata,
             suggested_rules,
         }
+    }
+
+    /// Per-tool preview lines for the approval dialog. See
+    /// [`preview::CatalogPreview`] for the dispatch table.
+    pub fn preview_for(
+        &self,
+        call: &ToolCall,
+        request: &PermissionRequest,
+    ) -> Vec<preview::PreviewLine> {
+        use preview::PermissionPreview;
+        preview::CatalogPreview.preview_lines(request, call, self.root.as_ref())
     }
 
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
@@ -1974,6 +2030,7 @@ impl ToolRegistry {
                         .await
                 }
                 "verify" => self.execute_verify(&call, cancel, &group_id).await,
+                "notebook_edit" => self.execute_notebook_edit(&call, &group_id).await,
                 "write_file" => self.execute_write_file(&call, &group_id).await,
                 "shell" => {
                     self.execute_shell(&call, cancel, &group_id, options.shell_ask_approver.clone())
@@ -2525,6 +2582,79 @@ impl ToolRegistry {
             .filter(|version| !version.is_empty())
     }
 
+    /// Return the most-recent `(content_sha256, call_id)` the model has seen
+    /// for `rel_path` via a `read_file` or `read_slice` receipt in the current
+    /// session. The mutation tools (`apply_patch`, `write_file`) consult this
+    /// to gate edits when the caller omitted `expected_sha256`: if the seen
+    /// hash matches the current file hash the model demonstrably has fresh
+    /// state, so the write can proceed; if it does not match (or no snapshot
+    /// exists) the call short-circuits to `ToolStatus::Stale` with a
+    /// "call read_file first" hint. Returns `None` when no store is wired up
+    /// or no snapshot has been recorded yet.
+    pub(crate) fn latest_seen_sha256_for_path(&self, rel_path: &str) -> Option<(String, String)> {
+        let store = self.state_store.as_deref()?;
+        let snapshots = store.read_snapshots_for_path(rel_path).ok()?;
+        let latest = snapshots
+            .into_iter()
+            .filter(|snap| {
+                matches!(snap.tool_name.as_str(), "read_file" | "read_slice")
+                    && snap.content_sha256.is_some()
+            })
+            .max_by_key(|snap| snap.created_unix_millis)?;
+        Some((latest.content_sha256?, latest.call_id))
+    }
+
+    /// Server-side fallback for the `expected_sha256` staleness gate. Called
+    /// when the model omits `expected_sha256`: if the latest read snapshot
+    /// for `rel_path` matches the current on-disk hash, the model
+    /// demonstrably has fresh state and the caller may proceed (`Ok(())`).
+    /// Otherwise the caller short-circuits to `ToolStatus::Stale` with a
+    /// payload that names the snapshot the model last saw vs the live hash
+    /// and points the model at `read_file` for recovery.
+    #[allow(clippy::result_large_err)]
+    fn gate_on_seen_sha256(
+        &self,
+        call: &ToolCall,
+        index: usize,
+        rel: &str,
+        current_sha256: &str,
+        op_label: &str,
+    ) -> std::result::Result<(), ToolResult> {
+        match self.latest_seen_sha256_for_path(rel) {
+            Some((ref seen_sha, _)) if seen_sha.as_str() == current_sha256 => Ok(()),
+            Some((seen_sha, last_call_id)) => Err(make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": "file changed since the model last saw it; call read_file first",
+                    "path": rel,
+                    "patch_index": index,
+                    "operation": op_label,
+                    "current_sha256": current_sha256,
+                    "last_seen_sha256": seen_sha,
+                    "last_read_call_id": last_call_id,
+                }),
+                ToolCostHint::default(),
+                Some(current_sha256.to_string()),
+            )),
+            None => Err(make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": format!(
+                        "expected_sha256 not provided and no read_file/read_slice snapshot found; call read_file first for {op_label}"
+                    ),
+                    "path": rel,
+                    "patch_index": index,
+                    "operation": op_label,
+                    "current_sha256": current_sha256,
+                }),
+                ToolCostHint::default(),
+                Some(current_sha256.to_string()),
+            )),
+        }
+    }
+
     /// Validate a single operation and append it to the staged plan. On any
     /// validation failure, the returned `Err` is the final tool result the
     /// caller should return verbatim — no writes have happened yet.
@@ -2599,21 +2729,58 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for search-replace patches",
-                                "path": rel,
-                                "current_sha256": before_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(before_sha256),
-                        ));
+                            index,
+                            &rel,
+                            &before_sha256,
+                            "search-replace patches",
+                        )?;
                     }
                 }
                 let matches = state.current.match_indices(search.as_str()).count();
                 if matches == 0 {
+                    // Quote-normalize fallback (F14-cc): the byte-exact search
+                    // failed, retry after collapsing curly quotes on both
+                    // sides. Common case: the file has `don\u{2019}t` but the
+                    // model emitted ASCII `don't`. Deterministic and free —
+                    // the sha256 staleness gate above stays in place because
+                    // we still hash the final file in the commit phase. Only
+                    // rescue single-match cases so the multi-match safeguard
+                    // below still applies; the unified-diff path remains for
+                    // wider drift the model opts into explicitly.
+                    if let Some((qstart, qend, qcount)) =
+                        find_with_quote_normalization(&state.current, search)
+                        && qcount == 1
+                    {
+                        let original_slice = &state.current[qstart..qend];
+                        let replacement = preserve_quote_style(replace, original_slice);
+                        let before_len = state.current.len();
+                        let mut new_contents = String::with_capacity(
+                            state.current.len() - (qend - qstart) + replacement.len(),
+                        );
+                        new_contents.push_str(&state.current[..qstart]);
+                        new_contents.push_str(&replacement);
+                        new_contents.push_str(&state.current[qend..]);
+                        state.current = new_contents;
+                        let after_len = state.current.len();
+                        staged.mark_last_op_inexact(Some("quote_normalize"));
+                        preview_ops.push(json!({
+                            "patch_index": index,
+                            "kind": "search_replace",
+                            "path": rel,
+                            "matches": qcount,
+                            "allow_multiple": allow_multiple.unwrap_or(false),
+                            "bytes_delta": after_len as i64 - before_len as i64,
+                            "fallback": "quote_normalize",
+                            "exact": false,
+                            "preview": {
+                                "search": truncate_text(search, PATCH_SNIPPET_MAX_CHARS),
+                                "replace": truncate_text(replace, PATCH_SNIPPET_MAX_CHARS),
+                            }
+                        }));
+                        return Ok(());
+                    }
                     // Optional unified-diff fallback (F89): the search body is
                     // a unified diff; preflight against the live worktree, and
                     // if it would apply, materialise the result by reading the
@@ -2636,7 +2803,7 @@ impl ToolRegistry {
                                     }
                                 };
                                 state.current = new_contents;
-                                staged.mark_last_op_inexact();
+                                staged.mark_last_op_inexact(Some("unified_diff"));
                                 preview_ops.push(json!({
                                     "patch_index": index,
                                     "kind": "search_replace",
@@ -2824,17 +2991,13 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for delete_file",
-                                "path": rel,
-                                "current_sha256": current_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(current_sha256),
-                        ));
+                            index,
+                            &rel,
+                            &current_sha256,
+                            "delete_file",
+                        )?;
                     }
                 }
                 staged.push_delete(rel.clone(), abs_path, current_sha256, existing.len());
@@ -2925,17 +3088,13 @@ impl ToolRegistry {
                         ));
                     }
                     None => {
-                        return Err(make_result(
+                        self.gate_on_seen_sha256(
                             call,
-                            ToolStatus::Stale,
-                            json!({
-                                "error": "expected_sha256 is required for move_file",
-                                "path": rel_from,
-                                "current_sha256": before_sha256,
-                            }),
-                            ToolCostHint::default(),
-                            Some(before_sha256),
-                        ));
+                            index,
+                            &rel_from,
+                            &before_sha256,
+                            "move_file",
+                        )?;
                     }
                 }
                 let mut final_contents = contents.clone();
@@ -3105,6 +3264,19 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
+        if is_notebook_path(&args.path) {
+            return make_result(
+                call,
+                ToolStatus::Error,
+                json!({
+                    "error": "use notebook_edit for .ipynb files; write_file would replace the entire notebook JSON",
+                    "path": args.path,
+                    "suggested_tool": "notebook_edit",
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
         if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
             return make_result(
                 call,
@@ -3144,18 +3316,31 @@ impl ToolRegistry {
         };
         let before = fs::read(&path).ok();
         let before_sha256 = before.as_ref().map(sha256_hex);
-        if before.is_some() && args.expected_sha256.as_deref() != before_sha256.as_deref() {
-            return make_result(
-                call,
-                ToolStatus::Stale,
-                json!({
-                    "error": "expected_sha256 does not match current file",
-                    "path": rel.to_string_lossy(),
-                    "current_sha256": before_sha256,
-                }),
-                ToolCostHint::default(),
-                before_sha256,
-            );
+        if let Some(current_sha) = before_sha256.clone() {
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            match args.expected_sha256.as_deref() {
+                Some(expected) if expected == current_sha => {}
+                Some(_) => {
+                    return make_result(
+                        call,
+                        ToolStatus::Stale,
+                        json!({
+                            "error": "expected_sha256 does not match current file",
+                            "path": rel_str,
+                            "current_sha256": before_sha256,
+                        }),
+                        ToolCostHint::default(),
+                        before_sha256,
+                    );
+                }
+                None => {
+                    if let Err(result) =
+                        self.gate_on_seen_sha256(call, 0, &rel_str, &current_sha, "write_file")
+                    {
+                        return result;
+                    }
+                }
+            }
         }
 
         if let Some(parent) = path.parent()
@@ -3180,6 +3365,161 @@ impl ToolRegistry {
             "before_sha256": before_sha256,
             "after_sha256": after_sha256,
             "bytes_written": args.content.len(),
+        });
+        self.append_checkpoint_to_content(
+            &mut content,
+            checkpoint_before.as_ref(),
+            call,
+            group_id,
+            ToolStatus::Success,
+            Vec::new(),
+        );
+        make_result(call, ToolStatus::Success, content, cost, Some(after_sha256))
+    }
+
+    async fn execute_notebook_edit(&self, call: &ToolCall, group_id: &str) -> ToolResult {
+        let args = match serde_json::from_value::<NotebookEditArgs>(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(err) => return tool_arg_error(call, err),
+        };
+        if !is_notebook_path(&args.path) {
+            return tool_error(call, "notebook_edit only operates on .ipynb files");
+        }
+        if let Err(err) = safety::assess_write_path(&args.path, &self.root, &self.shell_sandbox) {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({
+                    "error": err.message(),
+                    "path": args.path,
+                    "reason": err.code(),
+                    "permission_denied": true,
+                    "policy_denied": true,
+                }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+        let path = match self.resolve_existing(&args.path) {
+            Ok(path) => path,
+            Err(err) => return tool_error(call, err),
+        };
+        let rel = self.relative(&path).to_string_lossy().to_string();
+        if is_secret_path(Path::new(&rel))
+            || safety::path_targets_protected_metadata(&path, &self.root, &self.shell_sandbox)
+                .is_some()
+        {
+            return make_result(
+                call,
+                ToolStatus::Denied,
+                json!({ "error": "refusing to edit a likely secret or protected metadata file" }),
+                ToolCostHint::default(),
+                None,
+            );
+        }
+
+        let mode = args.edit_mode.unwrap_or_default();
+        let before = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => return tool_error(call, format!("failed to read notebook {rel}: {err}")),
+        };
+        let before_sha256 = sha256_hex(&before);
+        if args.expected_sha256 != before_sha256 {
+            return make_result(
+                call,
+                ToolStatus::Stale,
+                json!({
+                    "error": "expected_sha256 does not match current file",
+                    "path": rel,
+                    "current_sha256": before_sha256,
+                }),
+                ToolCostHint::default(),
+                Some(before_sha256),
+            );
+        }
+        let mut notebook: Value = match serde_json::from_slice(&before) {
+            Ok(value) => value,
+            Err(err) => return tool_error(call, format!("notebook is not valid JSON: {err}")),
+        };
+        let Some(cells) = notebook.get_mut("cells").and_then(Value::as_array_mut) else {
+            return tool_error(call, "notebook missing a `cells` array");
+        };
+        let target_idx = match notebook_locate_cell(cells, args.cell_id.as_deref()) {
+            Ok(idx) => idx,
+            Err(err) => return tool_error(call, err),
+        };
+        let summary = match mode {
+            NotebookEditMode::Replace => {
+                let Some(idx) = target_idx else {
+                    return tool_error(call, "replace requires cell_id");
+                };
+                let new_source = args.new_source.unwrap_or_default();
+                let cell = &mut cells[idx];
+                if let Some(obj) = cell.as_object_mut() {
+                    if let Some(ct) = args.cell_type {
+                        obj.insert("cell_type".into(), Value::String(ct.as_str().into()));
+                    }
+                    obj.insert("source".into(), notebook_source_lines(&new_source));
+                }
+                notebook_reset_outputs(cell);
+                json!({"mode": "replace", "cell_index": idx})
+            }
+            NotebookEditMode::Insert => {
+                let Some(ct) = args.cell_type else {
+                    return tool_error(call, "insert requires cell_type");
+                };
+                let new_source = args.new_source.unwrap_or_default();
+                let insert_at = target_idx.map(|i| i + 1).unwrap_or(0);
+                let mut new_cell = json!({
+                    "cell_type": ct.as_str(),
+                    "metadata": {},
+                    "source": notebook_source_lines(&new_source),
+                });
+                notebook_reset_outputs(&mut new_cell);
+                cells.insert(insert_at, new_cell);
+                json!({"mode": "insert", "cell_index": insert_at})
+            }
+            NotebookEditMode::Delete => {
+                let Some(idx) = target_idx else {
+                    return tool_error(call, "delete requires cell_id");
+                };
+                cells.remove(idx);
+                json!({"mode": "delete", "cell_index": idx})
+            }
+        };
+
+        let checkpoint_before = match self.track_checkpoint_tree() {
+            Ok(snapshot) => snapshot,
+            Err(err) => return tool_error(call, err),
+        };
+        // Mirror Jupyter's default: single-space indent so per-cell diffs stay
+        // small. `to_vec_pretty` would default to four spaces.
+        let mut buf = Vec::new();
+        let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+        let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+        if let Err(err) = notebook.serialize(&mut ser) {
+            return tool_error(call, format!("failed to serialise notebook: {err}"));
+        }
+        // Notebooks conventionally end with a trailing newline.
+        if buf.last() != Some(&b'\n') {
+            buf.push(b'\n');
+        }
+        if let Err(err) = fs::write(&path, &buf) {
+            return tool_error(call, err);
+        }
+        self.invalidate_diff_cache();
+        let after_sha256 = sha256_hex(&buf);
+        let cost = ToolCostHint {
+            bytes_read: before.len() as u64,
+            output_bytes: buf.len() as u64,
+            ..ToolCostHint::default()
+        };
+        let mut content = json!({
+            "path": rel,
+            "before_sha256": before_sha256,
+            "after_sha256": after_sha256,
+            "bytes_written": buf.len(),
+            "edit": summary,
         });
         self.append_checkpoint_to_content(
             &mut content,
@@ -3673,6 +4013,60 @@ struct ObservationsArgs {
     limit: Option<u32>,
 }
 
+/// Locate a notebook cell by its `id` or the `cell-N` numeric-index
+/// convention. `Ok(None)` means no id was supplied.
+fn notebook_locate_cell(
+    cells: &[Value],
+    cell_id: Option<&str>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(cell_id) = cell_id else {
+        return Ok(None);
+    };
+    if let Some((idx, _)) = cells.iter().enumerate().find(|(_, cell)| {
+        cell.get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id == cell_id)
+    }) {
+        return Ok(Some(idx));
+    }
+    if let Some(rest) = cell_id.strip_prefix("cell-")
+        && let Ok(idx) = rest.parse::<usize>()
+        && idx < cells.len()
+    {
+        return Ok(Some(idx));
+    }
+    Err(format!("cell_id {cell_id:?} not found"))
+}
+
+/// Emit a notebook cell `source` array of line-fragments (matches Jupyter's
+/// writer; keeps per-line diffs small).
+fn notebook_source_lines(source: &str) -> Value {
+    Value::Array(
+        source
+            .split_inclusive('\n')
+            .map(|line| Value::String(line.to_string()))
+            .collect(),
+    )
+}
+
+/// Code-cell modifications drop execution_count/outputs (the model has not
+/// run the new source); markdown cells must not carry those fields.
+fn notebook_reset_outputs(cell: &mut Value) {
+    let is_code = cell
+        .get("cell_type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t == "code");
+    if let Some(obj) = cell.as_object_mut() {
+        if is_code {
+            obj.insert("execution_count".to_string(), Value::Null);
+            obj.insert("outputs".to_string(), Value::Array(Vec::new()));
+        } else {
+            obj.remove("execution_count");
+            obj.remove("outputs");
+        }
+    }
+}
+
 fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "preference" => Some(ObservationKind::Preference),
@@ -3704,6 +4098,46 @@ struct WriteFileArgs {
     path: String,
     content: String,
     expected_sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NotebookEditArgs {
+    path: String,
+    #[serde(default)]
+    cell_id: Option<String>,
+    #[serde(default)]
+    new_source: Option<String>,
+    #[serde(default)]
+    cell_type: Option<NotebookCellType>,
+    #[serde(default)]
+    edit_mode: Option<NotebookEditMode>,
+    expected_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NotebookEditMode {
+    #[default]
+    Replace,
+    Insert,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum NotebookCellType {
+    Code,
+    Markdown,
+}
+
+impl NotebookCellType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::Markdown => "markdown",
+        }
+    }
 }
 
 fn grep_include_ignored(arguments: &Value) -> bool {
@@ -3796,6 +4230,11 @@ pub(crate) enum StagedOp {
         rel: String,
         file_index: usize,
         exact: bool,
+        /// Audit tag describing which rescue path matched the search when the
+        /// byte-exact lookup failed. `None` for verbatim matches; `Some` for
+        /// `unified_diff` / `quote_normalize` so the post-apply `delta` and
+        /// log can attribute the inexact apply.
+        fallback: Option<&'static str>,
     },
     CreateFile {
         rel: String,
@@ -3829,6 +4268,7 @@ impl StagedApply {
                 rel: rel.to_string(),
                 file_index: idx,
                 exact: true,
+                fallback: None,
             });
             return Ok(idx);
         }
@@ -3847,15 +4287,24 @@ impl StagedApply {
             rel: rel.to_string(),
             file_index: idx,
             exact: true,
+            fallback: None,
         });
         Ok(idx)
     }
 
-    /// Mark the most-recently staged op as non-exact (e.g., the search-replace
-    /// matched only via the `unified_diff` fallback rather than verbatim).
-    fn mark_last_op_inexact(&mut self) {
-        if let Some(StagedOp::SearchReplace { exact, .. }) = self.ops.last_mut() {
+    /// Mark the most-recently staged op as non-exact and stamp the fallback
+    /// tag (e.g., the search-replace matched only via `unified_diff` or
+    /// `quote_normalize` rather than verbatim). Both flags surface in
+    /// `applied_delta` so the audit log captures the rescue.
+    fn mark_last_op_inexact(&mut self, fallback_tag: Option<&'static str>) {
+        if let Some(StagedOp::SearchReplace {
+            exact, fallback, ..
+        }) = self.ops.last_mut()
+        {
             *exact = false;
+            if fallback_tag.is_some() {
+                *fallback = fallback_tag;
+            }
         }
     }
 
@@ -4058,6 +4507,12 @@ impl StagedOp {
                 obj.insert("error".to_string(), json!(message));
             }
             match self {
+                StagedOp::SearchReplace {
+                    fallback: Some(tag),
+                    ..
+                } => {
+                    obj.insert("fallback".to_string(), json!(tag));
+                }
                 StagedOp::SearchReplace { .. } => {}
                 StagedOp::CreateFile { contents, .. } => {
                     obj.insert(
@@ -4600,6 +5055,123 @@ pub(crate) fn truncate_text(value: &str, max_chars: usize) -> String {
     output
 }
 
+/// Curly-quote → straight-quote map used by the apply_patch search fallback.
+/// Mirrors clear-code's `normalizeQuotes` (`src/tools/FileEditTool/utils.ts:31`).
+/// Each curly quote in UTF-8 is 3 bytes; the straight counterpart is 1 byte —
+/// so a normalized copy of any string is at most the same byte length as the
+/// original, never longer. That lets us safely index normalized offsets back
+/// into the original via a per-character byte map.
+fn map_curly_to_straight(ch: char) -> Option<char> {
+    match ch {
+        '\u{2018}' | '\u{2019}' => Some('\''),
+        '\u{201C}' | '\u{201D}' => Some('"'),
+        _ => None,
+    }
+}
+fn normalize_quotes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        output.push(map_curly_to_straight(ch).unwrap_or(ch));
+    }
+    output
+}
+/// Locate `search` inside `content` after collapsing curly quotes to their
+/// straight ASCII counterparts on both sides. Returns `(byte_start, byte_end)`
+/// pointing at the matched slice in the *original* `content`, plus the number
+/// of normalized matches — so the caller can refuse to apply when the
+/// normalized search matched more than once. Returns `None` when no normalized
+/// match exists. Used only after `match_indices(search)` returned zero; never
+/// shadows an exact hit.
+fn find_with_quote_normalization(content: &str, search: &str) -> Option<(usize, usize, usize)> {
+    let normalized_search = normalize_quotes(search);
+    if normalized_search.is_empty() {
+        return None;
+    }
+    // Build a per-byte map from normalized-content byte offsets back to
+    // original-content byte offsets. We push one entry per byte produced into
+    // the normalized buffer; the curly-quote case shrinks 3 bytes → 1.
+    let mut normalized = String::with_capacity(content.len());
+    let mut byte_map: Vec<usize> = Vec::with_capacity(content.len());
+    for (orig_idx, ch) in content.char_indices() {
+        let mapped = map_curly_to_straight(ch).unwrap_or(ch);
+        let pre_len = normalized.len();
+        normalized.push(mapped);
+        for _ in 0..(normalized.len() - pre_len) {
+            byte_map.push(orig_idx);
+        }
+    }
+    // Map for the byte just past the end so `match_end` can resolve.
+    byte_map.push(content.len());
+    let mut matches = Vec::new();
+    let mut scan_from = 0;
+    while let Some(rel) = normalized[scan_from..].find(normalized_search.as_str()) {
+        let n_start = scan_from + rel;
+        let n_end = n_start + normalized_search.len();
+        matches.push((n_start, n_end));
+        scan_from = n_start + 1;
+    }
+    if matches.is_empty() {
+        return None;
+    }
+    let (n_start, n_end) = matches[0];
+    let orig_start = *byte_map.get(n_start)?;
+    let orig_end = *byte_map.get(n_end)?;
+    Some((orig_start, orig_end, matches.len()))
+}
+/// Re-emit curly quotes in `replace` whenever the matched original slice used
+/// them, so a quote-normalized edit preserves the file's typography. Mirrors
+/// clear-code's `preserveQuoteStyle` (`src/tools/FileEditTool/utils.ts:104`)
+/// with the same open/close heuristic plus the apostrophe-in-contraction
+/// special case so `"don't" → "don't"` round-trips correctly.
+fn preserve_quote_style(replace: &str, original_slice: &str) -> String {
+    let has_curly_double =
+        original_slice.contains('\u{201C}') || original_slice.contains('\u{201D}');
+    let has_curly_single =
+        original_slice.contains('\u{2018}') || original_slice.contains('\u{2019}');
+    if !has_curly_double && !has_curly_single {
+        return replace.to_string();
+    }
+    let chars: Vec<char> = replace.chars().collect();
+    let mut output = String::with_capacity(replace.len());
+    for (idx, ch) in chars.iter().enumerate() {
+        match ch {
+            '"' if has_curly_double => {
+                output.push(if is_opening_quote_context(&chars, idx) {
+                    '\u{201C}'
+                } else {
+                    '\u{201D}'
+                });
+            }
+            '\'' if has_curly_single => {
+                let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+                let next = chars.get(idx + 1).copied();
+                let prev_is_letter = prev.map(|c| c.is_alphabetic()).unwrap_or(false);
+                let next_is_letter = next.map(|c| c.is_alphabetic()).unwrap_or(false);
+                if prev_is_letter && next_is_letter {
+                    // Contraction (e.g. "don't") — always the right curly.
+                    output.push('\u{2019}');
+                } else {
+                    output.push(if is_opening_quote_context(&chars, idx) {
+                        '\u{2018}'
+                    } else {
+                        '\u{2019}'
+                    });
+                }
+            }
+            _ => output.push(*ch),
+        }
+    }
+    output
+}
+fn is_opening_quote_context(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    matches!(
+        chars[index - 1],
+        ' ' | '\t' | '\n' | '\r' | '(' | '[' | '{' | '\u{2014}' | '\u{2013}'
+    )
+}
 fn patch_match_contexts(content: &str, search: &str, max_matches: usize) -> Vec<Value> {
     content
         .match_indices(search)

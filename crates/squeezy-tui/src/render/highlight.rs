@@ -5,6 +5,7 @@ use ratatui::{
 use tree_sitter::Language;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
 
+use crate::render::cache;
 use crate::render::palette::{self, PaletteTone, best_color};
 
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
@@ -123,8 +124,13 @@ pub(crate) fn highlight_code(language_hint: Option<&str>, source: &str) -> Vec<L
     let Some(spec) = language_spec(language_hint) else {
         return plain_lines(source);
     };
+    // `spec.name` is `&'static str`, so it can key the cache directly.
+    cache::get_or_compute_highlight(source, spec.name, || highlight_uncached(source, &spec))
+}
+
+fn highlight_uncached(source: &str, spec: &LanguageSpec) -> Vec<Line<'static>> {
     let Ok(mut config) = HighlightConfiguration::new(
-        spec.language,
+        spec.language.clone(),
         spec.name,
         spec.highlights_query,
         spec.injections_query,

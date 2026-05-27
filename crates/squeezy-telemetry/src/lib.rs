@@ -962,6 +962,19 @@ pub enum ProviderKind {
     Together,
     Fireworks,
     Cerebras,
+    DeepInfra,
+    Baseten,
+    // Pin wire format so the snake_case derivation doesn't split the
+    // multi-capital variant names (`LMStudio` -> `l_m_studio`) and diverge
+    // from the canonical preset identifier.
+    #[serde(rename = "lmstudio")]
+    LMStudio,
+    #[serde(rename = "vllm")]
+    VLlm,
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
+    CloudflareWorkersAi,
+    CloudflareAiGateway,
     OpenAiCompatible,
 }
 
@@ -987,6 +1000,13 @@ impl ProviderKind {
                 OpenAiCompatiblePreset::Together => Self::Together,
                 OpenAiCompatiblePreset::Fireworks => Self::Fireworks,
                 OpenAiCompatiblePreset::Cerebras => Self::Cerebras,
+                OpenAiCompatiblePreset::DeepInfra => Self::DeepInfra,
+                OpenAiCompatiblePreset::Baseten => Self::Baseten,
+                OpenAiCompatiblePreset::LMStudio => Self::LMStudio,
+                OpenAiCompatiblePreset::VLlm => Self::VLlm,
+                OpenAiCompatiblePreset::LlamaCpp => Self::LlamaCpp,
+                OpenAiCompatiblePreset::CloudflareWorkersAi => Self::CloudflareWorkersAi,
+                OpenAiCompatiblePreset::CloudflareAiGateway => Self::CloudflareAiGateway,
                 OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
             },
         }

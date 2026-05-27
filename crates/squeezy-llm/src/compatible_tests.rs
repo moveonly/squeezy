@@ -1,6 +1,6 @@
 use super::*;
 use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
-use serde_json::json;
+use serde_json::{Value, json};
 use squeezy_core::OpenAiCompatiblePreset;
 use std::sync::Arc;
 
@@ -38,6 +38,7 @@ fn sample_request() -> LlmRequest {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     }
 }
 
@@ -145,6 +146,7 @@ fn request_body_serialises_assistant_function_call_history() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let body = OpenAiCompatibleProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");
@@ -430,7 +432,10 @@ fn parse_chat_event_handles_done_sentinel() {
     };
     let events = parse_chat_event("[DONE]", &mut state).expect("done");
     assert_eq!(events.len(), 1);
-    let LlmEvent::Completed { response_id, cost } = &events[0] else {
+    let LlmEvent::Completed {
+        response_id, cost, ..
+    } = &events[0]
+    else {
         panic!("expected completed event");
     };
     assert_eq!(response_id.as_deref(), Some("resp_2"));
@@ -443,12 +448,46 @@ fn parse_chat_event_handles_done_sentinel() {
 fn parse_chat_event_propagates_stream_error() {
     let mut state = StreamState::default();
     let err = parse_chat_event(
-        r#"{"error":{"message":"rate limited","type":"rate_limit_error"}}"#,
+        r#"{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}"#,
         &mut state,
     )
     .expect_err("must surface error");
     let message = err.to_string();
     assert!(message.contains("rate limited"), "got: {message}");
+    assert!(
+        message.contains("type=rate_limit_error"),
+        "must surface error.type for callers distinguishing retryable failures from auth bugs: {message}"
+    );
+    assert!(
+        message.contains("code=rate_limit_exceeded"),
+        "must surface error.code: {message}"
+    );
+}
+
+#[test]
+fn format_chat_error_handles_partial_envelopes() {
+    let only_message: Value = serde_json::from_str(r#"{"error":{"message":"boom"}}"#).unwrap();
+    assert_eq!(format_chat_error(&only_message, "fallback"), "boom");
+
+    let only_type: Value =
+        serde_json::from_str(r#"{"error":{"type":"invalid_request_error"}}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&only_type, "fallback"),
+        "fallback (type=invalid_request_error)"
+    );
+
+    let numeric_code: Value =
+        serde_json::from_str(r#"{"error":{"message":"nope","code":429}}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&numeric_code, "fallback"),
+        "nope (code=429)"
+    );
+
+    let bare_string: Value = serde_json::from_str(r#"{"error":"insufficient quota"}"#).unwrap();
+    assert_eq!(
+        format_chat_error(&bare_string, "fallback"),
+        "insufficient quota"
+    );
 }
 
 #[test]
@@ -547,6 +586,42 @@ fn request_body_skips_cache_control_when_no_cache_key() {
     // System and user content stay as plain strings.
     assert_eq!(body["messages"][0]["content"], "be brief");
     assert_eq!(body["messages"][1]["content"], "hello");
+}
+
+#[test]
+fn request_body_forwards_prompt_cache_key_to_openai_via_openrouter() {
+    // OpenAI-via-OpenRouter (and any aggregator that forwards body fields
+    // verbatim) honors the top-level `prompt_cache_key` for OpenAI's
+    // prompt-cache layer. The Anthropic-only `cache_control` markers above
+    // do not cover this case; `prompt_cache_key` carries the affinity hint
+    // through to OpenAI-hosted models so cached-input billing applies.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+}
+
+#[test]
+fn request_body_forwards_prompt_cache_key_alongside_anthropic_cache_control() {
+    // Anthropic-via-OpenRouter gets the ephemeral `cache_control` markers,
+    // and `prompt_cache_key` rides along as a top-level hint. Aggregators
+    // that ignore unknown fields drop it harmlessly; OpenAI receives it.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert_eq!(
+        body["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral",
+    );
+}
+
+#[test]
+fn request_body_omits_prompt_cache_key_when_unset() {
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(body.get("prompt_cache_key").is_none());
 }
 
 #[test]

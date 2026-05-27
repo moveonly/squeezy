@@ -2,11 +2,11 @@ use std::sync::{Arc, LazyLock};
 
 use serde::Deserialize;
 use serde_json::Value;
-use squeezy_core::{CostSnapshot, ModelProfile, ProviderConfig, Result};
+use squeezy_core::{CostSnapshot, ModelProfile, OpenAiCompatiblePreset, ProviderConfig, Result};
 
 use crate::{
     AnthropicProvider, BedrockProvider, GoogleProvider, LlmInputItem, LlmProvider, LlmRequest,
-    OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider,
+    OllamaProvider, OpenAiCompatibleProvider, OpenAiProvider, XaiProvider,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -226,6 +226,11 @@ pub const PROVIDERS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
+    "cloudflare_workers_ai",
+    "cloudflare_ai_gateway",
     "openai_compatible",
 ];
 
@@ -351,9 +356,13 @@ pub fn provider_from_config(config: &ProviderConfig) -> Result<Arc<dyn LlmProvid
         }
         ProviderConfig::Bedrock(bedrock) => Ok(Arc::new(BedrockProvider::from_config(bedrock)?)),
         ProviderConfig::Ollama(ollama) => Ok(Arc::new(OllamaProvider::from_config(ollama))),
-        ProviderConfig::OpenAiCompatible(config) => {
-            Ok(Arc::new(OpenAiCompatibleProvider::from_config(config)?))
-        }
+        ProviderConfig::OpenAiCompatible(config) => match config.preset {
+            // xAI ships both Chat Completions and Responses APIs on the
+            // same host; route Grok 3+ through Responses for reasoning
+            // summaries, drop older Grok models onto Chat.
+            OpenAiCompatiblePreset::XAi => Ok(Arc::new(XaiProvider::from_config(config)?)),
+            _ => Ok(Arc::new(OpenAiCompatibleProvider::from_config(config)?)),
+        },
     }
 }
 
@@ -466,3 +475,7 @@ fn estimate_text_tokens(text: &str, bytes_per_token: f64) -> u64 {
     let estimate = (bytes / bytes_per_token.max(0.1)).ceil() as u64;
     estimate.max(1)
 }
+
+#[cfg(test)]
+#[path = "registry_tests.rs"]
+mod tests;

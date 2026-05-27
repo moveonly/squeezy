@@ -220,6 +220,64 @@ impl SessionStore {
         }
     }
 
+    /// Create a child session that branches off `parent_session_id`. The
+    /// new session copies the parent's resume state (conversation +
+    /// transcript) and any context attachments so the user can keep
+    /// talking from the same point without disturbing the parent. The
+    /// child's metadata carries `parent_id = Some(parent_session_id)` so
+    /// the TUI session list can render fork chains. Used by `squeezy
+    /// sessions fork <id>` for the offline fork path; the in-process
+    /// `Agent::fork_current` writes the same `parent_id` directly on the
+    /// metadata it constructs.
+    pub fn fork_session(
+        &self,
+        parent_session_id: &str,
+        mut metadata: SessionMetadata,
+    ) -> Result<SessionHandle> {
+        let parent_dir = self.session_dir(parent_session_id);
+        if !parent_dir.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "fork_session: parent {parent_session_id} not found at {}",
+                parent_dir.display()
+            )));
+        }
+        let parent_resume: SessionResumeState = read_json(&parent_dir.join("resume_state.json"))
+            .or_else(|_| {
+                // Fall back to a replay when the snapshot is missing or
+                // corrupt — matches `Agent::resume`'s recovery path so an
+                // intact event log keeps forks possible.
+                let handle = self.open_session(parent_session_id.to_string());
+                handle.replay_resume_state()
+            })?;
+        metadata.parent_id = Some(parent_session_id.to_string());
+        let handle = self.start_session(metadata)?;
+        let dir = self.session_dir(handle.session_id());
+        write_json(&dir.join("resume_state.json"), &parent_resume)?;
+        let parent_attachments = parent_dir.join("attachments");
+        if parent_attachments.exists() {
+            let child_attachments = dir.join("attachments");
+            fs::create_dir_all(&child_attachments)?;
+            for entry in fs::read_dir(&parent_attachments)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let from = entry.path();
+                let Some(name) = from.file_name() else {
+                    continue;
+                };
+                fs::copy(&from, child_attachments.join(name))?;
+            }
+        }
+        handle.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!("forked from {parent_session_id}")),
+            json!({ "parent_session_id": parent_session_id }),
+        ))?;
+        Ok(handle)
+    }
+
     pub fn list(&self, query: &SessionQuery) -> Result<Vec<SessionMetadata>> {
         let mut sessions = Vec::new();
         if !self.root.exists() {
@@ -298,9 +356,11 @@ impl SessionStore {
         if let Ok(text) = fs::read_to_string(&metadata_path)
             && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
         {
+            let stamp = now_ms();
             metadata.status = SessionStatus::Archived;
+            metadata.archived_at_ms = Some(stamp);
             if metadata.ended_at_ms.is_none() {
-                metadata.ended_at_ms = Some(now_ms());
+                metadata.ended_at_ms = Some(stamp);
             }
             let _ = write_json(&metadata_path, &metadata);
         }
@@ -329,6 +389,7 @@ impl SessionStore {
             && let Ok(mut metadata) = serde_json::from_str::<SessionMetadata>(&text)
         {
             metadata.status = SessionStatus::Completed;
+            metadata.archived_at_ms = None;
             let _ = write_json(&metadata_path, &metadata);
         }
         Ok(())
@@ -430,20 +491,41 @@ impl SessionStore {
     /// match (used to keep the currently active session from being removed
     /// out from under a live agent).
     ///
-    /// Live sessions that expire (or that the caller names in `ids`) are
-    /// *archived* — moved to `archived/<id>/` and flipped to
-    /// `SessionStatus::Archived` — instead of being deleted outright.
-    /// Sessions that have already been archived for longer than
-    /// `retention_archive_days` are then permanently deleted in the same
-    /// sweep. This gives users a window to recover a session that the
-    /// retention policy would otherwise destroy: live retention reduces
-    /// disk pressure, archive retention bounds the recoverable history.
-    /// Setting `retention_archive_days` to `0` disables the archive sweep
-    /// so archived sessions are kept until the user removes them by hand.
+    /// Defaults to [`CleanupMode::Archive`]: live sessions that expire or are
+    /// explicitly named in `ids` are moved into `archived/<id>/`. Use
+    /// [`Self::cleanup_with`] with [`CleanupMode::Purge`] to hard-delete
+    /// instead.
     pub fn cleanup_excluding(
         &self,
         ids: &[String],
         protected_id: Option<&str>,
+    ) -> Result<CleanupReport> {
+        self.cleanup_with(ids, protected_id, CleanupMode::Archive)
+    }
+
+    /// Run the cleanup sweep with explicit control over the soft-archive vs
+    /// hard-delete decision.
+    ///
+    /// [`CleanupMode::Archive`] (the default) moves expired or explicitly
+    /// named live sessions into `archived/<id>/` and flips their status to
+    /// [`SessionStatus::Archived`]. They survive until the archive retention
+    /// sweep removes them after `retention_archive_days`. This gives users a
+    /// window to recover a session that the retention policy would otherwise
+    /// destroy: live retention reduces disk pressure, archive retention
+    /// bounds the recoverable history. Setting `retention_archive_days` to
+    /// `0` disables the archive sweep so archived sessions are kept until
+    /// the user removes them by hand.
+    ///
+    /// [`CleanupMode::Purge`] skips the soft-archive step and hard-deletes
+    /// live sessions outright. Sessions already in `archived/<id>/` are also
+    /// hard-deleted irrespective of `retention_archive_days`, so `--purge`
+    /// is the explicit "I want this gone" escape hatch from the
+    /// archive-by-default policy.
+    pub fn cleanup_with(
+        &self,
+        ids: &[String],
+        protected_id: Option<&str>,
+        mode: CleanupMode,
     ) -> Result<CleanupReport> {
         let mut archived = Vec::new();
         let mut removed = Vec::new();
@@ -457,24 +539,34 @@ impl SessionStore {
                 continue;
             }
             if matches!(metadata.status, SessionStatus::Archived) {
-                // Archived sessions exist purely so users can recover
-                // history that retention would otherwise have destroyed.
-                // Hard-deleting them on explicit `ids` would defeat that;
-                // the only path that removes them is the archive retention
-                // sweep below, which fires when both the days threshold
-                // is non-zero and the session has been archived long
-                // enough. Until then, callers that truly want to delete
-                // must unarchive first and then run cleanup again.
+                let is_explicit = explicit.contains(metadata.session_id.as_str());
+                // `--purge` hard-deletes archived sessions regardless of
+                // archive retention so the user has an explicit "I want
+                // this gone now" path. The `Archive` default mode keeps
+                // them around until the retention sweep removes them.
+                let force_remove = matches!(mode, CleanupMode::Purge) && is_explicit;
+                if force_remove {
+                    let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
+                    if dir.exists() {
+                        fs::remove_dir_all(&dir)?;
+                    }
+                    removed.push(metadata.session_id);
+                    continue;
+                }
                 if self.retention_archive_days == 0 {
                     continue;
                 }
                 let archive_cutoff =
                     now_ms().saturating_sub(self.retention_archive_days.saturating_mul(86_400_000));
-                // `ended_at_ms` is set when `archive_session` flips the
-                // status, so it is the right "time of archival" anchor.
-                // Fall back to `started_at_ms` for sessions archived by
-                // older code paths that may not have populated it.
-                let archived_at = metadata.ended_at_ms.unwrap_or(metadata.started_at_ms);
+                // Prefer the dedicated archival timestamp. Older metadata
+                // files written before `archived_at_ms` existed fall back
+                // to `ended_at_ms` (set when `archive_session` flips the
+                // status) and finally `started_at_ms` so the sweep keeps
+                // working on legacy on-disk data.
+                let archived_at = metadata
+                    .archived_at_ms
+                    .or(metadata.ended_at_ms)
+                    .unwrap_or(metadata.started_at_ms);
                 if archived_at < archive_cutoff {
                     let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
                     if dir.exists() {
@@ -497,11 +589,23 @@ impl SessionStore {
                 }
             };
             if is_explicit || expired {
-                // `archive_session` is idempotent for the live -> archived
-                // move; a destination collision means another caller raced
-                // us, which we surface so the operator can investigate.
-                self.archive_session(&metadata.session_id)?;
-                archived.push(metadata.session_id);
+                match mode {
+                    CleanupMode::Archive => {
+                        // `archive_session` is idempotent for the live ->
+                        // archived move; a destination collision means
+                        // another caller raced us, which we surface so the
+                        // operator can investigate.
+                        self.archive_session(&metadata.session_id)?;
+                        archived.push(metadata.session_id);
+                    }
+                    CleanupMode::Purge => {
+                        let dir = self.session_dir(&metadata.session_id);
+                        if dir.exists() {
+                            fs::remove_dir_all(&dir)?;
+                        }
+                        removed.push(metadata.session_id);
+                    }
+                }
             }
         }
         Ok(CleanupReport { archived, removed })
@@ -995,6 +1099,14 @@ pub struct SessionMetadata {
     pub session_id: String,
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
+    /// Timestamp the session was moved into the `archived/` tree. Distinct
+    /// from `ended_at_ms` so the lifecycle "session ended at T1, user (or
+    /// retention sweep) archived it later at T2" is recoverable. Older
+    /// metadata files predate this field, so `serde(default)` keeps them
+    /// loadable; the cleanup sweep then falls back to `ended_at_ms` /
+    /// `started_at_ms` as it did before.
+    #[serde(default)]
+    pub archived_at_ms: Option<u64>,
     pub cwd: String,
     pub workspace_root: String,
     pub repo_root: Option<String>,
@@ -1017,6 +1129,14 @@ pub struct SessionMetadata {
     /// files compatible.
     #[serde(default)]
     pub token_calibration: squeezy_llm::TokenCalibration,
+    /// Set on sessions created by `Agent::fork_current` or
+    /// `squeezy sessions fork`: the parent's session id. `None` for any
+    /// other origin (fresh start, resume of a top-level session). The
+    /// structured field lets the TUI session list render fork chains
+    /// without re-parsing `session_forked` events. `serde(default)` so
+    /// pre-fork `metadata.json` files keep deserializing.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 impl SessionMetadata {
@@ -1545,10 +1665,27 @@ pub struct CleanupReport {
     /// sweep deletes them.
     #[serde(default)]
     pub archived: Vec<String>,
-    /// Sessions that were permanently deleted by this sweep. Only the
-    /// archive retention sweep populates this list: live sessions
-    /// always move through `archived/` first.
+    /// Sessions that were permanently deleted by this sweep. Populated
+    /// when the archive retention sweep removes a session that has
+    /// outlived `retention_archive_days`, and when [`CleanupMode::Purge`]
+    /// is requested for explicit `ids`.
     pub removed: Vec<String>,
+}
+
+/// Soft-archive vs hard-delete policy for [`SessionStore::cleanup_with`].
+/// The CLI/TUI surfaces this as `/session-cleanup --archive` (default)
+/// vs `--purge`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CleanupMode {
+    /// Move expired or explicitly named live sessions into
+    /// `archived/<id>/` rather than deleting them. The archive retention
+    /// sweep eventually removes them after `retention_archive_days`.
+    #[default]
+    Archive,
+    /// Hard-delete expired or explicitly named sessions. Live sessions
+    /// skip the archive step; already-archived sessions named in `ids`
+    /// are removed without waiting for archive retention.
+    Purge,
 }
 
 fn session_root(config: &AppConfig) -> PathBuf {

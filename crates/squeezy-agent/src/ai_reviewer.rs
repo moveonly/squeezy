@@ -157,6 +157,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
     let model = reviewer
         .model
         .clone()
+        .or_else(|| input.config.resolved_small_fast_model())
         .unwrap_or_else(|| input.config.model.clone());
     let request = LlmRequest {
         model: Arc::from(model.as_str()),
@@ -174,6 +175,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
     let response = match tokio::time::timeout(
@@ -234,6 +236,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                     action: PermissionAction::Allow,
                     matched_rule: None,
                     reason,
+                    silent: false,
                 })
             } else {
                 input
@@ -293,10 +296,16 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
                 ReviewerAuditVerdict::Deny,
                 &reason,
             );
+            // Anti-pattern guard (audit
+            // 04-sandboxing-and-permissions.md, "Do not silent-deny by default
+            // on the AI reviewer"): keep the explained-deny shape so the user
+            // can evaluate the model's reasoning. Silent is only for explicit
+            // `silent = true` rules loaded from TOML.
             AiReviewerOutcome::Verdict(PermissionVerdict {
                 action: PermissionAction::Deny,
                 matched_rule: None,
                 reason,
+                silent: false,
             })
         }
     }

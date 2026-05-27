@@ -2,7 +2,9 @@ use async_stream::try_stream;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use squeezy_core::{CostSnapshot, OllamaConfig, ProviderTransportConfig, Result, SqueezyError};
+use squeezy_core::{
+    CostSnapshot, OllamaConfig, OllamaRoute, ProviderTransportConfig, Result, SqueezyError,
+};
 use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -10,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    lmstudio::{LMStudioConfig, LMStudioProvider},
     retry::{RetryPolicy, idle_timeout, send_with_retry},
 };
 
@@ -18,14 +21,25 @@ pub struct OllamaProvider {
     client: reqwest::Client,
     base_url: String,
     transport: ProviderTransportConfig,
+    compat: Option<LMStudioProvider>,
 }
 
 impl OllamaProvider {
     pub fn from_config(config: &OllamaConfig) -> Self {
+        let base_url = config.base_url.trim_end_matches('/').to_string();
+        let compat = match config.route_style {
+            OllamaRoute::Native => None,
+            OllamaRoute::OpenAiCompatible => Some(LMStudioProvider::from_config(&LMStudioConfig {
+                base_url: openai_compat_base_url(&base_url),
+                api_key: None,
+                transport: config.transport,
+            })),
+        };
         Self {
             client: reqwest::Client::new(),
-            base_url: config.base_url.trim_end_matches('/').to_string(),
+            base_url,
             transport: config.transport,
+            compat,
         }
     }
 
@@ -140,12 +154,30 @@ fn parse_num_ctx(parameters: &str) -> Option<u64> {
     })
 }
 
+/// Translate a Native-style Ollama base URL (`http://host:port/api`) into the
+/// OpenAI-compatible root (`http://host:port/v1`). If the caller already wrote
+/// a `/v1` suffix we leave it alone, and an unsuffixed root gets `/v1`
+/// appended so users can give us either shape.
+pub(crate) fn openai_compat_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/v1") {
+        return trimmed.to_string();
+    }
+    if let Some(root) = trimmed.strip_suffix("/api") {
+        return format!("{root}/v1");
+    }
+    format!("{trimmed}/v1")
+}
+
 impl LlmProvider for OllamaProvider {
     fn name(&self) -> &'static str {
         "ollama"
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Some(compat) = &self.compat {
+            return compat.stream_response(request, cancel);
+        }
         let client = self.client.clone();
         let url = format!("{}/chat", self.base_url);
         let body = Self::request_body(&request);
@@ -313,6 +345,11 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
         }
     }
     if value.get("done").and_then(Value::as_bool) == Some(true) {
+        let stop_reason = value
+            .get("done_reason")
+            .and_then(Value::as_str)
+            .map(crate::StopReason::from_ollama)
+            .or(Some(crate::StopReason::EndTurn));
         events.push(LlmEvent::Completed {
             response_id: None,
             cost: CostSnapshot {
@@ -323,6 +360,7 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),
             },
+            stop_reason,
         });
     }
     Ok(events)

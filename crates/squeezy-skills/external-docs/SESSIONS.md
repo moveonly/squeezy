@@ -98,10 +98,12 @@ finalization so a more informative outcome is never silently overwritten by the
 generic `completed` status emitted on graceful exit. Resuming a session seeds
 the new agent with the original session's cost, metrics, and redaction totals
 so subsequent turns add to the running totals rather than replacing them.
-`squeezy sessions cleanup` and the TUI `/session-cleanup` command refuse to
-delete the currently active session, and the retention sweep skips sessions
-that are still `running` (only explicit ids can remove a Running session, in
-case it was orphaned by a crash).
+`squeezy sessions cleanup` and the TUI `/session-cleanup` command soft-archive
+live sessions by default (moved into `archived/<id>/`, recoverable with
+`squeezy sessions unarchive <id>`); pass `--purge` to hard-delete instead.
+Both refuse to delete the currently active session, and the retention sweep
+skips sessions that are still `running` (only explicit ids can remove a
+Running session, in case it was orphaned by a crash).
 
 Routine per-turn events (tool calls, tool results, approvals, deltas) append
 to `events.jsonl` without rewriting `metadata.json`; the on-disk metadata is

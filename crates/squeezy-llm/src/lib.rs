@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 pub use squeezy_core::{
     AnthropicThinkingBlock, AnthropicThinkingKind, ReasoningKind, ReasoningPayload,
-    ReasoningSnapshot,
+    ReasoningSnapshot, resolve_model_alias,
 };
 use squeezy_core::{CostSnapshot, ReasoningEffort, ResponseVerbosity, Result, SqueezyError};
 use tokio_util::sync::CancellationToken;
@@ -15,18 +15,22 @@ pub const INVALID_TOOL_ARGUMENTS_ERROR_KEY: &str = "__squeezy_parse_error";
 pub const INVALID_TOOL_ARGUMENTS_RAW_KEY: &str = "__squeezy_raw_arguments";
 
 mod anthropic;
+mod anthropic_betas;
 mod bedrock;
+mod cache_policy;
 mod compatible;
 mod credentials;
 mod google;
 mod lmstudio;
 pub mod model_discovery;
+pub mod models_dev;
 mod ollama;
 mod openai;
 mod registry;
 mod retry;
 mod sse;
 pub mod tokens;
+mod xai;
 pub use tokens::{
     DEFAULT_BYTES_PER_TOKEN, DEFAULT_EMA_ALPHA, ProviderCalibration, TokenCalibration,
     default_bytes_per_token, estimate_tokens,
@@ -42,6 +46,10 @@ pub use google::GoogleProvider;
 pub use lmstudio::{
     DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
 };
+pub use model_discovery::{
+    CONSERVATIVE_FALLBACK_CAPABILITIES, CapabilitySource, ResolvedCapabilities,
+    resolve_capabilities, resolve_capabilities_with,
+};
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
     pull_model,
@@ -53,6 +61,7 @@ pub use registry::{
     estimate_request_context, estimate_request_context_calibrated, model_info_for,
     models_for_provider, provider_from_config, provider_name,
 };
+pub use xai::XaiProvider;
 
 pub type LlmStream = Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>>;
 
@@ -84,6 +93,20 @@ pub struct LlmRequest {
     /// place. Only the OpenAI provider currently reads this; other
     /// providers ignore it.
     pub parallel_tool_calls: Option<bool>,
+    /// Anthropic beta opt-ins (e.g. `context-1m-2025-08-07`,
+    /// `interleaved-thinking-2025-05-14`). Empty by default. The
+    /// Anthropic provider joins these into an `anthropic-beta` HTTP
+    /// header; the Bedrock provider partitions them and forwards only
+    /// the body-param-eligible subset via
+    /// `additional_model_request_fields.anthropic_beta`. Mirrors
+    /// clear-code's per-provider routing (`constants/betas.ts` +
+    /// `claude.ts:272-331`). Other providers ignore the field.
+    #[serde(default = "empty_beta_headers")]
+    pub beta_headers: Arc<[Arc<str>]>,
+}
+
+fn empty_beta_headers() -> Arc<[Arc<str>]> {
+    Arc::from(Vec::new())
 }
 
 impl LlmRequest {
@@ -107,6 +130,7 @@ impl LlmRequest {
             tool_choice: None,
             output_schema: None,
             parallel_tool_calls: None,
+            beta_headers: empty_beta_headers(),
         }
     }
 }
@@ -156,6 +180,87 @@ pub struct LlmToolCall {
     pub arguments: Value,
 }
 
+/// Normalized completion cause. Each provider maps its native `stop_reason`
+/// (Anthropic), `finish_reason`/`incomplete_details.reason` (OpenAI),
+/// `finishReason` (Google), Bedrock `stopReason`, or Ollama `done_reason`
+/// into one of these variants so the agent can branch on a single shape.
+///
+/// `EndTurn` is the model voluntarily releasing the turn; `ToolUse` means
+/// the model wants to invoke tools; `MaxTokens` and `ContextWindowExceeded`
+/// are truncation signals the agent surfaces explicitly so the user (and
+/// future compaction-retry logic) can act on them instead of seeing a bare
+/// provider error; `StopSequence` and `Refusal` carry the remaining
+/// semantically distinct cases; `Other` keeps provider-specific strings
+/// reachable without forcing the registry to enumerate every value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum StopReason {
+    EndTurn,
+    ToolUse,
+    MaxTokens,
+    ContextWindowExceeded,
+    StopSequence,
+    Refusal,
+    Other(String),
+}
+
+impl StopReason {
+    /// Parse Anthropic Messages API `stop_reason` strings.
+    pub fn from_anthropic(value: &str) -> Self {
+        match value {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "stop_sequence" => Self::StopSequence,
+            "refusal" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse OpenAI Responses API `incomplete_details.reason` strings.
+    pub fn from_openai_incomplete(value: &str) -> Self {
+        match value {
+            "max_output_tokens" => Self::MaxTokens,
+            "content_filter" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Google `candidates[0].finishReason` strings.
+    pub fn from_google(value: &str) -> Self {
+        match value {
+            "STOP" => Self::EndTurn,
+            "MAX_TOKENS" => Self::MaxTokens,
+            "SAFETY" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY"
+            | "LANGUAGE" | "RECITATION" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Bedrock Converse `stopReason` strings.
+    pub fn from_bedrock(value: &str) -> Self {
+        match value {
+            "end_turn" => Self::EndTurn,
+            "tool_use" => Self::ToolUse,
+            "max_tokens" => Self::MaxTokens,
+            "model_context_window_exceeded" => Self::ContextWindowExceeded,
+            "stop_sequence" => Self::StopSequence,
+            "guardrail_intervened" | "content_filtered" => Self::Refusal,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    /// Parse Ollama `done_reason` strings.
+    pub fn from_ollama(value: &str) -> Self {
+        match value {
+            "stop" => Self::EndTurn,
+            "length" => Self::MaxTokens,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LlmEvent {
@@ -170,6 +275,11 @@ pub enum LlmEvent {
     Completed {
         response_id: Option<String>,
         cost: CostSnapshot,
+        /// Normalized completion cause. `None` when the provider stream
+        /// closed without emitting one (e.g. transport truncation handled
+        /// elsewhere). Producers that have a native value MUST populate
+        /// this; the agent uses it to drive explicit recovery branches.
+        stop_reason: Option<StopReason>,
     },
     Cancelled,
 }

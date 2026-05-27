@@ -39,6 +39,22 @@ The model can spawn subagents through these advertised tools:
 All four are gated on `subagents.enabled`. `explore` is additionally gated
 on `subagents.explore_enabled`.
 
+## Permission Derivation
+
+Subagents do not inherit the parent's full tool-permission set. Each spawn
+in `subagent_allowed_tools` (in `crates/squeezy-agent/src/lib.rs`) starts
+from the parent's advertised tools, intersects them with the per-kind
+allow-list (the role catalog for `explore`, `delegate_plan`,
+`delegate_review`; a curated research list for `delegate`; empty for
+`doc_help`), then drops anything whose `PermissionCapability` is not
+`Read` or `Search`. The capability filter is the load-bearing safety
+guarantee: even if a future role allow-list accidentally names a mutating
+tool, the filter still strips `Edit`, `Shell`, `Network`, `Mcp`, `Git`,
+`Compiler`, and `Destructive` from the advertisement the subagent sees.
+`explore_subagent_cannot_call_write_file` and
+`typed_subagents_filter_to_read_search_capability` in `lib_tests.rs`
+lock this in.
+
 ## Flat Spawning Invariant
 
 Subagents may never spawn other subagents. The invariant is enforced *by

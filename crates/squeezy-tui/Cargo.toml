@@ -16,6 +16,7 @@ publish.workspace = true
 ansi-to-tui.workspace = true
 crossterm.workspace = true
 ignore.workspace = true
+lru.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true

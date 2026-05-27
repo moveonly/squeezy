@@ -76,6 +76,7 @@ fn build_request(model: &str) -> LlmRequest {
         store: false,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
         tool_choice: None,
     }
 }
@@ -126,7 +127,9 @@ async fn lmstudio_streaming_completion_against_mock_server() {
         .count();
     assert_eq!(started, 1, "Started must be emitted exactly once");
 
-    let Some(LlmEvent::Completed { cost, response_id }) = events
+    let Some(LlmEvent::Completed {
+        cost, response_id, ..
+    }) = events
         .iter()
         .find(|event| matches!(event, LlmEvent::Completed { .. }))
     else {

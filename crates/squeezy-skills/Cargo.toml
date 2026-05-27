@@ -25,6 +25,7 @@ include = [
 serde.workspace = true
 serde_json.workspace = true
 squeezy-core.workspace = true
+squeezy-hooks.workspace = true
 toml.workspace = true
 tracing.workspace = true
 

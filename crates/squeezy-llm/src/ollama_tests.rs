@@ -28,6 +28,7 @@ fn request_body_uses_chat_stream_shape() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -71,6 +72,7 @@ fn request_body_preserves_function_tool_order() {
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -107,6 +109,10 @@ fn parser_extracts_text_tool_calls_and_usage() {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: Some(0),
             },
+            // Ollama omits `done_reason` on natural completions; the
+            // provider falls back to `EndTurn` so the agent loop sees a
+            // populated stop reason on every Ollama turn.
+            stop_reason: Some(crate::StopReason::EndTurn),
         }
     );
 }
@@ -210,4 +216,69 @@ fn pull_parser_ignores_empty_keepalive_frames() {
 fn pull_parser_rejects_invalid_json() {
     let err = parse_pull_line("not-json").expect_err("invalid JSON surfaces");
     assert!(matches!(err, SqueezyError::ProviderStream(_)));
+}
+
+#[test]
+fn openai_compat_base_url_swaps_api_for_v1() {
+    assert_eq!(
+        openai_compat_base_url("http://localhost:11434/api"),
+        "http://localhost:11434/v1"
+    );
+}
+
+#[test]
+fn openai_compat_base_url_appends_v1_when_unsuffixed() {
+    assert_eq!(
+        openai_compat_base_url("http://localhost:11434"),
+        "http://localhost:11434/v1"
+    );
+}
+
+#[test]
+fn openai_compat_base_url_preserves_existing_v1() {
+    assert_eq!(
+        openai_compat_base_url("http://localhost:11434/v1/"),
+        "http://localhost:11434/v1"
+    );
+}
+
+#[test]
+fn route_style_compat_builds_lmstudio_delegate() {
+    let provider = OllamaProvider::from_config(&squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::OpenAiCompatible,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    });
+    assert!(
+        provider.compat.is_some(),
+        "OpenAiCompatible route must instantiate the LM Studio delegate",
+    );
+}
+
+#[test]
+fn route_style_native_leaves_compat_delegate_unset() {
+    let provider = OllamaProvider::from_config(&squeezy_core::OllamaConfig {
+        base_url: "http://localhost:11434/api".to_string(),
+        route_style: squeezy_core::OllamaRoute::Native,
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    });
+    assert!(
+        provider.compat.is_none(),
+        "Native route must keep the proprietary /api/chat path",
+    );
+}
+
+#[test]
+fn ollama_route_parse_recognises_canonical_aliases() {
+    use squeezy_core::OllamaRoute;
+    assert_eq!(OllamaRoute::parse("native"), Some(OllamaRoute::Native));
+    assert_eq!(
+        OllamaRoute::parse("openai_compatible"),
+        Some(OllamaRoute::OpenAiCompatible)
+    );
+    assert_eq!(
+        OllamaRoute::parse("v1"),
+        Some(OllamaRoute::OpenAiCompatible)
+    );
+    assert_eq!(OllamaRoute::parse("nope"), None);
 }

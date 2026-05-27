@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use squeezy_core::{Result, SqueezyError};
 
+use crate::registry::{MODEL_REGISTRY, ModelCapabilities};
+
 pub const CACHE_TTL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -220,6 +222,141 @@ pub async fn refresh(
     // Best-effort persist; cache miss does not fail the refresh.
     let _ = write_cache(&catalog);
     Ok(catalog)
+}
+
+/// Conservative capability defaults for `(provider, model)` pairs that are
+/// absent from both the bundled `models.json` registry and the live
+/// `/models` discovery cache. With arbitrary OpenAI-compatible aggregators
+/// serving any subset of models, optimistically advertising tool calling
+/// causes a 4xx (Groq, Cerebras) or a silent drop where the provider
+/// strips `tools` and emits a chatty no-tool response. Until we have
+/// positive evidence the model supports a feature, leave the feature
+/// off. Streaming and JSON mode stay on because every Chat-Completions
+/// host implements them.
+pub const CONSERVATIVE_FALLBACK_CAPABILITIES: ModelCapabilities = ModelCapabilities {
+    streaming: true,
+    tool_calling: false,
+    json_mode: true,
+    vision: false,
+    response_state: false,
+    reasoning_tokens: false,
+    reasoning_effort: false,
+    text_verbosity: false,
+    prompt_caching: false,
+};
+
+/// Where the resolved `ModelCapabilities` came from.
+///
+/// Surfaced in `squeezy doctor` so users can see whether a provider/model
+/// pair has positive capability evidence (`Bundled` / `LiveCatalog`) or is
+/// running on conservative defaults (`ConservativeFallback`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySource {
+    /// The bundled `crates/squeezy-llm/src/models.json` had an exact match
+    /// for `(provider, model)`.
+    Bundled,
+    /// The cached `/models` catalog at
+    /// `~/.squeezy/cache/models/<provider>.json` had positive evidence for
+    /// the model (e.g. OpenRouter's `supported_parameters: ["tools", ...]`).
+    LiveCatalog,
+    /// Neither source named this model. Capabilities default to streaming
+    /// + JSON mode only — tool calling, vision, reasoning are all off.
+    ConservativeFallback,
+}
+
+impl CapabilitySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bundled => "bundled",
+            Self::LiveCatalog => "live_catalog",
+            Self::ConservativeFallback => "conservative_fallback",
+        }
+    }
+}
+
+/// Capability + provenance for a `(provider, model)` pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedCapabilities {
+    pub capabilities: ModelCapabilities,
+    pub source: CapabilitySource,
+}
+
+/// Run the provider feature-detection handshake for `(provider, model)`.
+///
+/// Resolution order:
+///   1. Bundled `models.json` entry (positive evidence, hand-curated).
+///   2. Cached `/models` catalog entry with `supports_tools` populated
+///      (positive evidence from the live aggregator).
+///   3. Conservative fallback — tool calling, vision, and reasoning all
+///      off — so we never silently send `tools` to a host that 4xx's or
+///      drops them.
+///
+/// This is the entry point an OpenAI-compatible provider should call
+/// before deciding whether to attach `tools` to the request body. The
+/// `squeezy doctor` row uses the same function so the user sees the same
+/// answer the request path sees.
+pub fn resolve_capabilities(provider: &str, model: &str) -> ResolvedCapabilities {
+    if let Some(info) = MODEL_REGISTRY
+        .iter()
+        .find(|entry| entry.provider == provider && entry.id == model)
+    {
+        return ResolvedCapabilities {
+            capabilities: info.capabilities,
+            source: CapabilitySource::Bundled,
+        };
+    }
+    if let Some(catalog) = read_cached(provider)
+        && let Some(entry) = catalog.models.iter().find(|m| m.id == model)
+        && let Some(supports_tools) = entry.supports_tools
+    {
+        let mut capabilities = CONSERVATIVE_FALLBACK_CAPABILITIES;
+        capabilities.tool_calling = supports_tools;
+        return ResolvedCapabilities {
+            capabilities,
+            source: CapabilitySource::LiveCatalog,
+        };
+    }
+    ResolvedCapabilities {
+        capabilities: CONSERVATIVE_FALLBACK_CAPABILITIES,
+        source: CapabilitySource::ConservativeFallback,
+    }
+}
+
+/// Pure variant of [`resolve_capabilities`] used in tests and in code paths
+/// that have already loaded a catalog (e.g. immediately after a `refresh`).
+/// Identical resolution rules — bundled wins over catalog wins over
+/// conservative fallback — but takes the catalog as a parameter instead of
+/// reading from disk.
+pub fn resolve_capabilities_with(
+    provider: &str,
+    model: &str,
+    catalog: Option<&ModelCatalog>,
+) -> ResolvedCapabilities {
+    if let Some(info) = MODEL_REGISTRY
+        .iter()
+        .find(|entry| entry.provider == provider && entry.id == model)
+    {
+        return ResolvedCapabilities {
+            capabilities: info.capabilities,
+            source: CapabilitySource::Bundled,
+        };
+    }
+    if let Some(catalog) = catalog
+        && let Some(entry) = catalog.models.iter().find(|m| m.id == model)
+        && let Some(supports_tools) = entry.supports_tools
+    {
+        let mut capabilities = CONSERVATIVE_FALLBACK_CAPABILITIES;
+        capabilities.tool_calling = supports_tools;
+        return ResolvedCapabilities {
+            capabilities,
+            source: CapabilitySource::LiveCatalog,
+        };
+    }
+    ResolvedCapabilities {
+        capabilities: CONSERVATIVE_FALLBACK_CAPABILITIES,
+        source: CapabilitySource::ConservativeFallback,
+    }
 }
 
 #[cfg(test)]

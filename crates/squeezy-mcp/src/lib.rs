@@ -15,11 +15,11 @@ use http::{HeaderName, HeaderValue};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CancelledNotificationParam, ClientInfo,
-        CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, JsonObject,
-        LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
+        CallToolRequestParams, CancelledNotificationParam, ClientCapabilities, ClientInfo,
+        CreateElicitationRequestParams, CreateElicitationResult, ElicitationAction, Implementation,
+        JsonObject, LoggingLevel, LoggingMessageNotificationParam, PaginatedRequestParams,
         ProgressNotificationParam, ReadResourceRequestParams, Resource,
-        ResourceUpdatedNotificationParam, Tool as RmcpTool,
+        ResourceUpdatedNotificationParam, ServerCapabilities, Tool as RmcpTool,
     },
     service::{NotificationContext, RequestContext, RoleClient},
     transport::{
@@ -748,6 +748,19 @@ impl McpClientRegistry {
         sessions.clear();
     }
 
+    /// Server-advertised capabilities captured during `initialize`, or `None`
+    /// if no session is currently held for `server_name`. Returns the live
+    /// `ServerCapabilities` so callers can inspect `experimental` flags (e.g.
+    /// `claude/channel/permission`-style opt-ins) without re-handshaking.
+    /// Callers must drive a connection first — either via `refresh_tools` or
+    /// any other path that runs `session_for` — before this returns `Some`.
+    pub async fn server_capabilities(&self, server_name: &str) -> Option<ServerCapabilities> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(server_name)
+            .and_then(|entry| entry.server_capabilities.clone())
+    }
+
     #[doc(hidden)]
     pub fn insert_cached_tool_for_test(&self, tool: ExternalMcpTool) {
         if let Ok(mut cache) = self.cache.lock() {
@@ -965,6 +978,13 @@ impl McpClientRegistry {
 struct SessionEntry {
     service: Arc<McpService>,
     _process: Option<StdioProcessHandle>,
+    /// Server-advertised capabilities captured from the `initialize` response
+    /// (`peer_info().capabilities`). Stored at session bring-up so callers
+    /// asking `server_capabilities` after a `tools/list` cannot trigger another
+    /// round-trip; rmcp's `OnceCell` is populated synchronously when `serve`
+    /// returns. `None` only if the peer never delivered an `initialize` result,
+    /// which would have failed the bring-up before this `SessionEntry` exists.
+    server_capabilities: Option<ServerCapabilities>,
 }
 
 #[derive(Debug)]
@@ -1219,7 +1239,27 @@ impl ClientHandler for SqueezyMcpClientHandler {
     }
 
     fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+        // Advertise Squeezy as the client implementation so servers logging
+        // peer identity see "squeezy-mcp" rather than the default
+        // `CARGO_CRATE_NAME` (`rmcp`). Capabilities are declared explicitly so
+        // a server gating on `client.capabilities.elicitation` knows the
+        // handler at `create_elicitation` will respond instead of timing out;
+        // `experimental` defaults to an empty map so future opt-in flags have
+        // a stable slot to land in without changing the wire shape. The
+        // struct is `#[non_exhaustive]` upstream, so we mutate `default()`
+        // rather than naming every field.
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.experimental = Some(rmcp::model::ExperimentalCapabilities::new());
+        capabilities.elicitation = Some(rmcp::model::ElicitationCapability {
+            form: Some(rmcp::model::FormElicitationCapability {
+                schema_validation: None,
+            }),
+            url: Some(rmcp::model::UrlElicitationCapability {}),
+        });
+        ClientInfo::new(
+            capabilities,
+            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        )
     }
 }
 
@@ -1357,9 +1397,11 @@ async fn start_stdio_service(
             server: server_name.to_string(),
             message: err.to_string(),
         })?;
+    let server_capabilities = service.peer_info().map(|info| info.capabilities.clone());
     Ok(SessionEntry {
         service: Arc::new(service),
         _process: process_handle,
+        server_capabilities,
     })
 }
 
@@ -1387,9 +1429,11 @@ async fn start_http_service(
             server: server_name.to_string(),
             message: err.to_string(),
         })?;
+    let server_capabilities = service.peer_info().map(|info| info.capabilities.clone());
     Ok(SessionEntry {
         service: Arc::new(service),
         _process: None,
+        server_capabilities,
     })
 }
 
@@ -1426,9 +1470,11 @@ async fn start_sse_service(
             server: server_name.to_string(),
             message: err.to_string(),
         })?;
+    let server_capabilities = service.peer_info().map(|info| info.capabilities.clone());
     Ok(SessionEntry {
         service: Arc::new(service),
         _process: None,
+        server_capabilities,
     })
 }
 

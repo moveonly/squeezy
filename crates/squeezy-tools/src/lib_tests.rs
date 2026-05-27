@@ -91,6 +91,23 @@ fn registry_with_state_store(root: &Path, store: Arc<SqueezyStore>) -> ToolRegis
     .expect("registry")
 }
 
+fn registry_with_state_store_and_checkpoints(
+    root: &Path,
+    store: Arc<SqueezyStore>,
+) -> ToolRegistry {
+    ToolRegistry::new_with_configs_skills_and_mcp(
+        root,
+        ToolRuntimeConfig {
+            checkpoints_enabled: true,
+            ..ToolRuntimeConfig::default()
+        },
+        SkillsConfig::default(),
+        &GraphConfig::default(),
+        ToolRegistryRuntime::new(Some(store), Arc::new(Redactor::default())),
+    )
+    .expect("registry")
+}
+
 #[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
@@ -301,6 +318,122 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
         "suggested rule target must match the request target so future calls match the persisted rule",
     );
     assert_eq!(suggested.capability, "edit");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn session_approval_extends_to_edit_family_on_optin() {
+    // F04-permission-scope-collapse-edit-family (squeezy-1ro.57): once the
+    // user opts into a session rule from one edit-family tool on a given
+    // path, the same rule must cover the rest of the family (write_file
+    // <-> apply_patch) for that path without re-prompting. The mechanism
+    // is the shared capability ("edit") + target ("path:<file>") shape
+    // both arms register; this test pins that contract so any future
+    // refactor that drifts apply_patch or write_file off `path:<file>`
+    // fails loudly.
+    use squeezy_core::{PermissionAction, PermissionPolicy};
+    let root = temp_workspace("permission_edit_family_optin");
+    let registry = registry_with_shell_sandbox_off(&root);
+    let policy = PermissionPolicy {
+        edit: PermissionMode::Ask,
+        ..PermissionPolicy::default()
+    };
+
+    let write_request = registry.permission_request(&ToolCall {
+        call_id: "write".to_string(),
+        name: "write_file".to_string(),
+        arguments: json!({
+            "path": "src/foo.rs",
+            "content": "fn main() {}",
+            "expected_sha256": "deadbeef",
+        }),
+    });
+    let patch_request = registry.permission_request(&ToolCall {
+        call_id: "patch".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patches": [{
+                "path": "src/foo.rs",
+                "search": "fn main() {}",
+                "replace": "fn main() { println!(\"hi\"); }",
+            }],
+        }),
+    });
+    assert_eq!(
+        patch_request.target, write_request.target,
+        "apply_patch and write_file on the same path must produce identical \
+         permission targets so a session rule from one covers the other",
+    );
+
+    // Default Ask + no rules: every edit-family call must still prompt.
+    let baseline_write = policy.evaluate(&write_request);
+    let baseline_patch = policy.evaluate(&patch_request);
+    assert_eq!(baseline_write.action, PermissionAction::Ask);
+    assert_eq!(baseline_patch.action, PermissionAction::Ask);
+
+    // After the user picks AllowSession on the write_file prompt, that
+    // single suggested rule must extend to the apply_patch sibling.
+    let write_session_rule = write_request
+        .suggested_rules
+        .first()
+        .expect("write_file should suggest a session rule")
+        .clone();
+    assert_eq!(write_session_rule.capability, "edit");
+    assert_eq!(write_session_rule.source, PermissionRuleSource::Session);
+    let extended_patch =
+        policy.evaluate_with_extra(&patch_request, std::slice::from_ref(&write_session_rule));
+    assert_eq!(
+        extended_patch.action,
+        PermissionAction::Allow,
+        "approving write_file for path:src/foo.rs must auto-allow apply_patch \
+         on the same path",
+    );
+    assert_eq!(
+        extended_patch
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.target.as_str()),
+        Some("path:src/foo.rs"),
+    );
+
+    // And the reverse: a session rule installed via apply_patch must
+    // cover a subsequent write_file on the same path. Without this, the
+    // user has to approve each tool variant separately, defeating the
+    // edit-family collapse.
+    let patch_session_rule = patch_request
+        .suggested_rules
+        .first()
+        .expect("apply_patch should suggest a session rule")
+        .clone();
+    assert_eq!(patch_session_rule.capability, "edit");
+    assert_eq!(patch_session_rule.target, "path:src/foo.rs");
+    let extended_write =
+        policy.evaluate_with_extra(&write_request, std::slice::from_ref(&patch_session_rule));
+    assert_eq!(
+        extended_write.action,
+        PermissionAction::Allow,
+        "approving apply_patch for path:src/foo.rs must auto-allow write_file \
+         on the same path",
+    );
+
+    // Opt-in narrowness: the rule is path-scoped, so a sibling path is
+    // still gated. This pins that the collapse never widens beyond the
+    // approved target.
+    let other_patch = registry.permission_request(&ToolCall {
+        call_id: "patch_other".to_string(),
+        name: "apply_patch".to_string(),
+        arguments: json!({
+            "patches": [{
+                "path": "src/bar.rs",
+                "search": "x",
+                "replace": "y",
+            }],
+        }),
+    });
+    let other_verdict =
+        policy.evaluate_with_extra(&other_patch, std::slice::from_ref(&write_session_rule));
+    assert_eq!(other_verdict.action, PermissionAction::Ask);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2150,6 +2283,112 @@ async fn apply_patch_unified_diff_fallback_applies_via_git_apply_3way() {
 }
 
 #[tokio::test]
+async fn apply_patch_recovers_from_curly_quote_drift() {
+    // Audit F14-cc: the file uses a curly apostrophe (U+2019) but the model
+    // emits ASCII `'` in both `search` and `replace`. The byte-exact lookup
+    // misses, the quote-normalize fallback locates the slice, and the
+    // replacement re-emits the curly apostrophe via `preserve_quote_style`
+    // so the file's typography survives the edit. The applied_delta surfaces
+    // the `fallback: "quote_normalize"` tag for the audit log.
+    let root = temp_workspace("apply_patch_curly_quote");
+    let initial = "We don\u{2019}t fly.\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_curly".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "don't fly",
+                        "replace": "don't run",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-curly".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "We don\u{2019}t run.\n",
+        "curly apostrophe must survive the edit",
+    );
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "quote_normalize"
+    );
+    let operations = result
+        .content
+        .get("operations")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("operations preview");
+    assert_eq!(operations[0]["fallback"], "quote_normalize");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_does_not_levenshtein_match() {
+    // Audit F14-cc anti-pattern guard: the quote-normalize fallback must be
+    // narrow. A 3-character-different search (no quote drift, just a typo)
+    // must NOT be rescued — keep the fallback deterministic, no fuzzy creep.
+    let root = temp_workspace("apply_patch_no_levenshtein");
+    let initial = "hello world\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    // Three characters off ('helo wrld!' vs 'hello world') — no curly drift,
+    // just a typo. Quote-normalize must NOT rescue this.
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_fuzzy".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "helo wrld!",
+                        "replace": "hi there",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-fuzzy".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    assert_eq!(
+        result.content["error"], "search text was not found",
+        "no fuzzy match: must surface the exact error so the model re-reads"
+    );
+    let unchanged = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(unchanged, initial);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
     // array — one entry per requested op, each `applied` and `exact=true`
@@ -2315,6 +2554,170 @@ async fn apply_patch_delta_reports_per_op_failure_with_error() {
         // applied and the failure-path assertions don't fire.
         assert_eq!(result.status, ToolStatus::Success);
     }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_expected_sha256_uses_server_side_seen_state() {
+    // F14-cc-server-side-read-state-gate: when the model omits
+    // `expected_sha256` and a prior `read_file` snapshot for the same path
+    // still matches the on-disk hash, apply_patch should proceed exactly as
+    // if the model had threaded the hash back through the patch arguments.
+    let root = temp_workspace("apply_patch_seen_state_ok");
+    let body = "before\n";
+    fs::write(root.join("sample.txt"), body).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "first_read".to_string(),
+            stable_output_sha256: "output-hash".to_string(),
+            content_sha256: Some(sha256_hex(body.as_bytes())),
+            start_byte: 0,
+            end_byte: body.len() as u64,
+            content: body.to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_no_hash".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-seen-state".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "after\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_seen_state_demands_read_first() {
+    // F14-cc-server-side-read-state-gate: when the model never read the file
+    // and omits `expected_sha256`, the server cannot vouch for the model's
+    // view of the file. apply_patch must refuse with a hint that points at
+    // `read_file` instead of writing blind.
+    let root = temp_workspace("apply_patch_seen_state_missing");
+    fs::write(root.join("sample.txt"), "before\n").expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_no_snapshot".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-no-snapshot".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    let error = result.content["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("call read_file first"),
+        "expected read_file hint, got: {error}"
+    );
+    // File must be untouched.
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "before\n"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_without_expected_sha256_detects_external_drift() {
+    // F14-cc-server-side-read-state-gate: when the model has a stale read
+    // snapshot (the file changed on disk between read_file and apply_patch),
+    // the server-side gate must catch the drift and refuse, naming both the
+    // last-seen and current hashes so the model can recover.
+    let root = temp_workspace("apply_patch_seen_state_drift");
+    let prior = "before\n";
+    let current = "before-modified-externally\n";
+    fs::write(root.join("sample.txt"), current).expect("write sample");
+    let store = Arc::new(SqueezyStore::open(&root, None).expect("store"));
+    let prior_sha = sha256_hex(prior.as_bytes());
+    store
+        .put_read_snapshot(&StoredReadSnapshot {
+            path: "sample.txt".to_string(),
+            tool_name: "read_file".to_string(),
+            call_id: "stale_read".to_string(),
+            stable_output_sha256: "output-stale".to_string(),
+            content_sha256: Some(prior_sha.clone()),
+            start_byte: 0,
+            end_byte: prior.len() as u64,
+            content: prior.to_string(),
+            model_output_bytes: 64,
+            created_unix_millis: 1,
+        })
+        .expect("put snapshot");
+    let registry = registry_with_state_store_and_checkpoints(&root, store);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_drift".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "before-modified-externally\n",
+                        "replace": "after\n",
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-drift".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale);
+    let error = result.content["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("file changed since the model last saw it"),
+        "expected drift error, got: {error}"
+    );
+    assert_eq!(result.content["last_seen_sha256"], prior_sha);
+    assert_eq!(result.content["last_read_call_id"], "stale_read");
+    assert_eq!(
+        result.content["current_sha256"],
+        sha256_hex(current.as_bytes())
+    );
+    // File must be untouched.
+    assert_eq!(
+        fs::read_to_string(root.join("sample.txt")).unwrap(),
+        current
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4704,13 +5107,18 @@ fn unstructured_shape_dedupes_identical_signal_lines() {
 #[test]
 fn web_tool_config_normalizes_blank_values() {
     let config = WebToolConfig {
+        provider: WebSearchProvider::Exa,
         exa_mcp_url: "  ".to_string(),
         exa_api_key: Some("  secret-token  ".to_string()),
+        parallel_mcp_url: "  ".to_string(),
+        parallel_api_key: Some("  bearer  ".to_string()),
     }
     .normalized();
 
     assert_eq!(config.exa_mcp_url, DEFAULT_EXA_MCP_URL);
     assert_eq!(config.exa_api_key.as_deref(), Some("secret-token"));
+    assert_eq!(config.parallel_mcp_url, DEFAULT_PARALLEL_MCP_URL);
+    assert_eq!(config.parallel_api_key.as_deref(), Some("bearer"));
 }
 
 #[test]
@@ -4809,6 +5217,7 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
         WebToolConfig {
             exa_mcp_url: "https://search.example/mcp".to_string(),
             exa_api_key: Some("secret-token".to_string()),
+            ..WebToolConfig::default()
         },
         http.clone(),
     )
@@ -4848,6 +5257,58 @@ async fn websearch_sends_exa_mcp_request_and_returns_text() {
         "rust async"
     );
     assert_eq!(requests[0].body["params"]["arguments"]["numResults"], 3);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn websearch_parallel_provider_dispatches_parallel_mcp_request() {
+    let root = temp_workspace("websearch_parallel");
+    let body = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"parallel results"}]}}"#;
+    let http = Arc::new(MockWebHttpClient::default());
+    http.push_post_response(ok_response("application/json", body.as_bytes()));
+    let registry = ToolRegistry::new_with_http_client(
+        &root,
+        ToolOutputConfig::default(),
+        WebToolConfig {
+            provider: WebSearchProvider::Parallel,
+            parallel_mcp_url: "https://search.parallel.example/mcp".to_string(),
+            parallel_api_key: Some("parallel-token".to_string()),
+            ..WebToolConfig::default()
+        },
+        http.clone(),
+    )
+    .expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_parallel".to_string(),
+                name: "websearch".to_string(),
+                arguments: json!({"query": "rust async"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["provider"], "parallel");
+    assert_eq!(result.content["result"], "parallel results");
+    let requests = http.post_requests.lock().expect("post requests");
+    assert_eq!(requests[0].url, "https://search.parallel.example/mcp");
+    assert!(requests[0].headers.contains(&(
+        "authorization".to_string(),
+        "Bearer parallel-token".to_string()
+    )));
+    assert_eq!(requests[0].body["params"]["name"], "web_search");
+    assert_eq!(
+        requests[0].body["params"]["arguments"]["objective"],
+        "rust async"
+    );
+    assert_eq!(
+        requests[0].body["params"]["arguments"]["search_queries"][0],
+        "rust async"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -5676,6 +6137,7 @@ fn tool_specs_are_sorted_by_name() {
             "hierarchy",
             "list_skills",
             "load_skill",
+            "notebook_edit",
             "notes_recall",
             "notes_remember",
             "observations",
@@ -6864,6 +7326,229 @@ async fn shell_result_records_implicit_skill_activation() {
         "implicit"
     );
 
+    let _ = fs::remove_dir_all(root);
+}
+
+fn sample_notebook_bytes() -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "cells": [
+            {
+                "cell_type": "code",
+                "id": "alpha",
+                "execution_count": 7,
+                "metadata": {},
+                "outputs": [{"output_type": "stream", "text": "stale\n"}],
+                "source": ["print('old')\n"]
+            },
+            {
+                "cell_type": "markdown",
+                "id": "beta",
+                "metadata": {},
+                "source": ["# heading\n"]
+            }
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }))
+    .expect("notebook bytes")
+}
+#[tokio::test]
+async fn notebook_edit_resets_execution_count_for_code_cell() {
+    let root = temp_workspace("notebook_edit_code");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "nb_replace".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "new_source": "print('new')\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nb".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let alpha = &parsed["cells"][0];
+    assert_eq!(alpha["execution_count"], Value::Null);
+    assert_eq!(alpha["outputs"].as_array().expect("outputs").len(), 0);
+    assert_eq!(alpha["source"][0], "print('new')\n");
+    assert_eq!(result.content["edit"]["mode"], "replace");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_replaces_cell_by_id_preserves_outputs_array_for_markdown() {
+    let root = temp_workspace("notebook_edit_md");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_md".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "beta",
+                    "new_source": "# new heading\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let beta = &parsed["cells"][1];
+    // Markdown cells should NOT acquire execution_count/outputs fields.
+    assert!(beta.get("execution_count").is_none());
+    assert!(beta.get("outputs").is_none());
+    assert_eq!(beta["source"][0], "# new heading\n");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_inserts_new_cell_at_position() {
+    let root = temp_workspace("notebook_edit_insert");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_ins".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "edit_mode": "insert",
+                    "cell_type": "code",
+                    "new_source": "x = 1\n",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let cells = parsed["cells"].as_array().expect("cells");
+    assert_eq!(cells.len(), 3);
+    assert_eq!(cells[1]["cell_type"], "code");
+    assert_eq!(cells[1]["source"][0], "x = 1\n");
+    assert_eq!(cells[1]["execution_count"], Value::Null);
+    assert!(cells[1]["outputs"].as_array().expect("outputs").is_empty());
+    assert_eq!(result.content["edit"]["cell_index"], 1);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn notebook_edit_deletes_cell_and_writes_valid_json() {
+    let root = temp_workspace("notebook_edit_delete");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "nb_del".to_string(),
+                name: "notebook_edit".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "cell_id": "alpha",
+                    "edit_mode": "delete",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let on_disk = fs::read(root.join("nb.ipynb")).expect("re-read");
+    let parsed: Value = serde_json::from_slice(&on_disk).expect("valid JSON");
+    let cells = parsed["cells"].as_array().expect("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0]["id"], "beta");
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_refuses_ipynb_with_redirect_to_notebook_edit() {
+    let root = temp_workspace("apply_patch_ipynb");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "patch_nb".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "nb.ipynb",
+                        "search": "old",
+                        "replace": "new",
+                        "expected_sha256": sha256_hex(&bytes),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["suggested_tool"], "notebook_edit");
+    // File untouched.
+    assert_eq!(fs::read(root.join("nb.ipynb")).unwrap(), bytes);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_refuses_ipynb_with_redirect_to_notebook_edit() {
+    let root = temp_workspace("write_file_ipynb");
+    let bytes = sample_notebook_bytes();
+    fs::write(root.join("nb.ipynb"), &bytes).expect("write notebook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "write_nb".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "nb.ipynb",
+                    "content": "{}",
+                    "expected_sha256": sha256_hex(&bytes),
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    assert_eq!(result.content["suggested_tool"], "notebook_edit");
+    assert_eq!(fs::read(root.join("nb.ipynb")).unwrap(), bytes);
     let _ = fs::remove_dir_all(root);
 }
 

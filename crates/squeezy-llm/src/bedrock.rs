@@ -18,11 +18,14 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
 use squeezy_core::{BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
+    anthropic_betas::bedrock_extra_body_betas, cache_policy::should_apply_caching,
+    retry::idle_timeout,
 };
 
 #[derive(Debug, Clone)]
@@ -75,12 +78,7 @@ impl LlmProvider for BedrockProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let provider = self.clone();
-        // `stream_idle_timeout_ms` is plumbed for future use; the AWS SDK
-        // already enforces its own per-event timeouts via the smithy
-        // runtime, and adding a second tokio::time::timeout layer here
-        // would require pinning the event receiver in place. Tracked as a
-        // follow-up.
-        let _ = provider.transport;
+        let transport = provider.transport;
         Box::pin(try_stream! {
             let client_result = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -91,9 +89,7 @@ impl LlmProvider for BedrockProvider {
             };
             let client = client_result?;
             let model = request.model.to_string();
-            let prompt_caching = request.cache_key.is_some()
-                && crate::capabilities_for("bedrock", &model)
-                    .is_some_and(|caps| caps.prompt_caching);
+            let prompt_caching = should_apply_caching("bedrock", &request);
             let mut builder = client.converse_stream().model_id(&model);
             for block in system_blocks(&request.instructions, prompt_caching)? {
                 builder = builder.system(block);
@@ -104,6 +100,8 @@ impl LlmProvider for BedrockProvider {
             if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
                 builder = builder.tool_config(config);
             }
+            let mut extra_fields: std::collections::HashMap<String, Document> =
+                std::collections::HashMap::new();
             if let Some(effort) = request.reasoning_effort
                 && crate::capabilities_for("bedrock", &model)
                     .is_some_and(|caps| caps.reasoning_effort)
@@ -123,10 +121,19 @@ impl LlmProvider for BedrockProvider {
                     .into_iter()
                     .collect(),
                 );
-                let extra = Document::Object(
-                    [("thinking".to_string(), thinking)].into_iter().collect(),
-                );
-                builder = builder.additional_model_request_fields(extra);
+                extra_fields.insert("thinking".to_string(), thinking);
+            }
+            let body_betas = bedrock_extra_body_betas(&request.beta_headers);
+            if !body_betas.is_empty() {
+                let beta_array = body_betas
+                    .iter()
+                    .map(|beta| Document::String(beta.as_ref().to_string()))
+                    .collect();
+                extra_fields.insert("anthropic_beta".to_string(), Document::Array(beta_array));
+            }
+            if !extra_fields.is_empty() {
+                builder =
+                    builder.additional_model_request_fields(Document::Object(extra_fields));
             }
 
             let send_result = tokio::select! {
@@ -148,9 +155,11 @@ impl LlmProvider for BedrockProvider {
                         yield LlmEvent::Cancelled;
                         return;
                     }
-                    next = recv_event(&mut stream) => next,
+                    next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
                 };
-                let event = polled?;
+                let event = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
+                })??;
                 let Some(event) = event else { break; };
                 for llm_event in handle_bedrock_event(event, &mut state)? {
                     yield llm_event;
@@ -161,12 +170,20 @@ impl LlmProvider for BedrockProvider {
                     "Bedrock stream ended without messageStop".to_string(),
                 ))?;
             }
+            if !state.saw_metadata {
+                tracing::warn!(
+                    provider = "bedrock",
+                    model = %model,
+                    "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
+                );
+            }
             if let Some(payload) = state.flush_reasoning() {
                 yield LlmEvent::ReasoningDone(payload);
             }
             yield LlmEvent::Completed {
                 response_id: None,
                 cost: state.cost(),
+                stop_reason: state.stop_reason.clone(),
             };
         })
     }
@@ -194,6 +211,8 @@ struct BedrockStreamState {
     reasoning_blocks: HashMap<i32, AnthropicThinkingBlock>,
     finished_reasoning: Vec<AnthropicThinkingBlock>,
     saw_message_stop: bool,
+    stop_reason: Option<crate::StopReason>,
+    saw_metadata: bool,
 }
 
 impl BedrockStreamState {
@@ -317,11 +336,13 @@ fn handle_bedrock_event(
                 arguments,
             })])
         }
-        ConverseStreamOutput::MessageStop(_) => {
+        ConverseStreamOutput::MessageStop(stop) => {
             state.saw_message_stop = true;
+            state.stop_reason = Some(crate::StopReason::from_bedrock(stop.stop_reason().as_str()));
             Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {
+            state.saw_metadata = true;
             if let Some(usage) = meta.usage {
                 state.input_tokens = Some(u64::try_from(usage.input_tokens).unwrap_or(0));
                 state.output_tokens = Some(u64::try_from(usage.output_tokens).unwrap_or(0));

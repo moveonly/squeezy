@@ -30,6 +30,38 @@ pub const DEFAULT_BEDROCK_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/api";
 pub const DEFAULT_OLLAMA_MODEL: &str = "qwen3-coder";
 
+// Small-fast-model defaults per provider. Used for low-stakes background calls
+// (compaction summaries, classifier prompts, auto-approver) where flagship
+// quality is wasted spend. Anthropic Haiku 4.5 is ~15x cheaper than Opus 4.7
+// per input token; comparable shape on OpenAI Nano vs flagship.
+pub const ANTHROPIC_SMALL_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
+pub const OPENAI_SMALL_FAST_MODEL: &str = "gpt-5.4-nano";
+pub const GOOGLE_SMALL_FAST_MODEL: &str = "gemini-2.5-flash-lite";
+pub const BEDROCK_SMALL_FAST_MODEL: &str = "anthropic.claude-haiku-4-5-20251001-v1:0";
+pub const AZURE_OPENAI_SMALL_FAST_MODEL: &str = OPENAI_SMALL_FAST_MODEL;
+pub const OPENROUTER_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const VERCEL_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+pub const PORTKEY_SMALL_FAST_MODEL: &str = "anthropic/claude-haiku-4-5";
+
+/// Returns the built-in small-fast-model id for `provider`. `provider` is the
+/// canonical short name (`provider_kind`/`LlmProvider::name`). Returns `None`
+/// for providers that have no obvious cheaper tier (Ollama serves a single
+/// local model; OpenAI-compatible light presets don't ship a curated cheap
+/// model). Callers should treat `None` as "fall back to the parent model".
+pub fn small_fast_model_for_provider(provider: &str) -> Option<&'static str> {
+    match provider {
+        "anthropic" => Some(ANTHROPIC_SMALL_FAST_MODEL),
+        "openai" => Some(OPENAI_SMALL_FAST_MODEL),
+        "google" => Some(GOOGLE_SMALL_FAST_MODEL),
+        "azure_openai" => Some(AZURE_OPENAI_SMALL_FAST_MODEL),
+        "bedrock" => Some(BEDROCK_SMALL_FAST_MODEL),
+        "openrouter" => Some(OPENROUTER_SMALL_FAST_MODEL),
+        "vercel" => Some(VERCEL_SMALL_FAST_MODEL),
+        "portkey" => Some(PORTKEY_SMALL_FAST_MODEL),
+        _ => None,
+    }
+}
+
 // OpenAI-compatible aggregators (full preset tier — curated models in models.json, dedicated costly test).
 pub const DEFAULT_OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "anthropic/claude-opus-4-7";
@@ -58,6 +90,22 @@ pub const DEFAULT_FIREWORKS_BASE_URL: &str = "https://api.fireworks.ai/inference
 pub const DEFAULT_FIREWORKS_MODEL: &str = "accounts/fireworks/models/llama-v3p3-70b-instruct";
 pub const DEFAULT_CEREBRAS_BASE_URL: &str = "https://api.cerebras.ai/v1";
 pub const DEFAULT_CEREBRAS_MODEL: &str = "llama-3.3-70b";
+pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
+pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
+pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+// OpenAI-compatible local self-hosted (light preset tier — loopback default,
+// auth optional, model id depends on whatever the local server has loaded).
+pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+pub const DEFAULT_VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
+pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+// Cloudflare Workers AI + AI Gateway. Both base URLs are templated on
+// `cloudflare_account_id` (and AI Gateway additionally on `cloudflare_gateway_id`),
+// so the static defaults below are empty — the caller must template them via
+// `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
+pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
@@ -68,9 +116,56 @@ pub fn vertex_base_url(project: &str, location: &str) -> String {
     )
 }
 
+/// Resolve a bare-name model alias (e.g. `opus`, `sonnet`, `haiku`) to the
+/// provider-preferred full model ID. Mirrors clear-code's
+/// `getDefaultOpusModel` / `getDefaultSonnetModel` / `getDefaultHaikuModel`
+/// (`src/utils/model/model.ts:105-138`) so `squeezy --model opus` resolves to
+/// `claude-opus-4-7` on Anthropic instead of being sent verbatim and 404-ing
+/// downstream. Lookup is case-insensitive on the alias. Returns `None` for
+/// inputs that don't match any alias, in which case callers should pass the
+/// string through unchanged (it's presumed to be a full model ID).
+pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> {
+    let normalized = alias.trim().to_ascii_lowercase();
+    match (provider, normalized.as_str()) {
+        ("anthropic", "opus") => Some(DEFAULT_ANTHROPIC_MODEL),
+        ("anthropic", "sonnet") => Some("claude-sonnet-4-6"),
+        ("anthropic", "haiku") => Some("claude-haiku-4-5-20251001"),
+        ("anthropic", "best") => Some(DEFAULT_ANTHROPIC_MODEL),
+        ("openai" | "azure_openai", "opus") => Some(DEFAULT_OPENAI_MODEL),
+        ("openai" | "azure_openai", "sonnet") => Some("gpt-5.4-mini"),
+        ("openai" | "azure_openai", "haiku") => Some("gpt-5.4-nano"),
+        ("openai" | "azure_openai", "best") => Some(DEFAULT_OPENAI_MODEL),
+        ("bedrock", "opus" | "best") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "sonnet") => Some(DEFAULT_BEDROCK_MODEL),
+        ("bedrock", "haiku") => Some(DEFAULT_BEDROCK_MODEL),
+        ("google", "opus" | "best") => Some(DEFAULT_GOOGLE_MODEL),
+        ("google", "sonnet") => Some("gemini-2.5-flash"),
+        ("google", "haiku") => Some("gemini-2.5-flash-lite"),
+        _ => None,
+    }
+}
+
+/// Cloudflare Workers AI's OpenAI-compatible chat completions endpoint is
+/// per-account. Returns the resolved base URL for an `account_id`, ready for
+/// `/chat/completions` to be appended.
+pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
+    format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+}
+
+/// Cloudflare AI Gateway proxies any OpenAI-compatible upstream behind a
+/// per-(account, gateway) URL. The `compat` suffix is the gateway's
+/// OpenAI-format compatibility surface; underneath it can route to Workers AI,
+/// OpenAI, Anthropic, etc. depending on the gateway's configured upstream.
+pub fn cloudflare_ai_gateway_base_url(account_id: &str, gateway_id: &str) -> String {
+    format!("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat")
+}
+
 pub const MODEL_SELECTION_VERSION: u32 = 1;
 pub const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 pub const DEFAULT_EXA_API_KEY_ENV: &str = "EXA_API_KEY";
+pub const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
+pub const DEFAULT_PARALLEL_API_KEY_ENV: &str = "PARALLEL_API_KEY";
+pub const DEFAULT_WEBSEARCH_PROVIDER: &str = "exa";
 pub const DEFAULT_MAX_OUTPUT_TOKENS: Option<u32> = None;
 pub const DEFAULT_TOOL_SPILL_THRESHOLD_BYTES: usize = 25_000;
 pub const DEFAULT_TOOL_PREVIEW_BYTES: usize = 2_000;
@@ -173,6 +268,20 @@ pub const DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS: u64 = 30;
 /// When strategy = LayeredFallback, model-assist only kicks in once the
 /// dropped slice exceeds this many tokens; smaller slices stay extractive.
 pub const DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS: u32 = 4_000;
+/// Mid-tier micro-compaction fires below the full-compaction threshold so
+/// the heavy tool-result bodies are reclaimed before the all-or-nothing
+/// summary head replaces the older slice. 60% leaves a 20-percentage-point
+/// band between micro and the 80% full-compaction default, which is the
+/// span where local tool clearing has the highest leverage (one large
+/// `read_file` or `shell` output dwarfs a few text messages).
+pub const DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT: u8 = 60;
+/// Keep this many newest compactable tool results verbatim during
+/// micro-compaction; older results are rewritten to a placeholder. 5
+/// matches clear-code's `TIME_BASED_MC_CONFIG_DEFAULTS.keepRecent`
+/// (`src/services/compact/timeBasedMCConfig.ts:33`), which is enough to
+/// resolve typical "what did the last read of foo.rs show?" follow-ups
+/// without forcing a re-read.
+pub const DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT: usize = 5;
 pub const DEFAULT_AGENT_COMPAT_SKILLS_DIR: &str = ".agents/skills";
 /// Tools whose full JSON schema is always sent up-front in every request,
 /// independent of `[tools].lazy_schema_loading`.
@@ -215,6 +324,12 @@ pub const DEFAULT_CORE_TOOL_NAMES: &[&str] = &[
 pub struct AppConfig {
     pub provider: ProviderConfig,
     pub model: String,
+    /// Cheap model id used for low-stakes background calls: compaction
+    /// summary, AI reviewer classifier, auto-approver. `None` falls back to
+    /// `small_fast_model_for_provider(provider)`, then to `model` if the
+    /// provider has no curated cheap tier (e.g. Ollama). Configured via
+    /// `[model].small_fast_model` in TOML or `SQUEEZY_SMALL_FAST_MODEL`.
+    pub small_fast_model: Option<String>,
     pub profile: ModelProfile,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub instructions: String,
@@ -243,6 +358,11 @@ pub struct AppConfig {
     pub tool_output_retention_days: u64,
     pub exa_mcp_url: String,
     pub exa_api_key_env: String,
+    pub parallel_mcp_url: String,
+    pub parallel_api_key_env: String,
+    /// Websearch backend identifier; expected values are "exa" or "parallel".
+    /// Stored as a string so squeezy-core has no dependency on squeezy-tools.
+    pub websearch_provider: String,
     pub max_tool_calls_per_turn: u64,
     pub max_tool_bytes_read_per_turn: u64,
     pub max_search_files_per_turn: u64,
@@ -427,6 +547,11 @@ impl AppConfig {
                 base_url: get_var("OLLAMA_BASE_URL")
                     .or_else(|| provider_setting(&providers, "ollama", "base_url"))
                     .unwrap_or_else(|| DEFAULT_OLLAMA_BASE_URL.to_string()),
+                route_style: get_var("OLLAMA_ROUTE_STYLE")
+                    .or_else(|| provider_setting(&providers, "ollama", "route_style"))
+                    .as_deref()
+                    .and_then(OllamaRoute::parse)
+                    .unwrap_or_default(),
                 transport: provider_transport_settings(&providers, &["ollama"]),
             }),
             "openai" => ProviderConfig::OpenAi(OpenAiConfig {
@@ -450,6 +575,7 @@ impl AppConfig {
                 )));
             }
         };
+        validate_provider_base_urls(&provider)?;
         let default_model = match &provider {
             ProviderConfig::OpenAi(_) => provider_setting(&providers, "openai", "default_model")
                 .unwrap_or_else(|| DEFAULT_OPENAI_MODEL.to_string()),
@@ -479,11 +605,27 @@ impl AppConfig {
             .as_deref()
             .and_then(ModelProfile::parse)
             .unwrap_or_default();
-        let model = get_var("SQUEEZY_MODEL")
+        let raw_model = get_var("SQUEEZY_MODEL")
             .or(model_settings.model)
             .or(settings.model)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(default_model);
+        let small_fast_model = get_var("SQUEEZY_SMALL_FAST_MODEL")
+            .or(model_settings.small_fast_model.clone())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let provider_slug = match &provider {
+            ProviderConfig::OpenAi(_) => "openai",
+            ProviderConfig::Anthropic(_) => "anthropic",
+            ProviderConfig::Google(_) => "google",
+            ProviderConfig::AzureOpenAi(_) => "azure_openai",
+            ProviderConfig::Bedrock(_) => "bedrock",
+            ProviderConfig::Ollama(_) => "ollama",
+            ProviderConfig::OpenAiCompatible(_) => "",
+        };
+        let model = resolve_model_alias(provider_slug, &raw_model)
+            .map(str::to_string)
+            .unwrap_or(raw_model);
         let reasoning_effort = model_settings.reasoning_effort;
         let max_output_tokens = get_var("SQUEEZY_MAX_OUTPUT_TOKENS")
             .and_then(|value| value.parse::<u32>().ok())
@@ -518,6 +660,15 @@ impl AppConfig {
         let exa_api_key_env = get_var("SQUEEZY_EXA_API_KEY_ENV")
             .or(web.exa_api_key_env)
             .unwrap_or_else(|| DEFAULT_EXA_API_KEY_ENV.to_string());
+        let parallel_mcp_url = get_var("SQUEEZY_PARALLEL_MCP_URL")
+            .or(web.parallel_mcp_url)
+            .unwrap_or_else(|| DEFAULT_PARALLEL_MCP_URL.to_string());
+        let parallel_api_key_env = get_var("SQUEEZY_PARALLEL_API_KEY_ENV")
+            .or(web.parallel_api_key_env)
+            .unwrap_or_else(|| DEFAULT_PARALLEL_API_KEY_ENV.to_string());
+        let websearch_provider = get_var("SQUEEZY_WEBSEARCH_PROVIDER")
+            .or(web.websearch_provider)
+            .unwrap_or_else(|| DEFAULT_WEBSEARCH_PROVIDER.to_string());
         let requested_store_responses = get_var("SQUEEZY_STORE_RESPONSES")
             .as_deref()
             .map(parse_enabled_bool)
@@ -662,6 +813,7 @@ impl AppConfig {
         Ok(Self {
             provider,
             model,
+            small_fast_model,
             profile,
             reasoning_effort,
             instructions: DEFAULT_INSTRUCTIONS.to_string(),
@@ -684,6 +836,9 @@ impl AppConfig {
             tool_output_retention_days,
             exa_mcp_url,
             exa_api_key_env,
+            parallel_mcp_url,
+            parallel_api_key_env,
+            websearch_provider,
             max_tool_calls_per_turn,
             max_tool_bytes_read_per_turn,
             max_search_files_per_turn,
@@ -723,6 +878,18 @@ impl AppConfig {
             .expect("built-in config defaults are valid")
     }
 
+    /// Resolves the small-fast-model id for background calls (compaction
+    /// summary, classifier, auto-approver). Returns the user-configured value
+    /// when set, then the provider built-in cheap default, then `None` when
+    /// the provider has no curated cheap tier — callers fall back to the
+    /// main model in that case.
+    pub fn resolved_small_fast_model(&self) -> Option<String> {
+        if let Some(model) = &self.small_fast_model {
+            return Some(model.clone());
+        }
+        small_fast_model_for_provider(provider_kind(&self.provider)).map(str::to_string)
+    }
+
     /// Returns `config_sources` with file paths reduced to short labels
     /// (`"user"`, `"project"`, `"repo"`) for display in narrow status lines. Full
     /// paths remain available on `config_sources` and via `config inspect`.
@@ -758,6 +925,13 @@ impl AppConfig {
             toml_string(provider_kind(&self.provider))
         ));
         output.push_str(&format!("model = {}\n", toml_string(&self.model)));
+        if let Some(small_fast) = &self.small_fast_model {
+            output.push_str(&format!("small_fast_model = {}\n", toml_string(small_fast)));
+        } else {
+            output.push_str(
+                "# small_fast_model = unset  # uses per-provider built-in cheap default\n",
+            );
+        }
         output.push_str(&format!(
             "profile = {}\n",
             toml_string(self.profile.as_str())
@@ -871,9 +1045,21 @@ impl AppConfig {
             self.context_compaction.model_assisted_timeout_secs
         ));
         output.push_str(&format!(
-            "layered_fallback_extractive_threshold_tokens = {}\n\n",
+            "layered_fallback_extractive_threshold_tokens = {}\n",
             self.context_compaction
                 .layered_fallback_extractive_threshold_tokens
+        ));
+        output.push_str(&format!(
+            "micro_compaction_enabled = {}\n",
+            self.context_compaction.micro_compaction_enabled
+        ));
+        output.push_str(&format!(
+            "micro_compaction_threshold_percent = {}\n",
+            self.context_compaction.micro_compaction_threshold_percent
+        ));
+        output.push_str(&format!(
+            "micro_compaction_keep_recent = {}\n\n",
+            self.context_compaction.micro_compaction_keep_recent
         ));
 
         output.push_str("[subagents]\n");
@@ -906,9 +1092,13 @@ impl AppConfig {
             self.subagents.max_summary_tokens
         ));
         match self.subagents.max_runtime_secs {
-            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n\n")),
-            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n\n"),
+            Some(secs) => output.push_str(&format!("max_runtime_secs = {secs}\n")),
+            None => output.push_str("max_runtime_secs = 0  # disabled; no wall-clock cap\n"),
         }
+        output.push_str(&format!(
+            "include_transcript = {}\n\n",
+            self.subagents.include_transcript
+        ));
 
         output.push_str("[budgets]\n");
         output.push_str(&format!(
@@ -1118,10 +1308,19 @@ impl AppConfig {
 
         output.push_str("[web]\n");
         output.push_str(&format!(
+            "websearch_provider = {}\n",
+            toml_string(&self.websearch_provider)
+        ));
+        output.push_str(&format!(
             "exa_mcp_url = {}\n",
             toml_string(&self.exa_mcp_url)
         ));
-        output.push_str("exa_api_key_env = \"<redacted>\"\n\n");
+        output.push_str("exa_api_key_env = \"<redacted>\"\n");
+        output.push_str(&format!(
+            "parallel_mcp_url = {}\n",
+            toml_string(&self.parallel_mcp_url)
+        ));
+        output.push_str("parallel_api_key_env = \"<redacted>\"\n\n");
 
         output.push_str("[skills]\n");
         output.push_str(&format!(
@@ -1473,8 +1672,8 @@ pub struct OpenAiCompatibleConfig {
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
 /// preset carries enough defaults that the user can wire a provider with just
 /// an API key. `Custom` is for any other OpenAI-compatible endpoint (e.g.
-/// self-hosted LiteLLM, Cloudflare Workers AI, Cohere) and requires the
-/// caller to supply `base_url` and `api_key_env` explicitly.
+/// self-hosted LiteLLM, Cohere) and requires the caller to supply `base_url`
+/// and `api_key_env` explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAiCompatiblePreset {
@@ -1489,6 +1688,19 @@ pub enum OpenAiCompatiblePreset {
     Together,
     Fireworks,
     Cerebras,
+    DeepInfra,
+    Baseten,
+    // Serde's snake_case derivation chops between each upper/lower transition
+    // (`LMStudio` -> `l_m_studio`), which would diverge from the TOML section
+    // name. Pin the wire format explicitly to keep round-trip stable.
+    #[serde(rename = "lmstudio")]
+    LMStudio,
+    #[serde(rename = "vllm")]
+    VLlm,
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
+    CloudflareWorkersAi,
+    CloudflareAiGateway,
     Custom,
 }
 
@@ -1508,6 +1720,13 @@ impl OpenAiCompatiblePreset {
             Self::Together => "together",
             Self::Fireworks => "fireworks",
             Self::Cerebras => "cerebras",
+            Self::DeepInfra => "deepinfra",
+            Self::Baseten => "baseten",
+            Self::LMStudio => "lmstudio",
+            Self::VLlm => "vllm",
+            Self::LlamaCpp => "llamacpp",
+            Self::CloudflareWorkersAi => "cloudflare_workers_ai",
+            Self::CloudflareAiGateway => "cloudflare_ai_gateway",
             Self::Custom => "openai_compatible",
         }
     }
@@ -1526,6 +1745,13 @@ impl OpenAiCompatiblePreset {
             Self::Together => "Together AI",
             Self::Fireworks => "Fireworks AI",
             Self::Cerebras => "Cerebras",
+            Self::DeepInfra => "DeepInfra",
+            Self::Baseten => "Baseten",
+            Self::LMStudio => "LM Studio",
+            Self::VLlm => "vLLM",
+            Self::LlamaCpp => "llama.cpp server",
+            Self::CloudflareWorkersAi => "Cloudflare Workers AI",
+            Self::CloudflareAiGateway => "Cloudflare AI Gateway",
             Self::Custom => "OpenAI-compatible (custom)",
         }
     }
@@ -1563,6 +1789,17 @@ impl OpenAiCompatiblePreset {
             Self::Together => DEFAULT_TOGETHER_BASE_URL,
             Self::Fireworks => DEFAULT_FIREWORKS_BASE_URL,
             Self::Cerebras => DEFAULT_CEREBRAS_BASE_URL,
+            Self::DeepInfra => DEFAULT_DEEPINFRA_BASE_URL,
+            Self::Baseten => DEFAULT_BASETEN_BASE_URL,
+            Self::LMStudio => DEFAULT_LMSTUDIO_BASE_URL,
+            Self::VLlm => DEFAULT_VLLM_BASE_URL,
+            Self::LlamaCpp => DEFAULT_LLAMACPP_BASE_URL,
+            // Cloudflare's base URLs are per-account (and per-gateway for the
+            // gateway preset). The caller must template them from
+            // `cloudflare_account_id` (and `cloudflare_gateway_id`); see
+            // `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+            Self::CloudflareWorkersAi => "",
+            Self::CloudflareAiGateway => "",
             Self::Custom => "",
         }
     }
@@ -1584,6 +1821,20 @@ impl OpenAiCompatiblePreset {
             Self::Together => "TOGETHER_API_KEY",
             Self::Fireworks => "FIREWORKS_API_KEY",
             Self::Cerebras => "CEREBRAS_API_KEY",
+            Self::DeepInfra => "DEEPINFRA_API_KEY",
+            Self::Baseten => "BASETEN_API_KEY",
+            // Local self-hosted servers usually do not authenticate, but the env
+            // var slot lets users layer a bearer token via a reverse proxy.
+            Self::LMStudio => "LMSTUDIO_API_KEY",
+            Self::VLlm => "VLLM_API_KEY",
+            Self::LlamaCpp => "LLAMACPP_API_KEY",
+            // Cloudflare uses one API token (CLOUDFLARE_API_KEY) for the
+            // direct Workers AI endpoint, and the same token for the
+            // upstream bearer when routing through AI Gateway. The optional
+            // gateway-level token (`cf-aig-authorization`) is configured
+            // separately via `CF_AIG_TOKEN` and injected as an extra header.
+            Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
+            Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
         }
     }
@@ -1601,6 +1852,15 @@ impl OpenAiCompatiblePreset {
             Self::Together => DEFAULT_TOGETHER_MODEL,
             Self::Fireworks => DEFAULT_FIREWORKS_MODEL,
             Self::Cerebras => DEFAULT_CEREBRAS_MODEL,
+            Self::DeepInfra => DEFAULT_DEEPINFRA_MODEL,
+            Self::Baseten => DEFAULT_BASETEN_MODEL,
+            // Local servers expose whatever checkpoint the operator loaded; we
+            // cannot guess a default, so the user supplies `model = …`.
+            Self::LMStudio => "",
+            Self::VLlm => "",
+            Self::LlamaCpp => "",
+            Self::CloudflareWorkersAi => DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL,
+            Self::CloudflareAiGateway => DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL,
             Self::Custom => "",
         }
     }
@@ -1621,6 +1881,17 @@ impl OpenAiCompatiblePreset {
             "together" | "together_ai" => Some(Self::Together),
             "fireworks" | "fireworks_ai" => Some(Self::Fireworks),
             "cerebras" => Some(Self::Cerebras),
+            "deepinfra" | "deep_infra" => Some(Self::DeepInfra),
+            "baseten" => Some(Self::Baseten),
+            "lmstudio" | "lm_studio" => Some(Self::LMStudio),
+            "vllm" => Some(Self::VLlm),
+            "llamacpp" | "llama_cpp" | "llama_cpp_server" => Some(Self::LlamaCpp),
+            "cloudflare_workers_ai" | "cloudflare_workersai" | "workers_ai" | "cf_workers_ai" => {
+                Some(Self::CloudflareWorkersAi)
+            }
+            "cloudflare_ai_gateway" | "cloudflare_gateway" | "cf_ai_gateway" | "ai_gateway" => {
+                Some(Self::CloudflareAiGateway)
+            }
             "openai_compatible" | "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -1628,7 +1899,7 @@ impl OpenAiCompatiblePreset {
 
     /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
     /// Used by the CLI to enumerate options without hard-coding the list.
-    pub fn all() -> [Self; 12] {
+    pub fn all() -> [Self; 19] {
         [
             Self::OpenRouter,
             Self::Vercel,
@@ -1641,6 +1912,13 @@ impl OpenAiCompatiblePreset {
             Self::Together,
             Self::Fireworks,
             Self::Cerebras,
+            Self::DeepInfra,
+            Self::Baseten,
+            Self::LMStudio,
+            Self::VLlm,
+            Self::LlamaCpp,
+            Self::CloudflareWorkersAi,
+            Self::CloudflareAiGateway,
             Self::Custom,
         ]
     }
@@ -1693,7 +1971,36 @@ pub struct BedrockConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OllamaConfig {
     pub base_url: String,
+    /// Wire route for `POST <model>` traffic. `Native` keeps the proprietary
+    /// `/api/chat` NDJSON path (default; exposes `keep_alive` + `num_ctx`);
+    /// `OpenAiCompatible` rewrites the request to `/v1/chat/completions` SSE
+    /// so users with portable tooling can pin Ollama to a uniform contract.
+    #[serde(default)]
+    pub route_style: OllamaRoute,
     pub transport: ProviderTransportConfig,
+}
+
+/// Selects which HTTP route the Ollama provider uses to stream completions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OllamaRoute {
+    /// Ollama's native NDJSON endpoint (`<base>/chat`). Preserves Ollama
+    /// extensions like `keep_alive` and `num_ctx` for local hardware tuning.
+    #[default]
+    Native,
+    /// OpenAI-compatible Chat Completions SSE endpoint (`<root>/v1/chat/completions`).
+    /// Portable wire shape; loses Ollama-specific options.
+    OpenAiCompatible,
+}
+
+impl OllamaRoute {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" | "api" | "default" => Some(Self::Native),
+            "openai_compatible" | "openai" | "v1" | "compat" => Some(Self::OpenAiCompatible),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2107,10 +2414,15 @@ pub struct ProviderSettings {
     pub preset: Option<String>,
     pub vertex_project: Option<String>,
     pub vertex_location: Option<String>,
+    pub cloudflare_account_id: Option<String>,
+    pub cloudflare_gateway_id: Option<String>,
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub headers: Option<BTreeMap<String, String>>,
+    /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
+    /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
+    pub route_style: Option<String>,
 }
 
 impl ProviderSettings {
@@ -2127,10 +2439,13 @@ impl ProviderSettings {
                 "preset",
                 "vertex_project",
                 "vertex_location",
+                "cloudflare_account_id",
+                "cloudflare_gateway_id",
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
                 "headers",
+                "route_style",
             ],
             source,
             path,
@@ -2182,6 +2497,18 @@ impl ProviderSettings {
                 source,
                 &field(path, "vertex_location"),
             )?,
+            cloudflare_account_id: string_value(
+                table,
+                "cloudflare_account_id",
+                source,
+                &field(path, "cloudflare_account_id"),
+            )?,
+            cloudflare_gateway_id: string_value(
+                table,
+                "cloudflare_gateway_id",
+                source,
+                &field(path, "cloudflare_gateway_id"),
+            )?,
             request_max_retries: u8_nonnegative_value(
                 table,
                 "request_max_retries",
@@ -2201,6 +2528,7 @@ impl ProviderSettings {
                 &field(path, "stream_idle_timeout_ms"),
             )?,
             headers,
+            route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
         })
     }
 
@@ -2214,6 +2542,8 @@ impl ProviderSettings {
         replace_if_some(&mut self.preset, next.preset);
         replace_if_some(&mut self.vertex_project, next.vertex_project);
         replace_if_some(&mut self.vertex_location, next.vertex_location);
+        replace_if_some(&mut self.cloudflare_account_id, next.cloudflare_account_id);
+        replace_if_some(&mut self.cloudflare_gateway_id, next.cloudflare_gateway_id);
         replace_if_some(&mut self.request_max_retries, next.request_max_retries);
         replace_if_some(&mut self.stream_max_retries, next.stream_max_retries);
         replace_if_some(
@@ -2245,6 +2575,10 @@ where
 pub struct ModelSettings {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Cheap model id used for low-stakes background calls (compaction
+    /// summary, AI reviewer classifier, auto-approver). When `None` the
+    /// per-provider built-in (`small_fast_model_for_provider`) applies.
+    pub small_fast_model: Option<String>,
     pub profile: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_output_tokens: Option<u32>,
@@ -2268,6 +2602,7 @@ impl ModelSettings {
             &[
                 "provider",
                 "model",
+                "small_fast_model",
                 "profile",
                 "reasoning_effort",
                 "max_output_tokens",
@@ -2297,6 +2632,12 @@ impl ModelSettings {
         Ok(Self {
             provider: string_value(table, "provider", source, &field(path, "provider"))?,
             model: string_value(table, "model", source, &field(path, "model"))?,
+            small_fast_model: string_value(
+                table,
+                "small_fast_model",
+                source,
+                &field(path, "small_fast_model"),
+            )?,
             profile,
             reasoning_effort,
             max_output_tokens: u32_value(
@@ -2335,6 +2676,7 @@ impl ModelSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.provider, next.provider);
         replace_if_some(&mut self.model, next.model);
+        replace_if_some(&mut self.small_fast_model, next.small_fast_model);
         replace_if_some(&mut self.profile, next.profile);
         replace_if_some(&mut self.reasoning_effort, next.reasoning_effort);
         replace_if_some(&mut self.max_output_tokens, next.max_output_tokens);
@@ -2855,6 +3197,9 @@ pub struct ContextCompactionSettings {
     pub model_assisted_max_output_tokens: Option<u32>,
     pub model_assisted_timeout_secs: Option<u64>,
     pub layered_fallback_extractive_threshold_tokens: Option<u32>,
+    pub micro_compaction_enabled: Option<bool>,
+    pub micro_compaction_threshold_percent: Option<u8>,
+    pub micro_compaction_keep_recent: Option<usize>,
 }
 
 impl ContextCompactionSettings {
@@ -2877,6 +3222,9 @@ impl ContextCompactionSettings {
                 "model_assisted_max_output_tokens",
                 "model_assisted_timeout_secs",
                 "layered_fallback_extractive_threshold_tokens",
+                "micro_compaction_enabled",
+                "micro_compaction_threshold_percent",
+                "micro_compaction_keep_recent",
             ],
             source,
             path,
@@ -2978,6 +3326,24 @@ impl ContextCompactionSettings {
                 source,
                 &field(path, "layered_fallback_extractive_threshold_tokens"),
             )?,
+            micro_compaction_enabled: bool_value(
+                table,
+                "micro_compaction_enabled",
+                source,
+                &field(path, "micro_compaction_enabled"),
+            )?,
+            micro_compaction_threshold_percent: u8_value(
+                table,
+                "micro_compaction_threshold_percent",
+                source,
+                &field(path, "micro_compaction_threshold_percent"),
+            )?,
+            micro_compaction_keep_recent: usize_value(
+                table,
+                "micro_compaction_keep_recent",
+                source,
+                &field(path, "micro_compaction_keep_recent"),
+            )?,
         })
     }
 
@@ -3015,6 +3381,18 @@ impl ContextCompactionSettings {
             &mut self.layered_fallback_extractive_threshold_tokens,
             next.layered_fallback_extractive_threshold_tokens,
         );
+        replace_if_some(
+            &mut self.micro_compaction_enabled,
+            next.micro_compaction_enabled,
+        );
+        replace_if_some(
+            &mut self.micro_compaction_threshold_percent,
+            next.micro_compaction_threshold_percent,
+        );
+        replace_if_some(
+            &mut self.micro_compaction_keep_recent,
+            next.micro_compaction_keep_recent,
+        );
     }
 }
 
@@ -3029,6 +3407,7 @@ pub struct SubagentSettings {
     pub max_model_rounds: Option<usize>,
     pub max_summary_tokens: Option<u32>,
     pub max_runtime_secs: Option<u64>,
+    pub include_transcript: Option<bool>,
 }
 
 impl SubagentSettings {
@@ -3045,6 +3424,7 @@ impl SubagentSettings {
                 "max_model_rounds",
                 "max_summary_tokens",
                 "max_runtime_secs",
+                "include_transcript",
             ],
             source,
             path,
@@ -3099,6 +3479,12 @@ impl SubagentSettings {
                 source,
                 &field(path, "max_runtime_secs"),
             )?,
+            include_transcript: bool_value(
+                table,
+                "include_transcript",
+                source,
+                &field(path, "include_transcript"),
+            )?,
         })
     }
 
@@ -3121,6 +3507,7 @@ impl SubagentSettings {
         replace_if_some(&mut self.max_model_rounds, next.max_model_rounds);
         replace_if_some(&mut self.max_summary_tokens, next.max_summary_tokens);
         replace_if_some(&mut self.max_runtime_secs, next.max_runtime_secs);
+        replace_if_some(&mut self.include_transcript, next.include_transcript);
     }
 }
 
@@ -3138,6 +3525,12 @@ pub struct SubagentConfig {
     /// `max_runtime_secs = 0` or `SQUEEZY_SUBAGENT_MAX_RUNTIME_SECS=0`)
     /// disables the timeout entirely; cancellation and round caps remain.
     pub max_runtime_secs: Option<u64>,
+    /// When `true`, the structured subagent result returned to the parent
+    /// carries a `transcript` field with the child's assistant + tool
+    /// trace. Default `false` — the parent sees only the final `summary`
+    /// + `supporting_receipts` + `files_touched`, mirroring clear-code's
+    ///   sidechained-by-default shape (`agentToolUtils.ts:276–357`).
+    pub include_transcript: bool,
 }
 
 impl SubagentConfig {
@@ -3193,6 +3586,10 @@ impl SubagentConfig {
                     .unwrap_or(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS);
                 if raw == 0 { None } else { Some(raw) }
             },
+            include_transcript: get_var("SQUEEZY_SUBAGENT_INCLUDE_TRANSCRIPT")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.include_transcript.unwrap_or(false)),
         }
     }
 }
@@ -3209,6 +3606,7 @@ impl Default for SubagentConfig {
             max_model_rounds: DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
             max_summary_tokens: DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
             max_runtime_secs: Some(DEFAULT_SUBAGENT_MAX_RUNTIME_SECS),
+            include_transcript: false,
         }
     }
 }
@@ -3284,6 +3682,19 @@ pub struct ContextCompactionConfig {
     pub model_assisted_max_output_tokens: u32,
     pub model_assisted_timeout_secs: u64,
     pub layered_fallback_extractive_threshold_tokens: u32,
+    /// Master switch for the mid-tier "micro" compaction pass. When true
+    /// and `enabled_mid_turn` is also true, the agent attempts to clear
+    /// older `FunctionCallOutput` payloads in place before falling
+    /// through to full compaction. Disabled callers go straight from
+    /// no-op to full compaction.
+    pub micro_compaction_enabled: bool,
+    /// Token-window fraction (0..=100) at which micro-compaction fires.
+    /// Should sit below `threshold_percent` so micro reclaims tool-output
+    /// bytes before the full tier's all-or-nothing summary kicks in.
+    pub micro_compaction_threshold_percent: u8,
+    /// Keep this many newest compactable tool results verbatim; older
+    /// results are rewritten to a structured placeholder.
+    pub micro_compaction_keep_recent: usize,
 }
 
 impl ContextCompactionConfig {
@@ -3375,6 +3786,23 @@ impl ContextCompactionConfig {
             .and_then(|raw| raw.parse::<u32>().ok())
             .or(settings.layered_fallback_extractive_threshold_tokens)
             .unwrap_or(DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS),
+            micro_compaction_enabled: get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_ENABLED")
+                .as_deref()
+                .map(parse_enabled_bool)
+                .unwrap_or(settings.micro_compaction_enabled.unwrap_or(true)),
+            micro_compaction_threshold_percent: clamp_percent(
+                get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT")
+                    .as_deref()
+                    .and_then(|raw| raw.parse::<u8>().ok())
+                    .or(settings.micro_compaction_threshold_percent)
+                    .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT),
+            ),
+            micro_compaction_keep_recent: parse_usize(
+                get_var("SQUEEZY_CONTEXT_MICRO_COMPACTION_KEEP_RECENT"),
+                settings
+                    .micro_compaction_keep_recent
+                    .unwrap_or(DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT),
+            ),
         }
     }
 }
@@ -3403,6 +3831,9 @@ impl Default for ContextCompactionConfig {
             model_assisted_timeout_secs: DEFAULT_CONTEXT_COMPACTION_MODEL_ASSISTED_TIMEOUT_SECS,
             layered_fallback_extractive_threshold_tokens:
                 DEFAULT_CONTEXT_COMPACTION_LAYERED_FALLBACK_EXTRACTIVE_THRESHOLD_TOKENS,
+            micro_compaction_enabled: true,
+            micro_compaction_threshold_percent: DEFAULT_CONTEXT_MICRO_COMPACTION_THRESHOLD_PERCENT,
+            micro_compaction_keep_recent: DEFAULT_CONTEXT_MICRO_COMPACTION_KEEP_RECENT,
         }
     }
 }
@@ -3506,6 +3937,21 @@ pub struct PermissionRule {
     pub action: PermissionAction,
     pub source: PermissionRuleSource,
     pub reason: Option<String>,
+    /// When `true` and `action == Deny`, the matching verdict suppresses the
+    /// per-call narrative on the tool-result string sent back to the model
+    /// (the audit JSONL still records the full reason). Only meaningful for
+    /// `Deny` rules; loaders reject `silent = true` on `Allow`/`Ask` to keep
+    /// the field's semantics narrow. The use case is boilerplate policy: an
+    /// absolute deny rule like `rm -rf /` or writes to `.git/config` does not
+    /// need to spell out `capability=...; target=...; risk=...` to the model
+    /// on every retry — the model only needs to know the call is rejected and
+    /// move on. Auditability stays in the JSONL log.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl PermissionRule {
@@ -3522,7 +3968,18 @@ impl PermissionRule {
             action,
             source,
             reason,
+            silent: false,
         }
+    }
+
+    /// Mark this rule as silent. Only meaningful for `Deny` rules; the loader
+    /// rejects `silent = true` on `Allow`/`Ask`, but this setter does not
+    /// re-check because in-memory builders may compose pieces in either order.
+    /// Callers responsible for upholding the invariant are the TOML loader and
+    /// any future builders that synthesize rules from typed sources.
+    pub fn with_silent(mut self, silent: bool) -> Self {
+        self.silent = silent;
+        self
     }
 }
 
@@ -3543,6 +4000,12 @@ pub struct PermissionVerdict {
     pub action: PermissionAction,
     pub matched_rule: Option<PermissionRule>,
     pub reason: String,
+    /// True when this verdict came from a `silent` deny rule. The agent uses
+    /// this to send a minimal `"action denied by policy"` to the model in place
+    /// of the structured `reason`, while the audit JSONL still receives the
+    /// full reason via `log_permission_verdict`. Only set when `action` is
+    /// `Deny`; other actions ignore the flag.
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -4442,10 +4905,17 @@ impl PermissionPolicy {
                     .clone()
                     .unwrap_or_else(|| format!("matched {} permission rule", rule.source.as_str()))
             });
+            // Silent is honored only when the resolved action is Deny: a
+            // downgraded Allow that survives with silent=true would be outside
+            // the documented policy shape (the loader already refuses silent
+            // on non-Deny rules), and a Deny that was downgraded would also
+            // drop silent.
+            let silent = rule.silent && action == PermissionAction::Deny;
             return PermissionVerdict {
                 action,
                 reason,
                 matched_rule: Some(rule),
+                silent,
             };
         }
         let action = self.mode_for(legacy_scope_for_capability(request.capability));
@@ -4457,6 +4927,7 @@ impl PermissionPolicy {
                 request.capability.as_str(),
                 action.as_str()
             ),
+            silent: false,
         }
     }
 }
@@ -5154,11 +5625,27 @@ const DEFAULT_REDACTION_PATTERNS: &[(&str, &str)] = &[
 pub struct WebSettings {
     pub exa_mcp_url: Option<String>,
     pub exa_api_key_env: Option<String>,
+    pub parallel_mcp_url: Option<String>,
+    pub parallel_api_key_env: Option<String>,
+    /// Pluggable websearch backend selector. Mirrors OpenCode's
+    /// `OPENCODE_WEBSEARCH_PROVIDER`; valid values: `exa`, `parallel`.
+    pub websearch_provider: Option<String>,
 }
 
 impl WebSettings {
     fn from_table(table: &toml::value::Table, source: &str, path: &str) -> Result<Self> {
-        reject_unknown_keys(table, &["exa_mcp_url", "exa_api_key_env"], source, path)?;
+        reject_unknown_keys(
+            table,
+            &[
+                "exa_mcp_url",
+                "exa_api_key_env",
+                "parallel_mcp_url",
+                "parallel_api_key_env",
+                "websearch_provider",
+            ],
+            source,
+            path,
+        )?;
         Ok(Self {
             exa_mcp_url: string_value(table, "exa_mcp_url", source, &field(path, "exa_mcp_url"))?,
             exa_api_key_env: string_value(
@@ -5167,12 +5654,33 @@ impl WebSettings {
                 source,
                 &field(path, "exa_api_key_env"),
             )?,
+            parallel_mcp_url: string_value(
+                table,
+                "parallel_mcp_url",
+                source,
+                &field(path, "parallel_mcp_url"),
+            )?,
+            parallel_api_key_env: string_value(
+                table,
+                "parallel_api_key_env",
+                source,
+                &field(path, "parallel_api_key_env"),
+            )?,
+            websearch_provider: string_value(
+                table,
+                "websearch_provider",
+                source,
+                &field(path, "websearch_provider"),
+            )?,
         })
     }
 
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.exa_mcp_url, next.exa_mcp_url);
         replace_if_some(&mut self.exa_api_key_env, next.exa_api_key_env);
+        replace_if_some(&mut self.parallel_mcp_url, next.parallel_mcp_url);
+        replace_if_some(&mut self.parallel_api_key_env, next.parallel_api_key_env);
+        replace_if_some(&mut self.websearch_provider, next.websearch_provider);
     }
 }
 
@@ -5705,15 +6213,19 @@ impl TuiAlternateScreen {
     }
 }
 
-/// User-controlled palette tone for the TUI. `System` defers to the
-/// existing terminal-tone detection (`COLORFGBG`); `Dark` and `Light`
-/// pin the tone regardless of what the terminal reports.
+/// User-controlled palette for the TUI. `System` defers to terminal-tone
+/// detection (`COLORFGBG`); `Dark` and `Light` pin the tone but keep the
+/// default amber/gold accent identity; `Catppuccin` swaps to mauve accents
+/// on a dark background; `HighContrast` pins a light tone with a black/
+/// yellow accent profile for accessibility-strict configs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiTheme {
     System,
     Dark,
     Light,
+    Catppuccin,
+    HighContrast,
 }
 
 impl TuiTheme {
@@ -5722,6 +6234,8 @@ impl TuiTheme {
             Self::System => "system",
             Self::Dark => "dark",
             Self::Light => "light",
+            Self::Catppuccin => "catppuccin",
+            Self::HighContrast => "high-contrast",
         }
     }
 
@@ -5730,6 +6244,8 @@ impl TuiTheme {
             "system" | "auto" => Some(Self::System),
             "dark" => Some(Self::Dark),
             "light" => Some(Self::Light),
+            "catppuccin" | "mauve" => Some(Self::Catppuccin),
+            "high-contrast" | "high_contrast" | "highcontrast" | "hc" => Some(Self::HighContrast),
             _ => None,
         }
     }
@@ -6234,8 +6750,11 @@ pub fn user_settings_template() -> &'static str {
 # custom_patterns = []
 
 # [web]
+# websearch_provider = "exa"          # "exa" or "parallel"
 # exa_mcp_url = "https://mcp.exa.ai/mcp"
 # exa_api_key_env = "EXA_API_KEY"
+# parallel_mcp_url = "https://search.parallel.ai/mcp"
+# parallel_api_key_env = "PARALLEL_API_KEY"
 
 # [skills]
 # user_dir = "~/.squeezy/skills"
@@ -6609,6 +7128,9 @@ fn provider_setting(
         "preset" => settings.preset.as_ref(),
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
+        "route_style" => settings.route_style.as_ref(),
+        "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
+        "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -6619,6 +7141,65 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+fn validate_provider_base_urls(provider: &ProviderConfig) -> Result<()> {
+    match provider {
+        ProviderConfig::OpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "openai"),
+        ProviderConfig::Anthropic(cfg) => check_base_url_scheme(&cfg.base_url, "anthropic"),
+        ProviderConfig::Google(cfg) => check_base_url_scheme(&cfg.base_url, "google"),
+        ProviderConfig::AzureOpenAi(cfg) => check_base_url_scheme(&cfg.base_url, "azure_openai"),
+        ProviderConfig::Ollama(cfg) => check_base_url_scheme(&cfg.base_url, "ollama"),
+        ProviderConfig::OpenAiCompatible(cfg) => {
+            check_base_url_scheme(&cfg.base_url, cfg.preset.as_str())
+        }
+        ProviderConfig::Bedrock(cfg) => match &cfg.base_url {
+            Some(url) => check_base_url_scheme(url, "bedrock"),
+            None => Ok(()),
+        },
+    }
+}
+
+/// Refuses an HTTP `base_url` unless the host is a loopback identifier
+/// (`localhost`, `127.0.0.0/8`, or `[::1]`). Anything else (LAN IPs, public
+/// hostnames) must use HTTPS so a misconfigured config file cannot silently
+/// exfiltrate API keys + prompt content to an attacker-controlled origin.
+fn check_base_url_scheme(base_url: &str, section: &str) -> Result<()> {
+    let trimmed = base_url.trim();
+    let Some(rest) = trimmed.strip_prefix("http://") else {
+        // Empty, https://, or any non-http scheme: the existing emptiness +
+        // reachability checks elsewhere handle these. We only police http.
+        return Ok(());
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('@')
+        .next()
+        .unwrap_or("");
+    let host_only = host
+        .strip_prefix('[')
+        .and_then(|s| s.split_once(']'))
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| host.split(':').next().unwrap_or(""));
+    if is_loopback_host(host_only) {
+        return Ok(());
+    }
+    Err(SqueezyError::Config(format!(
+        "providers.{section}.base_url must use https:// for non-loopback hosts (got {trimmed:?}); \
+         API keys and prompt content would otherwise transit in cleartext"
+    )))
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host == "::1" {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
 }
 
 fn build_openai_compatible_config(
@@ -6661,6 +7242,31 @@ fn build_openai_compatible_config(
                 .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
             vertex_base_url(project.trim(), location.trim())
         }
+        (OpenAiCompatiblePreset::CloudflareWorkersAi, None) => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
+                            .to_string(),
+                    )
+                })?;
+            cloudflare_workers_ai_base_url(account_id.trim())
+        }
+        (OpenAiCompatiblePreset::CloudflareAiGateway, None) => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
+                            .to_string(),
+                    )
+                })?;
+            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
+                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
+            cloudflare_ai_gateway_base_url(account_id.trim(), gateway_id.trim())
+        }
         (_, None) => preset.default_base_url().to_string(),
     };
     if base_url.trim().is_empty() {
@@ -6669,7 +7275,27 @@ fn build_openai_compatible_config(
             preset.display_name()
         )));
     }
-    let extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
+    let mut extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
+    // AI Gateway dual-auth: the upstream provider's API key flows in as the
+    // standard `Authorization: Bearer …` (resolved by the provider), and an
+    // optional gateway-level token flows in as `cf-aig-authorization`. Honor
+    // `CF_AIG_TOKEN` as a convenience env so the gateway token does not have
+    // to be pasted into a TOML `headers` table; user-supplied headers always
+    // win to keep manual overrides possible.
+    if preset == OpenAiCompatiblePreset::CloudflareAiGateway {
+        let has_gateway_header = extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("cf-aig-authorization"));
+        if !has_gateway_header && let Some(token) = get_var("CF_AIG_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                extra_headers.insert(
+                    "cf-aig-authorization".to_string(),
+                    format!("Bearer {trimmed}"),
+                );
+            }
+        }
+    }
     let transport = provider_transport_settings(providers, &[section]);
     let api_key = provider_setting(providers, section, "api_key");
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
@@ -6702,6 +7328,13 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::Together => &["together"],
             OpenAiCompatiblePreset::Fireworks => &["fireworks"],
             OpenAiCompatiblePreset::Cerebras => &["cerebras"],
+            OpenAiCompatiblePreset::DeepInfra => &["deepinfra"],
+            OpenAiCompatiblePreset::Baseten => &["baseten"],
+            OpenAiCompatiblePreset::LMStudio => &["lmstudio"],
+            OpenAiCompatiblePreset::VLlm => &["vllm"],
+            OpenAiCompatiblePreset::LlamaCpp => &["llamacpp"],
+            OpenAiCompatiblePreset::CloudflareWorkersAi => &["cloudflare_workers_ai"],
+            OpenAiCompatiblePreset::CloudflareAiGateway => &["cloudflare_ai_gateway"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
     }
@@ -7481,7 +8114,7 @@ fn permission_rules_value(
                 .ok_or_else(|| type_error(source, &rule_path, "table"))?;
             reject_unknown_keys(
                 table,
-                &["capability", "target", "action", "source", "reason"],
+                &["capability", "target", "action", "source", "reason", "silent"],
                 source,
                 &rule_path,
             )?;
@@ -7527,13 +8160,16 @@ fn permission_rules_value(
                 .and_then(PermissionRuleSource::parse)
                 .unwrap_or_else(|| default_permission_rule_source(source));
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
-            Ok(PermissionRule::new(
-                capability,
-                target,
-                action,
-                source_value,
-                reason,
-            ))
+            let silent =
+                bool_value(table, "silent", source, &field(&rule_path, "silent"))?.unwrap_or(false);
+            if silent && action != PermissionAction::Deny {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: silent = true is only valid on Deny rules; \
+                     remove `silent` or set `action = \"deny\"`"
+                )));
+            }
+            Ok(PermissionRule::new(capability, target, action, source_value, reason)
+                .with_silent(silent))
         })
         .collect()
 }
@@ -7560,7 +8196,7 @@ fn mcp_permission_rules_value(
                 .ok_or_else(|| type_error(source, &rule_path, "table"))?;
             reject_unknown_keys(
                 table,
-                &["target", "action", "source", "reason"],
+                &["target", "action", "source", "reason", "silent"],
                 source,
                 &rule_path,
             )?;
@@ -7589,13 +8225,16 @@ fn mcp_permission_rules_value(
                 .and_then(PermissionRuleSource::parse)
                 .unwrap_or_else(|| default_permission_rule_source(source));
             let reason = string_value(table, "reason", source, &field(&rule_path, "reason"))?;
-            Ok(PermissionRule::new(
-                "mcp",
-                target,
-                action,
-                source_value,
-                reason,
-            ))
+            let silent =
+                bool_value(table, "silent", source, &field(&rule_path, "silent"))?.unwrap_or(false);
+            if silent && action != PermissionAction::Deny {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: {rule_path}: silent = true is only valid on Deny rules; \
+                     remove `silent` or set `action = \"deny\"`"
+                )));
+            }
+            Ok(PermissionRule::new("mcp", target, action, source_value, reason)
+                .with_silent(silent))
         })
         .collect()
 }

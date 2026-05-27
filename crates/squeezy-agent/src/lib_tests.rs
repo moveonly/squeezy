@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs, io,
     path::{Path, PathBuf},
     pin::Pin,
@@ -20,6 +20,7 @@ use squeezy_core::{
 use squeezy_llm::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, LlmToolSpec,
+    StopReason,
 };
 use squeezy_tools::{ToolCall, ToolStatus, sha256_hex};
 use tracing_subscriber::fmt::MakeWriter;
@@ -269,6 +270,7 @@ async fn turn_stream_accumulates_assistant_text() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -348,6 +350,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -355,6 +358,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -504,6 +508,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
             Ok(LlmEvent::Completed {
                 response_id: None,
                 cost: Default::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -512,6 +517,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
             Ok(LlmEvent::Completed {
                 response_id: None,
                 cost: Default::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -564,6 +570,7 @@ async fn session_replay_replays_recorded_model_response() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_replay".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config.clone(), provider);
@@ -614,6 +621,7 @@ async fn user_input_is_redacted_before_model_request_and_transcript() {
     let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
+        stop_reason: None,
     })]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
@@ -645,6 +653,7 @@ async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
     let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
+        stop_reason: None,
     })]]));
     let config = AppConfig {
         workspace_root: root.clone(),
@@ -730,6 +739,7 @@ async fn assistant_text_is_redacted_in_streamed_deltas_and_completed_message() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -778,6 +788,7 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -941,6 +952,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
         vec![
@@ -956,6 +968,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1009,11 +1022,13 @@ async fn shell_tool_emits_job_events_and_session_events() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         })],
     ]));
     let config = AppConfig {
@@ -1090,6 +1105,7 @@ async fn asks_for_edit_permission_before_write_tool() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -1139,6 +1155,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1147,6 +1164,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1201,6 +1219,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1211,6 +1230,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1219,6 +1239,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1280,6 +1301,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1290,6 +1312,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1298,6 +1321,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1356,6 +1380,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1366,6 +1391,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1374,6 +1400,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1418,6 +1445,7 @@ async fn cancelling_turn_unblocks_pending_approval() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -1488,6 +1516,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -1496,6 +1525,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -1540,6 +1570,7 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -1592,6 +1623,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1663,6 +1695,7 @@ async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_doc_help_budget".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     // Construct a config where `max_summary_tokens` is deliberately tiny so
@@ -1750,6 +1783,7 @@ async fn natural_language_run_ls_phrase_goes_to_provider() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(
@@ -1907,6 +1941,7 @@ async fn unrelated_questions_still_call_provider() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1934,6 +1969,7 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -1969,6 +2005,7 @@ async fn trigger_skill_activation_injects_body() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -2008,6 +2045,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2016,6 +2054,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -2072,6 +2111,7 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_meta".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -2143,11 +2183,13 @@ async fn network_shell_command_is_denied_by_network_permission_policy() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         })],
     ]));
     let config = AppConfig {
@@ -2839,6 +2881,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -2847,6 +2890,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3238,6 +3282,104 @@ async fn agent_build_stitches_agents_md_into_instructions() {
     );
 }
 
+// AGENTS.md is workspace-level prose for the user-facing agent. A spawned
+// subagent has its own narrow role instructions (`subagent_instructions`)
+// and must not inherit the parent's AGENTS.md preamble — it would burn
+// context on conventions the read-only research role can't act on. Regress
+// the property that the subagent's LlmRequest.instructions is the per-kind
+// briefing only, never the parent's stitched `config.instructions`.
+#[tokio::test]
+async fn subagent_request_instructions_omit_agents_md() {
+    let root = temp_workspace("subagent_omits_agents_md");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let marker = "PARENT-ONLY-AGENTS-MD-SENTINEL";
+    fs::write(root.join("AGENTS.md"), marker).expect("write AGENTS.md");
+    let provider = Arc::new(MockProvider::new(vec![
+        // Parent round 1: spawn a `delegate` subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "del_omit_1".to_string(),
+                name: "delegate".to_string(),
+                arguments: json!({"prompt": "investigate something"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_omit_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+        // Subagent round 1: end immediately with a short text answer.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_sub_omit_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+        // Parent round 2: close the turn after consuming the subagent result.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("noted".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_parent_omit_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+    ]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+    assert!(
+        agent.config().instructions.contains(marker),
+        "precondition: parent must have AGENTS.md stitched in"
+    );
+
+    let mut rx = agent.start_turn("delegate then close".to_string(), CancellationToken::new());
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed { .. } | AgentEvent::Failed { .. } = event {
+            break;
+        }
+    }
+
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 2,
+        "expected at least parent + subagent requests, got {}",
+        requests.len()
+    );
+    // Subagent request is the second stream the provider serves. Its
+    // instructions field must contain the per-kind delegate briefing and
+    // must not carry the parent's AGENTS.md sentinel.
+    let subagent_request = &requests[1];
+    assert!(
+        subagent_request
+            .instructions
+            .contains("isolated Squeezy research subagent"),
+        "subagent request must use the per-kind delegate instructions: {:?}",
+        subagent_request.instructions
+    );
+    assert!(
+        !subagent_request.instructions.contains(marker),
+        "subagent must not inherit AGENTS.md from parent.config.instructions: {:?}",
+        subagent_request.instructions
+    );
+    assert!(
+        !subagent_request
+            .instructions
+            .contains("Project conventions from AGENTS.md"),
+        "subagent must not inherit the AGENTS.md preamble header: {:?}",
+        subagent_request.instructions
+    );
+}
+
 fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     let mut items = Vec::new();
     for n in 0..16 {
@@ -3370,6 +3512,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
                     cache_write_input_tokens: None,
                     estimated_usd_micros: None,
                 },
+                stop_reason: None,
             }),
         ],
         // Turn-loop round 2: assistant finalizes with plain text after the
@@ -3380,6 +3523,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3560,6 +3704,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -3568,6 +3713,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -3636,6 +3782,184 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
         after <= before,
         "compaction should shrink or hold token count: before={before} after={after}",
     );
+}
+
+/// Stub `PreToolUse` handler that denies every call for a target tool
+/// name and lets other tools through. Used by
+/// `pretooluse_hook_denies_tool_call` to verify deny enforcement
+/// without needing a per-test config file.
+struct DenyToolByName {
+    tool_name: &'static str,
+    reason: &'static str,
+}
+
+impl squeezy_hooks::HookHandler for DenyToolByName {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        if ctx.event != squeezy_hooks::HookEvent::PreToolUse {
+            return squeezy_hooks::HookResult::allow();
+        }
+        let payload_name = ctx
+            .payload
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if payload_name == self.tool_name {
+            squeezy_hooks::HookResult::deny(self.reason)
+        } else {
+            squeezy_hooks::HookResult::allow()
+        }
+    }
+}
+
+#[tokio::test]
+async fn pretooluse_hook_denies_tool_call() {
+    use squeezy_hooks::HookRegistry;
+
+    let root = temp_workspace("pretooluse_hook_denies_tool_call");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(DenyToolByName {
+        tool_name: "read_file",
+        reason: "blocked by org policy",
+    }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut approvals_seen = 0usize;
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ApprovalRequested { decision_tx, .. } => {
+                approvals_seen += 1;
+                let _ = decision_tx.send(ToolApprovalDecision::Denied);
+            }
+            AgentEvent::ToolCallCompleted { result, .. } if result.call_id == "read_1" => {
+                read_result = Some(result);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        approvals_seen, 0,
+        "PreToolUse deny must short-circuit before the permission engine asks the user",
+    );
+    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+    assert_eq!(read_result.status, ToolStatus::Denied);
+    let reason = read_result.content["reason"]
+        .as_str()
+        .expect("denied result carries a reason string");
+    assert_eq!(reason, "blocked by org policy");
+    assert_eq!(
+        read_result.content["permission_denied"],
+        json!(true),
+        "denied result must mark permission_denied for downstream consumers",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn pretooluse_hook_allow_lets_tool_run() {
+    use squeezy_hooks::HookRegistry;
+
+    let root = temp_workspace("pretooluse_hook_allow_lets_tool_run");
+    fs::write(root.join("README.md"), "hello\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "README.md"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    // Handler denies a *different* tool, so the read_file call must run
+    // to completion. This guards against the change short-circuiting
+    // unrelated tool calls.
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(DenyToolByName {
+        tool_name: "shell",
+        reason: "shell blocked",
+    }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    let mut read_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.call_id == "read_1"
+        {
+            read_result = Some(result);
+        }
+    }
+
+    let read_result = read_result.expect("ToolCallCompleted with read_1 must arrive");
+    assert_eq!(
+        read_result.status,
+        ToolStatus::Success,
+        "deny aimed at another tool must not block read_file: {:?}",
+        read_result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
 }
 
 #[test]
@@ -3737,6 +4061,134 @@ fn subagent_kind_role_does_not_overlay_delegate() {
     );
 }
 
+/// Parent tool advertisement that mixes typical read/search tools with a
+/// representative mutating tool for every non-read capability. The mutating
+/// names cover the audit's named risks (`write_file`, `shell`, `apply_patch`)
+/// plus one per remaining `PermissionCapability` variant so a new capability
+/// added later cannot leak in unnoticed.
+fn parent_tools_with_mutators() -> Vec<AdvertisedTool> {
+    vec![
+        // Read/search tools every subagent role allow-list mentions.
+        test_advertised_tool("read_file", PermissionCapability::Read),
+        test_advertised_tool("read_slice", PermissionCapability::Read),
+        test_advertised_tool("grep", PermissionCapability::Search),
+        test_advertised_tool("glob", PermissionCapability::Search),
+        test_advertised_tool("repo_map", PermissionCapability::Search),
+        test_advertised_tool("decl_search", PermissionCapability::Search),
+        test_advertised_tool("definition_search", PermissionCapability::Search),
+        test_advertised_tool("reference_search", PermissionCapability::Search),
+        test_advertised_tool("hierarchy", PermissionCapability::Search),
+        test_advertised_tool("symbol_context", PermissionCapability::Search),
+        test_advertised_tool("upstream_flow", PermissionCapability::Search),
+        test_advertised_tool("downstream_flow", PermissionCapability::Search),
+        test_advertised_tool("diff_context", PermissionCapability::Read),
+        // Mutating tools the audit calls out by name plus one per remaining
+        // non-read capability.
+        test_advertised_tool("write_file", PermissionCapability::Edit),
+        test_advertised_tool("apply_patch", PermissionCapability::Edit),
+        test_advertised_tool("shell", PermissionCapability::Shell),
+        test_advertised_tool("webfetch", PermissionCapability::Network),
+        test_advertised_tool("mcp__remote__call", PermissionCapability::Mcp),
+        test_advertised_tool("git_commit", PermissionCapability::Git),
+        test_advertised_tool("cargo_build", PermissionCapability::Compiler),
+        test_advertised_tool("rm_rf", PermissionCapability::Destructive),
+    ]
+}
+
+#[test]
+fn explore_subagent_cannot_call_write_file() {
+    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the explorer
+    // role is read-only by construction. `subagent_allowed_tools` filters the
+    // parent tool advertisement down to Read|Search capability, so even when
+    // the parent advertises `write_file`, `apply_patch`, and `shell`, the
+    // explore subagent must never see them.
+    let parent_tools = parent_tools_with_mutators();
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Explore);
+    let allowed_names: BTreeSet<&str> =
+        allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
+
+    assert!(
+        !allowed_names.contains("write_file"),
+        "explore subagent must not see write_file: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("apply_patch"),
+        "explore subagent must not see apply_patch: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("shell"),
+        "explore subagent must not see shell: {allowed_names:?}"
+    );
+    // Read/search tools the explorer needs must survive the filter.
+    assert!(
+        allowed_names.contains("read_file"),
+        "explore subagent should keep read_file: {allowed_names:?}"
+    );
+    assert!(
+        allowed_names.contains("grep"),
+        "explore subagent should keep grep: {allowed_names:?}"
+    );
+}
+
+#[test]
+fn typed_subagents_filter_to_read_search_capability() {
+    // The capability filter is the load-bearing safety guarantee. Iterate
+    // every non-DocHelp role kind and assert that no tool of a capability
+    // outside `{Read, Search}` survives the filter. Captures explorer,
+    // planner, and reviewer — extending to any future typed subagent kind
+    // requires updating this matrix.
+    let parent_tools = parent_tools_with_mutators();
+    for kind in [
+        SubagentKind::Delegate,
+        SubagentKind::Explore,
+        SubagentKind::Plan,
+        SubagentKind::Review,
+    ] {
+        let allowed = subagent_allowed_tools(&parent_tools, kind);
+        for tool in &allowed {
+            assert!(
+                matches!(
+                    tool.capability,
+                    PermissionCapability::Read | PermissionCapability::Search
+                ),
+                "subagent kind {:?} leaked non-read/search tool {:?} with capability {:?}",
+                kind,
+                tool.spec.name,
+                tool.capability
+            );
+        }
+    }
+}
+
+#[test]
+fn reviewer_subagent_cannot_call_apply_patch_or_shell() {
+    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the reviewer
+    // role reviews diffs and must not be able to mutate the working tree or
+    // run shell commands, even if the parent advertisement contains those
+    // tools.
+    let parent_tools = parent_tools_with_mutators();
+    let allowed = subagent_allowed_tools(&parent_tools, SubagentKind::Review);
+    let allowed_names: BTreeSet<&str> =
+        allowed.iter().map(|tool| tool.spec.name.as_str()).collect();
+
+    assert!(
+        !allowed_names.contains("write_file"),
+        "reviewer subagent must not see write_file: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("apply_patch"),
+        "reviewer subagent must not see apply_patch: {allowed_names:?}"
+    );
+    assert!(
+        !allowed_names.contains("shell"),
+        "reviewer subagent must not see shell: {allowed_names:?}"
+    );
+    assert!(
+        allowed_names.contains("diff_context"),
+        "reviewer subagent should keep diff_context: {allowed_names:?}"
+    );
+}
+
 #[test]
 fn compaction_strategy_parse_round_trip() {
     for variant in [
@@ -3786,6 +4238,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                     Ok(LlmEvent::Completed {
                         response_id: Some("resp_parent_1".to_string()),
                         cost: CostSnapshot::default(),
+                        stop_reason: None,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -3812,6 +4265,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                             estimated_usd_micros: Some(1_234),
                             ..CostSnapshot::default()
                         },
+                        stop_reason: None,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -3925,6 +4379,7 @@ impl LlmProvider for OneDelegateProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("parent_tools".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
             _ => vec![
@@ -3933,6 +4388,7 @@ impl LlmProvider for OneDelegateProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("parent_final".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ],
         };
@@ -4327,6 +4783,96 @@ fn redact_llm_input_items_drops_orphan_function_call_outputs_defensively() {
     assert_eq!(prepared.len(), 3, "only the orphan should be removed");
 }
 
+#[test]
+fn tool_call_without_output_gets_synthetic_error_repair() {
+    // A cancel mid-tool-call or an executor panic can leave a bare
+    // `FunctionCall` in the conversation with no answering
+    // `FunctionCallOutput`. Anthropic's Messages API rejects the whole
+    // turn — *"tool_use blocks must be followed by a tool_result"* —
+    // and the failure is sticky until `/clear`. The redact pipeline
+    // must inject a synthetic error output so the orphan call is
+    // closed before the request reaches the provider.
+    let redactor = squeezy_core::Redactor::default();
+    let input = vec![
+        LlmInputItem::UserText("hi".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_orphan".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        LlmInputItem::UserText("continue".to_string()),
+    ];
+
+    let prepared = super::redact_llm_input_items(input, &redactor);
+
+    assert_eq!(prepared.len(), 4, "synthetic output should be inserted");
+    assert!(matches!(
+        &prepared[1],
+        LlmInputItem::FunctionCall { call_id, .. } if call_id == "call_orphan"
+    ));
+    match &prepared[2] {
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "call_orphan");
+            assert!(
+                output.contains("interrupted"),
+                "synthetic output should advertise the repair: {output}"
+            );
+            assert!(output.contains("is_error"));
+        }
+        other => panic!("expected synthetic FunctionCallOutput, got {other:?}"),
+    }
+    assert!(matches!(
+        &prepared[3],
+        LlmInputItem::UserText(text) if text == "continue"
+    ));
+}
+
+#[test]
+fn mixed_orphan_call_and_orphan_output_both_repaired() {
+    // The two repair passes must compose: an orphan output (without a
+    // declaring call) is stripped while an orphan call (without an
+    // answering output) is closed with a synthetic error in the same
+    // pipeline run.
+    let redactor = squeezy_core::Redactor::default();
+    let input = vec![
+        LlmInputItem::UserText("hi".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "call_orphan".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "output_orphan".to_string(),
+            output: "lingering output from a dropped call".to_string(),
+        },
+        LlmInputItem::UserText("continue".to_string()),
+    ];
+
+    let prepared = super::redact_llm_input_items(input, &redactor);
+
+    let call_ids: std::collections::BTreeSet<&str> = prepared
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let output_ids: std::collections::BTreeSet<&str> = prepared
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(call_ids, std::collections::BTreeSet::from(["call_orphan"]));
+    assert_eq!(
+        output_ids,
+        std::collections::BTreeSet::from(["call_orphan"]),
+        "orphan output should be stripped and orphan call answered"
+    );
+}
+
 #[tokio::test]
 async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
     use squeezy_core::Redactor;
@@ -4439,6 +4985,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Plan subagent: return text followed by a JSON tail.
@@ -4453,6 +5000,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Parent turn 2: wrap up.
@@ -4462,6 +5010,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4513,6 +5062,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         // Plan subagent: emits plain prose with no JSON tail.
@@ -4524,6 +5074,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4532,6 +5083,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
             Ok(LlmEvent::Completed {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4647,6 +5199,7 @@ async fn drained_swap_makes_next_request_carry_new_model_id() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_swap".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let mut agent = Agent::new(AppConfig::default(), provider.clone());
@@ -4697,6 +5250,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4705,6 +5259,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4759,6 +5314,7 @@ async fn build_mode_refuses_request_user_input_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
         vec![
@@ -4767,6 +5323,7 @@ async fn build_mode_refuses_request_user_input_call() {
             Ok(LlmEvent::Completed {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
+                stop_reason: None,
             }),
         ],
     ]));
@@ -4815,6 +5372,7 @@ async fn plan_mode_instructions_are_appended_to_request() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_plan".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -4844,6 +5402,7 @@ async fn build_mode_instructions_omit_plan_overlay() {
         Ok(LlmEvent::Completed {
             response_id: Some("resp_build".to_string()),
             cost: CostSnapshot::default(),
+            stop_reason: None,
         }),
     ]]));
     let config = AppConfig {
@@ -5177,4 +5736,290 @@ fn effective_tool_choice_passes_through_other_values_unchanged() {
         );
         assert_eq!(effective_tool_choice(None, round), None);
     }
+}
+
+#[tokio::test]
+async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
+    // Provider stream completes cleanly but signals truncation via
+    // `StopReason::MaxTokens`. Before this change Anthropic raised an
+    // opaque `ProviderStream("Anthropic response stopped after
+    // max_tokens")` here; now the agent surfaces an `AgentEvent::Failed`
+    // with a descriptive error so the TUI can suggest /compact or
+    // raising `max_output_tokens`.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("partial".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_trunc".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::MaxTokens),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    let mut saw_success = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Failed { error, .. } => failed_error = Some(error.to_string()),
+            AgentEvent::Completed { .. } => saw_success = true,
+            _ => {}
+        }
+    }
+    let err = failed_error.expect("AgentEvent::Failed must fire for MaxTokens");
+    assert!(
+        err.contains("max_tokens"),
+        "error message should mention max_tokens, got: {err}"
+    );
+    assert!(
+        !saw_success,
+        "MaxTokens must not produce a successful Completed event"
+    );
+}
+
+#[tokio::test]
+async fn refusal_stop_reason_emits_failed_with_safety_hint() {
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_refusal".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::Refusal),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("forbidden".to_string(), CancellationToken::new());
+    let mut failed_error: Option<String> = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Failed { error, .. } = event {
+            failed_error = Some(error.to_string());
+        }
+    }
+    let err = failed_error.expect("AgentEvent::Failed must fire for Refusal");
+    assert!(
+        err.contains("refused"),
+        "error message should mention refusal, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn end_turn_stop_reason_completes_successfully() {
+    // Regression guard for the audit's `end_turn_with_empty_content_is_success`
+    // case: a clean `EndTurn` with text content must still take the
+    // success path even now that explicit branches exist on stop_reason.
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("done".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_ok".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: Some(StopReason::EndTurn),
+        }),
+    ]]));
+    let agent = Agent::new(AppConfig::default(), provider);
+    let mut rx = agent.start_turn("hi".to_string(), CancellationToken::new());
+    let mut saw_success = false;
+    let mut saw_failure = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Completed { .. } => saw_success = true,
+            AgentEvent::Failed { .. } => saw_failure = true,
+            _ => {}
+        }
+    }
+    assert!(saw_success, "EndTurn must produce a successful Completed");
+    assert!(!saw_failure, "EndTurn must not produce a Failed event");
+}
+
+fn make_subagent_execution(
+    supporting_receipts: Vec<serde_json::Value>,
+    files_touched: Vec<String>,
+    transcript: Vec<serde_json::Value>,
+    provider: CostSnapshot,
+) -> SubagentExecution {
+    SubagentExecution {
+        status: ToolStatus::Success,
+        summary: "ok".to_string(),
+        status_label: "completed",
+        error: None,
+        metrics: TurnMetrics {
+            provider,
+            ..TurnMetrics::default()
+        },
+        supporting_receipts,
+        model: "test-model".to_string(),
+        structured_output: None,
+        files_touched,
+        transcript,
+    }
+}
+
+#[test]
+fn subagent_tool_call_path_extracts_known_tool_args() {
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "src/lib.rs"}),
+        }),
+        Some("src/lib.rs".to_string())
+    );
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c2".to_string(),
+            name: "apply_patch".to_string(),
+            arguments: json!({"patches": [{"path": "a.rs"}, {"path": "b.rs"}]}),
+        }),
+        Some("a.rs".to_string())
+    );
+    assert_eq!(
+        subagent_tool_call_path(&ToolCall {
+            call_id: "c3".to_string(),
+            name: "shell".to_string(),
+            arguments: json!({"command": "ls"}),
+        }),
+        None
+    );
+}
+
+#[test]
+fn collect_files_touched_dedupes_and_drops_denied_and_pathless() {
+    let receipts = vec![
+        json!({"tool": "read_file", "status": "success", "path": "src/lib.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "src/lib.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "src/main.rs"}),
+        json!({"tool": "read_file", "status": "denied", "path": "secret.env"}),
+        json!({"tool": "shell", "status": "success"}),
+        json!({"tool": "grep", "status": "success"}),
+    ];
+    assert_eq!(
+        collect_files_touched(&receipts),
+        vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]
+    );
+}
+
+#[test]
+fn subagent_result_contains_files_touched() {
+    let call = ToolCall {
+        call_id: "del_1".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "investigate"}),
+    };
+    let supporting_receipts = vec![
+        json!({"tool": "read_file", "status": "success", "path": "crates/a.rs"}),
+        json!({"tool": "read_file", "status": "success", "path": "crates/b.rs"}),
+    ];
+    let execution = make_subagent_execution(
+        supporting_receipts,
+        vec!["crates/a.rs".to_string(), "crates/b.rs".to_string()],
+        Vec::new(),
+        CostSnapshot::default(),
+    );
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let files = result
+        .content
+        .get("files_touched")
+        .expect("files_touched key");
+    let files = files.as_array().expect("files_touched is an array");
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0], "crates/a.rs");
+    assert_eq!(files[1], "crates/b.rs");
+}
+
+#[test]
+fn subagent_result_includes_cache_breakdown() {
+    let call = ToolCall {
+        call_id: "del_2".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "with cache"}),
+    };
+    let provider = CostSnapshot {
+        input_tokens: Some(1_000),
+        output_tokens: Some(120),
+        cached_input_tokens: Some(640),
+        cache_write_input_tokens: Some(360),
+        ..CostSnapshot::default()
+    };
+    let execution = make_subagent_execution(Vec::new(), Vec::new(), Vec::new(), provider);
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let cache = result.content.get("cache").expect("cache key");
+    assert_eq!(cache.get("input_tokens"), Some(&json!(1_000)));
+    assert_eq!(cache.get("output_tokens"), Some(&json!(120)));
+    assert_eq!(cache.get("cached_input_tokens"), Some(&json!(640)));
+    assert_eq!(cache.get("cache_write_input_tokens"), Some(&json!(360)));
+}
+
+#[test]
+fn subagent_result_omits_transcript_by_default() {
+    let call = ToolCall {
+        call_id: "del_3".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "no transcript"}),
+    };
+    let execution =
+        make_subagent_execution(Vec::new(), Vec::new(), Vec::new(), CostSnapshot::default());
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    assert!(
+        result.content.get("transcript").is_none(),
+        "transcript leaked into default result: {:?}",
+        result.content
+    );
+}
+
+#[test]
+fn subagent_result_includes_transcript_when_debug_enabled() {
+    let call = ToolCall {
+        call_id: "del_4".to_string(),
+        name: "delegate".to_string(),
+        arguments: json!({"prompt": "with transcript"}),
+    };
+    let transcript = vec![
+        json!({"role": "user", "text": "investigate"}),
+        json!({"role": "assistant", "text": "looking..."}),
+    ];
+    let execution = make_subagent_execution(
+        Vec::new(),
+        Vec::new(),
+        transcript.clone(),
+        CostSnapshot::default(),
+    );
+    let result = subagent_control_result(&call, SubagentKind::Delegate, execution);
+    let recorded = result
+        .content
+        .get("transcript")
+        .expect("transcript key when populated");
+    let recorded = recorded.as_array().expect("transcript is an array");
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0].get("role"), Some(&json!("user")));
+    assert_eq!(recorded[1].get("role"), Some(&json!("assistant")));
+}
+
+#[test]
+fn subagent_transcript_serializes_conversation_items() {
+    use squeezy_llm::LlmInputItem;
+    let conversation = vec![
+        LlmInputItem::UserText("hello".to_string()),
+        LlmInputItem::FunctionCall {
+            call_id: "c1".to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({"path": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: "ok".to_string(),
+        },
+    ];
+    let transcript = subagent_transcript(&conversation);
+    assert_eq!(transcript.len(), 3);
+    assert_eq!(transcript[0].get("role"), Some(&json!("user")));
+    assert_eq!(transcript[0].get("text"), Some(&json!("hello")));
+    assert_eq!(transcript[1].get("role"), Some(&json!("tool_call")));
+    assert_eq!(transcript[1].get("name"), Some(&json!("read_file")));
+    assert_eq!(transcript[2].get("role"), Some(&json!("tool_result")));
+}
+
+#[test]
+fn subagent_config_include_transcript_defaults_false() {
+    let config = SubagentConfig::default();
+    assert!(!config.include_transcript);
 }

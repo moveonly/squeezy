@@ -117,11 +117,18 @@ fn enum_variants_are_distinct() {
         HookEvent::PreTurn,
         HookEvent::PreToolUse,
         HookEvent::PostToolUse,
+        HookEvent::PostToolUseFailure,
         HookEvent::PostTool,
         HookEvent::PreCompact,
         HookEvent::PostCompact,
         HookEvent::SubagentStart,
+        HookEvent::SubagentStop,
         HookEvent::PermissionRequest,
+        HookEvent::PermissionDenied,
+        HookEvent::UserPromptSubmit,
+        HookEvent::SessionStart,
+        HookEvent::Stop,
+        HookEvent::Setup,
     ];
     for (i, a) in events.iter().enumerate() {
         for (j, b) in events.iter().enumerate() {

@@ -273,8 +273,8 @@ on_tool = "grep"                  # fire mid-stream when grep is requested
 #### `slash_command` coverage
 
 Slash commands dispatch through `Agent::dispatch_command`. Today's
-supported set: `/compact`, `/plan`, `/build`, `/cost`, `/jobs`,
-`/permissions`. Anything else lands as `CommandOutcome::Unsupported`,
+supported set: `/compact`, `/plan`, `/build`, `/cost`, `/tasks` (alias
+`/jobs`), `/permissions`. Anything else lands as `CommandOutcome::Unsupported`,
 which surfaces as the `unsupported_slash_command` auto-finding so
 triage flags missing automation rather than silently no-op.
 

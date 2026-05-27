@@ -22,6 +22,23 @@ expected to navigate code through `bash -lc` + grep + raw reads. That model
 sacrifices the moat — multi-language symbol resolution, capped candidate sets,
 and typed confidence per edge — that this navigation layer exists to preserve.
 
+Squeezy also declines to ship an LSP-backed navigation tool alongside the
+tree-sitter graph. Adjacent agents expose a generic `lsp` tool that brokers
+go-to-definition, hover, and completion requests to a per-language language
+server (e.g. rust-analyzer, gopls, pyright). That shape conflicts with the
+`AGENTS.md` rule "Do not use LSP or `rust-analyzer` for navigation" and would
+fragment the evidence surface: tool callers would have to reconcile two
+parallel confidence vocabularies (`ExactSyntax`/`ImportResolved`/... versus
+LSP-reported precision), and `refresh_before_query` budgets would compete with
+language-server cold-start and indexing time. Rust-analyzer and the JS/TS
+language service remain benchmark oracles only — they expose Squeezy's losses
+in `BENCHMARKS.md` rather than serving evidence on the production navigation
+path. If a future request justifies LSP-shaped information (real type
+inference, trait-dispatch resolution, generic substitution), the staged plan
+is to model it as an explicit `compiler_facts`-style cache that records typed
+facts into the existing graph confidence vocabulary, not as a passthrough tool
+that forwards raw LSP responses to the model.
+
 ## What Is Indexed
 
 - Gitignore-aware file records: path, relative path, size, mtime, stable content

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use squeezy_agent::RequestUserInputResponse;
@@ -192,9 +190,15 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         true,
         &[PermissionCapability::Git, PermissionCapability::Read],
     ),
-    slash("/jobs", "list background jobs"),
-    slash_args("/job", "show a background job", true, "<id>"),
-    slash_args("/job-cancel", "cancel a background job", true, "<id>"),
+    slash("/tasks", "list background tasks (jobs + AI reviewer)"),
+    slash_args("/task", "show a background task", true, "<id>"),
+    slash_args("/task-cancel", "cancel a background task", true, "<id>"),
+    // `/jobs`, `/job`, `/job-cancel` are retained as aliases for one release
+    // window so muscle memory keeps working; the documented surface is now
+    // `/tasks` (see F07-cc-tasks-and-background-jobs).
+    slash("/jobs", "alias for /tasks"),
+    slash_args("/job", "alias for /task", true, "<id>"),
+    slash_args("/job-cancel", "alias for /task-cancel", true, "<id>"),
     slash_args("/pin", "pin transcript context", false, "<id>"),
     slash("/pins", "list pinned context"),
     slash_args("/unpin", "remove pinned context", false, "<id>"),
@@ -241,12 +245,12 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
-    // Locked + destructive: deletes session JSON on disk.
+    // Locked + destructive: archives or purges sessions on disk.
     SlashCommand {
         name: "/session-cleanup",
-        description: "remove old sessions",
+        description: "soft-archive (default) or --purge old sessions",
         available_during_task: false,
-        parameter_hint: None,
+        parameter_hint: Some("[--archive|--purge] [<id>...]"),
         capabilities: &[PermissionCapability::Destructive],
     },
     slash_caps(
@@ -283,6 +287,13 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         ],
     },
     slash_args_caps(
+        "/effort",
+        "set reasoning effort for this session (or `auto` to clear)",
+        false,
+        "[low|medium|high|xhigh|auto]",
+        &[PermissionCapability::Edit],
+    ),
+    slash_args_caps(
         "/verbosity",
         "open config focused on response verbosity (or set inline)",
         false,
@@ -305,9 +316,9 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args_caps(
         "/theme",
-        "switch palette tone (persists to settings)",
+        "switch theme (persists to settings)",
         true,
-        "[system|dark|light]",
+        "[system|dark|light|catppuccin|high-contrast]",
         &[PermissionCapability::Edit],
     ),
     slash("/keymap", "list current key bindings"),
@@ -368,15 +379,18 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     };
-    if app.workspace_files.is_none() {
-        let root = std::path::Path::new(&app.directory).to_path_buf();
-        let files = mention::load_workspace_files(&root);
-        app.workspace_files = Some(Arc::new(files));
+    let root = std::path::Path::new(&app.directory);
+    let needs_build = app
+        .workspace_file_cache
+        .as_ref()
+        .is_none_or(|cache| cache.should_rebuild(root));
+    if needs_build {
+        app.workspace_file_cache = Some(mention::WorkspaceFileCache::build(root));
     }
     let matches = app
-        .workspace_files
+        .workspace_file_cache
         .as_ref()
-        .map(|files| mention::rank_files(&query.query, files))
+        .map(|cache| mention::rank_files(&query.query, cache.files()))
         .unwrap_or_default();
     if matches.is_empty() {
         app.mention_popup = None;

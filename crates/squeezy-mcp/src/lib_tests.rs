@@ -880,3 +880,174 @@ fn registry_elicitation_audit_log_starts_empty() {
     let registry = McpClientRegistry::new(BTreeMap::new());
     assert!(registry.elicitation_audit_log().is_empty());
 }
+
+#[test]
+fn client_info_advertises_squeezy_identity_and_elicitation_capability() {
+    // Servers gating features on `client.capabilities.elicitation` must see
+    // Squeezy declare it before sending elicitation requests; servers logging
+    // peer identity must see "squeezy-mcp", not rmcp's `CARGO_CRATE_NAME`.
+    let handler = SqueezyMcpClientHandler {
+        server_name: "id-probe".to_string(),
+        elicitation_handler: Arc::new(Mutex::new(None)),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        pause_state: ElicitationPauseState::default(),
+    };
+    let info = ClientHandler::get_info(&handler);
+    assert_eq!(info.client_info.name, env!("CARGO_PKG_NAME"));
+    assert_eq!(info.client_info.version, env!("CARGO_PKG_VERSION"));
+    let elicitation = info
+        .capabilities
+        .elicitation
+        .as_ref()
+        .expect("elicitation capability must be advertised");
+    assert!(
+        elicitation.form.is_some(),
+        "form elicitation must be advertised"
+    );
+    assert!(
+        elicitation.url.is_some(),
+        "url elicitation must be advertised so OAuth-style flows are gated correctly"
+    );
+    let experimental = info
+        .capabilities
+        .experimental
+        .as_ref()
+        .expect("experimental capabilities slot must exist for future opt-ins");
+    assert!(
+        experimental.is_empty(),
+        "no experimental flags advertised today; slot is reserved for forward-compat"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn server_capabilities_surfaces_experimental_flags_from_initialize_response() {
+    // Acceptance test for squeezy-4b7.9: a server declaring
+    // `{ experimental: { "squeezy/test": {} } }` in its initialize response
+    // must be reachable via `registry.server_capabilities("fixture")`. We
+    // drive a legacy SSE handshake (cheaper than spawning a child process
+    // and reusing the same pattern as the existing SSE-transport test) so
+    // the discovery path actually runs `session_for` end-to-end.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // Accept the SSE GET on a background task, then accept every follow-up
+    // POST so the worker's `initialize` + `initialized` round-trips can both
+    // complete. The shutdown signal closes the SSE channel after the test has
+    // captured the live `service`, mirroring the existing SSE-transport test
+    // pattern but without prematurely tearing the channel down.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_signal = shutdown.clone();
+    let accept = tokio::spawn(async move {
+        let (mut sse_socket, _) = listener.accept().await.expect("accept sse");
+        let mut buf = vec![0u8; 4096];
+        let _ = sse_socket.read(&mut buf).await.unwrap_or(0);
+
+        // Reply with a declared experimental capability so the registry must
+        // surface it to callers asking for `server_capabilities`.
+        let endpoint_path = "/sse-messages?sid=capabilities";
+        let init_response = r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{"experimental":{"squeezy/test":{}}},"serverInfo":{"name":"fixture","version":"0.0.0"}}}"#;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let _ = sse_socket.write_all(headers.as_bytes()).await;
+        let endpoint_frame = format!("event: endpoint\r\ndata: {endpoint_path}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, endpoint_frame.as_bytes()).await;
+        let message_frame = format!("event: message\r\ndata: {init_response}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, message_frame.as_bytes()).await;
+
+        // Drain incoming POSTs (`initialize`, `notifications/initialized`,
+        // any keep-alive) and respond 202 until the test signals shutdown,
+        // so the worker's `serve` future completes cleanly.
+        loop {
+            tokio::select! {
+                _ = shutdown_signal.notified() => break,
+                accepted = listener.accept() => {
+                    let Ok((mut post_socket, _)) = accepted else {
+                        break;
+                    };
+                    let mut post_buf = vec![0u8; 8192];
+                    let _ = post_socket.read(&mut post_buf).await.unwrap_or(0);
+                    let _ = post_socket
+                        .write_all(
+                            b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = post_socket.shutdown().await;
+                }
+            }
+        }
+        drop(sse_socket);
+    });
+
+    let mut server = http_fixture_server();
+    server.transport = McpTransport::Sse;
+    let sse_url = format!("http://{addr}/sse");
+    server.url = Some(sse_url.clone());
+
+    let handler = SqueezyMcpClientHandler {
+        server_name: "fixture".to_string(),
+        elicitation_handler: Arc::new(Mutex::new(None)),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
+        pause_state: ElicitationPauseState::default(),
+    };
+    let (auth_header, custom_headers) = resolve_http_auth_and_headers("fixture", &server, |_| None);
+    let worker =
+        crate::sse::build_sse_worker(sse_url, auth_header, custom_headers).expect("worker built");
+    let serve = tokio::time::timeout(std::time::Duration::from_secs(5), handler.serve(worker));
+    let service = serve
+        .await
+        .expect("serve future timed out")
+        .expect("serve failed");
+    // The listener stays alive until we signal so the worker's `initialize`
+    // and `initialized` POSTs both get a 202. Closing the channel beforehand
+    // surfaces as `TransportError::Closed` from rmcp.
+    shutdown.notify_one();
+    accept.await.expect("listener task");
+
+    let capabilities = service
+        .peer_info()
+        .map(|info| info.capabilities.clone())
+        .expect("peer_info must be populated after initialize");
+    let experimental = capabilities
+        .experimental
+        .as_ref()
+        .expect("server declared experimental block");
+    assert!(
+        experimental.contains_key("squeezy/test"),
+        "experimental flag must round-trip from initialize response: {experimental:?}"
+    );
+
+    // Now plumb the captured capabilities into the registry the way
+    // `session_for` does, and confirm the public accessor returns them.
+    let entry = Arc::new(SessionEntry {
+        service: Arc::new(service),
+        _process: None,
+        server_capabilities: Some(capabilities.clone()),
+    });
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry
+        .sessions
+        .lock()
+        .await
+        .insert("fixture".to_string(), entry);
+    let observed = registry
+        .server_capabilities("fixture")
+        .await
+        .expect("registry must surface captured capabilities");
+    assert_eq!(observed, capabilities);
+    let observed_experimental = observed
+        .experimental
+        .expect("experimental must survive accessor round-trip");
+    assert!(observed_experimental.contains_key("squeezy/test"));
+
+    assert!(
+        registry
+            .server_capabilities("never-connected")
+            .await
+            .is_none(),
+        "missing server must surface as None, not a default-empty value"
+    );
+}

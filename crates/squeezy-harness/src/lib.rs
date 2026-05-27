@@ -824,6 +824,7 @@ impl LlmProvider for PlannerProbeProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("planner_probe_final".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ]
         } else if *phase == 0 {
@@ -842,6 +843,7 @@ impl LlmProvider for PlannerProbeProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("planner_probe_grep".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ]
         } else {
@@ -857,6 +859,7 @@ impl LlmProvider for PlannerProbeProvider {
                 Ok(LlmEvent::Completed {
                     response_id: Some("planner_probe_read".to_string()),
                     cost: CostSnapshot::default(),
+                    stop_reason: None,
                 }),
             ]
         };
@@ -909,6 +912,7 @@ fn trace_to_llm_event(event: TraceEvent) -> Result<LlmEvent> {
                 cache_write_input_tokens: None,
                 estimated_usd_micros: None,
             },
+            stop_reason: None,
         }),
     }
 }

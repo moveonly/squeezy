@@ -6,10 +6,14 @@
 //! [`HookResult`] that can advise the caller to deny the action or
 //! mutate its payload.
 //!
-//! This first cut wires only the [`HookEvent::PreTurn`] dispatch point
-//! in `squeezy-agent`. Other variants are reserved for follow-up
-//! commits and surface as named enum entries so handlers can already
-//! match on them without breaking changes later.
+//! The dispatched call sites today are `PreTurn`, `PreToolUse`,
+//! `PostToolUse`, `PreCompact`, and `PostCompact` (see
+//! `squeezy-agent`). The remaining variants — `PostToolUseFailure`,
+//! `PostTool`, `SubagentStart`, `SubagentStop`, `PermissionRequest`,
+//! `PermissionDenied`, `UserPromptSubmit`, `SessionStart`, `Stop`,
+//! `Setup` — are reserved as named enum entries so handlers can match
+//! against them now and follow-up call-site wiring can land
+//! incrementally without forcing the trait surface to evolve.
 //!
 //! Mutation results are recorded by the agent today but not yet
 //! applied; the contract here is shaped for a future commit that wires
@@ -20,11 +24,18 @@ use serde_json::Value;
 
 /// Lifecycle points at which the agent fans out to registered handlers.
 ///
-/// [`HookEvent::PreTurn`], [`HookEvent::PreToolUse`], and
-/// [`HookEvent::PostToolUse`] are currently dispatched. The remaining
+/// The variant set spans tool execution (`PreToolUse`, `PostToolUse`,
+/// `PostToolUseFailure`, `PostTool`), permission gating
+/// (`PermissionRequest`, `PermissionDenied`), subagent boundaries
+/// (`SubagentStart`, `SubagentStop`), compaction (`PreCompact`,
+/// `PostCompact`), and session boundaries (`PreTurn`,
+/// `UserPromptSubmit`, `SessionStart`, `Stop`, `Setup`).
+/// [`HookEvent::PreTurn`], [`HookEvent::PreToolUse`],
+/// [`HookEvent::PostToolUse`], [`HookEvent::PreCompact`], and
+/// [`HookEvent::PostCompact`] are currently dispatched; the remaining
 /// variants are reserved so handler implementations can statically
 /// declare interest in them before the agent wires the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HookEvent {
     /// Fired once per turn, immediately before the LLM request is sent.
     PreTurn,
@@ -36,6 +47,10 @@ pub enum HookEvent {
     /// mirrors `PreToolUse` and adds `{ "status" }` so handlers can
     /// audit outcomes.
     PostToolUse,
+    /// Fired when a tool call returned a non-success status. Splits the
+    /// failure path from [`HookEvent::PostToolUse`] so handlers can wire
+    /// retry / SIEM-export logic without re-parsing the status field.
+    PostToolUseFailure,
     /// Fired after a tool result is appended to the conversation.
     PostTool,
     /// Fired before a context compaction pass runs.
@@ -45,8 +60,30 @@ pub enum HookEvent {
     PostCompact,
     /// Fired when a subagent is spawned.
     SubagentStart,
+    /// Fired when a subagent terminates, so audit / replay handlers can
+    /// capture the final transcript and exit reason.
+    SubagentStop,
     /// Fired when a permission decision is about to be presented.
     PermissionRequest,
+    /// Fired when a permission decision resolved as deny. Lets handlers
+    /// nudge the model with a retry hint or escalate the denial to an
+    /// out-of-band audit channel.
+    PermissionDenied,
+    /// Fired when the user submits a new prompt. Lets handlers append
+    /// `additionalContexts` (e.g. current git branch, on-call rotation)
+    /// before the turn begins.
+    UserPromptSubmit,
+    /// Fired at session start. Companion to [`HookEvent::Setup`]; this
+    /// variant signals "agent is live for this run", while `Setup`
+    /// signals "agent installation completed (first launch or
+    /// maintenance)".
+    SessionStart,
+    /// Fired when the agent yields the turn back to the user without an
+    /// outstanding tool call (clear-code's `Stop` semantics).
+    Stop,
+    /// Fired the first time the agent boots in a workspace, or when a
+    /// maintenance task (config migration, index rebuild) completes.
+    Setup,
 }
 
 /// Per-event payload passed to every [`HookHandler`].

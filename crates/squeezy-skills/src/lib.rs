@@ -2,12 +2,14 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use squeezy_core::{Result, SkillConfigEntry, SkillsConfig, SqueezyError};
+use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
 use tracing::warn;
 
 pub mod help;
@@ -40,6 +42,10 @@ const BUNDLED_SKILL_SOURCES: &[BundledSkillSource] = &[
     BundledSkillSource {
         dir_name: "beads-workflow",
         content: include_str!("../builtin/beads-workflow/SKILL.md"),
+    },
+    BundledSkillSource {
+        dir_name: "customize-squeezy",
+        content: include_str!("../builtin/customize-squeezy/SKILL.md"),
     },
     BundledSkillSource {
         dir_name: "release-notes",
@@ -88,9 +94,11 @@ pub fn bundled_skills() -> Vec<LoadedSkill> {
                     location,
                     disabled: false,
                     manifest: None,
+                    context_mode: metadata.context_mode,
                 },
                 base_dir,
                 body,
+                hooks: metadata.hooks,
             }
         })
         .collect()
@@ -158,6 +166,34 @@ impl SkillManifest {
     }
 }
 
+/// Execution context a skill declares in its `SKILL.md` frontmatter.
+///
+/// `Inline` (the default and current behaviour) injects the skill body
+/// into the main turn's instructions, so any tool calls the model issues
+/// run on the parent thread. `Fork` is the marker that the skill author
+/// expects this body to be dispatched into a clean subagent — the
+/// downstream dispatcher (see `F10-cc-disk-loaded-agent-definitions`)
+/// will read the field once it lands. Until then this surfaces the
+/// declaration so callers can branch on it without re-parsing the
+/// frontmatter, and an unknown value (`context: bogus`) is mapped to
+/// `Inline` with a `tracing::warn!` rather than rejecting the skill.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillContextMode {
+    #[default]
+    Inline,
+    Fork,
+}
+
+impl SkillContextMode {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::Fork => "fork",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSummary {
     pub name: String,
@@ -168,6 +204,14 @@ pub struct SkillSummary {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest: Option<SkillManifest>,
+    /// Execution context declared in the skill frontmatter; defaults to
+    /// `Inline` when the field is absent or unrecognised.
+    #[serde(default, skip_serializing_if = "is_inline_context_mode")]
+    pub context_mode: SkillContextMode,
+}
+
+fn is_inline_context_mode(mode: &SkillContextMode) -> bool {
+    matches!(mode, SkillContextMode::Inline)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +219,36 @@ pub struct LoadedSkill {
     pub summary: SkillSummary,
     pub base_dir: PathBuf,
     pub body: String,
+    /// Hook specs parsed from `hooks:` frontmatter, indexed by event name.
+    /// Empty when the skill declares no hooks. Registered against a
+    /// `HookRegistry` via [`register_skill_hooks`] when the skill becomes
+    /// active.
+    pub hooks: BTreeMap<HookEvent, Vec<SkillHookMatcher>>,
+}
+
+/// One matcher clause inside a per-event hook block.
+///
+/// `matcher` is an optional tool-name filter consulted by the handler at
+/// dispatch time — `None` (or the literal `"*"`) means every payload for
+/// the event fires this matcher's hooks. Unknown events and unknown hook
+/// kinds drop with a `tracing::warn!` rather than failing the skill load,
+/// matching the broader frontmatter parsing contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillHookMatcher {
+    pub matcher: Option<String>,
+    pub hooks: Vec<SkillHookSpec>,
+}
+
+/// One concrete hook handler declaration.
+///
+/// Today only the `command` kind is implemented: it shells out to the
+/// declared `command` line, resolved relative to the skill's `base_dir`
+/// when the path is relative. `once: true` semantics live in the handler
+/// (self-skipped after first run) so the registry stays agnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillHookSpec {
+    pub command: String,
+    pub once: bool,
 }
 
 impl LoadedSkill {
@@ -187,6 +261,7 @@ impl LoadedSkill {
             location,
             disabled: _,
             manifest,
+            context_mode: _,
         } = &self.summary;
         let when_to_use = when_to_use
             .as_ref()
@@ -334,6 +409,7 @@ impl SkillCatalog {
                         "location": summary.location,
                         "disabled": summary.disabled,
                         "manifest": manifest,
+                        "context_mode": summary.context_mode.as_str(),
                     })
                 })
                 .collect::<Vec<_>>()
@@ -353,11 +429,12 @@ impl SkillCatalog {
             return Err(SqueezyError::Tool(format!("skill disabled: {name}")));
         }
         let content = fs::read_to_string(&entry.summary.location)?;
-        let (_metadata, body) = parse_skill_file(&content).map_err(SqueezyError::Tool)?;
+        let (metadata, body) = parse_skill_file(&content).map_err(SqueezyError::Tool)?;
         let loaded = LoadedSkill {
             summary: entry.summary.clone(),
             base_dir: entry.base_dir.clone(),
             body,
+            hooks: metadata.hooks,
         };
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(name.to_string(), loaded.clone());
@@ -525,6 +602,7 @@ impl SkillCatalog {
                 location: skill_path,
                 disabled: false,
                 manifest,
+                context_mode: metadata.context_mode,
             };
             self.insert(SkillEntry {
                 summary,
@@ -724,6 +802,8 @@ struct SkillMetadata {
     description: String,
     when_to_use: Option<String>,
     triggers: Vec<String>,
+    context_mode: SkillContextMode,
+    hooks: BTreeMap<HookEvent, Vec<SkillHookMatcher>>,
 }
 
 fn parse_explicit_skill_command(input: &str) -> Option<(&str, &str)> {
@@ -776,9 +856,14 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
     let mut description = None;
     let mut when_to_use = None;
     let mut triggers = Vec::new();
+    let mut context_mode = SkillContextMode::Inline;
+    let mut hooks: BTreeMap<HookEvent, Vec<SkillHookMatcher>> = BTreeMap::new();
     let mut list_key: Option<&str> = None;
+    let mut idx = 0;
 
-    for raw in lines {
+    while idx < lines.len() {
+        let raw = lines[idx];
+        idx += 1;
         let line = raw.trim_end();
         if line.trim().is_empty() || line.trim_start().starts_with('#') {
             continue;
@@ -804,6 +889,13 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
             "when_to_use" => when_to_use = Some(unquote(value).to_string()),
             "triggers" if value.is_empty() => list_key = Some("triggers"),
             "triggers" => triggers.extend(parse_inline_list(value)),
+            "context" => {
+                context_mode = parse_context_mode(unquote(value));
+            }
+            "hooks" if value.is_empty() => {
+                let consumed = parse_hooks_block(&lines[idx..], &mut hooks);
+                idx += consumed;
+            }
             _ => {}
         }
     }
@@ -819,7 +911,187 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
         description,
         when_to_use,
         triggers,
+        context_mode,
+        hooks,
     })
+}
+
+/// Parse the `context:` frontmatter value into a [`SkillContextMode`].
+///
+/// Only `fork` (case-insensitive) maps to [`SkillContextMode::Fork`].
+/// Anything else — including the explicit `inline` literal, an empty
+/// string, or a typo like `bogus` — falls back to
+/// [`SkillContextMode::Inline`]. Unknown values warn so authors can
+/// catch typos without losing the skill.
+fn parse_context_mode(value: &str) -> SkillContextMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "inline" => SkillContextMode::Inline,
+        "fork" => SkillContextMode::Fork,
+        other => {
+            warn!(
+                target: "squeezy_skills",
+                value = %other,
+                "unrecognised skill context mode; defaulting to inline"
+            );
+            SkillContextMode::Inline
+        }
+    }
+}
+
+/// Parse the nested block following a top-level `hooks:` key.
+///
+/// Returns how many input lines were consumed so the caller can advance
+/// its cursor past the block. The block ends at the first non-blank line
+/// with zero indentation (a new top-level frontmatter key). Indent is
+/// the structural anchor: event names sit at the shallowest indent,
+/// `- matcher:` clauses one level deeper, and per-spec key/value pairs
+/// inside a matcher's `hooks:` sub-list one level deeper still.
+/// Unrecognised event names and hook kinds log a `tracing::warn!` and
+/// drop, matching how unknown top-level keys are handled today.
+fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookMatcher>>) -> usize {
+    let mut consumed = 0;
+    let mut current_event: Option<HookEvent> = None;
+    let mut current_matchers: Vec<SkillHookMatcher> = Vec::new();
+    let mut event_indent: Option<usize> = None;
+    let mut matcher_indent: Option<usize> = None;
+
+    fn flush_event(
+        out: &mut BTreeMap<HookEvent, Vec<SkillHookMatcher>>,
+        event: &mut Option<HookEvent>,
+        matchers: &mut Vec<SkillHookMatcher>,
+    ) {
+        if !matchers.is_empty()
+            && let Some(ev) = event.take()
+        {
+            out.entry(ev).or_default().append(matchers);
+        }
+        *event = None;
+        matchers.clear();
+    }
+
+    for line in rest {
+        let raw = line.trim_end();
+        if raw.trim().is_empty() || raw.trim_start().starts_with('#') {
+            consumed += 1;
+            continue;
+        }
+        let indent = raw.len() - raw.trim_start().len();
+        if indent == 0 {
+            break;
+        }
+        consumed += 1;
+        let trimmed = raw.trim_start();
+
+        // Establish the event indent on the first non-blank child of
+        // the `hooks:` block; any line at that same indent is treated
+        // as a new event name.
+        let level = event_indent.get_or_insert(indent);
+        if indent == *level {
+            flush_event(out, &mut current_event, &mut current_matchers);
+            matcher_indent = None;
+            if let Some((key, value)) = trimmed.split_once(':')
+                && value.trim().is_empty()
+            {
+                match parse_hook_event(key.trim()) {
+                    Some(event) => current_event = Some(event),
+                    None => warn!(
+                        target: "squeezy_skills",
+                        event = %key.trim(),
+                        "ignoring unknown skill hook event"
+                    ),
+                }
+            }
+            continue;
+        }
+
+        // A `- matcher: ...` clause opens a new matcher under the
+        // current event. The matcher indent is locked on first sight
+        // so later `command:`/`once:` lines can be told apart from a
+        // sibling matcher reliably.
+        if let Some(item) = trimmed.strip_prefix("- ")
+            && let Some((key, value)) = item.split_once(':')
+            && key.trim() == "matcher"
+        {
+            matcher_indent = Some(indent);
+            let raw_match = unquote(value.trim()).to_string();
+            let matcher = if raw_match.is_empty() || raw_match == "*" {
+                None
+            } else {
+                Some(raw_match)
+            };
+            current_matchers.push(SkillHookMatcher {
+                matcher,
+                hooks: Vec::new(),
+            });
+            continue;
+        }
+
+        // A `- type: command` (or any `- key: value`) at indent
+        // strictly greater than the matcher line opens a new spec on
+        // the active matcher, then the same line's `type:` is parsed
+        // as the spec's first key.
+        if let Some(item) = trimmed.strip_prefix("- ")
+            && matcher_indent.is_some_and(|m| indent > m)
+            && let Some(matcher) = current_matchers.last_mut()
+        {
+            matcher.hooks.push(SkillHookSpec {
+                command: String::new(),
+                once: false,
+            });
+            if let Some(spec) = matcher.hooks.last_mut() {
+                apply_spec_kv(spec, item);
+            }
+            continue;
+        }
+
+        // Plain `key: value` line below a `- type:` opener — apply to
+        // the most recent spec on the current matcher.
+        if let Some(matcher) = current_matchers.last_mut()
+            && let Some(spec) = matcher.hooks.last_mut()
+        {
+            apply_spec_kv(spec, trimmed);
+        }
+    }
+
+    flush_event(out, &mut current_event, &mut current_matchers);
+    consumed
+}
+
+/// Apply a single `key: value` token to an in-progress spec.
+fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
+    let Some((key, value)) = line.split_once(':') else {
+        return;
+    };
+    let value = unquote(value.trim());
+    match key.trim() {
+        "command" => spec.command = value.to_string(),
+        "once" => spec.once = matches!(value, "true" | "yes" | "1"),
+        "type" if value != "command" => {
+            warn!(
+                target: "squeezy_skills",
+                kind = %value,
+                "ignoring unsupported skill hook kind"
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Map a YAML key to a [`HookEvent`]. Accepts the canonical PascalCase
+/// names used in [`HookEvent`] plus the `snake_case` aliases produced by
+/// serde so frontmatter authors can use either convention.
+fn parse_hook_event(name: &str) -> Option<HookEvent> {
+    match name {
+        "PreTurn" | "pre_turn" => Some(HookEvent::PreTurn),
+        "PreToolUse" | "pre_tool_use" => Some(HookEvent::PreToolUse),
+        "PostToolUse" | "post_tool_use" => Some(HookEvent::PostToolUse),
+        "PostTool" | "post_tool" => Some(HookEvent::PostTool),
+        "PreCompact" | "pre_compact" => Some(HookEvent::PreCompact),
+        "PostCompact" | "post_compact" => Some(HookEvent::PostCompact),
+        "SubagentStart" | "subagent_start" => Some(HookEvent::SubagentStart),
+        "PermissionRequest" | "permission_request" => Some(HookEvent::PermissionRequest),
+        _ => None,
+    }
 }
 
 fn parse_inline_list(value: &str) -> Vec<String> {
@@ -961,6 +1233,157 @@ fn load_manifest(base_dir: &Path) -> Option<SkillManifest> {
 
 pub(crate) fn parse_skill_manifest(content: &str) -> std::result::Result<SkillManifest, String> {
     toml::from_str::<SkillManifest>(content).map_err(|error| error.to_string())
+}
+
+/// [`HookHandler`] implementation that fires a skill's declared shell
+/// command when its event matches.
+///
+/// `event` is the variant from the skill's frontmatter; the handler
+/// fast-paths-returns `HookResult::allow()` without spawning a process
+/// when `ctx.event` doesn't match, so registering hooks for one event
+/// stays cheap on unrelated dispatches. `matcher` (when present) is
+/// matched against the `tool_name` payload field on tool-scoped events;
+/// `None` means the handler fires for every payload of the event.
+/// `base_dir` is the skill's filesystem root and lets the handler
+/// resolve relative `command` paths the same way CC resolves
+/// `${CLAUDE_PLUGIN_ROOT}`.
+pub struct SkillHookHandler {
+    skill_name: String,
+    event: HookEvent,
+    matcher: Option<String>,
+    spec: SkillHookSpec,
+    base_dir: PathBuf,
+    /// Tracks whether a `once: true` hook has already fired in this
+    /// session. Held behind a `Mutex` so the trait method stays `&self`
+    /// while still allowing in-place mutation across dispatches.
+    fired: Mutex<bool>,
+}
+
+impl SkillHookHandler {
+    pub fn new(
+        skill_name: String,
+        event: HookEvent,
+        matcher: Option<String>,
+        spec: SkillHookSpec,
+        base_dir: PathBuf,
+    ) -> Self {
+        Self {
+            skill_name,
+            event,
+            matcher,
+            spec,
+            base_dir,
+            fired: Mutex::new(false),
+        }
+    }
+}
+
+impl HookHandler for SkillHookHandler {
+    fn handle(&self, ctx: &HookContext) -> HookResult {
+        if ctx.event != self.event {
+            return HookResult::allow();
+        }
+        if let Some(needle) = self.matcher.as_deref() {
+            let tool = ctx
+                .payload
+                .get("tool_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if tool != needle {
+                return HookResult::allow();
+            }
+        }
+        if self.spec.once
+            && let Ok(mut fired) = self.fired.lock()
+        {
+            if *fired {
+                return HookResult::allow();
+            }
+            *fired = true;
+        }
+
+        // Resolve the command path against the skill's base_dir when
+        // relative. The payload is piped on stdin as JSON, matching the
+        // hook-engine contract documented on `HookContext`.
+        let trimmed = self.spec.command.trim();
+        if trimmed.is_empty() {
+            warn!(
+                target: "squeezy_skills",
+                skill = %self.skill_name,
+                "skipping skill hook with empty command"
+            );
+            return HookResult::allow();
+        }
+        let payload = ctx.payload.to_string();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(trimmed)
+            .current_dir(&self.base_dir)
+            .env("SQUEEZY_SKILL_DIR", &self.base_dir)
+            .env("SQUEEZY_SKILL_NAME", &self.skill_name)
+            .env("SQUEEZY_HOOK_PAYLOAD", payload);
+        match command.status() {
+            Ok(status) if status.success() => HookResult::allow(),
+            Ok(status) => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    code = ?status.code(),
+                    "skill hook exited non-zero"
+                );
+                HookResult::deny(format!(
+                    "skill `{}` hook denied the action",
+                    self.skill_name
+                ))
+            }
+            Err(error) => {
+                warn!(
+                    target: "squeezy_skills",
+                    skill = %self.skill_name,
+                    error = %error,
+                    "skill hook failed to spawn"
+                );
+                HookResult::allow()
+            }
+        }
+    }
+}
+
+/// Register every hook declared in a [`LoadedSkill`]'s frontmatter
+/// against the given [`HookRegistry`].
+///
+/// Returns the number of [`SkillHookHandler`]s installed so callers can
+/// log the activation count alongside the skill name. The registry takes
+/// ownership of each handler; deregistering individual skill hooks is
+/// not yet implemented because the registry stores erased boxed
+/// handlers — that surface is left to a follow-up when the agent loop
+/// learns to drop hooks on skill deactivation.
+pub fn register_skill_hooks(skill: &LoadedSkill, registry: &mut HookRegistry) -> usize {
+    let mut installed = 0;
+    for (event, matchers) in &skill.hooks {
+        for matcher in matchers {
+            for spec in &matcher.hooks {
+                registry.register(Box::new(SkillHookHandler::new(
+                    skill.summary.name.clone(),
+                    *event,
+                    matcher.matcher.clone(),
+                    spec.clone(),
+                    skill.base_dir.clone(),
+                )));
+                installed += 1;
+            }
+        }
+    }
+    if installed > 0 {
+        tracing::info!(
+            target: "squeezy_skills",
+            skill = %skill.summary.name,
+            installed,
+            "registered skill frontmatter hooks"
+        );
+    }
+    installed
 }
 
 #[cfg(test)]

@@ -46,6 +46,7 @@ globset = "0.4"
 http = "1"
 ignore = "0.4"
 libc = "0.2"
+lru = "0.16"
 pulldown-cmark = "0.13.4"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 regex = "1"
@@ -130,3 +131,4 @@ inherits = "release"
 # Distribution artifacts opt into whole-program optimization explicitly.
 lto = true
 codegen-units = 1
+strip = "symbols"
