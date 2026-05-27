@@ -60,6 +60,16 @@ squeezy doctor
 Use this path when you already have a recent Rust toolchain installed. Squeezy
 requires Rust 1.93.1 or newer.
 
+For local source checkouts, keep install artifacts in a persistent target
+directory so repeat installs can reuse them:
+
+```sh
+cargo install --path crates/squeezy-cli --locked --target-dir target/local-install
+```
+
+Add `--timings` when investigating slow installs; Cargo writes an HTML report
+under the target directory.
+
 ## GitHub Release Archives
 
 Tagged releases publish prebuilt archives and SHA-256 checksum files:
