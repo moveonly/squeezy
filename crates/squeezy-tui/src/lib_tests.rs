@@ -3961,6 +3961,16 @@ fn exit_hint_points_to_session_resume_command() {
 }
 
 #[test]
+fn cross_project_resume_hint_quotes_target_cwd_and_command() {
+    let hint = cross_project_resume_hint("session-abc", "/work/other");
+    assert!(hint.contains("/work/other"), "{hint}");
+    assert!(
+        hint.contains("squeezy sessions resume session-abc"),
+        "{hint}"
+    );
+}
+
+#[test]
 fn render_prompt_uses_rotating_coin_and_cursor() {
     let mut app = test_app(SessionMode::Build);
     set_input(&mut app, "ship it".to_string());

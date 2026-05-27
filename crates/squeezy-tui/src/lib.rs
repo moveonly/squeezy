@@ -500,13 +500,33 @@ fn maybe_pick_resume_session(
     if candidates.is_empty() {
         return Ok(ResumeStartup::Fresh);
     }
-    let choice = resume_picker::run_picker(&mut terminal.terminal, candidates)
-        .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
+    let choice = resume_picker::run_picker(
+        &mut terminal.terminal,
+        candidates,
+        config.workspace_root.clone(),
+    )
+    .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
     match choice {
         resume_picker::ResumeChoice::StartFresh => Ok(ResumeStartup::Fresh),
         resume_picker::ResumeChoice::Resume(id) => Ok(ResumeStartup::Use(id)),
+        resume_picker::ResumeChoice::CrossProject {
+            session_id,
+            target_cwd,
+        } => {
+            // Silently switching cwd would surprise users juggling sibling
+            // repos; instead exit with the exact recommended invocation in
+            // the exit hint so they can re-run from the target directory.
+            terminal.set_exit_hint(Some(cross_project_resume_hint(&session_id, &target_cwd)));
+            Ok(ResumeStartup::Quit)
+        }
         resume_picker::ResumeChoice::Quit => Ok(ResumeStartup::Quit),
     }
+}
+
+/// Format the exit hint printed when the user picks a cross-project
+/// resume target. Exposed at module scope so tests can lock the wording.
+fn cross_project_resume_hint(session_id: &str, target_cwd: &str) -> String {
+    format!("Cross-project resume — run from {target_cwd}:\n  squeezy sessions resume {session_id}")
 }
 
 /// Restore the most recently cancelled prompt into the composer. Only
