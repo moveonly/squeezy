@@ -62,6 +62,11 @@ pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/opena
 pub const DEFAULT_DEEPINFRA_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
 pub const DEFAULT_BASETEN_BASE_URL: &str = "https://inference.baseten.co/v1";
 pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct";
+// OpenAI-compatible local self-hosted (light preset tier — loopback default,
+// auth optional, model id depends on whatever the local server has loaded).
+pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+pub const DEFAULT_VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
+pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
 
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
@@ -1521,6 +1526,15 @@ pub enum OpenAiCompatiblePreset {
     Cerebras,
     DeepInfra,
     Baseten,
+    // Serde's snake_case derivation chops between each upper/lower transition
+    // (`LMStudio` -> `l_m_studio`), which would diverge from the TOML section
+    // name. Pin the wire format explicitly to keep round-trip stable.
+    #[serde(rename = "lmstudio")]
+    LMStudio,
+    #[serde(rename = "vllm")]
+    VLlm,
+    #[serde(rename = "llamacpp")]
+    LlamaCpp,
     Custom,
 }
 
@@ -1542,6 +1556,9 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras => "cerebras",
             Self::DeepInfra => "deepinfra",
             Self::Baseten => "baseten",
+            Self::LMStudio => "lmstudio",
+            Self::VLlm => "vllm",
+            Self::LlamaCpp => "llamacpp",
             Self::Custom => "openai_compatible",
         }
     }
@@ -1562,6 +1579,9 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras => "Cerebras",
             Self::DeepInfra => "DeepInfra",
             Self::Baseten => "Baseten",
+            Self::LMStudio => "LM Studio",
+            Self::VLlm => "vLLM",
+            Self::LlamaCpp => "llama.cpp server",
             Self::Custom => "OpenAI-compatible (custom)",
         }
     }
@@ -1601,6 +1621,9 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras => DEFAULT_CEREBRAS_BASE_URL,
             Self::DeepInfra => DEFAULT_DEEPINFRA_BASE_URL,
             Self::Baseten => DEFAULT_BASETEN_BASE_URL,
+            Self::LMStudio => DEFAULT_LMSTUDIO_BASE_URL,
+            Self::VLlm => DEFAULT_VLLM_BASE_URL,
+            Self::LlamaCpp => DEFAULT_LLAMACPP_BASE_URL,
             Self::Custom => "",
         }
     }
@@ -1624,6 +1647,11 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras => "CEREBRAS_API_KEY",
             Self::DeepInfra => "DEEPINFRA_API_KEY",
             Self::Baseten => "BASETEN_API_KEY",
+            // Local self-hosted servers usually do not authenticate, but the env
+            // var slot lets users layer a bearer token via a reverse proxy.
+            Self::LMStudio => "LMSTUDIO_API_KEY",
+            Self::VLlm => "VLLM_API_KEY",
+            Self::LlamaCpp => "LLAMACPP_API_KEY",
             Self::Custom => "",
         }
     }
@@ -1643,6 +1671,11 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras => DEFAULT_CEREBRAS_MODEL,
             Self::DeepInfra => DEFAULT_DEEPINFRA_MODEL,
             Self::Baseten => DEFAULT_BASETEN_MODEL,
+            // Local servers expose whatever checkpoint the operator loaded; we
+            // cannot guess a default, so the user supplies `model = …`.
+            Self::LMStudio => "",
+            Self::VLlm => "",
+            Self::LlamaCpp => "",
             Self::Custom => "",
         }
     }
@@ -1665,6 +1698,9 @@ impl OpenAiCompatiblePreset {
             "cerebras" => Some(Self::Cerebras),
             "deepinfra" | "deep_infra" => Some(Self::DeepInfra),
             "baseten" => Some(Self::Baseten),
+            "lmstudio" | "lm_studio" => Some(Self::LMStudio),
+            "vllm" => Some(Self::VLlm),
+            "llamacpp" | "llama_cpp" | "llama_cpp_server" => Some(Self::LlamaCpp),
             "openai_compatible" | "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -1672,7 +1708,7 @@ impl OpenAiCompatiblePreset {
 
     /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
     /// Used by the CLI to enumerate options without hard-coding the list.
-    pub fn all() -> [Self; 14] {
+    pub fn all() -> [Self; 17] {
         [
             Self::OpenRouter,
             Self::Vercel,
@@ -1687,6 +1723,9 @@ impl OpenAiCompatiblePreset {
             Self::Cerebras,
             Self::DeepInfra,
             Self::Baseten,
+            Self::LMStudio,
+            Self::VLlm,
+            Self::LlamaCpp,
             Self::Custom,
         ]
     }
@@ -6819,6 +6858,9 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::Cerebras => &["cerebras"],
             OpenAiCompatiblePreset::DeepInfra => &["deepinfra"],
             OpenAiCompatiblePreset::Baseten => &["baseten"],
+            OpenAiCompatiblePreset::LMStudio => &["lmstudio"],
+            OpenAiCompatiblePreset::VLlm => &["vllm"],
+            OpenAiCompatiblePreset::LlamaCpp => &["llamacpp"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
     }

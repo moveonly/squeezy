@@ -363,6 +363,9 @@ pub const PROVIDER_OPTIONS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
     "openai_compatible",
 ];
 

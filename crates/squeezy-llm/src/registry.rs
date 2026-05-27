@@ -226,6 +226,9 @@ pub const PROVIDERS: &[&str] = &[
     "together",
     "fireworks",
     "cerebras",
+    "lmstudio",
+    "vllm",
+    "llamacpp",
     "openai_compatible",
 ];
 

@@ -103,6 +103,27 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         env: "SQUEEZY_CEREBRAS_KEY",
         fallback_env: Some("CEREBRAS_API_KEY"),
     },
+    // Local self-hosted OpenAI-compatible servers. They typically run without
+    // authentication on a loopback port; the inline-key slot exists so users
+    // can stand up a reverse proxy that requires a bearer token.
+    KnownProvider {
+        section: "lmstudio",
+        cli: "lmstudio",
+        env: "SQUEEZY_LMSTUDIO_KEY",
+        fallback_env: Some("LMSTUDIO_API_KEY"),
+    },
+    KnownProvider {
+        section: "vllm",
+        cli: "vllm",
+        env: "SQUEEZY_VLLM_KEY",
+        fallback_env: Some("VLLM_API_KEY"),
+    },
+    KnownProvider {
+        section: "llamacpp",
+        cli: "llamacpp",
+        env: "SQUEEZY_LLAMACPP_KEY",
+        fallback_env: Some("LLAMACPP_API_KEY"),
+    },
     KnownProvider {
         section: "openai_compatible",
         cli: "openai_compatible",
@@ -240,6 +261,9 @@ fn static_section_name(provider: &str) -> &'static str {
         "together" => "together",
         "fireworks" => "fireworks",
         "cerebras" => "cerebras",
+        "lmstudio" => "lmstudio",
+        "vllm" => "vllm",
+        "llamacpp" => "llamacpp",
         "openai_compatible" => "openai_compatible",
         // Last-resort: fail closed if the caller passed something we
         // can't statically map. A future provider should be wired into
