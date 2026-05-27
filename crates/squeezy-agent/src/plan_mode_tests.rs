@@ -61,6 +61,23 @@ fn plan_mode_instructions_within_budget() {
 }
 
 #[test]
+fn plan_mode_instructions_size_pinned() {
+    // The overlay is appended to every Plan-mode system prompt and lives
+    // inside the cached prefix; growth inflates token cost on every Plan
+    // turn. 2200 chars is roughly one short paragraph above the 3-phase
+    // body, enough for small editorial tweaks but tight enough that adding
+    // a fourth phase or expanding any one phase by a paragraph trips this
+    // test — a deliberate re-budget then has to bump the ceiling.
+    const SIZE_CEILING: usize = 2200;
+    assert!(
+        PLAN_MODE_INSTRUCTIONS.len() < SIZE_CEILING,
+        "PLAN_MODE_INSTRUCTIONS grew to {} chars (ceiling {})",
+        PLAN_MODE_INSTRUCTIONS.len(),
+        SIZE_CEILING
+    );
+}
+
+#[test]
 fn plan_mode_mentions_proposed_plan_contract() {
     assert!(PLAN_MODE_INSTRUCTIONS.contains("<proposed_plan>"));
     assert!(PLAN_MODE_INSTRUCTIONS.contains("request_user_input"));

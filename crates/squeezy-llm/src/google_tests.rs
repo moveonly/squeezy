@@ -42,6 +42,8 @@ fn request_body_uses_generate_content_shape() {
         ]),
         store: false,
         tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -85,6 +87,8 @@ fn request_body_preserves_function_tool_order() {
         ]),
         store: false,
         tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = GoogleProvider::request_body(&request);
@@ -120,6 +124,8 @@ fn request_body_preserves_function_response_name() {
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = GoogleProvider::request_body(&request);

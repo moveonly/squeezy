@@ -28,6 +28,16 @@ struct TelemetryState {
     endpoint: String,
     install_id: String,
     session_id: String,
+    /// Per-session trace id (W3C-shaped 32-hex-char string) stamped on
+    /// every emitted event. Lets an operator pivot from a single Worker-side
+    /// event back to all other events emitted from the same Squeezy session,
+    /// and lets local `tracing` logs that record the same id pull in their
+    /// matching aggregate counters.
+    trace_id: String,
+    /// Per-turn span id stamped on every event enqueued between
+    /// [`TelemetryClient::begin_turn`] and [`TelemetryClient::end_turn`].
+    /// `None` outside an active turn (e.g. `app_started`). 16-hex-char string.
+    current_span_id: std::sync::Mutex<Option<String>>,
     next_event_sequence: AtomicU64,
     queue: Mutex<TelemetryQueue>,
     http: reqwest::Client,
@@ -90,6 +100,8 @@ impl TelemetryClient {
                 endpoint: config.telemetry.endpoint.clone(),
                 install_id,
                 session_id: random_uuid_like(),
+                trace_id: random_trace_id(),
+                current_span_id: std::sync::Mutex::new(None),
                 next_event_sequence: AtomicU64::new(1),
                 queue: Mutex::new(TelemetryQueue::default()),
                 http,
@@ -99,6 +111,39 @@ impl TelemetryClient {
 
     pub fn enabled(&self) -> bool {
         self.state.is_some()
+    }
+
+    /// Open a per-turn span. The returned id is stamped on every event
+    /// recorded between this call and [`Self::end_turn`]. Calling
+    /// `begin_turn` again replaces the active span (the prior span is
+    /// abandoned without a close event — this matches `tracing::Span`
+    /// drop semantics). Returns `None` when telemetry is disabled.
+    pub fn begin_turn(&self) -> Option<String> {
+        let state = self.state.as_ref()?;
+        let id = random_span_id();
+        if let Ok(mut guard) = state.current_span_id.lock() {
+            *guard = Some(id.clone());
+        }
+        Some(id)
+    }
+
+    /// Close the active per-turn span so subsequent events (e.g.
+    /// post-turn `failure_seen`) carry no `span_id` until the next
+    /// [`Self::begin_turn`].
+    pub fn end_turn(&self) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        if let Ok(mut guard) = state.current_span_id.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Per-session trace id. `None` when telemetry is disabled. Exposed
+    /// so the agent/CLI layer can include it in local `tracing` spans for
+    /// log-to-aggregate correlation without re-deriving the id.
+    pub fn trace_id(&self) -> Option<String> {
+        self.state.as_ref().map(|state| state.trace_id.clone())
     }
 
     pub fn spawn(&self, event: TelemetryEvent) {
@@ -121,7 +166,11 @@ impl TelemetryClient {
         let Some(state) = self.state.clone() else {
             return Ok(());
         };
-        send_batch(state, events).await
+        let mut stamped = events;
+        for event in &mut stamped {
+            stamp_trace_ids(&state, event);
+        }
+        send_batch(state, stamped).await
     }
 
     pub async fn flush(&self) -> Result<(), TelemetryError> {
@@ -409,7 +458,8 @@ pub enum TelemetryError {
     Status(reqwest::StatusCode),
 }
 
-async fn enqueue_event(state: Arc<TelemetryState>, event: TelemetryEvent) {
+async fn enqueue_event(state: Arc<TelemetryState>, mut event: TelemetryEvent) {
+    stamp_trace_ids(&state, &mut event);
     let action = {
         let mut queue = state.queue.lock().await;
         queue.events.push(event);
@@ -606,6 +656,25 @@ impl TelemetryEvent {
             },
         }
     }
+
+    /// `ai_reviewer.allow_downgrade{capability}` counter event. Fires when
+    /// the AI reviewer model returned `allow` but the requested capability
+    /// is not in the operator's `allow_capabilities` allowlist, so the
+    /// reviewer silently downgrades the decision to "no decision" and falls
+    /// back to the user prompt. Without this counter, operators cannot tell
+    /// how often the reviewer would have approved if the allowlist were
+    /// wider, so the allowlist cannot evolve.
+    pub fn ai_reviewer_allow_downgrade(capability: &str) -> Self {
+        Self {
+            event: TelemetryEventName::AiReviewerAllowDowngrade,
+            timestamp_ms: now_ms(),
+            event_sequence: 0,
+            properties: TelemetryProperties {
+                permission_capability: Some(capability.to_string()),
+                ..TelemetryProperties::default()
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -631,6 +700,13 @@ pub enum TelemetryEventName {
     /// dashboards rather than only in audit logs.
     #[serde(rename = "approval_best_effort_fallback")]
     ShellSandboxBestEffortFallback,
+    /// `ai_reviewer.allow_downgrade{capability}` — emitted when the AI
+    /// reviewer would have approved but the capability was not in the
+    /// operator's `allow_capabilities` allowlist, so the verdict silently
+    /// fell back to the user prompt. Lets operators see how often a wider
+    /// allowlist would have spared an interruption.
+    #[serde(rename = "ai_reviewer_allow_downgrade")]
+    AiReviewerAllowDowngrade,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -732,6 +808,26 @@ pub struct TelemetryProperties {
     /// `linux-direct-syscalls`, `windows-job-object`, etc.).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_backend: Option<String>,
+    /// Tagged on AI-reviewer events (`AiReviewerAllowDowngrade`) so
+    /// dashboards can break down silent allow-downgrade rates by the
+    /// requested capability (`read`, `edit`, `shell`, ...). Operators
+    /// use this to decide which capability to add to the
+    /// `allow_capabilities` allowlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_capability: Option<String>,
+    /// Per-session trace id stamped by [`TelemetryClient`] on every event
+    /// it accepts. W3C-trace-context-shaped 32-hex-char string. Equal
+    /// across every event emitted by a single Squeezy session so an
+    /// operator can pivot from one Worker-side event to every other event
+    /// for the same session, and so local `tracing::span!` records that
+    /// embed this id correlate with the aggregate counters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<String>,
+    /// Per-turn span id stamped by [`TelemetryClient`] on events recorded
+    /// inside an active turn. 16-hex-char string. `None` for events
+    /// emitted outside any turn (e.g. `app_started`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<String>,
 }
 
 impl TelemetryProperties {
@@ -1064,6 +1160,66 @@ fn default_install_id_path() -> PathBuf {
                 .map(|home| home.join(".squeezy/install_id"))
         })
         .unwrap_or_else(|| PathBuf::from(".squeezy/install_id"))
+}
+
+/// Stamp the session-scoped `trace_id` and any active per-turn `span_id`
+/// on `event`. Idempotent: a `trace_id` already present on the event
+/// (set by a caller for a span they manage themselves) is preserved.
+fn stamp_trace_ids(state: &TelemetryState, event: &mut TelemetryEvent) {
+    if event.properties.trace_id.is_none() {
+        event.properties.trace_id = Some(state.trace_id.clone());
+    }
+    if event.properties.span_id.is_none()
+        && let Ok(guard) = state.current_span_id.lock()
+        && let Some(span_id) = guard.as_ref()
+    {
+        event.properties.span_id = Some(span_id.clone());
+    }
+}
+
+/// W3C-trace-context style 32-hex-char trace id. We don't pull in the
+/// `opentelemetry` crate — the audit's F10 explicitly notes that plain
+/// UUIDs are sufficient — but we shape the id like a real `traceparent`
+/// so an operator pasting it into a Jaeger/Honeycomb URL bar gets a
+/// match if/when downstream collectors are added.
+fn random_trace_id() -> String {
+    let mut bytes = [0u8; 16];
+    fill_random_bytes(&mut bytes);
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+/// W3C-trace-context style 16-hex-char span id.
+fn random_span_id() -> String {
+    let mut bytes = [0u8; 8];
+    fill_random_bytes(&mut bytes);
+    let mut out = String::with_capacity(16);
+    for byte in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn fill_random_bytes(bytes: &mut [u8]) {
+    if fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(bytes))
+        .is_ok()
+    {
+        return;
+    }
+    // Mix in a per-process counter so a `now_ms` collision under a clock
+    // freeze still produces distinct ids.
+    static SALT: AtomicU64 = AtomicU64::new(0);
+    let salt = SALT.fetch_add(1, Ordering::Relaxed);
+    let mix = now_ms() as u64 ^ salt;
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = ((mix >> ((i % 8) * 8)) & 0xff) as u8;
+    }
 }
 
 fn random_uuid_like() -> String {

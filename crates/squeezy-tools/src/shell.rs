@@ -5,10 +5,10 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -34,7 +34,6 @@ use tokio_util::sync::CancellationToken;
 #[cfg(unix)]
 use crate::ipc;
 use crate::ipc::IpcListener;
-#[cfg(unix)]
 use crate::sha256_hex;
 use crate::shell_output::{insert_content_field, shape_shell_output};
 use crate::shell_parse::{
@@ -133,7 +132,20 @@ impl ToolRegistry {
                 "shell output_byte_cap must be at least 1",
             );
         }
-        let direct_user_shell = args.direct_user_shell && call.call_id.starts_with("local-shell-");
+        // The fast path that skips sandboxing and checkpointing is gated by
+        // BOTH a `local-shell-` call_id prefix AND a per-process nonce that
+        // only the TUI's `!cmd` minter holds. Stripping either side leaves the
+        // command on the normal model-tool path with full sandbox/checkpoint
+        // guarantees. See [`direct_user_shell_nonce`] for why this combination
+        // is unforgeable from outside the process.
+        let nonce_ok = args
+            .direct_user_shell_nonce
+            .as_deref()
+            .is_some_and(|nonce| {
+                constant_time_eq(nonce.as_bytes(), direct_user_shell_nonce().as_bytes())
+            });
+        let direct_user_shell =
+            args.direct_user_shell && call.call_id.starts_with("local-shell-") && nonce_ok;
         let workdir = match self.resolve_shell_workdir(args.workdir.as_deref().unwrap_or(".")) {
             Ok(path) => path,
             Err(err) => {
@@ -717,6 +729,7 @@ impl ToolRegistry {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ShellArgs {
     pub(crate) command: String,
     pub(crate) workdir: Option<String>,
@@ -728,6 +741,66 @@ pub(crate) struct ShellArgs {
     pub(crate) tty: bool,
     #[serde(default)]
     pub(crate) direct_user_shell: bool,
+    /// Per-process secret that the user-driven `!cmd` path mints alongside
+    /// `direct_user_shell=true`. Validated against [`direct_user_shell_nonce`]
+    /// before the sandbox is disabled; without it, the `local-shell-` call_id
+    /// prefix is meaningless and the call falls through to the normal model
+    /// path. Never advertised in the shell schema — the model has no way to
+    /// observe it, and replay tapes / mock providers in a separate process
+    /// will not have a matching value.
+    #[serde(default)]
+    pub(crate) direct_user_shell_nonce: Option<String>,
+}
+
+/// Per-process secret bound to the TUI's local-shell path.
+///
+/// The hash inputs (PID, wall + monotonic clock samples, heap and static
+/// addresses) are visible only inside this process, so the digest cannot be
+/// reproduced by any external caller — including mock providers, replay
+/// tapes, and out-of-process MCP shims that might one day mint `local-shell-`
+/// call_ids. The `direct_user_shell` fast path requires both the call_id
+/// prefix and a matching nonce; the prefix alone is therefore insufficient
+/// to disable the sandbox or skip checkpointing.
+pub fn direct_user_shell_nonce() -> &'static str {
+    static NONCE: OnceLock<String> = OnceLock::new();
+    NONCE.get_or_init(|| {
+        let mut seed = Vec::with_capacity(96);
+        seed.extend_from_slice(&std::process::id().to_le_bytes());
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        seed.extend_from_slice(&now_nanos.to_le_bytes());
+        let mono_nanos = std::time::Instant::now().elapsed().as_nanos();
+        seed.extend_from_slice(&mono_nanos.to_le_bytes());
+        // Heap allocation address is randomized per-process by ASLR on every
+        // supported platform; reading it as additional entropy means an
+        // attacker who guesses the clocks/PID still cannot reproduce the hash.
+        let heap_marker: Box<u8> = Box::new(0);
+        let heap_addr = (Box::as_ref(&heap_marker) as *const u8) as usize;
+        seed.extend_from_slice(&heap_addr.to_le_bytes());
+        // Mix in the address of the OnceLock itself; static address is also
+        // ASLR-randomized and differs from heap.
+        let lock_addr = (&NONCE as *const OnceLock<String>) as usize;
+        seed.extend_from_slice(&lock_addr.to_le_bytes());
+        sha256_hex(seed)
+    })
+}
+
+/// Length-aware byte-for-byte comparison that does not short-circuit on the
+/// first mismatch. The nonce is per-process and never travels off-host, so a
+/// timing oracle is not really in scope, but constant-time matches the secret
+/// shape and avoids future regressions if the comparison ever moves to a
+/// boundary where timing matters.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub(crate) fn shell_termination_reason(

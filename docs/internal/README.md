@@ -7,6 +7,8 @@ development conventions.
 - [Architecture](ARCHITECTURE.md): crate boundaries and major runtime choices.
 - [Async and background work](ASYNC_BACKGROUND_WORK.md): job cancellation,
   session-log writer boundaries, and deferred queue/watcher/spool guardrails.
+- [Checkpoints and rollback](CHECKPOINTS.md): why `RollbackTarget::Group`
+  exists alongside `Latest` and `Checkpoint(id)`.
 - [Semantic graph](SEMANTIC_GRAPH.md): graph schema, refresh policy,
   heuristics, traversal surface, compiler facts, and benchmark interpretation.
 - [Benchmarks](BENCHMARKS.md): benchmark CLI, corpus, oracle setup, and local

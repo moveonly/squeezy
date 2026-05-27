@@ -11,6 +11,24 @@ pub struct SkillPreambleRender {
     pub omitted_count: usize,
 }
 
+/// Counters emitted alongside an `<active_skills>` render so the agent
+/// can record them to telemetry without re-walking the inputs.
+///
+/// `total` counts how many `LoadedSkill` candidates entered the
+/// render; `included` is how many appear in the final block (either as
+/// full body or as a stub); `dropped` is how many were skipped because
+/// the aggregate budget was exhausted; `body_truncated` is how many
+/// were emitted as a `<skill truncated="true">` stub rather than full
+/// body (either because the per-skill `body_cap_chars` fired or the
+/// aggregate fit only after falling back to the stub).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkillActivationMetrics {
+    pub total: usize,
+    pub included: usize,
+    pub dropped: usize,
+    pub body_truncated: usize,
+}
+
 pub fn render_active_skills(
     skills: &[LoadedSkill],
     budget_chars: usize,
@@ -32,7 +50,7 @@ pub fn render_active_skills(
                 chars_truncated = body_chars.saturating_sub(body_cap_chars),
                 "skill_truncated"
             );
-            blocks.push(render_stub(skill, "body_cap"));
+            blocks.push(render_stub(skill, "body_cap", STUB_DESCRIPTION_MAX_CHARS));
         } else {
             blocks.push(skill.prompt_block());
         }
@@ -44,47 +62,87 @@ pub fn render_active_skills(
         return Some(block);
     }
 
-    let mut fitted = Vec::new();
-    for (skill, block) in skills.iter().zip(blocks) {
-        let candidates = if block_contains_stub(&block) {
-            vec![block]
-        } else {
-            vec![block, render_stub(skill, "aggregate_budget")]
+    // Aggregate overflow: switch every skill to its minimum-stub form (zero
+    // description chars) and verify the floor fits. If even the floor blows
+    // the budget we drop the lowest-priority skills until it fits or no skill
+    // remains. This mirrors codex's `render_lines_with_description_budget`:
+    // the roster is preserved before per-skill description detail.
+    let mut survivors: Vec<&LoadedSkill> = skills.iter().collect();
+    let mut min_blocks: Vec<String> = survivors
+        .iter()
+        .map(|skill| render_stub(skill, "aggregate_budget", 0))
+        .collect();
+    while let Some(min_block) = wrap_blocks(&min_blocks)
+        && char_count(&min_block) > budget_chars
+    {
+        let Some(dropped) = survivors.pop() else {
+            break;
         };
-        let mut inserted = false;
-        for candidate in candidates {
-            let mut attempt = fitted.clone();
-            attempt.push(candidate.clone());
-            if let Some(rendered) = wrap_blocks(&attempt)
-                && char_count(&rendered) <= budget_chars
-            {
-                if block_contains_stub(&candidate) {
-                    let body_chars = char_count(&skill.body);
-                    warn!(
-                        target: "squeezy_skills",
-                        skill = %skill.summary.name,
-                        body_chars,
-                        cap_chars = budget_chars,
-                        chars_truncated = body_chars,
-                        "skill_truncated"
-                    );
-                }
-                fitted = attempt;
-                inserted = true;
-                break;
+        min_blocks.pop();
+        warn!(
+            target: "squeezy_skills",
+            skill = %dropped.summary.name,
+            budget_chars,
+            "skill omitted from active skill bundle because the budget is exhausted"
+        );
+    }
+    if survivors.is_empty() {
+        return None;
+    }
+
+    // Char-by-char description redistribution across the surviving skills.
+    // Each skill's description grows one char at a time so short descriptions
+    // never strand budget that a longer description could use.
+    let max_chars: Vec<usize> = survivors
+        .iter()
+        .map(|skill| char_count(&skill.summary.description).min(STUB_DESCRIPTION_MAX_CHARS))
+        .collect();
+    let mut allocations = vec![0usize; survivors.len()];
+    let base_cost = char_count(&wrap_blocks(&min_blocks).unwrap_or_default());
+    let mut remaining = budget_chars.saturating_sub(base_cost);
+    loop {
+        let mut changed = false;
+        for index in 0..survivors.len() {
+            if allocations[index] >= max_chars[index] {
+                continue;
+            }
+            // Each additional description character usually costs one in the
+            // rendered output; XML-special chars expand to entities, so
+            // `stub_description_delta` measures the real cost between two
+            // allocation sizes.
+            let candidate = allocations[index] + 1;
+            let delta = stub_description_delta(
+                &survivors[index].summary.description,
+                allocations[index],
+                candidate,
+            );
+            if delta <= remaining {
+                allocations[index] = candidate;
+                remaining = remaining.saturating_sub(delta);
+                changed = true;
             }
         }
-        if !inserted {
-            warn!(
-                target: "squeezy_skills",
-                skill = %skill.summary.name,
-                budget_chars,
-                "skill omitted from active skill bundle because the budget is exhausted"
-            );
+        if !changed {
+            break;
         }
     }
 
-    wrap_blocks(&fitted).filter(|rendered| char_count(rendered) <= budget_chars)
+    let mut rendered = Vec::with_capacity(survivors.len());
+    for (index, skill) in survivors.iter().enumerate() {
+        let body_chars = char_count(&skill.body);
+        warn!(
+            target: "squeezy_skills",
+            skill = %skill.summary.name,
+            body_chars,
+            cap_chars = budget_chars,
+            chars_truncated = body_chars,
+            description_chars = allocations[index],
+            "skill_truncated"
+        );
+        rendered.push(render_stub(skill, "aggregate_budget", allocations[index]));
+    }
+
+    wrap_blocks(&rendered).filter(|out| char_count(out) <= budget_chars)
 }
 
 pub fn render_skill_preamble(
@@ -141,6 +199,92 @@ pub fn render_skill_preamble(
     })
 }
 
+/// Render the active-skill block and report counters describing how
+/// many skills were included, dropped, or body-truncated.
+///
+/// This is the metrics-aware companion to `render_active_skills`. The
+/// rendered string matches `render_active_skills` exactly for the same
+/// inputs; only the second tuple element is new. Callers that just
+/// need the string can keep using `render_active_skills`; callers that
+/// also want to feed a telemetry handle (e.g. the agent calling
+/// `record_skill_activation`) should use this variant.
+pub fn render_active_skills_with_metrics(
+    skills: &[LoadedSkill],
+    budget_chars: usize,
+    body_cap_chars: usize,
+) -> (Option<String>, SkillActivationMetrics) {
+    let mut metrics = SkillActivationMetrics {
+        total: skills.len(),
+        ..SkillActivationMetrics::default()
+    };
+
+    if skills.is_empty() || budget_chars == 0 {
+        return (None, metrics);
+    }
+
+    let mut blocks = Vec::with_capacity(skills.len());
+    let mut body_cap_truncated = vec![false; skills.len()];
+    for (index, skill) in skills.iter().enumerate() {
+        let body_chars = char_count(&skill.body);
+        if body_chars > body_cap_chars {
+            body_cap_truncated[index] = true;
+            blocks.push(render_stub(skill, "body_cap", STUB_DESCRIPTION_MAX_CHARS));
+        } else {
+            blocks.push(skill.prompt_block());
+        }
+    }
+
+    if let Some(block) = wrap_blocks(&blocks)
+        && char_count(&block) <= budget_chars
+    {
+        metrics.included = skills.len();
+        metrics.body_truncated = body_cap_truncated.iter().filter(|hit| **hit).count();
+        return (Some(block), metrics);
+    }
+
+    let mut fitted = Vec::new();
+    let mut included_is_stub = Vec::<bool>::new();
+    for (index, (skill, block)) in skills.iter().zip(blocks).enumerate() {
+        let starts_as_stub = body_cap_truncated[index];
+        let candidates = if starts_as_stub {
+            vec![(block, true)]
+        } else {
+            vec![
+                (block, false),
+                (render_stub(skill, "aggregate_budget", 0), true),
+            ]
+        };
+        let mut inserted = false;
+        for (candidate, candidate_is_stub) in candidates {
+            let mut attempt = fitted.clone();
+            attempt.push(candidate.clone());
+            if let Some(rendered) = wrap_blocks(&attempt)
+                && char_count(&rendered) <= budget_chars
+            {
+                fitted = attempt;
+                included_is_stub.push(candidate_is_stub);
+                inserted = true;
+                break;
+            }
+        }
+        if !inserted {
+            metrics.dropped += 1;
+        }
+    }
+
+    let rendered = wrap_blocks(&fitted).filter(|rendered| char_count(rendered) <= budget_chars);
+    if rendered.is_some() {
+        metrics.included = included_is_stub.len();
+        metrics.body_truncated = included_is_stub.iter().filter(|stub| **stub).count();
+    } else {
+        // Final wrap failed the budget — treat every block as dropped.
+        metrics.dropped = skills.len();
+        metrics.included = 0;
+        metrics.body_truncated = 0;
+    }
+    (rendered, metrics)
+}
+
 fn wrap_blocks(blocks: &[String]) -> Option<String> {
     (!blocks.is_empty())
         .then(|| format!("<active_skills>\n{}\n</active_skills>", blocks.join("\n")))
@@ -153,7 +297,7 @@ fn wrap_preamble(lines: &[String]) -> String {
     )
 }
 
-fn render_stub(skill: &LoadedSkill, reason: &str) -> String {
+fn render_stub(skill: &LoadedSkill, reason: &str, description_max_chars: usize) -> String {
     let summary = &skill.summary;
     let when_to_use = summary
         .when_to_use
@@ -174,18 +318,21 @@ fn render_stub(skill: &LoadedSkill, reason: &str) -> String {
         xml_escape(&summary.name),
         summary.source.as_str(),
         xml_escape(reason),
-        xml_escape(&compact_text(
-            &summary.description,
-            STUB_DESCRIPTION_MAX_CHARS
-        )),
+        xml_escape(&take_chars(&summary.description, description_max_chars)),
         summary.location.display(),
         skill.base_dir.display(),
         escape_body_breakouts(&instruction)
     )
 }
 
-fn block_contains_stub(block: &str) -> bool {
-    block.contains("truncated=\"true\"")
+fn stub_description_delta(description: &str, from_chars: usize, to_chars: usize) -> usize {
+    char_count(&xml_escape(&take_chars(description, to_chars))).saturating_sub(char_count(
+        &xml_escape(&take_chars(description, from_chars)),
+    ))
+}
+
+fn take_chars(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
@@ -203,3 +350,7 @@ fn compact_text(value: &str, max_chars: usize) -> String {
 fn char_count(value: &str) -> usize {
     value.chars().count()
 }
+
+#[cfg(test)]
+#[path = "render_tests.rs"]
+mod tests;

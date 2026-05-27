@@ -26,6 +26,8 @@ fn request_body_uses_chat_stream_shape() {
         ]),
         store: false,
         tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -67,6 +69,8 @@ fn request_body_preserves_function_tool_order() {
         ]),
         store: false,
         tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OllamaProvider::request_body(&request);
@@ -142,4 +146,68 @@ fn tags_metadata_extracts_installed_model_names() {
         ollama_model_names_from_tags(&value),
         vec!["qwen3-coder:latest", "llama3.3:70b"]
     );
+}
+
+#[test]
+fn pull_parser_maps_status_progress_and_success_lines() {
+    let status = parse_pull_line(r#"{"status":"pulling manifest"}"#)
+        .expect("status line parses")
+        .expect("status emits an event");
+    assert_eq!(status, PullEvent::Status("pulling manifest".to_string()));
+
+    let progress = parse_pull_line(
+        r#"{"status":"downloading","digest":"sha256:abc","total":1000,"completed":250}"#,
+    )
+    .expect("progress line parses")
+    .expect("progress emits an event");
+    assert_eq!(
+        progress,
+        PullEvent::Progress {
+            digest: "sha256:abc".to_string(),
+            total: Some(1000),
+            completed: Some(250),
+        }
+    );
+
+    let progress_partial = parse_pull_line(r#"{"digest":"sha256:abc","total":1000}"#)
+        .expect("partial progress parses")
+        .expect("emits a progress event");
+    assert_eq!(
+        progress_partial,
+        PullEvent::Progress {
+            digest: "sha256:abc".to_string(),
+            total: Some(1000),
+            completed: None,
+        }
+    );
+
+    let success = parse_pull_line(r#"{"status":"success"}"#)
+        .expect("success parses")
+        .expect("emits an event");
+    assert_eq!(success, PullEvent::Success);
+}
+
+#[test]
+fn pull_parser_surfaces_server_errors_as_stream_errors() {
+    let err = parse_pull_line(r#"{"error":"pull model manifest: file does not exist"}"#)
+        .expect_err("server error surfaces");
+    let SqueezyError::ProviderStream(message) = err else {
+        panic!("expected ProviderStream");
+    };
+    assert!(
+        message.contains("file does not exist"),
+        "got message: {message}"
+    );
+}
+
+#[test]
+fn pull_parser_ignores_empty_keepalive_frames() {
+    let empty = parse_pull_line(r#"{}"#).expect("empty frame parses");
+    assert!(empty.is_none(), "empty frame emits no event");
+}
+
+#[test]
+fn pull_parser_rejects_invalid_json() {
+    let err = parse_pull_line("not-json").expect_err("invalid JSON surfaces");
+    assert!(matches!(err, SqueezyError::ProviderStream(_)));
 }

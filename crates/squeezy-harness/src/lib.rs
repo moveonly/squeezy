@@ -668,6 +668,7 @@ async fn run_agent_with_config(
             | AgentEvent::SubagentStarted { .. }
             | AgentEvent::SubagentCompleted { .. }
             | AgentEvent::SubagentFailed { .. }
+            | AgentEvent::SubagentRejected { .. }
             | AgentEvent::AiReviewerTripped { .. } => {}
             AgentEvent::JobUpdated { .. } | AgentEvent::JobNotification { .. } => {}
             AgentEvent::CostWarning { .. }

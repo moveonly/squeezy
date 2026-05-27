@@ -1,13 +1,65 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
+use tracing_subscriber::fmt::MakeWriter;
 
 use super::*;
+
+#[test]
+fn bundled_skills_load_with_valid_metadata() {
+    let bundled = bundled_skills();
+    assert!(
+        bundled.len() >= 2,
+        "expected at least two bundled samples, got {}",
+        bundled.len()
+    );
+    let mut seen = BTreeSet::new();
+    for skill in &bundled {
+        assert!(
+            is_valid_skill_name(&skill.summary.name),
+            "bundled skill name {} must satisfy SKILL.md naming rules",
+            skill.summary.name
+        );
+        assert!(
+            !skill.summary.description.trim().is_empty(),
+            "bundled skill {} must have a non-empty description",
+            skill.summary.name
+        );
+        assert!(
+            !skill.body.trim().is_empty(),
+            "bundled skill {} must have a non-empty body",
+            skill.summary.name
+        );
+        assert!(
+            seen.insert(skill.summary.name.clone()),
+            "duplicate bundled skill name: {}",
+            skill.summary.name
+        );
+        assert!(
+            skill.base_dir.starts_with("<squeezy-builtin>"),
+            "bundled skill {} base_dir must be the in-binary sentinel root, got {}",
+            skill.summary.name,
+            skill.base_dir.display()
+        );
+    }
+}
+
+#[test]
+fn bundled_skills_render_through_catalog_helpers() {
+    let bundled = bundled_skills();
+    let block = bundled
+        .first()
+        .expect("at least one bundled skill")
+        .prompt_block();
+    assert!(block.contains("<skill name=\""));
+    assert!(block.contains("<content>"));
+}
 
 #[test]
 fn parses_skill_frontmatter_and_body() {
@@ -119,11 +171,54 @@ fn explicit_and_trigger_activation_loads_lazily() {
         .expect("activate");
     assert_eq!(explicit.task_input, "find main");
     assert_eq!(explicit.skills.len(), 1);
+    assert_eq!(explicit.kinds, vec![SkillActivationKind::Explicit]);
 
     let trigger = catalog
         .activate_for_input("please inspect this Rust symbol")
         .expect("activate");
     assert_eq!(trigger.skills.len(), 1);
+    assert_eq!(trigger.kinds, vec![SkillActivationKind::Trigger]);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn activation_kind_serializes_as_snake_case() {
+    let cases = [
+        (SkillActivationKind::Explicit, "\"explicit\""),
+        (SkillActivationKind::Trigger, "\"trigger\""),
+        (SkillActivationKind::ImplicitShell, "\"implicit_shell\""),
+    ];
+    for (kind, expected) in cases {
+        let json = serde_json::to_string(&kind).expect("serialize");
+        assert_eq!(json, expected);
+    }
+}
+
+#[test]
+fn explicit_then_trigger_dedup_keeps_explicit_kind() {
+    let root = temp_workspace("skills_activation_kind_dedup");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Rust nav",
+        &["rust symbol"],
+    );
+    let catalog = SkillCatalog::discover(&root, &config);
+
+    // Input names the skill explicitly *and* the trigger phrase matches.
+    // Dedup must keep the first occurrence (Explicit) so telemetry reports
+    // the strongest signal, not the incidental trigger hit.
+    let activation = catalog
+        .activate_for_input("/skill rust-nav inspect this rust symbol")
+        .expect("activate");
+    assert_eq!(activation.skills.len(), 1);
+    assert_eq!(activation.kinds, vec![SkillActivationKind::Explicit]);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -263,6 +358,100 @@ fn active_skill_render_respects_budget_and_uses_stub() {
     assert!(rendered.chars().count() <= config.active_budget_chars);
     assert!(rendered.contains("truncated=\"true\""));
     assert!(rendered.contains("load_skill"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn active_skill_render_redistributes_descriptions_to_preserve_roster() {
+    // Three skills, each with body well above the body cap so every skill
+    // starts as a stub. Budget is sized so that the full-description stubs
+    // overflow the active block but the minimum-line stubs all fit — the
+    // redistribute step must keep every skill present and give each a
+    // non-empty description.
+    let root = temp_workspace("skills_active_redistribute");
+    let names = ["alpha-skill", "beta-skill", "gamma-skill"];
+    let descriptions = [
+        "Alpha description that is long enough to occupy several stub characters when budget allows.",
+        "Beta description, also reasonably long so we can verify the redistribute loop allocates across skills.",
+        "Gamma description with comparable length, exercising the third allocation slot of the loop.",
+    ];
+    for (name, description) in names.iter().zip(descriptions.iter()) {
+        write_skill_with_body(
+            &root.join(".squeezy/skills").join(name),
+            name,
+            description,
+            &[],
+            &"body line that exceeds the cap. ".repeat(60),
+        );
+    }
+    // Compute the minimum-stub floor at runtime so the test budget is robust
+    // against temp-path length variation across hosts. The full-description
+    // aggregate is the floor plus the description chars themselves — sit
+    // between the two so the redistribute step is required.
+    let catalog = SkillCatalog::discover(
+        &root,
+        &SkillsConfig {
+            user_dir: root.join("user"),
+            compat_user_dir: root.join("compat"),
+            active_budget_chars: usize::MAX,
+            active_body_cap_chars: 100,
+            ..Default::default()
+        },
+    );
+    let loaded = names
+        .iter()
+        .map(|name| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let full_block = render::render_active_skills(&loaded, usize::MAX, 100)
+        .expect("baseline render with unbounded budget");
+    // Each description is ASCII without XML-special chars so xml_escape is
+    // identity; subtracting the description-char sum from the full render
+    // yields the minimum-stub floor (description text removed, structure
+    // kept).
+    let desc_payload_chars: usize = descriptions
+        .iter()
+        .map(|description| description.chars().count())
+        .sum();
+    let floor = full_block.chars().count() - desc_payload_chars;
+    // Pick a budget strictly between the floor and the full aggregate so the
+    // redistribute branch — not the all-fits-as-is branch and not the
+    // drop-skills branch — is the one exercised.
+    let active_budget_chars = floor + desc_payload_chars / 2;
+
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        active_budget_chars,
+        active_body_cap_chars: 100,
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let loaded = names
+        .iter()
+        .map(|name| catalog.load(name).expect("load"))
+        .collect::<Vec<_>>();
+    let rendered = catalog
+        .render_active_skills(&loaded)
+        .expect("render active skills");
+
+    assert!(rendered.chars().count() <= config.active_budget_chars);
+    for name in &names {
+        let needle = format!("name=\"{name}\"");
+        assert!(
+            rendered.contains(&needle),
+            "redistribute must keep every skill present; missing {name}\n---\n{rendered}\n---"
+        );
+    }
+    // No skill should have a completely empty description tag — the loop
+    // must allocate at least one char to each skill when the budget allows
+    // it. Empty `<description></description>` indicates the skill was kept
+    // at the minimum-stub floor.
+    assert!(
+        !rendered.contains("<description></description>"),
+        "redistribute must allocate at least one description char per skill\n---\n{rendered}\n---"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -453,6 +642,7 @@ fn prompt_block_escapes_metadata_and_breakouts() {
             source: SkillSource::Project,
             location: PathBuf::from("/tmp/SKILL.md"),
             disabled: false,
+            manifest: None,
         },
         base_dir: PathBuf::from("/tmp"),
         body: "Body with </content> and </skill> markers.".to_string(),
@@ -881,6 +1071,182 @@ fn discover_chars_mode_pins_catalog_budget_regardless_of_window() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn parses_skill_manifest_with_all_fields() {
+    let manifest = parse_skill_manifest(
+        r#"
+tool_deps = ["mcp:exa", "shell"]
+icon = "assets/icon.png"
+prompt_hint = "Use this when navigating the repo."
+"#,
+    )
+    .expect("parse manifest");
+
+    assert_eq!(manifest.tool_deps, vec!["mcp:exa", "shell"]);
+    assert_eq!(manifest.icon, Some(PathBuf::from("assets/icon.png")));
+    assert_eq!(
+        manifest.prompt_hint.as_deref(),
+        Some("Use this when navigating the repo.")
+    );
+}
+
+#[test]
+fn empty_skill_manifest_parses_into_default() {
+    let manifest = parse_skill_manifest("").expect("empty toml parses");
+    assert!(manifest.tool_deps.is_empty());
+    assert!(manifest.icon.is_none());
+    assert!(manifest.prompt_hint.is_none());
+}
+
+#[test]
+fn malformed_skill_manifest_returns_error() {
+    let error = parse_skill_manifest("tool_deps = not a list\n").expect_err("invalid toml");
+    assert!(!error.is_empty());
+}
+
+#[test]
+fn manifest_is_attached_to_summary_during_discovery() {
+    let root = temp_workspace("skills_manifest_attached");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    fs::write(
+        skill_dir.join("skill.toml"),
+        r#"tool_deps = ["mcp:exa"]
+icon = "assets/icon.png"
+prompt_hint = "Use the graph carefully."
+"#,
+    )
+    .expect("write skill.toml");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog.summaries().pop().expect("summary");
+    let manifest = summary.manifest.expect("manifest attached");
+    assert_eq!(manifest.tool_deps, vec!["mcp:exa"]);
+    assert_eq!(manifest.icon, Some(PathBuf::from("assets/icon.png")));
+    assert_eq!(
+        manifest.prompt_hint.as_deref(),
+        Some("Use the graph carefully.")
+    );
+
+    let json = catalog.summaries_json();
+    let entry = &json["skills"][0];
+    assert_eq!(entry["manifest"]["tool_deps"][0], "mcp:exa");
+    assert_eq!(entry["manifest"]["icon"], "assets/icon.png");
+    assert_eq!(entry["manifest"]["prompt_hint"], "Use the graph carefully.");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn manifest_tool_deps_and_hint_surface_in_prompt_block() {
+    let root = temp_workspace("skills_manifest_prompt");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    fs::write(
+        skill_dir.join("skill.toml"),
+        r#"tool_deps = ["mcp:exa", "web_fetch"]
+prompt_hint = "Activate for Rust graph questions."
+"#,
+    )
+    .expect("write skill.toml");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let loaded = catalog.load("rust-nav").expect("load");
+    let block = loaded.prompt_block();
+
+    assert!(block.contains("<manifest>"), "{block}");
+    assert!(block.contains("<tool>mcp:exa</tool>"), "{block}");
+    assert!(block.contains("<tool>web_fetch</tool>"), "{block}");
+    assert!(
+        block.contains("<prompt_hint>Activate for Rust graph questions.</prompt_hint>"),
+        "{block}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_skill_manifest_leaves_summary_unaffected() {
+    let root = temp_workspace("skills_manifest_missing");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog.summaries().pop().expect("summary");
+    assert!(summary.manifest.is_none());
+
+    let loaded = catalog.load("rust-nav").expect("load");
+    assert!(!loaded.prompt_block().contains("<manifest>"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn malformed_skill_manifest_is_skipped_without_dropping_skill() {
+    let root = temp_workspace("skills_manifest_malformed");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    fs::write(skill_dir.join("skill.toml"), "tool_deps = not a list\n").expect("write skill.toml");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog.summaries().pop().expect("summary");
+    assert_eq!(summary.name, "rust-nav");
+    assert!(summary.manifest.is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn empty_skill_manifest_does_not_attach_to_summary() {
+    let root = temp_workspace("skills_manifest_empty_file");
+    let skill_dir = root.join(".squeezy/skills/rust-nav");
+    write_skill(&skill_dir, "rust-nav", "Rust nav", &[]);
+    fs::write(skill_dir.join("skill.toml"), "").expect("write empty skill.toml");
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog.summaries().pop().expect("summary");
+    assert!(summary.manifest.is_none());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn skill_manifest_unknown_keys_are_rejected() {
+    // Strict mode keeps the format auditable: typos in field names must
+    // surface so a misspelled `tools_dep` doesn't silently drop the
+    // declared dependency.
+    let error = parse_skill_manifest("bogus_field = 1\n").expect_err("unknown key");
+    assert!(
+        error.contains("unknown") || error.contains("bogus"),
+        "{error}"
+    );
+}
+
 fn write_skill(dir: &Path, name: &str, description: &str, triggers: &[&str]) {
     write_skill_with_body(dir, name, description, triggers, &format!("# {name}\n"));
 }
@@ -909,4 +1275,196 @@ fn temp_workspace(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("squeezy_{name}_{nonce}"));
     fs::create_dir_all(&path).expect("create temp workspace");
     path
+}
+
+#[derive(Clone, Default)]
+struct SharedLogWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedLogWriter {
+    fn contents(&self) -> String {
+        let bytes = self.buffer.lock().expect("log buffer").clone();
+        String::from_utf8(bytes).expect("logs are UTF-8")
+    }
+}
+
+impl<'writer> MakeWriter<'writer> for SharedLogWriter {
+    type Writer = SharedLogWrite;
+
+    fn make_writer(&'writer self) -> Self::Writer {
+        SharedLogWrite {
+            buffer: self.buffer.clone(),
+        }
+    }
+}
+
+struct SharedLogWrite {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedLogWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer
+            .lock()
+            .expect("log buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_discover_logs(workspace: &Path, config: &SkillsConfig) -> (SkillCatalog, String) {
+    let writer = SharedLogWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(writer.clone())
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let catalog =
+        tracing::subscriber::with_default(subscriber, || SkillCatalog::discover(workspace, config));
+    (catalog, writer.contents())
+}
+
+#[test]
+fn same_precedence_name_collision_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_same_precedence_name");
+    write_skill(
+        &root.join(".squeezy/skills/first"),
+        "rust-nav",
+        "First Rust nav",
+        &[],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/second"),
+        "rust-nav",
+        "Second Rust nav",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(catalog.ambiguous_names().contains("rust-nav"));
+    assert!(
+        logs.contains("same-precedence skill name collision"),
+        "missing same-precedence warning: {logs}"
+    );
+    assert!(
+        logs.contains("name=rust-nav"),
+        "missing skill name field: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn cross_precedence_name_collision_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_cross_precedence_name");
+    write_skill(
+        &root.join(".agents/skills/rust-nav"),
+        "rust-nav",
+        "Compat project Rust nav",
+        &[],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Native project Rust nav",
+        &[],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    // The native-project copy wins; the compat copy is shadowed.
+    let summary = catalog.summaries().pop().expect("summary");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert!(
+        logs.contains("skill name reused at higher precedence"),
+        "missing cross-precedence warning: {logs}"
+    );
+    assert!(
+        logs.contains("overriding_source=\"project\"")
+            || logs.contains("overriding_source=project"),
+        "missing overriding source field: {logs}"
+    );
+    assert!(
+        logs.contains("overridden_source=\"compat_project\"")
+            || logs.contains("overridden_source=compat_project"),
+        "missing overridden source field: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn duplicate_trigger_across_skills_emits_load_time_warning() {
+    let root = temp_workspace("skills_warn_trigger_collision");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/beta"),
+        "beta",
+        "Beta skill",
+        &["GRAPH"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (_catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(
+        logs.contains("duplicate skill trigger"),
+        "missing trigger collision warning: {logs}"
+    );
+    assert!(
+        logs.contains("trigger=graph"),
+        "missing trigger field (case-folded): {logs}"
+    );
+    assert!(
+        logs.contains("\"alpha\"") && logs.contains("\"beta\""),
+        "missing colliding skill names: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn trigger_warning_skips_single_skill_with_repeated_trigger() {
+    let root = temp_workspace("skills_warn_no_self_trigger");
+    write_skill(
+        &root.join(".squeezy/skills/alpha"),
+        "alpha",
+        "Alpha skill",
+        &["graph", "GRAPH"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user"),
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+
+    let (_catalog, logs) = capture_discover_logs(&root, &config);
+    assert!(
+        !logs.contains("duplicate skill trigger"),
+        "trigger collision must require two distinct skills: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }

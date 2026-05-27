@@ -19,6 +19,7 @@ mod bedrock;
 mod compatible;
 mod credentials;
 mod google;
+mod lmstudio;
 pub mod model_discovery;
 mod ollama;
 mod openai;
@@ -34,9 +35,17 @@ pub use tokens::{
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use compatible::OpenAiCompatibleProvider;
-pub use credentials::{KeySource, ResolvedKey, resolve_api_key, resolve_api_key_with_inline};
+pub use credentials::{
+    KeySource, ResolvedKey, delete_api_key, resolve_api_key, resolve_api_key_with_inline,
+};
 pub use google::GoogleProvider;
-pub use ollama::{OllamaProvider, fetch_ollama_context_window, fetch_ollama_model_names};
+pub use lmstudio::{
+    DEFAULT_LMSTUDIO_BASE_URL, LMStudioConfig, LMStudioProvider, fetch_lmstudio_model_names,
+};
+pub use ollama::{
+    OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
+    pull_model,
+};
 pub use openai::OpenAiProvider;
 pub use registry::{
     MODEL_REGISTRY, ModelCapabilities, ModelInfo, ModelLifecycle, ModelLimits, PROVIDERS,
@@ -68,6 +77,13 @@ pub struct LlmRequest {
     /// `lowerToolChoice` pass-through (`openai-chat.ts:172, 267`) and
     /// clear-code's `options.toolChoice` (`claude.ts:1712`).
     pub tool_choice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<LlmOutputSchema>,
+    /// When `Some(false)`, force the OpenAI Responses API to issue tool
+    /// calls serially. `None` leaves the OpenAI default (parallel) in
+    /// place. Only the OpenAI provider currently reads this; other
+    /// providers ignore it.
+    pub parallel_tool_calls: Option<bool>,
 }
 
 impl LlmRequest {
@@ -89,8 +105,23 @@ impl LlmRequest {
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
         }
     }
+}
+
+/// Strict JSON Schema response contract carried on `LlmRequest::output_schema`.
+///
+/// Providers that support structured outputs (OpenAI Responses
+/// `text.format = { type: "json_schema", ... }`) attach this to the request
+/// body; others ignore it. `strict` mirrors OpenAI's "the model MUST emit
+/// JSON that validates" flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmOutputSchema {
+    pub name: String,
+    pub schema: Value,
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

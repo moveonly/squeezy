@@ -20,6 +20,95 @@ fn parses_patch_hunks_as_zero_based_line_ranges() {
 }
 
 #[test]
+fn preview_patch_stream_emits_one_item_per_operation() {
+    let payload = serde_json::json!({
+        "operations": [
+            {
+                "kind": "search_replace",
+                "path": "src/lib.rs",
+                "search": "old_fn",
+                "replace": "new_fn",
+            },
+            {
+                "kind": "create_file",
+                "path": "src/new.rs",
+                "contents": "pub fn hello() {}\n",
+            },
+            {
+                "kind": "delete_file",
+                "path": "src/dead.rs",
+            },
+            {
+                "kind": "move_file",
+                "from": "src/old.rs",
+                "to": "src/new_name.rs",
+            },
+        ],
+    })
+    .to_string();
+
+    let mut emitted: Vec<PatchOpPreview> = Vec::new();
+    let count =
+        preview_patch_stream(&payload, |preview| emitted.push(preview)).expect("preview stream");
+
+    assert_eq!(count, 4, "stream item count must match op count");
+    assert_eq!(emitted.len(), 4);
+    assert_eq!(emitted[0].kind, PatchOpKind::SearchReplace);
+    assert_eq!(emitted[0].path, "src/lib.rs");
+    assert_eq!(emitted[0].index, 0);
+    assert_eq!(
+        emitted[0].search_hash.as_deref(),
+        Some(sha256_hex(b"old_fn").as_str())
+    );
+    assert_eq!(
+        emitted[0].replace_hash.as_deref(),
+        Some(sha256_hex(b"new_fn").as_str())
+    );
+    assert_eq!(emitted[1].kind, PatchOpKind::CreateFile);
+    assert_eq!(emitted[1].path, "src/new.rs");
+    assert_eq!(
+        emitted[1].contents_hash.as_deref(),
+        Some(sha256_hex(b"pub fn hello() {}\n").as_str())
+    );
+    assert_eq!(emitted[2].kind, PatchOpKind::DeleteFile);
+    assert_eq!(emitted[2].path, "src/dead.rs");
+    assert_eq!(emitted[3].kind, PatchOpKind::MoveFile);
+    assert_eq!(emitted[3].path, "src/new_name.rs");
+    assert_eq!(emitted[3].from_path.as_deref(), Some("src/old.rs"));
+    for (expected_index, preview) in emitted.iter().enumerate() {
+        assert_eq!(preview.index, expected_index);
+    }
+}
+
+#[test]
+fn preview_patch_stream_supports_legacy_patches_array() {
+    let payload = serde_json::json!({
+        "patches": [
+            { "path": "a.txt", "search": "x", "replace": "y" },
+            { "path": "b.txt", "search": "p", "replace": "q" },
+        ],
+    })
+    .to_string();
+    let mut emitted: Vec<PatchOpPreview> = Vec::new();
+    let count =
+        preview_patch_stream(&payload, |preview| emitted.push(preview)).expect("preview stream");
+    assert_eq!(count, 2);
+    assert!(
+        emitted
+            .iter()
+            .all(|preview| preview.kind == PatchOpKind::SearchReplace)
+    );
+    assert_eq!(emitted[0].path, "a.txt");
+    assert_eq!(emitted[1].path, "b.txt");
+}
+
+#[test]
+fn preview_patch_stream_rejects_non_json() {
+    let outcome = preview_patch_stream("{not valid", |_| {});
+    assert!(outcome.is_err());
+}
+
+#[test]
 fn parses_numstat_with_binary_counts() {
     let parsed = parse_numstat(b"2\t3\tsrc/lib.rs\0-\t-\timage.png\0");
     assert_eq!(parsed["src/lib.rs"].additions, 2);
@@ -610,6 +699,114 @@ fn shadow_repo_ignores_user_hooks() {
         !marker_path.exists(),
         "shadow-repo writes must not invoke user hooks at {hooks_dir:?}"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn shadow_repo_lock_is_created_on_open_and_removed_on_close() {
+    let root = temp_repo("shadow_repo_lock_lifecycle");
+    fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+    let lock_path = root
+        .join(".squeezy")
+        .join("checkpoints")
+        .join(SHADOW_LOCK_FILENAME);
+
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    assert!(
+        lock_path.exists(),
+        "shadow-repo lock file must exist while the store is open at {lock_path:?}"
+    );
+    let lock_body = fs::read_to_string(&lock_path).expect("read lock");
+    let recorded_pid: u32 = lock_body
+        .lines()
+        .next()
+        .and_then(|line| line.parse().ok())
+        .expect("lock file must record our pid on the first line");
+    assert_eq!(recorded_pid, std::process::id());
+
+    drop(store);
+    assert!(
+        !lock_path.exists(),
+        "shadow-repo lock file must be removed when the store is dropped"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn shadow_repo_open_rejects_concurrent_process_lock() {
+    let root = temp_repo("shadow_repo_concurrent_lock");
+    fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+
+    let first = CheckpointStore::open(&root).expect("first checkpoint store");
+    let err = CheckpointStore::open(&root)
+        .expect_err("second open must fail while the first store holds the lock");
+    let message = format!("{err}");
+    assert!(
+        message.contains("shadow-repo lock"),
+        "expected lock-held error, got: {message}"
+    );
+
+    drop(first);
+    let second = CheckpointStore::open(&root).expect("re-open after lock released");
+    drop(second);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn shadow_repo_open_cleans_stale_orphan_dirs() {
+    let root = temp_repo("shadow_repo_stale_cleanup");
+    fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+    // Pre-create `.squeezy/checkpoints/` so we can plant a stale entry
+    // before the store ever opens.
+    let checkpoints_dir = root.join(".squeezy").join("checkpoints");
+    fs::create_dir_all(&checkpoints_dir).expect("pre-create checkpoints dir");
+    let stale_dir = checkpoints_dir.join("orphan-scratch");
+    fs::create_dir_all(&stale_dir).expect("create orphan dir");
+    fs::write(stale_dir.join("payload"), b"old").expect("write orphan payload");
+    let stale_lock = checkpoints_dir.join("crashed-process.lock");
+    fs::write(&stale_lock, b"99999\n").expect("write stale lock");
+    let recent_dir = checkpoints_dir.join("recent-scratch");
+    fs::create_dir_all(&recent_dir).expect("create recent orphan dir");
+
+    let stale_at = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(
+            (SHADOW_STALE_DIR_RETENTION_DAYS + 1) * 24 * 60 * 60,
+        ))
+        .expect("stale instant");
+    fs::File::open(&stale_dir)
+        .expect("open stale dir")
+        .set_modified(stale_at)
+        .expect("backdate stale dir mtime");
+    fs::File::options()
+        .write(true)
+        .open(&stale_lock)
+        .expect("open stale lock for mtime")
+        .set_modified(stale_at)
+        .expect("backdate stale lock mtime");
+
+    let store = CheckpointStore::open(&root).expect("checkpoint store");
+    assert!(
+        !stale_dir.exists(),
+        "stale orphan directory must be removed on open"
+    );
+    assert!(
+        !stale_lock.exists(),
+        "stale lock file must be removed on open"
+    );
+    assert!(
+        recent_dir.exists(),
+        "recent orphan directory must not be removed on open"
+    );
+    assert!(
+        checkpoints_dir.join("git").exists(),
+        "shadow `git/` directory must survive cleanup"
+    );
+    drop(store);
 
     let _ = fs::remove_dir_all(root);
 }

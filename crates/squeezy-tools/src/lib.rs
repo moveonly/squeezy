@@ -73,6 +73,7 @@ use patch::{
     PlanPatchArgs, SearchReplaceFallback,
 };
 use schema::compact_tool_parameters;
+pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
 #[cfg(test)]
 pub(crate) use shell::{
@@ -1285,6 +1286,14 @@ impl ToolRegistry {
 
     pub fn set_mcp_elicitation_handler(&self, handler: Option<McpElicitationHandler>) {
         self.mcp.set_elicitation_handler(handler);
+    }
+
+    /// Plumb the host's MCP approval policy into the MCP client so it can
+    /// short-circuit elicitations the user has globally denied and avoid
+    /// silently auto-accepting empty-form prompts when the user expects to
+    /// be asked first.
+    pub fn set_mcp_elicitation_policy(&self, policy: squeezy_core::PermissionMode) {
+        self.mcp.set_elicitation_policy(policy);
     }
 
     fn mcp_tool(&self, name: &str) -> Option<ExternalMcpTool> {
@@ -3576,6 +3585,7 @@ pub(crate) struct ShellPermissionAnalysis {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct VerifyArgs {
     scope: Option<VerifyScope>,
     level: Option<VerifyLevel>,
@@ -3583,6 +3593,7 @@ struct VerifyArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RefreshCompilerFactsArgs {
     diagnostics: Option<bool>,
 }
@@ -3625,14 +3636,17 @@ impl OutputMode {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ListSkillsArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoadSkillArgs {
     name: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotesRememberArgs {
     kind: String,
     text: String,
@@ -3643,6 +3657,7 @@ struct NotesRememberArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NotesRecallArgs {
     query: String,
     #[serde(default)]
@@ -3650,6 +3665,7 @@ struct NotesRecallArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ObservationsArgs {
     #[serde(default)]
     query: Option<String>,
@@ -3669,18 +3685,21 @@ fn parse_observation_kind(raw: &str) -> Option<ObservationKind> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpListResourcesArgs {
     server: String,
     cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct McpReadResourceArgs {
     server: String,
     uri: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WriteFileArgs {
     path: String,
     content: String,

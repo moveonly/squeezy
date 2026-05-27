@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
-    ReasoningPayload,
+    LlmEvent, LlmInputItem, LlmOutputSchema, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
+    ReasoningKind, ReasoningPayload,
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -90,8 +90,18 @@ impl OpenAiProvider {
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
         }
+        let mut text = serde_json::Map::new();
         if let Some(response_verbosity) = request.response_verbosity {
-            body["text"] = json!({ "verbosity": openai_text_verbosity(response_verbosity) });
+            text.insert(
+                "verbosity".to_string(),
+                json!(openai_text_verbosity(response_verbosity)),
+            );
+        }
+        if let Some(schema) = request.output_schema.as_ref() {
+            text.insert("format".to_string(), openai_text_format(schema));
+        }
+        if !text.is_empty() {
+            body["text"] = Value::Object(text);
         }
         // The o-series and gpt-5.x models reason internally regardless of
         // whether the caller picks an effort level; the API just won't stream
@@ -136,6 +146,15 @@ impl OpenAiProvider {
                 body["tool_choice"] = json!(choice);
             }
         }
+        if let Some(parallel) = request.parallel_tool_calls {
+            // OpenAI's Responses API defaults to parallel tool calls; only
+            // forward an explicit override when the caller opts out
+            // (`Some(false)`) so the request body stays compact for the
+            // common case.
+            if !parallel {
+                body["parallel_tool_calls"] = json!(false);
+            }
+        }
         body
     }
 }
@@ -146,6 +165,15 @@ fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
         ResponseVerbosity::Normal => "medium",
         ResponseVerbosity::Verbose => "high",
     }
+}
+
+fn openai_text_format(schema: &LlmOutputSchema) -> Value {
+    json!({
+        "type": "json_schema",
+        "name": schema.name,
+        "strict": schema.strict,
+        "schema": schema.schema,
+    })
 }
 
 impl LlmProvider for OpenAiProvider {

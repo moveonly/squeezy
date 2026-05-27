@@ -13,6 +13,14 @@
 #                         https://github.com/esqueezy/squeezy/releases/download.
 #                         Mainly useful for CI smoke tests against a local
 #                         file:// mirror.
+#   SQUEEZY_INSTALL_CHECKSUM_BASE_URL
+#                         Base URL the matching .sha256 sidecar is downloaded
+#                         from. When set, the checksum is fetched from
+#                         ${SQUEEZY_INSTALL_CHECKSUM_BASE_URL}/${tag}/${archive}.sha256
+#                         instead of alongside the archive. This lets the
+#                         checksum live on a second origin so a single-origin
+#                         compromise (e.g. release-publish token theft on
+#                         github.com) cannot swap both files.
 #   SQUEEZY_GPG_KEY_PATH  Path to the Squeezy release public key. When this
 #                         file is present and gpg is installed, the release
 #                         archive's .asc signature is verified after the
@@ -27,6 +35,7 @@ LATEST_API_URL="https://api.github.com/repos/${REPO}/releases/latest"
 INSTALL_DIR="${SQUEEZY_INSTALL_DIR:-$HOME/.local/bin}"
 TAG="${SQUEEZY_INSTALL_TAG:-}"
 BASE_URL="${SQUEEZY_INSTALL_BASE_URL:-$DEFAULT_BASE_URL}"
+CHECKSUM_BASE_URL="${SQUEEZY_INSTALL_CHECKSUM_BASE_URL:-$BASE_URL}"
 GPG_KEY_PATH="${SQUEEZY_GPG_KEY_PATH:-$HOME/.squeezy/release-key.gpg}"
 
 err() {
@@ -81,7 +90,8 @@ detect_target() {
     Linux)
       case "$arch" in
         x86_64|amd64) echo "x86_64-unknown-linux-musl" ;;
-        *) err "unsupported Linux architecture: $arch (only x86_64 is published)" ;;
+        arm64|aarch64) echo "aarch64-unknown-linux-musl" ;;
+        *) err "unsupported Linux architecture: $arch" ;;
       esac
       ;;
     *)
@@ -109,8 +119,12 @@ tag="$(resolve_tag)"
 
 archive="squeezy-${target}.tar.gz"
 archive_url="${BASE_URL}/${tag}/${archive}"
-checksum_url="${archive_url}.sha256"
+checksum_url="${CHECKSUM_BASE_URL}/${tag}/${archive}.sha256"
 signature_url="${archive_url}.asc"
+
+if [ "$CHECKSUM_BASE_URL" != "$BASE_URL" ]; then
+  info "checksum origin: $CHECKSUM_BASE_URL (split from archive origin)"
+fi
 
 tmpdir="$(mktemp -d 2>/dev/null || mktemp -d -t squeezy-install)"
 cleanup() { rm -rf "$tmpdir"; }

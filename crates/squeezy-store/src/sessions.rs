@@ -1,4 +1,5 @@
 use std::{
+    env,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -16,12 +17,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, Result, SessionMetrics,
-    SessionMode, SqueezyError, TranscriptItem,
+    AppConfig, ContextAttachment, ContextCompactionState, CostSnapshot, ReasoningPayload, Result,
+    SessionMetrics, SessionMode, SqueezyError, TranscriptItem,
 };
 
 static NEXT_SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub const SESSION_REPLAY_SCHEMA_VERSION: u32 = 1;
+/// Schema version stamped onto every `RolloutEvent` emitted by
+/// [`SessionStore::bundle_rollout_trace`]. The reducer is additive over
+/// `events.jsonl` + `replay.jsonl`, so bumping this only requires changing
+/// the merge logic or the wire shape of `RolloutEvent` itself.
+pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
@@ -30,6 +36,7 @@ pub const ARCHIVED_SUBDIR: &str = "archived";
 pub struct SessionStore {
     root: PathBuf,
     retention_days: u64,
+    retention_archive_days: u64,
     max_event_bytes: usize,
     max_session_bytes: usize,
 }
@@ -40,6 +47,7 @@ impl SessionStore {
         Self {
             root,
             retention_days: config.session_logs.log_retention_days,
+            retention_archive_days: config.session_logs.log_retention_archive_days,
             max_event_bytes: config.session_logs.max_event_bytes,
             max_session_bytes: config.session_logs.max_session_bytes,
         }
@@ -75,6 +83,88 @@ impl SessionStore {
     ) -> Result<()> {
         fs::create_dir_all(&self.root)?;
         write_json(&self.calibration_path(), calibration)
+    }
+
+    /// Path to the user-global memory file. Returns `None` when `HOME` is
+    /// unset — the same condition under which the agent's prompt-side
+    /// ingestion (`ingest_user_memory`) declines to do anything. The file
+    /// itself is the single static memory store described in
+    /// `docs/internal/MEMORY_SCOPE.md`; this primitive does not introduce a
+    /// new directory or partition scheme.
+    pub fn memory_path() -> Option<PathBuf> {
+        let home = env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".squeezy").join("memory.md"))
+    }
+
+    /// Append one normalized line to the user-global memory file
+    /// (`~/.squeezy/memory.md`). The input is trimmed; empty input is a
+    /// no-op that returns `Ok(0)`. The store ensures the file ends with a
+    /// newline before the append so each `remember` call sits on its own
+    /// line and the byte-cap ingestion path stays predictable. Returns
+    /// the number of bytes appended (line body plus the trailing newline).
+    ///
+    /// This is the canonical cross-session memory write primitive; higher
+    /// layers (e.g. the deferred `memory_append` tool from
+    /// `MEMORY_SCOPE.md`) wrap this rather than re-implement the path or
+    /// the newline discipline.
+    pub fn remember(line: &str) -> Result<usize> {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+        let Some(path) = Self::memory_path() else {
+            return Err(SqueezyError::Agent(
+                "remember requires HOME to be set to locate ~/.squeezy/memory.md".to_string(),
+            ));
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let needs_leading_newline = match fs::metadata(&path) {
+            Ok(meta) if meta.len() > 0 => !memory_file_ends_with_newline(&path)?,
+            _ => false,
+        };
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut written = 0;
+        if needs_leading_newline {
+            file.write_all(b"\n")?;
+            written += 1;
+        }
+        file.write_all(trimmed.as_bytes())?;
+        file.write_all(b"\n")?;
+        written += trimmed.len() + 1;
+        Ok(written)
+    }
+
+    /// Read the user-global memory file (`~/.squeezy/memory.md`) and
+    /// return its body truncated to `max_bytes` at a char boundary,
+    /// appending `\n[truncated]` when the file is larger than the cap.
+    /// Matches the semantics of the agent's prompt-side
+    /// `ingest_user_memory` so call sites can rely on a single source of
+    /// truth for the recall shape. Returns `None` when ingestion is
+    /// disabled (`max_bytes == 0`), `HOME` is unset, or the file is
+    /// absent / empty / unreadable. Errors are silent on purpose — recall
+    /// is best-effort enrichment, never load-bearing.
+    pub fn recall(max_bytes: usize) -> Option<String> {
+        if max_bytes == 0 {
+            return None;
+        }
+        let path = Self::memory_path()?;
+        let body = fs::read_to_string(&path).ok()?;
+        if body.is_empty() {
+            return None;
+        }
+        if body.len() <= max_bytes {
+            return Some(body);
+        }
+        let mut end = max_bytes;
+        while end > 0 && !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut truncated = String::with_capacity(end + "\n[truncated]".len());
+        truncated.push_str(&body[..end]);
+        truncated.push_str("\n[truncated]");
+        Some(truncated)
     }
 
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
@@ -245,7 +335,7 @@ impl SessionStore {
     }
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
-        let dir = self.session_dir(session_id);
+        let dir = self.locate_session_dir(session_id);
         let metadata = read_json(&dir.join("metadata.json"))?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
@@ -263,13 +353,58 @@ impl SessionStore {
 
     pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
         let (events, warnings) =
-            read_replay_jsonl(&self.session_dir(session_id).join("replay.jsonl"))?;
+            read_replay_jsonl(&self.locate_session_dir(session_id).join("replay.jsonl"))?;
         Ok(SessionReplayTape {
             schema_version: SESSION_REPLAY_SCHEMA_VERSION,
             session_id: session_id.to_string(),
             events,
             warnings,
         })
+    }
+
+    /// Resolve the on-disk directory for a session whether it currently
+    /// lives under the live root or under `archived/<id>/`. Used by
+    /// read-only callers (`show`, `replay_tape`) so an archived session
+    /// stays inspectable; producers continue to use [`Self::session_dir`]
+    /// so they create new sessions under the live root.
+    fn locate_session_dir(&self, session_id: &str) -> PathBuf {
+        let live = self.session_dir(session_id);
+        if live.exists() {
+            return live;
+        }
+        let archived = self.root.join(ARCHIVED_SUBDIR).join(session_id);
+        if archived.exists() {
+            return archived;
+        }
+        // No directory exists at either location. Return the live path
+        // so downstream `read_*` calls produce a consistent "not found"
+        // error rather than a spurious archive-tree error message.
+        live
+    }
+
+    /// Merge the session's `events.jsonl` and `replay.jsonl` into a single
+    /// ordered, normalized [`RolloutEvent`] stream. Stable-sorted on
+    /// `(ts_unix_ms, source, sequence_or_insertion)`; within a tied
+    /// millisecond the replay tape sorts before the lifecycle event.
+    pub fn bundle_rollout_trace(&self, session_id: &str) -> Result<Vec<RolloutEvent>> {
+        let dir = self.locate_session_dir(session_id);
+        let (events, _event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
+        let (replay, _replay_warnings) = read_replay_jsonl(&dir.join("replay.jsonl"))?;
+
+        let mut bundle: Vec<RolloutEvent> = Vec::with_capacity(events.len() + replay.len());
+        for (insertion, event) in events.into_iter().enumerate() {
+            bundle.push(RolloutEvent::from_session_event(event, insertion));
+        }
+        for replay_event in replay {
+            bundle.push(RolloutEvent::from_replay_event(replay_event));
+        }
+        bundle.sort_by(|left, right| {
+            left.ts_unix_ms
+                .cmp(&right.ts_unix_ms)
+                .then_with(|| left.source_order().cmp(&right.source_order()))
+                .then_with(|| left.tie_breaker().cmp(&right.tie_breaker()))
+        });
+        Ok(bundle)
     }
 
     pub fn export(&self, session_id: &str) -> Result<Value> {
@@ -294,28 +429,65 @@ impl SessionStore {
     /// Like [`cleanup`] but skips `protected_id` even if it would otherwise
     /// match (used to keep the currently active session from being removed
     /// out from under a live agent).
+    ///
+    /// Live sessions that expire (or that the caller names in `ids`) are
+    /// *archived* — moved to `archived/<id>/` and flipped to
+    /// `SessionStatus::Archived` — instead of being deleted outright.
+    /// Sessions that have already been archived for longer than
+    /// `retention_archive_days` are then permanently deleted in the same
+    /// sweep. This gives users a window to recover a session that the
+    /// retention policy would otherwise destroy: live retention reduces
+    /// disk pressure, archive retention bounds the recoverable history.
+    /// Setting `retention_archive_days` to `0` disables the archive sweep
+    /// so archived sessions are kept until the user removes them by hand.
     pub fn cleanup_excluding(
         &self,
         ids: &[String],
         protected_id: Option<&str>,
     ) -> Result<CleanupReport> {
+        let mut archived = Vec::new();
         let mut removed = Vec::new();
         let cutoff = now_ms().saturating_sub(self.retention_days.saturating_mul(86_400_000));
         let explicit: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
-        for metadata in self.list(&SessionQuery::default())? {
+        for metadata in self.list(&SessionQuery {
+            include_archived: true,
+            ..SessionQuery::default()
+        })? {
             if protected_id == Some(metadata.session_id.as_str()) {
                 continue;
             }
-            let is_explicit = explicit.contains(metadata.session_id.as_str());
-            // Archived sessions are explicit user keepers: skip them in
-            // every retention sweep, even when listed in `ids`. Callers
-            // that want to permanently delete must unarchive first.
             if matches!(metadata.status, SessionStatus::Archived) {
+                // Archived sessions exist purely so users can recover
+                // history that retention would otherwise have destroyed.
+                // Hard-deleting them on explicit `ids` would defeat that;
+                // the only path that removes them is the archive retention
+                // sweep below, which fires when both the days threshold
+                // is non-zero and the session has been archived long
+                // enough. Until then, callers that truly want to delete
+                // must unarchive first and then run cleanup again.
+                if self.retention_archive_days == 0 {
+                    continue;
+                }
+                let archive_cutoff =
+                    now_ms().saturating_sub(self.retention_archive_days.saturating_mul(86_400_000));
+                // `ended_at_ms` is set when `archive_session` flips the
+                // status, so it is the right "time of archival" anchor.
+                // Fall back to `started_at_ms` for sessions archived by
+                // older code paths that may not have populated it.
+                let archived_at = metadata.ended_at_ms.unwrap_or(metadata.started_at_ms);
+                if archived_at < archive_cutoff {
+                    let dir = self.root.join(ARCHIVED_SUBDIR).join(&metadata.session_id);
+                    if dir.exists() {
+                        fs::remove_dir_all(&dir)?;
+                    }
+                    removed.push(metadata.session_id);
+                }
                 continue;
             }
+            let is_explicit = explicit.contains(metadata.session_id.as_str());
             // Never sweep a `Running` session through retention alone: it may
             // belong to a long-lived process whose `ended_at_ms` simply isn't
-            // set yet. Explicit ids still win so users can force-remove a
+            // set yet. Explicit ids still win so users can force-archive a
             // crashed or stuck session.
             let expired = match metadata.ended_at_ms {
                 Some(end) => end < cutoff,
@@ -325,19 +497,29 @@ impl SessionStore {
                 }
             };
             if is_explicit || expired {
-                let dir = self.session_dir(&metadata.session_id);
-                fs::remove_dir_all(&dir)?;
-                removed.push(metadata.session_id);
+                // `archive_session` is idempotent for the live -> archived
+                // move; a destination collision means another caller raced
+                // us, which we surface so the operator can investigate.
+                self.archive_session(&metadata.session_id)?;
+                archived.push(metadata.session_id);
             }
         }
-        Ok(CleanupReport { removed })
+        Ok(CleanupReport { archived, removed })
     }
 
+    /// Soft-delete that prefers archiving over permanent removal.
+    /// Live sessions are moved into `archived/<id>/` (same path as
+    /// [`archive_session`]); archived sessions are left in place because
+    /// the retention sweep is the only path that permanently deletes
+    /// history. Missing sessions are a no-op so callers can drive this
+    /// from a stale id without erroring.
     pub fn remove_session(&self, session_id: &str) -> Result<()> {
-        let dir = self.session_dir(session_id);
-        if dir.exists() {
-            fs::remove_dir_all(dir)?;
+        let live_dir = self.session_dir(session_id);
+        if live_dir.exists() {
+            return self.archive_session(session_id);
         }
+        // Already archived (or never existed) — nothing to do. The
+        // archive retention sweep handles the eventual hard delete.
         Ok(())
     }
 
@@ -940,6 +1122,120 @@ pub struct SessionReplayTape {
     pub warnings: u64,
 }
 
+/// Discriminator for [`RolloutEvent`] — tells consumers which of the two
+/// underlying logs (`events.jsonl` vs `replay.jsonl`) the entry originated
+/// from. Stored as a tag in the serialised form so JSONL exports remain
+/// self-describing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutEventSource {
+    /// Originated from `events.jsonl` (coarse session-lifecycle events).
+    Event,
+    /// Originated from `replay.jsonl` (fine-grained per-turn replay tape).
+    Replay,
+}
+
+/// Normalized rollout-trace entry: one item per row in the merged
+/// `events.jsonl` + `replay.jsonl` stream, with its provenance preserved.
+///
+/// `RolloutEvent` is the output shape of [`SessionStore::bundle_rollout_trace`].
+/// The `payload` keeps the raw JSON Squeezy already persisted; the typed
+/// `event_kind` / `replay_kind` enums are populated when the row's
+/// discriminator matches a known variant so consumers don't have to re-parse
+/// the payload to dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RolloutEvent {
+    pub schema_version: u32,
+    pub source: RolloutEventSource,
+    pub ts_unix_ms: u64,
+    /// Strictly-monotonic sequence assigned by the replay writer. Zero for
+    /// entries that came from `events.jsonl` (which has no sequence column).
+    pub sequence: u64,
+    pub turn_id: Option<String>,
+    pub summary: Option<String>,
+    /// Free-form discriminator from the source log. Mirrors
+    /// `SessionEvent.kind` for events and the snake_case rendering of
+    /// `SessionReplayEventKind` for replay rows. Always populated.
+    pub kind: String,
+    /// Typed view of the row when it came from `events.jsonl` and the
+    /// discriminator matched a known [`SessionEventKind`] variant.
+    pub event_kind: Option<SessionEventKind>,
+    /// Typed view of the row when it came from `replay.jsonl`.
+    pub replay_kind: Option<SessionReplayEventKind>,
+    /// Content-addressed digest of `payload`, only present on replay rows
+    /// (events.jsonl entries do not carry one).
+    pub payload_sha256: Option<String>,
+    pub payload: Value,
+}
+
+impl RolloutEvent {
+    /// Sort key for the source discriminator. Replay rows sort before events
+    /// in the same millisecond so the granular per-turn flow precedes the
+    /// coarse lifecycle summary it produced.
+    fn source_order(&self) -> u8 {
+        match self.source {
+            RolloutEventSource::Replay => 0,
+            RolloutEventSource::Event => 1,
+        }
+    }
+
+    /// Secondary sort key. Replay rows already carry a strictly-monotonic
+    /// `sequence`; event rows fall back to their insertion index so the
+    /// `events.jsonl` order is preserved.
+    fn tie_breaker(&self) -> u64 {
+        self.sequence
+    }
+
+    fn from_session_event(event: SessionEvent, insertion: usize) -> Self {
+        let kind = event.kind.clone();
+        let event_kind = SessionEventKind::try_from_event(&event);
+        Self {
+            schema_version: ROLLOUT_TRACE_SCHEMA_VERSION,
+            source: RolloutEventSource::Event,
+            ts_unix_ms: event.ts_unix_ms,
+            sequence: insertion as u64,
+            turn_id: event.turn_id,
+            summary: event.summary,
+            kind,
+            event_kind,
+            replay_kind: None,
+            payload_sha256: None,
+            payload: event.payload,
+        }
+    }
+
+    fn from_replay_event(event: SessionReplayEvent) -> Self {
+        Self {
+            schema_version: ROLLOUT_TRACE_SCHEMA_VERSION,
+            source: RolloutEventSource::Replay,
+            ts_unix_ms: event.ts_unix_ms,
+            sequence: event.sequence,
+            turn_id: event.turn_id,
+            summary: None,
+            kind: replay_kind_discriminator(event.kind).to_string(),
+            event_kind: None,
+            replay_kind: Some(event.kind),
+            payload_sha256: Some(event.payload_sha256),
+            payload: event.payload,
+        }
+    }
+}
+
+fn replay_kind_discriminator(kind: SessionReplayEventKind) -> &'static str {
+    match kind {
+        SessionReplayEventKind::UserMessage => "user_message",
+        SessionReplayEventKind::ModelRequest => "model_request",
+        SessionReplayEventKind::ModelStarted => "model_started",
+        SessionReplayEventKind::ModelTextDelta => "model_text_delta",
+        SessionReplayEventKind::ModelToolCall => "model_tool_call",
+        SessionReplayEventKind::ModelCompleted => "model_completed",
+        SessionReplayEventKind::ModelCancelled => "model_cancelled",
+        SessionReplayEventKind::ToolCall => "tool_call",
+        SessionReplayEventKind::ToolResult => "tool_result",
+        SessionReplayEventKind::CostDecision => "cost_decision",
+    }
+}
+
 impl SessionEvent {
     pub fn new(
         kind: impl Into<String>,
@@ -1040,6 +1336,15 @@ pub enum SessionEventKind {
         #[serde(default)]
         conversation: Vec<ResumeItem>,
     },
+    /// Provider-tagged reasoning blob emitted at the end of each reasoning
+    /// segment (one per `LlmEvent::ReasoningDone`). Persisted so the
+    /// `events.jsonl` replay fallback can rebuild the same `ResumeItem::Reasoning`
+    /// items that `resume_state.json` would have produced, preserving
+    /// the model's prior chain-of-thought (including OpenAI
+    /// `encrypted_content` and Anthropic/Google signed blocks) across resume.
+    Reasoning {
+        payload: ReasoningPayload,
+    },
     ApprovalRequested {
         #[serde(default)]
         tool: String,
@@ -1080,6 +1385,7 @@ impl SessionEventKind {
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
             Self::ContextCompacted { .. } => "context_compacted",
+            Self::Reasoning { .. } => "reasoning",
             Self::ApprovalRequested { .. } => "approval_requested",
             Self::ApprovalDecided { .. } => "approval_decided",
             Self::SessionStarted => "session_started",
@@ -1231,8 +1537,17 @@ pub struct SessionRecord {
     pub replay: Option<SessionReplayTape>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CleanupReport {
+    /// Live sessions that were moved into `archived/<id>/` by this
+    /// sweep. They still exist on disk and can be restored with
+    /// [`SessionStore::unarchive_session`] until the archive retention
+    /// sweep deletes them.
+    #[serde(default)]
+    pub archived: Vec<String>,
+    /// Sessions that were permanently deleted by this sweep. Only the
+    /// archive retention sweep populates this list: live sessions
+    /// always move through `archived/` first.
     pub removed: Vec<String>,
 }
 
@@ -1252,6 +1567,22 @@ fn resolve_workspace_path(root: &Path, path: &Path) -> PathBuf {
     } else {
         root.join(path)
     }
+}
+
+/// Return whether the file at `path` ends with a `\n` byte. Used by the
+/// memory append path to keep each remembered line on its own row even
+/// when the user (or an earlier tool) left a trailing-newline-less file.
+fn memory_file_ends_with_newline(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut buf = [0u8; 1];
+    file.read_exact(&mut buf)?;
+    Ok(buf[0] == b'\n')
 }
 
 fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
@@ -1356,6 +1687,9 @@ fn apply_event_to_replay(
         // no `conversation` field, so we treat it as a no-op and let the
         // linear replay continue.
         SessionEventKind::ContextCompacted { .. } => {}
+        SessionEventKind::Reasoning { payload } => {
+            conversation.push(ResumeItem::Reasoning { payload });
+        }
         // Approval and session-lifecycle events are bookkeeping rather
         // than conversation items; they do not modify the resume state's
         // conversation/transcript but still need to be enumerated so the

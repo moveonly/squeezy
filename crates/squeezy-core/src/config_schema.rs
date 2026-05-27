@@ -15,13 +15,14 @@ use crate::{
     DEFAULT_MAX_PARALLEL_TOOLS, DEFAULT_MAX_SEARCH_FILES_PER_TURN,
     DEFAULT_MAX_TOOL_BYTES_READ_PER_TURN, DEFAULT_MAX_TOOL_CALLS_PER_TURN, DEFAULT_OLLAMA_MODEL,
     DEFAULT_OPENAI_MODEL, DEFAULT_REPORT_ENDPOINT, DEFAULT_REPORT_MAX_BYTES,
-    DEFAULT_SESSION_LOG_RETENTION_DAYS, DEFAULT_SESSION_MAX_EVENT_BYTES,
-    DEFAULT_SESSION_MAX_SESSION_BYTES, DEFAULT_STREAM_IDLE_TIMEOUT_MS,
-    DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS, DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS, DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL,
-    DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL, DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS,
-    OpenAiCompatiblePreset, PermissionMode, ProviderConfig, ReasoningEffort, ResponseVerbosity,
-    SessionMode, StatusVerbosity, ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
+    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS, DEFAULT_SESSION_LOG_RETENTION_DAYS,
+    DEFAULT_SESSION_MAX_EVENT_BYTES, DEFAULT_SESSION_MAX_SESSION_BYTES,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS, DEFAULT_SUBAGENT_MAX_MODEL_ROUNDS,
+    DEFAULT_SUBAGENT_MAX_SEARCH_FILES_PER_CALL, DEFAULT_SUBAGENT_MAX_SUMMARY_TOKENS,
+    DEFAULT_SUBAGENT_MAX_TOOL_BYTES_READ_PER_CALL, DEFAULT_SUBAGENT_MAX_TOOL_CALLS_PER_CALL,
+    DEFAULT_TELEMETRY_ENDPOINT, DEFAULT_TICK_RATE_MS, OpenAiCompatiblePreset, PermissionMode,
+    ProviderConfig, ReasoningEffort, ResponseVerbosity, SessionMode, StatusVerbosity,
+    ToolOutputVerbosity, TranscriptDefault, TuiAlternateScreen,
 };
 
 /// When a save takes effect.
@@ -948,7 +949,24 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 set: set_session_log_retention_days,
                 default_display: "30 days",
                 default: || FieldValue::Integer(DEFAULT_SESSION_LOG_RETENTION_DAYS as i64),
-                help: "Session logs older than this are pruned at startup.",
+                help: "Live session logs older than this are archived at startup.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
+                label: "log_retention_archive_days",
+                toml_path: &["session", "log_retention_archive_days"],
+                kind: FieldKind::Integer {
+                    min: 0,
+                    max: 3650,
+                    suffix: Some("days"),
+                },
+                tier: ApplyTier::Restart,
+                get: get_session_log_retention_archive_days,
+                set: set_session_log_retention_archive_days,
+                default_display: "30 days",
+                default: || FieldValue::Integer(DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS as i64),
+                help: "Archived sessions older than this are permanently deleted; 0 disables the archive sweep.",
                 env_override: None,
                 secret: false,
             },
@@ -1969,6 +1987,24 @@ fn set_session_log_retention_days(
         return Err("must be >= 1");
     }
     cfg.session_logs.log_retention_days = v as u64;
+    Ok(())
+}
+
+fn get_session_log_retention_archive_days(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Integer(cfg.session_logs.log_retention_archive_days as i64)
+}
+fn set_session_log_retention_archive_days(
+    cfg: &mut AppConfig,
+    value: FieldValue,
+) -> Result<(), &'static str> {
+    let v = match value {
+        FieldValue::Integer(v) => v,
+        _ => return Err("expects integer"),
+    };
+    if v < 0 {
+        return Err("must be >= 0");
+    }
+    cfg.session_logs.log_retention_archive_days = v as u64;
     Ok(())
 }
 
