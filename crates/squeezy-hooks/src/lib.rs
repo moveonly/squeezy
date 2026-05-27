@@ -35,7 +35,7 @@ use serde_json::Value;
 /// [`HookEvent::PostCompact`] are currently dispatched; the remaining
 /// variants are reserved so handler implementations can statically
 /// declare interest in them before the agent wires the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum HookEvent {
     /// Fired once per turn, immediately before the LLM request is sent.
     PreTurn,

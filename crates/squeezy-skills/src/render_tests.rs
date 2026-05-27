@@ -1,6 +1,5 @@
 use super::*;
 use crate::{SkillContextMode, SkillSource, SkillSummary};
-use crate::{SkillSource, SkillSummary};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 

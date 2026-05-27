@@ -1637,6 +1637,7 @@ fn register_skill_hooks_installs_one_handler_per_spec() {
             location: PathBuf::from("/tmp/SKILL.md"),
             disabled: false,
             manifest: None,
+            context_mode: SkillContextMode::Inline,
         },
         base_dir: PathBuf::from("/tmp"),
         body: String::new(),

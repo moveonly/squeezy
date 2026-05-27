@@ -912,6 +912,7 @@ fn parse_frontmatter(lines: &[&str]) -> std::result::Result<SkillMetadata, Strin
         when_to_use,
         triggers,
         context_mode,
+        hooks,
     })
 }
 
@@ -962,7 +963,7 @@ fn parse_hooks_block(rest: &[&str], out: &mut BTreeMap<HookEvent, Vec<SkillHookM
         if !matchers.is_empty()
             && let Some(ev) = event.take()
         {
-            out.entry(ev).or_default().extend(matchers.drain(..));
+            out.entry(ev).or_default().append(matchers);
         }
         *event = None;
         matchers.clear();
@@ -1065,14 +1066,12 @@ fn apply_spec_kv(spec: &mut SkillHookSpec, line: &str) {
     match key.trim() {
         "command" => spec.command = value.to_string(),
         "once" => spec.once = matches!(value, "true" | "yes" | "1"),
-        "type" => {
-            if value != "command" {
-                warn!(
-                    target: "squeezy_skills",
-                    kind = %value,
-                    "ignoring unsupported skill hook kind"
-                );
-            }
+        "type" if value != "command" => {
+            warn!(
+                target: "squeezy_skills",
+                kind = %value,
+                "ignoring unsupported skill hook kind"
+            );
         }
         _ => {}
     }
@@ -1294,13 +1293,13 @@ impl HookHandler for SkillHookHandler {
                 return HookResult::allow();
             }
         }
-        if self.spec.once {
-            if let Ok(mut fired) = self.fired.lock() {
-                if *fired {
-                    return HookResult::allow();
-                }
-                *fired = true;
+        if self.spec.once
+            && let Ok(mut fired) = self.fired.lock()
+        {
+            if *fired {
+                return HookResult::allow();
             }
+            *fired = true;
         }
 
         // Resolve the command path against the skill's base_dir when
