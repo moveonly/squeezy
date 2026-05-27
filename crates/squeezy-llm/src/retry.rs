@@ -280,10 +280,12 @@ impl SkipCursor {
                 response_id,
                 cost,
                 stop_reason,
+                reasoning_only_stop,
             } => Some(LlmEvent::Completed {
                 response_id,
                 cost,
                 stop_reason,
+                reasoning_only_stop,
             }),
             LlmEvent::Cancelled => Some(LlmEvent::Cancelled),
         }

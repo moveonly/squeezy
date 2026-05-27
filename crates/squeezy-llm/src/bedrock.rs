@@ -184,6 +184,7 @@ impl LlmProvider for BedrockProvider {
                 response_id: None,
                 cost: state.cost(),
                 stop_reason: state.stop_reason.clone(),
+                reasoning_only_stop: false,
             };
         })
     }

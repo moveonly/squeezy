@@ -363,11 +363,17 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 );
             }
             if !state.completed_emitted {
+                // Truncated stream — no terminal finish_reason from the
+                // upstream. Surface `None` so the agent loop / eval can
+                // distinguish "stream cut" from a real provider-reported
+                // stop. `reasoning_only_stop` stays false: we don't know
+                // what the model intended in this case.
                 let stop_reason = state.finish_reason.as_deref().map(chat_stop_reason);
                 yield LlmEvent::Completed {
                     response_id: state.response_id.take(),
                     cost: state.cost.clone(),
                     stop_reason,
+                    reasoning_only_stop: state.reasoning_only_stop,
                 };
             }
         })
@@ -485,6 +491,13 @@ struct StreamState {
     /// exactly the case we want to detect so we can inject a visible
     /// notice instead of completing with an empty assistant message.
     saw_visible_output: bool,
+    /// `true` iff a `finish_reason="stop"` was observed while
+    /// `saw_visible_output` was false AND the reasoning buffer had any
+    /// content. Latched once because subsequent choices on a multi-choice
+    /// stream don't clear the marker. Distinct from `finish_reason`
+    /// because the normalized `StopReason::EndTurn` alone can't
+    /// disambiguate "clean stop" from "reasoning-only stop".
+    reasoning_only_stop: bool,
 }
 
 #[derive(Debug, Default)]
@@ -532,8 +545,21 @@ impl StreamState {
             // the turn with whatever did surface, let the model retry next
             // turn. A short stderr warning makes the drop traceable.
             let Some(name) = partial.name else {
+                // Surface the drop both to stderr (for `tail -f
+                // ~/.cache/squeezy-tui-debug.log`) AND via the
+                // structured `tracing` channel so eval harnesses can
+                // count it with `RUST_LOG=squeezy_llm=warn`. The drop is
+                // silent to the user otherwise and is a likely
+                // contributor to the "model said it'd call X then the
+                // turn ended" pattern on Qwen-class models.
                 eprintln!(
                     "squeezy: skipping incomplete chat-completions tool call at index {index} (call_id={call_id}, no function name in stream)"
+                );
+                tracing::warn!(
+                    target: "squeezy_llm::compatible",
+                    index,
+                    call_id = %call_id,
+                    "dropped incomplete chat-completions tool call (no function name)"
                 );
                 continue;
             };
@@ -664,6 +690,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 response_id: state.response_id.take(),
                 cost: state.cost.clone(),
                 stop_reason,
+                reasoning_only_stop: state.reasoning_only_stop,
             });
             state.completed_emitted = true;
         }
@@ -735,6 +762,14 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                         // produced no actionable output. Skipped when the
                         // model did emit content or a tool call.
                         if !state.saw_visible_output {
+                            // Latch reasoning-only-stop only when there is
+                            // actually reasoning text in the buffer.
+                            // Otherwise this is "model said nothing at
+                            // all", which is a different (and rarer)
+                            // failure mode.
+                            if !state.reasoning_buf.trim().is_empty() {
+                                state.reasoning_only_stop = true;
+                            }
                             if let Some(reasoning_done) = drain_reasoning(state) {
                                 events.push(reasoning_done);
                             }

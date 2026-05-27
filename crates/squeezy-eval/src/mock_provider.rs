@@ -39,6 +39,18 @@ pub struct MockTurn {
     pub input_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
+    /// Optional chat-completions-style `finish_reason` to surface on
+    /// the `LlmEvent::Completed` event, normalized through
+    /// `StopReason`. Lets mock scenarios exercise the finish-reason
+    /// aware code paths (the agent's stop-no-action retry, the eval
+    /// `expect_finish_reason` rule) without needing a live
+    /// chat-completions provider.
+    #[serde(default)]
+    pub finish_reason: Option<String>,
+    /// Optional `reasoning_only_stop` flag to surface on the
+    /// `LlmEvent::Completed` event. Defaults to `false`.
+    #[serde(default)]
+    pub reasoning_only_stop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,10 +127,23 @@ impl LlmProvider for MockProvider {
             output_tokens: turn.output_tokens,
             ..CostSnapshot::default()
         };
+        // Map the chat-completions-style `finish_reason` string the user
+        // wrote in TOML onto the normalized `StopReason` the agent
+        // expects. Mirrors `compatible.rs::chat_stop_reason`, kept
+        // inline here so mock scenarios don't depend on private
+        // compatible.rs helpers.
+        let stop_reason = turn.finish_reason.as_deref().map(|raw| match raw {
+            "stop" => squeezy_llm::StopReason::EndTurn,
+            "tool_calls" | "function_call" => squeezy_llm::StopReason::ToolUse,
+            "length" => squeezy_llm::StopReason::MaxTokens,
+            "content_filter" => squeezy_llm::StopReason::Refusal,
+            other => squeezy_llm::StopReason::Other(other.to_string()),
+        });
         events.push(Ok(LlmEvent::Completed {
             response_id: None,
             cost,
-            stop_reason: None,
+            stop_reason,
+            reasoning_only_stop: turn.reasoning_only_stop,
         }));
         Box::pin(stream::iter(events))
     }

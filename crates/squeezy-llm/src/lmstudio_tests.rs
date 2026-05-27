@@ -114,6 +114,7 @@ fn parser_collects_text_deltas_into_completed() {
             response_id,
             cost,
             stop_reason,
+            ..
         } => {
             assert_eq!(response_id.as_deref(), Some("chatcmpl-1"));
             assert_eq!(cost.input_tokens, Some(4));

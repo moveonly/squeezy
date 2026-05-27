@@ -214,9 +214,13 @@ max_output_tokens = 1024
 Setting `provider = "mock"` activates the built-in scripted provider; see
 [Mock provider](#mock-provider).
 
-> **Note (first-cut limit):** the `provider` overlay is currently
-> advisory for non-mock providers. To actually switch providers per
-> run, set `SQUEEZY_PROVIDER=...` before invoking `squeezy-eval run`.
+`provider = "<preset>"` for any other registered preset (`openai`,
+`anthropic`, `portkey`, `openrouter`, ...) now threads through
+`AppConfig::from_env_and_settings_with_provider`, so the run's full
+ProviderConfig (base URL, `api_key_env`, transport) is resolved against
+that preset. You still need the matching API-key env var exported
+(`OPENAI_API_KEY`, `PORTKEY_API_KEY`, etc.) — the scenario references
+the provider by name only.
 
 ### Steps: prompts and actions
 
@@ -418,7 +422,10 @@ One record per assistant turn:
   "cost_display": "$0.0179",
   "styled_lines": [{ "spans": [{ "text": "src/lib.rs", "fg": null, "bg": null, "modifiers": [] }] }],
   "ansi": "src/lib.rs defines make_widget.\n",
-  "finish": "completed"
+  "finish": "completed",
+  "finish_reason": "stop",
+  "reasoning_only_stop": false,
+  "dropped_tool_calls": 0
 }
 ```
 
@@ -430,6 +437,22 @@ One record per assistant turn:
 - `ansi` is a re-rendering you can `cat` into a terminal.
 - `cost_micro_usd` is the result of `squeezy_llm::estimate_cost`;
   `0` means no pricing entry for the model.
+- `finish_reason` is the provider-reported terminal reason
+  (`stop` / `length` / `tool_calls` / `content_filter` for
+  Chat-Completions; `end_turn` / `max_tokens` / `tool_use` for
+  Anthropic). `null` when the provider didn't surface one (synthetic
+  end on truncated stream, helper paths, replay reconstruction).
+- `reasoning_only_stop` is `true` when the final round was the
+  Qwen3-style "thinks but emits nothing" pattern (stop + reasoning text
+  but no content or tool call). The
+  `stop_with_intent_text_no_tool_call` finding rule keys off the
+  related but distinct content-emitted-but-no-tool case.
+- `dropped_tool_calls` is the count of chat-completions tool-call
+  frames the provider dropped this turn because the stream cut before
+  a function name arrived. Always 0 for native OpenAI / Anthropic /
+  Google / Bedrock / Ollama. A non-zero value is a likely contributor
+  to the "I'll do X then stop" Qwen pattern — the model thinks it
+  emitted the call but the wire frame was incomplete.
 
 ### findings.jsonl + rule reference
 
@@ -444,10 +467,12 @@ diffable across runs.
 | `high_tool_burst` | minor | one turn fires > `expect.max_tools_per_turn` (default 10) tool calls |
 | `unsupported_slash_command` | minor | any `action_step.status` starts with `unsupported_slash_command:` |
 | `approval_unanswered` | major | an `Approval` event has `decision` starting with `denied_no_action` |
+| `stop_with_intent_text_no_tool_call` | major | turn finished `finish_reason=stop`, zero tool calls, assistant text contains an intent phrase like `"let me X"` / `"i'll Y"` with an action verb — the canonical Qwen3 chatty-preamble-then-stop pattern |
 | `expect_wall_clock` | minor | wall clock > `expect.max_wall_clock_seconds` |
 | `expect_input_tokens` | minor | total input tokens > `expect.max_input_tokens` |
 | `expect_final_text_contains` | minor | the last turn's assistant_text missing a required substring |
 | `expect_no_tool_errors` | minor | any `Error`/`Cancelled` `tool_call_completed` and `expect.no_tool_errors = true` |
+| `expect_finish_reason` | major | any completed turn matches `expect.finish_reason_not` — literal match against the provider's `finish_reason`, or the sentinel `"stop_no_action"` (stop + zero tool calls) |
 
 Adding a new rule is a single file change in
 `crates/squeezy-eval/src/findings.rs`: implement the `Rule` trait,
@@ -634,10 +659,6 @@ focus = "transcript-state regressions only — ignore stylistic findings"
 ---
 
 ## Limits and non-goals
-
-- **`provider` overlay is advisory.** Switching the provider per-scenario
-  still requires `SQUEEZY_PROVIDER=...` env var; we have not threaded
-  `AppConfig::from_env_and_settings_with_provider` through.
 - **Slash-command coverage** is the subset that lives wholly inside
   `Agent` (compact / plan / build / cost / jobs / permissions). TUI-only
   commands (overlays, help text) return `Unsupported`.

@@ -271,6 +271,7 @@ async fn turn_stream_accumulates_assistant_text() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -351,6 +352,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -359,6 +361,7 @@ async fn task_state_tool_updates_visible_state_logs_snapshot_and_summary() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -509,6 +512,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
                 response_id: None,
                 cost: Default::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -518,6 +522,7 @@ async fn invalid_tool_arguments_are_returned_to_model_instead_of_failing_turn() 
                 response_id: None,
                 cost: Default::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -571,6 +576,7 @@ async fn session_replay_replays_recorded_model_response() {
             response_id: Some("resp_replay".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(config.clone(), provider);
@@ -622,6 +628,7 @@ async fn user_input_is_redacted_before_model_request_and_transcript() {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
         stop_reason: None,
+        reasoning_only_stop: false,
     })]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
 
@@ -654,6 +661,7 @@ async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
         response_id: Some("resp_1".to_string()),
         cost: CostSnapshot::default(),
         stop_reason: None,
+        reasoning_only_stop: false,
     })]]));
     let config = AppConfig {
         workspace_root: root.clone(),
@@ -740,6 +748,7 @@ async fn assistant_text_is_redacted_in_streamed_deltas_and_completed_message() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -789,6 +798,7 @@ async fn approval_summary_is_redacted_for_secret_bearing_shell_command() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -953,6 +963,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     estimated_usd_micros: None,
                 },
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -969,6 +980,7 @@ async fn tool_loop_executes_fallback_tool_and_returns_observation() {
                     estimated_usd_micros: None,
                 },
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1023,12 +1035,14 @@ async fn shell_tool_emits_job_events_and_session_events() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         })],
     ]));
     let config = AppConfig {
@@ -1106,6 +1120,7 @@ async fn asks_for_edit_permission_before_write_tool() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -1156,6 +1171,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1165,6 +1181,7 @@ async fn session_approval_installs_in_memory_rule_without_persisting() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1220,6 +1237,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1231,6 +1249,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1240,6 +1259,7 @@ async fn ai_reviewer_allows_allowlisted_read_without_user_prompt() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1302,6 +1322,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1313,6 +1334,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1322,6 +1344,7 @@ async fn ai_reviewer_denies_without_user_prompt() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1381,6 +1404,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1392,6 +1416,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
                 response_id: Some("reviewer".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1401,6 +1426,7 @@ async fn ai_reviewer_allow_for_non_allowlisted_edit_escalates_to_user() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1446,6 +1472,7 @@ async fn cancelling_turn_unblocks_pending_approval() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -1517,6 +1544,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -1526,6 +1554,7 @@ async fn tool_loop_can_edit_file_with_write_tool() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -1571,6 +1600,7 @@ async fn inactive_skills_are_not_eagerly_added_to_instructions() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -1614,7 +1644,8 @@ async fn known_help_topic_short_circuits_without_provider_request() {
 
 #[tokio::test]
 async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
-    let provider = Arc::new(MockProvider::new(vec![vec![
+    let provider =
+        Arc::new(MockProvider::new(vec![vec![
         Ok(LlmEvent::Started),
         Ok(LlmEvent::TextDelta(
             "Squeezy does not document a quantum-billing flow; see docs/external/CONFIGURATION.md."
@@ -1624,6 +1655,7 @@ async fn unknown_help_topic_routes_to_doc_subagent_with_inlined_corpus() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1696,6 +1728,7 @@ async fn doc_help_subagent_gets_its_own_output_budget_not_summary_cap() {
             response_id: Some("resp_doc_help_budget".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     // Construct a config where `max_summary_tokens` is deliberately tiny so
@@ -1790,6 +1823,7 @@ async fn natural_language_run_ls_phrase_goes_to_provider() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(
@@ -1948,6 +1982,7 @@ async fn unrelated_questions_still_call_provider() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider.clone());
@@ -1976,6 +2011,7 @@ async fn explicit_skill_activation_injects_body_and_rewrites_task() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -2012,6 +2048,7 @@ async fn trigger_skill_activation_injects_body() {
             response_id: Some("resp_1".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(config_with_skill_dirs(&root), provider.clone());
@@ -2052,6 +2089,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -2061,6 +2099,7 @@ async fn shell_implicit_skill_activation_reaches_next_model_request() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -2118,6 +2157,7 @@ async fn shell_approval_event_surfaces_new_sandbox_metadata() {
             response_id: Some("resp_meta".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -2190,12 +2230,14 @@ async fn network_shell_command_is_denied_by_network_permission_policy() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![Ok(LlmEvent::Completed {
             response_id: Some("resp_2".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         })],
     ]));
     let config = AppConfig {
@@ -2888,6 +2930,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
                 response_id: Some("resp_tools".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -2897,6 +2940,7 @@ async fn allow_project_rule_takes_effect_within_the_same_session_and_writes_sque
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -3313,6 +3357,7 @@ async fn subagent_request_instructions_omit_agents_md() {
                 response_id: Some("resp_parent_omit_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Subagent round 1: end immediately with a short text answer.
@@ -3323,6 +3368,7 @@ async fn subagent_request_instructions_omit_agents_md() {
                 response_id: Some("resp_sub_omit_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Parent round 2: close the turn after consuming the subagent result.
@@ -3333,6 +3379,7 @@ async fn subagent_request_instructions_omit_agents_md() {
                 response_id: Some("resp_parent_omit_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -3519,6 +3566,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
                     estimated_usd_micros: None,
                 },
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Turn-loop round 2: assistant finalizes with plain text after the
@@ -3530,6 +3578,7 @@ async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -3711,6 +3760,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -3720,6 +3770,7 @@ async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -3835,6 +3886,7 @@ async fn pretooluse_hook_denies_tool_call() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -3844,6 +3896,7 @@ async fn pretooluse_hook_denies_tool_call() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -3916,6 +3969,7 @@ async fn pretooluse_hook_allow_lets_tool_run() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -3925,6 +3979,7 @@ async fn pretooluse_hook_allow_lets_tool_run() {
                 response_id: Some("resp_final".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -4245,6 +4300,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                         response_id: Some("resp_parent_1".to_string()),
                         cost: CostSnapshot::default(),
                         stop_reason: None,
+                        reasoning_only_stop: false,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -4272,6 +4328,7 @@ impl LlmProvider for SubagentTimeoutProvider {
                             ..CostSnapshot::default()
                         },
                         stop_reason: None,
+                        reasoning_only_stop: false,
                     }),
                 ];
                 let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
@@ -4386,6 +4443,7 @@ impl LlmProvider for OneDelegateProvider {
                     response_id: Some("parent_tools".to_string()),
                     cost: CostSnapshot::default(),
                     stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
             ],
             _ => vec![
@@ -4395,6 +4453,7 @@ impl LlmProvider for OneDelegateProvider {
                     response_id: Some("parent_final".to_string()),
                     cost: CostSnapshot::default(),
                     stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
             ],
         };
@@ -4992,6 +5051,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Plan subagent: return text followed by a JSON tail.
@@ -5007,6 +5067,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Parent turn 2: wrap up.
@@ -5017,6 +5078,7 @@ async fn plan_subagent_parses_json_tail_into_structured_output() {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -5069,6 +5131,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
                 response_id: Some("parent_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         // Plan subagent: emits plain prose with no JSON tail.
@@ -5081,6 +5144,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
                 response_id: Some("plan_subagent_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -5090,6 +5154,7 @@ async fn plan_subagent_falls_back_to_summary_when_json_missing() {
                 response_id: Some("parent_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -5206,6 +5271,7 @@ async fn drained_swap_makes_next_request_carry_new_model_id() {
             response_id: Some("resp_swap".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let mut agent = Agent::new(AppConfig::default(), provider.clone());
@@ -5257,6 +5323,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -5266,6 +5333,7 @@ async fn plan_mode_request_user_input_pauses_turn_and_resumes_with_choice() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -5321,6 +5389,7 @@ async fn build_mode_refuses_request_user_input_call() {
                 response_id: Some("resp_1".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
         vec![
@@ -5330,6 +5399,7 @@ async fn build_mode_refuses_request_user_input_call() {
                 response_id: Some("resp_2".to_string()),
                 cost: CostSnapshot::default(),
                 stop_reason: None,
+                reasoning_only_stop: false,
             }),
         ],
     ]));
@@ -5379,6 +5449,7 @@ async fn plan_mode_instructions_are_appended_to_request() {
             response_id: Some("resp_plan".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -5409,6 +5480,7 @@ async fn build_mode_instructions_omit_plan_overlay() {
             response_id: Some("resp_build".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: None,
+            reasoning_only_stop: false,
         }),
     ]]));
     let config = AppConfig {
@@ -5759,6 +5831,7 @@ async fn max_tokens_stop_reason_emits_failed_with_recovery_hint() {
             response_id: Some("resp_trunc".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: Some(StopReason::MaxTokens),
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -5791,6 +5864,7 @@ async fn refusal_stop_reason_emits_failed_with_safety_hint() {
             response_id: Some("resp_refusal".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: Some(StopReason::Refusal),
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);
@@ -5820,6 +5894,7 @@ async fn end_turn_stop_reason_completes_successfully() {
             response_id: Some("resp_ok".to_string()),
             cost: CostSnapshot::default(),
             stop_reason: Some(StopReason::EndTurn),
+            reasoning_only_stop: false,
         }),
     ]]));
     let agent = Agent::new(AppConfig::default(), provider);

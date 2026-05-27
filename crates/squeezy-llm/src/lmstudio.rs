@@ -218,6 +218,7 @@ impl LlmProvider for LMStudioProvider {
                     response_id: state.response_id.take(),
                     cost: state.cost.clone(),
                     stop_reason,
+                    reasoning_only_stop: false,
                 };
             }
         })
@@ -388,6 +389,7 @@ pub(crate) fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Ve
                 response_id: state.response_id.take(),
                 cost: state.cost.clone(),
                 stop_reason,
+                reasoning_only_stop: false,
             });
             state.completed_emitted = true;
         }

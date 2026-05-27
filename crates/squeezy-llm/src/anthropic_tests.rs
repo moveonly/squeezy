@@ -543,6 +543,7 @@ fn parser_extracts_completed_response_id_and_usage() {
                 estimated_usd_micros: None,
             },
             stop_reason: Some(crate::StopReason::EndTurn),
+            reasoning_only_stop: false,
         }]
     );
 }
@@ -591,6 +592,7 @@ fn parser_populates_both_cache_counters_from_usage() {
                 estimated_usd_micros: None,
             },
             stop_reason: Some(crate::StopReason::EndTurn),
+            reasoning_only_stop: false,
         }]
     );
 }

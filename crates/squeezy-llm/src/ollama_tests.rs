@@ -113,6 +113,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
             // provider falls back to `EndTurn` so the agent loop sees a
             // populated stop reason on every Ollama turn.
             stop_reason: Some(crate::StopReason::EndTurn),
+            reasoning_only_stop: false,
         }
     );
 }

@@ -617,6 +617,7 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
                 response_id: state.response_id.clone(),
                 cost: state.cost(),
                 stop_reason,
+                reasoning_only_stop: false,
             });
             Ok(events)
         }

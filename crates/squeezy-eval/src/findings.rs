@@ -72,6 +72,14 @@ pub struct TraceContext {
     pub last_assistant_text: String,
     /// Number of `ToolCallCompleted` events with status Error/Cancelled.
     pub tool_error_count: u64,
+    /// Per-turn-id assistant text accumulated from
+    /// `EvalEventKind::AssistantDelta`. Populated for every turn that
+    /// emitted any text; absent for tool-only or empty turns.
+    pub assistant_text_by_turn: BTreeMap<String, String>,
+    /// Per-turn finish state captured at `EvalEventKind::TurnCompleted`.
+    /// `(sequence, stop_reason, reasoning_only_stop)` per completed
+    /// turn, in order of arrival.
+    pub turn_finish_states: BTreeMap<String, (u64, Option<squeezy_llm::StopReason>, bool)>,
 }
 
 impl TraceContext {
@@ -100,6 +108,8 @@ impl TraceContext {
         let mut last_ts: Option<u64> = None;
         let mut per_turn_text: BTreeMap<String, String> = BTreeMap::new();
         let mut last_completed_turn: Option<String> = None;
+        let mut turn_finish_states: BTreeMap<String, (u64, Option<squeezy_llm::StopReason>, bool)> =
+            BTreeMap::new();
         for event in &events {
             first_ts.get_or_insert(event.ts_unix_ms);
             last_ts = Some(event.ts_unix_ms);
@@ -134,12 +144,21 @@ impl TraceContext {
                 EvalEventKind::TurnFailed { error } => {
                     turn_failures.push((event.sequence, error.clone()));
                 }
-                EvalEventKind::TurnCompleted { cost, .. } => {
+                EvalEventKind::TurnCompleted {
+                    cost,
+                    stop_reason,
+                    reasoning_only_stop,
+                    ..
+                } => {
                     if let Some(v) = cost.get("input_tokens").and_then(|v| v.as_u64()) {
                         total_input_tokens += v;
                     }
                     if let Some(turn) = &event.turn_id {
                         last_completed_turn = Some(turn.clone());
+                        turn_finish_states.insert(
+                            turn.clone(),
+                            (event.sequence, stop_reason.clone(), *reasoning_only_stop),
+                        );
                     }
                 }
                 EvalEventKind::ToolCallCompleted { result }
@@ -185,6 +204,8 @@ impl TraceContext {
             turn_count,
             last_assistant_text,
             tool_error_count,
+            assistant_text_by_turn: per_turn_text,
+            turn_finish_states,
         })
     }
 }
@@ -1009,6 +1030,213 @@ impl Rule for ExactSyntaxWithoutSource {
     }
 }
 
+/// Detects the canonical Qwen3 "I'll do X then stop" failure mode: a
+/// turn ends with `stop_reason=EndTurn`, no tool calls, and the
+/// assistant text contains an intent phrase that promised tool work
+/// (`"let me X"`, `"i'll Y"`, `"i will Z"`, ...). The model committed
+/// verbally to follow-up tool use, then never emitted the call.
+///
+/// Why this rule exists: the existing `finish_reason="stop"` handler in
+/// `compatible.rs` only fires when *no* visible output surfaced
+/// (`saw_visible_output == false`). The bug we're after is the opposite
+/// — text emitted, intent stated, tool call missing — and that path
+/// looks like a perfectly normal turn-ending stop on the wire. The
+/// finding's presence in a run is the smoking gun that a stronger
+/// retry-on-intent-without-action fix is worth shipping.
+pub struct StopWithIntentTextNoToolCall;
+impl Rule for StopWithIntentTextNoToolCall {
+    fn rule_id(&self) -> &'static str {
+        "stop_with_intent_text_no_tool_call"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const INTENT_PATTERNS: &[&str] = &[
+            "let me ",
+            "let's ",
+            "i'll ",
+            "ill ",
+            "i will ",
+            "now i'll ",
+            "now i ",
+            "next i ",
+            "next, i ",
+            "i need to ",
+            "i can ",
+            "first, i ",
+            "going to ",
+        ];
+        const ACTION_PATTERNS: &[&str] = &[
+            "scan",
+            "search",
+            "explore",
+            "find",
+            "read",
+            "look",
+            "check",
+            "inspect",
+            "grep",
+            "map",
+            "list",
+            "open",
+            "fetch",
+            "load",
+            "fix",
+            "edit",
+            "modify",
+            "write",
+            "create",
+            "rename",
+            "investigate",
+            "trace",
+            "follow",
+        ];
+        let mut out = Vec::new();
+        for (turn, (seq, stop_reason, _)) in &ctx.turn_finish_states {
+            // Only check turns that actually finished with EndTurn (the
+            // normalized "model voluntarily released the turn" signal).
+            // Other stop reasons (MaxTokens, ToolUse, Refusal, …) are
+            // out of scope — different failure modes with different
+            // fixes.
+            if *stop_reason != Some(squeezy_llm::StopReason::EndTurn) {
+                continue;
+            }
+            // Must have zero tool calls in this turn.
+            let tool_count = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if tool_count > 0 {
+                continue;
+            }
+            let text = ctx
+                .assistant_text_by_turn
+                .get(turn)
+                .cloned()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if text.trim().is_empty() {
+                continue;
+            }
+            // Look for `let me X` / `I'll X` / ... where X is an action verb.
+            let intent_match = INTENT_PATTERNS.iter().any(|intent| {
+                if let Some(idx) = text.find(intent) {
+                    let tail = &text[idx + intent.len()..];
+                    let next_30 = &tail[..tail.len().min(40)];
+                    ACTION_PATTERNS
+                        .iter()
+                        .any(|action| next_30.contains(action))
+                } else {
+                    false
+                }
+            });
+            if !intent_match {
+                continue;
+            }
+            out.push(Finding {
+                rule_id: "stop_with_intent_text_no_tool_call".into(),
+                severity: Severity::Major,
+                category: "correctness".into(),
+                summary: format!(
+                    "Turn {turn}: model finished with `stop_reason=EndTurn`, emitted intent text \
+                     (\"let me / i'll <action>\") but fired zero tool calls. Likely the canonical \
+                     Qwen3 chatty-preamble-then-stop pattern."
+                ),
+                evidence: vec![EvidencePointer {
+                    trace_event: Some(*seq),
+                    frame: None,
+                }],
+            });
+        }
+        out
+    }
+}
+
+/// Detects when a completed turn's `stop_reason` matches an entry in
+/// `expect.finish_reason_not`. Used to assert "no turn ended with
+/// `length` truncation" or "no turn ended with `stop` and no tool call
+/// (via the synthetic `stop_no_action` sentinel)". The sentinel is
+/// resolved by checking `tool_count == 0` AND
+/// `stop_reason == EndTurn`, so scenarios can write
+/// `expect.finish_reason_not = ["stop_no_action"]` without having to
+/// know the underlying mechanism. String literals in
+/// `finish_reason_not` are matched against the lowercased
+/// `StopReason` debug form (`"end_turn"`, `"max_tokens"`, `"tool_use"`,
+/// `"context_window_exceeded"`, `"stop_sequence"`, `"refusal"`).
+pub struct ExpectFinishReasonNot;
+impl Rule for ExpectFinishReasonNot {
+    fn rule_id(&self) -> &'static str {
+        "expect_finish_reason"
+    }
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
+        if scenario.expect.finish_reason_not.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (turn, (seq, stop_reason, _)) in &ctx.turn_finish_states {
+            let actual_label = stop_reason_label(stop_reason.as_ref());
+            let tool_count = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            let assistant_text = ctx
+                .assistant_text_by_turn
+                .get(turn)
+                .map(String::as_str)
+                .unwrap_or("");
+            for forbidden in &scenario.expect.finish_reason_not {
+                let hit = match forbidden.as_str() {
+                    // `stop_no_action` means the model produced nothing
+                    // actionable — no tool call AND no assistant text.
+                    // A normal plan-mode finish (text only, no tool
+                    // calls) is a legitimate "stop" and should NOT
+                    // match the sentinel.
+                    "stop_no_action" => {
+                        *stop_reason == Some(squeezy_llm::StopReason::EndTurn)
+                            && tool_count == 0
+                            && assistant_text.trim().is_empty()
+                    }
+                    literal => actual_label.as_deref() == Some(literal),
+                };
+                if hit {
+                    out.push(Finding {
+                        rule_id: "expect_finish_reason".into(),
+                        severity: Severity::Major,
+                        category: "correctness".into(),
+                        summary: format!(
+                            "Turn {turn}: stop_reason={actual_label:?} matched forbidden \
+                             `expect.finish_reason_not = {forbidden:?}` \
+                             (tool_count={tool_count}, assistant_text_chars={})",
+                            assistant_text.trim().chars().count()
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(*seq),
+                            frame: None,
+                        }],
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Lowercase snake_case label for a `StopReason`, matching the strings
+/// users write in `expect.finish_reason_not`. The `Other(s)` variant
+/// surfaces the inner string verbatim so provider-specific stop
+/// reasons stay reachable.
+fn stop_reason_label(reason: Option<&squeezy_llm::StopReason>) -> Option<String> {
+    reason.map(|r| match r {
+        squeezy_llm::StopReason::EndTurn => "end_turn".to_string(),
+        squeezy_llm::StopReason::ToolUse => "tool_use".to_string(),
+        squeezy_llm::StopReason::MaxTokens => "max_tokens".to_string(),
+        squeezy_llm::StopReason::ContextWindowExceeded => "context_window_exceeded".to_string(),
+        squeezy_llm::StopReason::StopSequence => "stop_sequence".to_string(),
+        squeezy_llm::StopReason::Refusal => "refusal".to_string(),
+        squeezy_llm::StopReason::Other(other) => other.clone(),
+    })
+}
+
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(DuplicateToolCall),
@@ -1024,6 +1252,8 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(UngroundedCitation),
         Box::new(IncompleteConfidenceLabels),
         Box::new(ExactSyntaxWithoutSource),
+        Box::new(StopWithIntentTextNoToolCall),
+        Box::new(ExpectFinishReasonNot),
         Box::new(ExpectationsAsFindings),
     ]
 }

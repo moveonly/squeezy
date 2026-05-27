@@ -23,6 +23,9 @@ fn ctx_from_events(events: Vec<EvalEvent>) -> TraceContext {
     let mut approvals = Vec::new();
     let mut total_input_tokens = 0u64;
     let mut turn_count = 0u64;
+    let mut assistant_text_by_turn: BTreeMap<String, String> = BTreeMap::new();
+    let mut turn_finish_states: BTreeMap<String, (u64, Option<squeezy_llm::StopReason>, bool)> =
+        BTreeMap::new();
     for event in &events {
         match &event.kind {
             EvalEventKind::TurnStarted => turn_count += 1,
@@ -44,6 +47,14 @@ fn ctx_from_events(events: Vec<EvalEvent>) -> TraceContext {
                     .or_default()
                     .push((name, sha, event.sequence));
             }
+            EvalEventKind::AssistantDelta { delta } => {
+                if let Some(turn) = &event.turn_id {
+                    assistant_text_by_turn
+                        .entry(turn.clone())
+                        .or_default()
+                        .push_str(delta);
+                }
+            }
             EvalEventKind::TurnFailed { error } => {
                 turn_failures.push((event.sequence, error.clone()));
             }
@@ -58,9 +69,20 @@ fn ctx_from_events(events: Vec<EvalEvent>) -> TraceContext {
             EvalEventKind::Approval { decision, .. } => {
                 approvals.push((event.sequence, decision.clone()));
             }
-            EvalEventKind::TurnCompleted { cost, .. } => {
+            EvalEventKind::TurnCompleted {
+                cost,
+                stop_reason,
+                reasoning_only_stop,
+                ..
+            } => {
                 if let Some(v) = cost.get("input_tokens").and_then(|v| v.as_u64()) {
                     total_input_tokens += v;
+                }
+                if let Some(turn) = &event.turn_id {
+                    turn_finish_states.insert(
+                        turn.clone(),
+                        (event.sequence, stop_reason.clone(), *reasoning_only_stop),
+                    );
                 }
             }
             _ => {}
@@ -77,6 +99,8 @@ fn ctx_from_events(events: Vec<EvalEvent>) -> TraceContext {
         turn_count,
         last_assistant_text: String::new(),
         tool_error_count: 0,
+        assistant_text_by_turn,
+        turn_finish_states,
     }
 }
 
@@ -273,6 +297,8 @@ fn trivial_answer_over_fetch_flags_short_output_with_burst() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({"output_tokens": 6, "input_tokens": 9000}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -306,6 +332,8 @@ fn trivial_answer_over_fetch_quiet_for_long_answers() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({"output_tokens": 500, "input_tokens": 9000}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -327,6 +355,8 @@ fn expect_input_tokens_per_turn_flags_one_turn() {
         kind: EvalEventKind::TurnCompleted {
             metrics: serde_json::json!({}),
             cost: serde_json::json!({"input_tokens": 250000, "output_tokens": 200}),
+            stop_reason: None,
+            reasoning_only_stop: false,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -349,6 +379,8 @@ fn expect_input_tokens_per_turn_quiet_when_unset() {
         kind: EvalEventKind::TurnCompleted {
             metrics: serde_json::json!({}),
             cost: serde_json::json!({"input_tokens": 250000}),
+            stop_reason: None,
+            reasoning_only_stop: false,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -380,6 +412,8 @@ fn ungrounded_citation_flags_zero_tools_with_path() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 20}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -410,6 +444,8 @@ fn ungrounded_citation_quiet_when_tool_call_ran() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 20}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -437,6 +473,8 @@ fn ungrounded_citation_quiet_for_no_path() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 5}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -480,6 +518,8 @@ fn incomplete_confidence_labels_flags_partial_compliance() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -513,6 +553,8 @@ fn incomplete_confidence_labels_quiet_when_no_prompt_asks() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -543,6 +585,8 @@ fn incomplete_confidence_labels_quiet_when_all_labeled() {
         kind: EvalEventKind::TurnCompleted {
             metrics: serde_json::json!({}),
             cost: serde_json::json!({}),
+            stop_reason: None,
+            reasoning_only_stop: false,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -579,6 +623,8 @@ fn exact_syntax_without_source_flags_label_without_read_slice() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -614,6 +660,8 @@ fn exact_syntax_without_source_quiet_when_read_slice_ran() {
             kind: EvalEventKind::TurnCompleted {
                 metrics: serde_json::json!({}),
                 cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
             },
         },
     ];
@@ -622,5 +670,150 @@ fn exact_syntax_without_source_quiet_when_read_slice_ran() {
         ExactSyntaxWithoutSource
             .check(&ctx, &empty_scenario())
             .is_empty()
+    );
+}
+
+fn assistant_delta(seq: u64, turn: &str, text: &str) -> EvalEvent {
+    EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: seq,
+        turn_id: Some(turn.into()),
+        kind: EvalEventKind::AssistantDelta { delta: text.into() },
+    }
+}
+
+fn turn_completed_with(
+    seq: u64,
+    turn: &str,
+    finish_reason: Option<&str>,
+    reasoning_only_stop: bool,
+) -> EvalEvent {
+    // Translate the chat-completions style string the test writes
+    // into the normalized `StopReason` the eval pipeline now stores.
+    // Mirrors `compatible.rs::chat_stop_reason` so tests stay
+    // independent of the live provider.
+    let stop_reason = finish_reason.map(|raw| match raw {
+        "stop" => squeezy_llm::StopReason::EndTurn,
+        "tool_calls" | "function_call" => squeezy_llm::StopReason::ToolUse,
+        "length" => squeezy_llm::StopReason::MaxTokens,
+        "content_filter" => squeezy_llm::StopReason::Refusal,
+        other => squeezy_llm::StopReason::Other(other.to_string()),
+    });
+    EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: seq,
+        turn_id: Some(turn.into()),
+        kind: EvalEventKind::TurnCompleted {
+            metrics: serde_json::json!({}),
+            cost: serde_json::json!({}),
+            stop_reason,
+            reasoning_only_stop,
+        },
+    }
+}
+
+#[test]
+fn stop_with_intent_text_fires_on_chatty_preamble_then_stop() {
+    let events = vec![
+        assistant_delta(
+            1,
+            "T(1)",
+            "Let me scan the codebase to find a good candidate for modernization.",
+        ),
+        turn_completed_with(2, "T(1)", Some("stop"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = StopWithIntentTextNoToolCall.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1, "should flag the intent-text stop pattern");
+    assert_eq!(out[0].rule_id, "stop_with_intent_text_no_tool_call");
+}
+
+#[test]
+fn stop_with_intent_text_quiet_when_tool_call_fired() {
+    let events = vec![
+        tool_call(1, "T(1)", "grep", serde_json::json!({"pattern": "x"})),
+        assistant_delta(
+            2,
+            "T(1)",
+            "Let me scan the codebase to find a good candidate.",
+        ),
+        turn_completed_with(3, "T(1)", Some("stop"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        StopWithIntentTextNoToolCall
+            .check(&ctx, &empty_scenario())
+            .is_empty(),
+        "intent text plus an actual tool call is not the bug"
+    );
+}
+
+#[test]
+fn stop_with_intent_text_quiet_on_pure_chitchat() {
+    let events = vec![
+        assistant_delta(1, "T(1)", "Hello there, happy to help."),
+        turn_completed_with(2, "T(1)", Some("stop"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        StopWithIntentTextNoToolCall
+            .check(&ctx, &empty_scenario())
+            .is_empty(),
+        "no intent verb means no flag"
+    );
+}
+
+#[test]
+fn stop_with_intent_text_quiet_on_non_stop_finish() {
+    // Even if intent text is present and no tool call fired, a
+    // non-`stop` finish reason is a different bug class — the rule
+    // should not claim those.
+    let events = vec![
+        assistant_delta(1, "T(1)", "Let me scan the source for the issue."),
+        turn_completed_with(2, "T(1)", Some("length"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        StopWithIntentTextNoToolCall
+            .check(&ctx, &empty_scenario())
+            .is_empty()
+    );
+}
+
+#[test]
+fn expect_finish_reason_not_flags_literal_match() {
+    let events = vec![turn_completed_with(1, "T(1)", Some("length"), false)];
+    let ctx = ctx_from_events(events);
+    let mut scenario = empty_scenario();
+    scenario.expect.finish_reason_not = vec!["length".into()];
+    let out = ExpectFinishReasonNot.check(&ctx, &scenario);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].summary.contains("length"));
+}
+
+#[test]
+fn expect_finish_reason_not_flags_stop_no_action_sentinel() {
+    let events = vec![turn_completed_with(1, "T(1)", Some("stop"), false)];
+    let ctx = ctx_from_events(events);
+    let mut scenario = empty_scenario();
+    scenario.expect.finish_reason_not = vec!["stop_no_action".into()];
+    let out = ExpectFinishReasonNot.check(&ctx, &scenario);
+    assert_eq!(out.len(), 1, "stop with zero tool calls is forbidden here");
+}
+
+#[test]
+fn expect_finish_reason_not_quiet_when_stop_had_tool_call() {
+    let events = vec![
+        tool_call(1, "T(1)", "grep", serde_json::json!({"pattern": "x"})),
+        turn_completed_with(2, "T(1)", Some("stop"), false),
+    ];
+    let ctx = ctx_from_events(events);
+    let mut scenario = empty_scenario();
+    scenario.expect.finish_reason_not = vec!["stop_no_action".into()];
+    assert!(
+        ExpectFinishReasonNot.check(&ctx, &scenario).is_empty(),
+        "stop with a tool call is the OK path"
     );
 }

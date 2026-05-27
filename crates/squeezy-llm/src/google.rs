@@ -170,6 +170,7 @@ impl LlmProvider for GoogleProvider {
                 stop_reason: last_finish_reason
                     .as_deref()
                     .map(crate::StopReason::from_google),
+                reasoning_only_stop: false,
             };
         })
     }

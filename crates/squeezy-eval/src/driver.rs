@@ -95,8 +95,24 @@ pub async fn run_scenario(
     let workspace = workspace::provision(&scenario.workspace, &scratch_root)?;
 
     // 2. Build the AppConfig with the scenario overlay applied, then the agent.
-    let mut config = AppConfig::from_env_and_settings()
-        .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?;
+    //
+    // When the scenario pins a provider (`[squeezy] provider = "..."`), thread it
+    // through `from_env_and_settings_with_provider` so the full ProviderConfig
+    // (base URLs, api_key_env, transport) is resolved against that preset
+    // instead of whatever `SQUEEZY_PROVIDER` happens to be in the eval env.
+    // `mock` stays in the standard path because it isn't a real provider preset;
+    // the dispatch site below swaps in the MockProvider regardless.
+    let provider_override = scenario
+        .squeezy
+        .provider
+        .as_deref()
+        .filter(|name| !name.eq_ignore_ascii_case("mock"));
+    let mut config = match provider_override {
+        Some(provider) => AppConfig::from_env_and_settings_with_provider(provider)
+            .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
+        None => AppConfig::from_env_and_settings()
+            .map_err(|err| EvalError::Config(format!("load AppConfig: {err}")))?,
+    };
     apply_overlay(&mut config, &scenario.squeezy, &workspace.path)?;
     let provider = if scenario.squeezy.provider.as_deref() == Some("mock") {
         crate::mock_provider::MockProvider::shared(scenario.mock.clone())
@@ -406,13 +422,10 @@ fn apply_overlay(
         config.permissions.web = mode;
         config.permissions.mcp = mode;
     }
-    // `provider` overlay is currently advisory; switching providers requires
-    // re-resolving the full provider config from settings (keys, base URLs,
-    // etc.), which we'd want to plumb through AppConfig::from_env_and_settings_with_provider.
-    if overlay.provider.is_some() {
-        // Intentional silent ignore in first cut. The scenario's expected
-        // model still applies. Documented in EVAL_HARNESS.md.
-    }
+    // Provider is now resolved at AppConfig construction time in
+    // `run_scenario` via `from_env_and_settings_with_provider`, so it's
+    // already baked into `config.provider` by the time `apply_overlay`
+    // runs. Nothing further to do here.
     // Tighten squeezy's live cost broker for probes. AppConfig already
     // has these knobs; they default to permissive values (64 tool calls,
     // 20 MB read, $5 session cap) which lets a planner over-fetch
@@ -1044,6 +1057,8 @@ impl Driver {
                     turn_id,
                     cost,
                     metrics,
+                    stop_reason,
+                    reasoning_only_stop,
                     ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
@@ -1051,6 +1066,8 @@ impl Driver {
                     frame.input_tokens = cost.input_tokens.unwrap_or(0);
                     frame.output_tokens = cost.output_tokens.unwrap_or(0);
                     frame.finish = FrameFinish::Completed;
+                    frame.stop_reason = stop_reason.clone();
+                    frame.reasoning_only_stop = reasoning_only_stop;
                     let cost_micro =
                         squeezy_llm::estimate_cost(self.provider_name, &self.model, &cost)
                             .unwrap_or(0);
@@ -1065,6 +1082,8 @@ impl Driver {
                         EvalEventKind::TurnCompleted {
                             metrics: metrics_v,
                             cost: cost_v,
+                            stop_reason: stop_reason.clone(),
+                            reasoning_only_stop,
                         },
                     )?;
                     completed = true;

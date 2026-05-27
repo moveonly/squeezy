@@ -436,6 +436,7 @@ impl LlmProvider for ToolUsingProvider {
                     response_id: Some("resp_2".to_string()),
                     cost: CostSnapshot::default(),
                     stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
             ]
         } else {
@@ -454,6 +455,7 @@ impl LlmProvider for ToolUsingProvider {
                     response_id: Some("resp_1".to_string()),
                     cost: CostSnapshot::default(),
                     stop_reason: None,
+                    reasoning_only_stop: false,
                 }),
             ]
         };

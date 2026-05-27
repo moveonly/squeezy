@@ -289,10 +289,19 @@ impl ReplayRuntime {
                     // Replay logs predate the stop_reason surface; mark
                     // replayed completions as `None` so consumers can tell
                     // a synthesized completion from a fresh provider one.
+                    // `reasoning_only_stop` is also pulled from the payload
+                    // when present (Phase 4 newer replay traces) and
+                    // defaults to false for pre-existing replay logs.
+                    let reasoning_only_stop = event
+                        .payload
+                        .get("reasoning_only_stop")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     events.push(LlmEvent::Completed {
                         response_id,
                         cost,
                         stop_reason: None,
+                        reasoning_only_stop,
                     });
                     return Ok(events);
                 }
@@ -3158,6 +3167,8 @@ async fn complete_squeezy_help_turn(
             cost,
             metrics,
             context_estimate,
+            stop_reason: None,
+            reasoning_only_stop: false,
         })
         .await;
 }
@@ -3353,6 +3364,8 @@ async fn complete_local_tool_turn(
             cost,
             metrics,
             context_estimate,
+            stop_reason: None,
+            reasoning_only_stop: false,
         })
         .await;
 }
@@ -4242,7 +4255,16 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            // Per-round terminal-state markers surfaced from the
+            // provider stream's `LlmEvent::Completed`. Forwarded on the
+            // terminal `AgentEvent::Completed` so eval / TUI consumers
+            // can branch on the actual finish path. `stop_reason` is the
+            // normalized provider stop kind (added by main); the
+            // `reasoning_only_stop` flag is the orthogonal "model spent
+            // the round on reasoning and stopped with nothing visible"
+            // signal that drives the Phase 4 reasoning-only retry.
             let mut stop_reason: Option<StopReason> = None;
+            let mut reasoning_only_stop = false;
             let mut round_text_started = false;
 
             while let Some(event) =
@@ -4393,6 +4415,7 @@ impl TurnRuntime {
                         response_id: id,
                         mut cost,
                         stop_reason: completion_stop_reason,
+                        reasoning_only_stop: round_reasoning_only_stop,
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
@@ -4417,6 +4440,7 @@ impl TurnRuntime {
                         completed_cost = cost;
                         response_id = id;
                         stop_reason = completion_stop_reason;
+                        reasoning_only_stop = round_reasoning_only_stop;
                         completed = true;
                         break;
                     }
@@ -4481,6 +4505,8 @@ impl TurnRuntime {
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
                         context_estimate,
+                        stop_reason: stop_reason.clone(),
+                        reasoning_only_stop,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -4617,6 +4643,8 @@ impl TurnRuntime {
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
                         context_estimate,
+                        stop_reason: stop_reason.clone(),
+                        reasoning_only_stop,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -10402,6 +10430,17 @@ pub enum AgentEvent {
         /// TUI to update its context-budget indicator without needing a
         /// follow-up `context_estimate_snapshot()` call.
         context_estimate: ContextEstimate,
+        /// Provider-reported normalized stop kind from the final round's
+        /// stream, if available. Surfaced for eval / regression tooling
+        /// so rules can distinguish "stop after content", "stop after
+        /// tool calls", "length truncation", etc. `None` when the
+        /// provider didn't report one or the stream was synthetic
+        /// (e.g. agent-loop short-circuit, replay reconstruction).
+        stop_reason: Option<StopReason>,
+        /// `true` iff the final round's `Completed` was the canonical
+        /// Qwen3 "reasoning-only finish" pattern (see
+        /// `LlmEvent::Completed::reasoning_only_stop`).
+        reasoning_only_stop: bool,
     },
     /// Emitted at most once per session, the first time the running provider
     /// cost crosses `cost_warn_percent` of the configured

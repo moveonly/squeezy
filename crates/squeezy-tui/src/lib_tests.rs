@@ -240,6 +240,8 @@ async fn completed_transcript_is_plan_free_after_stream_extraction() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -296,6 +298,8 @@ async fn unterminated_proposed_plan_block_does_not_duplicate_at_completion() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5377,6 +5381,8 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5422,6 +5428,8 @@ async fn readonly_turn_does_not_push_undo_hint() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5576,6 +5584,8 @@ async fn completion_clears_cancelled_prompt() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5722,6 +5732,8 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
             estimated_tokens: 5_800,
             ..ContextEstimate::default()
         },
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5748,6 +5760,8 @@ async fn pre_compaction_nudge_pushed_once_then_resets_after_compaction() {
             estimated_tokens: 5_900,
             ..ContextEstimate::default()
         },
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5784,6 +5798,8 @@ async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
             estimated_tokens: 4_200,
             ..ContextEstimate::default()
         },
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5838,6 +5854,8 @@ async fn pre_compaction_nudge_suppressed_at_or_past_threshold() {
             estimated_tokens: 6_100,
             ..ContextEstimate::default()
         },
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5871,6 +5889,8 @@ async fn pre_compaction_nudge_silent_below_seventy_percent() {
             estimated_tokens: 4_100,
             ..ContextEstimate::default()
         },
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -5989,6 +6009,8 @@ async fn completed_event_preserves_scroll_offset_in_history() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -6041,6 +6063,8 @@ async fn completed_event_suppresses_assistant_duplicate_shell_output_fence() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -6098,6 +6122,8 @@ async fn completed_event_keeps_substantive_assistant_summary_after_tool_output()
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
@@ -6165,6 +6191,8 @@ async fn completed_event_suppresses_materially_repeated_shell_output_fence() {
         cost: CostSnapshot::default(),
         metrics: TurnMetrics::default(),
         context_estimate: ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
     })
     .await
     .expect("send completed");
