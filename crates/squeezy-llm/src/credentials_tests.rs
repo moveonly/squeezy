@@ -459,3 +459,138 @@ fn inline_still_beats_credentials_file() {
     assert_eq!(resolved.value, "inline-winner");
     assert_eq!(resolved.source, KeySource::Inline);
 }
+
+// --- SQUEEZY_CREDENTIALS_JSON env tier --------------------------------------
+
+fn set_creds_json(value: &str) {
+    unsafe {
+        std::env::set_var("SQUEEZY_CREDENTIALS_JSON", value);
+    }
+}
+
+fn clear_creds_json() {
+    unsafe {
+        std::env::remove_var("SQUEEZY_CREDENTIALS_JSON");
+    }
+}
+
+#[test]
+fn credentials_resolves_from_squeezy_credentials_json() {
+    // The acceptance test named in the audit: with no inline, no file,
+    // no env var, no fallback env, the JSON blob still resolves the
+    // requested credential by provider name. Synthetic env var name
+    // so a developer with `OPENAI_API_KEY` exported in their shell
+    // doesn't shadow the JSON tier under test.
+    let _guard = creds_lock();
+    let scratch = scratch("json-providers");
+    point_creds_at(&scratch.file);
+    set_creds_json(r#"{"providers":{"resolver_test_json_acceptance":"sk-from-json"}}"#);
+    let resolved = resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_JSON_ACCEPTANCE_KEY")
+        .expect("json env resolves provider");
+    clear_creds_json();
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "sk-from-json");
+    assert_eq!(resolved.source, KeySource::JsonEnv);
+}
+
+#[test]
+fn credentials_json_resolves_through_vendor_named_env() {
+    // Provider-name lookup must work even when the caller asked for the
+    // vendor-style env var name: the JSON blob is keyed on the
+    // provider section, not the env var. Synthetic name so the host
+    // environment can't shadow.
+    let _guard = creds_lock();
+    let scratch = scratch("json-vendor-name");
+    point_creds_at(&scratch.file);
+    set_creds_json(r#"{"providers":{"resolver_test_vendor":"sk-vendor"}}"#);
+    let resolved = resolve_api_key_with_inline(None, "RESOLVER_TEST_VENDOR_API_KEY")
+        .expect("vendor-named lookup");
+    clear_creds_json();
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "sk-vendor");
+    assert_eq!(resolved.source, KeySource::JsonEnv);
+}
+
+#[test]
+fn credentials_json_accepts_flat_env_var_keying() {
+    // The on-disk credentials.json schema (flat `{"ENV_VAR": "value"}`)
+    // also works when piped through the env var, so a workflow can
+    // `cat credentials.json` into the variable without restructuring.
+    let _guard = creds_lock();
+    let scratch = scratch("json-flat");
+    point_creds_at(&scratch.file);
+    set_creds_json(r#"{"SQUEEZY_RESOLVER_TEST_JSON_FLAT": "flat-value"}"#);
+    let resolved = resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_JSON_FLAT")
+        .expect("flat shape resolves");
+    clear_creds_json();
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "flat-value");
+    assert_eq!(resolved.source, KeySource::JsonEnv);
+}
+
+#[test]
+fn credentials_json_sits_below_env_in_the_chain() {
+    // The JSON blob is the broadcast channel for CI/CD; an explicitly
+    // exported per-provider env var must still win so an operator can
+    // override the CI-injected secret for a single shell session.
+    let _guard = creds_lock();
+    let scratch = scratch("json-below-env");
+    point_creds_at(&scratch.file);
+    set_creds_json(r#"{"providers":{"openai":"from-json"}}"#);
+    unsafe {
+        std::env::set_var("SQUEEZY_RESOLVER_TEST_JSON_VS_ENV", "from-env");
+    }
+    let resolved = resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_JSON_VS_ENV")
+        .expect("env beats json");
+    unsafe {
+        std::env::remove_var("SQUEEZY_RESOLVER_TEST_JSON_VS_ENV");
+    }
+    clear_creds_json();
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "from-env");
+    assert_eq!(resolved.source, KeySource::Env);
+}
+
+#[test]
+fn malformed_credentials_json_env_does_not_break_resolution() {
+    // A bad JSON blob must not poison resolution — the resolver warns
+    // once and continues to the missing-key error so the caller knows
+    // which env var is needed.
+    let _guard = creds_lock();
+    let scratch = scratch("json-malformed");
+    point_creds_at(&scratch.file);
+    set_creds_json("{ this is not JSON");
+    let err = resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_JSON_MALFORMED")
+        .expect_err("no key anywhere");
+    clear_creds_json();
+    clear_creds_pointer();
+    assert!(
+        err.to_string()
+            .contains("SQUEEZY_RESOLVER_TEST_JSON_MALFORMED"),
+        "{err}"
+    );
+}
+
+#[test]
+fn empty_credentials_json_env_falls_through() {
+    // Treat an empty / whitespace blob the same as an absent one so
+    // CI configurations that always set the var (but leave it empty
+    // for builds that don't need credentials) don't accidentally
+    // shadow named env vars.
+    let _guard = creds_lock();
+    let scratch = scratch("json-empty");
+    point_creds_at(&scratch.file);
+    set_creds_json("   ");
+    unsafe {
+        std::env::set_var("SQUEEZY_RESOLVER_TEST_JSON_EMPTY", "via-env");
+    }
+    let resolved = resolve_api_key_with_inline(None, "SQUEEZY_RESOLVER_TEST_JSON_EMPTY")
+        .expect("env resolves");
+    unsafe {
+        std::env::remove_var("SQUEEZY_RESOLVER_TEST_JSON_EMPTY");
+    }
+    clear_creds_json();
+    clear_creds_pointer();
+    assert_eq!(resolved.value, "via-env");
+    assert_eq!(resolved.source, KeySource::Env);
+}
