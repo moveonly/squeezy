@@ -99,7 +99,7 @@ use render::palette::{
     blend_color,
 };
 #[cfg(test)]
-use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG, WORKING_SHIMMER_HIGHLIGHT};
 use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
@@ -5828,9 +5828,7 @@ fn reasoning_block_lines_with_extras(
     selected: bool,
     extras: usize,
 ) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(palette::muted_fg())
-        .add_modifier(Modifier::ITALIC);
+    let style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
     let body_lines: Vec<&str> = text.lines().collect();

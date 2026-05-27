@@ -7440,6 +7440,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/session-cleanup",
         "/undo",
         "/revert-turn",
+        "/effort",
         "/verbosity",
         "/tool-verbosity",
     ];
