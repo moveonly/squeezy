@@ -17,6 +17,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use squeezy_core::{Result, SqueezyError};
 
+pub mod worktree;
+pub use worktree::{Worktree, WorktreeCleanup, validate_worktree_slug};
+
 pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
