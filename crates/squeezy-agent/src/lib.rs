@@ -5277,7 +5277,7 @@ struct ToolExecutionContext<'a> {
     hooks: Option<Arc<HookRegistry>>,
 }
 
-impl ToolExecutionContext<'_> {
+impl<'a> ToolExecutionContext<'a> {
     /// Session id derived from the session log handle, used by plan-mode
     /// path-scoped write exception (issue 17). `None` when the session
     /// has not yet been assigned an id (pre-first-turn window) or has no
@@ -5286,6 +5286,43 @@ impl ToolExecutionContext<'_> {
         self.session_log
             .as_ref()
             .map(|handle| handle.session_id().to_string())
+    }
+
+    /// Build a sibling `ToolExecutionContext` rooted at `cancel`.
+    ///
+    /// `handle_subagent_call` derives a child `CancellationToken` from
+    /// the parent's token and registers it in `SubagentRegistry` as the
+    /// subagent's logical cancel handle. The subagent body must run on
+    /// that child token so every nested `child_token()` — for the LLM
+    /// stream, downstream tool calls, and any sub-subagents — hangs off
+    /// the subagent's own node in the tree. Cancelling the subagent
+    /// slot then cascades into the body; cancelling the parent turn
+    /// still reaches it through the child relationship.
+    fn with_cancel(&self, cancel: CancellationToken) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            turn_id: self.turn_id,
+            origin: self.origin,
+            provider: self.provider.clone(),
+            tools: self.tools,
+            jobs: self.jobs,
+            config: self.config,
+            telemetry: self.telemetry.clone(),
+            redactor: self.redactor.clone(),
+            tx: self.tx.clone(),
+            cancel,
+            approval_ids: self.approval_ids.clone(),
+            session_rules: self.session_rules.clone(),
+            ai_reviewer_state: self.ai_reviewer_state.clone(),
+            session_mode: self.session_mode.clone(),
+            session_log: self.session_log.clone(),
+            conversation_state: self.conversation_state.clone(),
+            task_state: self.task_state.clone(),
+            subagents: self.subagents.clone(),
+            all_tool_specs: self.all_tool_specs,
+            loaded_tool_schemas: self.loaded_tool_schemas.clone(),
+            exploration_state: self.exploration_state.clone(),
+            hooks: self.hooks.clone(),
+        }
     }
 }
 
@@ -5813,7 +5850,14 @@ async fn handle_subagent_call(
         })
         .await;
 
-    let execution = run_subagent(context, kind, request).await;
+    // Root the subagent body at `child_cancel` so every nested
+    // `child_token()` derives from the subagent's registered token.
+    // Cancelling either the parent turn (which `child_cancel` inherits
+    // from) or the subagent slot directly now cascades through its LLM
+    // stream, nested tool calls, and any sub-subagents — a real
+    // cancellation tree instead of a flat sibling list under the turn.
+    let child_context = context.with_cancel(child_cancel.clone());
+    let execution = run_subagent(&child_context, kind, request).await;
     drop(lease);
     broker
         .metrics
