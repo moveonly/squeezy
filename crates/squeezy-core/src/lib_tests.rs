@@ -1380,6 +1380,8 @@ enabled = true
 transport = "http"
 url = "https://docs.example/mcp"
 timeout_ms = 5000
+discovery_timeout_ms = 45000
+tool_call_timeout_ms = 120000
 env = { TOKEN = "secret" }
 
 [mcp.servers.docs.permissions]
@@ -1440,6 +1442,15 @@ reason = "docs lookups are safe"
     assert_eq!(config.tui.alternate_screen, TuiAlternateScreen::Always);
     assert!(!config.tui.show_reasoning_usage);
     assert_eq!(config.mcp_servers["docs"].transport, McpTransport::Http);
+    assert_eq!(config.mcp_servers["docs"].timeout_ms, Some(5_000));
+    assert_eq!(
+        config.mcp_servers["docs"].discovery_timeout_ms,
+        Some(45_000)
+    );
+    assert_eq!(
+        config.mcp_servers["docs"].tool_call_timeout_ms,
+        Some(120_000)
+    );
     assert_eq!(
         config.mcp_servers["docs"].permissions.default,
         Some(PermissionMode::Ask)
@@ -2560,4 +2571,28 @@ api_key_env = "OPENAI_API_KEY"
         "test",
     )
     .expect("api_key + api_key_env both parse cleanly");
+}
+
+#[test]
+fn memory_scope_doc_records_deferred_tool_decision() {
+    let scope_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("docs")
+        .join("internal")
+        .join("MEMORY_SCOPE.md");
+    let body = std::fs::read_to_string(&scope_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", scope_path.display()));
+    assert!(
+        body.contains("user_memory_max_bytes"),
+        "scope doc must anchor to the existing config field"
+    );
+    assert!(
+        body.contains("declines to ship a tool-mediated memory pipeline"),
+        "scope doc must state the deferred decision in absolute terms"
+    );
+    assert!(
+        body.contains("memory_append"),
+        "scope doc must name the staged tool surface for future adoption"
+    );
 }

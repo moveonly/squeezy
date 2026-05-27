@@ -2,29 +2,36 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fs,
     sync::{Arc, Mutex as StdMutex},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{
-    AppConfig, PermissionAction, PermissionRequest, PermissionVerdict, Role, TranscriptItem, TurnId,
+    AppConfig, PermissionAction, PermissionCapability, PermissionRequest, PermissionVerdict, Role,
+    TranscriptItem, TurnId,
 };
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest};
 use squeezy_skills::{APPROVAL_POLICY_DOC_PATH, bundled_doc};
+use squeezy_telemetry::{TelemetryClient, TelemetryEvent};
 use tokio_util::sync::CancellationToken;
 
 fn default_policy() -> &'static str {
     bundled_doc(APPROVAL_POLICY_DOC_PATH).expect("APPROVAL_POLICY.md missing from bundled docs")
 }
-const MAX_RECENT_TRANSCRIPT_ITEMS: usize = 15;
+/// Number of most-recent transcript turns kept whole in the sliding window.
+/// Older entries collapse into a single summary line so the reviewer always
+/// sees the user's original intent even when the request lands many turns
+/// downstream.
+const RECENT_WINDOW_ITEMS: usize = 8;
 const MAX_USER_TOKENS: usize = 800;
 const MAX_OTHER_TOKENS: usize = 400;
-const MAX_TRANSCRIPT_TOKENS: usize = 2_000;
+const SUMMARY_TOKEN_RESERVE: usize = 200;
 const CHARS_PER_TOKEN: usize = 4;
 const CONSECUTIVE_DENIAL_TRIP: usize = 2;
 const RECENT_WINDOW: usize = 20;
 const RECENT_DENIAL_TRIP: usize = 5;
+const AUDIT_RING_CAPACITY: usize = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AiReviewerTranscriptSnapshot {
@@ -33,10 +40,41 @@ pub(crate) struct AiReviewerTranscriptSnapshot {
     pub(crate) entry_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewerAuditVerdict {
+    Allow,
+    Deny,
+    NoDecision,
+    CircuitTripped,
+}
+
+impl ReviewerAuditVerdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+            Self::NoDecision => "no-decision",
+            Self::CircuitTripped => "circuit-tripped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewerAuditEntry {
+    pub recorded_at: SystemTime,
+    pub turn_id: u64,
+    pub tool_name: String,
+    pub capability: PermissionCapability,
+    pub target: String,
+    pub verdict: ReviewerAuditVerdict,
+    pub reason: String,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AiReviewerState {
     turn_circuits: BTreeMap<u64, TurnCircuit>,
     transcript_cursor: Option<TranscriptCursor>,
+    audit: VecDeque<ReviewerAuditEntry>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,6 +105,7 @@ pub(crate) struct AiReviewerInput<'a> {
     pub(crate) state: Arc<StdMutex<AiReviewerState>>,
     pub(crate) turn_id: TurnId,
     pub(crate) cancel: CancellationToken,
+    pub(crate) telemetry: TelemetryClient,
 }
 
 pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerOutcome {
@@ -77,18 +116,33 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         };
     }
 
-    if let Some(reason) = input
-        .state
-        .lock()
-        .expect("ai reviewer state")
-        .bypass_reason(input.turn_id)
-    {
+    if let Some(reason) = {
+        let mut state = input.state.lock().expect("ai reviewer state");
+        let reason = state.bypass_reason(input.turn_id);
+        if let Some(reason) = reason.as_deref() {
+            state.record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::CircuitTripped,
+                reason,
+            );
+        }
+        reason
+    } {
         return AiReviewerOutcome::CircuitTripped { reason };
     }
 
     let policy = match load_policy(input.config) {
         Ok(policy) => policy,
-        Err(reason) => return AiReviewerOutcome::NoDecision { reason },
+        Err(reason) => {
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
+        }
     };
     let prompt = {
         let mut state = input.state.lock().expect("ai reviewer state");
@@ -117,6 +171,8 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
     let timeout = Duration::from_secs(reviewer.timeout_secs);
     let response = match tokio::time::timeout(
@@ -126,66 +182,120 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
     .await
     {
         Ok(Ok(text)) => text,
-        Ok(Err(reason)) => return AiReviewerOutcome::NoDecision { reason },
+        Ok(Err(reason)) => {
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
+        }
         Err(_) => {
-            return AiReviewerOutcome::NoDecision {
-                reason: "ai reviewer timed out".to_string(),
-            };
+            let reason = "ai reviewer timed out".to_string();
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::NoDecision,
+                &reason,
+            );
+            return AiReviewerOutcome::NoDecision { reason };
         }
     };
     let Some(decision) = parse_reviewer_response(&response) else {
-        return AiReviewerOutcome::NoDecision {
-            reason: "ai reviewer returned invalid decision JSON".to_string(),
-        };
+        let reason = "ai reviewer returned invalid decision JSON".to_string();
+        input.state.lock().expect("ai reviewer state").record_audit(
+            input.turn_id,
+            input.request,
+            ReviewerAuditVerdict::NoDecision,
+            &reason,
+        );
+        return AiReviewerOutcome::NoDecision { reason };
     };
     match decision.action {
         PermissionAction::Allow => {
-            input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_non_denial(input.turn_id);
             if reviewer
                 .allow_capabilities
                 .contains(&input.request.capability)
             {
+                let reason = format!("AI reviewer approved: {}", decision.reason);
+                {
+                    let mut state = input.state.lock().expect("ai reviewer state");
+                    state.record_non_denial(input.turn_id);
+                    state.record_audit(
+                        input.turn_id,
+                        input.request,
+                        ReviewerAuditVerdict::Allow,
+                        &reason,
+                    );
+                }
                 AiReviewerOutcome::Verdict(PermissionVerdict {
                     action: PermissionAction::Allow,
                     matched_rule: None,
-                    reason: format!("AI reviewer approved: {}", decision.reason),
+                    reason,
                 })
             } else {
-                AiReviewerOutcome::NoDecision {
-                    reason: format!(
-                        "ai reviewer allow ignored for non-allowlisted {} capability",
-                        input.request.capability.as_str()
-                    ),
+                input
+                    .telemetry
+                    .spawn(TelemetryEvent::ai_reviewer_allow_downgrade(
+                        input.request.capability.as_str(),
+                    ));
+                let reason = format!(
+                    "ai reviewer allow ignored for non-allowlisted {} capability",
+                    input.request.capability.as_str()
+                );
+                {
+                    let mut state = input.state.lock().expect("ai reviewer state");
+                    state.record_non_denial(input.turn_id);
+                    state.record_audit(
+                        input.turn_id,
+                        input.request,
+                        ReviewerAuditVerdict::NoDecision,
+                        &reason,
+                    );
                 }
+                AiReviewerOutcome::NoDecision { reason }
             }
         }
         PermissionAction::Ask => {
-            input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_non_denial(input.turn_id);
-            AiReviewerOutcome::NoDecision {
-                reason: decision.reason,
+            let reason = decision.reason;
+            {
+                let mut state = input.state.lock().expect("ai reviewer state");
+                state.record_non_denial(input.turn_id);
+                state.record_audit(
+                    input.turn_id,
+                    input.request,
+                    ReviewerAuditVerdict::NoDecision,
+                    &reason,
+                );
             }
+            AiReviewerOutcome::NoDecision { reason }
         }
         PermissionAction::Deny => {
-            let tripped = input
-                .state
-                .lock()
-                .expect("ai reviewer state")
-                .record_denial(input.turn_id);
+            let tripped = {
+                let mut state = input.state.lock().expect("ai reviewer state");
+                state.record_denial(input.turn_id)
+            };
             if let Some(reason) = tripped {
+                input.state.lock().expect("ai reviewer state").record_audit(
+                    input.turn_id,
+                    input.request,
+                    ReviewerAuditVerdict::CircuitTripped,
+                    &reason,
+                );
                 return AiReviewerOutcome::CircuitTripped { reason };
             }
+            let reason = format!("AI reviewer denied: {}", decision.reason);
+            input.state.lock().expect("ai reviewer state").record_audit(
+                input.turn_id,
+                input.request,
+                ReviewerAuditVerdict::Deny,
+                &reason,
+            );
             AiReviewerOutcome::Verdict(PermissionVerdict {
                 action: PermissionAction::Deny,
                 matched_rule: None,
-                reason: format!("AI reviewer denied: {}", decision.reason),
+                reason,
             })
         }
     }
@@ -235,10 +345,11 @@ fn build_review_prompt(
     policy: &str,
     state: &mut AiReviewerState,
 ) -> String {
+    let max_transcript_tokens = config.permissions.ai_reviewer.max_transcript_tokens;
     let transcript_text = transcript
         .map(|snapshot| {
             let delta_marker = state.transcript_delta_marker(snapshot);
-            bounded_transcript(snapshot, delta_marker.as_deref())
+            bounded_transcript(snapshot, delta_marker.as_deref(), max_transcript_tokens)
         })
         .unwrap_or_else(|| "No transcript snapshot is available.".to_string());
     let payload = json!({
@@ -261,47 +372,85 @@ fn build_review_prompt(
     )
 }
 
+/// Render a transcript snapshot under `max_transcript_tokens`, keeping the
+/// last `RECENT_WINDOW_ITEMS` turns whole and collapsing older turns into one
+/// compacted summary line. The last user turn is always preserved so the
+/// reviewer never loses intent context even when the permission request lands
+/// many turns downstream of the original ask.
 fn bounded_transcript(
     snapshot: &AiReviewerTranscriptSnapshot,
     delta_marker: Option<&str>,
+    max_transcript_tokens: usize,
 ) -> String {
-    let recent_start = snapshot
-        .items
-        .len()
-        .saturating_sub(MAX_RECENT_TRANSCRIPT_ITEMS);
-    let recent = &snapshot.items[recent_start..];
-    let last_user = recent.iter().rposition(|item| item.role == Role::User);
-    let mut kept = Vec::new();
+    if max_transcript_tokens == 0 || snapshot.items.is_empty() {
+        return "No recent transcript entries fit the review budget.".to_string();
+    }
+    let items = snapshot.items.as_slice();
+    let recent_start = items.len().saturating_sub(RECENT_WINDOW_ITEMS);
+    let older = &items[..recent_start];
+    let recent = &items[recent_start..];
+    let last_user_global = items.iter().rposition(|item| item.role == Role::User);
+
+    let summary_budget = if older.is_empty() {
+        0
+    } else {
+        SUMMARY_TOKEN_RESERVE.min(max_transcript_tokens / 4)
+    };
+    let recent_budget = max_transcript_tokens.saturating_sub(summary_budget);
+
+    let mut kept: Vec<(usize, String)> = Vec::new();
     let mut total_tokens = 0usize;
 
-    if let Some(index) = last_user
-        && let Some(line) = format_transcript_line(index, &recent[index], MAX_USER_TOKENS)
+    if let Some(index) = last_user_global
+        && index >= recent_start
+        && let Some(line) = format_transcript_line(index, &items[index], MAX_USER_TOKENS)
     {
         total_tokens = total_tokens.saturating_add(approx_tokens(&line));
         kept.push((index, line));
     }
 
-    for (index, item) in recent.iter().enumerate().rev() {
-        if Some(index) == last_user || total_tokens >= MAX_TRANSCRIPT_TOKENS {
+    for (offset, item) in recent.iter().enumerate().rev() {
+        let global_index = recent_start + offset;
+        if Some(global_index) == last_user_global {
             continue;
         }
-        let remaining = MAX_TRANSCRIPT_TOKENS.saturating_sub(total_tokens);
+        if total_tokens >= recent_budget {
+            break;
+        }
+        let remaining = recent_budget.saturating_sub(total_tokens);
         let role_cap = if item.role == Role::User {
             MAX_USER_TOKENS
         } else {
             MAX_OTHER_TOKENS
         };
         let cap = role_cap.min(remaining);
-        if let Some(line) = format_transcript_line(index, item, cap) {
+        if let Some(line) = format_transcript_line(global_index, item, cap) {
             total_tokens = total_tokens.saturating_add(approx_tokens(&line));
-            kept.push((index, line));
+            kept.push((global_index, line));
         }
     }
+
+    if let Some(index) = last_user_global
+        && index < recent_start
+        && let Some(line) = format_transcript_line(index, &items[index], MAX_USER_TOKENS)
+    {
+        let _ = total_tokens.saturating_add(approx_tokens(&line));
+        kept.push((index, line));
+    }
+
+    let summary_line = if older.is_empty() {
+        None
+    } else {
+        compact_older_summary(older, last_user_global, summary_budget)
+    };
 
     kept.sort_by_key(|(index, _)| *index);
     let mut lines = Vec::new();
     if let Some(delta_marker) = delta_marker {
         lines.push(delta_marker.to_string());
+    }
+    if let Some(summary) = summary_line {
+        lines.push(summary);
     }
     lines.extend(kept.into_iter().map(|(_, line)| line));
     if lines.is_empty() {
@@ -309,6 +458,60 @@ fn bounded_transcript(
     } else {
         lines.join("\n")
     }
+}
+
+/// Collapse pre-window transcript items into a single budgeted summary line.
+/// Counts roles and concatenates the head of each entry up to the per-summary
+/// budget so the reviewer retains a synopsis of older intent without paying
+/// per-entry overhead.
+fn compact_older_summary(
+    older: &[TranscriptItem],
+    last_user_global: Option<usize>,
+    summary_budget_tokens: usize,
+) -> Option<String> {
+    if older.is_empty() || summary_budget_tokens == 0 {
+        return None;
+    }
+    let mut users = 0usize;
+    let mut assistants = 0usize;
+    let mut systems = 0usize;
+    for item in older {
+        match item.role {
+            Role::User => users += 1,
+            Role::Assistant => assistants += 1,
+            Role::System => systems += 1,
+        }
+    }
+
+    let header = format!(
+        "[summary of {} earlier turn(s): {users} user, {assistants} assistant, {systems} system]",
+        older.len()
+    );
+    let header_tokens = approx_tokens(&header);
+    if header_tokens >= summary_budget_tokens {
+        return Some(header);
+    }
+    let body_budget_tokens = summary_budget_tokens.saturating_sub(header_tokens);
+    let body_budget_chars = body_budget_tokens.saturating_mul(CHARS_PER_TOKEN);
+    if body_budget_chars == 0 {
+        return Some(header);
+    }
+    // Prefer the last user turn (intent) when it falls outside the recent
+    // window, otherwise fall back to the most recent older entry.
+    let pick_index = match last_user_global {
+        Some(index) if index < older.len() => Some(index),
+        _ => older.iter().rposition(|item| item.role == Role::User),
+    };
+    let pick = pick_index
+        .map(|index| &older[index])
+        .or_else(|| older.last())?;
+    let role = match pick.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+    };
+    let snippet = truncate_chars(&pick.content, body_budget_chars);
+    Some(format!("{header} {role}: {snippet}"))
 }
 
 fn format_transcript_line(
@@ -428,6 +631,31 @@ impl AiReviewerState {
             entry_count: snapshot.entry_count,
         });
         marker
+    }
+
+    fn record_audit(
+        &mut self,
+        turn_id: TurnId,
+        request: &PermissionRequest,
+        verdict: ReviewerAuditVerdict,
+        reason: &str,
+    ) {
+        if self.audit.len() == AUDIT_RING_CAPACITY {
+            self.audit.pop_front();
+        }
+        self.audit.push_back(ReviewerAuditEntry {
+            recorded_at: SystemTime::now(),
+            turn_id: turn_id.get(),
+            tool_name: request.tool_name.clone(),
+            capability: request.capability,
+            target: request.target.clone(),
+            verdict,
+            reason: reason.to_string(),
+        });
+    }
+
+    pub fn recent_decisions(&self) -> Vec<ReviewerAuditEntry> {
+        self.audit.iter().cloned().collect()
     }
 }
 

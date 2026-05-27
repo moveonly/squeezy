@@ -14,20 +14,18 @@ Subagent behavior is parameterized by a role drawn from a static catalog in
 - A read-only or planning-only allow-list of tool names.
 - A model policy: reuse the parent model, or downshift to a cheap model.
 - A reasoning-effort hint for providers that accept one.
-- A status: `Active` or `Roadmap`.
 
-The catalog currently defines four roles:
+The catalog currently defines three roles:
 
-| Role     | Status   | Mutates files | Default model | Purpose                                                            |
-| -------- | -------- | ------------- | ------------- | ------------------------------------------------------------------ |
-| Explorer | Active   | No            | Cheap         | Graph-first codebase exploration; the `explore` control tool.      |
-| Worker   | Roadmap  | (Yes)         | Parent        | Future mutation-capable worker; no model-visible tool yet.         |
-| Planner  | Active   | No            | Parent        | Read-only implementation planning; the `delegate_plan` control tool. |
-| Reviewer | Active   | No            | Cheap         | Read-only diff review; the `delegate_review` control tool.         |
+| Role     | Mutates files | Default model | Purpose                                                              |
+| -------- | ------------- | ------------- | -------------------------------------------------------------------- |
+| Explorer | No            | Cheap         | Graph-first codebase exploration; the `explore` control tool.        |
+| Planner  | No            | Parent        | Read-only implementation planning; the `delegate_plan` control tool. |
+| Reviewer | No            | Cheap         | Read-only diff review; the `delegate_review` control tool.           |
 
 `delegate` keeps its existing broad-research behavior and is intentionally
-*not* overlaid by the Worker role — the Worker role is roadmap, and pinning
-delegate to it would strip access to `plan_patch` and skill discovery.
+not overlaid by any role, so it retains access to `plan_patch` and skill
+discovery for broad research tasks.
 
 ## Control Tools
 

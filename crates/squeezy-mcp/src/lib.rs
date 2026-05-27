@@ -27,10 +27,11 @@ use rmcp::{
         streamable_http_client::StreamableHttpClientTransportConfig,
     },
 };
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use squeezy_core::{McpServerConfig, McpTransport};
+use squeezy_core::{McpServerConfig, McpTransport, PermissionMode};
 use squeezy_store::SqueezyStore;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -38,7 +39,30 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod sse;
+
 const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+
+/// Timeout applied to MCP tool discovery (including the implicit session
+/// bring-up on the first call). Falls back to `timeout_ms`, then to the
+/// crate-wide default.
+fn discovery_timeout_ms(server: &McpServerConfig) -> u64 {
+    server
+        .discovery_timeout_ms
+        .or(server.timeout_ms)
+        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
+}
+
+/// Timeout applied to MCP tool invocations and follow-on requests (tool
+/// calls, resource listing, resource reads). Falls back to `timeout_ms`,
+/// then to the crate-wide default.
+fn tool_call_timeout_ms(server: &McpServerConfig) -> u64 {
+    server
+        .tool_call_timeout_ms
+        .or(server.timeout_ms)
+        .unwrap_or(DEFAULT_MCP_TIMEOUT_MS)
+}
+
 const MCP_TOOL_CACHE_SCHEMA_VERSION: u64 = 1;
 const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 const HASH_SUFFIX_BYTES: usize = 12;
@@ -171,6 +195,37 @@ impl McpElicitationResponse {
     }
 }
 
+/// Outcome of a single elicitation policy check, surfaced for audit/UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum McpElicitationAuditOutcome {
+    /// Policy + content allowed silent acceptance; no user was prompted.
+    AutoAccepted,
+    /// Policy denied without prompting.
+    AutoDeclined,
+    /// Forwarded to the host handler (UI) for a user decision.
+    Forwarded,
+}
+
+/// Record emitted every time the MCP client takes an elicitation decision.
+///
+/// Provides a structured audit trail so a malicious server spamming empty
+/// `Form` elicitations cannot silently flip behavior — each decision is
+/// observable from the host without scraping `tracing` logs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpElicitationAuditEvent {
+    pub server: String,
+    pub request_id: String,
+    pub kind: McpElicitationKind,
+    pub policy: PermissionMode,
+    pub outcome: McpElicitationAuditOutcome,
+    pub unix_millis: u128,
+}
+
+/// Cap on retained audit entries. Older records are dropped FIFO; this is
+/// purely a defense against runaway memory if a misbehaving server floods
+/// elicitations — the host is expected to drain via `audit_log_snapshot`.
+const MCP_AUDIT_LOG_CAPACITY: usize = 256;
+
 #[derive(Clone)]
 pub struct McpClientRegistry {
     servers: Arc<BTreeMap<String, McpServerConfig>>,
@@ -179,6 +234,13 @@ pub struct McpClientRegistry {
     store: Option<Arc<SqueezyStore>>,
     status_tx: watch::Sender<McpStatusSnapshot>,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    /// Approval gate consulted before auto-accepting an elicitation. `Ask`
+    /// (the conservative default) forces every request through the host
+    /// handler; `Allow` keeps the historical fast-path for empty-form
+    /// confirmations; `Deny` short-circuits to a decline so a misbehaving
+    /// server cannot block the agent waiting on user input.
+    elicitation_policy: Arc<Mutex<PermissionMode>>,
+    elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
     resource_reads: Arc<Mutex<BTreeMap<(String, String), CachedResourceRead>>>,
 }
@@ -206,6 +268,10 @@ impl McpClientRegistry {
             store,
             status_tx,
             elicitation_handler: Arc::new(Mutex::new(None)),
+            elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+            elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                MCP_AUDIT_LOG_CAPACITY,
+            ))),
             pause_state: ElicitationPauseState::default(),
             resource_reads: Arc::new(Mutex::new(BTreeMap::new())),
         };
@@ -235,6 +301,33 @@ impl McpClientRegistry {
         if let Ok(mut slot) = self.elicitation_handler.lock() {
             *slot = handler;
         }
+    }
+
+    /// Update the approval gate that decides how MCP server elicitations are
+    /// handled. Callers should plumb their host policy here (typically the
+    /// `permissions.mcp` mode) so a malicious server cannot bypass user
+    /// consent by spamming empty `Form` elicitations.
+    pub fn set_elicitation_policy(&self, policy: PermissionMode) {
+        if let Ok(mut slot) = self.elicitation_policy.lock() {
+            *slot = policy;
+        }
+    }
+
+    pub fn elicitation_policy(&self) -> PermissionMode {
+        self.elicitation_policy
+            .lock()
+            .map(|policy| *policy)
+            .unwrap_or(PermissionMode::Ask)
+    }
+
+    /// Snapshot of the most recent elicitation decisions (oldest first).
+    /// Intended for audit surfaces; the underlying ring is capped at
+    /// `MCP_AUDIT_LOG_CAPACITY` so a flood cannot exhaust memory.
+    pub fn elicitation_audit_log(&self) -> Vec<McpElicitationAuditEvent> {
+        self.elicitation_audit
+            .lock()
+            .map(|log| log.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn status_snapshot(&self) -> McpStatusSnapshot {
@@ -467,7 +560,7 @@ impl McpClientRegistry {
                 uri: uri.to_string(),
             });
         }
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(&server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -511,7 +604,7 @@ impl McpClientRegistry {
         server: &McpServerConfig,
         cancel: CancellationToken,
     ) -> McpResult<Vec<ExternalMcpTool>> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = discovery_timeout_ms(server);
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
@@ -582,7 +675,7 @@ impl McpClientRegistry {
         arguments: JsonObject,
         cancel: CancellationToken,
     ) -> McpResult<Value> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_for_call = server.clone();
         let server_name_owned = server_name.to_string();
@@ -627,13 +720,14 @@ impl McpClientRegistry {
         let handler = SqueezyMcpClientHandler {
             server_name: server_name.to_string(),
             elicitation_handler: self.elicitation_handler.clone(),
+            elicitation_policy: self.elicitation_policy.clone(),
+            elicitation_audit: self.elicitation_audit.clone(),
             pause_state: self.pause_state.clone(),
         };
         let entry = match server.transport {
             McpTransport::Stdio => start_stdio_service(server_name, server, handler).await?,
-            McpTransport::Http | McpTransport::Sse => {
-                start_http_service(server_name, server, handler).await?
-            }
+            McpTransport::Http => start_http_service(server_name, server, handler).await?,
+            McpTransport::Sse => start_sse_service(server_name, server, handler).await?,
         };
         let arc = Arc::new(entry);
         let mut sessions = self.sessions.lock().await;
@@ -739,7 +833,7 @@ impl McpClientRegistry {
         cursor: Option<String>,
         cancel: CancellationToken,
     ) -> McpResult<rmcp::model::ListResourcesResult> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -768,7 +862,7 @@ impl McpClientRegistry {
         cursor: Option<String>,
         cancel: CancellationToken,
     ) -> McpResult<rmcp::model::ListResourceTemplatesResult> {
-        let timeout_ms = server.timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+        let timeout_ms = tool_call_timeout_ms(server);
         let registry = self.clone();
         let server_name_owned = server_name.to_string();
         let server_for_call = server.clone();
@@ -890,6 +984,8 @@ struct McpToolCacheRecord {
 struct SqueezyMcpClientHandler {
     server_name: String,
     elicitation_handler: Arc<Mutex<Option<McpElicitationHandler>>>,
+    elicitation_policy: Arc<Mutex<PermissionMode>>,
+    elicitation_audit: Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
     pause_state: ElicitationPauseState,
 }
 
@@ -899,37 +995,119 @@ impl ClientHandler for SqueezyMcpClientHandler {
         request: CreateElicitationRequestParams,
         context: RequestContext<RoleClient>,
     ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
-        if can_auto_accept_elicitation(&request) {
-            return Ok(CreateElicitationResult {
-                action: ElicitationAction::Accept,
-                content: Some(json!({})),
-                meta: None,
-            });
-        }
-        let handler = self
-            .elicitation_handler
+        let request_id = format!("{:?}", context.id);
+        let policy = self
+            .elicitation_policy
             .lock()
-            .ok()
-            .and_then(|handler| handler.clone());
-        let Some(handler) = handler else {
-            return Ok(CreateElicitationResult {
-                action: ElicitationAction::Decline,
-                content: None,
-                meta: None,
-            });
-        };
-        let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
-        let _pause = self.pause_state.enter();
-        let response = handler(ui_request).await;
-        Ok(CreateElicitationResult {
-            action: match response.action {
-                McpElicitationAction::Accept => ElicitationAction::Accept,
-                McpElicitationAction::Decline => ElicitationAction::Decline,
-                McpElicitationAction::Cancel => ElicitationAction::Cancel,
-            },
-            content: response.content,
-            meta: None,
-        })
+            .map(|policy| *policy)
+            .unwrap_or(PermissionMode::Ask);
+        let kind = elicitation_kind(&request);
+        let auto = classify_elicitation(policy, &request);
+        if matches!(auto, AutoElicitationDecision::AutoAccept) {
+            tracing::info!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                request_id = %request_id,
+                kind = ?kind,
+                policy = %policy.as_str(),
+                "auto-accepting MCP elicitation: policy allows and form has no required fields"
+            );
+        } else if matches!(auto, AutoElicitationDecision::AutoDecline) {
+            tracing::info!(
+                target: "squeezy::mcp",
+                server = %self.server_name,
+                request_id = %request_id,
+                kind = ?kind,
+                policy = %policy.as_str(),
+                "auto-declining MCP elicitation: policy denies all elicitations"
+            );
+        }
+        match auto {
+            AutoElicitationDecision::AutoAccept => {
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::AutoAccepted,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Accept,
+                    content: Some(json!({})),
+                    meta: None,
+                })
+            }
+            AutoElicitationDecision::AutoDecline => {
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::AutoDeclined,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                Ok(CreateElicitationResult {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                    meta: None,
+                })
+            }
+            AutoElicitationDecision::Forward => {
+                let handler = self
+                    .elicitation_handler
+                    .lock()
+                    .ok()
+                    .and_then(|handler| handler.clone());
+                let Some(handler) = handler else {
+                    push_elicitation_audit(
+                        &self.elicitation_audit,
+                        McpElicitationAuditEvent {
+                            server: self.server_name.clone(),
+                            request_id,
+                            kind,
+                            policy,
+                            outcome: McpElicitationAuditOutcome::AutoDeclined,
+                            unix_millis: unix_millis(),
+                        },
+                    );
+                    return Ok(CreateElicitationResult {
+                        action: ElicitationAction::Decline,
+                        content: None,
+                        meta: None,
+                    });
+                };
+                push_elicitation_audit(
+                    &self.elicitation_audit,
+                    McpElicitationAuditEvent {
+                        server: self.server_name.clone(),
+                        request_id,
+                        kind,
+                        policy,
+                        outcome: McpElicitationAuditOutcome::Forwarded,
+                        unix_millis: unix_millis(),
+                    },
+                );
+                let ui_request = elicitation_request_for_ui(&self.server_name, &context, &request);
+                let _pause = self.pause_state.enter();
+                let response = handler(ui_request).await;
+                Ok(CreateElicitationResult {
+                    action: match response.action {
+                        McpElicitationAction::Accept => ElicitationAction::Accept,
+                        McpElicitationAction::Decline => ElicitationAction::Decline,
+                        McpElicitationAction::Cancel => ElicitationAction::Cancel,
+                    },
+                    content: response.content,
+                    meta: None,
+                })
+            }
+        }
     }
 
     async fn on_cancelled(
@@ -1215,20 +1393,60 @@ async fn start_http_service(
     })
 }
 
-/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+/// Start a session against a legacy MCP HTTP+SSE server (2024-11-05 spec).
 ///
-/// Resolves `bearer_token_env_var`, `http_headers`, and `env_http_headers`
+/// The transport opens a GET against `server.url` for the `text/event-stream`
+/// channel, waits for the server's `event: endpoint` frame, then routes
+/// outbound JSON-RPC messages through POSTs to the advertised endpoint. The
+/// stream is parsed via `crate::sse::SseDecoder`, which honours `event:` and
+/// `data:` lines per the HTML SSE grammar — distinct from the 2025-03-26
+/// streamable-HTTP transport, where SSE handling is internal to rmcp.
+async fn start_sse_service(
+    server_name: &str,
+    server: &McpServerConfig,
+    handler: SqueezyMcpClientHandler,
+) -> McpResult<SessionEntry> {
+    let url = server.url.as_ref().ok_or_else(|| McpError::MissingUrl {
+        server: server_name.to_string(),
+        transport: "sse",
+    })?;
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers(server_name, server, |name| std::env::var(name).ok());
+    let worker =
+        sse::build_sse_worker(url.clone(), auth_header, custom_headers).map_err(|err| {
+            McpError::Transport {
+                server: server_name.to_string(),
+                message: err.to_string(),
+            }
+        })?;
+    let service = handler
+        .serve(worker)
+        .await
+        .map_err(|err| McpError::Transport {
+            server: server_name.to_string(),
+            message: err.to_string(),
+        })?;
+    Ok(SessionEntry {
+        service: Arc::new(service),
+        _process: None,
+    })
+}
+
+/// Resolve `bearer_token_env_var`, `http_headers`, and `env_http_headers`
 /// against the supplied env lookup. Missing env vars are skipped (not fatal);
 /// invalid header names/values log a warning and are dropped so a single bad
 /// entry never blocks the whole server from connecting. Env-sourced headers
 /// override the static map on name conflict so secret rotation does not lose
-/// to a stale literal.
-fn build_streamable_http_config<F>(
+/// to a stale literal. Shared by the streamable-HTTP and legacy-SSE clients
+/// so both transports honour the same auth/header config surface.
+fn resolve_http_auth_and_headers<F>(
     server_name: &str,
-    url: String,
     server: &McpServerConfig,
     lookup_env: F,
-) -> StreamableHttpClientTransportConfig
+) -> (
+    Option<String>,
+    std::collections::HashMap<HeaderName, HeaderValue>,
+)
 where
     F: Fn(&str) -> Option<String>,
 {
@@ -1302,7 +1520,21 @@ where
             }
         }
     }
+    (auth_header, custom_headers)
+}
 
+/// Build a `StreamableHttpClientTransportConfig` from an MCP server config.
+fn build_streamable_http_config<F>(
+    server_name: &str,
+    url: String,
+    server: &McpServerConfig,
+    lookup_env: F,
+) -> StreamableHttpClientTransportConfig
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers(server_name, server, lookup_env);
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     config.auth_header = auth_header;
     config.custom_headers = custom_headers;
@@ -1667,6 +1899,48 @@ fn can_auto_accept_elicitation(request: &CreateElicitationRequestParams) -> bool
     }
 }
 
+fn elicitation_kind(request: &CreateElicitationRequestParams) -> McpElicitationKind {
+    match request {
+        CreateElicitationRequestParams::FormElicitationParams { .. } => McpElicitationKind::Form,
+        CreateElicitationRequestParams::UrlElicitationParams { .. } => McpElicitationKind::Url,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoElicitationDecision {
+    AutoAccept,
+    AutoDecline,
+    Forward,
+}
+
+/// Resolve the per-request elicitation decision against the host policy. Pure
+/// function so the gate can be exercised in tests without spinning up an
+/// `rmcp` peer; the audit ring and tracing are applied around it.
+fn classify_elicitation(
+    policy: PermissionMode,
+    request: &CreateElicitationRequestParams,
+) -> AutoElicitationDecision {
+    match policy {
+        PermissionMode::Deny => AutoElicitationDecision::AutoDecline,
+        PermissionMode::Allow if can_auto_accept_elicitation(request) => {
+            AutoElicitationDecision::AutoAccept
+        }
+        PermissionMode::Allow | PermissionMode::Ask => AutoElicitationDecision::Forward,
+    }
+}
+
+fn push_elicitation_audit(
+    log: &Arc<Mutex<std::collections::VecDeque<McpElicitationAuditEvent>>>,
+    event: McpElicitationAuditEvent,
+) {
+    if let Ok(mut log) = log.lock() {
+        if log.len() >= MCP_AUDIT_LOG_CAPACITY {
+            log.pop_front();
+        }
+        log.push_back(event);
+    }
+}
+
 fn elicitation_request_for_ui(
     server: &str,
     context: &RequestContext<RoleClient>,
@@ -1720,6 +1994,8 @@ fn tool_cache_key(server_name: &str, server: &McpServerConfig) -> String {
         "args": &server.args,
         "url": &server.url,
         "timeout_ms": server.timeout_ms,
+        "discovery_timeout_ms": server.discovery_timeout_ms,
+        "tool_call_timeout_ms": server.tool_call_timeout_ms,
         "env_keys": server.env.keys().collect::<Vec<_>>(),
         "enabled_tools": &server.enabled_tools,
         "disabled_tools": &server.disabled_tools,

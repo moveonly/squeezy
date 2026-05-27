@@ -270,6 +270,25 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
 }
 
 #[test]
+fn ai_reviewer_allow_downgrade_event_tags_capability() {
+    // squeezy-2so: the reviewer silently downgrades model `allow` decisions
+    // when the capability is not in the operator's allowlist. The counter
+    // must carry the capability label so operators can pivot dashboards on
+    // it and decide which capability deserves to be added to the allowlist.
+    let event = TelemetryEvent::ai_reviewer_allow_downgrade("shell");
+    let text = serde_json::to_string(&event).unwrap();
+
+    assert!(
+        text.contains("ai_reviewer_allow_downgrade"),
+        "event name slug missing: {text}"
+    );
+    assert!(
+        text.contains("\"permission_capability\":\"shell\""),
+        "permission_capability missing: {text}"
+    );
+}
+
+#[test]
 fn shell_sandbox_best_effort_fallback_event_tags_backend_and_tool() {
     // F3-4: surface silent best_effort sandbox degradation as a counter.
     // The event name must be the documented `approval.best_effort.fallback`
@@ -294,6 +313,171 @@ fn shell_sandbox_best_effort_fallback_event_tags_backend_and_tool() {
         text.contains("\"tool_family\":\"shell\""),
         "tool_family missing: {text}"
     );
+}
+
+#[test]
+fn trace_id_is_session_scoped_and_w3c_shaped() {
+    // squeezy-dpi: every TelemetryClient holds one trace_id that is
+    // stable for the life of the client and looks like a W3C trace_id
+    // (32 lowercase hex chars). Disabled clients have no id.
+    let root = telemetry_temp_root();
+    let path = root.join("install_id");
+    let config = AppConfig {
+        telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &path);
+    let trace_id = client.trace_id().expect("enabled client has trace id");
+    assert_eq!(trace_id.len(), 32, "trace_id len: {trace_id}");
+    assert!(
+        trace_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "trace_id not hex: {trace_id}"
+    );
+    assert_eq!(
+        trace_id,
+        client.trace_id().unwrap(),
+        "trace_id must be stable across calls on one client"
+    );
+
+    let disabled = TelemetryClient::disabled();
+    assert!(disabled.trace_id().is_none());
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn events_carry_consistent_trace_id_across_a_turn() {
+    // squeezy-dpi: every event emitted during the same turn must carry
+    // the same trace_id and the same span_id so a debugger pulling one
+    // Worker-side event can pull the rest of the turn's events.
+    let root = telemetry_temp_root();
+    let path = root.join("install_id");
+    let config = AppConfig {
+        telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &path);
+    let trace_id = client.trace_id().unwrap();
+    let span_id = client.begin_turn().expect("begin_turn on enabled client");
+
+    client.record(TelemetryEvent::app_started(&config)).await;
+    client
+        .record(TelemetryEvent::tool_completed(ToolTelemetryReport {
+            provider: &config.provider,
+            model: &config.model,
+            turn_index: 1,
+            tool_sequence: 1,
+            tool_name: "grep",
+            status: ToolStatusKind::Success,
+            duration: Duration::from_millis(3),
+            cost: ToolCostProperties::default(),
+            args_sha256: None,
+            output_sha256: None,
+            content_sha256: None,
+        }))
+        .await;
+    client
+        .record(TelemetryEvent::turn_completed(
+            &config,
+            1,
+            TurnMetrics::default(),
+        ))
+        .await;
+
+    let pending = client.pending_events_snapshot().await;
+    assert_eq!(pending.len(), 3, "all three events enqueued");
+    for event in &pending {
+        assert_eq!(
+            event.properties.trace_id.as_deref(),
+            Some(trace_id.as_str()),
+            "trace_id mismatch on {:?}",
+            event.event,
+        );
+        assert_eq!(
+            event.properties.span_id.as_deref(),
+            Some(span_id.as_str()),
+            "span_id mismatch on {:?}",
+            event.event,
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn span_id_rotates_per_turn_and_clears_after_end_turn() {
+    // squeezy-dpi: a new begin_turn replaces the active span_id; events
+    // recorded after end_turn carry no span_id (but still carry trace_id).
+    let root = telemetry_temp_root();
+    let path = root.join("install_id");
+    let config = AppConfig {
+        telemetry: telemetry_config(true, "https://telemetry.example/v1/batch"),
+        ..AppConfig::default()
+    };
+    let client = TelemetryClient::from_config_with_install_path(&config, &path);
+    let trace_id = client.trace_id().unwrap();
+
+    let span_a = client.begin_turn().unwrap();
+    client
+        .record(TelemetryEvent::turn_completed(
+            &config,
+            1,
+            TurnMetrics::default(),
+        ))
+        .await;
+    client.end_turn();
+    client
+        .record(TelemetryEvent::failure_seen(ErrorKind::Provider))
+        .await;
+    let span_b = client.begin_turn().unwrap();
+    client
+        .record(TelemetryEvent::turn_completed(
+            &config,
+            2,
+            TurnMetrics::default(),
+        ))
+        .await;
+
+    assert_ne!(span_a, span_b, "begin_turn must rotate span_id");
+    assert_eq!(span_a.len(), 16, "span_id is 16 hex chars");
+    assert_eq!(span_b.len(), 16, "span_id is 16 hex chars");
+    assert!(span_a.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(span_b.bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let pending = client.pending_events_snapshot().await;
+    assert_eq!(pending.len(), 3);
+    assert_eq!(
+        pending[0].properties.span_id.as_deref(),
+        Some(span_a.as_str())
+    );
+    assert!(
+        pending[1].properties.span_id.is_none(),
+        "event after end_turn carries no span_id: {:?}",
+        pending[1].properties.span_id,
+    );
+    assert_eq!(
+        pending[2].properties.span_id.as_deref(),
+        Some(span_b.as_str())
+    );
+    for event in &pending {
+        assert_eq!(
+            event.properties.trace_id.as_deref(),
+            Some(trace_id.as_str())
+        );
+    }
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn disabled_client_does_not_stamp_or_track_spans() {
+    // begin_turn / end_turn / trace_id on a disabled client are no-ops
+    // and must not panic.
+    let client = TelemetryClient::disabled();
+    assert!(client.begin_turn().is_none());
+    client.end_turn();
+    assert!(client.trace_id().is_none());
+    client
+        .record(TelemetryEvent::failure_seen(ErrorKind::Io))
+        .await;
+    assert!(client.pending_events_snapshot().await.is_empty());
 }
 
 #[test]

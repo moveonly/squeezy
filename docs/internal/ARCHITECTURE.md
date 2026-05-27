@@ -101,6 +101,31 @@ retired:
   the only acceptable form of local IPC, and it is bound to a session
   socket — not a network port.
 
+## Non-Goals
+
+Squeezy is a single-process Rust CLI/TUI. The following are explicit
+non-goals; reviewers should reject PRs that move toward them.
+
+- No app-server, daemon, or long-running background service. There is no
+  process that outlives the user's interactive session.
+- No SDK client crate, remote-control protocol, or proprietary
+  cross-process API. The runtime surface is the `squeezy` binary and its
+  subcommands; there is no parallel API surface for embedders.
+- No new workspace members matching `*-server`, `*-client`,
+  `*-protocol`, `*-daemon`, or `sdk-*`. The 18-crate layout under
+  `crates/` is the intended scope.
+- No embedded HTTP server or inbound network listener (see the
+  "Provider SDK Policy" section above for the framework-level
+  restatement of this rule). The only acceptable local IPC is the
+  session-scoped Unix socket used by `squeezy ask`.
+
+Callers that need to script Squeezy invoke the CLI directly
+(`squeezy --prompt …` for one-shot non-interactive turns, or subcommands
+like `squeezy sessions`, `squeezy repo`, `squeezy config`). External
+tools that need to extend Squeezy's capabilities run as MCP servers
+configured via `squeezy mcp add`; cross-process orchestration belongs to
+MCP, not to a Squeezy-specific protocol.
+
 ## Adding A Language Family
 
 1. Add the `LanguageKind` variant and map it to a `LanguageFamily` in

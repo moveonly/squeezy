@@ -4,6 +4,24 @@ Squeezy's semantic navigation layer is built from tree-sitter parsers, workspace
 file records, and local resolution heuristics. It is designed to answer common
 navigation questions before the model reads raw files.
 
+## Design Policy: Graph-First Navigation
+
+Squeezy deliberately keeps a graph-first navigation surface and will not retreat
+to a bash/grep/`apply_patch` shell-loop navigation model. Tree-sitter grammars
+for Rust, Python, Java, C#, Go, C/C++, and JavaScript/TypeScript drive a
+persisted semantic graph with a typed-confidence call resolver and a documented
+agent-facing tool surface (`decl_search`, `definition_search`,
+`reference_search`, `hierarchy`, `upstream_flow`, `downstream_flow`,
+`symbol_context`, `repo_map`). Lexical fallbacks (`grep`, `glob`, `read_slice`)
+are intentionally framed as graph-anchored last resorts rather than the primary
+navigation surface.
+
+Squeezy does not adopt the alternative seen in adjacent shell-first agents
+where tree-sitter is only used to parse `apply_patch` heredocs and the model is
+expected to navigate code through `bash -lc` + grep + raw reads. That model
+sacrifices the moat — multi-language symbol resolution, capped candidate sets,
+and typed confidence per edge — that this navigation layer exists to preserve.
+
 ## What Is Indexed
 
 - Gitignore-aware file records: path, relative path, size, mtime, stable content
@@ -102,6 +120,22 @@ immediately after debounce. There is intentionally no always-on workspace file
 watcher today. If no events arrive, Squeezy polls every 15 seconds as a safety
 net. Refresh recrawls tracked files, compares stable hashes, reparses changed
 files only, removes deleted files, and preserves unchanged graph partitions.
+
+The 250 ms per-tool refresh budget is a hard cap, not a soft hint. Reparse work
+yields with `budget_exhausted=true` on the refresh report once the budget is
+spent and leaves the remaining dirty files queued for the next tool call. This
+keeps `decl_search`, `reference_search`, and other graph tools under a
+predictable latency ceiling even when a branch switch or bulk edit dirties
+hundreds of files, at the cost of letting a small tail of changes settle across
+two or three tool calls instead of one. The alternative — lazy or streaming
+refresh that serves partial results while reparse continues in the background —
+was rejected because it would let stale symbols leak into evidence packets
+with the same `freshness` label as fully-refreshed results, which the
+typed-confidence contract does not allow. Benchmark harnesses or CI gates
+that need a full settle should loop `refresh_before_query` until
+`budget_exhausted` reports `false`, rather than treating a single budgeted
+refresh as authoritative.
+
 Body-only edits replace body-derived facts for that file.
 Signature/module/import edits replace that file's stub and rebuild cross-file
 indexes. JS/TS config edits such as `tsconfig.json` path changes or

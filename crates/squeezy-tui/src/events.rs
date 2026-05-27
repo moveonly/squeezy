@@ -13,8 +13,8 @@ use crate::{
     PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compact_text,
     compaction_status_line, context_window_pct, dedupe_assistant_repeated_tool_output,
     format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
-    format_mcp_status_snapshot, is_control_tool_name, proposed_plan, render, tool_call_label,
-    tool_result_status_text,
+    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, render,
+    tool_call_label, tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -244,6 +244,22 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         compact_text(&error, 180)
                     ));
                 }
+                AgentEvent::SubagentRejected {
+                    agent,
+                    reason,
+                    limit,
+                    active,
+                    ..
+                } => {
+                    app.status =
+                        format!("{agent} subagent capped ({active}/{limit} already running)");
+                    app.push_log(format!(
+                        "{agent} subagent capped reason={} limit={} active={}",
+                        reason.as_str(),
+                        limit,
+                        active,
+                    ));
+                }
                 AgentEvent::AiReviewerTripped { reason, .. } => {
                     app.status = "approval review paused".to_string();
                     app.push_log(format!("AI approval reviewer paused: {reason}"));
@@ -255,6 +271,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format_approval_status_line(&request);
                     app.approval_selection_index = 0;
+                    app.notify_approval_pending(&request.tool_name);
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
@@ -405,6 +422,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
+                    input::restore_prompt_after_cancel(app);
                     keep_rx = false;
                     break;
                 }

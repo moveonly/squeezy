@@ -140,6 +140,12 @@ pub const DEFAULT_REPORT_MAX_BYTES: usize = 2 * 1024 * 1024;
 pub const PROJECT_SETTINGS_FILE: &str = "squeezy.toml";
 pub const DEFAULT_SQUEEZY_SKILLS_DIR: &str = ".squeezy/skills";
 pub const DEFAULT_SESSION_LOG_RETENTION_DAYS: u64 = 30;
+/// Days an archived session lives before the retention sweep permanently
+/// deletes it. Live sessions hit `log_retention_days` first, then move to
+/// `archived/<id>/`, where they linger for this long. Matches the live
+/// default so an idle workspace keeps roughly 60 days of recoverable
+/// history (30 live + 30 archived) without manual intervention.
+pub const DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS: u64 = 30;
 pub const DEFAULT_SESSION_MAX_EVENT_BYTES: usize = 65_536;
 pub const DEFAULT_SESSION_MAX_SESSION_BYTES: usize = 52_428_800;
 pub const DEFAULT_CONTEXT_ATTACHMENT_MAX_BYTES: usize = 1_048_576;
@@ -255,11 +261,21 @@ impl AppConfig {
     }
 
     pub fn from_env_and_settings() -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(None)
+        Self::from_default_paths_and_env_with_provider_value(None, None)
     }
 
     pub fn from_env_and_settings_with_provider(provider: &str) -> Result<Self> {
-        Self::from_default_paths_and_env_with_provider_value(Some(provider))
+        Self::from_default_paths_and_env_with_provider_value(Some(provider), None)
+    }
+
+    /// Like `from_env_and_settings`, but applies the named TOML profile
+    /// (`[profiles.<name>]`) on top of the merged base settings before the
+    /// env-var layer is applied. Errors if the profile is not configured.
+    pub fn from_env_and_settings_with_profile(
+        provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_default_paths_and_env_with_provider_value(provider, profile)
     }
 
     pub fn from_settings_path_and_env(path: PathBuf) -> Result<Self> {
@@ -676,8 +692,15 @@ impl AppConfig {
         })
     }
 
-    fn from_default_paths_and_env_with_provider_value(provider: Option<&str>) -> Result<Self> {
-        let (settings, sources) = load_default_settings_sources()?;
+    fn from_default_paths_and_env_with_provider_value(
+        provider: Option<&str>,
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        let (mut settings, mut sources) = load_default_settings_sources()?;
+        if let Some(name) = profile {
+            settings.apply_profile(name)?;
+            sources.push(format!("profile:{name}"));
+        }
         Self::try_from_settings_and_env_vars_with_sources(settings, sources, provider, |name| {
             env::var(name).ok()
         })
@@ -766,6 +789,10 @@ impl AppConfig {
         output.push_str(&format!(
             "log_retention_days = {}\n",
             self.session_logs.log_retention_days
+        ));
+        output.push_str(&format!(
+            "log_retention_archive_days = {}\n",
+            self.session_logs.log_retention_archive_days
         ));
         output.push_str(&format!(
             "max_event_bytes = {}\n",
@@ -959,6 +986,10 @@ impl AppConfig {
                 toml_string(&policy_file.display().to_string())
             ));
         }
+        output.push_str(&format!(
+            "max_transcript_tokens = {}\n",
+            self.permissions.ai_reviewer.max_transcript_tokens
+        ));
         output.push_str(&format!(
             "timeout_secs = {}\n\n",
             self.permissions.ai_reviewer.timeout_secs
@@ -1245,6 +1276,12 @@ impl AppConfig {
             }
             if let Some(timeout_ms) = server.timeout_ms {
                 output.push_str(&format!("timeout_ms = {timeout_ms}\n"));
+            }
+            if let Some(discovery_timeout_ms) = server.discovery_timeout_ms {
+                output.push_str(&format!("discovery_timeout_ms = {discovery_timeout_ms}\n"));
+            }
+            if let Some(tool_call_timeout_ms) = server.tool_call_timeout_ms {
+                output.push_str(&format!("tool_call_timeout_ms = {tool_call_timeout_ms}\n"));
             }
             if let Some(enabled_tools) = &server.enabled_tools {
                 output.push_str(&format!(
@@ -1757,6 +1794,12 @@ pub struct SettingsFile {
     pub tui: Option<TuiSettings>,
     pub mcp: Option<McpSettings>,
     pub hardening: Option<HardeningSettings>,
+    /// Named configuration profiles. A `[profiles.<name>]` TOML section
+    /// accepts the same leaves as the root settings file and is merged on
+    /// top of the base settings when the user selects `<name>` via
+    /// `--profile`. The `profiles` and `profile` leaves of the inner table
+    /// are stripped so a profile cannot recursively select another profile.
+    pub profiles: Option<BTreeMap<String, SettingsFile>>,
 }
 
 impl SettingsFile {
@@ -1827,6 +1870,7 @@ impl SettingsFile {
                 "tui",
                 "mcp",
                 "hardening",
+                "profiles",
             ],
             source,
             "",
@@ -1899,7 +1943,29 @@ impl SettingsFile {
         settings.hardening = optional_table(table, "hardening", source)?
             .map(|table| HardeningSettings::from_table(table, source, "hardening"))
             .transpose()?;
+        settings.profiles = parse_profiles_map(table, source)?;
         Ok(settings)
+    }
+
+    /// Merges the named `[profiles.<name>]` section on top of the base
+    /// settings. Returns an error if `name` isn't present in `profiles`.
+    /// After application, the `profiles` map is cleared so downstream
+    /// merging and `inspect` paths don't re-emit it.
+    pub fn apply_profile(&mut self, name: &str) -> Result<()> {
+        let Some(profile_map) = self.profiles.take() else {
+            return Err(SqueezyError::Config(format!(
+                "profile {name:?} not found; no `[profiles.*]` sections are configured"
+            )));
+        };
+        let Some(profile) = profile_map.get(name).cloned() else {
+            let mut available: Vec<&String> = profile_map.keys().collect();
+            available.sort();
+            return Err(SqueezyError::Config(format!(
+                "profile {name:?} not found; available profiles: {available:?}"
+            )));
+        };
+        self.merge(profile);
+        Ok(())
     }
 
     fn merge(&mut self, next: Self) {
@@ -1949,6 +2015,7 @@ impl SettingsFile {
             next.hardening,
             HardeningSettings::merge,
         );
+        merge_profiles_maps(&mut self.profiles, next.profiles);
     }
 }
 
@@ -2611,6 +2678,7 @@ pub struct SessionSettings {
     pub mode: Option<SessionMode>,
     pub log_dir: Option<PathBuf>,
     pub log_retention_days: Option<u64>,
+    pub log_retention_archive_days: Option<u64>,
     pub max_event_bytes: Option<usize>,
     pub max_session_bytes: Option<usize>,
 }
@@ -2623,6 +2691,7 @@ impl SessionSettings {
                 "mode",
                 "log_dir",
                 "log_retention_days",
+                "log_retention_archive_days",
                 "max_event_bytes",
                 "max_session_bytes",
             ],
@@ -2651,6 +2720,12 @@ impl SessionSettings {
                 source,
                 &field(path, "log_retention_days"),
             )?,
+            log_retention_archive_days: u64_value(
+                table,
+                "log_retention_archive_days",
+                source,
+                &field(path, "log_retention_archive_days"),
+            )?,
             max_event_bytes: usize_value(
                 table,
                 "max_event_bytes",
@@ -2670,6 +2745,10 @@ impl SessionSettings {
         replace_if_some(&mut self.mode, next.mode);
         replace_if_some(&mut self.log_dir, next.log_dir);
         replace_if_some(&mut self.log_retention_days, next.log_retention_days);
+        replace_if_some(
+            &mut self.log_retention_archive_days,
+            next.log_retention_archive_days,
+        );
         replace_if_some(&mut self.max_event_bytes, next.max_event_bytes);
         replace_if_some(&mut self.max_session_bytes, next.max_session_bytes);
     }
@@ -2679,8 +2758,17 @@ impl SessionSettings {
 pub struct SessionLogConfig {
     pub log_dir: Option<PathBuf>,
     pub log_retention_days: u64,
+    /// Days an archived session lingers before the retention sweep
+    /// permanently deletes it. Setting this to `0` disables the archive
+    /// sweep; archived sessions are then retained until removed by hand.
+    #[serde(default = "default_log_retention_archive_days")]
+    pub log_retention_archive_days: u64,
     pub max_event_bytes: usize,
     pub max_session_bytes: usize,
+}
+
+fn default_log_retention_archive_days() -> u64 {
+    DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS
 }
 
 impl SessionLogConfig {
@@ -2691,6 +2779,13 @@ impl SessionLogConfig {
                 .log_retention_days
                 .filter(|value| *value > 0)
                 .unwrap_or(DEFAULT_SESSION_LOG_RETENTION_DAYS),
+            // `0` is a valid explicit value here: it disables the archive
+            // sweep and lets archived sessions accumulate until the user
+            // removes them by hand. Anything else falls back to the
+            // built-in default rather than silently being treated as zero.
+            log_retention_archive_days: settings
+                .log_retention_archive_days
+                .unwrap_or(DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS),
             max_event_bytes: settings
                 .max_event_bytes
                 .filter(|value| *value > 0)
@@ -2708,6 +2803,7 @@ impl Default for SessionLogConfig {
         Self {
             log_dir: None,
             log_retention_days: DEFAULT_SESSION_LOG_RETENTION_DAYS,
+            log_retention_archive_days: DEFAULT_SESSION_LOG_RETENTION_ARCHIVE_DAYS,
             max_event_bytes: DEFAULT_SESSION_MAX_EVENT_BYTES,
             max_session_bytes: DEFAULT_SESSION_MAX_SESSION_BYTES,
         }
@@ -3131,8 +3227,11 @@ pub struct ContextCompactionConfig {
     /// Maximum bytes of concatenated AGENTS.md content stitched into the
     /// base instructions at session start. 0 disables ingestion.
     pub repo_doc_max_bytes: usize,
-    /// Maximum bytes of `~/.squeezy/memory.md` stitched into the base
-    /// instructions at session start. 0 disables ingestion.
+    /// Maximum bytes of `~/.squeezy/MEMORY.md` (or lowercase `memory.md`)
+    /// stitched into the base instructions at session start. 0 disables
+    /// ingestion. The static file is the only cross-session memory
+    /// surface; see `docs/internal/MEMORY_SCOPE.md` for the deferred
+    /// tool-mediated pipeline decision.
     pub user_memory_max_bytes: usize,
     /// When true, the turn loop re-checks token usage between LLM events and
     /// triggers compaction once usage crosses `threshold_percent` of
@@ -3512,6 +3611,7 @@ pub struct AiReviewerSettings {
     pub allow_capabilities: Option<Vec<String>>,
     pub policy_file: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub max_transcript_tokens: Option<u64>,
 }
 
 impl AiReviewerSettings {
@@ -3524,6 +3624,7 @@ impl AiReviewerSettings {
                 "allow_capabilities",
                 "policy_file",
                 "timeout_secs",
+                "max_transcript_tokens",
             ],
             source,
             path,
@@ -3539,6 +3640,12 @@ impl AiReviewerSettings {
             )?,
             policy_file: string_value(table, "policy_file", source, &field(path, "policy_file"))?,
             timeout_secs: u64_value(table, "timeout_secs", source, &field(path, "timeout_secs"))?,
+            max_transcript_tokens: u64_value(
+                table,
+                "max_transcript_tokens",
+                source,
+                &field(path, "max_transcript_tokens"),
+            )?,
         })
     }
 
@@ -3548,6 +3655,7 @@ impl AiReviewerSettings {
         replace_if_some(&mut self.allow_capabilities, next.allow_capabilities);
         replace_if_some(&mut self.policy_file, next.policy_file);
         replace_if_some(&mut self.timeout_secs, next.timeout_secs);
+        replace_if_some(&mut self.max_transcript_tokens, next.max_transcript_tokens);
     }
 }
 
@@ -3558,7 +3666,15 @@ pub struct AiReviewerConfig {
     pub allow_capabilities: Vec<PermissionCapability>,
     pub policy_file: Option<PathBuf>,
     pub timeout_secs: u64,
+    /// Sliding-window transcript budget for the reviewer prompt. Keeps the most
+    /// recent turns whole and compacts older entries into a single summary
+    /// line so late-turn permission requests retain earlier intent context.
+    pub max_transcript_tokens: usize,
 }
+
+pub const DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: usize = 4_000;
+const MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: u64 = 512;
+const MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS: u64 = 32_000;
 
 impl Default for AiReviewerConfig {
     fn default() -> Self {
@@ -3568,6 +3684,7 @@ impl Default for AiReviewerConfig {
             allow_capabilities: vec![PermissionCapability::Read, PermissionCapability::Search],
             policy_file: None,
             timeout_secs: 15,
+            max_transcript_tokens: DEFAULT_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS,
         }
     }
 }
@@ -3600,6 +3717,16 @@ impl AiReviewerConfig {
                 )));
             }
             config.timeout_secs = timeout_secs;
+        }
+        if let Some(max_transcript_tokens) = settings.max_transcript_tokens {
+            if !(MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS..=MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS)
+                .contains(&max_transcript_tokens)
+            {
+                return Err(SqueezyError::Config(format!(
+                    "{source}: permissions.ai_reviewer.max_transcript_tokens {max_transcript_tokens} outside supported range {MIN_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS}..={MAX_AI_REVIEWER_MAX_TRANSCRIPT_TOKENS}"
+                )));
+            }
+            config.max_transcript_tokens = max_transcript_tokens as usize;
         }
         if let Some(allow_capabilities) = settings.allow_capabilities {
             let mut parsed = Vec::new();
@@ -5580,6 +5707,42 @@ impl TuiTheme {
     }
 }
 
+/// Off-screen notification surface for turn-complete and approval-pending
+/// events. Maps directly to bytes emitted to the controlling terminal:
+/// `Bel` writes `\x07`, `Osc9` writes the iTerm-style OSC 9 desktop
+/// notification escape, `Auto` picks OSC 9 when `$TERM_PROGRAM` matches a
+/// known capable terminal and falls back to BEL otherwise. `Off` is the
+/// default so a fresh install never makes noise the user did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationMethod {
+    Off,
+    Bel,
+    Osc9,
+    Auto,
+}
+
+impl NotificationMethod {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Bel => "bel",
+            Self::Osc9 => "osc9",
+            Self::Auto => "auto",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "false" => Some(Self::Off),
+            "bel" | "bell" => Some(Self::Bel),
+            "osc9" | "osc-9" | "osc_9" => Some(Self::Osc9),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TuiConfig {
     pub tick_rate_ms: u64,
@@ -5598,6 +5761,15 @@ pub struct TuiConfig {
     pub status_line_use_colors: bool,
     /// Palette tone preference. `System` defers to terminal detection.
     pub theme: TuiTheme,
+    /// Off-screen attention surface (OSC 9 desktop notification / BEL).
+    /// Fires on turn-complete and approval-pending; default `Off`.
+    pub desktop_notifications: NotificationMethod,
+    /// User-supplied key rebindings for the TUI composer / chat surface.
+    /// Keyed by an action slug (e.g. `transcript_overlay`, `page_up`);
+    /// the value is a key spec like `"Ctrl+t"` or `"PageUp"`. Unknown
+    /// slugs and unparseable specs are surfaced by the TUI when
+    /// `/keymap` is invoked.
+    pub keymap: BTreeMap<String, String>,
 }
 
 impl TuiConfig {
@@ -5623,6 +5795,10 @@ impl TuiConfig {
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
             theme: settings.theme.unwrap_or(TuiTheme::System),
+            desktop_notifications: settings
+                .desktop_notifications
+                .unwrap_or(NotificationMethod::Off),
+            keymap: settings.keymap.unwrap_or_default(),
         }
     }
 }
@@ -5645,6 +5821,8 @@ pub struct TuiSettings {
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
+    pub desktop_notifications: Option<NotificationMethod>,
+    pub keymap: Option<BTreeMap<String, String>>,
 }
 
 impl TuiSettings {
@@ -5662,6 +5840,8 @@ impl TuiSettings {
                 "status_line",
                 "status_line_use_colors",
                 "theme",
+                "desktop_notifications",
+                "keymap",
             ],
             source,
             path,
@@ -5717,6 +5897,13 @@ impl TuiSettings {
                 &field(path, "status_line_use_colors"),
             )?,
             theme: tui_theme_value(table, "theme", source, &field(path, "theme"))?,
+            desktop_notifications: notification_method_value(
+                table,
+                "desktop_notifications",
+                source,
+                &field(path, "desktop_notifications"),
+            )?,
+            keymap: string_map_value(table, "keymap", source, &field(path, "keymap"))?,
         })
     }
 
@@ -5734,6 +5921,8 @@ impl TuiSettings {
             next.status_line_use_colors,
         );
         replace_if_some(&mut self.theme, next.theme);
+        replace_if_some(&mut self.desktop_notifications, next.desktop_notifications);
+        replace_if_some(&mut self.keymap, next.keymap);
     }
 }
 
@@ -5898,6 +6087,7 @@ pub fn user_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
+# log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
@@ -5908,7 +6098,7 @@ pub fn user_settings_template() -> &'static str {
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
-# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
 # enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
 # model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
 # threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
@@ -5955,6 +6145,7 @@ pub fn user_settings_template() -> &'static str {
 # allow_capabilities = ["read", "search"]
 # policy_file = ""              # optional local approval policy override
 # timeout_secs = 15
+# max_transcript_tokens = 4000  # sliding-window budget: keeps recent turns whole + summary of older
 #
 # Rule targets use prefix-tagged strings so different scopes don't collide.
 # Known prefixes:
@@ -6083,6 +6274,7 @@ pub fn project_settings_template() -> &'static str {
 # mode = "build"              # build | plan
 # log_dir = ".squeezy/sessions"
 # log_retention_days = 30
+# log_retention_archive_days = 30  # archived sessions deleted after this many days; 0 disables the archive sweep
 # max_event_bytes = 65536
 # max_session_bytes = 52428800
 
@@ -6093,7 +6285,7 @@ pub fn project_settings_template() -> &'static str {
 # compaction_recent_items = 6
 # compaction_max_summary_bytes = 12000
 # repo_doc_max_bytes = 16384    # cap on AGENTS.md content stitched into base instructions (0 disables)
-# user_memory_max_bytes = 8192  # cap on ~/.squeezy/memory.md content stitched into base instructions (0 disables)
+# user_memory_max_bytes = 8192  # cap on ~/.squeezy/MEMORY.md content stitched into base instructions (0 disables)
 # enabled_mid_turn = true                          # trigger compaction between LLM events when usage crosses the threshold
 # model_context_window = 100000                    # token budget for the active model; mid-turn trigger is dormant until set
 # threshold_percent = 80                           # fraction (0-100) of the window that arms the mid-turn trigger
@@ -6588,6 +6780,15 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     pub url: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// Timeout applied to MCP tool discovery (`tools/list`, plus the implicit
+    /// session bring-up on the first call). Falls back to `timeout_ms` when
+    /// unset. Useful for servers that are slow to initialize but fast per
+    /// call, or vice-versa.
+    pub discovery_timeout_ms: Option<u64>,
+    /// Timeout applied to MCP tool invocations and follow-on requests
+    /// (`tools/call`, `resources/list`, `resources/read`). Falls back to
+    /// `timeout_ms` when unset.
+    pub tool_call_timeout_ms: Option<u64>,
     pub enabled_tools: Option<Vec<String>>,
     pub disabled_tools: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -6619,6 +6820,8 @@ impl McpServerConfig {
                 "args",
                 "url",
                 "timeout_ms",
+                "discovery_timeout_ms",
+                "tool_call_timeout_ms",
                 "enabled_tools",
                 "disabled_tools",
                 "env",
@@ -6657,6 +6860,18 @@ impl McpServerConfig {
                 .unwrap_or_default(),
             url: string_value(table, "url", source, &field(path, "url"))?,
             timeout_ms: u64_value(table, "timeout_ms", source, &field(path, "timeout_ms"))?,
+            discovery_timeout_ms: u64_value(
+                table,
+                "discovery_timeout_ms",
+                source,
+                &field(path, "discovery_timeout_ms"),
+            )?,
+            tool_call_timeout_ms: u64_value(
+                table,
+                "tool_call_timeout_ms",
+                source,
+                &field(path, "tool_call_timeout_ms"),
+            )?,
             enabled_tools: string_array_value(
                 table,
                 "enabled_tools",
@@ -6692,6 +6907,8 @@ impl McpServerConfig {
         }
         replace_if_some(&mut self.url, next.url);
         replace_if_some(&mut self.timeout_ms, next.timeout_ms);
+        replace_if_some(&mut self.discovery_timeout_ms, next.discovery_timeout_ms);
+        replace_if_some(&mut self.tool_call_timeout_ms, next.tool_call_timeout_ms);
         replace_if_some(&mut self.enabled_tools, next.enabled_tools);
         if !next.disabled_tools.is_empty() {
             self.disabled_tools = next.disabled_tools;
@@ -6781,6 +6998,31 @@ fn providers_settings(
             name.clone(),
             ProviderSettings::from_table(provider_table, source, &field("providers", name))?,
         );
+    }
+    Ok(Some(result))
+}
+
+fn parse_profiles_map(
+    table: &toml::value::Table,
+    source: &str,
+) -> Result<Option<BTreeMap<String, SettingsFile>>> {
+    let Some(profiles) = optional_table(table, "profiles", source)? else {
+        return Ok(None);
+    };
+    let mut result = BTreeMap::new();
+    for (name, value) in profiles {
+        let inner = value
+            .as_table()
+            .ok_or_else(|| type_error(source, &field("profiles", name), "table"))?;
+        let mut parsed =
+            SettingsFile::from_toml_table(inner, &format!("{source}.profiles.{name}"))?;
+        // Profiles are leaves: an inner `[profiles.<name>.profiles]` or
+        // `profile = …` selector inside a named profile would invite
+        // surprising recursion, so drop them silently here. The TOML parser
+        // has already rejected truly-unknown keys via reject_unknown_keys.
+        parsed.profiles = None;
+        parsed.profile = None;
+        result.insert(name.clone(), parsed);
     }
     Ok(Some(result))
 }
@@ -7498,6 +7740,22 @@ fn tui_theme_value(
     })
 }
 
+fn notification_method_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Option<NotificationMethod>> {
+    let Some(value) = string_value(table, key, source, path)? else {
+        return Ok(None);
+    };
+    NotificationMethod::parse(&value).map(Some).ok_or_else(|| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: invalid notification method {value:?}; expected off, bel, osc9, or auto"
+        ))
+    })
+}
+
 fn reasoning_effort_value(
     table: &toml::value::Table,
     key: &str,
@@ -7590,6 +7848,22 @@ fn merge_provider_maps(
             .entry(name)
             .and_modify(|existing| existing.merge(provider.clone()))
             .or_insert(provider);
+    }
+}
+
+fn merge_profiles_maps(
+    target: &mut Option<BTreeMap<String, SettingsFile>>,
+    next: Option<BTreeMap<String, SettingsFile>>,
+) {
+    let Some(next) = next else {
+        return;
+    };
+    let target = target.get_or_insert_with(BTreeMap::new);
+    for (name, profile) in next {
+        target
+            .entry(name)
+            .and_modify(|existing| existing.merge(profile.clone()))
+            .or_insert(profile);
     }
 }
 
@@ -8101,6 +8375,65 @@ pub struct CostSnapshot {
     pub estimated_usd_micros: Option<u64>,
 }
 
+/// Per-`SubagentKind` rollup attached to [`TurnMetrics`] /
+/// [`SessionMetrics`]. Each bucket carries the same counters as the
+/// aggregate `subagent_*` fields but scoped to a single kind so the
+/// operator can answer "is Explore burning the bulk of subagent tokens?"
+/// and tune `explore_model` accordingly.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentKindMetrics {
+    #[serde(default)]
+    pub delegate: SubagentKindBucket,
+    #[serde(default)]
+    pub explore: SubagentKindBucket,
+    #[serde(default)]
+    pub plan: SubagentKindBucket,
+    #[serde(default)]
+    pub review: SubagentKindBucket,
+}
+
+impl SubagentKindMetrics {
+    pub fn merge(&mut self, other: &SubagentKindMetrics) {
+        self.delegate.merge(&other.delegate);
+        self.explore.merge(&other.explore);
+        self.plan.merge(&other.plan);
+        self.review.merge(&other.review);
+    }
+
+    /// Mutable handle to the bucket for `kind`. Returns `None` for kinds
+    /// outside the four audited buckets (delegate/explore/plan/review)
+    /// so callers can ignore intra-agent helper kinds like `doc_help`
+    /// without polluting the rollup.
+    pub fn bucket_mut(&mut self, kind: &str) -> Option<&mut SubagentKindBucket> {
+        match kind {
+            "delegate" => Some(&mut self.delegate),
+            "explore" => Some(&mut self.explore),
+            "plan" => Some(&mut self.plan),
+            "review" => Some(&mut self.review),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentKindBucket {
+    pub calls: u64,
+    pub failures: u64,
+    pub tool_calls: u64,
+    pub bytes_read: u64,
+    pub provider: CostSnapshot,
+}
+
+impl SubagentKindBucket {
+    pub fn merge(&mut self, other: &SubagentKindBucket) {
+        self.calls += other.calls;
+        self.failures += other.failures;
+        self.tool_calls += other.tool_calls;
+        self.bytes_read += other.bytes_read;
+        merge_cost_snapshot(&mut self.provider, &other.provider);
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetrics {
     pub turns: u64,
@@ -8131,6 +8464,8 @@ pub struct SessionMetrics {
     pub redactions: u64,
     pub provider: CostSnapshot,
     pub subagent_provider: CostSnapshot,
+    #[serde(default)]
+    pub subagent_by_kind: SubagentKindMetrics,
 }
 
 impl SessionMetrics {
@@ -8163,6 +8498,7 @@ impl SessionMetrics {
         self.redactions += turn.redactions;
         merge_cost_snapshot(&mut self.provider, &turn.provider);
         merge_cost_snapshot(&mut self.subagent_provider, &turn.subagent_provider);
+        self.subagent_by_kind.merge(&turn.subagent_by_kind);
     }
 }
 
@@ -8195,6 +8531,8 @@ pub struct TurnMetrics {
     pub redactions: u64,
     pub provider: CostSnapshot,
     pub subagent_provider: CostSnapshot,
+    #[serde(default)]
+    pub subagent_by_kind: SubagentKindMetrics,
 }
 
 impl TurnMetrics {

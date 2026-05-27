@@ -115,8 +115,11 @@ fn enum_variants_are_distinct() {
     // accidentally collapsing a variant during a future refactor.
     let events = [
         HookEvent::PreTurn,
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
         HookEvent::PostTool,
         HookEvent::PreCompact,
+        HookEvent::PostCompact,
         HookEvent::SubagentStart,
         HookEvent::PermissionRequest,
     ];
@@ -125,4 +128,56 @@ fn enum_variants_are_distinct() {
             assert_eq!(a == b, i == j);
         }
     }
+}
+
+#[test]
+fn dispatch_pre_and_post_tool_use_round_trip_payloads() {
+    /// Captures each `(event, payload)` pair so the test can assert the
+    /// dispatcher forwarded both variants without dropping or
+    /// reordering payload keys.
+    struct Recorder {
+        seen: std::sync::Mutex<Vec<(HookEvent, Value)>>,
+    }
+
+    impl HookHandler for Recorder {
+        fn handle(&self, ctx: &HookContext) -> HookResult {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((ctx.event, ctx.payload.clone()));
+            HookResult::allow()
+        }
+    }
+
+    let recorder = std::sync::Arc::new(Recorder {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    struct RecorderRef(std::sync::Arc<Recorder>);
+    impl HookHandler for RecorderRef {
+        fn handle(&self, ctx: &HookContext) -> HookResult {
+            self.0.handle(ctx)
+        }
+    }
+
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(RecorderRef(recorder.clone())));
+
+    let pre_payload = json!({ "tool_name": "read_file", "call_id": "c1", "turn_id": "7" });
+    let post_payload = json!({
+        "tool_name": "read_file",
+        "call_id": "c1",
+        "turn_id": "7",
+        "status": "success"
+    });
+    let _ = registry.dispatch(HookEvent::PreToolUse, pre_payload.clone());
+    let _ = registry.dispatch(HookEvent::PostToolUse, post_payload.clone());
+
+    let seen = recorder.seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        vec![
+            (HookEvent::PreToolUse, pre_payload),
+            (HookEvent::PostToolUse, post_payload),
+        ]
+    );
 }

@@ -276,6 +276,47 @@ jobs:
             exit 1
           fi
 
+          # Split-origin variant: serve the .sha256 from a second mirror so a
+          # single-origin compromise of the archive host cannot swap both
+          # files. Restore a valid checksum on the checksum origin, leave the
+          # corrupt one on the archive origin, and confirm the install
+          # succeeds (checksum origin wins because it is fetched separately).
+          checksum_mirror="$(mktemp -d)"
+          mkdir -p "$checksum_mirror/$tag"
+          shasum -a 256 "$mirror/$tag/squeezy-${triple}.tar.gz" \
+            > "$checksum_mirror/$tag/squeezy-${triple}.tar.gz.sha256"
+
+          split_log="$(mktemp)"
+          target2="$(mktemp -d)/bin"
+          SQUEEZY_INSTALL_DIR="$target2" \
+            SQUEEZY_INSTALL_TAG="$tag" \
+            SQUEEZY_INSTALL_BASE_URL="file://$mirror" \
+            SQUEEZY_INSTALL_CHECKSUM_BASE_URL="file://$checksum_mirror" \
+            SQUEEZY_GPG_KEY_PATH="$(mktemp -u)/missing.gpg" \
+            sh install.sh >"$split_log" 2>&1
+          cat "$split_log"
+
+          test -x "$target2/squeezy"
+          "$target2/squeezy" --version
+
+          if ! grep -q "split from archive origin" "$split_log"; then
+            echo "install.sh did not log the split-origin checksum source" >&2
+            exit 1
+          fi
+
+          # Split-origin negative: corrupt the checksum on the separate origin
+          # and confirm install still fails when the second origin disagrees.
+          echo "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef  squeezy-${triple}.tar.gz" \
+            > "$checksum_mirror/$tag/squeezy-${triple}.tar.gz.sha256"
+          if SQUEEZY_INSTALL_DIR="$target2" \
+               SQUEEZY_INSTALL_TAG="$tag" \
+               SQUEEZY_INSTALL_BASE_URL="file://$mirror" \
+               SQUEEZY_INSTALL_CHECKSUM_BASE_URL="file://$checksum_mirror" \
+               sh install.sh 2>/dev/null; then
+            echo "install.sh accepted a corrupt split-origin checksum" >&2
+            exit 1
+          fi
+
       - name: Package debug artifact
         shell: bash
         run: |

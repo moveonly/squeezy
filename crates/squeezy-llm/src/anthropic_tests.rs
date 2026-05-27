@@ -29,6 +29,8 @@ fn request_body_uses_messages_streaming_shape() {
             .into(),
         ]),
         store: true,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -75,6 +77,8 @@ fn request_body_preserves_function_tool_order() {
             .into(),
         ]),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -96,6 +100,8 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -127,6 +133,8 @@ fn request_body_maps_tool_roundtrip_messages() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -165,6 +173,8 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         cache_key: Some("squeezy::session-1".to_string()),
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -224,6 +234,8 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
             .into(),
         ]),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -257,6 +269,8 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
             .into(),
         ]),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -280,6 +294,8 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = AnthropicProvider::request_body(&request);
@@ -397,6 +413,53 @@ fn parser_extracts_completed_response_id_and_usage() {
                 reasoning_output_tokens: None,
                 cached_input_tokens: Some(3),
                 cache_write_input_tokens: None,
+                estimated_usd_micros: None,
+            },
+        }]
+    );
+}
+
+#[test]
+fn parser_populates_both_cache_counters_from_usage() {
+    let mut state = AnthropicStreamState::default();
+
+    parse_anthropic_event(
+        r#"{
+          "type":"message_start",
+          "message":{
+            "id":"msg_cache",
+            "usage":{
+              "input_tokens":42,
+              "output_tokens":1,
+              "cache_read_input_tokens":17,
+              "cache_creation_input_tokens":29
+            }
+          }
+        }"#,
+        &mut state,
+    )
+    .expect("start");
+    parse_anthropic_event(
+        r#"{
+          "type":"message_delta",
+          "delta":{"stop_reason":"end_turn"},
+          "usage":{"output_tokens":8}
+        }"#,
+        &mut state,
+    )
+    .expect("delta");
+    let event = parse_anthropic_event(r#"{"type":"message_stop"}"#, &mut state).expect("stop");
+
+    assert_eq!(
+        event,
+        vec![LlmEvent::Completed {
+            response_id: Some("msg_cache".to_string()),
+            cost: CostSnapshot {
+                input_tokens: Some(42),
+                output_tokens: Some(8),
+                reasoning_output_tokens: None,
+                cached_input_tokens: Some(17),
+                cache_write_input_tokens: Some(29),
                 estimated_usd_micros: None,
             },
         }]

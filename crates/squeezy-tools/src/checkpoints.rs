@@ -8,19 +8,23 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointListArgs {}
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointUndoArgs {
     mode: Option<RollbackMode>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointShowArgs {
     pub(crate) checkpoint_id: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointRevertArgs {
     pub(crate) group_id: Option<String>,
     pub(crate) checkpoint_id: Option<String>,

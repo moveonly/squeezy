@@ -14,6 +14,7 @@ publish.workspace = true
 include = [
     "Cargo.toml",
     "build.rs",
+    "builtin/*/SKILL.md",
     "external-docs/*.md",
     "src/**",
     "tests/artifacts/**",
@@ -24,4 +25,8 @@ include = [
 serde.workspace = true
 serde_json.workspace = true
 squeezy-core.workspace = true
+toml.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

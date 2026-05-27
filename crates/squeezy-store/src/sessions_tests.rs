@@ -3,10 +3,10 @@ use std::{collections::BTreeSet, fs, path::PathBuf, sync::Arc, time::Duration};
 use redb::{Database, TableDefinition};
 use serde_json::json;
 use squeezy_core::{
-    AppConfig, ContextAttachment, ContextAttachmentKind, ContextAttachmentSource,
-    ContextAttachmentStatus, ContextCompactionRecord, ContextCompactionState,
-    ContextCompactionTrigger, ContextEstimate, ContextPin, CostSnapshot, FileId, SessionLogConfig,
-    SessionMetrics,
+    AnthropicThinkingBlock, AnthropicThinkingKind, AppConfig, ContextAttachment,
+    ContextAttachmentKind, ContextAttachmentSource, ContextAttachmentStatus,
+    ContextCompactionRecord, ContextCompactionState, ContextCompactionTrigger, ContextEstimate,
+    ContextPin, CostSnapshot, FileId, ReasoningPayload, SessionLogConfig, SessionMetrics,
 };
 
 use crate::{
@@ -631,14 +631,36 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
         .expect("backdate completed session");
 
     let report = store.cleanup(&[]).expect("cleanup");
+    // Live retention is now a soft delete: the completed-and-expired
+    // session moves to `archived/<id>/` instead of being removed
+    // outright. `archived` carries the soft-deleted ids; `removed`
+    // is reserved for the archive retention sweep that runs in the
+    // same pass once `retention_archive_days` is exceeded.
     assert_eq!(
-        report.removed,
+        report.archived,
         vec![completed.session_id().to_string()],
-        "only the completed-and-expired session should be swept",
+        "the completed-and-expired session should be archived, not deleted",
+    );
+    assert!(
+        report.removed.is_empty(),
+        "live retention must not permanently delete; got {:?}",
+        report.removed,
     );
     assert!(
         store.root().join(running.session_id()).exists(),
         "running session must survive a retention sweep",
+    );
+    assert!(
+        store
+            .root()
+            .join(super::ARCHIVED_SUBDIR)
+            .join(completed.session_id())
+            .exists(),
+        "completed session must land in the archive subtree",
+    );
+    assert!(
+        !store.root().join(completed.session_id()).exists(),
+        "completed session must leave the live root after archival",
     );
 }
 
@@ -667,7 +689,10 @@ fn cleanup_excluding_skips_protected_session() {
         )
         .expect("cleanup");
 
-    assert_eq!(report.removed, vec![collateral.session_id().to_string()]);
+    // Explicit `ids` archive the live session rather than deleting it,
+    // matching the retention sweep so neither path destroys history.
+    assert_eq!(report.archived, vec![collateral.session_id().to_string()]);
+    assert!(report.removed.is_empty());
     assert!(
         store.root().join(protected.session_id()).exists(),
         "protected session must remain on disk"
@@ -1100,6 +1125,13 @@ fn typed_session_events_round_trip_through_event_log() {
             replacement_id: Some("ckpt-1".to_string()),
             conversation: Vec::new(),
         },
+        SessionEventKind::Reasoning {
+            payload: ReasoningPayload::OpenAi {
+                item_id: "rs_typed_log".to_string(),
+                summary: vec!["typed log thinking".to_string()],
+                encrypted_content: Some("ENCRYPTED-TYPED".to_string()),
+            },
+        },
         SessionEventKind::SessionEnded {
             status: "completed".to_string(),
         },
@@ -1214,6 +1246,111 @@ fn replay_resume_state_falls_back_when_resume_json_deleted() {
     );
 }
 
+#[test]
+fn replay_resume_state_round_trips_reasoning_items() {
+    // Acceptance for squeezy-fp0: a session that records reasoning blobs
+    // alongside user / assistant text must, after `resume_state.json` is
+    // deleted, replay an identical conversation off the durable
+    // `events.jsonl` stream — including the reasoning items, with their
+    // provider-tagged ids and opaque content preserved bit-for-bit. Without
+    // this, resuming a gpt-5.x or Claude thinking session loses the model's
+    // prior chain-of-thought and the next turn has to re-derive (and re-bill
+    // for) the same reasoning.
+    let root = temp_root("replay-reasoning-round-trip");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+
+    let openai_reasoning = ReasoningPayload::OpenAi {
+        item_id: "rs_openai_42".to_string(),
+        summary: vec!["Read the file before patching it.".to_string()],
+        encrypted_content: Some("ENCRYPTED-OPENAI-BLOB".to_string()),
+    };
+    let anthropic_reasoning = ReasoningPayload::Anthropic {
+        blocks: vec![AnthropicThinkingBlock {
+            kind: AnthropicThinkingKind::Thinking,
+            text: "First check the failing test.".to_string(),
+            signature: Some("sig-anthropic".to_string()),
+            data: None,
+        }],
+    };
+
+    handle
+        .append_typed_event(
+            SessionEventKind::UserMessage {
+                text: "why does the test fail?".to_string(),
+            },
+            None,
+            None,
+        )
+        .expect("user message");
+    handle
+        .append_typed_event(
+            SessionEventKind::Reasoning {
+                payload: openai_reasoning.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("openai reasoning");
+    handle
+        .append_typed_event(
+            SessionEventKind::Reasoning {
+                payload: anthropic_reasoning.clone(),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("anthropic reasoning");
+    handle
+        .append_typed_event(
+            SessionEventKind::AssistantCompleted {
+                text: "the test asserts the wrong column".to_string(),
+                response_id: Some("resp-reasoning-1".to_string()),
+            },
+            Some("1".to_string()),
+            None,
+        )
+        .expect("assistant completion");
+    handle.flush_events().expect("flush events");
+
+    let session_dir = store.root().join(handle.session_id());
+    fs::remove_file(session_dir.join("resume_state.json"))
+        .expect("delete resume_state.json to force the events.jsonl fallback");
+
+    let replayed = handle
+        .replay_resume_state()
+        .expect("replay reconstructs from events.jsonl");
+    assert!(replayed.resume_available);
+    assert_eq!(
+        replayed.conversation,
+        vec![
+            ResumeItem::UserText {
+                text: "why does the test fail?".to_string(),
+            },
+            ResumeItem::Reasoning {
+                payload: openai_reasoning,
+            },
+            ResumeItem::Reasoning {
+                payload: anthropic_reasoning,
+            },
+            ResumeItem::AssistantText {
+                text: "the test asserts the wrong column".to_string(),
+            },
+        ],
+        "reasoning items must round-trip with id and content preserved",
+    );
+}
+
 fn open_test_store(label: &str) -> (PathBuf, SessionStore, AppConfig) {
     let root = temp_root(label);
     let config = AppConfig {
@@ -1273,9 +1410,17 @@ fn cleanup_skips_archived_sessions() {
     let report = store
         .cleanup(std::slice::from_ref(&session_id))
         .expect("cleanup with archived id");
+    // Explicit `ids` for an already-archived session are a no-op: the
+    // archive retention sweep is the only path that hard-deletes, and
+    // the just-archived session has not yet aged past
+    // `retention_archive_days` (default 30 days).
     assert!(
         !report.removed.contains(&session_id),
-        "archived session must not be removed by cleanup",
+        "archived session must not be hard-deleted by cleanup",
+    );
+    assert!(
+        !report.archived.contains(&session_id),
+        "already-archived session must not be re-archived",
     );
 
     let still_there = store
@@ -1289,6 +1434,171 @@ fn cleanup_skips_archived_sessions() {
             .iter()
             .any(|metadata| metadata.session_id == session_id),
         "archived session survives cleanup",
+    );
+}
+
+#[test]
+fn cleanup_deletes_archived_sessions_past_archive_retention() {
+    let root = temp_root("archive-retention-deletes");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            // Live retention stays high so we exercise the archive
+            // retention path in isolation: nothing is archived by the
+            // sweep itself; we age the existing archive entry by hand.
+            log_retention_days: 3650,
+            log_retention_archive_days: 7,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive");
+
+    // Backdate the archived metadata so `ended_at_ms` (the archival
+    // timestamp) sits well outside the 7-day archive retention.
+    let archived_dir = store.root().join(super::ARCHIVED_SUBDIR).join(&session_id);
+    let metadata_path = archived_dir.join("metadata.json");
+    let text = fs::read_to_string(&metadata_path).expect("read archived metadata");
+    let mut metadata: super::SessionMetadata =
+        serde_json::from_str(&text).expect("parse archived metadata");
+    metadata.started_at_ms = 1;
+    metadata.ended_at_ms = Some(1);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize"),
+    )
+    .expect("write metadata");
+
+    let report = store.cleanup(&[]).expect("cleanup archive-retention");
+    assert_eq!(
+        report.removed,
+        vec![session_id.clone()],
+        "expired archived session should be hard-deleted",
+    );
+    assert!(
+        report.archived.is_empty(),
+        "no live session should have been archived in this sweep",
+    );
+    assert!(
+        !archived_dir.exists(),
+        "expired archived session must be removed from disk",
+    );
+}
+
+#[test]
+fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
+    let root = temp_root("archive-retention-disabled");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            log_retention_days: 3650,
+            // `0` disables the archive sweep entirely: archived
+            // sessions linger until the user removes them by hand.
+            log_retention_archive_days: 0,
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    store.archive_session(&session_id).expect("archive");
+
+    let archived_dir = store.root().join(super::ARCHIVED_SUBDIR).join(&session_id);
+    let metadata_path = archived_dir.join("metadata.json");
+    let text = fs::read_to_string(&metadata_path).expect("read archived metadata");
+    let mut metadata: super::SessionMetadata =
+        serde_json::from_str(&text).expect("parse archived metadata");
+    metadata.started_at_ms = 1;
+    metadata.ended_at_ms = Some(1);
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).expect("serialize"),
+    )
+    .expect("write metadata");
+
+    let report = store.cleanup(&[]).expect("cleanup");
+    assert!(
+        report.removed.is_empty(),
+        "archive sweep must be a no-op when retention_archive_days = 0",
+    );
+    assert!(
+        archived_dir.exists(),
+        "archived session must survive when the archive sweep is disabled",
+    );
+}
+
+#[test]
+fn remove_session_archives_live_session() {
+    let (_root, store, config) = open_test_store("remove-session-archives");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    // Drop the handle so the session log writer thread shuts down
+    // before we move the directory out from under it.
+    drop(handle);
+
+    store
+        .remove_session(&session_id)
+        .expect("remove_session should soft-archive");
+
+    assert!(
+        !store.root().join(&session_id).exists(),
+        "live directory must be empty after remove_session",
+    );
+    assert!(
+        store
+            .root()
+            .join(super::ARCHIVED_SUBDIR)
+            .join(&session_id)
+            .exists(),
+        "remove_session must move the directory under the archived/ subtree",
+    );
+}
+
+#[test]
+fn archived_session_remains_readable_via_show() {
+    let (_root, store, config) = open_test_store("archived-readable");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("read me back after archive".to_string()),
+            json!({"ok": true}),
+        ))
+        .expect("append event");
+    handle.flush_events().expect("flush events");
+    let session_id = handle.session_id().to_string();
+    drop(handle);
+    store.archive_session(&session_id).expect("archive");
+
+    let record = store
+        .show(&session_id)
+        .expect("show should resolve an archived session");
+    assert_eq!(record.metadata.session_id, session_id);
+    assert_eq!(record.metadata.status, SessionStatus::Archived);
+    assert!(
+        record
+            .events
+            .iter()
+            .any(|event| event.summary.as_deref() == Some("read me back after archive")),
+        "events.jsonl content must round-trip through archive",
     );
 }
 
@@ -1311,4 +1621,414 @@ fn unarchive_round_trip_restores_session() {
         .find(|metadata| metadata.session_id == session_id)
         .expect("unarchived session in default list");
     assert_eq!(found.status, SessionStatus::Completed);
+}
+
+#[test]
+fn bundle_rollout_trace_is_empty_when_no_logs_exist() {
+    let (_root, store, config) = open_test_store("rollout-trace-empty");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle empty trace");
+    assert!(bundle.is_empty());
+}
+
+#[test]
+fn bundle_rollout_trace_preserves_event_order_when_no_replay() {
+    let (_root, store, config) = open_test_store("rollout-trace-events-only");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            Some("turn-1".to_string()),
+            Some("find payment bug".to_string()),
+            json!({}),
+        ))
+        .expect("append user");
+    handle
+        .append_event(SessionEvent::new(
+            "assistant_completed",
+            Some("turn-1".to_string()),
+            Some("looking at payments".to_string()),
+            json!({"response_id": "resp_1"}),
+        ))
+        .expect("append assistant");
+    handle.flush_events().expect("flush events");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle");
+    assert_eq!(bundle.len(), 2);
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.source == RolloutEventSource::Event)
+    );
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.schema_version == ROLLOUT_TRACE_SCHEMA_VERSION)
+    );
+    assert_eq!(bundle[0].kind, "user_message");
+    assert_eq!(bundle[1].kind, "assistant_completed");
+    // Replay-side fields stay absent for event-sourced rows so consumers can
+    // pattern-match on `source` without re-checking discriminators.
+    assert!(bundle.iter().all(|entry| entry.replay_kind.is_none()));
+    assert!(bundle.iter().all(|entry| entry.payload_sha256.is_none()));
+    // Typed event_kind is populated when the discriminator matches.
+    assert!(matches!(
+        bundle[0].event_kind,
+        Some(SessionEventKind::UserMessage { .. })
+    ));
+    assert!(matches!(
+        bundle[1].event_kind,
+        Some(SessionEventKind::AssistantCompleted { .. })
+    ));
+}
+
+#[test]
+fn bundle_rollout_trace_emits_replay_when_no_events() {
+    let (_root, store, config) = open_test_store("rollout-trace-replay-only");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::UserMessage,
+            Some("turn-1".to_string()),
+            json!({"input": "find a bug"}),
+        ))
+        .expect("append user replay");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelStarted,
+            Some("turn-1".to_string()),
+            json!({"model": "gpt-test"}),
+        ))
+        .expect("append model started");
+    handle
+        .append_replay_event(SessionReplayEvent::new(
+            SessionReplayEventKind::ModelCompleted,
+            Some("turn-1".to_string()),
+            json!({"response_id": "resp_1"}),
+        ))
+        .expect("append model completed");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle");
+    assert_eq!(bundle.len(), 3);
+    assert!(
+        bundle
+            .iter()
+            .all(|entry| entry.source == RolloutEventSource::Replay)
+    );
+    // Sequence is preserved end-to-end so a downstream reducer can pair
+    // model_started/model_completed without re-deriving the order.
+    let sequences: Vec<u64> = bundle.iter().map(|entry| entry.sequence).collect();
+    assert_eq!(sequences, vec![1, 2, 3]);
+    assert!(bundle.iter().all(|entry| {
+        entry
+            .payload_sha256
+            .as_deref()
+            .is_some_and(|d| !d.is_empty())
+    }));
+    assert!(matches!(
+        bundle[0].replay_kind,
+        Some(SessionReplayEventKind::UserMessage)
+    ));
+    assert!(matches!(
+        bundle[2].replay_kind,
+        Some(SessionReplayEventKind::ModelCompleted)
+    ));
+    // event_kind is left empty for replay-sourced rows.
+    assert!(bundle.iter().all(|entry| entry.event_kind.is_none()));
+}
+
+#[test]
+fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
+    let (_root, store, config) = open_test_store("rollout-trace-merge");
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+
+    // Fabricate both logs with controlled timestamps so the merge order is
+    // deterministic — `now_ms()` resolution is one millisecond and a tight
+    // sequence of appends would otherwise alias into the same bucket.
+    let event_line = |event: &SessionEvent| {
+        let mut bytes = serde_json::to_vec(event).expect("serialise event");
+        bytes.push(b'\n');
+        bytes
+    };
+    let events_path = session_dir.join("events.jsonl");
+    let replay_path = session_dir.join("replay.jsonl");
+
+    let mut events_jsonl = Vec::new();
+    events_jsonl.extend(event_line(&SessionEvent {
+        ts_unix_ms: 100,
+        kind: "user_message".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        summary: Some("find a bug".to_string()),
+        payload: json!({"text": "find a bug"}),
+    }));
+    events_jsonl.extend(event_line(&SessionEvent {
+        ts_unix_ms: 300,
+        kind: "assistant_completed".to_string(),
+        turn_id: Some("turn-1".to_string()),
+        summary: Some("done".to_string()),
+        payload: json!({"text": "done", "response_id": "resp_1"}),
+    }));
+    fs::write(&events_path, events_jsonl).expect("write events.jsonl");
+
+    let replay_line = |event: &SessionReplayEvent| {
+        let mut bytes = serde_json::to_vec(event).expect("serialise replay");
+        bytes.push(b'\n');
+        bytes
+    };
+    // Manually-stamped replay rows with controlled sequences. The constructor
+    // would call `now_ms()` and overwrite sequence at append time, so we go
+    // around it for deterministic ordering.
+    let mut replay_jsonl = Vec::new();
+    let replay_event_start = SessionReplayEvent {
+        schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+        ts_unix_ms: 200,
+        sequence: 1,
+        kind: SessionReplayEventKind::ModelStarted,
+        turn_id: Some("turn-1".to_string()),
+        payload_sha256: String::new(),
+        payload: json!({"model": "gpt-test"}),
+    };
+    let replay_event_start = SessionReplayEvent {
+        payload_sha256: hash_payload(&replay_event_start.payload),
+        ..replay_event_start
+    };
+    let replay_event_completed = SessionReplayEvent {
+        schema_version: SESSION_REPLAY_SCHEMA_VERSION,
+        ts_unix_ms: 300, // same ms as the assistant_completed event
+        sequence: 2,
+        kind: SessionReplayEventKind::ModelCompleted,
+        turn_id: Some("turn-1".to_string()),
+        payload_sha256: String::new(),
+        payload: json!({"response_id": "resp_1"}),
+    };
+    let replay_event_completed = SessionReplayEvent {
+        payload_sha256: hash_payload(&replay_event_completed.payload),
+        ..replay_event_completed
+    };
+    replay_jsonl.extend(replay_line(&replay_event_start));
+    replay_jsonl.extend(replay_line(&replay_event_completed));
+    fs::write(&replay_path, replay_jsonl).expect("write replay.jsonl");
+
+    let bundle = store
+        .bundle_rollout_trace(handle.session_id())
+        .expect("bundle merged trace");
+    // Expected order:
+    //   ts=100 Event user_message
+    //   ts=200 Replay ModelStarted
+    //   ts=300 Replay ModelCompleted (replay sorts before event on ties)
+    //   ts=300 Event assistant_completed
+    assert_eq!(bundle.len(), 4);
+    assert_eq!(
+        (bundle[0].source, bundle[0].kind.as_str()),
+        (RolloutEventSource::Event, "user_message"),
+    );
+    assert_eq!(
+        (bundle[1].source, bundle[1].kind.as_str()),
+        (RolloutEventSource::Replay, "model_started"),
+    );
+    assert_eq!(
+        (bundle[2].source, bundle[2].kind.as_str()),
+        (RolloutEventSource::Replay, "model_completed"),
+        "replay row wins ties within the same millisecond",
+    );
+    assert_eq!(
+        (bundle[3].source, bundle[3].kind.as_str()),
+        (RolloutEventSource::Event, "assistant_completed"),
+    );
+    // Timestamps are non-decreasing across the whole bundle.
+    let timestamps: Vec<u64> = bundle.iter().map(|entry| entry.ts_unix_ms).collect();
+    assert!(timestamps.windows(2).all(|pair| pair[0] <= pair[1]));
+}
+
+fn hash_payload(payload: &serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(payload).unwrap_or_default();
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+// `HOME` is process-global; the memory tests below mutate it to point at a
+// temp dir so the user's real `~/.squeezy/memory.md` is never touched. The
+// lock keeps parallel test runners from racing on the env mutation.
+static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn with_home<R>(home: &Path, body: impl FnOnce() -> R) -> R {
+    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let previous = std::env::var_os("HOME");
+    // SAFETY: the lock above serialises HOME mutations across the suite.
+    unsafe {
+        std::env::set_var("HOME", home);
+    }
+    let result = body();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    result
+}
+
+#[test]
+fn remember_and_recall_round_trip_through_user_memory_file() {
+    let home = temp_root("remember-recall-round-trip");
+    with_home(&home, || {
+        let initial = SessionStore::recall(8_192);
+        assert!(initial.is_none(), "fresh HOME must surface no memory body");
+
+        let written = SessionStore::remember("prefers cargo nextest over cargo test")
+            .expect("remember preference");
+        assert_eq!(
+            written,
+            "prefers cargo nextest over cargo test".len() + 1,
+            "first remember writes body + trailing newline only"
+        );
+
+        let recalled = SessionStore::recall(8_192).expect("recall after remember");
+        assert!(recalled.contains("prefers cargo nextest over cargo test"));
+        assert!(
+            recalled.ends_with('\n'),
+            "memory body keeps trailing newline"
+        );
+
+        let written_again =
+            SessionStore::remember("repo uses redb for the graph store").expect("second remember");
+        assert_eq!(
+            written_again,
+            "repo uses redb for the graph store".len() + 1,
+            "follow-up remember skips the leading newline when file already ends with one"
+        );
+
+        let body = SessionStore::recall(8_192).expect("recall after second remember");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                "prefers cargo nextest over cargo test",
+                "repo uses redb for the graph store",
+            ],
+            "each remembered line lands on its own row"
+        );
+    });
+}
+
+#[test]
+fn remember_inserts_leading_newline_when_file_lacks_one() {
+    let home = temp_root("remember-fixup-trailing-newline");
+    with_home(&home, || {
+        let memory = SessionStore::memory_path().expect("HOME set");
+        fs::create_dir_all(memory.parent().expect("memory dir")).expect("mkdir");
+        fs::write(&memory, b"manual entry without newline").expect("seed memory.md");
+
+        let written = SessionStore::remember("agent-added entry").expect("remember");
+        // 1 leading newline + body + trailing newline.
+        assert_eq!(written, 1 + "agent-added entry".len() + 1);
+
+        let body = fs::read_to_string(&memory).expect("read");
+        assert_eq!(
+            body, "manual entry without newline\nagent-added entry\n",
+            "leading newline appended when prior file lacked one",
+        );
+    });
+}
+
+#[test]
+fn remember_trims_whitespace_and_drops_empty_input() {
+    let home = temp_root("remember-trim-empty");
+    with_home(&home, || {
+        let zero = SessionStore::remember("   \n\t  ").expect("empty input is ok");
+        assert_eq!(zero, 0, "blank input must not touch the file");
+        let memory = SessionStore::memory_path().expect("HOME set");
+        let initial_body = fs::read_to_string(&memory).unwrap_or_default();
+        assert!(
+            initial_body.is_empty(),
+            "blank remember leaves memory.md absent or empty (got {initial_body:?})",
+        );
+
+        let written =
+            SessionStore::remember("   keep the trimmed body  \n").expect("trim and append");
+        assert_eq!(written, "keep the trimmed body".len() + 1);
+
+        let body = fs::read_to_string(&memory).expect("read");
+        assert_eq!(body, "keep the trimmed body\n");
+    });
+}
+
+#[test]
+fn recall_truncates_at_char_boundary_with_marker() {
+    let home = temp_root("recall-truncates-at-boundary");
+    with_home(&home, || {
+        SessionStore::remember("héllo world — long enough to be truncated")
+            .expect("remember unicode body");
+
+        // Cap=2 lands inside 'é' (a 2-byte char that occupies bytes 1..3 in
+        // the persisted body). The recall must back off to byte 1, which is
+        // the boundary after 'h'.
+        let recalled = SessionStore::recall(2).expect("recall capped");
+        assert_eq!(
+            recalled, "h\n[truncated]",
+            "char-boundary backoff yields a valid prefix plus marker",
+        );
+
+        // Cap >= body length returns the full body untouched.
+        let full = SessionStore::recall(8_192).expect("recall uncapped");
+        assert!(!full.contains("[truncated]"));
+        assert!(full.starts_with("héllo world"));
+    });
+}
+
+#[test]
+fn recall_returns_none_when_max_bytes_zero_or_missing() {
+    let home = temp_root("recall-disabled-or-missing");
+    with_home(&home, || {
+        assert!(
+            SessionStore::recall(0).is_none(),
+            "max_bytes=0 disables recall",
+        );
+        assert!(
+            SessionStore::recall(8_192).is_none(),
+            "missing memory.md surfaces as None",
+        );
+    });
+}
+
+#[test]
+fn memory_path_is_none_when_home_unset() {
+    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+    let path = SessionStore::memory_path();
+    let recall = SessionStore::recall(8_192);
+    let remember = SessionStore::remember("unused");
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(path.is_none(), "HOME unset means no memory path");
+    assert!(recall.is_none(), "HOME unset means no recall body");
+    assert!(
+        remember.is_err(),
+        "remember fails loudly when HOME is unset"
+    );
 }

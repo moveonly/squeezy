@@ -47,8 +47,16 @@ struct Cli {
     provider: Option<String>,
     #[arg(long, help = "Model id; overrides settings and SQUEEZY_MODEL")]
     model: Option<String>,
-    #[arg(long, help = "Model profile: cheap, balanced, or strong")]
+    #[arg(
+        long,
+        help = "Named TOML profile; merges `[profiles.<name>]` on top of settings"
+    )]
     profile: Option<String>,
+    #[arg(
+        long = "model-profile",
+        help = "Model tier: cheap, balanced, or strong"
+    )]
+    model_profile: Option<String>,
     #[arg(long, help = "Max output tokens; overrides SQUEEZY_MAX_OUTPUT_TOKENS")]
     max_output_tokens: Option<u32>,
     #[arg(long, help = "Start session mode: plan or build")]
@@ -99,7 +107,7 @@ enum Command {
     },
     #[command(about = "Ask the running Squeezy shell session for an in-flight permission decision")]
     Ask(AskArgs),
-    #[command(about = "Manage provider credentials stored in the OS keyring")]
+    #[command(about = "Manage provider API keys stored inline in the settings TOML")]
     Auth {
         #[command(subcommand)]
         command: auth::AuthCommand,
@@ -427,13 +435,18 @@ async fn main() -> squeezy_core::Result<()> {
 }
 
 fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
-    let mut config = config_from_cli_provider(cli.provider.as_deref())?;
+    let mut config = config_from_cli_provider(cli.provider.as_deref(), cli.profile.as_deref())?;
     let mut cli_used = false;
     if let Some(model) = &cli.model {
         cli_used = true;
         config.model = model.clone();
     }
-    if let Some(profile) = cli.profile.as_deref().and_then(ModelProfile::parse) {
+    if let Some(raw) = cli.model_profile.as_deref() {
+        let profile = ModelProfile::parse(raw).ok_or_else(|| {
+            SqueezyError::Config(format!(
+                "cli: --model-profile: invalid value {raw:?}; expected cheap, balanced, or strong"
+            ))
+        })?;
         cli_used = true;
         config.profile = profile;
     }
@@ -1786,6 +1799,8 @@ async fn run_prompt(
             .map(|session| format!("squeezy::{}", session.session_id())),
         tools: Arc::from(Vec::new()),
         store: config.store_responses,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
     let mut stream = provider.stream_response(request, CancellationToken::new());
     let mut stdout = io::stdout().lock();
@@ -1884,7 +1899,13 @@ fn provider_from_app_config(config: &AppConfig) -> Arc<dyn LlmProvider> {
     }
 }
 
-fn config_from_cli_provider(provider: Option<&str>) -> squeezy_core::Result<AppConfig> {
+fn config_from_cli_provider(
+    provider: Option<&str>,
+    profile: Option<&str>,
+) -> squeezy_core::Result<AppConfig> {
+    if profile.is_some() {
+        return AppConfig::from_env_and_settings_with_profile(provider, profile);
+    }
     let Some(provider) = provider else {
         return AppConfig::from_env_and_settings();
     };

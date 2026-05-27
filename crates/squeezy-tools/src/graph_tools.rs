@@ -28,6 +28,7 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SymbolContextArgs {
     pub(crate) query: String,
     path: Option<String>,
@@ -38,12 +39,14 @@ pub(crate) struct SymbolContextArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RepoMapArgs {
     max_depth: Option<usize>,
     max_files: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeclSearchArgs {
     query: Option<String>,
     kind: Option<String>,
@@ -56,6 +59,7 @@ struct DeclSearchArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DefinitionSearchArgs {
     query: Option<String>,
     symbol_id: Option<String>,
@@ -66,6 +70,7 @@ struct DefinitionSearchArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReferenceSearchArgs {
     query: Option<String>,
     text: Option<String>,
@@ -76,6 +81,7 @@ struct ReferenceSearchArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FlowArgs {
     symbol_id: Option<String>,
     query: Option<String>,
@@ -88,6 +94,7 @@ struct FlowArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HierarchyArgs {
     symbol_id: Option<String>,
     query: Option<String>,
@@ -98,6 +105,7 @@ struct HierarchyArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadSliceArgs {
     pub(crate) path: Option<String>,
     symbol_id: Option<String>,

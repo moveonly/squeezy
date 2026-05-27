@@ -368,6 +368,37 @@ async fn grep_respects_gitignore_by_default_and_can_include_ignored() {
 }
 
 #[tokio::test]
+async fn grep_rejects_unknown_field() {
+    let root = temp_workspace("grep_unknown_field");
+    fs::write(root.join("visible.txt"), "needle\n").expect("write visible");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_unknown".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"patern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let message = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("unknown field"),
+        "expected serde unknown-field error, got: {message}"
+    );
+    assert!(
+        message.contains("patern"),
+        "expected error to mention misspelled key, got: {message}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn glob_lists_paths_without_reading_content_and_respects_ignore() {
     let root = temp_workspace("glob_ignore");
     fs::write(root.join(".gitignore"), "ignored.rs\n").expect("write gitignore");
@@ -3116,7 +3147,8 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
                 arguments: json!({
                     "command": "printf direct > direct.txt",
                     "description": "run an explicit user shell command",
-                    "direct_user_shell": true
+                    "direct_user_shell": true,
+                    "direct_user_shell_nonce": crate::direct_user_shell_nonce(),
                 }),
             },
             CancellationToken::new(),
@@ -3133,6 +3165,44 @@ async fn direct_user_shell_skips_checkpoint_and_sandbox() {
         fs::read_to_string(root.join("direct.txt")).unwrap(),
         "direct"
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn direct_user_shell_rejects_wrong_nonce() {
+    // A caller that knows the `local-shell-` call_id convention but ships
+    // a forged (or missing) nonce must NOT be allowed to skip the sandbox
+    // / checkpoint guarantees. The bypass is gated on the process-local
+    // secret, so only the in-process TUI minter can ever satisfy both
+    // halves of the check.
+    let root = temp_workspace("direct_user_shell_wrong_nonce");
+    let registry = registry_with_shell_sandbox_off_and_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "local-shell-spoof".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf forged > forged.txt",
+                    "description": "attempt to spoof the user-shell fast path",
+                    "direct_user_shell": true,
+                    "direct_user_shell_nonce": "not-the-real-nonce",
+                }),
+            },
+            CancellationToken::new(),
+            "turn-spoof".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    // Bypass refused: the call falls through to the normal model path, so
+    // the policy view records `direct_user_shell=false` AND a checkpoint
+    // gets created for the destructive command — the very protections the
+    // bypass would have skipped.
+    assert_eq!(result.content["policy"]["direct_user_shell"], false);
+    assert_eq!(result.content["checkpoint"]["group_id"], "turn-spoof");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -6207,6 +6277,124 @@ pub fn gamma() {}
     assert_eq!(
         total as u64, returned,
         "distribution counts must sum to returned_matches"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn reference_search_emits_confidence_distribution() {
+    let root = temp_workspace("graph_reference_confidence_distribution");
+    fs::create_dir_all(root.join("services")).expect("create services dir");
+    fs::write(
+        root.join("services").join("greeter.py"),
+        r#"
+class Greeter:
+    def hello(self):
+        return "hi"
+
+# Same-file reference to Greeter — binds via the loose-reference path and
+# therefore lands in the `Heuristic` bucket.
+def make_local():
+    return Greeter()
+"#,
+    )
+    .expect("write greeter");
+    // Cross-file alias-import reference: `Greeter` is brought in via `as GA`,
+    // calls through that alias bind via `reference_alias_matches_symbol` and
+    // therefore land in the `ImportResolved` bucket.
+    fs::write(
+        root.join("aliased.py"),
+        r#"
+from services.greeter import Greeter as GA
+
+def make_aliased():
+    return GA()
+"#,
+    )
+    .expect("write aliased");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let definition = registry
+        .execute(
+            ToolCall {
+                call_id: "ref_distribution_def".to_string(),
+                name: "definition_search".to_string(),
+                arguments: json!({"query": "Greeter", "path": "services/greeter.py"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(definition.status, ToolStatus::Success);
+    let greeter_id = definition.content["packets"][0]["symbol"]["id"]
+        .as_str()
+        .expect("definition packet carries symbol id")
+        .to_string();
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "ref_distribution".to_string(),
+                name: "reference_search".to_string(),
+                arguments: json!({"symbol_id": greeter_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+
+    let distribution = &result.cost_hint.confidence_distribution;
+    assert!(
+        !distribution.is_empty(),
+        "reference_search must populate confidence_distribution, got {result:?}"
+    );
+
+    let valid_ids: std::collections::HashSet<&str> = squeezy_core::Confidence::ALL
+        .iter()
+        .map(|c| c.id())
+        .collect();
+    for key in distribution.keys() {
+        assert!(
+            valid_ids.contains(key.as_str()),
+            "distribution key `{key}` is not a Confidence::id() value"
+        );
+    }
+
+    let packets = result.content["packets"]
+        .as_array()
+        .expect("reference_search packets array");
+    let total: u32 = distribution.values().copied().sum();
+    assert_eq!(
+        total as usize,
+        packets.len(),
+        "distribution counts must sum to the number of returned packets"
+    );
+
+    let mut expected: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for packet in packets {
+        let label = packet["confidence"]
+            .as_str()
+            .expect("packet must carry a confidence label")
+            .to_string();
+        *expected.entry(label).or_insert(0) += 1;
+    }
+    assert_eq!(
+        distribution, &expected,
+        "cost_hint distribution must match per-packet confidence counts"
+    );
+
+    assert!(
+        distribution.len() >= 2,
+        "fixture must produce a mix of confidence buckets, got {distribution:?}"
+    );
+    assert!(
+        distribution.contains_key("import_resolved"),
+        "fixture must surface at least one import_resolved reference, got {distribution:?}"
+    );
+    assert!(
+        distribution.contains_key("heuristic"),
+        "fixture must surface at least one heuristic reference, got {distribution:?}"
     );
 
     let _ = fs::remove_dir_all(root);
