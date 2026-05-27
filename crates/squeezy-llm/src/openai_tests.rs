@@ -341,6 +341,7 @@ fn parser_extracts_completed_response_id_and_usage() {
             // provider normalizes this to `EndTurn` so the agent's loop
             // sees a uniform stop reason across providers.
             stop_reason: Some(crate::StopReason::EndTurn),
+            reasoning_only_stop: false,
         })
     );
 }

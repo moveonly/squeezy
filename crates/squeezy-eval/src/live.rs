@@ -137,7 +137,7 @@ impl LivePrinter {
                 let _ = writeln!(g.writer, "     ↳ {icon} {name} ({bytes}B)");
                 let _ = g.writer.flush();
             }
-            EvalEventKind::TurnCompleted { cost, metrics } => {
+            EvalEventKind::TurnCompleted { cost, metrics, .. } => {
                 g.finish_assistant_chunk_inplace();
                 let input = cost
                     .get("input_tokens")

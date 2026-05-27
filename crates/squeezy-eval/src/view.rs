@@ -148,7 +148,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out, "_(turn started)_");
                 let _ = writeln!(out);
             }
-            EvalEventKind::TurnCompleted { cost, metrics } => {
+            EvalEventKind::TurnCompleted { cost, metrics, .. } => {
                 flush_assistant(&mut assistant_buf, out);
                 let input = cost
                     .get("input_tokens")

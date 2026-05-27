@@ -280,8 +280,57 @@ pub enum LlmEvent {
         /// elsewhere). Producers that have a native value MUST populate
         /// this; the agent uses it to drive explicit recovery branches.
         stop_reason: Option<StopReason>,
+        /// `true` iff the stream finished with `stop_reason=EndTurn`,
+        /// no content or tool-call delta latched
+        /// `state.saw_visible_output`, AND the reasoning buffer was
+        /// non-empty.
+        ///
+        /// This is the canonical Qwen3 / DeepSeek-R1 "reasoning-only
+        /// finish" pattern — model thinks, model stops, no actionable
+        /// output. Agent loop consumers may retry the turn once when
+        /// this flag is set. Separate from `stop_reason` because the
+        /// normalized `EndTurn` variant alone can't distinguish a clean
+        /// "model emitted a real answer and stopped" from a degenerate
+        /// "model spent the round on reasoning and stopped with
+        /// nothing visible".
+        #[serde(default)]
+        reasoning_only_stop: bool,
     },
     Cancelled,
+}
+
+impl LlmEvent {
+    /// Construct a `Completed` event with no provider-reported stop
+    /// reason and no reasoning-only-stop marker. Convenience for test
+    /// code and synthetic completions (replay reconstruction, helper
+    /// turn paths) that don't carry a real upstream signal.
+    pub fn completed(response_id: Option<String>, cost: CostSnapshot) -> Self {
+        LlmEvent::Completed {
+            response_id,
+            cost,
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }
+    }
+
+    /// Construct a `Completed` event with explicit normalized
+    /// `stop_reason` and `reasoning_only_stop` markers. Used by the
+    /// Chat-Completions provider when the upstream surfaces a real
+    /// terminal reason AND we want the reasoning-only-stop signal
+    /// latched.
+    pub fn completed_with_reason(
+        response_id: Option<String>,
+        cost: CostSnapshot,
+        stop_reason: Option<StopReason>,
+        reasoning_only_stop: bool,
+    ) -> Self {
+        LlmEvent::Completed {
+            response_id,
+            cost,
+            stop_reason,
+            reasoning_only_stop,
+        }
+    }
 }
 
 pub trait LlmProvider: Send + Sync {

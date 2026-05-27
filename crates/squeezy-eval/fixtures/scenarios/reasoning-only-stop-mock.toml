@@ -1,0 +1,54 @@
+id = "reasoning-only-stop-mock"
+title = "Deterministic regression: plan mode + reasoning-only stop retries to yield a plan"
+description = """
+Mocks the canonical Qwen3 plan-mode failure: round 0 emits ONLY
+reasoning text (no content delta, no tool call), finishes with
+`finish_reason=stop` and `reasoning_only_stop=true`. The agent's
+Phase 4 retry latch should inject a plan-mode-aware nudge ("Write
+your plan now in the <proposed_plan> tag") and round 1 should
+produce the actual `<proposed_plan>` block.
+
+Runs entirely offline. The `expect_finish_reason` and
+`stop_with_intent_text_no_tool_call` findings must NOT fire when the
+retry succeeds.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "plan"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Plan a small refactor."
+wait_for = "turn_completed"
+
+[expect]
+final_text_contains = ["<proposed_plan>"]
+finish_reason_not = ["stop_no_action"]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+# Round 0: reasoning-only stop. No content, no tool call,
+# `reasoning_only_stop = true` to mimic the real chat-completions
+# state when reasoning text exists but no visible output surfaced.
+[[mock.turns]]
+input_tokens = 100
+output_tokens = 0
+finish_reason = "stop"
+reasoning_only_stop = true
+
+# Round 1: after the plan-mode nudge, model emits the plan.
+[[mock.turns]]
+text = "<proposed_plan>\n## Context\nSmall refactor.\n## Steps\n1. Extract helper.\n2. Update callers.\n</proposed_plan>"
+input_tokens = 110
+output_tokens = 30
+finish_reason = "stop"
+
+[triage]
+enabled = false

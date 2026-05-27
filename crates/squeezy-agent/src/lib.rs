@@ -289,10 +289,19 @@ impl ReplayRuntime {
                     // Replay logs predate the stop_reason surface; mark
                     // replayed completions as `None` so consumers can tell
                     // a synthesized completion from a fresh provider one.
+                    // `reasoning_only_stop` is also pulled from the payload
+                    // when present (Phase 4 newer replay traces) and
+                    // defaults to false for pre-existing replay logs.
+                    let reasoning_only_stop = event
+                        .payload
+                        .get("reasoning_only_stop")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
                     events.push(LlmEvent::Completed {
                         response_id,
                         cost,
                         stop_reason: None,
+                        reasoning_only_stop,
                     });
                     return Ok(events);
                 }
@@ -3158,6 +3167,8 @@ async fn complete_squeezy_help_turn(
             cost,
             metrics,
             context_estimate,
+            stop_reason: None,
+            reasoning_only_stop: false,
         })
         .await;
 }
@@ -3353,6 +3364,8 @@ async fn complete_local_tool_turn(
             cost,
             metrics,
             context_estimate,
+            stop_reason: None,
+            reasoning_only_stop: false,
         })
         .await;
 }
@@ -4154,6 +4167,16 @@ impl TurnRuntime {
         // currently observational only — see `dispatch_pre_turn` for
         // the rationale.
         self.dispatch_pre_turn();
+        // One-shot "the model promised follow-up tool use but stopped"
+        // recovery latch. Set when a round ends with `finish_reason=stop`,
+        // zero tool calls, AND the assistant text contains an intent
+        // phrase that named a tool action (the canonical Qwen3 chatty-
+        // preamble pattern). Forces one extra round with a synthetic
+        // user nudge ("Continue. Call the tool you described, or give
+        // the final answer.") before letting the turn end. Capped at
+        // one retry per turn to prevent infinite loops if the model
+        // ignores the nudge.
+        let mut replan_retry_used = false;
         for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
@@ -4242,7 +4265,16 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            // Per-round terminal-state markers surfaced from the
+            // provider stream's `LlmEvent::Completed`. Forwarded on the
+            // terminal `AgentEvent::Completed` so eval / TUI consumers
+            // can branch on the actual finish path. `stop_reason` is the
+            // normalized provider stop kind (added by main); the
+            // `reasoning_only_stop` flag is the orthogonal "model spent
+            // the round on reasoning and stopped with nothing visible"
+            // signal that drives the Phase 4 reasoning-only retry.
             let mut stop_reason: Option<StopReason> = None;
+            let mut reasoning_only_stop = false;
             let mut round_text_started = false;
 
             while let Some(event) =
@@ -4393,6 +4425,7 @@ impl TurnRuntime {
                         response_id: id,
                         mut cost,
                         stop_reason: completion_stop_reason,
+                        reasoning_only_stop: round_reasoning_only_stop,
                     } => {
                         if cost.estimated_usd_micros.is_none() {
                             cost.estimated_usd_micros =
@@ -4417,6 +4450,7 @@ impl TurnRuntime {
                         completed_cost = cost;
                         response_id = id;
                         stop_reason = completion_stop_reason;
+                        reasoning_only_stop = round_reasoning_only_stop;
                         completed = true;
                         break;
                     }
@@ -4481,6 +4515,8 @@ impl TurnRuntime {
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
                         context_estimate,
+                        stop_reason: stop_reason.clone(),
+                        reasoning_only_stop,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -4578,11 +4614,108 @@ impl TurnRuntime {
             }
 
             if tool_calls.is_empty() {
+                // Flush any tail still buffered by the stream redactor
+                // BEFORE the retry check — `assistant_text_has_unresolved_intent`
+                // needs the complete assistant text, including the last
+                // chunk the redactor was holding for cross-chunk redaction
+                // scans. The downstream end-of-turn path also wants the
+                // flushed text, so we move the flush up unconditionally
+                // and re-use it for both branches.
                 if let Some(tail) = self
                     .flush_assistant_stream(&mut assistant_stream, &mut assistant_message)
                     .await
                 {
                     self.record_replay_model_text_delta(&tail);
+                }
+
+                // One-shot retry for the "model finished without
+                // actionable output" failure modes. Three gating
+                // shapes, each with its own nudge text:
+                //
+                // (1) `reasoning_only_stop` — model burned the round
+                //     entirely on `reasoning_content` and finished
+                //     with stop, no content, no tool call. Canonical
+                //     Qwen3 / DeepSeek-R1 reasoning-mode collapse.
+                //     Fires from any round so plan-mode turns that
+                //     reasoning-out without emitting `<proposed_plan>`
+                //     get a second chance.
+                //
+                // (2) "Promised tool use but stopped" — model emitted
+                //     intent text ("Let me scan the codebase") with
+                //     finish_reason=stop and zero tool calls AFTER
+                //     successfully using a tool earlier this turn.
+                //     The exact shape from the user's PortKey+Qwen
+                //     screenshot. Gated on `round > 0` so a chatty
+                //     preamble before round 0's tool burst isn't
+                //     mistaken for the bug.
+                //
+                // Both branches push the assistant's text to
+                // `conversation`, append a mode-aware synthetic user
+                // nudge, and re-enter the round loop once. The retry
+                // is one-shot per turn via `replan_retry_used` so the
+                // model can't trap us in a forever loop.
+                let active_mode = load_session_mode(&self.session_mode);
+                let plan_mode = active_mode == SessionMode::Plan;
+                let reasoning_only_branch = !replan_retry_used
+                    && stop_reason == Some(StopReason::EndTurn)
+                    && reasoning_only_stop;
+                let promised_action_branch = !replan_retry_used
+                    && round > 0
+                    && stop_reason == Some(StopReason::EndTurn)
+                    && assistant_text_has_unresolved_intent(&assistant_message);
+                if reasoning_only_branch || promised_action_branch {
+                    let raw_assistant_text = std::mem::take(&mut assistant_message);
+                    conversation.push(redact_input_item(
+                        LlmInputItem::AssistantText(raw_assistant_text.clone()),
+                        &self.redactor,
+                    ));
+                    let nudge = if reasoning_only_branch {
+                        if plan_mode {
+                            "You finished thinking but produced no `<proposed_plan>...</proposed_plan>` block. \
+                             Write your plan now in the tag. Skip further reasoning."
+                        } else {
+                            "You finished thinking but produced no visible content or tool call. \
+                             Respond directly to the user now."
+                        }
+                    } else {
+                        "You described a follow-up action but did not call any tool. \
+                         If you need to call a tool to complete the user's request, \
+                         call it now. If the previous output is enough, give the final \
+                         answer directly instead."
+                    };
+                    let nudge_item = redact_input_item(
+                        LlmInputItem::UserText(nudge.to_string()),
+                        &self.redactor,
+                    );
+                    conversation.push(nudge_item.clone());
+                    // Keep the stored-responses chain anchored on the
+                    // round we just observed; the next round's request
+                    // sends only the nudge as the delta. When not
+                    // using stored responses, replay the full
+                    // conversation including the nudge.
+                    if self.config.store_responses {
+                        previous_response_id = response_id.clone();
+                        next_input = vec![nudge_item];
+                    } else {
+                        previous_response_id = None;
+                        next_input = conversation.clone();
+                    }
+                    replan_retry_used = true;
+                    tracing::debug!(
+                        target: "squeezy_agent::stop_no_action_retry",
+                        round,
+                        stop_reason = ?stop_reason,
+                        reasoning_only_stop,
+                        plan_mode,
+                        assistant_text_chars = raw_assistant_text.chars().count(),
+                        branch = if reasoning_only_branch {
+                            "reasoning_only"
+                        } else {
+                            "promised_action"
+                        },
+                        "retrying turn with mode-aware nudge",
+                    );
+                    continue;
                 }
                 self.record_replay_model_completed(response_id.clone(), &completed_cost);
                 broker.metrics.redactions += assistant_stream.total_redactions();
@@ -4617,6 +4750,8 @@ impl TurnRuntime {
                         cost: total_cost,
                         metrics: broker.metrics.clone(),
                         context_estimate,
+                        stop_reason: stop_reason.clone(),
+                        reasoning_only_stop,
                     })
                     .await;
                 self.finish_turn(&broker.metrics).await;
@@ -6016,6 +6151,13 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
     if !matches!(kind, SubagentKind::Explore) && thoroughness.is_some() {
         return Err(format!("{} does not accept thoroughness", kind.as_str()));
     }
+    // Tool-shy models (Qwen3, smaller MoEs) sometimes emit a delegate /
+    // explore / doc_help call with no `prompt` field at all on simple
+    // conversational turns. The old error message was a raw serde-style
+    // line — `"missing required string field: prompt"` — which is
+    // grammatically backwards and hard for the model to act on.
+    // Returning the missing field, the kind, and an actionable hint
+    // gives the next round's retry a concrete recipe.
     let prompt = match kind {
         SubagentKind::Plan => call
             .arguments
@@ -6023,7 +6165,12 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "missing required string field: goal".to_string())?
+            .ok_or_else(|| {
+                "plan subagent requires a non-empty `goal` string argument. \
+                 Set `goal` to a one-sentence description of what to plan, \
+                 or answer the user directly without calling plan."
+                    .to_string()
+            })?
             .to_string(),
         SubagentKind::Review => call
             .arguments
@@ -6041,7 +6188,14 @@ fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<Subagen
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "missing required string field: prompt".to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "{kind} subagent requires a non-empty `prompt` string argument. \
+                     Set `prompt` to a concrete instruction for the subagent, \
+                     or answer the user directly without calling {kind}.",
+                    kind = kind.as_str()
+                )
+            })?
             .to_string(),
     };
     Ok(SubagentRequest {
@@ -7123,6 +7277,97 @@ fn is_control_tool_name(name: &str) -> bool {
         name,
         TASK_STATE_TOOL_NAME | LOAD_TOOL_SCHEMA_TOOL_NAME | REQUEST_USER_INPUT_TOOL_NAME
     )
+}
+
+/// Heuristic: does the assistant text contain an intent phrase that
+/// implies the model promised follow-up tool work it never delivered?
+///
+/// True when ALL of the following hold:
+///   1. The text is non-empty (an actually visible message, not just whitespace).
+///   2. The text contains at least one intent phrase (`let me`, `i'll`,
+///      `i will`, `going to`, `i need to`, etc.).
+///   3. The intent phrase is followed within ~40 chars by an action verb
+///      that maps to a tool the model has access to (`scan`, `search`,
+///      `read`, `explore`, `find`, ...).
+///
+/// Skipped when the text contains a `<proposed_plan>` block (plan-mode
+/// output is a legitimate finish_reason=stop) or a fenced final-answer
+/// marker (`final answer:`, `here is the answer:`).
+fn assistant_text_has_unresolved_intent(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    // Plan-mode output: a `<proposed_plan>` block is the expected
+    // end-of-turn shape; not a chatty-stop bug.
+    if lower.contains("<proposed_plan>") {
+        return false;
+    }
+    // Final-answer markers: model is signaling "this is my answer".
+    const FINAL_MARKERS: &[&str] = &[
+        "final answer:",
+        "here is the answer:",
+        "in summary:",
+        "to summarize:",
+    ];
+    if FINAL_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    const INTENT_PATTERNS: &[&str] = &[
+        "let me ",
+        "let's ",
+        "i'll ",
+        "i will ",
+        "now i'll ",
+        "now i ",
+        "next i'll ",
+        "next i ",
+        "next, i ",
+        "i need to ",
+        "i can ",
+        "first, i ",
+        "going to ",
+        "i'm going to ",
+        "we should ",
+    ];
+    const ACTION_PATTERNS: &[&str] = &[
+        "scan ",
+        "search ",
+        "explore ",
+        "find ",
+        "read ",
+        "look ",
+        "check ",
+        "inspect ",
+        "grep ",
+        "map ",
+        "list ",
+        "open ",
+        "fetch ",
+        "load ",
+        "fix ",
+        "edit ",
+        "modify ",
+        "write ",
+        "create ",
+        "rename ",
+        "investigate ",
+        "trace ",
+        "follow ",
+        "delegate ",
+        "run ",
+    ];
+    for intent in INTENT_PATTERNS {
+        if let Some(idx) = lower.find(intent) {
+            let tail_start = idx + intent.len();
+            let tail_end = (tail_start + 40).min(lower.len());
+            let tail = &lower[tail_start..tail_end];
+            if ACTION_PATTERNS.iter().any(|action| tail.contains(action)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn tool_failure_detail(result: &ToolResult) -> String {
@@ -9092,14 +9337,19 @@ fn delegate_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: DELEGATE_TOOL_NAME.to_string(),
-            description: "Delegate broad research to an isolated subagent. The parent receives only a structured summary, supporting receipts, and separate spend metrics.".to_string(),
+            description: "Delegate broad research to an isolated subagent. \
+                          Use only when the user explicitly asks for non-trivial research, code mapping, or refactoring help — \
+                          NOT for greetings, casual replies, or simple questions the parent can answer directly. \
+                          The `prompt` field is required; calling without a concrete instruction will be rejected. \
+                          The parent receives only a structured summary, supporting receipts, and separate spend metrics."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Natural language research task for the subagent."
+                        "description": "Required: a concrete natural-language research instruction for the subagent. Must be present and non-empty."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -9221,14 +9471,18 @@ fn explore_advertised_tool() -> AdvertisedTool {
         capability: PermissionCapability::Read,
         spec: Arc::new(LlmToolSpec {
             name: EXPLORE_TOOL_NAME.to_string(),
-            description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools and return a compact briefing before planning or executing.".to_string(),
+            description: "Ask a cheaper read-only exploration subagent to scan the codebase with Squeezy semantic tools. \
+                          Use only when the user asks a non-trivial codebase question — \
+                          NOT for greetings, chitchat, or questions the parent can answer directly from context. \
+                          The `prompt` field is required and must contain a concrete codebase question."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "Codebase question or task context to investigate."
+                        "description": "Required: a concrete codebase question or task context to investigate. Must be present and non-empty."
                     },
                     "scope": {
                         "type": ["string", "null"],
@@ -10402,6 +10656,17 @@ pub enum AgentEvent {
         /// TUI to update its context-budget indicator without needing a
         /// follow-up `context_estimate_snapshot()` call.
         context_estimate: ContextEstimate,
+        /// Provider-reported normalized stop kind from the final round's
+        /// stream, if available. Surfaced for eval / regression tooling
+        /// so rules can distinguish "stop after content", "stop after
+        /// tool calls", "length truncation", etc. `None` when the
+        /// provider didn't report one or the stream was synthetic
+        /// (e.g. agent-loop short-circuit, replay reconstruction).
+        stop_reason: Option<StopReason>,
+        /// `true` iff the final round's `Completed` was the canonical
+        /// Qwen3 "reasoning-only finish" pattern (see
+        /// `LlmEvent::Completed::reasoning_only_stop`).
+        reasoning_only_stop: bool,
     },
     /// Emitted at most once per session, the first time the running provider
     /// cost crosses `cost_warn_percent` of the configured

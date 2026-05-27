@@ -361,6 +361,7 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
                 estimated_usd_micros: Some(0),
             },
             stop_reason,
+            reasoning_only_stop: false,
         });
     }
     Ok(events)

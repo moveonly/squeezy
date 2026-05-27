@@ -43,6 +43,29 @@ pub struct FrameRecord {
     #[serde(default)]
     pub ansi: String,
     pub finish: FrameFinish,
+    /// Provider-reported normalized stop kind from the final round of
+    /// this turn, propagated from `AgentEvent::Completed`. `None` for
+    /// turns that did not reach a real provider stream (helper paths,
+    /// failed/cancelled turns, replay reconstruction). Surfaced into
+    /// `frames.jsonl` so regression rules and the `view` subcommand can
+    /// branch on the actual terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<squeezy_llm::StopReason>,
+    /// `true` iff the final round was a Qwen3-style "reasoning-only
+    /// finish" (`stop_reason=EndTurn` with reasoning text but no
+    /// content or tool call). See
+    /// `LlmEvent::Completed::reasoning_only_stop` for the exact gate.
+    #[serde(default)]
+    pub reasoning_only_stop: bool,
+    /// Count of tool-call frames the chat-completions provider dropped
+    /// during this turn because their stream cut before a function
+    /// name arrived (`compatible.rs::drain_tool_calls`). Surfaced
+    /// because a silent drop is a strong "I'll do X then stop" smoking
+    /// gun for Qwen-class models — the model emits intent text, then
+    /// the tool call goes missing on the wire. Always 0 for native
+    /// OpenAI / Anthropic / Google / Bedrock / Ollama streams.
+    #[serde(default)]
+    pub dropped_tool_calls: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

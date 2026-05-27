@@ -239,6 +239,22 @@ pub struct Expect {
     /// rule does not fire.
     #[serde(default)]
     pub max_input_tokens_per_turn: Option<u64>,
+    /// Provider-reported `finish_reason` values that are NOT allowed on
+    /// any completed turn. Each match produces an `expect_finish_reason`
+    /// finding. Useful for asserting "this run must not end with
+    /// `length` truncation" or, with the synthetic
+    /// `stop_no_action` sentinel, "no turn finished with `stop` but
+    /// emitted no tool call and only intent text". The sentinel is
+    /// implemented by the `stop_with_intent_text_no_tool_call` rule.
+    #[serde(default)]
+    pub finish_reason_not: Vec<String>,
+    /// Maximum tolerated count of dropped tool-call frames (sum across
+    /// all turns). The chat-completions provider silently drops tool
+    /// calls whose stream cut before a function name arrived, which is
+    /// invisible to the user and a likely root cause of the
+    /// "I'll do X then stop" Qwen pattern. Default 0.
+    #[serde(default)]
+    pub max_dropped_tool_calls: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

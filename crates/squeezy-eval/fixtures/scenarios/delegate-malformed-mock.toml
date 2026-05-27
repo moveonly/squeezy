@@ -1,0 +1,57 @@
+id = "delegate-malformed-mock"
+title = "Delegate validation: model self-corrects when prompt is missing"
+description = """
+Reproduces the Qwen3-via-PortKey failure mode where the model emits a
+`delegate` tool call with no `prompt` field. The agent should reject
+the malformed call with a friendly, actionable error message, and the
+mocked second turn should still produce a useful assistant message.
+
+Runs entirely offline. Captures the trace + frame so the
+`stop_with_intent_text_no_tool_call` finding does NOT fire (model
+emitted content) and so eval consumers can confirm the friendly error
+text replaces the old raw `"missing required string field: prompt"`
+surface.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "how are you today?"
+
+[expect]
+final_text_contains = ["doing well"]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback: no scripted turn for this prompt)"
+
+# Turn 1: model emits a `delegate` call with NO prompt argument
+# (mirrors the Qwen3 failure mode), then the parent records the
+# validation rejection as a normal ToolResult. The mock provider
+# advances to the next turn on the next round.
+[[mock.turns]]
+text = ""
+input_tokens = 50
+output_tokens = 2
+
+[[mock.turns.tool_calls]]
+name = "delegate"
+arguments = { scope = "small talk" }
+
+# Turn 2: parent emits the recovery text. The friendly error message
+# from `parse_subagent_request` should have nudged it toward a direct
+# response instead of another delegate call.
+[[mock.turns]]
+text = "I'm doing well, thanks for asking! What can I help you with?"
+input_tokens = 60
+output_tokens = 12
+
+[triage]
+enabled = false

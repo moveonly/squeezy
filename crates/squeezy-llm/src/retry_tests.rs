@@ -85,11 +85,7 @@ fn full_event_sequence() -> Vec<LlmEvent> {
         LlmEvent::Started,
         LlmEvent::TextDelta("hello ".to_string()),
         LlmEvent::TextDelta("world".to_string()),
-        LlmEvent::Completed {
-            response_id: Some("resp_1".to_string()),
-            cost: CostSnapshot::default(),
-            stop_reason: None,
-        },
+        LlmEvent::completed(Some("resp_1".to_string()), CostSnapshot::default()),
     ]
 }
 

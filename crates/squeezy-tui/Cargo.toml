@@ -35,6 +35,7 @@ supports-color.workspace = true
 toml_edit.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 tree-sitter.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-c.workspace = true

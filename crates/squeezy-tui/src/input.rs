@@ -182,8 +182,18 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         parameter_hint: None,
         capabilities: &[PermissionCapability::Network],
     },
-    slash("/collapse", "collapse transcript entries"),
-    slash("/expand", "expand transcript entries"),
+    slash_args(
+        "/collapse",
+        "collapse transcript entries (default: all)",
+        true,
+        "[all|tools|logs|diffs|receipts|assistant|reasoning]",
+    ),
+    slash_args(
+        "/expand",
+        "expand transcript entries (default: all)",
+        true,
+        "[all|tools|logs|diffs|receipts|assistant|reasoning]",
+    ),
     slash_caps(
         "/diff",
         "show uncommitted changes (tracked + untracked)",

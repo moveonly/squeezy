@@ -37,6 +37,19 @@ pub enum EvalEventKind {
     TurnCompleted {
         metrics: Value,
         cost: Value,
+        /// Provider-reported normalized stop kind from the final round
+        /// of this turn, propagated from `AgentEvent::Completed`. `None`
+        /// when the provider didn't report one or the stream ended
+        /// synthetically (e.g. truncated upstream connection,
+        /// agent-loop short-circuit). Surfaced in trace.jsonl so
+        /// findings rules can branch on the actual terminal state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<squeezy_llm::StopReason>,
+        /// `true` iff the final round was a Qwen3-style "reasoning-only
+        /// finish" (`stop_reason=EndTurn` with reasoning text but no
+        /// content or tool call).
+        #[serde(default)]
+        reasoning_only_stop: bool,
     },
     TurnFailed {
         error: String,

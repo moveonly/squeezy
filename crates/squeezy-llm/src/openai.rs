@@ -396,6 +396,7 @@ fn parse_openai_event(
                 response_id,
                 cost: parse_cost(response),
                 stop_reason,
+                reasoning_only_stop: false,
             }))
         }
         "response.incomplete" => {
@@ -417,6 +418,7 @@ fn parse_openai_event(
                 response_id,
                 cost: parse_cost(response),
                 stop_reason,
+                reasoning_only_stop: false,
             }))
         }
         "error" | "response.failed" => {

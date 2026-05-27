@@ -55,6 +55,15 @@ pub(crate) enum Action {
     /// Jump to the bottom of the transcript when the composer is
     /// empty (`End` default; falls through to line-end otherwise).
     TranscriptEnd,
+    /// Toggle expand/collapse on the currently selected (or latest
+    /// collapsed) transcript entry (`Ctrl+E` default; falls through
+    /// to readline line-end when the composer has text).
+    ExpandSelectedTranscriptEntry,
+    /// Toggle expand-all across every toggleable transcript entry —
+    /// expands when any is collapsed, collapses all back to default
+    /// otherwise (`Alt+E` default; always fires regardless of
+    /// composer state).
+    ExpandAllTranscriptEntries,
 }
 
 impl Action {
@@ -69,6 +78,8 @@ impl Action {
             Self::ScrollTranscriptPageDown => "page_down",
             Self::TranscriptHome => "transcript_home",
             Self::TranscriptEnd => "transcript_end",
+            Self::ExpandSelectedTranscriptEntry => "expand_selected_transcript_entry",
+            Self::ExpandAllTranscriptEntries => "expand_all_transcript_entries",
         }
     }
 
@@ -82,6 +93,8 @@ impl Action {
         Action::ScrollTranscriptPageDown,
         Action::TranscriptHome,
         Action::TranscriptEnd,
+        Action::ExpandSelectedTranscriptEntry,
+        Action::ExpandAllTranscriptEntries,
     ];
 
     pub(crate) fn from_slug(slug: &str) -> Option<Action> {
@@ -108,6 +121,17 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            Self::ExpandSelectedTranscriptEntry => {
+                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            }
+            // `Alt+e` is reachable on every terminal we care about
+            // (macOS Terminal, iTerm2, kitty, Alacritty, Windows Terminal,
+            // tmux pass-through). Ctrl+Shift+E is not — many terminals
+            // can't disambiguate it from plain Ctrl+E because Shift on
+            // alphabetic codes is terminal-dependent.
+            Self::ExpandAllTranscriptEntries => {
+                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::ALT)
+            }
         }
     }
 }
