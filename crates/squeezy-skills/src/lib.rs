@@ -44,6 +44,10 @@ const BUNDLED_SKILL_SOURCES: &[BundledSkillSource] = &[
         content: include_str!("../builtin/beads-workflow/SKILL.md"),
     },
     BundledSkillSource {
+        dir_name: "customize-squeezy",
+        content: include_str!("../builtin/customize-squeezy/SKILL.md"),
+    },
+    BundledSkillSource {
         dir_name: "release-notes",
         content: include_str!("../builtin/release-notes/SKILL.md"),
     },

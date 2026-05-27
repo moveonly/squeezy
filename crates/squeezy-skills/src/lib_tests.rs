@@ -53,6 +53,60 @@ fn bundled_skills_load_with_valid_metadata() {
 }
 
 #[test]
+fn customize_skill_loads_when_user_edits_config_toml() {
+    // Acceptance test for the bundled `customize-squeezy` skill: it must
+    // be present in the in-binary sample list, and when installed into a
+    // discovered skills root it must activate on the kind of input a user
+    // gives when they ask to edit `settings.toml` / `squeezy.toml`.
+    let bundled = bundled_skills();
+    let customize = bundled
+        .iter()
+        .find(|skill| skill.summary.name == "customize-squeezy")
+        .expect("customize-squeezy bundled skill is registered");
+    assert!(
+        customize
+            .body
+            .to_ascii_lowercase()
+            .contains("settings.toml"),
+        "bundled customize-squeezy body should document settings.toml edits"
+    );
+
+    let root = temp_workspace("skills_customize_squeezy_loads");
+    let user_dir = root.join("user");
+    let skill_dir = user_dir.join("customize-squeezy");
+    fs::create_dir_all(&skill_dir).expect("mkdir");
+    fs::write(
+        skill_dir.join("SKILL.md"),
+        include_str!("../builtin/customize-squeezy/SKILL.md"),
+    )
+    .expect("install bundled skill");
+
+    let config = SkillsConfig {
+        user_dir,
+        compat_user_dir: root.join("compat"),
+        ..Default::default()
+    };
+    let catalog = SkillCatalog::discover(&root, &config);
+    let activation = catalog
+        .activate_for_input("please edit my ~/.squeezy/settings.toml to add a provider")
+        .expect("activate");
+    assert!(
+        activation
+            .skills
+            .iter()
+            .any(|loaded| loaded.summary.name == "customize-squeezy"),
+        "expected customize-squeezy to activate on a settings.toml edit prompt, got {:?}",
+        activation
+            .skills
+            .iter()
+            .map(|loaded| loaded.summary.name.as_str())
+            .collect::<Vec<_>>()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn bundled_skills_render_through_catalog_helpers() {
     let bundled = bundled_skills();
     let block = bundled
