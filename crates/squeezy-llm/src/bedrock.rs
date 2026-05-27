@@ -18,12 +18,14 @@ use aws_sdk_bedrockruntime::{
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::Value;
 use squeezy_core::{BedrockConfig, CostSnapshot, ProviderTransportConfig, Result, SqueezyError};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, LlmToolSpec, ReasoningKind, ReasoningPayload,
     anthropic_betas::bedrock_extra_body_betas, cache_policy::should_apply_caching,
+    retry::idle_timeout,
 };
 
 #[derive(Debug, Clone)]
@@ -76,12 +78,7 @@ impl LlmProvider for BedrockProvider {
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
         let provider = self.clone();
-        // `stream_idle_timeout_ms` is plumbed for future use; the AWS SDK
-        // already enforces its own per-event timeouts via the smithy
-        // runtime, and adding a second tokio::time::timeout layer here
-        // would require pinning the event receiver in place. Tracked as a
-        // follow-up.
-        let _ = provider.transport;
+        let transport = provider.transport;
         Box::pin(try_stream! {
             let client_result = tokio::select! {
                 _ = cancel.cancelled() => {
@@ -158,9 +155,11 @@ impl LlmProvider for BedrockProvider {
                         yield LlmEvent::Cancelled;
                         return;
                     }
-                    next = recv_event(&mut stream) => next,
+                    next = timeout(idle_timeout(transport), recv_event(&mut stream)) => next,
                 };
-                let event = polled?;
+                let event = polled.map_err(|_| {
+                    SqueezyError::ProviderStream("Bedrock stream idle timeout".to_string())
+                })??;
                 let Some(event) = event else { break; };
                 for llm_event in handle_bedrock_event(event, &mut state)? {
                     yield llm_event;
