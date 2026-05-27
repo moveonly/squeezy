@@ -99,6 +99,13 @@ pub const DEFAULT_BASETEN_MODEL: &str = "meta-llama/Meta-Llama-3.1-70B-Instruct"
 pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 pub const DEFAULT_VLLM_BASE_URL: &str = "http://127.0.0.1:8000/v1";
 pub const DEFAULT_LLAMACPP_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+// Cloudflare Workers AI + AI Gateway. Both base URLs are templated on
+// `cloudflare_account_id` (and AI Gateway additionally on `cloudflare_gateway_id`),
+// so the static defaults below are empty — the caller must template them via
+// `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_ID: &str = "default";
+pub const DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+pub const DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL: &str = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /// Vertex AI's OpenAI-compatible chat completions endpoint lives behind a
 /// regional URL that names the project. Returns the resolved base URL for a
@@ -136,6 +143,21 @@ pub fn resolve_model_alias(provider: &str, alias: &str) -> Option<&'static str> 
         ("google", "haiku") => Some("gemini-2.5-flash-lite"),
         _ => None,
     }
+}
+
+/// Cloudflare Workers AI's OpenAI-compatible chat completions endpoint is
+/// per-account. Returns the resolved base URL for an `account_id`, ready for
+/// `/chat/completions` to be appended.
+pub fn cloudflare_workers_ai_base_url(account_id: &str) -> String {
+    format!("https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1")
+}
+
+/// Cloudflare AI Gateway proxies any OpenAI-compatible upstream behind a
+/// per-(account, gateway) URL. The `compat` suffix is the gateway's
+/// OpenAI-format compatibility surface; underneath it can route to Workers AI,
+/// OpenAI, Anthropic, etc. depending on the gateway's configured upstream.
+pub fn cloudflare_ai_gateway_base_url(account_id: &str, gateway_id: &str) -> String {
+    format!("https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/compat")
 }
 
 pub const MODEL_SELECTION_VERSION: u32 = 1;
@@ -1650,8 +1672,8 @@ pub struct OpenAiCompatibleConfig {
 /// Named presets for the OpenAI-compatible (Chat Completions) provider. Each
 /// preset carries enough defaults that the user can wire a provider with just
 /// an API key. `Custom` is for any other OpenAI-compatible endpoint (e.g.
-/// self-hosted LiteLLM, Cloudflare Workers AI, Cohere) and requires the
-/// caller to supply `base_url` and `api_key_env` explicitly.
+/// self-hosted LiteLLM, Cohere) and requires the caller to supply `base_url`
+/// and `api_key_env` explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenAiCompatiblePreset {
@@ -1677,6 +1699,8 @@ pub enum OpenAiCompatiblePreset {
     VLlm,
     #[serde(rename = "llamacpp")]
     LlamaCpp,
+    CloudflareWorkersAi,
+    CloudflareAiGateway,
     Custom,
 }
 
@@ -1701,6 +1725,8 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio => "lmstudio",
             Self::VLlm => "vllm",
             Self::LlamaCpp => "llamacpp",
+            Self::CloudflareWorkersAi => "cloudflare_workers_ai",
+            Self::CloudflareAiGateway => "cloudflare_ai_gateway",
             Self::Custom => "openai_compatible",
         }
     }
@@ -1724,6 +1750,8 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio => "LM Studio",
             Self::VLlm => "vLLM",
             Self::LlamaCpp => "llama.cpp server",
+            Self::CloudflareWorkersAi => "Cloudflare Workers AI",
+            Self::CloudflareAiGateway => "Cloudflare AI Gateway",
             Self::Custom => "OpenAI-compatible (custom)",
         }
     }
@@ -1766,6 +1794,12 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio => DEFAULT_LMSTUDIO_BASE_URL,
             Self::VLlm => DEFAULT_VLLM_BASE_URL,
             Self::LlamaCpp => DEFAULT_LLAMACPP_BASE_URL,
+            // Cloudflare's base URLs are per-account (and per-gateway for the
+            // gateway preset). The caller must template them from
+            // `cloudflare_account_id` (and `cloudflare_gateway_id`); see
+            // `cloudflare_workers_ai_base_url` / `cloudflare_ai_gateway_base_url`.
+            Self::CloudflareWorkersAi => "",
+            Self::CloudflareAiGateway => "",
             Self::Custom => "",
         }
     }
@@ -1794,6 +1828,13 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio => "LMSTUDIO_API_KEY",
             Self::VLlm => "VLLM_API_KEY",
             Self::LlamaCpp => "LLAMACPP_API_KEY",
+            // Cloudflare uses one API token (CLOUDFLARE_API_KEY) for the
+            // direct Workers AI endpoint, and the same token for the
+            // upstream bearer when routing through AI Gateway. The optional
+            // gateway-level token (`cf-aig-authorization`) is configured
+            // separately via `CF_AIG_TOKEN` and injected as an extra header.
+            Self::CloudflareWorkersAi => "CLOUDFLARE_API_KEY",
+            Self::CloudflareAiGateway => "CLOUDFLARE_API_KEY",
             Self::Custom => "",
         }
     }
@@ -1818,6 +1859,8 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio => "",
             Self::VLlm => "",
             Self::LlamaCpp => "",
+            Self::CloudflareWorkersAi => DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL,
+            Self::CloudflareAiGateway => DEFAULT_CLOUDFLARE_AI_GATEWAY_MODEL,
             Self::Custom => "",
         }
     }
@@ -1843,6 +1886,12 @@ impl OpenAiCompatiblePreset {
             "lmstudio" | "lm_studio" => Some(Self::LMStudio),
             "vllm" => Some(Self::VLlm),
             "llamacpp" | "llama_cpp" | "llama_cpp_server" => Some(Self::LlamaCpp),
+            "cloudflare_workers_ai" | "cloudflare_workersai" | "workers_ai" | "cf_workers_ai" => {
+                Some(Self::CloudflareWorkersAi)
+            }
+            "cloudflare_ai_gateway" | "cloudflare_gateway" | "cf_ai_gateway" | "ai_gateway" => {
+                Some(Self::CloudflareAiGateway)
+            }
             "openai_compatible" | "custom" => Some(Self::Custom),
             _ => None,
         }
@@ -1850,7 +1899,7 @@ impl OpenAiCompatiblePreset {
 
     /// Every preset that ships with `cargo run -p squeezy -- --list-providers`.
     /// Used by the CLI to enumerate options without hard-coding the list.
-    pub fn all() -> [Self; 17] {
+    pub fn all() -> [Self; 19] {
         [
             Self::OpenRouter,
             Self::Vercel,
@@ -1868,6 +1917,8 @@ impl OpenAiCompatiblePreset {
             Self::LMStudio,
             Self::VLlm,
             Self::LlamaCpp,
+            Self::CloudflareWorkersAi,
+            Self::CloudflareAiGateway,
             Self::Custom,
         ]
     }
@@ -2363,6 +2414,8 @@ pub struct ProviderSettings {
     pub preset: Option<String>,
     pub vertex_project: Option<String>,
     pub vertex_location: Option<String>,
+    pub cloudflare_account_id: Option<String>,
+    pub cloudflare_gateway_id: Option<String>,
     pub request_max_retries: Option<u8>,
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
@@ -2386,6 +2439,8 @@ impl ProviderSettings {
                 "preset",
                 "vertex_project",
                 "vertex_location",
+                "cloudflare_account_id",
+                "cloudflare_gateway_id",
                 "request_max_retries",
                 "stream_max_retries",
                 "stream_idle_timeout_ms",
@@ -2442,6 +2497,18 @@ impl ProviderSettings {
                 source,
                 &field(path, "vertex_location"),
             )?,
+            cloudflare_account_id: string_value(
+                table,
+                "cloudflare_account_id",
+                source,
+                &field(path, "cloudflare_account_id"),
+            )?,
+            cloudflare_gateway_id: string_value(
+                table,
+                "cloudflare_gateway_id",
+                source,
+                &field(path, "cloudflare_gateway_id"),
+            )?,
             request_max_retries: u8_nonnegative_value(
                 table,
                 "request_max_retries",
@@ -2475,6 +2542,8 @@ impl ProviderSettings {
         replace_if_some(&mut self.preset, next.preset);
         replace_if_some(&mut self.vertex_project, next.vertex_project);
         replace_if_some(&mut self.vertex_location, next.vertex_location);
+        replace_if_some(&mut self.cloudflare_account_id, next.cloudflare_account_id);
+        replace_if_some(&mut self.cloudflare_gateway_id, next.cloudflare_gateway_id);
         replace_if_some(&mut self.request_max_retries, next.request_max_retries);
         replace_if_some(&mut self.stream_max_retries, next.stream_max_retries);
         replace_if_some(
@@ -7020,6 +7089,8 @@ fn provider_setting(
         "vertex_project" => settings.vertex_project.as_ref(),
         "vertex_location" => settings.vertex_location.as_ref(),
         "route_style" => settings.route_style.as_ref(),
+        "cloudflare_account_id" => settings.cloudflare_account_id.as_ref(),
+        "cloudflare_gateway_id" => settings.cloudflare_gateway_id.as_ref(),
         _ => None,
     }?;
     Some(value.clone())
@@ -7131,6 +7202,31 @@ fn build_openai_compatible_config(
                 .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string());
             vertex_base_url(project.trim(), location.trim())
         }
+        (OpenAiCompatiblePreset::CloudflareWorkersAi, None) => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_workers_ai.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare Workers AI preset"
+                            .to_string(),
+                    )
+                })?;
+            cloudflare_workers_ai_base_url(account_id.trim())
+        }
+        (OpenAiCompatiblePreset::CloudflareAiGateway, None) => {
+            let account_id = get_var("CLOUDFLARE_ACCOUNT_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_account_id"))
+                .ok_or_else(|| {
+                    SqueezyError::Config(
+                        "providers.cloudflare_ai_gateway.cloudflare_account_id (or CLOUDFLARE_ACCOUNT_ID) is required for the Cloudflare AI Gateway preset"
+                            .to_string(),
+                    )
+                })?;
+            let gateway_id = get_var("CLOUDFLARE_AI_GATEWAY_ID")
+                .or_else(|| provider_setting(providers, section, "cloudflare_gateway_id"))
+                .unwrap_or_else(|| DEFAULT_CLOUDFLARE_AI_GATEWAY_ID.to_string());
+            cloudflare_ai_gateway_base_url(account_id.trim(), gateway_id.trim())
+        }
         (_, None) => preset.default_base_url().to_string(),
     };
     if base_url.trim().is_empty() {
@@ -7139,7 +7235,27 @@ fn build_openai_compatible_config(
             preset.display_name()
         )));
     }
-    let extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
+    let mut extra_headers = provider_setting_headers(providers, section).unwrap_or_default();
+    // AI Gateway dual-auth: the upstream provider's API key flows in as the
+    // standard `Authorization: Bearer …` (resolved by the provider), and an
+    // optional gateway-level token flows in as `cf-aig-authorization`. Honor
+    // `CF_AIG_TOKEN` as a convenience env so the gateway token does not have
+    // to be pasted into a TOML `headers` table; user-supplied headers always
+    // win to keep manual overrides possible.
+    if preset == OpenAiCompatiblePreset::CloudflareAiGateway {
+        let has_gateway_header = extra_headers
+            .keys()
+            .any(|key| key.eq_ignore_ascii_case("cf-aig-authorization"));
+        if !has_gateway_header && let Some(token) = get_var("CF_AIG_TOKEN") {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                extra_headers.insert(
+                    "cf-aig-authorization".to_string(),
+                    format!("Bearer {trimmed}"),
+                );
+            }
+        }
+    }
     let transport = provider_transport_settings(providers, &[section]);
     let api_key = provider_setting(providers, section, "api_key");
     Ok(ProviderConfig::OpenAiCompatible(OpenAiCompatibleConfig {
@@ -7177,6 +7293,8 @@ fn provider_settings_keys(provider: &ProviderConfig) -> &'static [&'static str] 
             OpenAiCompatiblePreset::LMStudio => &["lmstudio"],
             OpenAiCompatiblePreset::VLlm => &["vllm"],
             OpenAiCompatiblePreset::LlamaCpp => &["llamacpp"],
+            OpenAiCompatiblePreset::CloudflareWorkersAi => &["cloudflare_workers_ai"],
+            OpenAiCompatiblePreset::CloudflareAiGateway => &["cloudflare_ai_gateway"],
             OpenAiCompatiblePreset::Custom => &["openai_compatible"],
         },
     }

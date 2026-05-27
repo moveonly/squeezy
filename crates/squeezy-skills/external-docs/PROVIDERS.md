@@ -198,6 +198,33 @@ api_key_env = "CEREBRAS_API_KEY"
 default_model = "llama-3.3-70b"
 # base_url defaults to https://api.cerebras.ai/v1
 
+# ── Cloudflare (account-templated URLs) ───────────────────────────────────
+# Workers AI hosts open-weight models on Cloudflare's network. AI Gateway is a
+# pass-through proxy that adds rate limiting, caching, and analytics in front
+# of any OpenAI-compatible upstream (including Workers AI itself, OpenAI,
+# Anthropic, etc.). Both base URLs are templated from your account id.
+
+[providers.cloudflare_workers_ai]
+api_key_env = "CLOUDFLARE_API_KEY"
+cloudflare_account_id = "your-cloudflare-account-id"
+default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+# base_url is templated to
+# https://api.cloudflare.com/client/v4/accounts/{cloudflare_account_id}/ai/v1
+
+[providers.cloudflare_ai_gateway]
+api_key_env = "CLOUDFLARE_API_KEY"
+cloudflare_account_id = "your-cloudflare-account-id"
+cloudflare_gateway_id = "your-gateway-id"  # defaults to "default"
+default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+# base_url is templated to
+# https://gateway.ai.cloudflare.com/v1/{cloudflare_account_id}/{cloudflare_gateway_id}/compat
+#
+# Dual-auth: the upstream provider's bearer flows through `api_key_env`.
+# For gateway-level auth (separate from the upstream's key), export
+# `CF_AIG_TOKEN` and Squeezy injects `cf-aig-authorization: Bearer <token>`.
+# Pin a fixed header instead by setting [providers.cloudflare_ai_gateway.headers]
+# explicitly; explicit headers always win over the env shortcut.
+
 # ── Custom OpenAI-compatible endpoint ─────────────────────────────────────
 # Any service that speaks `POST /chat/completions` with a Bearer token
 # works through the `openai_compatible` preset. Examples:
@@ -205,14 +232,13 @@ default_model = "llama-3.3-70b"
 #   * Microsoft Foundry (Azure AI Studio) serverless deployment — base_url is
 #     your Foundry endpoint, e.g.
 #     https://your-deployment.eastus2.models.ai.azure.com/v1
-#   * Cloudflare Workers AI — base_url contains your account id.
 #   * Self-hosted LiteLLM proxy — base_url is your deployment.
 #   * Cohere — partial compatibility; tool calling may differ.
 
 [providers.openai_compatible]
 api_key_env = "CUSTOM_API_KEY"
-base_url = "https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1"
-default_model = "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+base_url = "https://your-host.example.com/v1"
+default_model = "your-model"
 ```
 
 `model = ""` means Squeezy uses the selected provider default. `profile` is
@@ -225,8 +251,9 @@ availability. Aggregators (OpenRouter / Vercel / PortKey) are listed first
 because one key gives access to many models. The picker also detects
 `GROQ_API_KEY`, `XAI_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`,
 `TOGETHER_API_KEY`, `FIREWORKS_API_KEY`, `CEREBRAS_API_KEY`,
-`AI_GATEWAY_API_KEY`, `PORTKEY_API_KEY`, plus the existing
-`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and Azure variants.
+`AI_GATEWAY_API_KEY`, `PORTKEY_API_KEY`, `CLOUDFLARE_API_KEY`, plus the
+existing `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, and Azure
+variants.
 It asks for provider/token, model, and supported model options (e.g. OpenAI
 reasoning effort), then saves only the environment variable name and the
 selected defaults to `~/.squeezy/settings.toml`. Secret token values are never
@@ -251,8 +278,9 @@ Existing env overrides remain supported: `SQUEEZY_PROVIDER`, `SQUEEZY_MODEL`,
 `SQUEEZY_PROFILE`, the provider-specific base URL variables
 (`OPENROUTER_BASE_URL`, `VERCEL_BASE_URL`, `PORTKEY_BASE_URL`, `GROQ_BASE_URL`,
 `XAI_BASE_URL`, `DEEPSEEK_BASE_URL`, `MISTRAL_BASE_URL`, `TOGETHER_BASE_URL`,
-`FIREWORKS_BASE_URL`, `CEREBRAS_BASE_URL`), and the provider API-key-env
-variables.
+`FIREWORKS_BASE_URL`, `CEREBRAS_BASE_URL`), the Cloudflare templating
+variables (`CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AI_GATEWAY_ID`,
+`CF_AIG_TOKEN`), and the provider API-key-env variables.
 
 ## Built-In Model Accounting Metadata
 
@@ -274,9 +302,10 @@ estimate assembled-request size without starting a model turn:
 | `deepseek` | `deepseek-chat` | 131,072 | 8,192 |
 
 Light-preset providers (`portkey`, `mistral`, `together`, `fireworks`,
-`cerebras`) and the `openai_compatible` custom preset fall back to a generic
-272K context / 64K max-output estimate until you set `default_model` to a
-model that exists in the curated registry.
+`cerebras`, `cloudflare_workers_ai`, `cloudflare_ai_gateway`) and the
+`openai_compatible` custom preset fall back to a generic 272K context / 64K
+max-output estimate until you set `default_model` to a model that exists in
+the curated registry.
 
 Ollama limits are local model metadata. Squeezy tries `/api/show` and uses
 `model_info.*.context_window` or `num_ctx` when available; otherwise the
@@ -291,7 +320,7 @@ until added to the registry or reported by the local provider.
 - `azure_openai`: Azure OpenAI Responses-compatible streaming with `api-key` auth and `api-version`.
 - `ollama`: Local `/api/chat` NDJSON streaming with function tool schemas and zero-dollar pricing. Set `route_style = "openai_compatible"` to switch to Ollama's `/v1/chat/completions` SSE endpoint for portable tooling.
 - `bedrock`: AWS SDK Bedrock Runtime `ConverseStream` transport, AWS default credential chain, region/base-url configuration, text streaming, tool use/tool results, and usage metadata.
-- `openrouter` / `vercel` / `portkey` / `groq` / `xai` / `deepseek` / `mistral` / `together` / `fireworks` / `cerebras` / `openai_compatible`: OpenAI-compatible `POST /chat/completions` streaming with Bearer auth, function-tool schemas, and `usage` extraction. OpenRouter ships default `HTTP-Referer` / `X-Title` headers for traffic attribution.
+- `openrouter` / `vercel` / `portkey` / `groq` / `xai` / `deepseek` / `mistral` / `together` / `fireworks` / `cerebras` / `cloudflare_workers_ai` / `cloudflare_ai_gateway` / `openai_compatible`: OpenAI-compatible `POST /chat/completions` streaming with Bearer auth, function-tool schemas, and `usage` extraction. OpenRouter ships default `HTTP-Referer` / `X-Title` headers for traffic attribution. Cloudflare AI Gateway injects `cf-aig-authorization` from `CF_AIG_TOKEN` for gateway-level dual auth.
 
 Pricing values are seed metadata for routing and telemetry, not billing
 authority. Aggregator entries leave pricing `null` because effective price

@@ -125,6 +125,18 @@ const KNOWN_PROVIDERS: &[KnownProvider] = &[
         fallback_env: Some("LLAMACPP_API_KEY"),
     },
     KnownProvider {
+        section: "cloudflare_workers_ai",
+        cli: "cloudflare_workers_ai",
+        env: "SQUEEZY_CLOUDFLARE_WORKERS_AI_KEY",
+        fallback_env: Some("CLOUDFLARE_API_KEY"),
+    },
+    KnownProvider {
+        section: "cloudflare_ai_gateway",
+        cli: "cloudflare_ai_gateway",
+        env: "SQUEEZY_CLOUDFLARE_AI_GATEWAY_KEY",
+        fallback_env: Some("CLOUDFLARE_API_KEY"),
+    },
+    KnownProvider {
         section: "openai_compatible",
         cli: "openai_compatible",
         env: "SQUEEZY_OPENAI_COMPATIBLE_KEY",

@@ -2050,6 +2050,188 @@ fn vertex_preset_rejects_missing_project() {
 }
 
 #[test]
+fn cloudflare_workers_ai_preset_templates_base_url_from_account_id() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_workers_ai".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_workers_ai"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("workers AI config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_workers_ai must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.preset,
+        OpenAiCompatiblePreset::CloudflareWorkersAi
+    );
+    assert_eq!(
+        compatible.base_url,
+        "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1"
+    );
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
+    assert_eq!(config.model, DEFAULT_CLOUDFLARE_WORKERS_AI_MODEL);
+}
+
+#[test]
+fn cloudflare_workers_ai_preset_rejects_missing_account_id() {
+    let settings = SettingsFile::default();
+    let error =
+        AppConfig::try_from_settings_and_env_vars(settings, Some("cloudflare_workers_ai"), |_| {
+            None
+        })
+        .expect_err("workers AI requires account_id");
+    assert!(
+        format!("{error}").contains("cloudflare_account_id"),
+        "error must explain the missing field, got: {error}"
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_preset_templates_base_url_and_injects_dual_auth_header() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            cloudflare_gateway_id: Some("my-gateway".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            "CF_AIG_TOKEN" => Some("gateway-secret".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.preset,
+        OpenAiCompatiblePreset::CloudflareAiGateway
+    );
+    assert_eq!(
+        compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat"
+    );
+    // Dual auth: standard bearer goes through `api_key_env`; gateway token is
+    // injected as `cf-aig-authorization` so the compat layer authenticates
+    // both the upstream provider and the gateway itself.
+    assert_eq!(compatible.api_key_env, "CLOUDFLARE_API_KEY");
+    assert_eq!(
+        compatible
+            .extra_headers
+            .get("cf-aig-authorization")
+            .map(String::as_str),
+        Some("Bearer gateway-secret"),
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_defaults_gateway_id_when_omitted() {
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            _ => None,
+        },
+    )
+    .expect("AI Gateway falls back to the `default` gateway id");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible.base_url,
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/default/compat"
+    );
+    // No CF_AIG_TOKEN supplied → no `cf-aig-authorization` header injected;
+    // the gateway runs in "open" / upstream-auth-only mode.
+    assert!(
+        !compatible
+            .extra_headers
+            .contains_key("cf-aig-authorization")
+    );
+}
+
+#[test]
+fn cloudflare_ai_gateway_user_supplied_header_wins_over_env_token() {
+    let mut providers = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "cf-aig-authorization".to_string(),
+        "Bearer user-supplied".to_string(),
+    );
+    providers.insert(
+        "cloudflare_ai_gateway".to_string(),
+        ProviderSettings {
+            cloudflare_account_id: Some("acct-abc".to_string()),
+            headers: Some(headers),
+            ..Default::default()
+        },
+    );
+    let settings = SettingsFile {
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let config = AppConfig::try_from_settings_and_env_vars(
+        settings,
+        Some("cloudflare_ai_gateway"),
+        |name| match name {
+            "CLOUDFLARE_API_KEY" => Some("cf-key".to_string()),
+            "CF_AIG_TOKEN" => Some("env-token-should-lose".to_string()),
+            _ => None,
+        },
+    )
+    .expect("config builds");
+    let ProviderConfig::OpenAiCompatible(compatible) = &config.provider else {
+        panic!("cloudflare_ai_gateway must map to OpenAiCompatible");
+    };
+    assert_eq!(
+        compatible
+            .extra_headers
+            .get("cf-aig-authorization")
+            .map(String::as_str),
+        Some("Bearer user-supplied"),
+    );
+}
+
+#[test]
 fn aliases_map_to_compatible_presets() {
     for (alias, expected) in [
         ("vercel_ai", OpenAiCompatiblePreset::Vercel),
@@ -2058,6 +2240,13 @@ fn aliases_map_to_compatible_presets() {
         ("port_key", OpenAiCompatiblePreset::PortKey),
         ("vertex_ai", OpenAiCompatiblePreset::Vertex),
         ("google_vertex", OpenAiCompatiblePreset::Vertex),
+        ("workers_ai", OpenAiCompatiblePreset::CloudflareWorkersAi),
+        ("cf_workers_ai", OpenAiCompatiblePreset::CloudflareWorkersAi),
+        ("ai_gateway", OpenAiCompatiblePreset::CloudflareAiGateway),
+        (
+            "cloudflare_gateway",
+            OpenAiCompatiblePreset::CloudflareAiGateway,
+        ),
         ("custom", OpenAiCompatiblePreset::Custom),
     ] {
         // Some presets need extra fields filled in before the config can
@@ -2080,6 +2269,25 @@ fn aliases_map_to_compatible_presets() {
                 ProviderSettings {
                     vertex_project: Some("alias-project".to_string()),
                     vertex_location: Some("us-central1".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        if expected == OpenAiCompatiblePreset::CloudflareWorkersAi {
+            providers.insert(
+                "cloudflare_workers_ai".to_string(),
+                ProviderSettings {
+                    cloudflare_account_id: Some("alias-acct".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        if expected == OpenAiCompatiblePreset::CloudflareAiGateway {
+            providers.insert(
+                "cloudflare_ai_gateway".to_string(),
+                ProviderSettings {
+                    cloudflare_account_id: Some("alias-acct".to_string()),
+                    cloudflare_gateway_id: Some("alias-gw".to_string()),
                     ..Default::default()
                 },
             );

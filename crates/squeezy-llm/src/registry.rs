@@ -229,6 +229,8 @@ pub const PROVIDERS: &[&str] = &[
     "lmstudio",
     "vllm",
     "llamacpp",
+    "cloudflare_workers_ai",
+    "cloudflare_ai_gateway",
     "openai_compatible",
 ];
 

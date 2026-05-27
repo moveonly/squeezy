@@ -973,6 +973,8 @@ pub enum ProviderKind {
     VLlm,
     #[serde(rename = "llamacpp")]
     LlamaCpp,
+    CloudflareWorkersAi,
+    CloudflareAiGateway,
     OpenAiCompatible,
 }
 
@@ -1003,6 +1005,8 @@ impl ProviderKind {
                 OpenAiCompatiblePreset::LMStudio => Self::LMStudio,
                 OpenAiCompatiblePreset::VLlm => Self::VLlm,
                 OpenAiCompatiblePreset::LlamaCpp => Self::LlamaCpp,
+                OpenAiCompatiblePreset::CloudflareWorkersAi => Self::CloudflareWorkersAi,
+                OpenAiCompatiblePreset::CloudflareAiGateway => Self::CloudflareAiGateway,
                 OpenAiCompatiblePreset::Custom => Self::OpenAiCompatible,
             },
         }
