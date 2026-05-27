@@ -23,6 +23,7 @@ pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
 pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GlobArgs {
     pub(crate) pattern: String,
     pub(crate) path: Option<String>,
@@ -33,6 +34,7 @@ pub(crate) struct GlobArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GrepArgs {
     pub(crate) pattern: String,
     pub(crate) path: Option<String>,
@@ -75,6 +77,7 @@ impl GrepOutputMode {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadFileArgs {
     pub(crate) path: String,
     offset: Option<usize>,
@@ -83,6 +86,7 @@ pub(crate) struct ReadFileArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadToolOutputArgs {
     pub(crate) handle: String,
     offset: Option<usize>,

@@ -25,6 +25,8 @@ fn fixture_server(enabled: bool, command: Option<&str>) -> McpServerConfig {
         args: Vec::new(),
         url: None,
         timeout_ms: Some(500),
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
         enabled_tools: None,
         disabled_tools: Vec::new(),
         env: BTreeMap::new(),
@@ -168,6 +170,43 @@ fn uri_templates_allow_declared_prefix_only() {
         "file:///etc/passwd",
         "docs://api/v3/repos/{owner}/{repo}"
     ));
+}
+
+#[test]
+fn separate_startup_and_tool_timeouts_apply() {
+    // Unset → both paths fall back to the shared timeout_ms.
+    let mut server = fixture_server(true, Some("unused"));
+    server.timeout_ms = Some(7_500);
+    assert_eq!(discovery_timeout_ms(&server), 7_500);
+    assert_eq!(tool_call_timeout_ms(&server), 7_500);
+
+    // Override only discovery → tool calls still use shared timeout_ms.
+    server.discovery_timeout_ms = Some(45_000);
+    assert_eq!(discovery_timeout_ms(&server), 45_000);
+    assert_eq!(tool_call_timeout_ms(&server), 7_500);
+
+    // Override only tool calls → discovery still uses its override.
+    server.tool_call_timeout_ms = Some(120_000);
+    assert_eq!(discovery_timeout_ms(&server), 45_000);
+    assert_eq!(tool_call_timeout_ms(&server), 120_000);
+
+    // With timeout_ms cleared the new knobs still apply; only the side
+    // without an override falls back to the crate default.
+    server.timeout_ms = None;
+    server.discovery_timeout_ms = None;
+    assert_eq!(discovery_timeout_ms(&server), DEFAULT_MCP_TIMEOUT_MS);
+    assert_eq!(tool_call_timeout_ms(&server), 120_000);
+}
+
+#[test]
+fn tool_cache_key_changes_when_timeout_split_changes() {
+    let mut server = fixture_server(true, Some("unused"));
+    let base = tool_cache_key("docs", &server);
+    server.discovery_timeout_ms = Some(60_000);
+    let discovery_changed = tool_cache_key("docs", &server);
+    assert_ne!(base, discovery_changed);
+    server.tool_call_timeout_ms = Some(90_000);
+    assert_ne!(discovery_changed, tool_cache_key("docs", &server));
 }
 
 #[test]
@@ -355,6 +394,8 @@ fn http_fixture_server() -> McpServerConfig {
         args: Vec::new(),
         url: Some("http://localhost:0/mcp".to_string()),
         timeout_ms: Some(500),
+        discovery_timeout_ms: None,
+        tool_call_timeout_ms: None,
         enabled_tools: None,
         disabled_tools: Vec::new(),
         env: BTreeMap::new(),
@@ -464,6 +505,146 @@ fn build_streamable_http_config_env_headers_override_static_headers() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn sse_transport_parses_event_data_lines_and_posts_to_advertised_endpoint() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    // Drive a real legacy MCP HTTP+SSE handshake against an in-process
+    // listener. The server replies to the worker's GET with a chunked
+    // `text/event-stream` body that carries:
+    //   * `event: endpoint` advertising the POST URL,
+    //   * `event: message` carrying an initialize response so rmcp's
+    //     `serve_client` can complete its handshake.
+    // We then capture the worker's subsequent POST to the advertised
+    // endpoint and assert it carries the configured headers — proving the
+    // SSE arm uses its own transport with `event:` / `data:` parsing rather
+    // than falling through to the streamable HTTP client.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (post_tx, post_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    let (get_tx, get_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+    let accept = tokio::spawn(async move {
+        // First connection: the GET that opens the SSE stream.
+        let (mut sse_socket, _) = listener.accept().await.expect("accept sse");
+        let mut buf = vec![0u8; 4096];
+        let n = sse_socket.read(&mut buf).await.unwrap_or(0);
+        buf.truncate(n);
+        let _ = get_tx.send(buf);
+
+        // Reply with an SSE stream: status + headers, then the endpoint
+        // event and an initialize response framed as `event: message`.
+        let endpoint_path = "/sse-messages?sid=session-1";
+        let init_response = r#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fixture","version":"0.0.0"}}}"#;
+        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+        let _ = sse_socket.write_all(headers.as_bytes()).await;
+        // First SSE frame: endpoint URL the worker should POST to.
+        let endpoint_frame = format!("event: endpoint\r\ndata: {endpoint_path}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, endpoint_frame.as_bytes()).await;
+        // Second SSE frame: the initialize response. Without this rmcp's
+        // `serve` future never completes the handshake.
+        let message_frame = format!("event: message\r\ndata: {init_response}\r\n\r\n");
+        write_sse_chunk(&mut sse_socket, message_frame.as_bytes()).await;
+
+        // Second connection: the POST the worker sends with the
+        // `initialized` notification once the handshake completes.
+        let (mut post_socket, _) = listener.accept().await.expect("accept post");
+        let mut buf = vec![0u8; 8192];
+        let n = post_socket.read(&mut buf).await.unwrap_or(0);
+        buf.truncate(n);
+        let _ = post_socket
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = post_socket.shutdown().await;
+        let _ = post_tx.send(buf);
+
+        // Hold the SSE socket open just long enough for the worker to
+        // dispatch the POST; the drop closes the connection.
+        drop(sse_socket);
+    });
+
+    let mut server = http_fixture_server();
+    server.transport = McpTransport::Sse;
+    server
+        .http_headers
+        .insert("X-Squeezy-Sse-Test".to_string(), "yes".to_string());
+    server.bearer_token_env_var = Some("SQUEEZY_TEST_SSE_TOKEN".to_string());
+    let sse_url = format!("http://{addr}/sse");
+    server.url = Some(sse_url.clone());
+
+    let handler = SqueezyMcpClientHandler {
+        server_name: "sse-server".to_string(),
+        elicitation_handler: Arc::new(Mutex::new(None)),
+        pause_state: ElicitationPauseState::default(),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(256))),
+    };
+    let (auth_header, custom_headers) =
+        resolve_http_auth_and_headers("sse-server", &server, |name| match name {
+            "SQUEEZY_TEST_SSE_TOKEN" => Some("fixture-secret".to_string()),
+            _ => None,
+        });
+    let worker =
+        crate::sse::build_sse_worker(sse_url, auth_header, custom_headers).expect("worker built");
+
+    // Serve completes once the handshake exchange finishes; then we drop
+    // the resulting service so its transport-close logic tears down.
+    let serve = tokio::time::timeout(std::time::Duration::from_secs(5), handler.serve(worker));
+    let _service = serve.await.expect("serve future timed out");
+    accept.await.expect("listener task");
+
+    let get_raw = tokio::time::timeout(std::time::Duration::from_secs(2), get_rx)
+        .await
+        .expect("no GET captured")
+        .expect("get channel closed");
+    let post_raw = tokio::time::timeout(std::time::Duration::from_secs(2), post_rx)
+        .await
+        .expect("no POST captured")
+        .expect("post channel closed");
+
+    let get_request = String::from_utf8_lossy(&get_raw);
+    let post_request = String::from_utf8_lossy(&post_raw);
+
+    assert!(
+        get_request.starts_with("GET /sse "),
+        "expected GET against /sse opening the SSE stream; got:\n{get_request}"
+    );
+    assert!(
+        get_request.lines().any(|line| line
+            .to_ascii_lowercase()
+            .contains("accept: text/event-stream")),
+        "GET must advertise text/event-stream so the server speaks SSE; got:\n{get_request}"
+    );
+    assert!(
+        post_request.starts_with("POST /sse-messages?sid=session-1 "),
+        "POST must target the URL advertised via `event: endpoint`; got:\n{post_request}"
+    );
+    assert!(
+        post_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("x-squeezy-sse-test: yes")),
+        "POST must carry the static custom header; got:\n{post_request}"
+    );
+    assert!(
+        post_request
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("authorization: Bearer fixture-secret")),
+        "POST must carry the resolved bearer token; got:\n{post_request}"
+    );
+}
+
+async fn write_sse_chunk<W: tokio::io::AsyncWriteExt + Unpin>(writer: &mut W, body: &[u8]) {
+    // Minimal chunked-encoding frame: `<size>\r\n<body>\r\n`. We never send a
+    // terminating `0\r\n\r\n` because we want the stream to stay open across
+    // multiple frames for the duration of the test.
+    let header = format!("{:X}\r\n", body.len());
+    let _ = writer.write_all(header.as_bytes()).await;
+    let _ = writer.write_all(body).await;
+    let _ = writer.write_all(b"\r\n").await;
+    let _ = writer.flush().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn streamable_http_transport_sends_authorization_bearer_header() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -507,6 +688,8 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
     let handler = SqueezyMcpClientHandler {
         server_name: "slack".to_string(),
         elicitation_handler: Arc::new(Mutex::new(None)),
+        elicitation_policy: Arc::new(Mutex::new(PermissionMode::Ask)),
+        elicitation_audit: Arc::new(Mutex::new(std::collections::VecDeque::new())),
         pause_state: ElicitationPauseState::default(),
     };
     // The serve call will fail because we hang up after one round trip — that
@@ -533,4 +716,167 @@ async fn streamable_http_transport_sends_authorization_bearer_header() {
             .any(|line| line.eq_ignore_ascii_case("x-squeezy-test: yes")),
         "outgoing request must carry the static custom header; got:\n{request}"
     );
+}
+
+fn empty_form_elicitation() -> CreateElicitationRequestParams {
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message: "confirm".to_string(),
+        requested_schema: rmcp::model::ElicitationSchema::new(std::collections::BTreeMap::new()),
+    }
+}
+
+fn required_form_elicitation() -> CreateElicitationRequestParams {
+    let mut schema = rmcp::model::ElicitationSchema::new(std::collections::BTreeMap::new());
+    schema.required = Some(vec!["name".to_string()]);
+    CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message: "name?".to_string(),
+        requested_schema: schema,
+    }
+}
+
+fn url_elicitation() -> CreateElicitationRequestParams {
+    CreateElicitationRequestParams::UrlElicitationParams {
+        meta: None,
+        message: "open?".to_string(),
+        url: "https://example.test/auth".to_string(),
+        elicitation_id: "e1".to_string(),
+    }
+}
+
+#[test]
+fn classify_elicitation_under_ask_forwards_every_request() {
+    // The default `Ask` policy must never silently accept a server-driven
+    // elicitation — even one with no required fields — so the user retains
+    // visibility into what each MCP server is asking for.
+    let decision = classify_elicitation(PermissionMode::Ask, &empty_form_elicitation());
+    assert_eq!(decision, AutoElicitationDecision::Forward);
+    let decision = classify_elicitation(PermissionMode::Ask, &url_elicitation());
+    assert_eq!(decision, AutoElicitationDecision::Forward);
+}
+
+#[test]
+fn classify_elicitation_under_allow_auto_accepts_only_empty_forms() {
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &empty_form_elicitation()),
+        AutoElicitationDecision::AutoAccept,
+    );
+    // A form that needs the user to supply values cannot be silently filled.
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &required_form_elicitation()),
+        AutoElicitationDecision::Forward,
+    );
+    // URL elicitations always need user attention; "Allow" does not blanket-trust them.
+    assert_eq!(
+        classify_elicitation(PermissionMode::Allow, &url_elicitation()),
+        AutoElicitationDecision::Forward,
+    );
+}
+
+#[test]
+fn classify_elicitation_under_deny_short_circuits_to_decline() {
+    assert_eq!(
+        classify_elicitation(PermissionMode::Deny, &empty_form_elicitation()),
+        AutoElicitationDecision::AutoDecline,
+    );
+    assert_eq!(
+        classify_elicitation(PermissionMode::Deny, &url_elicitation()),
+        AutoElicitationDecision::AutoDecline,
+    );
+}
+
+#[test]
+fn registry_default_elicitation_policy_is_ask() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Ask);
+}
+
+#[test]
+fn set_elicitation_policy_persists_and_is_readable() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    registry.set_elicitation_policy(PermissionMode::Allow);
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Allow);
+    registry.set_elicitation_policy(PermissionMode::Deny);
+    assert_eq!(registry.elicitation_policy(), PermissionMode::Deny);
+}
+
+#[test]
+fn auto_accept_emit_audit_event() {
+    // Acceptance test for squeezy-7pc: every auto-accept must leave an audit
+    // record so a host can observe whether a malicious server has been
+    // silently confirming prompts. We exercise the helper that both the
+    // ClientHandler path and operators use to push records, since the rmcp
+    // `RequestContext<RoleClient>` cannot be constructed in a unit test.
+    let log = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let request = empty_form_elicitation();
+    let policy = PermissionMode::Allow;
+    let decision = classify_elicitation(policy, &request);
+    assert_eq!(
+        decision,
+        AutoElicitationDecision::AutoAccept,
+        "Allow + empty form must auto-accept"
+    );
+
+    push_elicitation_audit(
+        &log,
+        McpElicitationAuditEvent {
+            server: "docs".to_string(),
+            request_id: "req-1".to_string(),
+            kind: elicitation_kind(&request),
+            policy,
+            outcome: McpElicitationAuditOutcome::AutoAccepted,
+            unix_millis: 0,
+        },
+    );
+
+    let entries: Vec<McpElicitationAuditEvent> = log
+        .lock()
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), 1, "auto-accept must record one audit entry");
+    assert_eq!(entries[0].server, "docs");
+    assert_eq!(entries[0].policy, PermissionMode::Allow);
+    assert_eq!(entries[0].kind, McpElicitationKind::Form);
+    assert_eq!(entries[0].outcome, McpElicitationAuditOutcome::AutoAccepted);
+}
+
+#[test]
+fn audit_log_is_capacity_bounded_fifo() {
+    // A misbehaving server could spam elicitations; the audit ring must drop
+    // the oldest entry once the cap is hit so a flood cannot pin memory.
+    let log = Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+        MCP_AUDIT_LOG_CAPACITY,
+    )));
+    for index in 0..(MCP_AUDIT_LOG_CAPACITY + 16) {
+        push_elicitation_audit(
+            &log,
+            McpElicitationAuditEvent {
+                server: format!("s-{index}"),
+                request_id: format!("req-{index}"),
+                kind: McpElicitationKind::Form,
+                policy: PermissionMode::Allow,
+                outcome: McpElicitationAuditOutcome::AutoAccepted,
+                unix_millis: index as u128,
+            },
+        );
+    }
+    let entries: Vec<McpElicitationAuditEvent> = log
+        .lock()
+        .map(|log| log.iter().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(entries.len(), MCP_AUDIT_LOG_CAPACITY);
+    // Oldest entries are evicted first; the surviving range starts where the
+    // overflow began (`+16`) so the newest record reflects the last push.
+    assert_eq!(entries.first().unwrap().server, "s-16");
+    assert_eq!(
+        entries.last().unwrap().server,
+        format!("s-{}", MCP_AUDIT_LOG_CAPACITY + 15)
+    );
+}
+
+#[test]
+fn registry_elicitation_audit_log_starts_empty() {
+    let registry = McpClientRegistry::new(BTreeMap::new());
+    assert!(registry.elicitation_audit_log().is_empty());
 }

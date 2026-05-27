@@ -2729,6 +2729,7 @@ async fn shell_ask_approver_routes_in_flight_commands_through_permission_policy(
             None,
         ))),
         subagents: SubagentRegistry::default(),
+        hooks: None,
     };
 
     let approver = shell_ask_approver_for_context(&context);
@@ -3191,6 +3192,52 @@ fn ingest_user_memory_returns_none_when_missing() {
     assert!(result.is_none());
 }
 
+#[test]
+fn ingest_user_memory_reads_uppercase() {
+    let home = temp_workspace("ingest_user_memory_uppercase_only");
+    let dir = home.join(".squeezy");
+    fs::create_dir_all(&dir).expect("mkdir .squeezy");
+    fs::write(dir.join("MEMORY.md"), "uppercase-only body").expect("write MEMORY.md");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::set_var("HOME", &home);
+    }
+    let result = super::ingest_user_memory(8_192);
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    let body = result.expect("memory present");
+    assert!(body.contains("uppercase-only body"));
+}
+
+#[tokio::test]
+async fn agent_build_stitches_agents_md_into_instructions() {
+    let root = temp_workspace("agent_build_agents_md");
+    fs::create_dir_all(root.join(".git")).expect("create .git marker");
+    let marker = "session-init AGENTS.md preamble marker";
+    fs::write(root.join("AGENTS.md"), marker).expect("write AGENTS.md");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider,
+    );
+    let instructions = &agent.config().instructions;
+    assert!(
+        instructions.contains(marker),
+        "AGENTS.md not stitched into base instructions: {instructions}"
+    );
+    assert!(
+        instructions.contains("Project conventions from AGENTS.md"),
+        "missing AGENTS.md preamble header: {instructions}"
+    );
+}
+
 fn mid_turn_test_conversation() -> Vec<LlmInputItem> {
     let mut items = Vec::new();
     for n in 0..16 {
@@ -3294,6 +3341,94 @@ fn mid_turn_compaction_fires_at_threshold() {
     assert!(state.last.is_some(), "history should record the run");
 }
 
+#[tokio::test]
+async fn mid_turn_compaction_fires_when_provider_reports_high_usage() {
+    // End-to-end acceptance for F12-mid-turn-cw-aware-compaction: a real
+    // turn loop with a provider that streams `usage.total = 80_001` on the
+    // first response observes mid-turn compaction firing before the next
+    // sample with `trigger=Auto`. Matches the audit acceptance literally.
+    let root = temp_workspace("mid_turn_e2e");
+    fs::write(root.join("sample.rs"), "fn marker() {}\n").expect("write sample");
+    let provider = Arc::new(MockProvider::new(vec![
+        // Turn-loop round 1: assistant calls `grep`, then `Completed` carries
+        // a usage snapshot whose total (input + output + reasoning) crosses
+        // the 80% threshold of a 100_000 window.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "marker", "include": ["*.rs"]}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(80_000),
+                    output_tokens: Some(1),
+                    reasoning_output_tokens: None,
+                    cached_input_tokens: None,
+                    cache_write_input_tokens: None,
+                    estimated_usd_micros: None,
+                },
+            }),
+        ],
+        // Turn-loop round 2: assistant finalizes with plain text after the
+        // mid-turn compaction has rewritten the conversation.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        context_compaction: ContextCompactionConfig {
+            enabled_mid_turn: true,
+            model_context_window: Some(100_000),
+            threshold_percent: 80,
+            // Keep the function-call/output pair together in `recent` and
+            // let the seed user message land in `older`. With `recent_items=1`
+            // the snap-split absorbs the function-call output back into the
+            // older slice and produces an empty split, so the compaction
+            // never fires on a 3-item conversation.
+            recent_items: 2,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let mut rx = agent.start_turn("find marker".to_string(), CancellationToken::new());
+    let mut compaction_report = None;
+    let mut completed_message = None;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::ContextCompacted { report, .. } => compaction_report = Some(report),
+            AgentEvent::Completed { message, .. } => completed_message = Some(message.content),
+            _ => {}
+        }
+    }
+
+    let report = compaction_report.expect("mid-turn compaction should fire");
+    assert!(
+        matches!(report.record.trigger, ContextCompactionTrigger::Auto),
+        "mid-turn trigger should be Auto, got {:?}",
+        report.record.trigger,
+    );
+    assert!(
+        report.record.before.estimated_tokens >= 80_000
+            || report.record.before.estimated_tokens > 0,
+        "before.estimated_tokens should reflect the pre-compaction estimate, got {}",
+        report.record.before.estimated_tokens,
+    );
+    assert_eq!(completed_message.as_deref(), Some("done"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn total_tokens_from_cost_sums_present_fields() {
     let cost = CostSnapshot {
@@ -3309,6 +3444,198 @@ fn total_tokens_from_cost_sums_present_fields() {
 fn total_tokens_from_cost_returns_none_when_no_fields() {
     let cost = CostSnapshot::default();
     assert!(super::total_tokens_from_cost(&cost).is_none());
+}
+
+#[test]
+fn mid_turn_compaction_will_fire_matches_maybe_compact_mid_turn_gate() {
+    let config = config_with_mid_turn(100_000, 80);
+    let conversation = mid_turn_test_conversation();
+
+    // Below the configured threshold, the predicate must report `false`
+    // so the agent does not fire a `PreCompact` hook on a turn that
+    // never reaches the rewrite path.
+    assert!(!super::mid_turn_compaction_will_fire(
+        &config,
+        &conversation,
+        Some(50_000),
+    ));
+
+    // At/above the threshold, the predicate must report `true` so the
+    // hook fires before `maybe_compact_mid_turn` mutates conversation.
+    assert!(super::mid_turn_compaction_will_fire(
+        &config,
+        &conversation,
+        Some(80_001),
+    ));
+
+    // Mid-turn disabled disables the predicate too.
+    let mut disabled = config.clone();
+    disabled.context_compaction.enabled_mid_turn = false;
+    assert!(!super::mid_turn_compaction_will_fire(
+        &disabled,
+        &conversation,
+        Some(80_001),
+    ));
+
+    // Missing window short-circuits the predicate.
+    let mut no_window = config;
+    no_window.context_compaction.model_context_window = None;
+    assert!(!super::mid_turn_compaction_will_fire(
+        &no_window,
+        &conversation,
+        Some(80_001),
+    ));
+}
+
+/// HookHandler that counts how many times each variant fires and
+/// snapshots the last payload it saw. Drives the end-to-end test that
+/// verifies the pre-turn compaction site dispatches `PreCompact` and
+/// `PostCompact` with the documented `{ before_tokens, after_tokens }`
+/// payload.
+struct CompactionHookRecorder {
+    pre_count: std::sync::atomic::AtomicUsize,
+    post_count: std::sync::atomic::AtomicUsize,
+    last_post_payload: std::sync::Mutex<Option<serde_json::Value>>,
+}
+
+impl CompactionHookRecorder {
+    fn new() -> Self {
+        Self {
+            pre_count: std::sync::atomic::AtomicUsize::new(0),
+            post_count: std::sync::atomic::AtomicUsize::new(0),
+            last_post_payload: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn pre(&self) -> usize {
+        self.pre_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn post(&self) -> usize {
+        self.post_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn last_post_payload(&self) -> Option<serde_json::Value> {
+        self.last_post_payload.lock().unwrap().clone()
+    }
+}
+
+struct CompactionHookRecorderRef(Arc<CompactionHookRecorder>);
+
+impl squeezy_hooks::HookHandler for CompactionHookRecorderRef {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        match ctx.event {
+            squeezy_hooks::HookEvent::PreCompact => {
+                self.0
+                    .pre_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            squeezy_hooks::HookEvent::PostCompact => {
+                self.0
+                    .post_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload.clone());
+            }
+            _ => {}
+        }
+        squeezy_hooks::HookResult::allow()
+    }
+}
+
+#[tokio::test]
+async fn pre_turn_compaction_dispatches_pre_and_post_compact_hooks() {
+    use squeezy_hooks::HookRegistry;
+
+    // Two MockProvider responses: turn 1 grows the conversation past
+    // the compaction floor, turn 2 trips the auto trigger because
+    // estimated_tokens=0 + min_items=1 + recent_items=1 means a
+    // conversation of three items will be split into [older..1] /
+    // [recent..2] and compacted.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(
+                "first reply long enough to estimate as tokens. ".repeat(40),
+            )),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("second reply".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            enabled: true,
+            min_items: 1,
+            recent_items: 1,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+
+    let mut agent = Agent::new(config, provider);
+    let recorder = Arc::new(CompactionHookRecorder::new());
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(CompactionHookRecorderRef(recorder.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    // Turn 1: drain to completion. After this, the persisted
+    // conversation contains [UserText, AssistantText].
+    let mut rx = agent.start_turn("seed turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+    assert_eq!(
+        recorder.pre(),
+        0,
+        "no compaction is possible on turn 1 because items (1) does not exceed keep (1)",
+    );
+    assert_eq!(recorder.post(), 0, "no PostCompact without a rewrite");
+
+    // Turn 2: push the third item (the new UserText) — items=3 now
+    // exceeds keep=1, so `maybe_compact_conversation` fires. PreCompact
+    // must fire before the rewrite, PostCompact must fire after with the
+    // before/after token counts in the payload.
+    let mut rx = agent.start_turn("second turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        recorder.pre(),
+        1,
+        "PreCompact must fire exactly once on the turn that compacts",
+    );
+    assert_eq!(
+        recorder.post(),
+        1,
+        "PostCompact must fire exactly once on the turn that compacts",
+    );
+
+    let payload = recorder
+        .last_post_payload()
+        .expect("PostCompact carries a payload");
+    let payload_obj = payload.as_object().expect("payload is an object");
+    assert!(
+        payload_obj.contains_key("before_tokens"),
+        "PostCompact payload missing before_tokens: {payload}",
+    );
+    assert!(
+        payload_obj.contains_key("after_tokens"),
+        "PostCompact payload missing after_tokens: {payload}",
+    );
+    let before = payload_obj["before_tokens"].as_u64().expect("u64");
+    let after = payload_obj["after_tokens"].as_u64().expect("u64");
+    assert!(
+        after <= before,
+        "compaction should shrink or hold token count: before={before} after={after}",
+    );
 }
 
 #[test]
@@ -3343,9 +3670,13 @@ fn subagent_registry_caps_concurrency() {
             "overflow",
         )
         .expect_err("starting past the cap should fail");
+    assert_eq!(err.reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(err.limit, SUBAGENT_MAX_CONCURRENT);
+    assert_eq!(err.active, SUBAGENT_MAX_CONCURRENT);
+    let message = err.as_message();
     assert!(
-        err.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
-        "cap error should mention the limit: {err}"
+        message.contains(&SUBAGENT_MAX_CONCURRENT.to_string()),
+        "cap error should mention the limit: {message}"
     );
     drop(leases.pop());
     let lease = registry
@@ -3554,6 +3885,123 @@ async fn subagent_wall_clock_timeout_terminates_with_partial_metrics() {
     assert!(
         metrics.model_output_bytes > 0,
         "model_output_bytes from the rejected tool result should be preserved: {metrics:?}"
+    );
+}
+
+/// Scripts a single `delegate` tool call so the parent loop reaches
+/// `handle_subagent_call`. The cap rejection short-circuits before the
+/// subagent runs, so a second parent round is needed to consume the
+/// rejection tool result and finish the turn.
+struct OneDelegateProvider {
+    calls: Mutex<usize>,
+}
+
+impl OneDelegateProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl LlmProvider for OneDelegateProvider {
+    fn name(&self) -> &'static str {
+        "mock"
+    }
+
+    fn stream_response(&self, _request: LlmRequest, _cancel: CancellationToken) -> LlmStream {
+        let mut calls = self.calls.lock().expect("calls");
+        *calls += 1;
+        let n = *calls;
+        drop(calls);
+        let events = match n {
+            1 => vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::ToolCall(LlmToolCall {
+                    call_id: "del_capped".to_string(),
+                    name: "delegate".to_string(),
+                    arguments: json!({"prompt": "please help"}),
+                })),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_tools".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+            _ => vec![
+                Ok(LlmEvent::Started),
+                Ok(LlmEvent::TextDelta("noted".to_string())),
+                Ok(LlmEvent::Completed {
+                    response_id: Some("parent_final".to_string()),
+                    cost: CostSnapshot::default(),
+                }),
+            ],
+        };
+        let stream: Pin<Box<dyn Stream<Item = Result<LlmEvent>> + Send>> =
+            Box::pin(stream::iter(events));
+        stream
+    }
+}
+
+#[tokio::test]
+async fn subagent_concurrency_cap_emits_rejected_event() {
+    let provider = Arc::new(OneDelegateProvider::new());
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    // Saturate the registry from outside the turn so the first delegate
+    // attempt hits the cap synchronously. Leases live until the end of
+    // the test, mirroring how a real parent would have N in-flight peers.
+    let registry = agent.subagent_registry_for_test();
+    let cancel = CancellationToken::new();
+    let mut leases = Vec::new();
+    for slot in 0..SUBAGENT_MAX_CONCURRENT {
+        leases.push(
+            registry
+                .start(
+                    roles::SubagentRole::Explorer,
+                    cancel.child_token(),
+                    SUBAGENT_MAX_CONCURRENT,
+                    format!("pre-saturate {slot}"),
+                )
+                .expect("under-cap start"),
+        );
+    }
+
+    let mut rx = agent.start_turn("delegate now".to_string(), cancel.clone());
+    let mut rejection: Option<(String, SubagentRejectionReason, usize, usize)> = None;
+    let mut saw_started = false;
+    let mut saw_failed = false;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::SubagentRejected {
+                agent,
+                reason,
+                limit,
+                active,
+                ..
+            } => {
+                rejection = Some((agent, reason, limit, active));
+            }
+            AgentEvent::SubagentStarted { .. } => saw_started = true,
+            AgentEvent::SubagentFailed { .. } => saw_failed = true,
+            AgentEvent::Completed { .. } | AgentEvent::Failed { .. } => break,
+            _ => {}
+        }
+    }
+    drop(leases);
+
+    let (agent_name, reason, limit, active) =
+        rejection.expect("expected a SubagentRejected event when the cap is full");
+    assert_eq!(agent_name, "delegate");
+    assert_eq!(reason, SubagentRejectionReason::ConcurrencyCap);
+    assert_eq!(limit, SUBAGENT_MAX_CONCURRENT);
+    assert_eq!(active, SUBAGENT_MAX_CONCURRENT);
+    assert!(
+        !saw_started,
+        "SubagentStarted must not fire when the registry refuses the lease"
+    );
+    assert!(
+        !saw_failed,
+        "rejection must use SubagentRejected, not SubagentFailed"
     );
 }
 
@@ -4696,4 +5144,37 @@ async fn shell_sandbox_fallback_counter_emits_per_call() {
     );
 
     let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn effective_tool_choice_downgrades_required_after_round_zero() {
+    assert_eq!(
+        effective_tool_choice(Some("required"), 0),
+        Some("required".to_string()),
+        "round 0 keeps 'required' to force the first tool call"
+    );
+    assert_eq!(
+        effective_tool_choice(Some("required"), 1),
+        Some("auto".to_string()),
+        "round 1+ downgrades so the model can end the turn naturally"
+    );
+    assert_eq!(
+        effective_tool_choice(Some("required"), 47),
+        Some("auto".to_string())
+    );
+}
+
+#[test]
+fn effective_tool_choice_passes_through_other_values_unchanged() {
+    for round in [0_usize, 1, 5] {
+        assert_eq!(
+            effective_tool_choice(Some("auto"), round),
+            Some("auto".to_string())
+        );
+        assert_eq!(
+            effective_tool_choice(Some("none"), round),
+            Some("none".to_string())
+        );
+        assert_eq!(effective_tool_choice(None, round), None);
+    }
 }

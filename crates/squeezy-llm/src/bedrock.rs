@@ -9,10 +9,10 @@ use aws_sdk_bedrockruntime::{
     error::SdkError,
     primitives::event_stream::EventReceiver,
     types::{
-        ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, Message,
-        ReasoningContentBlock, ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock,
-        Tool, ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
-        ToolSpecification, ToolUseBlock,
+        CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
+        ConversationRole, Message, ReasoningContentBlock, ReasoningContentBlockDelta,
+        ReasoningTextBlock, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+        ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
     },
 };
 use aws_smithy_types::{Blob, Document, Number};
@@ -91,14 +91,17 @@ impl LlmProvider for BedrockProvider {
             };
             let client = client_result?;
             let model = request.model.to_string();
+            let prompt_caching = request.cache_key.is_some()
+                && crate::capabilities_for("bedrock", &model)
+                    .is_some_and(|caps| caps.prompt_caching);
             let mut builder = client.converse_stream().model_id(&model);
-            for block in system_blocks(&request.instructions) {
+            for block in system_blocks(&request.instructions, prompt_caching)? {
                 builder = builder.system(block);
             }
-            for message in conversation_messages(&request.input)? {
+            for message in conversation_messages(&request.input, prompt_caching)? {
                 builder = builder.messages(message);
             }
-            if let Some(config) = tool_configuration(&request.tools)? {
+            if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
                 builder = builder.tool_config(config);
             }
             if let Some(effort) = request.reasoning_effort
@@ -354,15 +357,33 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-pub(crate) fn system_blocks(instructions: &str) -> Vec<SystemContentBlock> {
-    if instructions.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![SystemContentBlock::Text(instructions.to_string())]
-    }
+fn cache_point_block() -> Result<CachePointBlock> {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .map_err(|err| {
+            SqueezyError::ProviderRequest(format!("failed to build Bedrock cachePoint: {err}"))
+        })
 }
 
-pub(crate) fn conversation_messages(input: &[LlmInputItem]) -> Result<Vec<Message>> {
+pub(crate) fn system_blocks(
+    instructions: &str,
+    prompt_caching: bool,
+) -> Result<Vec<SystemContentBlock>> {
+    if instructions.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut blocks = vec![SystemContentBlock::Text(instructions.to_string())];
+    if prompt_caching {
+        blocks.push(SystemContentBlock::CachePoint(cache_point_block()?));
+    }
+    Ok(blocks)
+}
+
+pub(crate) fn conversation_messages(
+    input: &[LlmInputItem],
+    prompt_caching: bool,
+) -> Result<Vec<Message>> {
     let mut messages: Vec<Message> = Vec::new();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
     for item in input {
@@ -450,7 +471,33 @@ pub(crate) fn conversation_messages(input: &[LlmInputItem]) -> Result<Vec<Messag
             LlmInputItem::Reasoning(_) => {}
         }
     }
+    if prompt_caching {
+        append_cache_point_to_last_user(&mut messages)?;
+    }
     Ok(messages)
+}
+
+fn append_cache_point_to_last_user(messages: &mut [Message]) -> Result<()> {
+    let Some(index) = messages
+        .iter()
+        .rposition(|message| *message.role() == ConversationRole::User)
+    else {
+        return Ok(());
+    };
+    let target = &messages[index];
+    let mut content = target.content().to_vec();
+    content.push(ContentBlock::CachePoint(cache_point_block()?));
+    let rebuilt = Message::builder()
+        .role(ConversationRole::User)
+        .set_content(Some(content))
+        .build()
+        .map_err(|err| {
+            SqueezyError::ProviderRequest(format!(
+                "failed to attach Bedrock cachePoint to user message: {err}"
+            ))
+        })?;
+    messages[index] = rebuilt;
+    Ok(())
 }
 
 fn push_message(
@@ -484,11 +531,14 @@ fn push_message(
     Ok(())
 }
 
-pub(crate) fn tool_configuration(specs: &[Arc<LlmToolSpec>]) -> Result<Option<ToolConfiguration>> {
+pub(crate) fn tool_configuration(
+    specs: &[Arc<LlmToolSpec>],
+    prompt_caching: bool,
+) -> Result<Option<ToolConfiguration>> {
     if specs.is_empty() {
         return Ok(None);
     }
-    let mut tools = Vec::with_capacity(specs.len());
+    let mut tools = Vec::with_capacity(specs.len() + usize::from(prompt_caching));
     for spec in specs {
         let schema = ToolInputSchema::Json(json_to_document(&spec.parameters));
         let tool_spec = ToolSpecification::builder()
@@ -500,6 +550,9 @@ pub(crate) fn tool_configuration(specs: &[Arc<LlmToolSpec>]) -> Result<Option<To
                 SqueezyError::ProviderRequest(format!("failed to build Bedrock tool spec: {err}"))
             })?;
         tools.push(Tool::ToolSpec(tool_spec));
+    }
+    if prompt_caching {
+        tools.push(Tool::CachePoint(cache_point_block()?));
     }
     let config = ToolConfiguration::builder()
         .set_tools(Some(tools))

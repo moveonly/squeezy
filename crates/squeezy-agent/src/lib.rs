@@ -83,6 +83,7 @@ use exploration_compiler::{ExplorationTurnState, compile_exploration_plan};
 use permission_persist::persist_permission_rule;
 use roles::{RoleModelPolicy, SubagentRole, role_config};
 
+pub use ai_reviewer::{ReviewerAuditEntry, ReviewerAuditVerdict};
 pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
@@ -930,6 +931,43 @@ impl Drop for SubagentLease {
     }
 }
 
+/// Typed reason the registry refused a `start()` call. Carries the
+/// `limit`/`active` counts so callers can render a "5 of 4 already
+/// running" warning rather than a flat string, and `as_message` is the
+/// canonical user-visible rendering used in tool results and session
+/// receipts so offline replayers see a single stable phrasing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubagentStartError {
+    reason: SubagentRejectionReason,
+    limit: usize,
+    active: usize,
+}
+
+impl SubagentStartError {
+    fn as_message(&self) -> String {
+        match self.reason {
+            SubagentRejectionReason::ConcurrencyCap => format!(
+                "subagent concurrency limit reached ({}; {} already running)",
+                self.limit, self.active
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentRejectionReason {
+    ConcurrencyCap,
+}
+
+impl SubagentRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConcurrencyCap => "concurrency_cap",
+        }
+    }
+}
+
 impl SubagentRegistry {
     fn start(
         &self,
@@ -937,17 +975,19 @@ impl SubagentRegistry {
         cancel: CancellationToken,
         max_concurrent: usize,
         status: impl Into<String>,
-    ) -> Result<SubagentLease, String> {
+    ) -> Result<SubagentLease, SubagentStartError> {
         let mut state = self.state.lock().unwrap_or_else(|err| err.into_inner());
         let active = state
             .values()
             .filter(|metadata| !metadata.cancel.is_cancelled())
             .count();
-        if active >= max_concurrent.max(1) {
-            return Err(format!(
-                "subagent concurrency limit reached ({})",
-                max_concurrent.max(1)
-            ));
+        let limit = max_concurrent.max(1);
+        if active >= limit {
+            return Err(SubagentStartError {
+                reason: SubagentRejectionReason::ConcurrencyCap,
+                limit,
+                active,
+            });
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         state.insert(
@@ -1392,13 +1432,13 @@ impl Agent {
                 "user_memory_ingested",
                 None,
                 Some(format!(
-                    "{} bytes ingested from ~/.squeezy/memory.md",
+                    "{} bytes ingested from ~/.squeezy/MEMORY.md",
                     user_memory.len()
                 )),
                 json!({ "bytes": user_memory.len() }),
             );
             config.instructions = format!(
-                "{}\n\nUser-level memory (~/.squeezy/memory.md):\n{}",
+                "{}\n\nUser-level memory (~/.squeezy/MEMORY.md):\n{}",
                 config.instructions, user_memory
             );
         }
@@ -1449,6 +1489,14 @@ impl Agent {
         &self.config
     }
 
+    /// Test-only handle to the subagent registry so callers can
+    /// pre-saturate it and exercise the cap-rejection path without
+    /// having to script `SUBAGENT_MAX_CONCURRENT` real subagents.
+    #[cfg(test)]
+    pub(crate) fn subagent_registry_for_test(&self) -> SubagentRegistry {
+        self.subagents.clone()
+    }
+
     /// Clone the current effective config — used by the config screen to
     /// initialize its editing buffer.
     pub fn config_snapshot(&self) -> AppConfig {
@@ -1495,11 +1543,13 @@ impl Agent {
     }
 
     /// Install a hook registry. Handlers registered here observe
-    /// `HookEvent::PreTurn` before each turn's LLM request and are
-    /// reserved (variant-only) for the other event kinds. Passing
-    /// `None` clears any previously-installed registry. Wrapped in
-    /// `Arc` so cloned `TurnRuntime`s share the same handler set
-    /// without paying for re-registration on every turn.
+    /// `HookEvent::PreTurn` before each turn's LLM request and
+    /// `HookEvent::{PreCompact, PostCompact}` around each compaction
+    /// pass (pre- and mid-turn). Remaining variants are reserved
+    /// (variant-only) for follow-up wiring. Passing `None` clears any
+    /// previously-installed registry. Wrapped in `Arc` so cloned
+    /// `TurnRuntime`s share the same handler set without paying for
+    /// re-registration on every turn.
     pub fn set_hooks(&mut self, hooks: Option<Arc<HookRegistry>>) {
         self.hooks = hooks;
     }
@@ -1518,6 +1568,13 @@ impl Agent {
         self.session_rules
             .read()
             .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn reviewer_audit_snapshot(&self) -> Vec<ReviewerAuditEntry> {
+        self.ai_reviewer_state
+            .lock()
+            .map(|guard| guard.recent_decisions())
             .unwrap_or_default()
     }
 
@@ -1764,6 +1821,9 @@ impl Agent {
                 plan_edit_allowed,
             )),
             store,
+            tool_choice: self.config.tool_choice.clone(),
+            output_schema: None,
+            parallel_tool_calls: None,
         }
     }
 
@@ -1853,6 +1913,59 @@ impl Agent {
             Self::resume(self.config.clone(), self.provider.clone(), session_id)?;
         *self = agent;
         Ok(transcript)
+    }
+
+    /// Branch the active session into a sibling session that inherits the
+    /// current transcript-so-far. The parent session is left resumable on
+    /// disk (status flipped to `Completed`) so the user can rewind to it via
+    /// `/resume`. The fork copies the live conversation state into a fresh
+    /// session log; subsequent turns append only to the new session.
+    ///
+    /// Returns the new session id, or an error if no active session log is
+    /// attached (e.g. when session logging was disabled at startup).
+    pub async fn fork_current(&mut self) -> squeezy_core::Result<String> {
+        let Some(parent) = self.session_log.clone() else {
+            return Err(SqueezyError::Agent("no active session to fork".to_string()));
+        };
+        let parent_session_id = parent.session_id().to_string();
+        let state = self.conversation_state.lock().await.clone();
+        let resume_state = state.to_resume_state();
+        // Finalise the parent with the latest resume snapshot so `/resume
+        // <parent>` later picks up exactly where the fork branched, and so
+        // retention treats it as a normal closed session rather than an
+        // orphaned running one.
+        parent.write_resume_state(&resume_state)?;
+        parent.finish(
+            SessionStatus::Completed,
+            state.cost.clone(),
+            state.metrics.clone(),
+            state.redactions,
+        )?;
+        // Seed the new session with the inherited cost/metrics so accounting
+        // reflects work the user has already paid for; the conversation copy
+        // lives in resume_state.json.
+        let store = SessionStore::open(&self.config);
+        let metadata = SessionMetadata {
+            cost: state.cost,
+            metrics: state.metrics,
+            redactions: state.redactions,
+            token_calibration: state.token_calibration,
+            ..SessionMetadata::new(&self.config, self.provider.name())
+        };
+        let child = store.start_session(metadata)?;
+        let new_session_id = child.session_id().to_string();
+        child.write_resume_state(&resume_state)?;
+        // Record fork lineage so replay / bug-report tooling can attribute
+        // the child to its parent. Use the free-form append: the typed
+        // SessionEventKind enum has no `Forked` variant.
+        let _ = child.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!("forked from {parent_session_id}")),
+            json!({ "parent_session_id": parent_session_id }),
+        ));
+        self.session_log = Some(child);
+        Ok(new_session_id)
     }
 
     pub async fn finish_session(&self, status: SessionStatus) {
@@ -2442,6 +2555,7 @@ impl Agent {
                             ai_reviewer_state: ai_reviewer_state.clone(),
                             loaded_tool_schemas: loaded_tool_schemas.clone(),
                             subagents: subagents.clone(),
+                            hooks: hooks.clone(),
                         },
                     )
                     .await;
@@ -2464,6 +2578,7 @@ impl Agent {
                             ai_reviewer_state: ai_reviewer_state.clone(),
                             session_mode: session_mode.clone(),
                             subagents: subagents.clone(),
+                            hooks: hooks.clone(),
                         },
                     )
                     .await;
@@ -2691,6 +2806,7 @@ struct LocalToolTurnDeps {
     ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     subagents: SubagentRegistry,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 async fn resolve_help_turn(task_title: &str, deps: &HelpResolutionDeps) -> HelpTurnOutcome {
@@ -2758,6 +2874,7 @@ struct HelpResolutionDeps {
     ai_reviewer_state: Arc<StdMutex<ai_reviewer::AiReviewerState>>,
     session_mode: Arc<AtomicU8>,
     subagents: SubagentRegistry,
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> DocHelpResolution {
@@ -2802,6 +2919,7 @@ async fn run_doc_help_subagent(task_title: &str, deps: &HelpResolutionDeps) -> D
         loaded_tool_schemas: Arc::new(Mutex::new(Vec::new())),
         exploration_state: Arc::new(Mutex::new(ExplorationTurnState::from_plan(None))),
         subagents: deps.subagents.clone(),
+        hooks: deps.hooks.clone(),
     };
     let execution = run_subagent(&parent, SubagentKind::DocHelp, request).await;
 
@@ -3033,6 +3151,7 @@ async fn complete_local_tool_turn(
         ai_reviewer_state,
         loaded_tool_schemas,
         subagents,
+        hooks,
     } = deps;
     let user_item = LlmInputItem::UserText(task_title.clone());
     let user_transcript = TranscriptItem::user(task_title.clone());
@@ -3089,6 +3208,7 @@ async fn complete_local_tool_turn(
             loaded_tool_schemas,
             exploration_state,
             subagents,
+            hooks,
         },
         &mut broker,
     )
@@ -3255,6 +3375,11 @@ fn local_shell_command_call(input: &str) -> Option<ToolCall> {
             "output_byte_cap": LOCAL_SHELL_OUTPUT_BYTE_CAP,
             "output_mode": "raw",
             "direct_user_shell": true,
+            // Paired with the call_id prefix so a downstream caller (mock
+            // provider, replay tape, future MCP shim) that mints
+            // `local-shell-…` ids cannot silently bypass the sandbox by
+            // toggling `direct_user_shell` alone.
+            "direct_user_shell_nonce": squeezy_tools::direct_user_shell_nonce(),
         }),
     })
 }
@@ -3379,6 +3504,24 @@ fn request_reasoning_effort(
         .map(|_| effort)
 }
 
+/// Resolve the `tool_choice` to send on a given round of a turn.
+///
+/// `"required"` is configured to fix tool-shy models (Qwen via
+/// OpenRouter, smaller MoEs) that emit a chatty preamble + finish
+/// without calling any tool — but applying it on *every* round would
+/// trap the model in an infinite call-tool-then-be-forced-to-call-tool
+/// loop where it can never naturally end the turn with a text answer.
+/// Downgrade to `"auto"` after round 0 so the model can finish once
+/// it has the data it needs. Other configured values (`"auto"`,
+/// `"none"`) pass through unchanged on every round; `None` keeps the
+/// field absent.
+fn effective_tool_choice(configured: Option<&str>, round: usize) -> Option<String> {
+    match configured {
+        Some("required") if round > 0 => Some("auto".to_string()),
+        other => other.map(str::to_string),
+    }
+}
+
 /// Appends a "Pinned context" block to the per-turn instructions.
 ///
 /// Pins are user-curated durable facts. They must be visible to the
@@ -3458,19 +3601,21 @@ fn ingest_agents_md(cwd: &std::path::Path, max_bytes: usize) -> Option<String> {
     }
 }
 
-/// Read `~/.squeezy/memory.md` and return its contents truncated to
-/// `max_bytes`. Returns `None` when ingestion is disabled, `HOME` is unset,
-/// or the file is absent / unreadable. Errors are silent on purpose: this is
-/// a best-effort enrichment, never load-bearing.
+/// Read `~/.squeezy/MEMORY.md` (preferred) or `~/.squeezy/memory.md` and
+/// return its contents truncated to `max_bytes`. Returns `None` when
+/// ingestion is disabled, `HOME` is unset, or neither file is present /
+/// readable. Errors are silent on purpose: this is a best-effort enrichment,
+/// never load-bearing. Uppercase first mirrors the project's `AGENTS.md`
+/// casing so users converging on the canonical name see it picked up.
 fn ingest_user_memory(max_bytes: usize) -> Option<String> {
     if max_bytes == 0 {
         return None;
     }
     let home = env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home)
-        .join(".squeezy")
-        .join("memory.md");
-    let body = fs::read_to_string(&path).ok()?;
+    let dir = std::path::PathBuf::from(home).join(".squeezy");
+    let body = fs::read_to_string(dir.join("MEMORY.md"))
+        .or_else(|_| fs::read_to_string(dir.join("memory.md")))
+        .ok()?;
     if body.is_empty() {
         return None;
     }
@@ -3571,6 +3716,85 @@ impl TurnRuntime {
         }
     }
 
+    /// Fan out a `HookEvent::PreCompact` to every registered handler
+    /// when a hook registry is installed. `before_tokens` is the
+    /// pre-compaction estimate so handlers can decide whether to log,
+    /// veto (advisory today; not yet enforced), or react. The hook is
+    /// skipped entirely when no registry is configured so the no-hooks
+    /// path stays allocation-free.
+    fn dispatch_pre_compact(&self, before_tokens: u64) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({
+            "turn_index": self.turn_id.to_string(),
+            "before_tokens": before_tokens,
+        });
+        let results = registry.dispatch(HookEvent::PreCompact, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PreCompact handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PreCompact handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+    }
+
+    /// Fan out a `HookEvent::PostCompact` carrying the before/after
+    /// token counts so handlers can observe how much the rewrite
+    /// shrank the conversation. Mirrors `dispatch_pre_compact` in
+    /// every other respect.
+    fn dispatch_post_compact(&self, before_tokens: u64, after_tokens: u64) {
+        let Some(registry) = self.hooks.as_ref() else {
+            return;
+        };
+        if registry.is_empty() {
+            return;
+        }
+        let payload = json!({
+            "turn_index": self.turn_id.to_string(),
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+        });
+        let results = registry.dispatch(HookEvent::PostCompact, payload);
+        for (idx, result) in results.iter().enumerate() {
+            if let Some(mutate) = result.mutate.as_ref() {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    %mutate,
+                    "PostCompact handler proposed a mutation (not yet applied)"
+                );
+            }
+            if !result.allow {
+                tracing::debug!(
+                    target: "squeezy::hooks",
+                    turn_id = %self.turn_id,
+                    handler_index = idx,
+                    message = result.message.as_deref().unwrap_or(""),
+                    "PostCompact handler returned allow=false (not yet enforced)"
+                );
+            }
+        }
+    }
+
     async fn run(mut self, input: String) -> squeezy_core::Result<()> {
         let task_title = input.clone();
         let activation = self.tools.activate_skills_for_input(&input)?;
@@ -3631,6 +3855,21 @@ impl TurnRuntime {
             redact_llm_input_items(prior_state.conversation.clone(), &self.redactor);
         conversation.push(user_item.clone());
         let mut context_compaction = prior_state.context_compaction.clone();
+        // PreCompact hook fires only when the auto trigger's
+        // thresholds are crossed so handlers don't see a hook on every
+        // turn — only when compaction will actually run. PostCompact
+        // mirrors the report's before/after counts so observers can
+        // measure the rewrite. The no-hook path stays allocation-free.
+        let pre_compaction_estimate = estimate_context(&conversation);
+        let keep = self.config.context_compaction.recent_items.max(1);
+        let compaction_likely = self.config.context_compaction.enabled
+            && pre_compaction_estimate.items >= self.config.context_compaction.min_items
+            && pre_compaction_estimate.items > keep
+            && pre_compaction_estimate.estimated_tokens
+                >= self.config.context_compaction.estimated_tokens;
+        if compaction_likely {
+            self.dispatch_pre_compact(pre_compaction_estimate.estimated_tokens);
+        }
         if let Some(report) = maybe_compact_conversation(
             &mut conversation,
             &mut context_compaction,
@@ -3639,6 +3878,10 @@ impl TurnRuntime {
             &self.config,
             ContextCompactionTrigger::Auto,
         ) {
+            self.dispatch_post_compact(
+                report.record.before.estimated_tokens,
+                report.record.after.estimated_tokens,
+            );
             self.log_event(
                 "context_compacted",
                 Some(self.turn_id),
@@ -3802,6 +4045,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        hooks: self.hooks.clone(),
                     },
                     &mut broker,
                 )
@@ -3879,7 +4123,7 @@ impl TurnRuntime {
         // currently observational only — see `dispatch_pre_turn` for
         // the rationale.
         self.dispatch_pre_turn();
-        for _round in 0..MAX_TOOL_ROUNDS {
+        for round in 0..MAX_TOOL_ROUNDS {
             if self.cancel.is_cancelled() {
                 self.finish_cancelled_turn(
                     &task_title,
@@ -3952,6 +4196,9 @@ impl TurnRuntime {
                     plan_edit_allowed,
                 )),
                 store: self.config.store_responses,
+                tool_choice: effective_tool_choice(self.config.tool_choice.as_deref(), round),
+                output_schema: None,
+                parallel_tool_calls: None,
             };
             let request_model = Arc::clone(&request.model);
             let request_input_bytes = llm_request_input_bytes(&request);
@@ -3963,6 +4210,7 @@ impl TurnRuntime {
             let mut completed = false;
             let mut response_id = None;
             let mut completed_cost = CostSnapshot::default();
+            let mut round_text_started = false;
 
             while let Some(event) =
                 next_llm_stream_event(&mut stream, &self.cancel, self.config.stream_idle_timeout)
@@ -3997,6 +4245,37 @@ impl TurnRuntime {
                         if chunk.text.is_empty() {
                             continue;
                         }
+                        // Each tool-call round runs the model again and its text deltas
+                        // flow into the same `assistant_message` buffer. Without a break,
+                        // the prior round's text (often a short "I'm about to do X."
+                        // preamble with no trailing newline) glues onto this round's
+                        // first chunk in both the live TUI buffer and the final stored
+                        // message. Inject a paragraph break before the first text chunk
+                        // of any round after the first.
+                        if !round_text_started && round > 0 && !assistant_message.is_empty() {
+                            let separator = if assistant_message.ends_with("\n\n") {
+                                ""
+                            } else if assistant_message.ends_with('\n') {
+                                "\n"
+                            } else {
+                                "\n\n"
+                            };
+                            if !separator.is_empty() {
+                                assistant_message.push_str(separator);
+                                if self
+                                    .tx
+                                    .send(AgentEvent::AssistantDelta {
+                                        turn_id: self.turn_id,
+                                        delta: separator.to_string(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        round_text_started = true;
                         self.record_replay_model_text_delta(&chunk.text);
                         assistant_message.push_str(&chunk.text);
                         if self
@@ -4255,6 +4534,7 @@ impl TurnRuntime {
                         loaded_tool_schemas: self.loaded_tool_schemas.clone(),
                         exploration_state: exploration_state.clone(),
                         subagents: self.subagents.clone(),
+                        hooks: self.hooks.clone(),
                     },
                     &mut broker,
                 )
@@ -4323,16 +4603,36 @@ impl TurnRuntime {
             // compaction generation, which forces previous_response_id
             // off the next request to keep the provider state consistent
             // with the new history.
+            //
+            // The PreCompact / PostCompact hook fan-out mirrors the
+            // pre-turn path: PreCompact fires only when the mid-turn
+            // gate will trip; PostCompact carries the report's
+            // before/after counts when the rewrite landed.
+            let mid_turn_observed_tokens = total_tokens_from_cost(&completed_cost);
+            let mid_turn_compaction_likely = mid_turn_compaction_will_fire(
+                &self.config,
+                &conversation,
+                mid_turn_observed_tokens,
+            );
+            if mid_turn_compaction_likely {
+                let pre_estimate = mid_turn_observed_tokens
+                    .unwrap_or_else(|| estimate_context(&conversation).estimated_tokens);
+                self.dispatch_pre_compact(pre_estimate);
+            }
             let mid_turn_report = maybe_compact_mid_turn(
                 &mut conversation,
                 &mut context_compaction,
                 &active_attachments,
                 self.store.as_deref(),
                 &self.config,
-                total_tokens_from_cost(&completed_cost),
+                mid_turn_observed_tokens,
             );
             let mid_turn_compacted = mid_turn_report.is_some();
             if let Some(report) = mid_turn_report {
+                self.dispatch_post_compact(
+                    report.record.before.estimated_tokens,
+                    report.record.after.estimated_tokens,
+                );
                 self.log_event(
                     "context_compacted",
                     Some(self.turn_id),
@@ -4848,6 +5148,11 @@ struct ToolExecutionContext<'a> {
     all_tool_specs: &'a [AdvertisedTool],
     loaded_tool_schemas: Arc<Mutex<Vec<String>>>,
     exploration_state: Arc<Mutex<ExplorationTurnState>>,
+    /// Hook registry shared with the parent `Agent` / `TurnRuntime`.
+    /// `None` when no hooks are installed — `run_one_tool` checks this
+    /// before building a `HookContext` so the no-hooks path costs zero
+    /// allocations.
+    hooks: Option<Arc<HookRegistry>>,
 }
 
 impl ToolExecutionContext<'_> {
@@ -4902,6 +5207,9 @@ fn install_mcp_elicitation_handler<'a>(
         })
     });
     context.tools.set_mcp_elicitation_handler(Some(handler));
+    context
+        .tools
+        .set_mcp_elicitation_policy(context.config.permissions.mcp);
     McpElicitationHandlerScope {
         tools: context.tools,
     }
@@ -4922,6 +5230,7 @@ struct PermissionDecisionContext {
     session_mode: Arc<AtomicU8>,
     session_log: Option<SessionHandle>,
     conversation_state: Option<Arc<Mutex<ConversationState>>>,
+    telemetry: TelemetryClient,
 }
 
 impl PermissionDecisionContext {
@@ -4940,6 +5249,7 @@ impl PermissionDecisionContext {
             session_mode: context.session_mode.clone(),
             session_log: context.session_log.clone(),
             conversation_state: context.conversation_state.clone(),
+            telemetry: context.telemetry.clone(),
         }
     }
 
@@ -5217,17 +5527,50 @@ struct SubagentExecution {
     structured_output: Option<Value>,
 }
 
+/// Bumps the global `subagent_calls` counter and the per-kind bucket so
+/// the two stay aligned. The four audited buckets (delegate/explore/
+/// plan/review) feed `/cost`-style telemetry; kinds outside that set
+/// (e.g. `doc_help`) are intentionally not bucketed so the rollup matches
+/// the operator-facing taxonomy.
+fn record_subagent_call(metrics: &mut TurnMetrics, kind: SubagentKind) {
+    metrics.subagent_calls += 1;
+    if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
+        bucket.calls += 1;
+    }
+}
+
+/// Pairs the global `subagent_failures` bump with the per-kind bucket
+/// so the totals match every early-return path in `handle_subagent_call`.
+fn record_subagent_failure(metrics: &mut TurnMetrics, kind: SubagentKind) {
+    metrics.subagent_failures += 1;
+    if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
+        bucket.failures += 1;
+    }
+}
+
+fn record_subagent_kind_execution(
+    metrics: &mut TurnMetrics,
+    kind: SubagentKind,
+    execution: &TurnMetrics,
+) {
+    if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
+        bucket.tool_calls += execution.tool_calls;
+        bucket.bytes_read += execution.bytes_read;
+        merge_cost(&mut bucket.provider, &execution.provider);
+    }
+}
+
 async fn handle_subagent_call(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
     kind: SubagentKind,
     broker: &mut CostBroker,
 ) -> ToolResult {
-    broker.metrics.subagent_calls += 1;
+    record_subagent_call(&mut broker.metrics, kind);
     if !context.config.subagents.enabled
         || (kind == SubagentKind::Explore && !context.config.subagents.explore_enabled)
     {
-        broker.metrics.subagent_failures += 1;
+        record_subagent_failure(&mut broker.metrics, kind);
         return subagent_control_result(
             call,
             kind,
@@ -5246,7 +5589,7 @@ async fn handle_subagent_call(
     let request = match parse_subagent_request(call, kind) {
         Ok(request) => request,
         Err(error) => {
-            broker.metrics.subagent_failures += 1;
+            record_subagent_failure(&mut broker.metrics, kind);
             return subagent_control_result(
                 call,
                 kind,
@@ -5263,6 +5606,66 @@ async fn handle_subagent_call(
             );
         }
     };
+    let child_cancel = context.cancel.child_token();
+    let lease = match context.subagents.start(
+        kind.role().unwrap_or(SubagentRole::Explorer),
+        child_cancel.clone(),
+        SUBAGENT_MAX_CONCURRENT,
+        format!("{} starting", kind.as_str()),
+    ) {
+        Ok(lease) => lease,
+        Err(start_error) => {
+            broker.metrics.subagent_failures += 1;
+            let error_message = start_error.as_message();
+            log_session_event(
+                context.session_log.as_ref(),
+                &context.redactor,
+                "subagent_rejected",
+                Some(context.turn_id),
+                Some(format!("{}: {}", kind.as_str(), error_message)),
+                json!({
+                    "agent": kind.as_str(),
+                    "reason": start_error.reason.as_str(),
+                    "limit": start_error.limit,
+                    "active": start_error.active,
+                }),
+            );
+            // Bump the `failure_seen{kind=tool}` counter so dashboards
+            // notice fleets that routinely hit the concurrency cap. The
+            // structured `subagent_rejected` session-log event above
+            // carries the specific `reason` for offline analysis; the
+            // shared telemetry counter just signals "subagents are
+            // being refused".
+            context
+                .telemetry
+                .spawn(TelemetryEvent::failure_seen(ErrorKind::Tool));
+            let _ = context
+                .tx
+                .send(AgentEvent::SubagentRejected {
+                    turn_id: context.turn_id,
+                    agent: kind.as_str().to_string(),
+                    reason: start_error.reason,
+                    limit: start_error.limit,
+                    active: start_error.active,
+                })
+                .await;
+            return subagent_control_result(
+                call,
+                kind,
+                SubagentExecution {
+                    status: ToolStatus::Denied,
+                    summary: String::new(),
+                    status_label: "capped",
+                    error: Some(error_message),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
+                    structured_output: None,
+                },
+            );
+        }
+    };
+
     let started_prompt = context
         .redactor
         .redact(&compact_text(&request.prompt, 240))
@@ -5288,40 +5691,14 @@ async fn handle_subagent_call(
         })
         .await;
 
-    let child_cancel = context.cancel.child_token();
-    let lease = match context.subagents.start(
-        kind.role().unwrap_or(SubagentRole::Explorer),
-        child_cancel.clone(),
-        SUBAGENT_MAX_CONCURRENT,
-        format!("{} starting", kind.as_str()),
-    ) {
-        Ok(lease) => lease,
-        Err(error) => {
-            broker.metrics.subagent_failures += 1;
-            return subagent_control_result(
-                call,
-                kind,
-                SubagentExecution {
-                    status: ToolStatus::Denied,
-                    summary: String::new(),
-                    status_label: "capped",
-                    error: Some(error),
-                    metrics: TurnMetrics::default(),
-                    supporting_receipts: Vec::new(),
-                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                    structured_output: None,
-                },
-            );
-        }
-    };
-
     let execution = run_subagent(context, kind, request).await;
     drop(lease);
     broker
         .metrics
         .merge_subagent_tool_metrics(&execution.metrics);
+    record_subagent_kind_execution(&mut broker.metrics, kind, &execution.metrics);
     if execution.status != ToolStatus::Success {
-        broker.metrics.subagent_failures += 1;
+        record_subagent_failure(&mut broker.metrics, kind);
     }
     let event_payload = json!({
         "agent": kind.as_str(),
@@ -5683,7 +6060,7 @@ async fn run_subagent_rounds(
     supporting_receipts: &mut Vec<Value>,
     model: String,
 ) -> SubagentExecution {
-    for _round in 0..config.subagents.max_model_rounds {
+    for round in 0..config.subagents.max_model_rounds {
         let request_model: Arc<str> = Arc::from(config.model.as_str());
         let llm_request = LlmRequest {
             model: Arc::clone(&request_model),
@@ -5696,6 +6073,9 @@ async fn run_subagent_rounds(
             cache_key: None,
             tools: Arc::from(tool_specs),
             store: false,
+            tool_choice: effective_tool_choice(config.tool_choice.as_deref(), round),
+            output_schema: None,
+            parallel_tool_calls: None,
         };
         let mut stream = parent
             .provider
@@ -5835,6 +6215,7 @@ async fn run_subagent_rounds(
                         loaded_tool_schemas: local_loaded_schemas.clone(),
                         exploration_state: local_exploration.clone(),
                         subagents: parent.subagents.clone(),
+                        hooks: parent.hooks.clone(),
                     },
                     broker,
                 )
@@ -6833,6 +7214,106 @@ async fn flush_parallel_batch(
     }
 }
 
+/// Fan out a `HookEvent::PreToolUse` to every registered handler when
+/// a hook registry is installed. Mutation and deny replies are logged
+/// but not yet applied — mirrors the observational contract of
+/// [`TurnRuntime::dispatch_pre_turn`] so a follow-up commit can wire
+/// enforcement without changing the call site. Returns immediately
+/// when no registry is configured so the no-hooks path costs zero
+/// allocations.
+fn dispatch_pre_tool_use(context: &ToolExecutionContext<'_>, call: &ToolCall) {
+    let Some(registry) = context.hooks.as_ref() else {
+        return;
+    };
+    if registry.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "turn_id": context.turn_id.to_string(),
+        "tool_name": call.name,
+        "call_id": call.call_id,
+    });
+    let results = registry.dispatch(HookEvent::PreToolUse, payload);
+    for (idx, result) in results.iter().enumerate() {
+        if let Some(mutate) = result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                %mutate,
+                "PreToolUse handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %call.name,
+                call_id = %call.call_id,
+                handler_index = idx,
+                message = result.message.as_deref().unwrap_or(""),
+                "PreToolUse handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+/// Fan out a `HookEvent::PostToolUse` to every registered handler after
+/// a tool result is available. Same observational contract as
+/// [`dispatch_pre_tool_use`]; the payload adds `status` so audit
+/// handlers can record per-tool outcomes.
+fn dispatch_post_tool_use(context: &ToolExecutionContext<'_>, result: &ToolResult) {
+    let Some(registry) = context.hooks.as_ref() else {
+        return;
+    };
+    if registry.is_empty() {
+        return;
+    }
+    let payload = json!({
+        "turn_id": context.turn_id.to_string(),
+        "tool_name": result.tool_name,
+        "call_id": result.call_id,
+        "status": tool_status_str(result.status),
+    });
+    let results = registry.dispatch(HookEvent::PostToolUse, payload);
+    for (idx, hook_result) in results.iter().enumerate() {
+        if let Some(mutate) = hook_result.mutate.as_ref() {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %result.tool_name,
+                call_id = %result.call_id,
+                handler_index = idx,
+                %mutate,
+                "PostToolUse handler proposed a mutation (not yet applied)"
+            );
+        }
+        if !hook_result.allow {
+            tracing::debug!(
+                target: "squeezy::hooks",
+                turn_id = %context.turn_id,
+                tool_name = %result.tool_name,
+                call_id = %result.call_id,
+                handler_index = idx,
+                message = hook_result.message.as_deref().unwrap_or(""),
+                "PostToolUse handler returned allow=false (not yet enforced)"
+            );
+        }
+    }
+}
+
+fn tool_status_str(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "success",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
+}
+
 async fn run_one_tool(
     context: ToolExecutionContext<'_>,
     tool_sequence: u64,
@@ -6910,6 +7391,12 @@ async fn run_one_tool(
     let call_for_telemetry = call.clone();
     let progress_call_id = call_for_telemetry.call_id.clone();
     let progress_tool_name = call_for_telemetry.name.clone();
+    // Fire the PreToolUse hook once per executed tool call, immediately
+    // before the tool registry takes ownership of the call. Mutation /
+    // deny replies are currently observational — see
+    // `dispatch_pre_tool_use` for the contract that will tighten when
+    // enforcement lands.
+    dispatch_pre_tool_use(&context, &call_for_telemetry);
     let exec_future = context.tools.execute_for_group_with_options(
         call,
         tracked_job
@@ -6940,6 +7427,10 @@ async fn run_one_tool(
             }
         }
     };
+    // Fire the PostToolUse hook as soon as the tool result is in hand,
+    // before downstream job/telemetry bookkeeping. Same observational
+    // contract as `dispatch_pre_tool_use`.
+    dispatch_post_tool_use(&context, &result);
     record_exploration_tool_result(&context, &result).await;
     if let Some((job_id, _)) = tracked_job {
         let status = job_status_for_tool_status(result.status);
@@ -7261,6 +7752,7 @@ async fn permission_decision_for_request(
             state: context.ai_reviewer_state.clone(),
             turn_id: context.turn_id,
             cancel: context.cancel.child_token(),
+            telemetry: context.telemetry.clone(),
         })
         .await
         {
@@ -7548,13 +8040,26 @@ fn shell_ask_approver_for_context(context: &ToolExecutionContext<'_>) -> ShellAs
 }
 
 fn is_direct_user_shell_call(call: &ToolCall) -> bool {
-    call.name == "shell"
-        && call.call_id.starts_with("local-shell-")
-        && call
-            .arguments
-            .get("direct_user_shell")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
+    if call.name != "shell" || !call.call_id.starts_with("local-shell-") {
+        return false;
+    }
+    let direct = call
+        .arguments
+        .get("direct_user_shell")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !direct {
+        return false;
+    }
+    // Mirror the registry's nonce check: the auto-approve path that skips
+    // the permission prompt requires the same per-process nonce that the
+    // TUI's `!cmd` minter ships. Without it, a downstream caller that
+    // synthesises a `local-shell-…` call_id falls back to the normal
+    // permission flow.
+    call.arguments
+        .get("direct_user_shell_nonce")
+        .and_then(Value::as_str)
+        == Some(squeezy_tools::direct_user_shell_nonce())
 }
 
 /// Lock-free read of the active session mode. Defaults to `Build` if the
@@ -7728,6 +8233,9 @@ Working target: {:?}",
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
     let mut stream = provider.stream_response(llm_request, cancel.clone());
     let mut text = String::new();
@@ -9073,6 +9581,34 @@ fn total_tokens_from_cost(cost: &CostSnapshot) -> Option<u64> {
     if saw_any { Some(total) } else { None }
 }
 
+/// Mirror of the gate inside `maybe_compact_mid_turn`. Returns `true`
+/// when the configured threshold is crossed so the agent can fire a
+/// `HookEvent::PreCompact` before the rewrite call. Kept here (rather
+/// than in `context_compaction.rs`) because the hook fan-out is an
+/// agent-loop concern; the function reads only public config and
+/// estimator state so it stays a thin predicate.
+fn mid_turn_compaction_will_fire(
+    config: &AppConfig,
+    conversation: &[LlmInputItem],
+    last_total_tokens: Option<u64>,
+) -> bool {
+    if !config.context_compaction.enabled_mid_turn {
+        return false;
+    }
+    let Some(window) = config.context_compaction.model_context_window else {
+        return false;
+    };
+    if window == 0 {
+        return false;
+    }
+    let threshold = window
+        .saturating_mul(config.context_compaction.threshold_percent.min(100) as u64)
+        .saturating_div(100);
+    let observed =
+        last_total_tokens.unwrap_or_else(|| estimate_context(conversation).estimated_tokens);
+    observed >= threshold
+}
+
 pub(crate) fn compact_text(text: &str, max_chars: usize) -> String {
     truncate_chars(&collapse_status_text(text), max_chars)
 }
@@ -9290,6 +9826,20 @@ pub enum AgentEvent {
         agent: String,
         error: String,
         metrics: TurnMetrics,
+    },
+    /// The subagent registry refused to admit a new subagent. Fires before
+    /// any provider work, in lieu of `SubagentStarted`/`SubagentFailed`,
+    /// so the TUI can surface a "concurrency cap reached, 4 already
+    /// running" warning instead of a bare failure with no diagnostic
+    /// hook. `active` is the count observed at rejection time (always
+    /// `>= limit` for `ConcurrencyCap`); both are surfaced so future
+    /// rejection reasons (e.g. depth cap) can reuse the same shape.
+    SubagentRejected {
+        turn_id: TurnId,
+        agent: String,
+        reason: SubagentRejectionReason,
+        limit: usize,
+        active: usize,
     },
     AiReviewerTripped {
         turn_id: TurnId,

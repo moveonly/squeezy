@@ -21,18 +21,18 @@ use crate::{TuiApp, context_window_pct};
 const STATUS_LINE_SEPARATOR: &str = " · ";
 
 /// Default status-bar items when the user hasn't configured `[tui].status_line`.
-/// Mirrors codex's pre-checked picker entries plus `provider-and-model`
-/// (squeezy ships configurable providers, so the provider:model pair carries
-/// more information than the model alone).
+/// Tight, high-signal set: who you're talking to, where you are, what
+/// you're shipping, and what you've spent. Drops the model+reasoning
+/// duplicate of `provider-and-model`, the project-name duplicate of
+/// `current-dir`, and `context-used` (only meaningful well into a long
+/// session — users opt in via `/statusline` when they need it).
 pub(crate) const DEFAULT_STATUS_LINE_ITEMS: &[StatusLineItem] = &[
     StatusLineItem::ProviderAndModel,
-    StatusLineItem::ModelWithReasoning,
     StatusLineItem::CurrentDir,
-    StatusLineItem::ProjectName,
     StatusLineItem::GitBranch,
     StatusLineItem::PullRequestNumber,
     StatusLineItem::BranchChanges,
-    StatusLineItem::ContextUsed,
+    StatusLineItem::Cost,
 ];
 
 /// One configurable status-bar item.
@@ -80,7 +80,6 @@ pub(crate) enum StatusLineItem {
     Redactions,
     Receipts,
     // Thread
-    ThreadTitle,
     Pins,
     CompactGeneration,
     // Progress
@@ -124,7 +123,6 @@ impl StatusLineItem {
             Self::Mcp => "mcp",
             Self::Redactions => "redactions",
             Self::Receipts => "receipts",
-            Self::ThreadTitle => "thread-title",
             Self::Pins => "pins",
             Self::CompactGeneration => "compact-generation",
             Self::TaskProgress => "task-progress",
@@ -167,7 +165,6 @@ impl StatusLineItem {
             Self::Mcp => "Connected MCP servers summary",
             Self::Redactions => "Redactions applied this session",
             Self::Receipts => "Receipt stub + negative receipt cache hits",
-            Self::ThreadTitle => "Current thread title",
             Self::Pins => "Number of pinned context items",
             Self::CompactGeneration => "Compaction generation counter",
             Self::TaskProgress => "Latest mid-turn task progress",
@@ -185,7 +182,6 @@ impl StatusLineItem {
         Self::GitBranch,
         Self::PullRequestNumber,
         Self::BranchChanges,
-        Self::ThreadTitle,
         Self::RunState,
         Self::Mode,
         Self::ContextRemaining,
@@ -286,9 +282,7 @@ impl StatusLineAccent {
             | StatusLineItem::Mcp
             | StatusLineItem::Redactions
             | StatusLineItem::Receipts => Self::Mode,
-            StatusLineItem::ThreadTitle
-            | StatusLineItem::Pins
-            | StatusLineItem::CompactGeneration => Self::Thread,
+            StatusLineItem::Pins | StatusLineItem::CompactGeneration => Self::Thread,
             StatusLineItem::TaskProgress => Self::Progress,
         }
     }
@@ -381,7 +375,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             })
         }
         StatusLineItem::RunState => Some(format_run_state(app)),
-        StatusLineItem::Mode => Some(format!("{:?}", app.mode)),
+        StatusLineItem::Mode => Some(crate::title_case_mode(app.mode).to_string()),
         StatusLineItem::ContextRemaining => context_pct(app).map(|pct| {
             let remaining = 100u64.saturating_sub(pct.min(100));
             format!("ctx {remaining}% left")
@@ -437,7 +431,6 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             "receipts {}",
             app.metrics.receipt_stub_hits + app.metrics.negative_receipt_hits
         )),
-        StatusLineItem::ThreadTitle => app.session_id.clone(),
         StatusLineItem::Pins => Some(format!("pins {}", app.context_compaction.pinned.len())),
         StatusLineItem::CompactGeneration => {
             Some(format!("compact {}", app.context_compaction.generation))

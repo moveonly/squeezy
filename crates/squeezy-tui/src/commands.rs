@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::time::SystemTime;
 
-use squeezy_agent::{Agent, SessionAccountingSnapshot};
+use squeezy_agent::{Agent, ReviewerAuditEntry, SessionAccountingSnapshot};
 use squeezy_llm::RequestTokenEstimate;
 use squeezy_store::parse_bug_report_section;
 
@@ -264,4 +265,43 @@ pub(crate) fn format_cost(cost: &squeezy_core::CostSnapshot) -> String {
     cost.estimated_usd_micros.map_or("-".to_string(), |value| {
         format!("${:.6}", value as f64 / 1_000_000.0)
     })
+}
+
+pub(crate) fn format_reviewer_command(entries: &[ReviewerAuditEntry], now: SystemTime) -> String {
+    if entries.is_empty() {
+        return "AI reviewer audit\nno auto-decisions recorded this session.".to_string();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(entries.len() + 1);
+    lines.push(format!(
+        "AI reviewer audit\n{} recent decision(s); newest first.",
+        entries.len()
+    ));
+    for entry in entries.iter().rev() {
+        let age = format_audit_age(now, entry.recorded_at);
+        lines.push(format!(
+            "{age} turn={turn} {verdict} {capability} {tool} target={target}\n    reason: {reason}",
+            age = age,
+            turn = entry.turn_id,
+            verdict = entry.verdict.as_str(),
+            capability = entry.capability.as_str(),
+            tool = entry.tool_name,
+            target = entry.target,
+            reason = entry.reason,
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_audit_age(now: SystemTime, when: SystemTime) -> String {
+    let elapsed = now.duration_since(when).unwrap_or_default();
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs:>3}s")
+    } else if secs < 3600 {
+        format!("{:>3}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{:>3}h", secs / 3600)
+    } else {
+        format!("{:>3}d", secs / 86_400)
+    }
 }

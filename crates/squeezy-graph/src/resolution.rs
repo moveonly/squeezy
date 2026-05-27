@@ -12,7 +12,12 @@ impl SemanticGraph {
                     .unwrap_or(true)
         });
         self.rebuild_resolution_indexes();
-        self.js_ts_resolver = JsTsResolver::from_files(&self.files);
+        // Incrementally update the JS/TS module-resolution table: configs
+        // (tsconfig.json / package.json) whose `ContentHash` matches the
+        // cached entry are reused, only changed/added/removed configs are
+        // re-parsed. In a TS monorepo a single file save no longer pays
+        // the cost of rebuilding the entire workspace path map.
+        self.js_ts_resolver.update_from_files(&self.files);
         self.add_csharp_type_edges();
 
         // Move-out, mutate, move-back. Each builder iterates a single
@@ -90,10 +95,9 @@ impl SemanticGraph {
                 _ => (
                     None,
                     Confidence::CandidateSet,
-                    candidates
-                        .iter()
+                    self.rank_import_candidates(&candidates, &import.file_id)
+                        .into_iter()
                         .take(MAX_EDGE_CANDIDATES)
-                        .cloned()
                         .collect(),
                 ),
             };
@@ -213,7 +217,10 @@ impl SemanticGraph {
                     None,
                     Confidence::CandidateSet,
                     "macro candidate set",
-                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                    self.rank_call_candidates(&candidates, caller_id, call)
+                        .into_iter()
+                        .take(MAX_EDGE_CANDIDATES)
+                        .collect(),
                 ),
             };
         }
@@ -343,7 +350,10 @@ impl SemanticGraph {
                     None,
                     Confidence::CandidateSet,
                     "method candidate set",
-                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                    self.rank_call_candidates(&candidates, caller_id, call)
+                        .into_iter()
+                        .take(MAX_EDGE_CANDIDATES)
+                        .collect(),
                 ),
             };
         }
@@ -355,7 +365,10 @@ impl SemanticGraph {
                     None,
                     Confidence::CandidateSet,
                     "receiver candidate set",
-                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                    self.rank_call_candidates(&candidates, caller_id, call)
+                        .into_iter()
+                        .take(MAX_EDGE_CANDIDATES)
+                        .collect(),
                 ),
             };
         }
@@ -383,7 +396,10 @@ impl SemanticGraph {
                     None,
                     Confidence::CandidateSet,
                     "unresolved imported symbol candidate set",
-                    candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                    self.rank_call_candidates(&candidates, caller_id, call)
+                        .into_iter()
+                        .take(MAX_EDGE_CANDIDATES)
+                        .collect(),
                 ),
             };
         }
@@ -404,7 +420,10 @@ impl SemanticGraph {
                 None,
                 Confidence::CandidateSet,
                 "candidate set",
-                candidates.into_iter().take(MAX_EDGE_CANDIDATES).collect(),
+                self.rank_call_candidates(&candidates, caller_id, call)
+                    .into_iter()
+                    .take(MAX_EDGE_CANDIDATES)
+                    .collect(),
             ),
         }
     }
@@ -909,5 +928,123 @@ impl SemanticGraph {
                 })
                 .map(|symbol| symbol.id.clone())
         }))
+    }
+
+    /// Order a `CandidateSet` for a call so the most-likely callee comes first.
+    ///
+    /// `symbols_by_name_or_scan` returns matches in `HashMap` iteration order,
+    /// so without an explicit rank the candidate list (and the truncated
+    /// `MAX_EDGE_CANDIDATES` prefix) is non-deterministic across runs. The
+    /// rank is a small set of cheap signals that hold across every supported
+    /// language:
+    ///
+    /// 1. Same file as the caller — most calls bind locally even under
+    ///    polymorphism.
+    /// 2. Same package/crate/directory as the caller.
+    /// 3. Receiver qualifier matches the candidate's enclosing impl/class
+    ///    header (`obj.do_thing()` with a `Beta` receiver prefers
+    ///    `Beta::do_thing` over `Alpha::do_thing`).
+    ///
+    /// `SymbolId` is the final tiebreaker so the order is fully deterministic.
+    pub(crate) fn rank_call_candidates(
+        &self,
+        candidates: &[SymbolId],
+        caller_id: &SymbolId,
+        call: &ParsedCall,
+    ) -> Vec<SymbolId> {
+        let caller_symbol = self.symbols.get(caller_id);
+        let caller_file = caller_symbol.map(|symbol| symbol.file_id.clone());
+        let caller_package = caller_symbol
+            .and_then(|symbol| self.files.get(&symbol.file_id))
+            .map(|file| package_key(&file.relative_path));
+        let receiver_qualifier = call
+            .receiver
+            .as_deref()
+            .map(last_path_segment)
+            .filter(|name| !name.is_empty());
+
+        let mut ranked: Vec<(i32, SymbolId)> = candidates
+            .iter()
+            .map(|id| {
+                let score = self.score_call_candidate(
+                    id,
+                    caller_file.as_ref(),
+                    caller_package.as_deref(),
+                    receiver_qualifier.as_deref(),
+                );
+                (score, id.clone())
+            })
+            .collect();
+        // Higher score first; SymbolId ascending as the deterministic tiebreaker.
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.0.cmp(&right.1.0)));
+        ranked.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Same idea as [`Self::rank_call_candidates`] but for import edges. Only
+    /// the file/package signals apply — there is no receiver for an import.
+    pub(crate) fn rank_import_candidates(
+        &self,
+        candidates: &[SymbolId],
+        importer_file: &FileId,
+    ) -> Vec<SymbolId> {
+        let importer_package = self
+            .files
+            .get(importer_file)
+            .map(|file| package_key(&file.relative_path));
+
+        let mut ranked: Vec<(i32, SymbolId)> = candidates
+            .iter()
+            .map(|id| {
+                let score = self.score_call_candidate(
+                    id,
+                    Some(importer_file),
+                    importer_package.as_deref(),
+                    None,
+                );
+                (score, id.clone())
+            })
+            .collect();
+        ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.0.cmp(&right.1.0)));
+        ranked.into_iter().map(|(_, id)| id).collect()
+    }
+
+    fn score_call_candidate(
+        &self,
+        candidate_id: &SymbolId,
+        caller_file: Option<&FileId>,
+        caller_package: Option<&str>,
+        receiver_qualifier: Option<&str>,
+    ) -> i32 {
+        let Some(candidate) = self.symbols.get(candidate_id) else {
+            return 0;
+        };
+        let mut score = 0;
+        if let Some(file_id) = caller_file
+            && &candidate.file_id == file_id
+        {
+            score += 8;
+        }
+        if let Some(package) = caller_package
+            && let Some(candidate_file) = self.files.get(&candidate.file_id)
+            && package_key(&candidate_file.relative_path) == package
+        {
+            score += 4;
+        }
+        if let Some(qualifier) = receiver_qualifier
+            && let Some(parent_id) = candidate.parent_id.as_ref()
+            && let Some(parent) = self.symbols.get(parent_id)
+        {
+            // Direct match (e.g. parent class/struct/trait named `Beta`).
+            if parent.name == qualifier {
+                score += 4;
+            } else if parent.kind == SymbolKind::Impl
+                && impl_header_matches_type(&parent.name, qualifier)
+            {
+                // Rust impl headers carry the implementing type in their name
+                // (e.g. `impl Trait for Concrete`).
+                score += 4;
+            }
+        }
+        score
     }
 }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -28,6 +28,9 @@ fn request_body_uses_responses_streaming_shape() {
             .into(),
         ]),
         store: true,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -75,6 +78,9 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -112,6 +118,9 @@ fn request_body_preserves_function_tool_order() {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -134,6 +143,9 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -163,6 +175,9 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             cache_key: None,
             tools: Arc::from(Vec::new()),
             store: false,
+            tool_choice: None,
+            output_schema: None,
+            parallel_tool_calls: None,
         };
 
         let body = OpenAiProvider::request_body(&request, "openai");
@@ -184,6 +199,9 @@ fn request_body_emits_prompt_cache_key_when_set() {
         cache_key: Some("squeezy::session-1".to_string()),
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -203,6 +221,9 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
 
     let body = OpenAiProvider::request_body(&request, "openai");
@@ -387,4 +408,151 @@ fn anthropic_reasoning_is_dropped_when_replaying_to_openai() {
         }],
     };
     assert!(openai_input_item(&LlmInputItem::Reasoning(payload)).is_none());
+}
+
+#[test]
+fn request_body_emits_text_format_when_output_schema_set() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "confidence": {"type": "number"}
+        },
+        "required": ["answer", "confidence"],
+        "additionalProperties": false
+    });
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "respond in JSON".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: Some(squeezy_core::ResponseVerbosity::Concise),
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        parallel_tool_calls: None,
+        output_schema: Some(LlmOutputSchema {
+            name: "answer_with_confidence".to_string(),
+            schema: schema.clone(),
+            strict: true,
+        }),
+        tool_choice: None,
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert_eq!(body["text"]["format"]["name"], "answer_with_confidence");
+    assert_eq!(body["text"]["format"]["strict"], true);
+    assert_eq!(body["text"]["format"]["schema"], schema);
+    // verbosity must coexist with format inside the same `text` object.
+    assert_eq!(body["text"]["verbosity"], "low");
+}
+
+#[test]
+fn request_body_omits_text_format_when_output_schema_unset() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        output_schema: None,
+        parallel_tool_calls: None,
+        tool_choice: None,
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert!(body.get("text").is_none());
+}
+
+#[test]
+fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
+    let schema = json!({
+        "type": "object",
+        "properties": {"ok": {"type": "boolean"}},
+        "required": ["ok"],
+        "additionalProperties": false
+    });
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "json".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        output_schema: Some(LlmOutputSchema {
+            name: "ok_box".to_string(),
+            schema,
+            strict: false,
+        }),
+        parallel_tool_calls: None,
+        tool_choice: None,
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["text"]["format"]["type"], "json_schema");
+    assert_eq!(body["text"]["format"]["strict"], false);
+    assert!(body["text"].get("verbosity").is_none());
+}
+
+#[test]
+fn request_body_emits_parallel_tool_calls_false_when_disabled() {
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        output_schema: None,
+        parallel_tool_calls: Some(false),
+        tool_choice: None,
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["parallel_tool_calls"], false);
+}
+
+#[test]
+fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
+    for value in [None, Some(true)] {
+        let request = LlmRequest {
+            model: "gpt-test".to_string().into(),
+            instructions: "be brief".to_string().into(),
+            input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+            max_output_tokens: None,
+            response_verbosity: None,
+            reasoning_effort: None,
+            previous_response_id: None,
+            cache_key: None,
+            tools: Arc::from(Vec::new()),
+            store: false,
+            output_schema: None,
+            parallel_tool_calls: value,
+            tool_choice: None,
+        };
+
+        let body = OpenAiProvider::request_body(&request, "openai");
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "parallel_tool_calls={:?} should not be emitted (OpenAI defaults to true)",
+            value,
+        );
+    }
 }

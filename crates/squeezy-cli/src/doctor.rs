@@ -2,8 +2,11 @@ use std::{env, fs, path::PathBuf, time::Duration};
 
 use clap::Args;
 use serde_json::json;
-use squeezy_core::{AppConfig, ProviderConfig, Result};
-use squeezy_store::{SessionStore, ensure_repo_profile};
+use squeezy_core::{
+    AppConfig, McpServerConfig, McpTransport, ProviderConfig, ProviderSettings, Result,
+    SettingsFile, default_settings_path,
+};
+use squeezy_store::{SessionStore, SqueezyStore, ensure_repo_profile};
 
 use crate::update::{self, UpdateStatus};
 
@@ -151,6 +154,8 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             detail: provider_check.1,
         });
 
+        checks.push(providers_check(&load_user_settings()));
+
         if args.probe {
             let (status, detail) = probe_provider(&config.provider).await;
             checks.push(Check {
@@ -160,7 +165,9 @@ pub async fn run(args: &DoctorArgs) -> Result<DoctorReport> {
             });
         }
 
+        checks.push(mcp_check(&config.mcp_servers));
         checks.push(session_store_check(config));
+        checks.push(state_store_check(config));
     }
 
     checks.push(sandbox_check());
@@ -242,6 +249,155 @@ fn probe_writable(root: &PathBuf) -> std::io::Result<()> {
     let probe = root.join(".squeezy-doctor-probe");
     fs::write(&probe, b"ok")?;
     fs::remove_file(&probe)
+}
+
+/// Open the redb-backed `state.redb` store and report whether it loads cleanly.
+/// Fail is reserved for hard errors (corrupt file, permission denied); a
+/// successful open after `SqueezyStore` migrated from an older schema is still
+/// reported as `ok` because the store handles that internally.
+fn state_store_check(config: &AppConfig) -> Check {
+    match SqueezyStore::open(&config.workspace_root, config.cache.root.as_deref()) {
+        Ok(store) => {
+            let path = store.path().display().to_string();
+            Check {
+                name: "state_store".to_string(),
+                status: Status::Ok,
+                detail: format!("opened: {path}"),
+            }
+        }
+        Err(error) => Check {
+            name: "state_store".to_string(),
+            status: Status::Fail,
+            detail: format!("{error}"),
+        },
+    }
+}
+
+/// Best-effort load of the user's `settings.toml`. Doctor still works when the
+/// file is absent (returns an empty `SettingsFile`); parse errors collapse to
+/// the same empty value because the existing `config` row already surfaced the
+/// real diagnostic.
+fn load_user_settings() -> SettingsFile {
+    SettingsFile::load_optional(&default_settings_path()).unwrap_or_default()
+}
+
+/// Summarize `[providers.*]` blocks in the user's settings: for each section,
+/// say whether it looks usable (`configured`) or is missing its API key
+/// (`missing api_key`). Providers that don't take a key (`bedrock`, `ollama`)
+/// are flagged `keyless`. Empty `[providers]` is reported as `ok` with a note;
+/// the active provider already gets its own `provider:<name>` row.
+fn providers_check(settings: &SettingsFile) -> Check {
+    let Some(providers) = settings.providers.as_ref().filter(|map| !map.is_empty()) else {
+        return Check {
+            name: "providers".to_string(),
+            status: Status::Ok,
+            detail: "no [providers.*] sections in settings.toml".to_string(),
+        };
+    };
+    let mut entries = Vec::new();
+    let mut missing = 0usize;
+    for (name, settings) in providers {
+        let state = provider_settings_state(name, settings);
+        if state.starts_with("missing") {
+            missing += 1;
+        }
+        entries.push(format!("{name}={state}"));
+    }
+    let status = if missing > 0 {
+        Status::Warn
+    } else {
+        Status::Ok
+    };
+    Check {
+        name: "providers".to_string(),
+        status,
+        detail: entries.join(", "),
+    }
+}
+
+fn provider_settings_state(name: &str, settings: &ProviderSettings) -> &'static str {
+    if matches!(name, "bedrock" | "ollama") {
+        return "keyless";
+    }
+    if settings
+        .api_key
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return "configured";
+    }
+    if let Some(env_name) = settings.api_key_env.as_deref()
+        && env::var(env_name).is_ok_and(|value| !value.trim().is_empty())
+    {
+        return "configured";
+    }
+    "missing api_key"
+}
+
+/// Summarize configured MCP servers without touching the network: count
+/// enabled/disabled servers and verify that each enabled entry has the field
+/// its transport needs (`command` for stdio, `url` for http/sse). Missing
+/// fields downgrade the row to `warn` — the server will fail to launch at
+/// session start but doctor stays runnable in CI without keys.
+fn mcp_check(servers: &std::collections::BTreeMap<String, McpServerConfig>) -> Check {
+    if servers.is_empty() {
+        return Check {
+            name: "mcp".to_string(),
+            status: Status::Ok,
+            detail: "no MCP servers configured".to_string(),
+        };
+    }
+    let mut enabled = 0usize;
+    let mut disabled = 0usize;
+    let mut issues = Vec::new();
+    for (name, server) in servers {
+        if !server.enabled {
+            disabled += 1;
+            continue;
+        }
+        enabled += 1;
+        match server.transport {
+            McpTransport::Stdio => {
+                if server
+                    .command
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    issues.push(format!("{name}: stdio transport without command"));
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                if server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    issues.push(format!(
+                        "{name}: {} transport without url",
+                        server.transport.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    let summary = format!("enabled={enabled} disabled={disabled}");
+    if issues.is_empty() {
+        Check {
+            name: "mcp".to_string(),
+            status: Status::Ok,
+            detail: summary,
+        }
+    } else {
+        Check {
+            name: "mcp".to_string(),
+            status: Status::Warn,
+            detail: format!("{summary}; {}", issues.join(", ")),
+        }
+    }
 }
 
 /// Pull the result of `update::check_for_update()` into a doctor row. Newer

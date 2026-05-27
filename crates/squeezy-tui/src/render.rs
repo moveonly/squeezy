@@ -1,4 +1,5 @@
 pub(crate) mod ansi;
+pub(crate) mod card;
 pub(crate) mod diff;
 pub(crate) mod highlight;
 pub mod markdown;

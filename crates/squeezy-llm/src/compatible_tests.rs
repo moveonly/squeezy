@@ -35,7 +35,51 @@ fn sample_request() -> LlmRequest {
             .into(),
         ]),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     }
+}
+
+#[test]
+fn request_body_omits_tool_choice_when_unset() {
+    // Default behavior: no tool_choice field in the body so the
+    // provider applies its default (typically `auto`).
+    let body = OpenAiCompatibleProvider::request_body(&sample_request());
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice must be absent when LlmRequest.tool_choice is None: {body}"
+    );
+}
+
+#[test]
+fn request_body_emits_tool_choice_required_when_set() {
+    // The fix for tool-shy chat-completions models (Qwen via OpenRouter,
+    // smaller MoEs): when `tool_choice = "required"` is configured under
+    // [model], it must be forwarded to the provider so the model is
+    // forced to emit at least one tool call per turn.
+    let mut request = sample_request();
+    request.tool_choice = Some("required".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["tool_choice"], "required");
+}
+
+#[test]
+fn request_body_omits_tool_choice_when_no_tools_advertised() {
+    // No tools → no `tool_choice` field, even when set, since the field
+    // is meaningless without tools and some providers reject it.
+    let mut request = sample_request();
+    request.tools = Arc::from(Vec::<Arc<LlmToolSpec>>::new());
+    request.tool_choice = Some("required".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert!(
+        body.get("tools").is_none(),
+        "tools field must be omitted when empty"
+    );
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice must be omitted when no tools are advertised"
+    );
 }
 
 #[test]
@@ -98,6 +142,9 @@ fn request_body_serialises_assistant_function_call_history() {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     };
     let body = OpenAiCompatibleProvider::request_body(&request);
     let messages = body["messages"].as_array().expect("messages array");
@@ -169,6 +216,123 @@ fn parse_chat_event_emits_reasoning_delta_for_array_shape() {
             text: "think".to_string(),
             kind: ReasoningKind::Summary,
         }]
+    );
+}
+
+#[test]
+fn reasoning_only_stop_emits_done_and_visible_notice() {
+    // Qwen3/DeepSeek-R1-via-aggregator failure mode: the model emits only
+    // `reasoning_content` deltas and finishes with `stop` — no `content`,
+    // no `tool_calls`. Without the fallback the agent loop builds an empty
+    // assistant message and the user sees the spinner stop with nothing
+    // new in the transcript. The parser must (1) drain the streamed
+    // reasoning into a `ReasoningDone` so it persists, and (2) inject a
+    // visible `TextDelta` so the empty completion is *seen*.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"thinking hard..."}}]}"#,
+        &mut state,
+    )
+    .expect("reasoning delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        &mut state,
+    )
+    .expect("stop");
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::ReasoningDone(_))),
+        "expected ReasoningDone to flush the streamed thinking: {events:?}"
+    );
+    let notice = events
+        .iter()
+        .find_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("synthetic notice TextDelta");
+    assert!(
+        notice.contains("finish_reason=stop"),
+        "notice must call out the reason: {notice}"
+    );
+}
+
+#[test]
+fn finish_stop_with_content_does_not_emit_notice() {
+    // Regression guard: a normal completion that produced a real
+    // assistant message must not get the empty-completion notice tacked
+    // on. `saw_visible_output` latches on the first non-empty content
+    // delta to suppress it.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"content":"hello world"}}]}"#,
+        &mut state,
+    )
+    .expect("content delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        &mut state,
+    )
+    .expect("stop");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::TextDelta(text) if text.contains("[squeezy]"))),
+        "synthetic notice should NOT appear when the model produced content: {events:?}"
+    );
+}
+
+#[test]
+fn finish_length_emits_truncation_notice_and_drains_reasoning() {
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"reasoning_content":"long thought..."}}]}"#,
+        &mut state,
+    )
+    .expect("reasoning delta");
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
+        &mut state,
+    )
+    .expect("length");
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, LlmEvent::ReasoningDone(_)))
+    );
+    let notice = events
+        .iter()
+        .find_map(|e| match e {
+            LlmEvent::TextDelta(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("truncation notice");
+    assert!(notice.contains("max_output_tokens"), "notice: {notice}");
+}
+
+#[test]
+fn drain_tool_calls_skips_incomplete_entries_without_erroring() {
+    // PortKey / OpenRouter sometimes ship a tool-call delta whose
+    // `function.name` chunk goes missing or whose stream cuts mid-call.
+    // The legacy hard-error killed the entire turn. We now skip the
+    // incomplete entry and complete the stream cleanly.
+    let mut state = StreamState::default();
+    parse_chat_event(
+        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]}}]}"#,
+        &mut state,
+    )
+    .expect("partial tool call (no name)");
+    // No name accumulated, but stream proceeds.
+    let events = parse_chat_event(
+        r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        &mut state,
+    )
+    .expect("finish must not error");
+    assert!(
+        !events.iter().any(|e| matches!(e, LlmEvent::ToolCall(_))),
+        "incomplete tool call must be skipped, not emitted: {events:?}"
     );
 }
 

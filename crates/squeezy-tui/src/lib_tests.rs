@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::backend::TestBackend;
 use squeezy_agent::{CostCapStatus, JobKind, JobStatus};
@@ -425,7 +425,7 @@ async fn plan_choice_execute_clean_starts_turn_and_records_compaction_attempt() 
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(msg) if msg.contains("execute-clean") || msg.contains("compacted prior context")
+            TranscriptEntryKind::Log(LogEntry { message: msg, .. }) if msg.contains("execute-clean") || msg.contains("compacted prior context")
         )),
         "expected an execute-clean log line; transcript={:?}",
         app.transcript
@@ -508,7 +508,7 @@ async fn plan_choice_view_keeps_prompt_open_and_logs_path() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains(&plan_id)
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains(&plan_id)
         )),
         "expected a 'plan {plan_id} file:' log entry"
     );
@@ -650,7 +650,7 @@ async fn plan_to_build_switch_queues_plan_handoff_when_plan_file_exists() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains("plan attached for next Build turn")
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("plan attached for next Build turn")
         )),
         "expected handoff log entry; transcript={:?}",
         app.transcript
@@ -779,7 +779,7 @@ async fn take_pending_plan_prefix_drops_handoff_when_file_missing() {
     assert!(
         app.transcript.iter().any(|entry| matches!(
             &entry.kind,
-            TranscriptEntryKind::Log(message) if message.contains("could not read plan file")
+            TranscriptEntryKind::Log(LogEntry { message, .. }) if message.contains("could not read plan file")
         )),
         "expected a recovery log line for the missing plan file; transcript={:?}",
         app.transcript
@@ -821,6 +821,199 @@ async fn slash_config_opens_screen() {
     .await
     .expect("handle key");
     assert!(app.config_screen.is_some(), "config screen should be open");
+}
+
+#[tokio::test]
+async fn slash_statusline_opens_picker() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.status_line_setup.is_some(),
+        "/statusline should open the picker overlay; status={:?}",
+        app.status
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_renders_in_inline_mode() {
+    // Inline is the default terminal mode; the overlay must be visible
+    // there, not just in AlternateScreen.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle key");
+    let rendered = render_inline_to_string(&app, 80, 24);
+    assert!(
+        rendered.contains("Configure Status Line"),
+        "inline render should show the picker; got:\n{rendered}"
+    );
+}
+
+#[test]
+fn status_line_default_layout_renders_users_configured_items() {
+    // Replays the exact list the user has in their ~/.squeezy/settings.toml
+    // and asserts the detail row paints. If this fails, AppConfig loading
+    // or item-parsing is broken; if it passes, the rendered binary should
+    // show the row at startup unmodified.
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.status_line_items = parse_status_line_items(Some(&[
+        "provider-and-model".to_string(),
+        "model-with-reasoning".to_string(),
+        "current-dir".to_string(),
+        "project-name".to_string(),
+        "git-branch".to_string(),
+        "pull-request-number".to_string(),
+        "branch-changes".to_string(),
+        "context-used".to_string(),
+    ]));
+    app.status_line_use_colors = true;
+    assert!(app.status_line_items.as_ref().is_some_and(|v| v.len() == 8));
+    assert_eq!(
+        app.status_line_items.as_ref().unwrap()[0],
+        StatusLineItem::ProviderAndModel
+    );
+    let lines = format_status_lines(&app, 200);
+    assert_eq!(lines.len(), 2, "expect detail+mode row + hints row");
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("scripted:gpt-test"),
+        "row 1 should include provider:model; got: {row1}"
+    );
+}
+
+#[tokio::test]
+async fn statusline_picker_toggle_then_save_reflects_in_status_row() {
+    // Open the picker, navigate to the first item row and toggle it off
+    // with Space, then save. The detail row should reflect the reduced
+    // selection, not the original pre-checked defaults.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    // Force a writable settings path inside the test, since save_status_line
+    // writes via apply_edits and we don't want to touch the real ~/.squeezy.
+    let tmpdir = std::env::temp_dir().join(format!(
+        "squeezy-statusline-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmpdir).expect("mkdir");
+    let settings_path = tmpdir.join("settings.toml");
+    // SAFETY: tests run sequentially per file with --test-threads=1 if needed;
+    // this env var is read at save time only.
+    unsafe {
+        std::env::set_var("SQUEEZY_SETTINGS_PATH", &settings_path);
+    }
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    // Cursor row 0 = "Use theme colors". Down moves to first item (ProviderAndModel by default).
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+    )
+    .await
+    .expect("down");
+    // Space toggles the first item off.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    )
+    .await
+    .expect("space");
+    // Enter saves.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(app.status_line_setup.is_none(), "picker should close");
+    let items = app.status_line_items.as_ref().expect("items saved");
+    assert!(
+        !items.contains(&crate::status::StatusLineItem::ProviderAndModel),
+        "toggled-off item should not be in saved list; got {items:?}"
+    );
+    let lines = format_status_lines(&app, 200);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        !row1.contains("scripted:gpt-test"),
+        "row 1 should no longer show provider-and-model after toggling it off; got: {row1}"
+    );
+    unsafe {
+        std::env::remove_var("SQUEEZY_SETTINGS_PATH");
+    }
+}
+
+#[tokio::test]
+async fn statusline_save_closes_picker_and_paints_detail_row() {
+    // Open the picker, then press Enter to save the pre-checked defaults.
+    // The picker must close and the status row must start showing the
+    // chosen items.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/statusline".to_string());
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("open picker");
+    assert!(app.status_line_setup.is_some(), "picker should be open");
+    // Second Enter inside the picker fires Save.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("save");
+    assert!(
+        app.status_line_setup.is_none(),
+        "picker should close after Save; status={:?}",
+        app.status
+    );
+    assert!(
+        app.status_line_items
+            .as_ref()
+            .is_some_and(|items| !items.is_empty()),
+        "Save should populate status_line_items with the pre-checked defaults; \
+         got {:?}, status={:?}",
+        app.status_line_items,
+        app.status
+    );
+    // The detail row replaces the overview's dir/branch on row 1 and
+    // should include a default item that always renders (provider:model).
+    let lines = format_status_lines(&app, 200);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        row1.contains("scripted:gpt-test"),
+        "row 1 should reflect saved items; got: {row1}"
+    );
 }
 
 #[tokio::test]
@@ -1844,6 +2037,61 @@ fn unknown_slash_command_does_not_start_model_turn() {
     assert!(app.status.contains("unknown command"), "{}", app.status);
 }
 
+#[test]
+fn slash_menu_surfaces_capability_badges_for_world_touching_commands() {
+    // Typing `/diff` should surface a `[git|read]` capability hint so the
+    // user can tell at a glance the command will hit the worktree on disk.
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/diff".to_string());
+    let rendered = render_to_string(&app, 120, 12);
+    assert!(
+        rendered.contains("[git|read]"),
+        "expected /diff badge in slash menu:\n{rendered}"
+    );
+
+    // Switch to a destructive command and confirm its badge appears too.
+    set_input(&mut app, "/session-cleanup".to_string());
+    let rendered = render_to_string(&app, 120, 12);
+    assert!(
+        rendered.contains("[destructive]"),
+        "expected /session-cleanup badge in slash menu:\n{rendered}"
+    );
+}
+
+#[test]
+fn slash_suggestion_line_contents_match_command_capabilities() {
+    // Build the menu lines directly and assert the badge follows the
+    // declared capabilities — covers both presence (`/help` → `net`) and
+    // absence (`/cost` → no badge).
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/help".to_string());
+    let lines = slash_suggestion_lines(&app);
+    let serialised = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect::<Vec<String>>();
+    let help_line = serialised
+        .iter()
+        .find(|line| line.contains("/help"))
+        .expect("rendered /help line");
+    assert!(help_line.contains("[net]"), "{help_line}");
+
+    set_input(&mut app, "/cost".to_string());
+    let lines = slash_suggestion_lines(&app);
+    let serialised = lines
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect::<Vec<String>>();
+    let cost_line = serialised
+        .iter()
+        .find(|line| line.contains("/cost") && !line.contains("/context"))
+        .expect("rendered /cost line");
+    assert!(
+        !cost_line.contains('['),
+        "/cost should not render a capability badge: {cost_line}"
+    );
+}
+
 #[tokio::test]
 async fn slash_cost_reports_empty_session_without_model_turn() {
     let mut agent = test_agent(SessionMode::Build);
@@ -1871,6 +2119,56 @@ async fn slash_cost_reports_empty_session_without_model_turn() {
     assert!(!output.contains("\nio bytes_read="), "{output}");
     assert!(!output.contains("\nredactions="), "{output}");
     assert!(app.jobs.is_empty());
+}
+
+#[test]
+fn format_reviewer_command_lists_recent_decisions_newest_first() {
+    use std::time::{Duration, SystemTime};
+
+    use squeezy_agent::{ReviewerAuditEntry, ReviewerAuditVerdict};
+    use squeezy_core::PermissionCapability;
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    let entries = vec![
+        ReviewerAuditEntry {
+            recorded_at: now - Duration::from_secs(120),
+            turn_id: 3,
+            tool_name: "shell.run".to_string(),
+            capability: PermissionCapability::Shell,
+            target: "command:ls".to_string(),
+            verdict: ReviewerAuditVerdict::Allow,
+            reason: "approved low-risk listing".to_string(),
+        },
+        ReviewerAuditEntry {
+            recorded_at: now - Duration::from_secs(5),
+            turn_id: 4,
+            tool_name: "edit.apply_patch".to_string(),
+            capability: PermissionCapability::Edit,
+            target: "path:secrets.env".to_string(),
+            verdict: ReviewerAuditVerdict::Deny,
+            reason: "writing into protected secrets path".to_string(),
+        },
+    ];
+
+    let output = commands::format_reviewer_command(&entries, now);
+    assert!(output.contains("2 recent decision(s)"), "{output}");
+    // Newest entry should appear before the older one.
+    let deny_idx = output.find("deny edit").expect("deny line present");
+    let allow_idx = output.find("allow shell").expect("allow line present");
+    assert!(deny_idx < allow_idx, "{output}");
+    assert!(output.contains("target=path:secrets.env"), "{output}");
+    assert!(
+        output.contains("reason: writing into protected secrets path"),
+        "{output}"
+    );
+}
+
+#[test]
+fn format_reviewer_command_handles_empty_buffer() {
+    use std::time::SystemTime;
+
+    let output = commands::format_reviewer_command(&[], SystemTime::UNIX_EPOCH);
+    assert!(output.contains("no auto-decisions recorded"), "{output}");
 }
 
 #[test]
@@ -2147,6 +2445,49 @@ async fn slash_help_unsupported_points_to_public_resources() {
 }
 
 #[tokio::test]
+async fn slash_fork_branches_into_sibling_session_with_same_transcript() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Seed the transcript so we can verify the fork inherits it on the
+    // caller side (the agent-side conversation copy is exercised by the
+    // agent's own integration tests).
+    app.push_transcript_item(TranscriptItem::user("explain this stack trace"));
+    app.push_transcript_item(TranscriptItem::assistant("here's the rundown"));
+    let transcript_before = app.transcript.len();
+
+    let parent_id = agent.session_id().expect("parent session id");
+    assert!(handle_slash_command(&mut app, &mut agent, "/fork").await);
+
+    let child_id = agent.session_id().expect("child session id");
+    assert_ne!(child_id, parent_id, "fork must produce a fresh session id");
+    assert!(
+        app.status.starts_with("forked session → "),
+        "status reports the fork outcome: {}",
+        app.status
+    );
+    assert!(
+        app.status.contains(&child_id),
+        "status includes the new session id: {}",
+        app.status
+    );
+    // Visible transcript stays in place — the new session inherits the
+    // existing turns rather than the user losing their context. The fork
+    // pushes a slash-command echo plus the announcement, so the new
+    // length is `before + 2`.
+    assert_eq!(
+        app.transcript.len(),
+        transcript_before + 2,
+        "fork preserves prior entries and adds the slash echo plus the announcement",
+    );
+    let announce = last_message_content(&app).expect("fork announcement");
+    assert!(
+        announce.contains(&child_id) && announce.contains("/resume"),
+        "fork transcript announcement explains the lineage: {announce}",
+    );
+}
+
+#[tokio::test]
 async fn mode_switch_is_refused_during_active_turn() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -2364,7 +2705,7 @@ fn shell_tool_rows_show_command_and_highlight_output() {
         "{output}"
     );
     assert!(
-        output.contains("└ cargo test -p squeezy-tui in .:"),
+        output.contains("│ cargo test -p squeezy-tui in .:"),
         "{output}"
     );
     assert!(
@@ -2404,7 +2745,7 @@ fn read_only_shell_rows_render_codex_style_output_block() {
         "{output}"
     );
     assert!(
-        output.contains("└ inspect workspace --details in /tmp/project:"),
+        output.contains("│ inspect workspace --details in /tmp/project:"),
         "{output}"
     );
     assert!(
@@ -2671,31 +3012,35 @@ fn edit_diff_preview_uses_dedicated_diff_colors() {
     assert!(!rendered.contains("diff --git"), "{rendered}");
     assert!(!rendered.contains("index 123"), "{rendered}");
 
-    let add_span = lines
+    // Patch content is "old" / "new" — short strings that the highlighter
+    // labels as plain identifiers, so the sign + body fall back to the
+    // diff-foreground color. The bg tint, however, is always applied on
+    // +/- rows.
+    let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "+new")
-        .expect("add span");
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign span");
     assert_eq!(
-        add_span.style.fg,
+        add_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_ADD_FG,)
         ))
     );
-    assert_eq!(add_span.style.bg, None);
+    assert_eq!(add_sign.style.bg, Some(render::diff::diff_add_bg()));
 
-    let del_span = lines
+    let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "-old")
-        .expect("delete span");
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign span");
     assert_eq!(
-        del_span.style.fg,
+        del_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_DEL_FG,)
         ))
     );
-    assert_eq!(del_span.style.bg, None);
+    assert_eq!(del_sign.style.bg, Some(render::diff::diff_del_bg()));
 }
 
 #[test]
@@ -2883,25 +3228,28 @@ fn diff_render_colorizes_gutter() {
     };
 
     let lines = render::diff::render_diff_file(&file);
-    let add = lines
+    // The sign character carries the line's foreground colour; gutter,
+    // sign and content are split into separate spans so per-token syntax
+    // highlighting can attach colours to the body.
+    let add_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "+new")
-        .expect("add span");
-    let del = lines
+        .find(|span| span.content.as_ref() == "+")
+        .expect("add sign span");
+    let del_sign = lines
         .iter()
         .flat_map(|line| line.spans.iter())
-        .find(|span| span.content.as_ref() == "-old")
-        .expect("delete span");
+        .find(|span| span.content.as_ref() == "-")
+        .expect("delete sign span");
 
     assert_eq!(
-        add.style.fg,
+        add_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_ADD_FG,)
         ))
     );
     assert_eq!(
-        del.style.fg,
+        del_sign.style.fg,
         Some(render::palette::best_color(
             render::palette::rgb_components(DIFF_DEL_FG,)
         ))
@@ -2915,6 +3263,7 @@ fn diff_render_colorizes_gutter() {
 
 #[test]
 fn highlight_rust_code_block() {
+    let palette = render::highlight::HighlightPalette::current();
     let lines = render::highlight::highlight_code(Some("rust"), "fn foo() { /* comment */ 42 }");
     let spans = lines
         .iter()
@@ -2934,13 +3283,75 @@ fn highlight_rust_code_block() {
         .find(|span| span.content.as_ref() == "42")
         .expect("number span");
 
-    assert_eq!(keyword.style.fg, Some(render::highlight::KEYWORD_COLOR));
-    assert_eq!(comment.style.fg, Some(render::highlight::COMMENT_COLOR));
-    assert_eq!(number.style.fg, Some(render::highlight::NUMBER_COLOR));
+    assert_eq!(keyword.style.fg, Some(palette.keyword));
+    assert_eq!(comment.style.fg, Some(palette.comment));
+    assert_eq!(number.style.fg, Some(palette.number));
+}
+
+#[test]
+fn highlight_yaml_code_block() {
+    // tree-sitter-yaml's highlight names (e.g. property, string.special.symbol)
+    // don't match the trimmed HIGHLIGHT_NAMES set squeezy configures, so this
+    // asserts only the dispatch wiring: yaml lexes without panicking and
+    // produces at least one span per line.
+    let lines = render::highlight::highlight_code(Some("yaml"), "name: squeezy\nport: 8080\n");
+    assert!(!lines.is_empty(), "yaml dispatch produced no lines");
+    for line in &lines {
+        assert!(!line.spans.is_empty(), "yaml line produced no spans");
+    }
+}
+
+#[test]
+fn highlight_bash_code_block() {
+    let lines = render::highlight::highlight_code(
+        Some("bash"),
+        "#!/bin/bash\nif [ -f foo ]; then echo hi; fi\n",
+    );
+    let spans = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .collect::<Vec<_>>();
+    let comment = spans
+        .iter()
+        .find(|span| span.content.as_ref().starts_with("#!"))
+        .expect("bash shebang comment span");
+    let keyword = spans
+        .iter()
+        .find(|span| span.content.as_ref() == "if")
+        .expect("bash keyword span");
+    assert_eq!(
+        comment.style.fg,
+        Some(render::highlight::HighlightPalette::current().comment)
+    );
+    assert_eq!(
+        keyword.style.fg,
+        Some(render::highlight::HighlightPalette::current().keyword)
+    );
+}
+
+#[test]
+fn highlight_toml_code_block() {
+    // tree-sitter-toml's highlight names diverge from the trimmed
+    // HIGHLIGHT_NAMES set; assert only that the dispatch wiring lexes the
+    // input and produces non-empty spans.
+    let lines = render::highlight::highlight_code(Some("toml"), "[package]\nname = \"squeezy\"\n");
+    assert!(!lines.is_empty(), "toml dispatch produced no lines");
+    for line in &lines {
+        assert!(!line.spans.is_empty(), "toml line produced no spans");
+    }
+}
+
+#[test]
+fn highlight_unknown_language_falls_back_to_plain() {
+    let lines = render::highlight::highlight_code(Some("klingon"), "qapla'!");
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].spans.len(), 1);
+    assert_eq!(lines[0].spans[0].style.fg, None);
 }
 
 #[test]
 fn markdown_renders_heading_and_code() {
+    let palette = render::highlight::HighlightPalette::current();
     let lines = render::markdown::render_markdown("# Heading\n\n```rust\nfn foo() {}\n```");
     let heading = lines[0]
         .spans
@@ -2954,10 +3365,7 @@ fn markdown_renders_heading_and_code() {
         .expect("code keyword span");
 
     assert!(heading.style.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(
-        code_keyword.style.fg,
-        Some(render::highlight::KEYWORD_COLOR)
-    );
+    assert_eq!(code_keyword.style.fg, Some(palette.keyword));
 }
 
 #[test]
@@ -4020,7 +4428,7 @@ fn failure_log_renders_as_detail_under_user_turn() {
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains("> hi"), "{output}");
     assert!(
-        output.contains("└ turn failed: provider stream failed"),
+        output.contains("│ turn failed: provider stream failed"),
         "{output}"
     );
     assert!(!output.contains("chars  turn failed"), "{output}");
@@ -4041,10 +4449,7 @@ fn active_tool_surfaces_current_work_in_working_line() {
 
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(
-        output.contains("Exploring definition search for getFoo"),
-        "{output}"
-    );
+    assert!(output.contains("Definition: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
 }
 
@@ -4072,7 +4477,7 @@ async fn queued_tool_event_updates_visible_working_status_without_transcript_row
     let output = render_to_string(&app, 120, 16);
     assert!(output.contains("• Working ("), "{output}");
     assert!(output.contains("esc to interrupt"), "{output}");
-    assert!(output.contains("Exploring grep getFoo"), "{output}");
+    assert!(output.contains("Grep: getFoo"), "{output}");
     assert!(!output.contains("Queued"), "{output}");
     assert!(!output.contains("args="), "{output}");
 }
@@ -4108,8 +4513,81 @@ async fn task_state_tool_does_not_replace_visible_active_work() {
 
     assert_eq!(app.active_tool.as_deref(), Some("shell"));
     let output = render_to_string(&app, 120, 16);
-    assert!(output.contains("Running ls"), "{output}");
+    assert!(output.contains("Shell: ls"), "{output}");
     assert!(!output.contains("update_task_state"), "{output}");
+}
+
+#[test]
+fn working_cell_shows_current_tool() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "cargo test --workspace"}),
+    });
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(output.contains("• Working ("), "{output}");
+    assert!(output.contains("Shell: cargo test --workspace"), "{output}");
+}
+
+#[test]
+fn working_cell_appends_per_tool_elapsed_after_heartbeat() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({"command": "cargo test --workspace"}),
+    });
+    app.note_active_tool_progress("shell", 4_500);
+
+    let output = render_to_string(&app, 140, 16);
+
+    assert!(output.contains("Shell: cargo test --workspace"), "{output}");
+    assert!(output.contains(" · 4s"), "{output}");
+}
+
+#[test]
+fn working_cell_truncates_long_command_args() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "shell".to_string(),
+        arguments: serde_json::json!({
+            "command": format!("echo {}", "x".repeat(200)),
+        }),
+    });
+
+    let output = render_to_string(&app, 200, 16);
+
+    assert!(output.contains("Shell: echo "), "{output}");
+    assert!(output.contains("..."), "{output}");
+    assert!(!output.contains(&"x".repeat(200)), "{output}");
+}
+
+#[test]
+fn working_cell_omits_args_for_unknown_tool() {
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(1);
+    app.turn_rx = Some(rx);
+    app.remember_active_tool_call(ToolCall {
+        call_id: "call-1".to_string(),
+        name: "mcp__server__custom".to_string(),
+        arguments: serde_json::json!({"opaque": "payload"}),
+    });
+
+    let output = render_to_string(&app, 140, 16);
+
+    // Capitalized tool name with no colon when no template-driven args.
+    assert!(output.contains("Mcp__server__custom"), "{output}");
+    assert!(!output.contains("Mcp__server__custom:"), "{output}");
 }
 
 #[test]
@@ -4756,7 +5234,7 @@ async fn successful_edit_turn_pushes_diff_undo_hint() {
     drain_agent_events(&mut app).await;
 
     let hint = app.transcript.iter().find_map(|entry| match &entry.kind {
-        TranscriptEntryKind::Log(message)
+        TranscriptEntryKind::Log(LogEntry { message, .. })
             if message.contains("/diff") && message.contains("/undo") =>
         {
             Some(message.clone())
@@ -4804,7 +5282,7 @@ async fn readonly_turn_does_not_push_undo_hint() {
         .transcript
         .iter()
         .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+            matches!(&entry.kind, TranscriptEntryKind::Log(LogEntry { message, .. })
                 if message.contains("/diff") && message.contains("/undo"))
         })
         .count();
@@ -4904,6 +5382,61 @@ async fn completion_clears_cancelled_prompt() {
     );
 }
 
+#[tokio::test]
+async fn cancel_restores_prompt_into_composer() {
+    let mut app = test_app(SessionMode::Build);
+    // Mirror the Enter handler: prompt stashed, composer cleared, turn live.
+    app.cancelled_prompt = Some("write the README".to_string());
+    app.input.clear();
+    app.input_cursor = 0;
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert_eq!(
+        app.input, "write the README",
+        "cancel must put the typed prompt back in the composer",
+    );
+    assert_eq!(app.input_cursor, app.input.len());
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "auto-restore consumes the stash; got: {:?}",
+        app.cancelled_prompt
+    );
+}
+
+#[tokio::test]
+async fn cancel_does_not_clobber_draft_typed_during_interrupt() {
+    let mut app = test_app(SessionMode::Build);
+    app.cancelled_prompt = Some("original".to_string());
+    // User started typing again before the Cancelled event drained.
+    app.input = "new draft".to_string();
+    app.input_cursor = app.input.len();
+    let (tx, rx) = mpsc::channel(4);
+    app.turn_rx = Some(rx);
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+    assert_eq!(
+        app.input, "new draft",
+        "cancel must not overwrite the user's in-progress draft",
+    );
+    assert_eq!(
+        app.cancelled_prompt.as_deref(),
+        Some("original"),
+        "stash stays so Ctrl-R can still recover the original prompt",
+    );
+}
+
 #[test]
 fn context_budget_renders_percent_and_threshold() {
     let mut app = test_app(SessionMode::Build);
@@ -4959,7 +5492,7 @@ fn count_auto_compact_nudges(app: &TuiApp) -> usize {
     app.transcript
         .iter()
         .filter(|entry| {
-            matches!(&entry.kind, TranscriptEntryKind::Log(message)
+            matches!(&entry.kind, TranscriptEntryKind::Log(LogEntry { message, .. })
                 if message.contains("auto-compact"))
         })
         .count()
@@ -5056,7 +5589,11 @@ async fn pre_compaction_nudge_fires_at_seventy_percent_of_threshold() {
         .transcript
         .iter()
         .find_map(|entry| match &entry.kind {
-            TranscriptEntryKind::Log(text) if text.contains("auto-compact") => Some(text.clone()),
+            TranscriptEntryKind::Log(LogEntry { message: text, .. })
+                if text.contains("auto-compact") =>
+            {
+                Some(text.clone())
+            }
             _ => None,
         })
         .expect("nudge must fire at 70% of the auto-compact threshold");
@@ -6119,6 +6656,130 @@ async fn slash_theme_without_arg_shows_usage() {
     );
 }
 
+/// `/keymap` lists the current bindings — even with no overrides it
+/// must surface every action plus the persisted-defaults hint so a
+/// fresh install can be inspected.
+#[tokio::test]
+async fn slash_keymap_lists_defaults() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/keymap").await;
+    assert!(ran);
+    let body = last_message_content(&app)
+        .expect("transcript entry")
+        .to_string();
+    assert!(body.contains("transcript_overlay"), "missing entry: {body}");
+    assert!(body.contains("page_up"), "missing entry: {body}");
+    assert!(body.contains("Ctrl+T"), "default binding missing: {body}");
+    assert!(body.contains("PageUp"), "default binding missing: {body}");
+    assert!(body.contains("[tui.keymap]"), "config hint missing: {body}");
+    assert!(
+        !body.contains("(override)"),
+        "no overrides expected: {body}",
+    );
+    assert!(
+        app.status.contains("defaults"),
+        "status should hint defaults, got: {}",
+        app.status,
+    );
+}
+
+/// A user override in `[tui.keymap]` flips the live key dispatch so
+/// the rebound key fires the action and the original default no
+/// longer does. Exercises the resolver wiring end-to-end.
+#[tokio::test]
+async fn keymap_override_redirects_transcript_overlay() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    // The pre-existing default no longer toggles the overlay.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Ctrl+T must no longer toggle when rebound",
+    );
+
+    // The user's new binding now toggles it open and closed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_some(),
+        "Ctrl+O must open the overlay after rebind",
+    );
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("handle key");
+    assert!(
+        app.transcript_overlay.is_none(),
+        "Ctrl+O must close the overlay on second press",
+    );
+}
+
+/// `/keymap` reports overrides and validation problems so the user
+/// can see why a typo silently fell back to the default.
+#[tokio::test]
+async fn slash_keymap_surfaces_overrides_and_diagnostics() {
+    let mut config = test_config(SessionMode::Build);
+    config
+        .tui
+        .keymap
+        .insert("transcript_overlay".to_string(), "Ctrl+o".to_string());
+    config
+        .tui
+        .keymap
+        .insert("not_a_real_action".to_string(), "Ctrl+x".to_string());
+    config
+        .tui
+        .keymap
+        .insert("page_up".to_string(), "garbage".to_string());
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    let ran = handle_slash_command(&mut app, &mut agent, "/keymap").await;
+    assert!(ran);
+    let body = last_message_content(&app)
+        .expect("transcript entry")
+        .to_string();
+    assert!(
+        body.contains("transcript_overlay")
+            && body.contains("Ctrl+O")
+            && body.contains("(override)"),
+        "override line missing: {body}",
+    );
+    assert!(
+        body.contains("Unknown action names") && body.contains("not_a_real_action"),
+        "unknown-action diagnostic missing: {body}",
+    );
+    assert!(
+        body.contains("Invalid key specs") && body.contains("page_up"),
+        "invalid-spec diagnostic missing: {body}",
+    );
+    // page_up keeps its default binding even though the override was
+    // invalid — verifies the resolver isolates failures.
+    assert!(body.contains("PageUp"), "default binding lost: {body}");
+}
+
 /// Serializes `/theme` tests so the process-global palette override and the
 /// `SQUEEZY_SETTINGS_PATH` env var don't race between concurrent tests.
 static THEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -6471,6 +7132,71 @@ fn status_segment_individually_returns_expected_text() {
     );
 }
 
+#[test]
+fn status_segments_render_in_priority_order() {
+    // Locks the order segments appear in the joined detail line so that
+    // adding a new segment stays a one-place change: append a function in
+    // `status::segments` and add a single row in `render_status_details`.
+    // Downstream consumers (CLI status verbose, logs) parse position-
+    // sensitively, so reordering existing labels is a breaking change.
+    let mut app = test_app(SessionMode::Build);
+    app.cost.input_tokens = Some(120);
+    app.cost.output_tokens = Some(34);
+    app.cost.cached_input_tokens = Some(7);
+    app.cost.cache_write_input_tokens = Some(3);
+    app.cost.estimated_usd_micros = Some(2_500);
+    app.context_estimate.estimated_tokens = 4096;
+    app.context_compaction_threshold = 10_000;
+    app.metrics.tool_calls = 5;
+    app.metrics.bytes_read = 1024;
+    app.metrics.redactions = 1;
+    app.metrics.receipt_stub_hits = 2;
+    app.metrics.negative_receipt_hits = 1;
+    app.metrics.budget_denials = 0;
+    app.context_compaction.generation = 1;
+    app.context_compaction.pinned.clear();
+    app.cost_cap_usd_micros = None;
+
+    // Priority order mirrors `status::render_status_details`. Keep this
+    // list in sync with the segments array in `status.rs`.
+    let expected_labels = [
+        "permissions",
+        "repo ",
+        "sandbox ",
+        "telemetry ",
+        "mcp ",
+        "cost ",
+        "tok ",
+        "ctx ",
+        "pins ",
+        "compact ",
+        "tools ",
+        "budget ",
+        "cfg ",
+        "read ",
+        "receipts ",
+        "redactions ",
+        "cached ",
+        "cache_write ",
+    ];
+
+    let joined = super::status::render_status_details(&app);
+    let mut cursor = 0usize;
+    for label in expected_labels {
+        // `permissions` is the first segment but emits the compact policy
+        // text (e.g. `r:allow…`) rather than a literal `permissions ` prefix.
+        // Skip the prefix check for that one; the second-position
+        // `repo ` anchors the order verification.
+        if label == "permissions" {
+            continue;
+        }
+        let needle_pos = joined[cursor..]
+            .find(label)
+            .unwrap_or_else(|| panic!("segment {label:?} missing or out of order in {joined:?}"));
+        cursor += needle_pos + label.len();
+    }
+}
+
 // ---- F39: slash command capabilities ----
 
 #[test]
@@ -6485,6 +7211,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/pin",
         "/unpin",
         "/resume",
+        "/fork",
         "/session-export",
         "/session-cleanup",
         "/undo",
@@ -6645,7 +7372,7 @@ async fn shell_sandbox_best_effort_fallback_warns_user_once_per_session() {
         .iter()
         .filter(|entry| match &entry.kind {
             TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(message) => message.contains(needle),
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
             _ => false,
         })
         .count();
@@ -6684,7 +7411,7 @@ async fn cost_warning_event_renders_exactly_once() {
         .iter()
         .filter(|entry| match &entry.kind {
             TranscriptEntryKind::Message(item) => item.content.contains(needle),
-            TranscriptEntryKind::Log(message) => message.contains(needle),
+            TranscriptEntryKind::Log(LogEntry { message, .. }) => message.contains(needle),
             _ => false,
         })
         .count();
@@ -7022,7 +7749,7 @@ fn status_line_unset_keeps_legacy_two_row_layout() {
 }
 
 #[test]
-fn status_line_configured_renders_detail_before_hints() {
+fn status_line_configured_replaces_overview_dir_and_branch() {
     use crate::status::StatusLineItem;
     let mut app = test_app(SessionMode::Build);
     app.status_line_items = Some(vec![
@@ -7032,16 +7759,24 @@ fn status_line_configured_renders_detail_before_hints() {
     app.status_line_use_colors = true;
     let lines = format_status_lines(&app, 200);
     assert_eq!(lines.len(), 2);
+    let row1: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
     let row2: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
-    // Detail items render with " · " separator and precede the hints,
-    // which are still appended after another " · " separator.
-    assert!(row2.contains("scripted:gpt-test"), "{row2}");
-    assert!(row2.contains(" · "), "{row2}");
-    assert!(row2.contains("Enter send"), "{row2}");
-    // Provider-and-Model lives in the Model accent group, so the span
-    // carrying it should be styled with the cyan fallback color when
-    // theme colors are enabled.
-    let provider_span = lines[1]
+    // Row 1 carries the configured detail items, no longer the legacy
+    // "dir … · git …" prefix that duplicates them.
+    assert!(row1.contains("scripted:gpt-test"), "row1={row1}");
+    assert!(
+        !row1.contains("dir "),
+        "overview should be replaced; row1={row1}"
+    );
+    assert!(
+        !row1.contains("· git "),
+        "overview should be replaced; row1={row1}"
+    );
+    // Mode label still right-aligns on row 1.
+    assert!(row1.contains("Build mode"), "row1={row1}");
+    // Hints move to row 2 alone.
+    assert!(row2.contains("Enter send"), "row2={row2}");
+    let provider_span = lines[0]
         .spans
         .iter()
         .find(|s| s.content.contains("scripted:gpt-test"))
@@ -7090,5 +7825,73 @@ fn status_line_codex_aliases_parse() {
     assert_eq!(
         "project".parse::<StatusLineItem>().unwrap(),
         StatusLineItem::ProjectName
+    );
+}
+
+#[test]
+fn frame_rate_limiter_allows_first_frame_immediately() {
+    let limiter = FrameRateLimiter::default();
+    let now = Instant::now();
+    assert!(
+        limiter.allow(now),
+        "fresh limiter must let the first frame through"
+    );
+    assert!(
+        limiter.time_until_next(now).is_none(),
+        "fresh limiter reports no wait before the first frame"
+    );
+}
+
+#[test]
+fn frame_rate_limiter_rejects_frames_inside_min_interval() {
+    let mut limiter = FrameRateLimiter::default();
+    let t0 = Instant::now();
+    limiter.mark_emitted(t0);
+
+    // 1 ms after the last emit is well inside the 16 ms budget: deny.
+    let too_soon = t0 + Duration::from_millis(1);
+    assert!(!limiter.allow(too_soon), "limiter must clamp to 60 FPS");
+    let wait = limiter
+        .time_until_next(too_soon)
+        .expect("limiter should report remaining wait");
+    assert_eq!(
+        wait,
+        MAX_FRAME_INTERVAL - Duration::from_millis(1),
+        "wait reflects time left in the frame budget"
+    );
+
+    // At exactly `MAX_FRAME_INTERVAL` after the last emit the next frame
+    // is allowed again.
+    let at_budget = t0 + MAX_FRAME_INTERVAL;
+    assert!(
+        limiter.allow(at_budget),
+        "limiter must release once MAX_FRAME_INTERVAL has elapsed"
+    );
+    assert!(
+        limiter.time_until_next(at_budget).is_none(),
+        "no wait once the budget has elapsed"
+    );
+}
+
+#[test]
+fn frame_rate_limiter_coalesces_burst_into_one_emit() {
+    // Simulates a flurry of events arriving inside a single frame budget:
+    // only one draw should pass the limiter; the rest must be denied so
+    // the loop coalesces them into the next frame.
+    let mut limiter = FrameRateLimiter::default();
+    let t0 = Instant::now();
+    assert!(limiter.allow(t0), "first burst frame is allowed");
+    limiter.mark_emitted(t0);
+
+    let mut denied = 0;
+    for i in 1..=5 {
+        let t = t0 + Duration::from_millis(i);
+        if !limiter.allow(t) {
+            denied += 1;
+        }
+    }
+    assert_eq!(
+        denied, 5,
+        "all five follow-up events inside the budget must be denied"
     );
 }

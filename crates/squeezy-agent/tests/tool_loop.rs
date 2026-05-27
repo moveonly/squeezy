@@ -15,6 +15,7 @@ use squeezy_core::{
     AppConfig, ContextCompactionConfig, CostSnapshot, PermissionAction, PermissionMode,
     PermissionPolicy, PermissionRule, PermissionRuleSource, PermissionScope, Result, SessionMode,
 };
+use squeezy_hooks::{HookContext, HookEvent, HookHandler, HookRegistry, HookResult};
 use squeezy_llm::{LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall};
 use squeezy_store::SqueezyStore;
 use squeezy_tools::sha256_hex;
@@ -587,6 +588,124 @@ async fn delegate_subagent_uses_parent_model_for_natural_research() {
     assert_eq!(content["ok"], true);
     assert_eq!(content["agent"], "delegate");
     assert_eq!(content["model"], "main-model");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn mixed_subagent_kinds_track_cost_per_kind() {
+    let root = temp_workspace("subagent_per_kind_rollup");
+    fs::write(root.join("src.rs"), "fn needle() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        // Turn 1 parent: dispatch explore subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "explore_call".to_string(),
+                name: "explore".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Find the needle entrypoint",
+                    "scope": "src.rs"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn1_parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Explore subagent final assistant message.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("found".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("explore_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(7),
+                    output_tokens: Some(5),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        // Turn 1 parent final.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("ready".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn1_parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Turn 2 parent: dispatch delegate subagent.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "delegate_call".to_string(),
+                name: "delegate".to_string(),
+                arguments: serde_json::json!({
+                    "prompt": "Summarize architecture",
+                    "scope": "Rust crates"
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn2_parent_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        // Delegate subagent final assistant message.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("Architecture summary".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("delegate_final".to_string()),
+                cost: CostSnapshot {
+                    input_tokens: Some(40),
+                    output_tokens: Some(60),
+                    ..CostSnapshot::default()
+                },
+            }),
+        ],
+        // Turn 2 parent final.
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("turn2_parent_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut config = config_for(root.clone());
+    config.model = "expensive-main".to_string();
+    config.subagents.explore_model = Some("cheap-explore".to_string());
+    let agent = Agent::new(config, provider.clone());
+
+    drain_turn(agent.start_turn("first".to_string(), CancellationToken::new())).await;
+    drain_turn(agent.start_turn("second".to_string(), CancellationToken::new())).await;
+
+    let snapshot = agent.session_accounting_snapshot().await;
+    // Aggregate counters still account for both kinds.
+    assert_eq!(snapshot.metrics.subagent_calls, 2);
+    assert_eq!(snapshot.metrics.subagent_failures, 0);
+
+    // Per-kind buckets must split the cost: explore got 7/5 input/output,
+    // delegate got 40/60. A regression that aggregates them would fail
+    // either equality.
+    let by_kind = &snapshot.metrics.subagent_by_kind;
+    assert_eq!(by_kind.explore.calls, 1);
+    assert_eq!(by_kind.explore.failures, 0);
+    assert_eq!(by_kind.explore.provider.input_tokens, Some(7));
+    assert_eq!(by_kind.explore.provider.output_tokens, Some(5));
+
+    assert_eq!(by_kind.delegate.calls, 1);
+    assert_eq!(by_kind.delegate.failures, 0);
+    assert_eq!(by_kind.delegate.provider.input_tokens, Some(40));
+    assert_eq!(by_kind.delegate.provider.output_tokens, Some(60));
+
+    // Untouched buckets stay zeroed.
+    assert_eq!(by_kind.plan.calls, 0);
+    assert_eq!(by_kind.review.calls, 0);
+    assert_eq!(by_kind.plan.provider.input_tokens, None);
+    assert_eq!(by_kind.review.provider.input_tokens, None);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2413,6 +2532,76 @@ async fn cleanup_sessions_refuses_to_remove_the_active_session() {
             .is_ok_and(|record| record.metadata.session_id == session_id),
         "active session metadata should still be readable",
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Records every hook context the agent dispatched. Used to assert
+/// that PreToolUse and PostToolUse fire for each executed tool call,
+/// in order, with payloads that name the tool and propagate its
+/// terminal status.
+struct RecordingHookHandler {
+    seen: Arc<Mutex<Vec<HookContext>>>,
+}
+
+impl HookHandler for RecordingHookHandler {
+    fn handle(&self, ctx: &HookContext) -> HookResult {
+        self.seen.lock().expect("hook recorder").push(ctx.clone());
+        HookResult::allow()
+    }
+}
+
+#[tokio::test]
+async fn pre_and_post_tool_use_hooks_fire_around_each_tool_call() {
+    let root = temp_workspace("hook_pre_post_tool_use");
+    fs::write(root.join("src.rs"), "fn hooked() {}\n").expect("write source");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "src.rs"}),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_tools".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+            }),
+        ],
+    ]));
+    let mut agent = Agent::new(config_for(root.clone()), provider);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(RecordingHookHandler { seen: seen.clone() }));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    drain_turn(agent.start_turn("inspect hooked".to_string(), CancellationToken::new())).await;
+
+    let captured = seen.lock().expect("seen").clone();
+    let tool_events: Vec<_> = captured
+        .iter()
+        .filter(|ctx| matches!(ctx.event, HookEvent::PreToolUse | HookEvent::PostToolUse))
+        .collect();
+    assert_eq!(
+        tool_events.len(),
+        2,
+        "expected one PreToolUse and one PostToolUse for the single read_file call: {captured:?}"
+    );
+    assert_eq!(tool_events[0].event, HookEvent::PreToolUse);
+    assert_eq!(tool_events[0].payload["tool_name"], "read_file");
+    assert_eq!(tool_events[0].payload["call_id"], "read_call");
+    assert_eq!(tool_events[1].event, HookEvent::PostToolUse);
+    assert_eq!(tool_events[1].payload["tool_name"], "read_file");
+    assert_eq!(tool_events[1].payload["call_id"], "read_call");
+    assert_eq!(tool_events[1].payload["status"], "success");
 
     let _ = fs::remove_dir_all(root);
 }

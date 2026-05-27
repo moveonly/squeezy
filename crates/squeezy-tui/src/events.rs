@@ -13,8 +13,8 @@ use crate::{
     PendingRequestUserInput, TranscriptItem, TuiApp, TurnVisualState, compact_text,
     compaction_status_line, context_window_pct, dedupe_assistant_repeated_tool_output,
     format_approval_status_line, format_error_status, format_mcp_elicitation_status_line,
-    format_mcp_status_snapshot, is_control_tool_name, proposed_plan, render, tool_call_label,
-    tool_result_status_text,
+    format_mcp_status_snapshot, input, is_control_tool_name, proposed_plan, render,
+    strip_plan_handoff_prefix, tool_call_label, tool_result_status_text,
 };
 
 pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
@@ -24,8 +24,13 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
         while let Ok(event) = rx.try_recv() {
             processed = true;
             match event {
-                AgentEvent::UserMessage { message, .. } => {
-                    app.push_transcript_item(message);
+                AgentEvent::UserMessage { mut message, .. } => {
+                    if let Some(stripped) = strip_plan_handoff_prefix(&message.content) {
+                        message.content = stripped;
+                    }
+                    if !message.content.trim().is_empty() {
+                        app.push_transcript_item(message);
+                    }
                     app.pending_assistant.clear();
                     app.transcript_scroll_from_bottom = 0;
                 }
@@ -150,7 +155,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         if app.mode == SessionMode::Build && app.pending_plan_handoff.is_some() {
                             app.pending_plan_handoff = None;
                             app.plan_handoff_turns_seen = 0;
-                            app.push_log("plan handoff cleared: plan is in motion".to_string());
+                            app.push_status("plan handoff cleared: plan is in motion".to_string());
                         }
                         // Plan-mode in-place refinement (issue 2): the model
                         // edited the active plan file via apply_patch. Re-
@@ -203,7 +208,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_estimate = report.record.after.clone();
                     app.context_compaction_nudge_shown = false;
                     app.status = compaction_status_line(&report.record);
-                    app.push_log(format!(
+                    app.push_status(format!(
                         "context compacted gen={} trigger={} items={} tok {}->{}",
                         report.record.generation,
                         report.record.trigger.as_str(),
@@ -244,6 +249,22 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         compact_text(&error, 180)
                     ));
                 }
+                AgentEvent::SubagentRejected {
+                    agent,
+                    reason,
+                    limit,
+                    active,
+                    ..
+                } => {
+                    app.status =
+                        format!("{agent} subagent capped ({active}/{limit} already running)");
+                    app.push_log(format!(
+                        "{agent} subagent capped reason={} limit={} active={}",
+                        reason.as_str(),
+                        limit,
+                        active,
+                    ));
+                }
                 AgentEvent::AiReviewerTripped { reason, .. } => {
                     app.status = "approval review paused".to_string();
                     app.push_log(format!("AI approval reviewer paused: {reason}"));
@@ -255,6 +276,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                 } => {
                     app.status = format_approval_status_line(&request);
                     app.approval_selection_index = 0;
+                    app.notify_approval_pending(&request.tool_name);
                     app.pending_approval = Some(PendingApproval {
                         request,
                         decision_tx,
@@ -311,7 +333,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.context_estimate = context_estimate;
                     app.cancelled_prompt = None;
                     if app.last_turn_had_edits {
-                        app.push_log(
+                        app.push_status(
                             "turn complete · /diff to inspect changes · /undo to revert this turn"
                                 .to_string(),
                         );
@@ -405,6 +427,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
+                    input::restore_prompt_after_cancel(app);
                     keep_rx = false;
                     break;
                 }
@@ -543,6 +566,36 @@ pub(crate) fn drain_job_events(app: &mut TuiApp) {
     }
     if processed {
         app.needs_redraw = true;
+    }
+}
+
+/// Poll the in-flight `/diff` snapshot (if any). The snapshot runs on a
+/// blocking task pool because `vcs.snapshot()` shells out to git; the
+/// result lands here so the diff card / log lines push into the
+/// transcript on the same frame the receiver completes.
+pub(crate) fn drain_pending_diff(app: &mut TuiApp) {
+    let Some(rx) = app.pending_diff.as_mut() else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(result) => {
+            app.pending_diff = None;
+            app.pending_diff_started_at = None;
+            for line in result.logs {
+                app.push_log(line);
+            }
+            if let Some(card) = result.card {
+                app.push_diff_card(card);
+            }
+            app.needs_redraw = true;
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            app.pending_diff = None;
+            app.pending_diff_started_at = None;
+            app.push_log("/diff: background snapshot task aborted".to_string());
+            app.needs_redraw = true;
+        }
     }
 }
 

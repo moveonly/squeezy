@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     env, fmt,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -40,9 +40,9 @@ use squeezy_agent::{
 };
 use squeezy_core::{
     AppConfig, ContextAttachment, ContextCompactionRecord, ContextCompactionState, ContextEstimate,
-    PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode, SqueezyError, StatusVerbosity,
-    TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity, TranscriptDefault, TranscriptItem,
-    TuiAlternateScreen, TuiTheme,
+    PermissionCapability, PermissionPolicy, ResponseVerbosity, Result, Role, SessionMode,
+    SqueezyError, StatusVerbosity, TaskStateSnapshot, TelemetryConfig, ToolOutputVerbosity,
+    TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
 use squeezy_store::{BugReportBundle, BugReportOptions, SessionQuery};
@@ -61,6 +61,7 @@ mod config_screen;
 mod events;
 mod history;
 mod input;
+mod keymap;
 mod mention;
 mod notification;
 mod overlay;
@@ -77,7 +78,7 @@ pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
-pub(crate) use events::{drain_agent_events, drain_job_events};
+pub(crate) use events::{drain_agent_events, drain_job_events, drain_pending_diff};
 #[cfg(test)]
 pub(crate) use input::set_input;
 pub(crate) use input::{HistoryDirection, SLASH_COMMANDS, SelectionDirection, SlashCommand};
@@ -91,9 +92,9 @@ use input::{
     recall_prompt_history, reject_unknown_slash_command, slash_suggestions,
 };
 
-use notification::{NotificationQueue, Severity as NotifySeverity};
+use notification::{DesktopNotifier, NotificationQueue, Severity as NotifySeverity};
 use render::palette::{
-    AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
+    self, AMBER, ERROR_RED, GOLD, MODE_BUILD_GREEN, MODE_PURPLE, PROMPT_BG, QUIET, SUCCESS_GREEN,
     WORKING_SHIMMER_HIGHLIGHT, blend_color,
 };
 #[cfg(test)]
@@ -236,6 +237,46 @@ pub struct StartupProfile {
     pub update_banner: Option<String>,
 }
 
+/// Maximum draw rate enforced by the event loop. 60 FPS keeps animations
+/// smooth on every common refresh rate while protecting against unbounded
+/// redraw spam when a flurry of agent/job events lands inside one tick.
+const MAX_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+/// Clamps consecutive draws so they cannot fire faster than
+/// `MAX_FRAME_INTERVAL`. Many events between draws coalesce into a single
+/// redraw.
+#[derive(Debug, Default)]
+struct FrameRateLimiter {
+    last_emitted_at: Option<Instant>,
+}
+
+impl FrameRateLimiter {
+    /// Returns `true` when a draw is allowed at `now`. Callers must invoke
+    /// `mark_emitted` immediately after the draw completes.
+    fn allow(&self, now: Instant) -> bool {
+        match self.last_emitted_at {
+            None => true,
+            Some(last) => now.saturating_duration_since(last) >= MAX_FRAME_INTERVAL,
+        }
+    }
+
+    fn mark_emitted(&mut self, at: Instant) {
+        self.last_emitted_at = Some(at);
+    }
+
+    /// How long the caller must wait before the next draw is allowed.
+    /// `None` when a draw can fire immediately.
+    fn time_until_next(&self, now: Instant) -> Option<Duration> {
+        let last = self.last_emitted_at?;
+        let elapsed = now.saturating_duration_since(last);
+        if elapsed >= MAX_FRAME_INTERVAL {
+            None
+        } else {
+            Some(MAX_FRAME_INTERVAL - elapsed)
+        }
+    }
+}
+
 pub async fn run(config: AppConfig, provider: Arc<dyn LlmProvider>) -> Result<()> {
     run_inner(config, provider, None, StartupProfile::default()).await
 }
@@ -375,8 +416,16 @@ async fn run_inner(
     let mut settings_watcher = settings_watcher::SettingsWatcher::new();
     // Poll mtimes roughly once per second; tick_rate defaults to 50ms.
     let settings_poll_every = (1000 / config.tick_rate.as_millis().max(1) as u64).max(1);
+    let mut frame_limiter = FrameRateLimiter::default();
 
     loop {
+        // Drain producers first so the next draw reflects everything that
+        // has landed since the previous iteration. A flurry of events
+        // therefore coalesces into a single frame.
+        drain_job_events(&mut app);
+        drain_agent_events(&mut app).await;
+        drain_pending_diff(&mut app);
+
         app.animation_tick = app.animation_tick.wrapping_add(1);
         if app.app_notifications.tick() {
             app.needs_redraw = true;
@@ -392,15 +441,28 @@ async fn run_inner(
         // resize is pending, or something visible is currently animating.
         // Skipping the draw on idle iterations stops the continuous
         // stdout traffic that triggers terminal emulators' per-tab
-        // activity indicators.
-        if app.needs_redraw || app.pending_resize || app.has_active_animation() {
+        // activity indicators. The frame limiter caps the redraw rate at
+        // 60 FPS so bursts of events do not produce a draw storm.
+        let wants_draw = app.needs_redraw || app.pending_resize || app.has_active_animation();
+        let now = Instant::now();
+        if wants_draw && frame_limiter.allow(now) {
             terminal.draw_app(&mut app)?;
             app.needs_redraw = false;
+            frame_limiter.mark_emitted(now);
         }
 
-        drain_job_events(&mut app);
-        drain_agent_events(&mut app).await;
-        if poll_input(&mut app, &mut agent, config.tick_rate).await? {
+        // Bound the input poll so a deferred draw wakes promptly when the
+        // frame budget releases; otherwise honour the configured tick rate.
+        let poll_budget = if wants_draw {
+            frame_limiter
+                .time_until_next(Instant::now())
+                .unwrap_or(Duration::ZERO)
+                .min(config.tick_rate)
+        } else {
+            config.tick_rate
+        };
+
+        if poll_input(&mut app, &mut agent, poll_budget).await? {
             break;
         }
     }
@@ -549,7 +611,7 @@ async fn apply_plan_choice(
                     app.context_compaction.history.push(report.record.clone());
                     app.context_estimate = report.record.after.clone();
                     app.context_compaction_nudge_shown = false;
-                    app.push_log(format!(
+                    app.push_status(format!(
                         "compacted prior context before executing plan {}",
                         pending.plan_id
                     ));
@@ -736,10 +798,12 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         app.terminal_title_state = TerminalTitleState::Cleared;
     }
 
-    // F11 toggles the config screen from anywhere. Ctrl+C is still honored
-    // below so users can always abort even with the screen open.
-    if key.code == KeyCode::F(11) && key.modifiers.is_empty() {
-        toggle_config_screen(app, agent, None);
+    // Rebindable actions (F11/Ctrl+T/Ctrl+P/Ctrl+Y/Ctrl+R/PageUp/PageDown/
+    // Home/End by default) resolve through the keymap before the legacy
+    // hardcoded handlers below get a look. The Home/End actions only fire
+    // when the composer is empty; otherwise we fall through so the
+    // hardcoded line-start/line-end edit semantics keep working.
+    if dispatch_keymap_action(app, agent, key) {
         return Ok(false);
     }
 
@@ -816,11 +880,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         // fall through — the keystroke still performs its normal action
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-        copy_to_clipboard(app, ClipboardTarget::LastAssistant);
-        return Ok(false);
-    }
-
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
         if app.input.is_empty() {
             toggle_selected_transcript_entry(app);
@@ -830,36 +889,11 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    // Ctrl+T toggles the full-screen transcript overlay. While the
-    // overlay is open, the rest of `handle_key` is preempted by the
-    // dispatcher below so input/turn handling stays out of the way.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-        app.transcript_overlay = if app.transcript_overlay.is_some() {
-            None
-        } else {
-            Some(TranscriptOverlayState::default())
-        };
-        app.status = if app.transcript_overlay.is_some() {
-            "transcript overlay (Esc to close)".to_string()
-        } else {
-            "transcript overlay closed".to_string()
-        };
-        return Ok(false);
-    }
-
+    // The transcript-overlay open/close action is dispatched up top
+    // by `dispatch_keymap_action`. While the overlay is open we still
+    // need to forward navigation keys to its own handler before the
+    // composer takes over.
     if app.transcript_overlay.is_some() && handle_transcript_overlay_key(app, key) {
-        return Ok(false);
-    }
-
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        if app.task_state.is_some() {
-            app.task_panel_collapsed = !app.task_panel_collapsed;
-            app.status = if app.task_panel_collapsed {
-                "task panel collapsed".to_string()
-            } else {
-                "task panel expanded".to_string()
-            };
-        }
         return Ok(false);
     }
 
@@ -922,13 +956,6 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && key.code == KeyCode::Char('r')
-        && restore_cancelled_prompt(app)
-    {
-        return Ok(false);
-    }
-
     if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('b') {
         move_input_cursor_word_left(app);
         return Ok(false);
@@ -976,31 +1003,16 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
             // turn/approval interrupts, so a bare ESC at this point is a no-op.
             Ok(false)
         }
-        // Scroll keys intentionally leave `app.status` alone so command
-        // handlers can keep their latest state even though the footer stays
-        // context-only.
-        KeyCode::PageUp => {
-            scroll_transcript_up(app, 8);
-            Ok(false)
-        }
-        KeyCode::PageDown => {
-            scroll_transcript_down(app, 8);
-            Ok(false)
-        }
+        // PageUp/PageDown and (empty-composer) Home/End are routed via
+        // `dispatch_keymap_action` so users can rebind them via
+        // `[tui.keymap]`. When dispatch returned `false` for Home/End
+        // (composer non-empty) the line-cursor cases below execute.
         KeyCode::Home => {
-            if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = u16::MAX;
-            } else {
-                move_input_cursor_line_start(app);
-            }
+            move_input_cursor_line_start(app);
             Ok(false)
         }
         KeyCode::End => {
-            if app.input.is_empty() {
-                app.transcript_scroll_from_bottom = 0;
-            } else {
-                move_input_cursor_line_end(app);
-            }
+            move_input_cursor_line_end(app);
             Ok(false)
         }
         KeyCode::Left => {
@@ -1180,6 +1192,110 @@ fn is_inline_paste(text: &str) -> bool {
     text.len() <= INLINE_PASTE_MAX_BYTES && !text.contains('\n')
 }
 
+/// Resolve `key` against the user-configurable keymap and execute the
+/// matched action. Returns `true` if the action consumed the keystroke
+/// so the caller skips the legacy hardcoded handlers. Bindings that
+/// have no override behave exactly like the pre-keymap build.
+///
+/// Composer basics (Enter / Esc / Backspace / character input) are
+/// intentionally outside this dispatch — they stay hardcoded below
+/// since rebinding them breaks every workflow.
+fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> bool {
+    let Some(action) = app.keymap.lookup(key.code, key.modifiers) else {
+        return false;
+    };
+    match action {
+        keymap::Action::ToggleConfigScreen => {
+            toggle_config_screen(app, agent, None);
+            true
+        }
+        keymap::Action::ToggleTranscriptOverlay => {
+            // Skip while the config screen is in the foreground; that
+            // overlay owns its own key routing.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            app.transcript_overlay = if app.transcript_overlay.is_some() {
+                None
+            } else {
+                Some(TranscriptOverlayState::default())
+            };
+            app.status = if app.transcript_overlay.is_some() {
+                "transcript overlay (Esc to close)".to_string()
+            } else {
+                "transcript overlay closed".to_string()
+            };
+            true
+        }
+        keymap::Action::ToggleTaskPanel => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.task_state.is_some() {
+                app.task_panel_collapsed = !app.task_panel_collapsed;
+                app.status = if app.task_panel_collapsed {
+                    "task panel collapsed".to_string()
+                } else {
+                    "task panel expanded".to_string()
+                };
+            }
+            true
+        }
+        keymap::Action::CopyLastAssistant => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            copy_to_clipboard(app, ClipboardTarget::LastAssistant);
+            true
+        }
+        keymap::Action::RestoreCancelledPrompt => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            restore_cancelled_prompt(app)
+        }
+        keymap::Action::ScrollTranscriptPageUp => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_transcript_up(app, 8);
+            true
+        }
+        keymap::Action::ScrollTranscriptPageDown => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            scroll_transcript_down(app, 8);
+            true
+        }
+        keymap::Action::TranscriptHome => {
+            // The legacy binding only jumps to top when the composer
+            // is empty; otherwise it acts as a line-start cursor move.
+            // Defer to the composer handler in that case.
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = u16::MAX;
+                true
+            } else {
+                false
+            }
+        }
+        keymap::Action::TranscriptEnd => {
+            if app.config_screen.is_some() || app.status_line_setup.is_some() {
+                return false;
+            }
+            if app.input.is_empty() {
+                app.transcript_scroll_from_bottom = 0;
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
 fn scroll_transcript_up(app: &mut TuiApp, lines: u16) {
     app.transcript_scroll_from_bottom = app.transcript_scroll_from_bottom.saturating_add(lines);
 }
@@ -1328,17 +1444,55 @@ fn save_status_line(
             cfg.tui.status_line = if slug_list.is_empty() {
                 None
             } else {
-                Some(slug_list)
+                Some(slug_list.clone())
             };
             cfg.tui.status_line_use_colors = use_colors;
             agent.replace_config(cfg);
             app.status_line_items = Some(items);
             app.status_line_use_colors = use_colors;
             app.status = format!("status line saved to {}", target_path.display());
+            let summary = if slug_list.is_empty() {
+                format!(
+                    "status line cleared (colors {}); written to {}",
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            } else {
+                format!(
+                    "status line saved: {} (colors {}); written to {}",
+                    slug_list.join(", "),
+                    if use_colors { "on" } else { "off" },
+                    target_path.display(),
+                )
+            };
+            app.push_transcript_item(TranscriptItem::system(summary));
         }
         Err(err) => {
-            app.status = format!("/statusline save failed: {err}");
+            let msg = format!("/statusline save failed: {err}");
+            app.status = msg.clone();
+            app.push_transcript_item(TranscriptItem::system(msg));
         }
+    }
+}
+
+/// Whether the transcript should show a styled banner for this slash
+/// command's invocation. Commands that open their own UI overlay
+/// (`/config`, `/statusline`, …) are silenced — the overlay is the
+/// affordance. Commands that route through `start_user_turn` and
+/// already produce a user-message bubble (`/help`) are also silenced
+/// to avoid duplication. `/verbosity` and `/tool-verbosity` open a UI
+/// when called bare but silently apply a value when given an arg —
+/// echo only the second form. Unrecognized commands are not echoed:
+/// they fall through to be sent as regular user prompts.
+fn should_echo_slash_command(command: &str, rest: &str) -> bool {
+    if !SLASH_COMMANDS.iter().any(|spec| spec.name == command) {
+        return false;
+    }
+    match command {
+        "/config" | "/statusline" | "/model" | "/permissions" | "/copy" | "/collapse"
+        | "/expand" | "/help" => false,
+        "/verbosity" | "/tool-verbosity" => !rest.trim().is_empty(),
+        _ => true,
     }
 }
 
@@ -1357,6 +1511,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     {
         app.status = format!("{command} unavailable during turn");
         return true;
+    }
+    if should_echo_slash_command(command, rest) {
+        app.push_slash_command_echo(input);
     }
     match command {
         "/config" => {
@@ -1411,6 +1568,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             app.status = "context snapshot".to_string();
             app.push_transcript_item(TranscriptItem::system(commands::format_context_command(
                 &snapshot,
+            )));
+            return true;
+        }
+        "/reviewer" => {
+            let entries = agent.reviewer_audit_snapshot();
+            if entries.is_empty() {
+                app.status = "no AI reviewer decisions recorded yet".to_string();
+            } else {
+                app.status = format!("{} AI reviewer decision(s)", entries.len());
+            }
+            app.push_transcript_item(TranscriptItem::system(commands::format_reviewer_command(
+                &entries,
+                std::time::SystemTime::now(),
             )));
             return true;
         }
@@ -1664,6 +1834,21 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             apply_theme_change(app, agent, theme);
             return true;
         }
+        "/keymap" => {
+            let body = keymap::format_keymap_command(&app.keymap);
+            let overrides = keymap::Action::ALL
+                .iter()
+                .copied()
+                .filter(|a| app.keymap.binding(*a) != a.default_binding())
+                .count();
+            app.status = if overrides == 0 {
+                "keymap (defaults)".to_string()
+            } else {
+                format!("keymap ({overrides} override(s))")
+            };
+            app.push_transcript_item(TranscriptItem::system(body));
+            return true;
+        }
         "/jobs" => {
             sync_jobs_from_agent(app, agent);
             let jobs = format_jobs_list(app);
@@ -1764,6 +1949,19 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
                     )));
                 }
                 Err(error) => app.status = format!("session show failed: {error}"),
+            }
+            return true;
+        }
+        "/fork" => {
+            match agent.fork_current().await {
+                Ok(new_id) => {
+                    app.status = format!("forked session → {new_id}");
+                    app.push_transcript_item(TranscriptItem::system(format!(
+                        "/fork started session {new_id}; the original session is saved and \
+                         remains resumable via /resume."
+                    )));
+                }
+                Err(error) => app.status = format!("fork failed: {error}"),
             }
             return true;
         }
@@ -2282,8 +2480,8 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         "selected" => app
             .selected_entry
             .and_then(|index| app.transcript.get(index))
-            .or_else(|| app.transcript.last()),
-        "last" => app.transcript.last(),
+            .or_else(|| last_pinnable_entry(app)),
+        "last" => last_pinnable_entry(app),
         _ => return PinSourceResult::UnknownTarget,
     };
     match entry {
@@ -2293,6 +2491,13 @@ fn pin_source(app: &TuiApp, target: &str) -> PinSourceResult {
         }
         None => PinSourceResult::NoEntry,
     }
+}
+
+fn last_pinnable_entry(app: &TuiApp) -> Option<&TranscriptEntry> {
+    app.transcript
+        .iter()
+        .rev()
+        .find(|entry| !matches!(entry.kind, TranscriptEntryKind::SlashEcho(_)))
 }
 
 fn sync_jobs_from_agent(app: &mut TuiApp, agent: &Agent) {
@@ -2580,6 +2785,29 @@ fn latest_toggleable_transcript_entry(app: &TuiApp) -> Option<usize> {
 }
 
 fn latest_collapsed_transcript_entry(app: &TuiApp) -> Option<usize> {
+    // Prefer the most recent collapsed reasoning entry when one exists.
+    // Without this preference Ctrl-E falls through to the most recent
+    // collapsed *peer* — which after a turn lands is the assistant
+    // message (also collapsed on `transcript_default = compact`). The
+    // assistant body is usually a short single line, so toggling it has
+    // no visible effect and the reasoning chevron the user actually
+    // wanted to expand stays collapsed. Reasoning blocks are by far the
+    // most common Ctrl-E target, so prefer them when the user hasn't
+    // explicitly navigated to a specific entry.
+    let latest_reasoning = app
+        .transcript
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| {
+            matches!(entry.kind, TranscriptEntryKind::Reasoning(_))
+                && entry.collapsed
+                && entry.is_toggleable()
+        })
+        .map(|(index, _)| index);
+    if latest_reasoning.is_some() {
+        return latest_reasoning;
+    }
     app.transcript
         .iter()
         .enumerate()
@@ -2628,6 +2856,48 @@ fn start_user_turn(app: &mut TuiApp, agent: &mut Agent, input: String) {
 /// (issue 16). The handoff is cleared automatically when the file is
 /// missing; routine clears (Build→Plan, discard, successful apply_patch)
 /// happen elsewhere.
+/// Strip the plan-handoff prefix that [`take_pending_plan_prefix`] prepended
+/// to the user-typed text. The agent still receives the full wrapped body —
+/// this only hides the duplicate echo in the rendered transcript, because the
+/// Plan card a few entries above already shows the same body. Returns `None`
+/// when the message has no plan-handoff prefix.
+pub(crate) fn strip_plan_handoff_prefix(content: &str) -> Option<String> {
+    let mut rest = content;
+    let mut changed = false;
+
+    if let Some(after) = rest.strip_prefix("[resuming from plan ")
+        && let Some(end) = after.find("]\n")
+    {
+        rest = &after[end + 2..];
+        changed = true;
+    }
+
+    if let Some(after) = rest.strip_prefix("[plan from previous session — ")
+        && let Some(header_end) = after.find("]\n")
+    {
+        let body_start = &after[header_end + 2..];
+        if let Some(close) = body_start.find("\n[end plan]\n") {
+            let mut tail = &body_start[close + "\n[end plan]\n".len()..];
+            tail = tail.strip_prefix('\n').unwrap_or(tail);
+            rest = tail;
+            changed = true;
+        }
+    } else if let Some(after) = rest.strip_prefix("[plan still in effect — ")
+        && let Some(end) = after.find("]\n")
+    {
+        let mut tail = &after[end + 2..];
+        tail = tail.strip_prefix('\n').unwrap_or(tail);
+        rest = tail;
+        changed = true;
+    }
+
+    if changed {
+        Some(rest.to_string())
+    } else {
+        None
+    }
+}
+
 fn take_pending_plan_prefix(app: &mut TuiApp) -> Option<String> {
     let plan_path = app.pending_plan_handoff.clone()?;
     if app.plan_handoff_turns_seen > 0 {
@@ -2689,7 +2959,7 @@ fn switch_mode(
             .current_plan_id
             .clone()
             .map(|plan_id| PlanPauseState { plan_id });
-        app.push_log("plan execution paused (Shift+Tab)".to_string());
+        app.push_status("plan execution paused (Shift+Tab)".to_string());
     }
 
     if !is_build_to_plan_pause
@@ -2740,7 +3010,7 @@ fn switch_mode(
                             };
                             app.plan_resume_marker = Some(note);
                         }
-                        app.push_log(format!(
+                        app.push_status(format!(
                             "plan attached for next Build turn: {}",
                             compact_path(&plan_path)
                         ));
@@ -2948,6 +3218,7 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     let Some(pending) = app.pending_approval.take() else {
         return false;
     };
+    let options = approval_options_for(&pending.request);
 
     match key.code {
         KeyCode::Up => {
@@ -2958,26 +3229,33 @@ fn handle_approval_key(app: &mut TuiApp, key: KeyEvent) -> bool {
         }
         KeyCode::Down => {
             app.approval_selection_index =
-                (app.approval_selection_index + 1).min(approval_options().len() - 1);
+                (app.approval_selection_index + 1).min(options.len() - 1);
             app.status = format_approval_status_line(&pending.request);
             app.pending_approval = Some(pending);
             true
         }
         KeyCode::Enter => {
-            let option = approval_options()
+            let option = options
                 .get(app.approval_selection_index)
-                .copied()
-                .unwrap_or(APPROVAL_ONCE);
+                .cloned()
+                .unwrap_or_else(approval_once);
             send_approval_decision(app, pending, option)
         }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            send_approval_decision(app, pending, APPROVAL_ONCE)
+            send_approval_decision(app, pending, approval_once())
         }
         KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('p') | KeyCode::Char('P') => {
-            send_approval_decision(app, pending, APPROVAL_PROJECT)
+            // Capability-scoped "always allow" — picks the per-capability
+            // project option built by `approval_options_for`.
+            let project = options
+                .iter()
+                .find(|opt| opt.choice == ApprovalChoice::ApproveProject)
+                .cloned()
+                .unwrap_or_else(approval_once);
+            send_approval_decision(app, pending, project)
         }
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('d') | KeyCode::Char('D') => {
-            send_approval_decision(app, pending, APPROVAL_DENY)
+            send_approval_decision(app, pending, approval_deny())
         }
         _ => {
             app.status = format_approval_status_line(&pending.request);
@@ -3013,57 +3291,169 @@ enum ApprovalChoice {
     DenySession,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ApprovalOption {
     choice: ApprovalChoice,
-    label: &'static str,
-    hint: &'static str,
+    label: std::borrow::Cow<'static, str>,
+    hint: std::borrow::Cow<'static, str>,
     decision: ToolApprovalDecision,
 }
 
-const APPROVAL_ONCE: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::Approve,
-    label: "Approve",
-    hint: "run this once",
-    decision: ToolApprovalDecision::AllowOnce,
-};
+impl ApprovalOption {
+    const fn new_static(
+        choice: ApprovalChoice,
+        label: &'static str,
+        hint: &'static str,
+        decision: ToolApprovalDecision,
+    ) -> Self {
+        Self {
+            choice,
+            label: std::borrow::Cow::Borrowed(label),
+            hint: std::borrow::Cow::Borrowed(hint),
+            decision,
+        }
+    }
+}
 
-const APPROVAL_SESSION: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::ApproveSession,
-    label: "Approve for this session",
-    hint: "save an in-memory rule",
-    decision: ToolApprovalDecision::AllowSession,
-};
+fn approval_once() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::Approve,
+        "Approve",
+        "run this once",
+        ToolApprovalDecision::AllowOnce,
+    )
+}
 
-const APPROVAL_PROJECT: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::ApproveProject,
-    label: "Always approve this command in this repo",
-    hint: "save a project rule",
-    decision: ToolApprovalDecision::AllowRuleProject,
-};
+fn approval_deny() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::Deny,
+        "Deny",
+        "skip this run",
+        ToolApprovalDecision::DenyOnce,
+    )
+}
 
-const APPROVAL_DENY: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::Deny,
-    label: "Deny",
-    hint: "skip this run",
-    decision: ToolApprovalDecision::DenyOnce,
-};
+fn approval_deny_session() -> ApprovalOption {
+    ApprovalOption::new_static(
+        ApprovalChoice::DenySession,
+        "Deny for this session",
+        "save an in-memory deny rule",
+        ToolApprovalDecision::DenySession,
+    )
+}
 
-const APPROVAL_DENY_SESSION: ApprovalOption = ApprovalOption {
-    choice: ApprovalChoice::DenySession,
-    label: "Deny for this session",
-    hint: "save an in-memory deny rule",
-    decision: ToolApprovalDecision::DenySession,
-};
-
-fn approval_options() -> &'static [ApprovalOption] {
-    &[
-        APPROVAL_ONCE,
-        APPROVAL_SESSION,
-        APPROVAL_PROJECT,
-        APPROVAL_DENY,
-        APPROVAL_DENY_SESSION,
+/// Build the per-capability allow/deny menu for a pending approval. Codex's
+/// `ExecApprovalRequestEvent::default_available_decisions` shapes the option
+/// list to the request (network host vs exec amendment vs plain accept); the
+/// audit (`ux.md#E-UX-06`) calls out that squeezy's fixed five-option set hides
+/// what scope each "Approve" actually saves. Labels here name the binary, host,
+/// server, or path that the resulting rule will cover so the user can codify
+/// *why* in one keystroke.
+fn approval_options_for(request: &ToolApprovalRequest) -> Vec<ApprovalOption> {
+    let (session_label, session_hint, project_label, project_hint) =
+        capability_scope_labels(request);
+    let session = ApprovalOption {
+        choice: ApprovalChoice::ApproveSession,
+        label: session_label,
+        hint: session_hint,
+        decision: ToolApprovalDecision::AllowSession,
+    };
+    let project = ApprovalOption {
+        choice: ApprovalChoice::ApproveProject,
+        label: project_label,
+        hint: project_hint,
+        decision: ToolApprovalDecision::AllowRuleProject,
+    };
+    vec![
+        approval_once(),
+        session,
+        project,
+        approval_deny(),
+        approval_deny_session(),
     ]
+}
+
+/// Returns `(session_label, session_hint, project_label, project_hint)` for
+/// the allow options. Each label names the capability-specific target (binary,
+/// host, MCP server/tool, write root) so the prompt makes the persisted rule
+/// shape visible without forcing the user to read the rule-preview line.
+fn capability_scope_labels(
+    request: &ToolApprovalRequest,
+) -> (
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+    std::borrow::Cow<'static, str>,
+) {
+    use std::borrow::Cow;
+    let permission = &request.permission;
+    let scope_name: Option<String> = match permission.capability {
+        PermissionCapability::Shell => permission
+            .metadata
+            .get("binary")
+            .cloned()
+            .or_else(|| permission.metadata.get("shell_prefix").cloned()),
+        PermissionCapability::Network => permission.metadata.get("host").cloned().or_else(|| {
+            permission
+                .target
+                .strip_prefix("domain:")
+                .map(str::to_string)
+        }),
+        PermissionCapability::Mcp => {
+            let server = permission.metadata.get("server").cloned();
+            let tool = permission.metadata.get("tool").cloned();
+            match (server, tool) {
+                (Some(server), Some(tool)) => Some(format!("{server}/{tool}")),
+                (Some(server), None) => Some(server),
+                _ => None,
+            }
+        }
+        PermissionCapability::Edit => permission
+            .metadata
+            .get("write_root")
+            .cloned()
+            .or_else(|| permission.metadata.get("path").cloned()),
+        PermissionCapability::Read | PermissionCapability::Search => permission
+            .metadata
+            .get("path")
+            .cloned()
+            .or_else(|| permission.metadata.get("query").cloned()),
+        PermissionCapability::Git
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => None,
+    };
+    let Some(scope) = scope_name.and_then(|s| {
+        let trimmed = s.trim().to_string();
+        if trimmed.is_empty() || trimmed == "*" {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) else {
+        return (
+            Cow::Borrowed("Approve for this session"),
+            Cow::Borrowed("save an in-memory rule"),
+            Cow::Borrowed("Always approve this command in this repo"),
+            Cow::Borrowed("save a project rule"),
+        );
+    };
+    let scope_display = compact_text(&scope, 60);
+    let (kind, hint_kind) = match permission.capability {
+        PermissionCapability::Shell => ("command", "command"),
+        PermissionCapability::Network => ("host", "host"),
+        PermissionCapability::Mcp => ("MCP tool", "MCP tool"),
+        PermissionCapability::Edit => ("edits to", "edit target"),
+        PermissionCapability::Read | PermissionCapability::Search => ("reads of", "read target"),
+        PermissionCapability::Git
+        | PermissionCapability::Compiler
+        | PermissionCapability::Destructive => unreachable!(),
+    };
+    (
+        Cow::Owned(format!("Allow {kind} {scope_display} (session)")),
+        Cow::Owned(format!("save an in-memory {hint_kind} rule")),
+        Cow::Owned(format!("Always allow {kind} {scope_display}")),
+        Cow::Owned(format!("save a project {hint_kind} rule")),
+    )
 }
 
 /// Single-line status banner shown in the 1-line status bar. Compact by
@@ -3302,8 +3692,10 @@ fn format_approval_menu_lines(
     selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = approval::render_preview(request);
-    for (index, option) in approval_options().iter().enumerate() {
-        let is_selected = index == selected.min(approval_options().len() - 1);
+    let options = approval_options_for(request);
+    let max_index = options.len().saturating_sub(1);
+    for (index, option) in options.iter().enumerate() {
+        let is_selected = index == selected.min(max_index);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
@@ -3315,7 +3707,7 @@ fn format_approval_menu_lines(
                 marker,
                 Style::default().fg(if is_selected { GOLD } else { QUIET }),
             ),
-            Span::styled(option.label, label_style),
+            Span::styled(option.label.to_string(), label_style),
             Span::styled(format!(" · {}", option.hint), Style::default().fg(QUIET)),
         ]));
     }
@@ -3505,6 +3897,26 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
     let area = frame.area();
+    if app.transcript_overlay.is_some() {
+        render_transcript_overlay(frame, area, app);
+        return;
+    }
+    if let Some(state) = &app.status_line_setup {
+        let notif_h = app.app_notifications.height();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(if notif_h > 0 {
+                vec![Constraint::Min(0), Constraint::Length(notif_h)]
+            } else {
+                vec![Constraint::Min(0)]
+            })
+            .split(area);
+        status_line_setup::render(frame, chunks[0], state, app);
+        if notif_h > 0 {
+            render_notification_pane(frame, chunks[1], app);
+        }
+        return;
+    }
     if let Some(state) = &app.config_screen {
         let notif_h = app.app_notifications.height();
         let chunks = Layout::default()
@@ -3656,7 +4068,14 @@ fn render_task_state(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 /// actionable to show. Returns `None` when the spinner alone suffices —
 /// keeps the working cell single-row in the common case.
 fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
-    // Highest priority: MCP startup in progress.
+    // Highest priority: a `/diff` snapshot is running on the blocking
+    // pool. The user typed `/diff` and is waiting for git to finish.
+    if app.pending_diff.is_some() {
+        return Some(Line::from(Span::styled(
+            "    ↳ computing diff…",
+            Style::default().fg(QUIET),
+        )));
+    }
     if let Some(snapshot) = app.mcp_status.as_ref() {
         let mut starting = 0usize;
         let mut total = 0usize;
@@ -3695,6 +4114,7 @@ fn working_detail_line(app: &TuiApp) -> Option<Line<'static>> {
 fn turn_in_progress(app: &TuiApp) -> bool {
     app.turn_rx.is_some()
         || app.cancel.is_some()
+        || app.pending_diff.is_some()
         || (app.last_turn_duration.is_none()
             && app
                 .task_state
@@ -3736,6 +4156,9 @@ fn working_line(app: &TuiApp) -> Line<'static> {
     {
         spans.push(Span::styled(" · ", Style::default().fg(QUIET)));
         spans.extend(active_tool_spans(call));
+        if let Some(elapsed_ms) = app.active_tool_elapsed_ms {
+            spans.extend(active_tool_elapsed_spans(elapsed_ms));
+        }
     }
     Line::from(spans)
 }
@@ -3777,6 +4200,7 @@ fn shimmer_word_spans(text: &'static str, elapsed_ms: u64) -> Vec<Span<'static>>
 
 fn current_turn_duration(app: &TuiApp) -> Duration {
     app.turn_started_at
+        .or(app.pending_diff_started_at)
         .map(|started_at| started_at.elapsed())
         .unwrap_or_default()
 }
@@ -3955,6 +4379,24 @@ fn render_transcript_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
 fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (index, entry) in app.transcript.iter().enumerate() {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &entry.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        false,
+                        app.selected_entry == Some(index),
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_expanded(
             entry,
             app.selected_entry == Some(index),
@@ -3982,7 +4424,7 @@ fn format_transcript_entry_expanded(
         TranscriptEntryKind::ToolResult(tool) => {
             format_tool_result_entry(tool, false, selected, tool_output_verbosity, width)
         }
-        TranscriptEntryKind::Log(message) => format_log_entry(message, false, selected),
+        TranscriptEntryKind::Log(entry) => format_log_entry(entry, false, selected),
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, false),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, false, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
@@ -3994,6 +4436,7 @@ fn format_transcript_entry_expanded(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
 }
 
@@ -4009,6 +4452,24 @@ fn transcript_lines_for_render(
         lines.push(Line::from(""));
     }
     for (index, item) in app.transcript.iter().enumerate() {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        item.collapsed,
+                        app.selected_entry == Some(index),
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_with_width(
             item,
             app.selected_entry == Some(index),
@@ -4277,7 +4738,9 @@ fn format_transcript_entry_with_width(
             tool_output_verbosity,
             width,
         ),
-        TranscriptEntryKind::Log(message) => format_log_entry(message, entry.collapsed, selected),
+        TranscriptEntryKind::Log(entry_log) => {
+            format_log_entry(entry_log, entry.collapsed, selected)
+        }
         TranscriptEntryKind::PlanCard(data) => format_plan_card_entry(data, entry.collapsed),
         TranscriptEntryKind::Diff(data) => format_diff_card_entry(data, entry.collapsed, selected),
         TranscriptEntryKind::Reasoning(snapshot) => {
@@ -4290,7 +4753,28 @@ fn format_transcript_entry_with_width(
                 Vec::new()
             }
         }
+        TranscriptEntryKind::SlashEcho(data) => vec![format_slash_echo_line(data, selected)],
     }
+}
+
+fn format_slash_echo_line(data: &SlashEchoData, selected: bool) -> Line<'static> {
+    let marker = if selected { "> " } else { "  " };
+    let mut spans = vec![
+        Span::raw(marker),
+        Span::styled(
+            "›  ",
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            data.cmd.clone(),
+            Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !data.args.is_empty() {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(data.args.clone(), Style::default().fg(QUIET)));
+    }
+    Line::from(spans)
 }
 
 fn format_plan_card_entry(
@@ -4313,12 +4797,34 @@ fn format_plan_card_entry(
 /// `disable_output_cap` UX — never truncated, always renderable via the
 /// existing `render::diff` helpers.
 fn handle_slash_diff(app: &mut TuiApp) {
+    if app.pending_diff.is_some() {
+        app.push_log("/diff: already computing — please wait".to_string());
+        return;
+    }
     let workspace_root = app.workspace_root.clone();
-    let vcs = match GitVcs::open(&workspace_root) {
+    let (tx, rx) = oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let result = compute_diff_snapshot(&workspace_root);
+        let _ = tx.send(result);
+    });
+    app.pending_diff = Some(rx);
+    app.pending_diff_started_at = Some(Instant::now());
+    app.needs_redraw = true;
+}
+
+/// Synchronous diff snapshot used by the background task. Returns either
+/// a renderable card or a list of log lines (errors / "no changes" /
+/// "not a git repo"). Kept off the input thread because `vcs.snapshot()`
+/// shells out to `git status` + `git diff` and iterates every changed
+/// file — fine for a background worker, fatal for the UI thread.
+fn compute_diff_snapshot(workspace_root: &Path) -> PendingDiffResult {
+    let vcs = match GitVcs::open(workspace_root) {
         Ok(vcs) => vcs,
         Err(err) => {
-            app.push_log(format!("/diff failed to open workspace VCS: {err}"));
-            return;
+            return PendingDiffResult {
+                logs: vec![format!("/diff failed to open workspace VCS: {err}")],
+                card: None,
+            };
         }
     };
     let snapshot = vcs.snapshot(
@@ -4329,20 +4835,24 @@ fn handle_slash_diff(app: &mut TuiApp) {
         },
     );
     if snapshot.vcs.kind != VcsKind::Git {
-        app.push_log("/diff: workspace is not a git repository".to_string());
-        return;
+        return PendingDiffResult {
+            logs: vec!["/diff: workspace is not a git repository".to_string()],
+            card: None,
+        };
     }
-    if !snapshot.errors.is_empty() {
-        for error in &snapshot.errors {
-            app.push_log(format!("/diff git error: {error}"));
-        }
-    }
+    let mut logs: Vec<String> = snapshot
+        .errors
+        .iter()
+        .map(|e| format!("/diff git error: {e}"))
+        .collect();
     if snapshot.files.is_empty() {
-        app.push_log("/diff: no uncommitted changes".to_string());
-        return;
+        logs.push("/diff: no uncommitted changes".to_string());
+        return PendingDiffResult { logs, card: None };
     }
-    let card = build_diff_card(&snapshot);
-    app.push_diff_card(card);
+    PendingDiffResult {
+        logs,
+        card: Some(build_diff_card(&snapshot)),
+    }
 }
 
 /// Build a renderable diff card from a worktree snapshot. Files are
@@ -4454,7 +4964,7 @@ fn message_outcome(entries: &[TranscriptEntry], index: usize) -> MessageOutcome 
 
     for entry in entries.iter().skip(index + 1) {
         match &entry.kind {
-            TranscriptEntryKind::Log(message) if is_failure_log(message) => {
+            TranscriptEntryKind::Log(entry_log) if is_failure_log(entry_log.message()) => {
                 return MessageOutcome::Failed;
             }
             TranscriptEntryKind::Message(_) => return MessageOutcome::Normal,
@@ -5053,8 +5563,20 @@ fn format_assistant_message_entry(
 }
 
 fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    reasoning_block_lines_with_extras(text, collapsed, selected, 0)
+}
+
+/// `extras` is the number of additional adjacent reasoning entries this chip
+/// stands in for. When `> 0`, the collapsed chip header gains a `· +N more`
+/// suffix so the run reads as one item.
+fn reasoning_block_lines_with_extras(
+    text: &str,
+    collapsed: bool,
+    selected: bool,
+    extras: usize,
+) -> Vec<Line<'static>> {
     let style = Style::default()
-        .fg(Color::DarkGray)
+        .fg(palette::muted_fg())
         .add_modifier(Modifier::ITALIC);
     let marker = if selected { "> " } else { "" };
     let mut lines = Vec::new();
@@ -5065,25 +5587,76 @@ fn reasoning_block_lines(text: &str, collapsed: bool, selected: bool) -> Vec<Lin
             .copied()
             .map(|first| compact_text(first, 120))
             .unwrap_or_default();
-        let suffix = if body_lines.len() > 1 {
+        let mut suffix = if body_lines.len() > 1 {
             format!(" … +{} lines (Ctrl-E to expand)", body_lines.len() - 1)
         } else {
             String::new()
         };
+        if extras > 0 {
+            suffix.push_str(&format!(" · +{extras} more"));
+        }
         lines.push(Line::from(Span::styled(
             format!("{marker}▸ reasoning: {summary}{suffix}"),
             style,
         )));
     } else {
-        lines.push(Line::from(Span::styled(
-            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1)),
-            style,
-        )));
+        let header = if extras > 0 {
+            format!(
+                "{marker}▾ reasoning ({} lines · +{extras} more)",
+                body_lines.len().max(1)
+            )
+        } else {
+            format!("{marker}▾ reasoning ({} lines)", body_lines.len().max(1))
+        };
+        lines.push(Line::from(Span::styled(header, style)));
         for raw in body_lines {
             lines.push(Line::from(Span::styled(format!("  {}", raw), style)));
         }
     }
     lines
+}
+
+/// Outcome of inspecting a reasoning entry's neighborhood for coalescing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReasoningRun {
+    /// Lead of a run of ≥2 adjacent reasoning entries. `extras` is the
+    /// number of *additional* entries this lead absorbs.
+    Lead { extras: usize },
+    /// A non-lead member of a run — caller should render nothing.
+    Suppressed,
+}
+
+/// If `index` is a `Reasoning` entry, classify how it should render given
+/// its neighborhood. Returns `None` for non-reasoning entries or singletons,
+/// in which case the caller renders normally.
+fn reasoning_run_info(transcript: &[TranscriptEntry], index: usize) -> Option<ReasoningRun> {
+    let entry = transcript.get(index)?;
+    if !matches!(entry.kind, TranscriptEntryKind::Reasoning(_)) {
+        return None;
+    }
+    let prev_is_reasoning = index > 0
+        && matches!(
+            transcript[index - 1].kind,
+            TranscriptEntryKind::Reasoning(_)
+        );
+    if prev_is_reasoning {
+        return Some(ReasoningRun::Suppressed);
+    }
+    let mut extras = 0usize;
+    let mut j = index + 1;
+    while let Some(next) = transcript.get(j) {
+        if matches!(next.kind, TranscriptEntryKind::Reasoning(_)) {
+            extras += 1;
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    if extras == 0 {
+        None
+    } else {
+        Some(ReasoningRun::Lead { extras })
+    }
 }
 
 fn collapsed_content_summary(content: &str) -> String {
@@ -5110,22 +5683,29 @@ fn format_tool_result_entry(
     let (marker, action) = tool_result_action(tool);
     let color = tool_result_display_color(tool);
     let summary_spans = tool_result_summary_spans(tool);
-    let mut lines = vec![action_line_spans(
-        selected,
-        marker,
-        color,
-        action,
-        color,
-        summary_spans,
-    )];
-    if collapsed {
-        lines.extend(collapsed_tool_preview_lines(
-            tool,
-            tool_output_verbosity,
-            width,
-        ));
+    let header = action_line_spans(selected, marker, color, action, color, summary_spans);
+    let body = if collapsed {
+        collapsed_tool_preview_lines(tool, tool_output_verbosity, width)
     } else {
-        lines.extend(expanded_tool_detail_lines(tool, tool_output_verbosity));
+        expanded_tool_detail_lines(tool, tool_output_verbosity)
+    };
+    // Visually group the action header with its detail rows by tinting
+    // both with a subtle card surface. Bail out gracefully on terminals
+    // that can't render bg blends — `card_background_style()` returns
+    // `None` and the layout falls back to today's flat row stack.
+    let bg = render::card::card_background_style();
+    if bg.is_none() {
+        let mut lines = vec![header];
+        lines.extend(body);
+        return lines;
+    }
+    let mut lines = vec![render::card::apply_background(header, bg)];
+    lines.extend(
+        body.into_iter()
+            .map(|line| render::card::apply_background(line, bg)),
+    );
+    if let Some(trailer) = render::card::blank_card_line(bg) {
+        lines.push(trailer);
     }
     lines
 }
@@ -5214,7 +5794,22 @@ fn head_tail_truncate_lines(lines: Vec<Line<'static>>, cap: usize) -> Vec<Line<'
     out
 }
 
-fn format_log_entry(message: &str, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+fn format_log_entry(entry: &LogEntry, collapsed: bool, selected: bool) -> Vec<Line<'static>> {
+    let message = entry.message.as_str();
+    if entry.kind == LogKind::Operational {
+        // Operational chrome: dim italic line with no bullet so it visually
+        // sinks below content. Always one line; selection inherits the
+        // standard marker so keyboard nav still highlights the entry.
+        let marker = if selected { "> " } else { "  " };
+        let style = Style::default()
+            .fg(palette::footer_fg())
+            .add_modifier(Modifier::ITALIC);
+        let preview = compact_text(message, 200);
+        return vec![Line::from(vec![
+            Span::raw(marker),
+            Span::styled(preview, style),
+        ])];
+    }
     let color = log_color(message);
     if collapsed && !is_failure_log(message) {
         let preview = compact_text(message, 140);
@@ -5313,10 +5908,10 @@ fn detail_line(selected: bool, color: Color, content: impl Into<String>) -> Line
     Line::from(vec![
         Span::raw(marker),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(content.into(), Style::default().fg(QUIET)),
+        Span::styled(content.into(), Style::default().fg(palette::muted_fg())),
     ])
 }
 
@@ -6000,34 +6595,125 @@ pub(crate) fn tool_call_label(call: &ToolCall) -> String {
 }
 
 fn active_tool_spans(call: &ToolCall) -> Vec<Span<'static>> {
-    let action = active_tool_action(&call.name);
-    let mut spans = vec![Span::styled(
-        action,
+    let name_span = Span::styled(
+        friendly_tool_name(&call.name),
         Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
-    )];
-    if matches!(call.name.as_str(), "shell" | "verify")
-        && let Some(command) = string_arg(&call.arguments, "command")
-    {
-        spans.extend(command_spans(&command));
+    );
+    let args = active_tool_args(call);
+    if args.is_empty() {
+        return vec![name_span];
+    }
+    let mut spans = vec![
+        name_span,
+        Span::styled(
+            ": ",
+            Style::default().fg(AMBER).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if matches!(call.name.as_str(), "shell" | "verify") {
+        spans.extend(command_spans(&compact_text(&args, 80)));
     } else {
         spans.push(Span::styled(
-            tool_call_label(call),
+            compact_text(&args, 80),
             Style::default().fg(Color::White),
         ));
     }
     spans
 }
 
+/// Per-tool elapsed segment ("· 3s") appended after the tool label.
+/// Returns no spans when the heartbeat hasn't reported elapsed yet — the
+/// turn-level "(Ns · esc to interrupt)" already covers that case.
+fn active_tool_elapsed_spans(elapsed_ms: u64) -> Vec<Span<'static>> {
+    let secs = elapsed_ms / 1000;
+    if secs == 0 {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(" · ", Style::default().fg(QUIET)),
+        Span::styled(format!("{secs}s"), Style::default().fg(QUIET)),
+    ]
+}
+
 pub(crate) fn is_control_tool_name(name: &str) -> bool {
     matches!(name, "update_task_state" | "load_tool_schema")
 }
 
-fn active_tool_action(tool_name: &str) -> &'static str {
+/// Argument snippet for the working-row label. Returns only the
+/// arguments (no tool-name prefix), so the row reads
+/// `Friendly: <args>` without duplicating the tool identity. Returns an
+/// empty string when no useful snippet is available — the row then ends
+/// at the colon.
+fn active_tool_args(call: &ToolCall) -> String {
+    match call.name.as_str() {
+        "shell" | "verify" => string_arg(&call.arguments, "command")
+            .or_else(|| string_arg(&call.arguments, "description"))
+            .unwrap_or_default(),
+        "decl_search" => {
+            let language = string_arg(&call.arguments, "language");
+            let kind = string_arg(&call.arguments, "kind").map(|value| kind_label(&value));
+            let query = string_arg(&call.arguments, "query");
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(language) = language {
+                parts.push(language);
+            }
+            if let Some(kind) = kind {
+                parts.push(kind);
+            }
+            if let Some(query) = query {
+                parts.push(query);
+            }
+            parts.join(" ")
+        }
+        "definition_search" | "reference_search" | "symbol_context" | "grep" | "websearch" => {
+            string_arg(&call.arguments, "query")
+                .or_else(|| string_arg(&call.arguments, "pattern"))
+                .or_else(|| string_arg(&call.arguments, "symbol_id"))
+                .unwrap_or_default()
+        }
+        "glob" => string_arg(&call.arguments, "pattern").unwrap_or_default(),
+        "read_file" | "read_slice" | "write_file" => {
+            string_arg(&call.arguments, "path").unwrap_or_default()
+        }
+        "plan_patch" => string_arg(&call.arguments, "objective").unwrap_or_default(),
+        "webfetch" => string_arg(&call.arguments, "url").unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Title-cased display name for the working-row label (codex-style
+/// "Shell: …", "Read: …"). Known tools get explicit casing; unknown tools
+/// fall back to ASCII-uppercase first letter so a server-defined tool
+/// like `slack_search` reads as `Slack_search` rather than the raw slug.
+fn friendly_tool_name(tool_name: &str) -> String {
     match tool_name {
-        "plan_patch" => "Planning ",
-        "apply_patch" | "write_file" => "Editing ",
-        name if is_exploration_tool(name) => "Exploring ",
-        _ => "Running ",
+        "shell" => "Shell".to_string(),
+        "verify" => "Verify".to_string(),
+        "read_file" | "read_slice" => "Read".to_string(),
+        "read_tool_output" => "Expand".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "write_file" => "Write".to_string(),
+        "apply_patch" => "Patch".to_string(),
+        "plan_patch" => "Plan".to_string(),
+        "repo_map" => "Repo map".to_string(),
+        "diff_context" => "Diff".to_string(),
+        "decl_search" => "Declarations".to_string(),
+        "definition_search" => "Definition".to_string(),
+        "reference_search" => "References".to_string(),
+        "symbol_context" => "Symbol".to_string(),
+        "hierarchy" => "Hierarchy".to_string(),
+        "upstream_flow" => "Upstream".to_string(),
+        "downstream_flow" => "Downstream".to_string(),
+        "webfetch" => "Fetch".to_string(),
+        "websearch" => "Search".to_string(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+                None => String::new(),
+            }
+        }
     }
 }
 
@@ -6042,11 +6728,76 @@ fn expanded_tool_detail_lines(
         "diff_context" => expanded_diff_context_detail_lines(tool),
         "plan_patch" => expanded_plan_patch_detail_lines(tool),
         "apply_patch" | "write_file" => expanded_edit_detail_lines(tool, verbosity),
+        "symbol_context" => expanded_symbol_context_detail_lines(tool, verbosity),
         "grep" | "glob" | "read_file" | "read_slice" | "read_tool_output" => {
             expanded_read_search_detail_lines(tool, verbosity)
         }
         _ => expanded_generic_tool_detail_lines(tool, verbosity),
     }
+}
+
+fn expanded_symbol_context_detail_lines(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let packet_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        ToolOutputVerbosity::Normal => 5,
+        ToolOutputVerbosity::Verbose => usize::MAX,
+    };
+    let mut lines = Vec::new();
+    if let Some(call) = tool.call.as_ref()
+        && let Some(query) = string_arg(&call.arguments, "query")
+    {
+        lines.push(detail_line(false, QUIET, format!("query `{query}`")));
+    }
+    let packets = tool.result.content["packets"].as_array();
+    let total = packets.map(|p| p.len()).unwrap_or(0);
+    if total == 0 {
+        if let Some(reason) = string_arg(&tool.result.content, "reason") {
+            lines.push(detail_line(false, QUIET, reason));
+        } else {
+            lines.push(detail_line(false, QUIET, "no symbols matched".to_string()));
+        }
+        return lines;
+    }
+    lines.push(detail_line(false, QUIET, format!("packets {total}")));
+    if let Some(packets) = packets {
+        for packet in packets.iter().take(packet_cap) {
+            let name = packet["name"].as_str().unwrap_or("?");
+            let kind = packet["kind"].as_str().unwrap_or("");
+            let path = packet["path"].as_str().unwrap_or("?");
+            let line = packet["span"]["start_line"].as_u64().unwrap_or(0);
+            let refs = packet["references"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            let callers = packet["callers"].as_array().map(|a| a.len()).unwrap_or(0);
+            let kind_suffix = if kind.is_empty() {
+                String::new()
+            } else {
+                format!(" ({kind})")
+            };
+            let counts = if refs == 0 && callers == 0 {
+                String::new()
+            } else {
+                format!(" · refs {refs} · callers {callers}")
+            };
+            lines.push(detail_line(
+                false,
+                QUIET,
+                format!("{path}:{line} {name}{kind_suffix}{counts}"),
+            ));
+        }
+    }
+    if total > packet_cap {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("+{} more packets (Ctrl-E to expand)", total - packet_cap),
+        ));
+    }
+    lines
 }
 
 fn expanded_shell_detail_lines(
@@ -6134,7 +6885,7 @@ fn shell_output_title_line(command: &str, workdir: &str) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -6293,7 +7044,7 @@ fn expanded_edit_detail_lines(
         lines.push(detail_line(false, QUIET, summary));
         if let Some(patch) = file.patch.as_deref().filter(|patch| !patch.is_empty()) {
             lines.push(detail_line(false, QUIET, "diff"));
-            lines.extend(render_diff_patch_full_lines(patch));
+            lines.extend(render_diff_patch_full_lines(patch, file.path.as_str()));
         }
     }
     if let Some(matches) = number_field(&tool.result.content, "matches") {
@@ -6323,8 +7074,8 @@ fn expanded_read_search_detail_lines(
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
     let lines = match tool.result.tool_name.as_str() {
-        "glob" => expanded_glob_detail_lines(tool),
-        "grep" => expanded_grep_detail_lines(tool),
+        "glob" => expanded_glob_detail_lines_v(tool, verbosity),
+        "grep" => expanded_grep_detail_lines_v(tool, verbosity),
         "read_file" | "read_slice" => expanded_read_file_detail_lines(tool, verbosity),
         "read_tool_output" => expanded_read_tool_output_detail_lines(tool, verbosity),
         _ => expanded_generic_tool_detail_lines(tool, verbosity),
@@ -6336,17 +7087,26 @@ fn expanded_read_search_detail_lines(
     }
 }
 
-fn expanded_glob_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_glob_detail_lines_v(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let path_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 8,
+    };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
         lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
     }
-    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+        && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
+    {
         lines.push(detail_line(false, QUIET, format!("root {path}")));
     }
     if let Some(paths) = tool.result.content["paths"].as_array() {
         lines.push(detail_line(false, QUIET, format!("paths {}", paths.len())));
-        lines.extend(paths.iter().take(8).filter_map(|path| {
+        lines.extend(paths.iter().take(path_cap).filter_map(|path| {
             path.as_str()
                 .map(|path| detail_line(false, QUIET, format!("path {path}")))
         }));
@@ -6354,20 +7114,37 @@ fn expanded_glob_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
     lines
 }
 
-fn expanded_grep_detail_lines(tool: &ToolTranscript) -> Vec<Line<'static>> {
+fn expanded_grep_detail_lines_v(
+    tool: &ToolTranscript,
+    verbosity: ToolOutputVerbosity,
+) -> Vec<Line<'static>> {
+    let match_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 6,
+    };
+    let path_cap = match verbosity {
+        ToolOutputVerbosity::Compact => 3,
+        _ => 8,
+    };
     let mut lines = Vec::new();
     if let Some(pattern) = string_arg(&tool.result.content["metadata"], "pattern") {
         lines.push(detail_line(false, QUIET, format!("pattern {pattern}")));
     }
-    if let Some(path) = string_arg(&tool.result.content["metadata"], "path") {
+    if !matches!(verbosity, ToolOutputVerbosity::Compact)
+        && let Some(path) = string_arg(&tool.result.content["metadata"], "path")
+    {
         lines.push(detail_line(false, QUIET, format!("root {path}")));
     }
     if let Some(count) = number_field(&tool.result.content, "count") {
         lines.push(detail_line(false, QUIET, format!("matches {count}")));
     }
-    lines.extend(path_detail_lines(&tool.result.content["paths"], "", 8));
+    lines.extend(path_detail_lines(
+        &tool.result.content["paths"],
+        "",
+        path_cap,
+    ));
     if let Some(matches) = tool.result.content["matches"].as_array() {
-        for item in matches.iter().take(6) {
+        for item in matches.iter().take(match_cap) {
             let path = item["path"].as_str().unwrap_or("?");
             let line = item["line"].as_u64().unwrap_or(0);
             let text = item["text"].as_str().unwrap_or_default();
@@ -6385,24 +7162,48 @@ fn expanded_read_file_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
+    let path = string_arg(&tool.result.content, "path");
+    let bytes = number_field(&tool.result.content, "bytes_returned");
+    let total = number_field(&tool.result.content, "total_bytes");
+    let ranges = tool.result.content["ranges"]
+        .as_array()
+        .map(|r| r.len())
+        .unwrap_or(0);
+
+    // Compact mode: a single chip summarising the read. The content body
+    // and per-field chips dominate transcripts otherwise — and Read's full
+    // text is already what the agent acted on, not something the user
+    // needs to re-read here.
+    if matches!(verbosity, ToolOutputVerbosity::Compact) {
+        let mut summary = path.clone().unwrap_or_else(|| "?".to_string());
+        if let Some(bytes) = bytes {
+            let total = total.unwrap_or(bytes);
+            summary.push_str(&format!(
+                " · {} of {}",
+                format_bytes(bytes),
+                format_bytes(total)
+            ));
+        }
+        if ranges > 1 {
+            summary.push_str(&format!(" · {ranges} ranges"));
+        }
+        return vec![detail_line(false, QUIET, summary)];
+    }
+
     let mut lines = Vec::new();
-    if let Some(path) = string_arg(&tool.result.content, "path") {
+    if let Some(path) = path {
         lines.push(detail_line(false, QUIET, format!("path {path}")));
     }
-    if let Some(bytes) = number_field(&tool.result.content, "bytes_returned") {
-        let total = number_field(&tool.result.content, "total_bytes").unwrap_or(bytes);
+    if let Some(bytes) = bytes {
+        let total = total.unwrap_or(bytes);
         lines.push(detail_line(
             false,
             QUIET,
             format!("bytes {} of {}", format_bytes(bytes), format_bytes(total)),
         ));
     }
-    if let Some(ranges) = tool.result.content["ranges"].as_array() {
-        lines.push(detail_line(
-            false,
-            QUIET,
-            format!("ranges {}", ranges.len()),
-        ));
+    if ranges > 0 {
+        lines.push(detail_line(false, QUIET, format!("ranges {ranges}")));
     }
     if let Some(content) = string_arg(&tool.result.content, "content") {
         lines.extend(output_block_lines("content", &content, verbosity));
@@ -6436,12 +7237,91 @@ fn expanded_generic_tool_detail_lines(
     tool: &ToolTranscript,
     verbosity: ToolOutputVerbosity,
 ) -> Vec<Line<'static>> {
-    let preview = preview_tool_result(&tool.result, verbosity);
-    output_block_lines("details", &preview, verbosity)
+    // Verbose mode preserves the legacy `details {...}` JSON dump so users
+    // who really want the raw payload (debugging a new tool, comparing two
+    // runs) can still get it via `/verbosity verbose`.
+    if matches!(verbosity, ToolOutputVerbosity::Verbose) {
+        let preview = preview_tool_result(&tool.result, verbosity);
+        return output_block_lines("details", &preview, verbosity);
+    }
+
+    // 1. If the tool surfaces plain stdout/stderr/output, render that —
+    //    walls of JSON aren't useful when the tool already gives us text.
+    if let Some(text) = tool_result_output_text(&tool.result) {
+        let preview = truncate_bytes(&text, TOOL_PREVIEW_COMPACT_BYTES);
+        return output_block_lines("output", &preview, verbosity);
+    }
+
+    // 2. Otherwise summarise the top-level keys of the result. Each value
+    //    gets at most one chip; the entry caps at 3 chips total so the
+    //    summary stays scannable. Full JSON is one verbosity flip away.
+    let Some(object) = tool.result.content.as_object() else {
+        let preview = preview_tool_result(&tool.result, verbosity);
+        return output_block_lines("details", &preview, verbosity);
+    };
+    if object.is_empty() {
+        return Vec::new();
+    }
+    let max_chips = if matches!(verbosity, ToolOutputVerbosity::Compact) {
+        3
+    } else {
+        6
+    };
+    let mut lines = Vec::new();
+    let mut shown = 0usize;
+    let total_keys = object.len();
+    for (key, value) in object {
+        if shown >= max_chips {
+            break;
+        }
+        let summary = summarize_json_value(value);
+        lines.push(detail_line(false, QUIET, format!("{key} {summary}")));
+        shown += 1;
+    }
+    if total_keys > shown {
+        lines.push(detail_line(
+            false,
+            QUIET,
+            format!("+{} more fields (Ctrl-E to expand)", total_keys - shown),
+        ));
+    }
+    lines
 }
 
-fn render_diff_patch_full_lines(patch: &str) -> Vec<Line<'static>> {
-    render::diff::render_patch_full_lines(patch)
+/// One-line summary of a JSON value, used by the generic tool renderer.
+/// Strings get inline-quoted (truncated); arrays/objects collapse to a
+/// count; scalars print as-is.
+fn summarize_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => format!("\"{}\"", compact_text(s, 80)),
+        serde_json::Value::Array(items) => {
+            if items.is_empty() {
+                "[]".to_string()
+            } else {
+                format!("{} items", items.len())
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                "{}".to_string()
+            } else {
+                let keys = map.keys().take(3).cloned().collect::<Vec<_>>().join(", ");
+                let suffix = if map.len() > 3 {
+                    format!(", +{}", map.len() - 3)
+                } else {
+                    String::new()
+                };
+                format!("{{{keys}{suffix}}}")
+            }
+        }
+    }
+}
+
+fn render_diff_patch_full_lines(patch: &str, path: &str) -> Vec<Line<'static>> {
+    render::diff::render_patch_full_lines(patch, render::diff::language_hint_from_path(path))
         .into_iter()
         .map(detail_rendered_line)
         .collect()
@@ -6524,7 +7404,7 @@ fn detail_spans_line(content: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -6536,7 +7416,7 @@ fn detail_rendered_line(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(
-            "└ ",
+            "│ ",
             Style::default().fg(QUIET).add_modifier(Modifier::BOLD),
         ),
     ];
@@ -7300,6 +8180,19 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::DIM | Modifier::ITALIC),
                 ));
             }
+            let badges = command.capability_badges();
+            if !badges.is_empty() {
+                spans.push(Span::styled(
+                    format!("  [{}]", badges.join("|")),
+                    Style::default()
+                        .fg(if dimmed { QUIET } else { AMBER })
+                        .add_modifier(if dimmed {
+                            Modifier::DIM | Modifier::ITALIC
+                        } else {
+                            Modifier::ITALIC
+                        }),
+                ));
+            }
             if dimmed {
                 spans.push(Span::styled(
                     "  (unavailable during turn)",
@@ -7526,7 +8419,7 @@ pub(crate) fn count_plan_steps(body: &str) -> usize {
         .count()
 }
 
-fn title_case_mode(mode: SessionMode) -> &'static str {
+pub(crate) fn title_case_mode(mode: SessionMode) -> &'static str {
     match mode {
         SessionMode::Plan => "Plan",
         SessionMode::Build => "Build",
@@ -7558,34 +8451,63 @@ fn format_status_tokens(app: &TuiApp) -> String {
 }
 
 fn format_status_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let mut lines = vec![format_status_overview_line(app, width)];
     let hints_span = Span::styled(format_status_hints(app), Style::default().fg(QUIET));
-    // Only render the codex-style detail line when the user has explicitly
-    // configured `[tui].status_line` via /statusline. When the key is unset
-    // the default is the original two-row layout (overview + hints).
     let detail = configured_status_line_items(app).and_then(|items| {
         status::render_status_detail_line(app, &items, app.status_line_use_colors)
     });
-    if let Some(mut line) = detail {
-        line.spans.push(Span::styled(
-            " · ",
-            Style::default().fg(QUIET).add_modifier(Modifier::DIM),
-        ));
-        line.spans.push(hints_span);
-        lines.push(line);
+    // When the user has configured `[tui].status_line`, the detail items
+    // take the place of `dir … · git …` on row 1 (otherwise both rows
+    // duplicate the same data). Mode label stays right-aligned. Without a
+    // configured list, fall back to the historical overview layout.
+    let top = match detail {
+        Some(detail_line) => compose_status_overview_with_detail(detail_line, app, width),
+        None => format_status_overview_line(app, width),
+    };
+    let bottom = if detail_was_present(app) {
+        Line::from(hints_span)
     } else if app.status_verbosity == StatusVerbosity::Verbose {
-        lines.push(Line::from(Span::styled(
+        Line::from(Span::styled(
             format!(
                 "{} · {}",
                 format_status_details(app),
                 format_status_hints(app)
             ),
             Style::default().fg(QUIET),
-        )));
+        ))
     } else {
-        lines.push(Line::from(hints_span));
-    }
-    lines
+        Line::from(hints_span)
+    };
+    vec![top, bottom]
+}
+
+/// Right-align the mode label on a status row whose left side is the
+/// codex-style detail line. Mirrors [`format_status_overview_line`]'s
+/// alignment math but preserves the detail line's styled spans.
+fn compose_status_overview_with_detail(
+    mut detail: Line<'static>,
+    app: &TuiApp,
+    width: u16,
+) -> Line<'static> {
+    let right = mode_status_text(app);
+    let right_width = right.chars().count();
+    let detail_width: usize = detail
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    let padding_width = (width as usize)
+        .saturating_sub(detail_width.saturating_add(right_width))
+        .max(1);
+    detail.spans.push(Span::raw(" ".repeat(padding_width)));
+    detail.spans.push(Span::styled(
+        right,
+        Style::default().fg(mode_status_color(app.mode)),
+    ));
+    detail
+}
+
+fn detail_was_present(app: &TuiApp) -> bool {
+    configured_status_line_items(app).is_some()
 }
 
 /// User-configured `[tui].status_line`. `None` when the TOML key is unset
@@ -8214,6 +9136,9 @@ pub(crate) struct TuiApp {
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     pub(crate) app_notifications: NotificationQueue,
+    /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
+    /// default; flips on via `[tui].desktop_notifications`.
+    pub(crate) desktop_notifier: DesktopNotifier,
     pub(crate) config_screen: Option<config_screen::ConfigScreenState>,
     /// Configured status-bar items (`[tui].status_line`). `None` means
     /// "use the built-in default list"; `Some(empty)` means the user
@@ -8227,6 +9152,27 @@ pub(crate) struct TuiApp {
     /// Latest mid-turn task-progress text surfaced by the agent.
     /// Drives the `task-progress` status item.
     pub(crate) latest_plan_progress: Option<String>,
+    /// Resolved key bindings (defaults + user overrides from
+    /// `[tui.keymap]`). Built once at startup; `/keymap` reads from
+    /// here and `handle_key` consults it before dispatching to the
+    /// legacy hardcoded handlers.
+    pub(crate) keymap: keymap::KeymapResolver,
+    /// In-flight `/diff` snapshot work. `vcs.snapshot()` shells out to
+    /// blocking git subprocesses and iterates every changed file, which
+    /// can take seconds on a busy worktree. We offload it to
+    /// `spawn_blocking` and poll this receiver each frame so the input
+    /// loop stays responsive. Drives the working spinner while set.
+    pub(crate) pending_diff: Option<oneshot::Receiver<PendingDiffResult>>,
+    /// Wall-clock anchor for the in-flight `/diff` snapshot. Drives the
+    /// elapsed-time counter on the Working row so the user can see the
+    /// command is making progress even though the foreground UI is idle.
+    pub(crate) pending_diff_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PendingDiffResult {
+    pub(crate) logs: Vec<String>,
+    pub(crate) card: Option<DiffCardData>,
 }
 
 impl TuiApp {
@@ -8379,11 +9325,15 @@ impl TuiApp {
             pending_report: None,
             clipboard,
             app_notifications: NotificationQueue::new(),
+            desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
             status_line_items: parse_status_line_items(config.tui.status_line.as_deref()),
             status_line_use_colors: config.tui.status_line_use_colors,
             status_line_setup: None,
             latest_plan_progress: None,
+            keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
+            pending_diff: None,
+            pending_diff_started_at: None,
         }
     }
 
@@ -8436,7 +9386,20 @@ impl TuiApp {
         // end-of-turn footer prints final totals separately.
         self.turn_progress = None;
         self.active_tool_elapsed_ms = None;
+        // Best-effort off-tab attention surface; the in-terminal toast and
+        // title glyph already cover the on-screen case. We ignore any IO
+        // error here because failing to notify is strictly less important
+        // than continuing the turn-finish bookkeeping.
+        let _ = self.desktop_notifier.notify("squeezy turn complete");
         self.needs_redraw = true;
+    }
+
+    /// Fire the desktop-notification surface for an approval-pending event.
+    /// Public to `events.rs` so the approval-request handler can call it
+    /// without poking the field directly.
+    pub(crate) fn notify_approval_pending(&self, tool_name: &str) {
+        let message = format!("squeezy needs approval for {tool_name}");
+        let _ = self.desktop_notifier.notify(&message);
     }
 
     /// Whether the next frame would visibly differ from the current one
@@ -8448,6 +9411,7 @@ impl TuiApp {
     pub(crate) fn has_active_animation(&self) -> bool {
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
+            || self.pending_diff.is_some()
     }
 
     pub(crate) fn push_transcript_item(&mut self, item: TranscriptItem) {
@@ -8517,6 +9481,19 @@ impl TuiApp {
         self.push_entry(TranscriptEntry::log(id, message, self.transcript_default));
     }
 
+    /// Append a transcript entry tagged as operational chrome — used for
+    /// turn-complete markers, compaction notices, and plan-handoff state
+    /// that should fade to the periphery rather than read as content.
+    pub(crate) fn push_status(&mut self, message: String) {
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::log_with_kind(
+            id,
+            message,
+            LogKind::Operational,
+            self.transcript_default,
+        ));
+    }
+
     pub(crate) fn push_plan_card(&mut self, data: render::plan_card::PlanCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::plan_card(
@@ -8529,6 +9506,24 @@ impl TuiApp {
     pub(crate) fn push_diff_card(&mut self, data: DiffCardData) {
         let id = self.next_id();
         self.push_entry(TranscriptEntry::diff_card(id, data));
+    }
+
+    /// Echo the slash command the user just ran into the transcript as a
+    /// styled banner. Used by commands that produce in-transcript output
+    /// (cards, logs) so the history retains the invocation that triggered
+    /// them. Skipped for commands that open their own UI overlay — the
+    /// overlay itself is the affordance.
+    pub(crate) fn push_slash_command_echo(&mut self, raw: &str) {
+        let trimmed = raw.trim_start();
+        if trimmed.is_empty() {
+            return;
+        }
+        let (cmd, args) = match trimmed.split_once(char::is_whitespace) {
+            Some((cmd, args)) => (cmd.to_string(), args.trim().to_string()),
+            None => (trimmed.to_string(), String::new()),
+        };
+        let id = self.next_id();
+        self.push_entry(TranscriptEntry::slash_echo(id, SlashEchoData { cmd, args }));
     }
 
     pub(crate) fn push_reasoning_segment(&mut self, snapshot: squeezy_core::ReasoningSnapshot) {
@@ -8615,10 +9610,22 @@ impl TranscriptEntry {
     }
 
     fn log(id: u64, message: String, transcript_default: TranscriptDefault) -> Self {
+        Self::log_with_kind(id, message, LogKind::Normal, transcript_default)
+    }
+
+    fn log_with_kind(
+        id: u64,
+        message: String,
+        kind: LogKind,
+        transcript_default: TranscriptDefault,
+    ) -> Self {
         Self {
             id,
-            kind: TranscriptEntryKind::Log(message),
-            collapsed: transcript_default == TranscriptDefault::Compact,
+            kind: TranscriptEntryKind::Log(LogEntry { message, kind }),
+            // Operational chrome never benefits from being collapsed —
+            // it's already a single dim line.
+            collapsed: kind != LogKind::Operational
+                && transcript_default == TranscriptDefault::Compact,
         }
     }
 
@@ -8642,6 +9649,14 @@ impl TranscriptEntry {
             kind: TranscriptEntryKind::Diff(Box::new(data)),
             // Mirror codex's `/diff`: never truncated by default. The
             // user can still Ctrl-E to fold the body if it's huge.
+            collapsed: false,
+        }
+    }
+
+    fn slash_echo(id: u64, data: SlashEchoData) -> Self {
+        Self {
+            id,
+            kind: TranscriptEntryKind::SlashEcho(data),
             collapsed: false,
         }
     }
@@ -8671,6 +9686,7 @@ impl TranscriptEntry {
                 TranscriptEntryKind::Log(_) => true,
                 TranscriptEntryKind::Message(item) => item.role == Role::System,
                 TranscriptEntryKind::PlanCard(_) => true,
+                TranscriptEntryKind::SlashEcho(_) => true,
                 _ => false,
             },
             TranscriptCategory::Diffs => match &self.kind {
@@ -8699,7 +9715,7 @@ impl TranscriptEntry {
             TranscriptEntryKind::ToolResult(tool) => {
                 vec![format!("tool result: {}", tool_result_summary(tool))]
             }
-            TranscriptEntryKind::Log(message) => vec![format!("log: {message}")],
+            TranscriptEntryKind::Log(entry) => vec![format!("log: {}", entry.message)],
             TranscriptEntryKind::PlanCard(data) => {
                 let body = proposed_plan::read_plan_body(&data.path).unwrap_or_default();
                 vec![format!("plan {}\n{body}", data.plan_id)]
@@ -8709,6 +9725,14 @@ impl TranscriptEntry {
             }
             TranscriptEntryKind::Reasoning(snapshot) => {
                 vec![format!("reasoning: {}", snapshot.display_text)]
+            }
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                vec![format!("slash: {body}")]
             }
         }
     }
@@ -8730,10 +9754,13 @@ impl TranscriptEntry {
                 item.role != Role::User && text_has_collapsible_content(&item.content)
             }
             TranscriptEntryKind::ToolResult(_) => true,
-            TranscriptEntryKind::Log(message) => text_has_collapsible_content(message),
+            TranscriptEntryKind::Log(entry) => {
+                entry.kind == LogKind::Normal && text_has_collapsible_content(&entry.message)
+            }
             TranscriptEntryKind::PlanCard(_) => true,
             TranscriptEntryKind::Diff(_) => true,
             TranscriptEntryKind::Reasoning(_) => true,
+            TranscriptEntryKind::SlashEcho(_) => false,
         }
     }
 
@@ -8749,9 +9776,9 @@ impl TranscriptEntry {
                 tool_result_summary(tool),
                 format!("transcript:{}", self.id),
             ),
-            TranscriptEntryKind::Log(message) => (
+            TranscriptEntryKind::Log(entry) => (
                 "log entry".to_string(),
-                message.clone(),
+                entry.message.clone(),
                 format!("transcript:{}", self.id),
             ),
             TranscriptEntryKind::PlanCard(data) => (
@@ -8769,7 +9796,41 @@ impl TranscriptEntry {
                 snapshot.display_text.clone(),
                 format!("transcript:{}", self.id),
             ),
+            TranscriptEntryKind::SlashEcho(data) => {
+                let body = if data.args.is_empty() {
+                    data.cmd.clone()
+                } else {
+                    format!("{} {}", data.cmd, data.args)
+                };
+                (
+                    "slash command".to_string(),
+                    body,
+                    format!("transcript:{}", self.id),
+                )
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogKind {
+    /// Standard log line — rendered with `└` and a status-color marker.
+    Normal,
+    /// Operational chrome (turn-complete markers, compaction notices,
+    /// plan-handoff state) — rendered dim/italic with no bullet so it
+    /// fades to the periphery instead of looking like a content event.
+    Operational,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LogEntry {
+    pub(crate) message: String,
+    pub(crate) kind: LogKind,
+}
+
+impl LogEntry {
+    fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -8777,7 +9838,7 @@ impl TranscriptEntry {
 enum TranscriptEntryKind {
     Message(TranscriptItem),
     ToolResult(Box<ToolTranscript>),
-    Log(String),
+    Log(LogEntry),
     /// Plan-mode v3 (PR-F): a styled card pointing at the persisted
     /// plan file. The body is loaded from disk at render time so the
     /// cell tracks in-place refinements and survives compaction.
@@ -8791,6 +9852,17 @@ enum TranscriptEntryKind {
     /// so each reasoning block becomes its own grey collapsible entry
     /// instead of being pinned to the next assistant message.
     Reasoning(Box<squeezy_core::ReasoningSnapshot>),
+    /// Echo of the slash command the user typed (e.g. `/diff`, `/plan rewrite foo`).
+    /// Renders as a one-line styled banner so the transcript history shows
+    /// the invocation that produced the next card / log entry. Inserted only
+    /// for commands that don't open their own UI overlay.
+    SlashEcho(SlashEchoData),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SlashEchoData {
+    pub(crate) cmd: String,
+    pub(crate) args: String,
 }
 
 /// Frozen snapshot of `/diff` output. Lines are pre-rendered with the
@@ -9190,6 +10262,24 @@ fn inline_history_lines_for_flush(
         lines.push(Line::from(""));
     }
     for (index, item) in app.transcript.iter().enumerate().skip(transcript_from) {
+        match reasoning_run_info(&app.transcript, index) {
+            Some(ReasoningRun::Suppressed) => continue,
+            Some(ReasoningRun::Lead { extras }) => {
+                if app.show_reasoning_usage
+                    && let TranscriptEntryKind::Reasoning(snapshot) = &item.kind
+                {
+                    lines.extend(reasoning_block_lines_with_extras(
+                        &snapshot.display_text,
+                        item.collapsed,
+                        false,
+                        extras,
+                    ));
+                    lines.push(Line::from(""));
+                }
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_with_width(
             item,
             false,

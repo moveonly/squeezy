@@ -7,7 +7,10 @@ use futures_util::StreamExt;
 use squeezy_core::{CostSnapshot, ProviderTransportConfig, SqueezyError};
 use tokio_util::sync::CancellationToken;
 
-use super::{RetryPolicy, idle_timeout, with_stream_retry};
+use super::{
+    JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
+    with_stream_retry,
+};
 use crate::{LlmEvent, LlmStream};
 
 #[test]
@@ -221,4 +224,117 @@ async fn mock_transport_does_not_double_emit_when_reconnect_replays_prefix() {
         text, "hello world",
         "skip-prefix must avoid double-emitting replayed tokens"
     );
+}
+
+#[test]
+fn apply_jitter_stays_within_bounds() {
+    let base = Duration::from_millis(1_000);
+    let lower_bound_nanos = (base.as_nanos() as f64 * (1.0 - JITTER_FRACTION)).round() as u128;
+    let upper_bound_nanos = (base.as_nanos() as f64 * (1.0 + JITTER_FRACTION)).round() as u128;
+
+    for sample in [-1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0] {
+        let jittered = apply_jitter(base, sample);
+        assert!(
+            jittered.as_nanos() >= lower_bound_nanos.saturating_sub(1),
+            "sample {sample} produced {jittered:?} below lower bound"
+        );
+        assert!(
+            jittered.as_nanos() <= upper_bound_nanos + 1,
+            "sample {sample} produced {jittered:?} above upper bound"
+        );
+    }
+
+    // Extreme samples must clamp to the documented ±25% window rather than
+    // amplifying further.
+    assert_eq!(apply_jitter(base, 5.0), apply_jitter(base, 1.0));
+    assert_eq!(apply_jitter(base, -5.0), apply_jitter(base, -1.0));
+}
+
+#[test]
+fn apply_jitter_extremes_match_window_endpoints() {
+    let base = Duration::from_millis(1_600);
+    let lo = apply_jitter(base, -1.0);
+    let hi = apply_jitter(base, 1.0);
+    assert_eq!(lo, Duration::from_millis(1_200));
+    assert_eq!(hi, Duration::from_millis(2_000));
+}
+
+#[test]
+fn backoff_grows_exponentially_within_jitter_window() {
+    // For each attempt, the expected base delay is 200ms * 2^attempt. The
+    // jittered result must land in ±JITTER_FRACTION of that base.
+    let base = Duration::from_millis(200);
+    for attempt in 0u8..5 {
+        let expected_nanos = base.as_nanos() as u64 * (1u64 << u64::from(attempt));
+        let lower = (expected_nanos as f64 * (1.0 - JITTER_FRACTION)) as u64;
+        let upper = (expected_nanos as f64 * (1.0 + JITTER_FRACTION)) as u64;
+        for _ in 0..32 {
+            let observed = backoff(base, attempt).as_nanos() as u64;
+            assert!(
+                observed >= lower && observed <= upper,
+                "attempt {attempt}: observed {observed}ns outside [{lower}, {upper}]"
+            );
+        }
+    }
+}
+
+#[test]
+fn backoff_produces_varying_delays_across_retries() {
+    // With jitter enabled, repeated calls at the same attempt must not all
+    // collapse to a single deterministic value. Drawing N samples and
+    // requiring at least N/2 distinct values catches a regression that drops
+    // jitter back to the deterministic 2^attempt schedule.
+    let base = Duration::from_millis(200);
+    const SAMPLES: usize = 16;
+
+    for attempt in 0u8..4 {
+        let delays: Vec<Duration> = (0..SAMPLES).map(|_| backoff(base, attempt)).collect();
+        let distinct: std::collections::BTreeSet<_> = delays.iter().collect();
+        assert!(
+            distinct.len() >= SAMPLES / 2,
+            "attempt {attempt}: expected jittered delays to vary, saw {} distinct in {SAMPLES} draws ({delays:?})",
+            distinct.len(),
+        );
+    }
+}
+
+#[test]
+fn n_retries_produce_n_distinct_delays() {
+    // Walks a realistic retry sequence (attempts 0..N) and asserts every
+    // observed delay is distinct. This is the property that prevents
+    // multiple Squeezy clients from retrying in lockstep on a shared 429.
+    let base = Duration::from_millis(200);
+    const N: u8 = 6;
+    let delays: Vec<Duration> = (0..N).map(|attempt| backoff(base, attempt)).collect();
+    let distinct: std::collections::BTreeSet<_> = delays.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        usize::from(N),
+        "expected {N} distinct retry delays, saw {} ({delays:?})",
+        distinct.len(),
+    );
+}
+
+#[test]
+fn jitter_sample_stays_in_bounds() {
+    for _ in 0..1024 {
+        let sample = jitter_sample();
+        assert!(
+            (-1.0..=1.0).contains(&sample),
+            "jitter sample {sample} outside [-1.0, 1.0]"
+        );
+    }
+}
+
+#[test]
+fn jitter_sample_is_not_constant() {
+    let first = jitter_sample();
+    let mut saw_different = false;
+    for _ in 0..64 {
+        if (jitter_sample() - first).abs() > f64::EPSILON {
+            saw_different = true;
+            break;
+        }
+    }
+    assert!(saw_different, "jitter sample appears deterministic");
 }

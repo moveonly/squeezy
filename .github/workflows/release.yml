@@ -43,6 +43,10 @@ jobs:
             os: ubuntu-22.04
             archive: squeezy-x86_64-unknown-linux-musl.tar.gz
             binary-path: target/x86_64-unknown-linux-musl/dist/squeezy
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+            archive: squeezy-aarch64-unknown-linux-musl.tar.gz
+            binary-path: target/aarch64-unknown-linux-musl/dist/squeezy
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             archive: squeezy-x86_64-pc-windows-msvc.zip
@@ -97,7 +101,7 @@ jobs:
         run: rustup target add ${{ matrix.target }}
 
       - name: Install Linux release tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+        if: endsWith(matrix.target, '-unknown-linux-musl')
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools file binutils
@@ -115,10 +119,16 @@ jobs:
       - name: Build release binary
         shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            export CC_x86_64_unknown_linux_musl=musl-gcc
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
-          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              export CC_x86_64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+              ;;
+            aarch64-unknown-linux-musl)
+              export CC_aarch64_unknown_linux_musl=musl-gcc
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+              ;;
+          esac
 
           cargo build --profile dist -p squeezy --target "${{ matrix.target }}"
 
@@ -126,19 +136,22 @@ jobs:
         shell: bash
         run: |
           binary="${{ matrix.binary-path }}"
+          target="${{ matrix.target }}"
 
-          if [[ "${{ matrix.target }}" == "x86_64-unknown-linux-musl" ]]; then
-            file "$binary"
-            if readelf -l "$binary" | grep -q INTERP; then
-              echo "Linux release binary has a dynamic program interpreter" >&2
-              exit 1
-            fi
+          case "$target" in
+            *-unknown-linux-musl)
+              file "$binary"
+              if readelf -l "$binary" | grep -q INTERP; then
+                echo "Linux release binary has a dynamic program interpreter" >&2
+                exit 1
+              fi
 
-            if readelf -d "$binary" 2>/dev/null | grep -q NEEDED; then
-              echo "Linux release binary has dynamic library dependencies" >&2
-              exit 1
-            fi
-          fi
+              if readelf -d "$binary" 2>/dev/null | grep -q NEEDED; then
+                echo "Linux release binary has dynamic library dependencies" >&2
+                exit 1
+              fi
+              ;;
+          esac
 
           "$binary" doctor
           "$binary" --version

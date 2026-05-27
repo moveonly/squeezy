@@ -1,7 +1,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions, TryLockError},
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -9,7 +9,7 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,8 @@ pub const CRATE_NAME: &str = "squeezy-vcs";
 const DEFAULT_MAX_PATCH_BYTES: usize = 1_000_000;
 const DEFAULT_CHECKPOINT_RETENTION_DAYS: u64 = 7;
 const DEFAULT_MAX_CHECKPOINT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const SHADOW_LOCK_FILENAME: &str = "shadow.lock";
+const SHADOW_STALE_DIR_RETENTION_DAYS: u64 = 14;
 static SHADOW_REPO_INIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static CHECKPOINT_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,11 +61,16 @@ pub struct GitVcs {
     root: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CheckpointStore {
     root: PathBuf,
     git_dir: PathBuf,
     journal_path: PathBuf,
+    lock_path: PathBuf,
+    /// OS-advisory lock held for the lifetime of the store. Dropping the
+    /// [`File`] releases the lock; the [`Drop`] impl also unlinks
+    /// [`Self::lock_path`] so a fresh process sees a clean directory.
+    _lock: Option<File>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +240,50 @@ pub struct UnifiedDiffOutcome {
     pub skipped_paths: Vec<String>,
 }
 
+/// Kind of `apply_patch` operation surfaced to a preview consumer.
+///
+/// Mirrors the op tags accepted by the `apply_patch` tool so the preview
+/// stream stays meaningful even when the consumer never sees the full
+/// argument payload. Tag values match the `ApplyPatchOperation` JSON shape
+/// in `squeezy-tools` so the TUI can render a single label for both
+/// streamed previews and post-apply receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchOpKind {
+    SearchReplace,
+    CreateFile,
+    DeleteFile,
+    MoveFile,
+}
+
+/// One streamed preview item produced by [`preview_patch_stream`].
+///
+/// Each entry stands for a single op the model has fully described in the
+/// JSON tool-arg payload so far. Hashes are sha256 hex digests of the raw
+/// `search`/`replace`/`contents` bytes — emitting hashes instead of payload
+/// text keeps the preview channel cheap when an op rewrites a large block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchOpPreview {
+    /// Zero-based op index in the payload order.
+    pub index: usize,
+    pub kind: PatchOpKind,
+    /// Primary path: the file being mutated for in-place ops, or the
+    /// destination path for `MoveFile`.
+    pub path: String,
+    /// Source path for `MoveFile`. `None` for every other op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_path: Option<String>,
+    /// sha256 of the `search` body for `SearchReplace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_hash: Option<String>,
+    /// sha256 of the `replace` body for `SearchReplace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_hash: Option<String>,
+    /// sha256 of the `contents` body for `CreateFile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents_hash: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckpointJournal {
     pub checkpoints: Vec<CheckpointRecord>,
@@ -335,6 +386,30 @@ impl GitVcs {
         }
 
         let mut files = by_path.into_values().collect::<Vec<_>>();
+
+        // Bulk-fetch patches for all tracked files in a single `git diff`
+        // invocation. Spawning git once per file ran the snapshot at
+        // 20-50ms × N files on macOS; one batched call collapses that to
+        // a single subprocess regardless of N.
+        let mut bulk_patches: BTreeMap<String, Patch> = BTreeMap::new();
+        if let Some(refish_str) = refish {
+            let tracked: Vec<String> = files
+                .iter()
+                .filter(|file| file.code != "??")
+                .map(|file| file.path.clone())
+                .collect();
+            if !tracked.is_empty() {
+                bulk_patches = self.patches_bulk(
+                    &git_root,
+                    refish_str,
+                    mode == DiffMode::Index,
+                    &tracked,
+                    options.max_patch_bytes,
+                    &mut errors,
+                );
+            }
+        }
+
         for file in &mut files {
             if file.status == DiffFileStatus::Added
                 && file.code == "??"
@@ -347,7 +422,12 @@ impl GitVcs {
 
             let patch = if file.code == "??" || refish.is_none() {
                 self.patch_untracked(&git_root, &file.path, options.max_patch_bytes)
+            } else if let Some(patch) = bulk_patches.remove(&file.path) {
+                Some(patch)
             } else {
+                // Fall back to a per-file call if the bulk parser missed
+                // this path (unusual filenames that the splitter could
+                // not match back). Preserves behavior for the long tail.
                 self.patch_file(
                     &git_root,
                     refish.unwrap_or("HEAD"),
@@ -406,6 +486,32 @@ impl GitVcs {
             errors,
         }
     }
+
+    // Design note — unified-diff fallback as the explicit escape hatch.
+    //
+    // The primary patch surface in `squeezy-tools::apply_patch` is strict
+    // literal search-replace gated by `expected_sha256`: the `search` block
+    // must substring-match the on-disk file byte-for-byte, and the pre-edit
+    // hash must match the current on-disk hash. A mismatch yields
+    // `ToolStatus::Stale` and refuses to write. This guarantees the agent
+    // can never silently overwrite a file whose contents drifted away from
+    // what it planned against — including drift produced by the user
+    // between turns or by a concurrent tool.
+    //
+    // Codex-style progressive line-pattern fuzz (exact → rstrip → trimmed
+    // → Unicode-normalised) is intentionally NOT the default. It trades a
+    // pre-mutation hash check for opportunistic typographic recovery, and
+    // the resulting "the model intended this so we wrote it" semantics
+    // weaken the cross-turn safety property above.
+    //
+    // The unified-diff path below is the deliberate escape hatch: callers
+    // opt in per-block via `fallback:"unified_diff"` when their literal
+    // search misses. It runs `git apply --3way --ignore-whitespace`, which
+    // recovers the typographic-drift cases (smart quotes, em-dashes, NBSP,
+    // tab/space drift) without giving up the sha256 contract — the caller
+    // still gates around this call with checkpoint capture and post-apply
+    // hash tracking. Promote this fallback in error messages and docs
+    // rather than loosening the literal default.
 
     /// Run `git apply --check --3way` against the user worktree to see whether
     /// the given unified-diff body would apply cleanly. No files are mutated.
@@ -662,6 +768,46 @@ impl GitVcs {
         parse_numstat(&output.stdout).into_values().next()
     }
 
+    /// Fetch patches for `files` in a single `git diff` invocation. Splits
+    /// the combined output on each `diff --git a/<path> b/<path>` header,
+    /// caps each per-file slice at `max_bytes`, and returns the result
+    /// keyed by file path. Files that the splitter can't map back to an
+    /// entry in `files` are silently dropped — the caller falls back to
+    /// per-file `patch_file` for those. Errors from git are surfaced as
+    /// warnings via `errors`; on failure the map is empty and the caller
+    /// falls back transparently.
+    fn patches_bulk(
+        &self,
+        git_root: &Path,
+        refish: &str,
+        cached: bool,
+        files: &[String],
+        max_bytes: usize,
+        errors: &mut Vec<String>,
+    ) -> BTreeMap<String, Patch> {
+        let mut args = vec![
+            "diff".to_string(),
+            "--patch".to_string(),
+            "--no-ext-diff".to_string(),
+            "--no-renames".to_string(),
+            "--unified=3".to_string(),
+        ];
+        if cached {
+            args.push("--cached".to_string());
+        }
+        args.push(refish.to_string());
+        args.push("--".to_string());
+        args.extend(files.iter().cloned());
+        let output = match git_output_vec_allow_status(git_root, args, &[0]) {
+            Ok(output) => output,
+            Err(err) => {
+                errors.push(format!("git diff (bulk) failed: {err}"));
+                return BTreeMap::new();
+            }
+        };
+        split_unified_patch(&output.stdout, files, max_bytes)
+    }
+
     fn patch_file(
         &self,
         git_root: &Path,
@@ -713,11 +859,19 @@ impl CheckpointStore {
         let dir = root.join(".squeezy").join("checkpoints");
         let git_dir = dir.join("git");
         let journal_path = dir.join("journal.jsonl");
+        let lock_path = dir.join(SHADOW_LOCK_FILENAME);
         fs::create_dir_all(&git_dir)?;
+        // Acquire the per-workspace shadow-repo lock before any cleanup or
+        // git work — two squeezy processes pointed at the same workspace
+        // must not race on `git add --all` + `write-tree`.
+        let lock = acquire_shadow_lock(&lock_path)?;
+        cleanup_stale_shadow_dirs(&dir, SHADOW_STALE_DIR_RETENTION_DAYS);
         let store = Self {
             root,
             git_dir,
             journal_path,
+            lock_path,
+            _lock: Some(lock),
         };
         store.ensure_shadow_repo()?;
         store.cleanup_old_checkpoints(DEFAULT_CHECKPOINT_RETENTION_DAYS)?;
@@ -1566,6 +1720,103 @@ fn hooks_off_value() -> &'static str {
     if cfg!(windows) { "NUL" } else { "/dev/null" }
 }
 
+/// Acquire an OS-advisory exclusive lock on the per-workspace shadow-repo
+/// lock file. Returns the open [`File`] so the caller can hold the lock by
+/// keeping the handle alive; dropping the file releases the lock.
+///
+/// The lock file body contains `<pid>\n<unix_millis>\n` for human / log
+/// diagnostics — neither field is consulted for correctness, the OS lock
+/// is the source of truth.
+fn acquire_shadow_lock(lock_path: &Path) -> Result<File> {
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => {
+            return Err(SqueezyError::Tool(format!(
+                "another squeezy process is holding the shadow-repo lock at {} \
+                 — start one squeezy per workspace or wait for it to exit",
+                lock_path.display()
+            )));
+        }
+        Err(TryLockError::Error(err)) => {
+            return Err(SqueezyError::Tool(format!(
+                "failed to acquire shadow-repo lock at {}: {err}",
+                lock_path.display()
+            )));
+        }
+    }
+    // Best-effort PID/timestamp diagnostics. A failure here must not
+    // release the lock we just took, so we log + continue.
+    let body = format!("{}\n{}\n", std::process::id(), now_ms());
+    if let Ok(mut handle) = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(lock_path)
+    {
+        let _ = handle.write_all(body.as_bytes());
+    }
+    Ok(file)
+}
+
+/// Remove orphan entries inside `.squeezy/checkpoints/` that are older
+/// than `retention_days`. The active shadow `git/` repo, the journal file,
+/// and the current lock file are always preserved; everything else (stray
+/// scratch directories, abandoned `.lock` files from crashed processes,
+/// stale temporaries) is swept so a long-running workspace does not
+/// accumulate untracked bookkeeping.
+///
+/// Failures are intentionally swallowed: cleanup is best-effort and must
+/// never prevent the store from opening.
+fn cleanup_stale_shadow_dirs(checkpoints_dir: &Path, retention_days: u64) {
+    let Ok(entries) = fs::read_dir(checkpoints_dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days * 24 * 60 * 60))
+        .unwrap_or(UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if matches!(name, "git" | "journal.jsonl" | SHADOW_LOCK_FILENAME) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if modified >= cutoff {
+            continue;
+        }
+        if metadata.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+impl Drop for CheckpointStore {
+    fn drop(&mut self) {
+        // Release the OS lock first by dropping the file handle, then
+        // remove the lock file so a fresh process opening the same
+        // workspace does not have to inspect a stale sentinel.
+        self._lock.take();
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
 fn mtime_parts(metadata: &fs::Metadata) -> (i64, u32) {
     let Ok(modified) = metadata.modified() else {
         return (0, 0);
@@ -1714,6 +1965,83 @@ fn parse_count(value: &str) -> u64 {
     }
 }
 
+/// Split combined `git diff --patch` output into per-file slices. The
+/// stream looks like:
+///
+/// ```text
+/// diff --git a/foo b/foo
+/// index ...
+/// --- a/foo
+/// +++ b/foo
+/// @@ ...
+/// diff --git a/bar b/bar
+/// ...
+/// ```
+///
+/// Each `diff --git a/<path> b/<path>` line opens a new file section
+/// that runs until the next such line (or EOF). We match the trailing
+/// `b/<path>` against `expected_files` so paths with embedded spaces
+/// still resolve correctly — git omits the trailing whitespace.
+fn split_unified_patch(
+    bytes: &[u8],
+    expected_files: &[String],
+    max_bytes: usize,
+) -> BTreeMap<String, Patch> {
+    let text = String::from_utf8_lossy(bytes);
+    let expected: BTreeSet<&str> = expected_files.iter().map(String::as_str).collect();
+    let mut out: BTreeMap<String, Patch> = BTreeMap::new();
+    let mut current_path: Option<String> = None;
+    let mut buffer = String::new();
+    let flush = |path: Option<String>, buffer: &mut String, out: &mut BTreeMap<String, Patch>| {
+        if let Some(path) = path {
+            let truncated = buffer.len() > max_bytes;
+            let text = if truncated {
+                buffer[..max_bytes].to_string()
+            } else {
+                std::mem::take(buffer)
+            };
+            out.insert(path, Patch { text, truncated });
+        }
+        buffer.clear();
+    };
+    for line in text.split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git a/")
+            && let Some(path) = extract_diff_git_path(rest, &expected)
+        {
+            flush(current_path.take(), &mut buffer, &mut out);
+            current_path = Some(path);
+        }
+        buffer.push_str(line);
+    }
+    flush(current_path, &mut buffer, &mut out);
+    out
+}
+
+/// Extract the `b/<path>` half of a `diff --git a/<path> b/<path>` line,
+/// matching against the known file list to handle paths with embedded
+/// spaces. The input is the suffix that follows `diff --git a/`.
+fn extract_diff_git_path<'a>(suffix: &'a str, expected: &BTreeSet<&'a str>) -> Option<String> {
+    let trimmed = suffix.trim_end_matches('\n').trim_end_matches('\r');
+    // The canonical no-spaces form: `<path> b/<path>`. Try it first.
+    if let Some(idx) = trimmed.find(" b/") {
+        let candidate = &trimmed[..idx];
+        if expected.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    // Fallback for paths with spaces: scan every ` b/<known-path>` suffix.
+    for path in expected {
+        let needle = format!(" b/{path}");
+        if trimmed.ends_with(&needle) {
+            let prefix_len = trimmed.len() - needle.len();
+            if trimmed[..prefix_len] == *path.to_string() {
+                return Some((*path).to_string());
+            }
+        }
+    }
+    None
+}
+
 fn capped_patch(bytes: Vec<u8>, max_bytes: usize) -> Patch {
     let truncated = bytes.len() > max_bytes;
     let text = if truncated {
@@ -1722,6 +2050,138 @@ fn capped_patch(bytes: Vec<u8>, max_bytes: usize) -> Patch {
         String::from_utf8_lossy(&bytes).to_string()
     };
     Patch { text, truncated }
+}
+
+/// Walk an `apply_patch` JSON payload and emit one [`PatchOpPreview`] per op
+/// in payload order.
+///
+/// Used by the TUI to render an incremental preview while the model is still
+/// streaming tool-arg tokens: callers feed the fully-parsed payload (or a
+/// snapshot of the partial payload that has reached a `{...}` boundary) and
+/// the closure is invoked synchronously once per op the walker recognises.
+/// `sink` is the stream surface — collect, throttle, or push onto a channel
+/// from inside the closure. Returns the number of ops emitted.
+///
+/// The payload is the same JSON shape `apply_patch` itself consumes. Both
+/// the multi-op `operations` array (preferred) and the legacy `patches`
+/// array of search/replace blocks are recognised. Unknown fields are
+/// ignored so a partial JSON snapshot that omits optional keys still
+/// produces a usable preview. Returns `Err` only when the payload is not
+/// parseable as JSON.
+pub fn preview_patch_stream<F>(payload: &str, mut sink: F) -> Result<usize>
+where
+    F: FnMut(PatchOpPreview),
+{
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|err| SqueezyError::Tool(format!("apply_patch payload not valid JSON: {err}")))?;
+    let mut index = 0usize;
+    if let Some(operations) = value.get("operations").and_then(|ops| ops.as_array()) {
+        for op in operations {
+            if let Some(preview) = op_preview_from_operation(index, op) {
+                sink(preview);
+                index += 1;
+            }
+        }
+    }
+    if let Some(patches) = value.get("patches").and_then(|patches| patches.as_array()) {
+        for patch in patches {
+            if let Some(preview) = op_preview_from_search_replace(index, patch) {
+                sink(preview);
+                index += 1;
+            }
+        }
+    }
+    Ok(index)
+}
+
+fn op_preview_from_operation(index: usize, op: &serde_json::Value) -> Option<PatchOpPreview> {
+    let kind = op.get("kind").and_then(|kind| kind.as_str())?;
+    match kind {
+        "search_replace" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::SearchReplace,
+                path,
+                from_path: None,
+                search_hash: op
+                    .get("search")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+                replace_hash: op
+                    .get("replace")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+                contents_hash: None,
+            })
+        }
+        "create_file" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::CreateFile,
+                path,
+                from_path: None,
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: op
+                    .get("contents")
+                    .and_then(|value| value.as_str())
+                    .map(|text| sha256_hex(text.as_bytes())),
+            })
+        }
+        "delete_file" => {
+            let path = op.get("path").and_then(|path| path.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::DeleteFile,
+                path,
+                from_path: None,
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: None,
+            })
+        }
+        "move_file" => {
+            let from = op.get("from").and_then(|from| from.as_str())?.to_string();
+            let to = op.get("to").and_then(|to| to.as_str())?.to_string();
+            Some(PatchOpPreview {
+                index,
+                kind: PatchOpKind::MoveFile,
+                path: to,
+                from_path: Some(from),
+                search_hash: None,
+                replace_hash: None,
+                contents_hash: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn op_preview_from_search_replace(
+    index: usize,
+    patch: &serde_json::Value,
+) -> Option<PatchOpPreview> {
+    let path = patch
+        .get("path")
+        .and_then(|path| path.as_str())?
+        .to_string();
+    Some(PatchOpPreview {
+        index,
+        kind: PatchOpKind::SearchReplace,
+        path,
+        from_path: None,
+        search_hash: patch
+            .get("search")
+            .and_then(|value| value.as_str())
+            .map(|text| sha256_hex(text.as_bytes())),
+        replace_hash: patch
+            .get("replace")
+            .and_then(|value| value.as_str())
+            .map(|text| sha256_hex(text.as_bytes())),
+        contents_hash: None,
+    })
 }
 
 pub fn parse_patch_hunks(patch: &str) -> Vec<DiffHunk> {

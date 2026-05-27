@@ -902,6 +902,7 @@ fn decode_html_entities(input: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WebSearchArgs {
     pub(crate) query: String,
     num_results: Option<usize>,
@@ -949,6 +950,7 @@ impl WebSearchLivecrawl {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WebFetchArgs {
     pub(crate) url: String,
     format: Option<WebFetchFormat>,

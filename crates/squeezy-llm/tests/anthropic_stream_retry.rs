@@ -134,6 +134,9 @@ fn build_request(model: &str) -> LlmRequest {
         cache_key: None,
         tools: Arc::from(Vec::new()),
         store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
     }
 }
 

@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
+    ReasoningPayload,
     credentials::resolve_api_key_with_inline,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
@@ -181,6 +182,18 @@ impl OpenAiCompatibleProvider {
                     })
                     .collect::<Vec<_>>()
             );
+            // Forward `tool_choice` when the caller set one. Omitting the
+            // field leaves the provider's default in place (typically
+            // `auto`), which preserves historical behavior for working
+            // models. Tool-shy models routed through aggregators (Qwen
+            // via OpenRouter, smaller MoEs) ignore `auto` and emit a
+            // chatty preamble with zero tool calls; setting
+            // `tool_choice = "required"` in `[model]` flips them into
+            // calling at least one tool per turn — see opencode's
+            // pass-through pattern in `openai-chat.ts:267`.
+            if let Some(choice) = request.tool_choice.as_deref() {
+                body["tool_choice"] = json!(choice);
+            }
         }
         body
     }
@@ -317,11 +330,20 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 }
             }
 
-            // The aggregator closed the stream without `[DONE]`. Emit any
-            // pending tool calls and a Completed event so the agent loop can
-            // finish cleanly.
+            // The aggregator closed the stream without `[DONE]`. Drain
+            // pending tool calls + reasoning so neither is lost, inject the
+            // empty-output notice if nothing visible reached the user, then
+            // emit Completed so the agent loop finishes cleanly.
             for emitted in state.drain_tool_calls()? {
                 yield emitted;
+            }
+            if let Some(reasoning_done) = drain_reasoning(&mut state) {
+                yield reasoning_done;
+            }
+            if !state.saw_visible_output && !state.completed_emitted {
+                yield LlmEvent::TextDelta(
+                    "\n[squeezy] stream ended without producing any content or tool call. The provider may have cut the connection mid-response; retry the turn.\n".to_string(),
+                );
             }
             if !state.completed_emitted {
                 yield LlmEvent::Completed {
@@ -422,6 +444,24 @@ struct StreamState {
     cost: CostSnapshot,
     tool_calls: BTreeMap<usize, PartialToolCall>,
     completed_emitted: bool,
+    /// Accumulates `reasoning_content` / `reasoning` text streamed across
+    /// chat-completions deltas. Drained into a `ReasoningDone` event when
+    /// the stream finishes so the agent loop persists the segment to the
+    /// conversation history and the TUI promotes the live "thinking"
+    /// buffer into a permanent transcript entry. Without this, providers
+    /// routed through chat-completions (PortKey, OpenRouter, DeepSeek,
+    /// Qwen, etc.) emitted reasoning deltas but never a Done event, so
+    /// the TUI cleared the live buffer on turn completion and the text
+    /// vanished.
+    reasoning_buf: String,
+    /// Whether any user-visible signal has surfaced this stream. Set
+    /// `true` on the first non-empty content delta OR on the first
+    /// tool-call delta carrying a function name. Reasoning deltas do
+    /// *not* count: a reasoning-only response (Qwen3-style: model
+    /// thinks, finishes with `stop`, no content or tool calls) is
+    /// exactly the case we want to detect so we can inject a visible
+    /// notice instead of completing with an empty assistant message.
+    saw_visible_output: bool,
 }
 
 #[derive(Debug, Default)]
@@ -441,6 +481,12 @@ impl StreamState {
             if let Some(name) = function.get("name").and_then(Value::as_str) {
                 let acc = entry.name.get_or_insert_with(String::new);
                 acc.push_str(name);
+                // A tool-call delta carrying a function name is the model
+                // committing to actionable output. Latch the visibility
+                // signal so we suppress the no-output notice even if the
+                // stream cuts before arguments fully arrive (incomplete
+                // tool calls are handled defensively in drain_tool_calls).
+                self.saw_visible_output = true;
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
                 entry.arguments.push_str(arguments);
@@ -453,11 +499,21 @@ impl StreamState {
         let drained = std::mem::take(&mut self.tool_calls);
         for (index, partial) in drained {
             let call_id = partial.call_id.unwrap_or_else(|| format!("call_{index}"));
-            let name = partial.name.ok_or_else(|| {
-                SqueezyError::ProviderStream(
-                    "chat completions tool call missing function name".to_string(),
-                )
-            })?;
+            // Skip incomplete tool calls (no function.name accumulated)
+            // instead of erroring the whole stream. PortKey / OpenRouter /
+            // Qwen sometimes ship a tool-call delta whose name chunk goes
+            // missing or whose stream cuts mid-call. Erroring here would
+            // discard any assistant text the model already produced and
+            // halt the turn. Match opencode's `finishAll`
+            // (utils/tool-stream.ts:200): drop the partial entry, complete
+            // the turn with whatever did surface, let the model retry next
+            // turn. A short stderr warning makes the drop traceable.
+            let Some(name) = partial.name else {
+                eprintln!(
+                    "squeezy: skipping incomplete chat-completions tool call at index {index} (call_id={call_id}, no function name in stream)"
+                );
+                continue;
+            };
             let arguments_text = if partial.arguments.is_empty() {
                 "{}".to_string()
             } else {
@@ -478,6 +534,25 @@ impl StreamState {
         }
         Ok(events)
     }
+}
+
+/// Flush any reasoning text accumulated across delta events into a
+/// `ReasoningDone` event so the agent loop persists the segment to
+/// conversation history and the TUI promotes the live "thinking" buffer
+/// into a permanent transcript entry. Uses the OpenAi payload variant as
+/// a generic carrier — the chat-completions replay path drops
+/// `LlmInputItem::Reasoning` items entirely, so the variant choice only
+/// affects display, never the wire format on the next turn.
+fn drain_reasoning(state: &mut StreamState) -> Option<LlmEvent> {
+    let text = std::mem::take(&mut state.reasoning_buf);
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(LlmEvent::ReasoningDone(ReasoningPayload::OpenAi {
+        item_id: String::new(),
+        summary: vec![text],
+        encrypted_content: None,
+    }))
 }
 
 /// Flatten a Chat-Completions delta field that may be a plain string or an
@@ -514,6 +589,9 @@ fn collect_delta_text(value: Option<&Value>) -> String {
 fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>> {
     if data == "[DONE]" {
         let mut events = state.drain_tool_calls()?;
+        if let Some(reasoning_done) = drain_reasoning(state) {
+            events.push(reasoning_done);
+        }
         if !state.completed_emitted {
             events.push(LlmEvent::Completed {
                 response_id: state.response_id.take(),
@@ -553,6 +631,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 let reasoning = collect_delta_text(delta.get("reasoning_content"))
                     + &collect_delta_text(delta.get("reasoning"));
                 if !reasoning.is_empty() {
+                    state.reasoning_buf.push_str(&reasoning);
                     events.push(LlmEvent::ReasoningDelta {
                         text: reasoning,
                         kind: ReasoningKind::Summary,
@@ -560,6 +639,7 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                 }
                 let content = collect_delta_text(delta.get("content"));
                 if !content.is_empty() {
+                    state.saw_visible_output = true;
                     events.push(LlmEvent::TextDelta(content));
                 }
                 if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -575,8 +655,45 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
                     "tool_calls" | "function_call" => {
                         events.extend(state.drain_tool_calls()?);
                     }
-                    "stop" | "length" | "content_filter" => {
+                    "stop" => {
                         events.extend(state.drain_tool_calls()?);
+                        // Reasoning-mode models (Qwen3, DeepSeek-R1 via
+                        // aggregator, etc.) sometimes emit only reasoning
+                        // and finish cleanly with `stop` — no content, no
+                        // tool calls. The agent loop would then push an
+                        // empty assistant message and the user would see
+                        // the spinner stop with nothing visible in the
+                        // transcript. Drain the streamed reasoning so it
+                        // lands in the transcript first, then inject a
+                        // visible notice so the user understands the turn
+                        // produced no actionable output. Skipped when the
+                        // model did emit content or a tool call.
+                        if !state.saw_visible_output {
+                            if let Some(reasoning_done) = drain_reasoning(state) {
+                                events.push(reasoning_done);
+                            }
+                            events.push(LlmEvent::TextDelta(
+                                "\n[squeezy] model finished without emitting any content or tool call (finish_reason=stop). Reasoning-mode models can burn their output budget on thinking; try a more concrete prompt, lower reasoning_effort, or set [model].tool_choice = \"required\" to force a tool call.\n".to_string(),
+                            ));
+                        }
+                    }
+                    "length" => {
+                        events.extend(state.drain_tool_calls()?);
+                        if let Some(reasoning_done) = drain_reasoning(state) {
+                            events.push(reasoning_done);
+                        }
+                        events.push(LlmEvent::TextDelta(
+                            "\n[squeezy] response truncated by max_output_tokens (finish_reason=length). Raise providers.<name>.max_output_tokens or lower reasoning_effort and retry.\n".to_string(),
+                        ));
+                    }
+                    "content_filter" => {
+                        events.extend(state.drain_tool_calls()?);
+                        if let Some(reasoning_done) = drain_reasoning(state) {
+                            events.push(reasoning_done);
+                        }
+                        events.push(LlmEvent::TextDelta(
+                            "\n[squeezy] response blocked by content filter (finish_reason=content_filter).\n".to_string(),
+                        ));
                     }
                     _ => {}
                 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::format_approval_prompt;
 use squeezy_agent::ToolApprovalRequest;
 use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
 use std::collections::BTreeMap;
@@ -155,4 +156,79 @@ fn previews_distinguish_by_capability() {
     assert_ne!(s, e, "shell and edit previews must differ");
     assert!(s.contains("$ cargo test"), "shell missing prompt: {s}");
     assert!(e.contains("✎ /tmp/a.rs"), "edit missing pen icon: {e}");
+}
+
+#[test]
+fn approval_menu_labels_name_capability_scope() {
+    // Shell with a `binary` metadata key names the binary in the label.
+    let shell = request_with(
+        "shell",
+        PermissionCapability::Shell,
+        "cargo:*",
+        &[("command", "cargo test --workspace"), ("binary", "cargo")],
+    );
+    let menu = format_approval_prompt(&shell);
+    assert!(
+        menu.contains("Always allow command cargo"),
+        "shell project label missing binary scope: {menu}"
+    );
+    assert!(
+        menu.contains("Allow command cargo (session)"),
+        "shell session label missing binary scope: {menu}"
+    );
+
+    // Network surfaces the host so users can codify "allow this host" in one
+    // keystroke (audit E-UX-06 cites Codex's `ApplyNetworkPolicyAmendment`).
+    let net = request_with(
+        "webfetch",
+        PermissionCapability::Network,
+        "domain:docs.rs",
+        &[("host", "docs.rs"), ("url", "https://docs.rs/serde")],
+    );
+    let net_menu = format_approval_prompt(&net);
+    assert!(
+        net_menu.contains("Always allow host docs.rs"),
+        "network project label missing host: {net_menu}"
+    );
+
+    // MCP names server/tool so the resulting rule shape is visible.
+    let mcp = request_with(
+        "mcp",
+        PermissionCapability::Mcp,
+        "filesystem/read",
+        &[("server", "filesystem"), ("tool", "read")],
+    );
+    let mcp_menu = format_approval_prompt(&mcp);
+    assert!(
+        mcp_menu.contains("Always allow MCP tool filesystem/read"),
+        "mcp project label missing scope: {mcp_menu}"
+    );
+
+    // Edit names the write path so users can save a path-scoped rule.
+    let edit = request_with(
+        "write_file",
+        PermissionCapability::Edit,
+        "path:/repo/foo.rs",
+        &[("path", "/repo/foo.rs")],
+    );
+    let edit_menu = format_approval_prompt(&edit);
+    assert!(
+        edit_menu.contains("Always allow edits to /repo/foo.rs"),
+        "edit project label missing path: {edit_menu}"
+    );
+
+    // Capabilities without scope metadata fall back to the generic label,
+    // which is what the original UI did.
+    let git = request_with("git", PermissionCapability::Git, "git:status", &[]);
+    let git_menu = format_approval_prompt(&git);
+    assert!(
+        git_menu.contains("Always approve this command in this repo"),
+        "git label should fall back to generic when no scope is available: {git_menu}"
+    );
+
+    // Deny options remain capability-agnostic.
+    assert!(
+        git_menu.contains("Deny") && git_menu.contains("Deny for this session"),
+        "deny options missing: {git_menu}"
+    );
 }

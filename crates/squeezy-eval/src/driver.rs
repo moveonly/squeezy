@@ -964,6 +964,27 @@ impl Driver {
                         },
                     )?;
                 }
+                AgentEvent::SubagentRejected {
+                    turn_id,
+                    agent,
+                    reason,
+                    limit,
+                    active,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::SubagentEvent {
+                            event: json!({
+                                "kind": "rejected",
+                                "agent": agent,
+                                "reason": reason.as_str(),
+                                "limit": limit,
+                                "active": active,
+                            }),
+                        },
+                    )?;
+                }
                 AgentEvent::AiReviewerTripped { turn_id, reason } => {
                     let turn_str = format!("{turn_id:?}");
                     self.capture.record(

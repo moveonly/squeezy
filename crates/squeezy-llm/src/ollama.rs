@@ -1,7 +1,9 @@
 use async_stream::try_stream;
+use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use squeezy_core::{CostSnapshot, OllamaConfig, ProviderTransportConfig, Result, SqueezyError};
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -324,6 +326,128 @@ fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
         });
     }
     Ok(events)
+}
+
+/// Streaming event emitted by [`pull_model`].
+///
+/// Ollama's `POST /api/pull` returns newline-delimited JSON; each line lands
+/// on the stream as one of these variants. The stream terminates either with
+/// [`PullEvent::Success`] or by surfacing a transport / parse error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullEvent {
+    /// Human-readable status message (`"pulling manifest"`, `"verifying digest"`).
+    Status(String),
+    /// Byte-level progress for one layer digest.
+    Progress {
+        digest: String,
+        total: Option<u64>,
+        completed: Option<u64>,
+    },
+    /// Pull finished successfully.
+    Success,
+}
+
+/// Boxed stream alias matching `LlmStream`'s shape for [`pull_model`].
+pub type PullStream = Pin<Box<dyn Stream<Item = Result<PullEvent>> + Send>>;
+
+/// Stream model-pull progress from an Ollama server's `/api/pull` endpoint.
+///
+/// The returned stream emits one event per NDJSON line. Server-side errors
+/// (`{"error": "..."}` payloads) are surfaced as `Err(ProviderStream(_))`
+/// and end the stream. Cancelling `cancel` shuts the stream down cleanly.
+///
+/// `base_url` should be the Ollama server root including `/api` — the same
+/// shape `OllamaConfig.base_url` carries (`http://localhost:11434/api`).
+pub fn pull_model(base_url: &str, model: &str, cancel: CancellationToken) -> PullStream {
+    let client = reqwest::Client::new();
+    let url = format!("{}/pull", base_url.trim_end_matches('/'));
+    let body = json!({ "model": model, "stream": true });
+
+    Box::pin(try_stream! {
+        let response = tokio::select! {
+            _ = cancel.cancelled() => {
+                return;
+            }
+            result = client.post(&url).json(&body).send() => result,
+        }
+        .map_err(|err| SqueezyError::ProviderRequest(format!("ollama pull request failed: {err}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read error response".to_string());
+            Err(SqueezyError::ProviderRequest(format!(
+                "ollama pull {status}: {message}"
+            )))?;
+            unreachable!("provider error returned above");
+        }
+
+        let mut decoder = JsonLineDecoder::default();
+        let mut bytes = response.bytes_stream();
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => return,
+                next = bytes.next() => next,
+            };
+            let Some(chunk) = next else { break; };
+            let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
+            for line in decoder.push(&chunk) {
+                match parse_pull_line(&line)? {
+                    Some(event @ PullEvent::Success) => {
+                        yield event;
+                        return;
+                    }
+                    Some(event) => yield event,
+                    None => {}
+                }
+            }
+        }
+        for line in decoder.finish() {
+            match parse_pull_line(&line)? {
+                Some(event @ PullEvent::Success) => {
+                    yield event;
+                    return;
+                }
+                Some(event) => yield event,
+                None => {}
+            }
+        }
+    })
+}
+
+/// Parse one NDJSON line emitted by Ollama's `/api/pull` endpoint. Returns
+/// `Ok(None)` for lines that carry neither a recognisable status nor
+/// progress field (Ollama occasionally emits empty `{}` keep-alive frames).
+pub(crate) fn parse_pull_line(line: &str) -> Result<Option<PullEvent>> {
+    let value: Value = serde_json::from_str(line)
+        .map_err(|err| SqueezyError::ProviderStream(format!("invalid Ollama pull JSON: {err}")))?;
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        return Err(SqueezyError::ProviderStream(format!(
+            "ollama pull error: {error}"
+        )));
+    }
+    // The server returns `status: "success"` on the final line. Treat it as
+    // the success terminator regardless of any other fields present.
+    if value.get("status").and_then(Value::as_str) == Some("success") {
+        return Ok(Some(PullEvent::Success));
+    }
+    // A line carrying a digest is a per-layer download progress update,
+    // even when `total`/`completed` are missing on intermediate frames.
+    if let Some(digest) = value.get("digest").and_then(Value::as_str) {
+        let total = value.get("total").and_then(Value::as_u64);
+        let completed = value.get("completed").and_then(Value::as_u64);
+        return Ok(Some(PullEvent::Progress {
+            digest: digest.to_string(),
+            total,
+            completed,
+        }));
+    }
+    if let Some(status) = value.get("status").and_then(Value::as_str) {
+        return Ok(Some(PullEvent::Status(status.to_string())));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

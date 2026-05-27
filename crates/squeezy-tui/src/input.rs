@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use squeezy_agent::RequestUserInputResponse;
+use squeezy_core::PermissionCapability;
 
 use crate::{TranscriptItem, TuiApp, mention, overlay};
 
@@ -14,6 +15,12 @@ pub(crate) struct SlashCommand {
     pub(crate) description: &'static str,
     pub(crate) available_during_task: bool,
     pub(crate) parameter_hint: Option<&'static str>,
+    /// Capabilities this command exercises on the user's behalf. Surfaced in
+    /// the slash menu so a user can see at a glance whether typing the
+    /// command will read the filesystem, hit the network, modify settings, or
+    /// perform a destructive operation. Empty for purely informational or
+    /// in-memory commands (e.g. `/cost`, `/expand`).
+    pub(crate) capabilities: &'static [PermissionCapability],
 }
 
 const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
@@ -22,6 +29,7 @@ const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
         description,
         available_during_task: true,
         parameter_hint: None,
+        capabilities: &[],
     }
 }
 
@@ -31,6 +39,7 @@ const fn slash_locked(name: &'static str, description: &'static str) -> SlashCom
         description,
         available_during_task: false,
         parameter_hint: None,
+        capabilities: &[],
     }
 }
 
@@ -45,6 +54,38 @@ const fn slash_args(
         description,
         available_during_task,
         parameter_hint: Some(parameter_hint),
+        capabilities: &[],
+    }
+}
+
+const fn slash_caps(
+    name: &'static str,
+    description: &'static str,
+    available_during_task: bool,
+    capabilities: &'static [PermissionCapability],
+) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task,
+        parameter_hint: None,
+        capabilities,
+    }
+}
+
+const fn slash_args_caps(
+    name: &'static str,
+    description: &'static str,
+    available_during_task: bool,
+    parameter_hint: &'static str,
+    capabilities: &'static [PermissionCapability],
+) -> SlashCommand {
+    SlashCommand {
+        name,
+        description,
+        available_during_task,
+        parameter_hint: Some(parameter_hint),
+        capabilities,
     }
 }
 
@@ -77,15 +118,33 @@ pub(crate) fn match_slash_command_prefix(text: &str) -> Option<usize> {
 }
 
 pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
-    slash("/help", "show local Squeezy help topics"),
-    slash_args(
+    // `/help` is forwarded to the model as a normal user turn, so it counts
+    // as a network-exercising command.
+    slash_caps(
+        "/help",
+        "show local Squeezy help topics",
+        true,
+        &[PermissionCapability::Network],
+    ),
+    slash_args_caps(
         "/config",
         "open the config screen (or pass a section name)",
         true,
         "[section]",
+        &[PermissionCapability::Edit],
     ),
-    slash("/model", "open config focused on provider and model"),
-    slash("/permissions", "open config focused on permissions"),
+    slash_caps(
+        "/model",
+        "open config focused on provider and model",
+        true,
+        &[PermissionCapability::Edit],
+    ),
+    slash_caps(
+        "/permissions",
+        "open config focused on permissions",
+        true,
+        &[PermissionCapability::Edit],
+    ),
     slash_args(
         "/plan",
         "switch to Plan mode (optionally with a prompt to run)",
@@ -98,74 +157,189 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         false,
         "[prompt]",
     ),
-    slash_args(
+    slash_args_caps(
         "/plans",
         "manage persisted plan-mode artifacts (list/show/delete/set-active/open)",
         true,
         "[list|show|delete|set-active|open] [<id>]",
+        &[PermissionCapability::Read],
     ),
     slash("/cost", "show token and cost accounting"),
     slash("/context", "show context budget and compaction state"),
-    slash_args(
+    slash("/reviewer", "show recent AI reviewer auto-decisions"),
+    slash_args_caps(
         "/attach",
         "attach a file as prompt context",
         false,
         "<path>",
+        &[PermissionCapability::Read],
     ),
     slash("/attachments", "list attached context"),
     slash("/copy", "copy last answer or transcript"),
-    slash_locked(
-        "/compact",
-        "compact conversation context now (use '/compact undo' to restore)",
-    ),
+    // `/compact` triggers a summarisation turn against the model.
+    SlashCommand {
+        name: "/compact",
+        description: "compact conversation context now (use '/compact undo' to restore)",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[PermissionCapability::Network],
+    },
     slash("/collapse", "collapse transcript entries"),
     slash("/expand", "expand transcript entries"),
-    slash("/diff", "show uncommitted changes (tracked + untracked)"),
+    slash_caps(
+        "/diff",
+        "show uncommitted changes (tracked + untracked)",
+        true,
+        &[PermissionCapability::Git, PermissionCapability::Read],
+    ),
     slash("/jobs", "list background jobs"),
     slash_args("/job", "show a background job", true, "<id>"),
     slash_args("/job-cancel", "cancel a background job", true, "<id>"),
     slash_args("/pin", "pin transcript context", false, "<id>"),
     slash("/pins", "list pinned context"),
     slash_args("/unpin", "remove pinned context", false, "<id>"),
-    slash("/feedback", "preview or send product feedback"),
-    slash("/report", "preview or send a bug report"),
-    slash("/sessions", "list recent sessions"),
-    slash_args("/session", "show a saved session", true, "<id>"),
-    slash_args("/resume", "resume a saved session", false, "<id>"),
-    slash_args("/session-export", "export a saved session", false, "<id>"),
-    slash_locked("/session-cleanup", "remove old sessions"),
-    slash("/checkpoints", "list local checkpoints"),
-    slash_args("/checkpoint", "show a local checkpoint", true, "<id>"),
-    slash_locked("/undo", "undo the latest checkpoint"),
-    slash_locked("/revert-turn", "revert a turn checkpoint"),
-    slash_args(
+    slash_caps(
+        "/feedback",
+        "preview or send product feedback",
+        true,
+        &[PermissionCapability::Network],
+    ),
+    slash_caps(
+        "/report",
+        "preview or send a bug report",
+        true,
+        &[PermissionCapability::Network],
+    ),
+    slash_caps(
+        "/sessions",
+        "list recent sessions",
+        true,
+        &[PermissionCapability::Read],
+    ),
+    slash_args_caps(
+        "/session",
+        "show a saved session",
+        true,
+        "<id>",
+        &[PermissionCapability::Read],
+    ),
+    slash_args_caps(
+        "/resume",
+        "resume a saved session",
+        false,
+        "<id>",
+        &[PermissionCapability::Read],
+    ),
+    slash_locked(
+        "/fork",
+        "branch the current session into a sibling with the same transcript",
+    ),
+    slash_args_caps(
+        "/session-export",
+        "export a saved session",
+        false,
+        "<id>",
+        &[PermissionCapability::Read, PermissionCapability::Edit],
+    ),
+    // Locked + destructive: deletes session JSON on disk.
+    SlashCommand {
+        name: "/session-cleanup",
+        description: "remove old sessions",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[PermissionCapability::Destructive],
+    },
+    slash_caps(
+        "/checkpoints",
+        "list local checkpoints",
+        true,
+        &[PermissionCapability::Read],
+    ),
+    slash_args_caps(
+        "/checkpoint",
+        "show a local checkpoint",
+        true,
+        "<id>",
+        &[PermissionCapability::Read],
+    ),
+    SlashCommand {
+        name: "/undo",
+        description: "undo the latest checkpoint",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive,
+        ],
+    },
+    SlashCommand {
+        name: "/revert-turn",
+        description: "revert a turn checkpoint",
+        available_during_task: false,
+        parameter_hint: None,
+        capabilities: &[
+            PermissionCapability::Edit,
+            PermissionCapability::Destructive,
+        ],
+    },
+    slash_args_caps(
         "/verbosity",
         "open config focused on response verbosity (or set inline)",
         false,
         "[concise|normal|verbose]",
+        &[PermissionCapability::Edit],
     ),
-    slash_args(
+    slash_args_caps(
         "/tool-verbosity",
         "open config focused on tool output verbosity (or set inline)",
         false,
         "[compact|normal|verbose]",
+        &[PermissionCapability::Edit],
     ),
     slash_args("/detach", "remove attached context", false, "<id>"),
-    slash(
+    slash_caps(
         "/statusline",
         "configure which items appear in the status bar",
+        true,
+        &[PermissionCapability::Edit],
     ),
-    slash_args(
+    slash_args_caps(
         "/theme",
         "switch palette tone (persists to settings)",
         true,
         "[system|dark|light]",
+        &[PermissionCapability::Edit],
     ),
+    slash("/keymap", "list current key bindings"),
 ];
 
 impl SlashCommand {
     pub(crate) fn is_dimmed(&self, task_in_progress: bool) -> bool {
         task_in_progress && !self.available_during_task
+    }
+
+    /// Short label used in the slash menu badge, e.g. `net`, `read`, `edit`.
+    /// Matches `PermissionCapability::as_str()` so users can correlate the
+    /// hint with the `permissions.toml` capability they recognise.
+    pub(crate) fn capability_badges(&self) -> Vec<&'static str> {
+        self.capabilities
+            .iter()
+            .map(|cap| capability_badge_label(*cap))
+            .collect()
+    }
+}
+
+pub(crate) const fn capability_badge_label(capability: PermissionCapability) -> &'static str {
+    match capability {
+        PermissionCapability::Read => "read",
+        PermissionCapability::Search => "search",
+        PermissionCapability::Edit => "edit",
+        PermissionCapability::Shell => "shell",
+        PermissionCapability::Network => "net",
+        PermissionCapability::Mcp => "mcp",
+        PermissionCapability::Git => "git",
+        PermissionCapability::Compiler => "compiler",
+        PermissionCapability::Destructive => "destructive",
     }
 }
 
@@ -324,6 +498,23 @@ pub(crate) fn set_input(app: &mut TuiApp, input: String) {
     app.input_cursor = app.input.len();
     clamp_input_cursor(app);
     clamp_slash_menu_index(app);
+}
+
+/// Move the stashed `cancelled_prompt` back into the composer so a turn
+/// the user just aborted doesn't vaporize their typed prompt. Skipped
+/// when the composer already has text (the user started a new draft mid-
+/// cancel) or when nothing was stashed. Returns `true` when the prompt
+/// was restored.
+pub(crate) fn restore_prompt_after_cancel(app: &mut TuiApp) -> bool {
+    if !app.input.is_empty() {
+        return false;
+    }
+    let Some(text) = app.cancelled_prompt.take() else {
+        return false;
+    };
+    app.input = text;
+    app.input_cursor = app.input.len();
+    true
 }
 
 pub(crate) fn input_cursor(app: &TuiApp) -> usize {
@@ -612,14 +803,24 @@ pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
     if !is_slash_completion_input(input) {
         return Vec::new();
     }
-    let prefix = input.trim();
-    let mut suggestions = SLASH_COMMANDS
+    let needle = input.trim();
+    // Bare `/` lists every command, ordered alphabetically by name.
+    if needle == "/" {
+        let mut suggestions = SLASH_COMMANDS.to_vec();
+        suggestions.sort_by(|left, right| left.name.cmp(right.name));
+        return suggestions;
+    }
+    let mut scored: Vec<(SlashCommand, i32)> = SLASH_COMMANDS
         .iter()
         .copied()
-        .filter(|command| command.name.starts_with(prefix))
-        .collect::<Vec<_>>();
-    suggestions.sort_by(|left, right| left.name.cmp(right.name));
-    suggestions
+        .filter_map(|command| {
+            squeezy_rank::fuzzy_score(command.name, needle).map(|score| (command, score))
+        })
+        .collect();
+    // Prefix/contiguous hits sort first via the negative bonuses in
+    // `fuzzy_score`; ties broken alphabetically for stable rendering.
+    scored.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.name.cmp(right.0.name)));
+    scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 
 pub(crate) fn is_slash_completion_input(input: &str) -> bool {
