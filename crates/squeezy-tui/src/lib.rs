@@ -73,6 +73,7 @@ mod status;
 mod status_line_setup;
 mod streaming;
 mod streaming_patch;
+mod toast;
 pub use render::markdown::render_markdown;
 pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
 
@@ -99,6 +100,7 @@ use render::palette::{
 };
 #[cfg(test)]
 use render::palette::{DIFF_ADD_FG, DIFF_DEL_FG};
+use toast::ToastQueue;
 
 const INLINE_PASTE_MAX_BYTES: usize = 512;
 const LONG_ASSISTANT_CHARS: usize = 1_200;
@@ -439,6 +441,9 @@ async fn run_inner(
 
         app.animation_tick = app.animation_tick.wrapping_add(1);
         if app.app_notifications.tick() {
+            app.needs_redraw = true;
+        }
+        if app.toasts.tick() {
             app.needs_redraw = true;
         }
         if app.animation_tick.is_multiple_of(settings_poll_every)
@@ -3958,6 +3963,7 @@ fn render(frame: &mut Frame<'_>, app: &TuiApp) {
     // Flexible filler keeps the prompt/status block attached to the transcript
     // instead of pinning it to the terminal bottom.
     let _ = chunks[index];
+    render_toast_overlay(frame, area, app);
 }
 
 fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
@@ -3997,6 +4003,49 @@ fn render_notification_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
         Style::default().fg(QUIET),
     ));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Overlay the corner-toast stack on the top-right of `area`. Each visible
+/// toast renders as a single-line tinted glyph + message. Toasts draw
+/// after every other surface so they sit on top of the transcript and
+/// modal flows; layout-wise they reserve zero rows in the constraint
+/// solver and simply clip whatever pixels they overlap.
+fn render_toast_overlay(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+    use ratatui::{
+        style::{Modifier, Style},
+        text::{Line, Span},
+        widgets::{Clear, Paragraph},
+    };
+    let visible = app.toasts.visible();
+    if visible.is_empty() || area.width < 8 || area.height == 0 {
+        return;
+    }
+    let max_width = area.width.saturating_sub(2).clamp(8, 40);
+    for (row_offset, toast) in visible.iter().enumerate() {
+        if row_offset as u16 >= area.height {
+            break;
+        }
+        let label = format!("{} {}", toast.variant.glyph(), toast.message);
+        let visual: String = label.chars().take(max_width as usize).collect();
+        let line_width = visual.chars().count() as u16;
+        let x = area.right().saturating_sub(line_width + 1).max(area.left());
+        let y = area.top() + row_offset as u16;
+        let rect = Rect {
+            x,
+            y,
+            width: line_width.min(area.right().saturating_sub(x)),
+            height: 1,
+        };
+        if rect.width == 0 {
+            continue;
+        }
+        let style = Style::default()
+            .fg(toast.variant.color())
+            .add_modifier(Modifier::BOLD);
+        let span = Span::styled(visual, style);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Paragraph::new(Line::from(span)), rect);
+    }
 }
 
 fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
@@ -4115,6 +4164,7 @@ fn render_inline(frame: &mut Frame<'_>, app: &TuiApp) {
         index += 1;
     }
     render_status(frame, chunks[index], app);
+    render_toast_overlay(frame, area, app);
 }
 
 fn transcript_prompt_gap_height(app: &TuiApp) -> u16 {
@@ -8870,6 +8920,12 @@ pub(crate) struct TuiApp {
     pub(crate) pending_report: Option<BugReportBundle>,
     pub(crate) clipboard: Box<dyn Clipboard>,
     pub(crate) app_notifications: NotificationQueue,
+    /// Corner toast stack — short-lived overlays for fire-and-forget
+    /// status events (telemetry flush, MCP connect, index ready). Kept
+    /// separate from `app_notifications` because that surface is an
+    /// inline rotating banner; toasts overlay the top-right and stack up
+    /// to three at a time.
+    pub(crate) toasts: ToastQueue,
     /// Opt-in OSC 9 / BEL emitter for off-tab attention. Disabled by
     /// default; flips on via `[tui].desktop_notifications`.
     pub(crate) desktop_notifier: DesktopNotifier,
@@ -9044,6 +9100,7 @@ impl TuiApp {
             pending_report: None,
             clipboard,
             app_notifications: NotificationQueue::new(),
+            toasts: ToastQueue::new(),
             desktop_notifier: DesktopNotifier::new(config.tui.desktop_notifications),
             config_screen: None,
             status_line_items: parse_status_line_items(config.tui.status_line.as_deref()),
