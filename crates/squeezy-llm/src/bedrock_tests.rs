@@ -1,12 +1,17 @@
 use std::sync::Arc;
 
 use aws_sdk_bedrockruntime::types::{
-    CachePointType, ContentBlock, ConversationRole, SystemContentBlock, ToolInputSchema,
+    CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
+    ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
+    ToolInputSchema,
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
 
-use super::{conversation_messages, json_to_document, system_blocks, tool_configuration};
+use super::{
+    BedrockStreamState, conversation_messages, handle_bedrock_event, json_to_document,
+    system_blocks, tool_configuration,
+};
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
 
@@ -275,5 +280,45 @@ fn beta_headers_route_into_extra_body_params_on_bedrock() {
         body_strs,
         vec!["context-1m-2025-08-07", "interleaved-thinking-2025-05-14"],
         "Bedrock subset must drop header-only betas (claude-code-*) and preserve order",
+    );
+}
+
+#[test]
+fn metadata_event_records_usage_tokens() {
+    let mut state = BedrockStreamState::default();
+    let usage = TokenUsage::builder()
+        .input_tokens(123)
+        .output_tokens(45)
+        .total_tokens(168)
+        .build()
+        .expect("build usage");
+    let metadata = ConverseStreamMetadataEvent::builder().usage(usage).build();
+    let events = handle_bedrock_event(ConverseStreamOutput::Metadata(metadata), &mut state)
+        .expect("handle metadata");
+    assert!(events.is_empty());
+    assert!(state.saw_metadata);
+    assert_eq!(state.input_tokens, Some(123));
+    assert_eq!(state.output_tokens, Some(45));
+}
+
+#[test]
+fn message_stop_without_metadata_leaves_usage_unset() {
+    let mut state = BedrockStreamState::default();
+    let stop = MessageStopEvent::builder()
+        .stop_reason(StopReason::EndTurn)
+        .build()
+        .expect("build stop");
+    let events = handle_bedrock_event(ConverseStreamOutput::MessageStop(stop), &mut state)
+        .expect("handle stop");
+    assert!(events.is_empty());
+    assert!(state.saw_message_stop);
+    assert!(
+        !state.saw_metadata,
+        "metadata flag should remain false when only messageStop has arrived"
+    );
+    let cost = state.cost();
+    assert!(
+        cost.input_tokens.is_none() && cost.output_tokens.is_none(),
+        "cost reports None when Metadata never arrived, signalling missing usage rather than zero"
     );
 }

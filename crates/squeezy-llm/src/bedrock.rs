@@ -170,6 +170,13 @@ impl LlmProvider for BedrockProvider {
                     "Bedrock stream ended without messageStop".to_string(),
                 ))?;
             }
+            if !state.saw_metadata {
+                tracing::warn!(
+                    provider = "bedrock",
+                    model = %model,
+                    "Bedrock stream ended without metadata event; usage tokens unavailable for this turn"
+                );
+            }
             if let Some(payload) = state.flush_reasoning() {
                 yield LlmEvent::ReasoningDone(payload);
             }
@@ -205,6 +212,7 @@ struct BedrockStreamState {
     finished_reasoning: Vec<AnthropicThinkingBlock>,
     saw_message_stop: bool,
     stop_reason: Option<crate::StopReason>,
+    saw_metadata: bool,
 }
 
 impl BedrockStreamState {
@@ -334,6 +342,7 @@ fn handle_bedrock_event(
             Ok(Vec::new())
         }
         ConverseStreamOutput::Metadata(meta) => {
+            state.saw_metadata = true;
             if let Some(usage) = meta.usage {
                 state.input_tokens = Some(u64::try_from(usage.input_tokens).unwrap_or(0));
                 state.output_tokens = Some(u64::try_from(usage.output_tokens).unwrap_or(0));
