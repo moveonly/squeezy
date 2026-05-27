@@ -60,6 +60,11 @@ def find_src_roots(repo_root: Path) -> list[Path]:
     for cargo_toml in sorted(repo_root.rglob("Cargo.toml")):
         if "target" in cargo_toml.parts:
             continue
+        # Skip agent worktrees living under .claude/worktrees/ — those are
+        # detached working copies maintained by external automation and are
+        # not part of the repo's enforced layout.
+        if ".claude" in cargo_toml.parts:
+            continue
         src = cargo_toml.parent / "src"
         if src.is_dir():
             roots.append(src)
