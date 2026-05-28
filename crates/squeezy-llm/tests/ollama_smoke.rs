@@ -88,7 +88,8 @@ async fn ollama_local_streaming_smoke() -> Result<()> {
             }
             LlmEvent::ReasoningDelta { .. }
             | LlmEvent::ReasoningDone(_)
-            | LlmEvent::ContextOverflow { .. } => {}
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
 

@@ -214,6 +214,8 @@ impl LlmProvider for OllamaProvider {
 
             yield LlmEvent::Started;
             let mut decoder = JsonLineDecoder::default();
+            let mut server_model_slot: Option<String> = None;
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -229,13 +231,25 @@ impl LlmProvider for OllamaProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for line in decoder.push(&chunk) {
-                    for event in parse_ollama_line(&line)? {
+                    let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
+                    if let Some(server) = server_model_slot.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for event in parsed {
                         yield event;
                     }
                 }
             }
             for line in decoder.finish() {
-                for event in parse_ollama_line(&line)? {
+                let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
+                if let Some(server) = server_model_slot.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for event in parsed {
                     yield event;
                 }
             }
@@ -332,11 +346,23 @@ impl JsonLineDecoder {
     }
 }
 
-fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
+fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(line)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Ollama JSON: {err}")))?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
         return Err(SqueezyError::ProviderStream(error.to_string()));
+    }
+
+    if server_model_slot.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Ollama echoes `model` on every NDJSON chunk. Capture the
+        // first occurrence — the outer stream loop drains it and
+        // emits `ServerModel` once when the canonical tag (e.g.
+        // `llama3:latest` → `llama3:8b-instruct-q4_0`) differs from
+        // the user-supplied request model.
+        *server_model_slot = Some(server_model.to_string());
     }
 
     let mut events = Vec::new();

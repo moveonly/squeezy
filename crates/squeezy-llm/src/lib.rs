@@ -577,6 +577,18 @@ pub enum LlmEvent {
         provider: String,
         signal: OverflowSignal,
     },
+    /// Server-echoed model id differed from the model the request
+    /// asked for. Emitted at most once per stream, additively, right
+    /// after [`LlmEvent::Started`], when the provider's first response
+    /// chunk carries a `model` field that does not match
+    /// `LlmRequest::model`. Surfaces silent provider-side fallback
+    /// (Anthropic regional substitution, OpenAI snapshot pinning,
+    /// aggregator routing rewrites, Ollama base-tag canonicalization,
+    /// Google `modelVersion` pinning, etc.) so the agent / TUI /
+    /// transcript record the actual model that produced the turn
+    /// instead of just the one the user asked for. Consumers that
+    /// only care about the canonical event stream can ignore it.
+    ServerModel(String),
     Completed {
         response_id: Option<String>,
         cost: CostSnapshot,
@@ -602,6 +614,48 @@ pub enum LlmEvent {
         reasoning_only_stop: bool,
     },
     Cancelled,
+}
+
+/// Once-per-stream tracker for the [`LlmEvent::ServerModel`] echo.
+///
+/// Every provider stream handler that observes a server-echoed model id
+/// (Anthropic `message_start.message.model`, OpenAI Responses
+/// `response.model`, Chat-Completions top-level `model`, Google
+/// `modelVersion`, Ollama `model`) feeds it to [`Self::observe`]. The
+/// helper returns `Some(LlmEvent::ServerModel(...))` exactly once per
+/// stream — the first time the server's echo differs from the
+/// requested model — and `None` thereafter (including when the echo
+/// matches the request, which is the steady-state happy path and
+/// should stay off the event stream entirely).
+#[derive(Debug, Default)]
+pub(crate) struct ServerModelEcho {
+    emitted: bool,
+}
+
+impl ServerModelEcho {
+    /// Compare the server-echoed model against the requested model and
+    /// return `Some(LlmEvent::ServerModel(server))` on the first
+    /// observation of a mismatch. Subsequent calls return `None`. An
+    /// empty `server` string is ignored (treated as "echo missing").
+    /// Both arguments are compared verbatim — providers do not
+    /// canonicalize aliases or versioned snapshot ids here, so callers
+    /// see the exact strings the upstream chose to send back.
+    pub(crate) fn observe(&mut self, requested: &str, server: &str) -> Option<LlmEvent> {
+        if self.emitted {
+            return None;
+        }
+        if server.is_empty() {
+            return None;
+        }
+        // Match seals the tracker so a later (identical) echo on the
+        // same stream cannot accidentally re-emit if the upstream
+        // duplicates the field across chunks.
+        self.emitted = true;
+        if server == requested {
+            return None;
+        }
+        Some(LlmEvent::ServerModel(server.to_string()))
+    }
 }
 
 impl LlmEvent {

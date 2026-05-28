@@ -188,6 +188,7 @@ impl LlmProvider for LMStudioProvider {
 
             let mut decoder = SseDecoder::default();
             let mut state = StreamState::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
             loop {
@@ -204,7 +205,13 @@ impl LlmProvider for LMStudioProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    for emitted in parse_chat_event(&event, &mut state)? {
+                    let parsed = parse_chat_event(&event, &mut state)?;
+                    if let Some(server) = state.server_model.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for emitted in parsed {
                         yield emitted;
                     }
                     if state.completed_emitted {
@@ -214,7 +221,13 @@ impl LlmProvider for LMStudioProvider {
             }
 
             for event in decoder.finish() {
-                for emitted in parse_chat_event(&event, &mut state)? {
+                let parsed = parse_chat_event(&event, &mut state)?;
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for emitted in parsed {
                     yield emitted;
                 }
                 if state.completed_emitted {
@@ -349,6 +362,13 @@ pub(crate) struct StreamState {
     /// Captured OpenAI chat-completions `finish_reason` from the last
     /// streamed choice; mapped to [`crate::StopReason`] at completion.
     finish_reason: Option<String>,
+    /// Stashes the server-echoed top-level `model` the first time it
+    /// appears on a chat-completions chunk. The outer stream loop
+    /// drains the slot and emits `LlmEvent::ServerModel` exactly once
+    /// when LM Studio's reported model id differs from the one the
+    /// request asked for (local server with a renamed model card,
+    /// auto-load swapping in a different quantization, etc.).
+    server_model: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -438,6 +458,13 @@ pub(crate) fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Ve
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         state.response_id.get_or_insert_with(|| id.to_string());
+    }
+
+    if state.server_model.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        state.server_model = Some(server_model.to_string());
     }
 
     if let Some(usage) = value.get("usage") {

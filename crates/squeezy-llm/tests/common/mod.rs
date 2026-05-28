@@ -102,7 +102,8 @@ pub async fn collect_text(mut stream: LlmStream, label: &str) -> Result<String> 
             }
             LlmEvent::ReasoningDelta { .. }
             | LlmEvent::ReasoningDone(_)
-            | LlmEvent::ContextOverflow { .. } => {}
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
     Ok(output)

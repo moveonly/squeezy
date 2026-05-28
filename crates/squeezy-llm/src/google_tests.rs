@@ -147,6 +147,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
     let events = parse_google_event(
         r#"{
           "candidates":[{
@@ -159,11 +160,13 @@ fn parser_extracts_text_tool_calls_and_usage() {
             "promptTokenCount":10,
             "candidatesTokenCount":3,
             "cachedContentTokenCount":2
-          }
+          },
+          "modelVersion":"gemini-2.5-pro-002"
         }"#,
         &mut cost,
         &mut last_finish_reason,
         &mut reasoning_buf,
+        &mut server_model_slot,
     )
     .expect("valid event");
 
@@ -179,6 +182,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(cost.input_tokens, Some(10));
     assert_eq!(cost.output_tokens, Some(3));
     assert_eq!(cost.cached_input_tokens, Some(2));
+    assert_eq!(server_model_slot.as_deref(), Some("gemini-2.5-pro-002"));
 }
 
 #[test]

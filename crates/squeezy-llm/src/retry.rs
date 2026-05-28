@@ -256,6 +256,13 @@ pub struct StreamSkipState {
     emitted_tool_calls: usize,
     /// Whether `Started` has been emitted to the downstream consumer.
     started: bool,
+    /// Whether a `ServerModel` event has already reached the
+    /// downstream consumer on this stream. The event is at-most-once
+    /// per turn — a mid-stream reconnect re-runs the provider's
+    /// first-frame parsing and would otherwise yield the same echo
+    /// again on attempt N+1. Suppress the duplicate so consumers
+    /// (TUI, transcript writer) see one notification per turn.
+    emitted_server_model: bool,
 }
 
 impl StreamSkipState {
@@ -269,6 +276,7 @@ impl StreamSkipState {
             }
             LlmEvent::ReasoningDone(_) => self.emitted_reasoning_done += 1,
             LlmEvent::ToolCall(_) => self.emitted_tool_calls += 1,
+            LlmEvent::ServerModel(_) => self.emitted_server_model = true,
             LlmEvent::Completed { .. } | LlmEvent::Cancelled | LlmEvent::ContextOverflow { .. } => {
             }
         }
@@ -351,6 +359,17 @@ impl SkipCursor {
             LlmEvent::Cancelled => Some(LlmEvent::Cancelled),
             LlmEvent::ContextOverflow { provider, signal } => {
                 Some(LlmEvent::ContextOverflow { provider, signal })
+            }
+            LlmEvent::ServerModel(model) => {
+                // Suppress duplicates across attempts: the provider's
+                // first-frame parser re-derives the echo on every
+                // reconnect, but downstream consumers should only see
+                // it once per turn.
+                if skip.emitted_server_model {
+                    None
+                } else {
+                    Some(LlmEvent::ServerModel(model))
+                }
             }
         }
     }

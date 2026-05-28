@@ -4892,7 +4892,7 @@ impl TurnRuntime {
                         .await;
                         return Ok(());
                     }
-                    LlmEvent::ContextOverflow { .. } => {}
+                    LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
                 }
             }
 
@@ -7084,7 +7084,7 @@ async fn run_subagent_rounds(
                         transcript: Vec::new(),
                     };
                 }
-                LlmEvent::ContextOverflow { .. } => {}
+                LlmEvent::ContextOverflow { .. } | LlmEvent::ServerModel(_) => {}
             }
         }
 
@@ -9771,7 +9771,8 @@ Working target: {:?}",
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
             | LlmEvent::ReasoningDone(_)
-            | LlmEvent::ContextOverflow { .. } => {}
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
     Some(parse_classifier_verdict(&text))

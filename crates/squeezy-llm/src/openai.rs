@@ -325,6 +325,7 @@ impl LlmProvider for OpenAiProvider {
             let mut decoder = SseDecoder::default();
             let mut saw_completed = false;
             let mut reasoning_acc = ReasoningAccumulator::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -340,7 +341,13 @@ impl LlmProvider for OpenAiProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
+                    let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                    if let Some(server) = reasoning_acc.take_server_model()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    if let Some(llm_event) = parsed {
                         if matches!(llm_event, LlmEvent::Completed { .. }) {
                             saw_completed = true;
                         }
@@ -350,7 +357,13 @@ impl LlmProvider for OpenAiProvider {
             }
 
             for event in decoder.finish() {
-                if let Some(llm_event) = parse_openai_event(&event, &mut reasoning_acc)? {
+                let parsed = parse_openai_event(&event, &mut reasoning_acc)?;
+                if let Some(server) = reasoning_acc.take_server_model()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                if let Some(llm_event) = parsed {
                     if matches!(llm_event, LlmEvent::Completed { .. }) {
                         saw_completed = true;
                     }
@@ -378,6 +391,14 @@ impl LlmProvider for OpenAiProvider {
 pub(crate) struct ReasoningAccumulator {
     summary: String,
     text: String,
+    /// Stashes the server-echoed `response.model` field the first time
+    /// any event carries it (typically `response.created`). The outer
+    /// stream loop drains the value via [`Self::take_server_model`] and
+    /// feeds it to [`crate::ServerModelEcho`] so [`LlmEvent::ServerModel`]
+    /// lands additively right after [`LlmEvent::Started`]. Stays `None`
+    /// for every event that doesn't include a `response.model` field —
+    /// the loop only acts on the first observation per stream.
+    server_model: Option<String>,
 }
 
 impl ReasoningAccumulator {
@@ -392,6 +413,10 @@ impl ReasoningAccumulator {
             out.push(text);
         }
         out
+    }
+
+    pub(crate) fn take_server_model(&mut self) -> Option<String> {
+        self.server_model.take()
     }
 }
 
@@ -410,6 +435,24 @@ pub(crate) fn parse_openai_event(
         .and_then(Value::as_str)
         .unwrap_or_default();
     tracing::trace!(target: "squeezy_llm::openai", event_type, "sse event");
+
+    // OpenAI Responses events embed the server-chosen model on the
+    // `response` object that ships with `response.created`,
+    // `response.in_progress`, `response.completed`, etc. Pluck it the
+    // first time we see it so the outer stream loop can compare
+    // against `request.model` and emit an additive `ServerModel`
+    // event. Repeated observations on the same stream are coalesced
+    // into a single drain in the caller via
+    // [`crate::ServerModelEcho`].
+    if reasoning_acc.server_model.is_none()
+        && let Some(server_model) = value
+            .get("response")
+            .and_then(|response| response.get("model"))
+            .and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        reasoning_acc.server_model = Some(server_model.to_string());
+    }
 
     match event_type {
         "response.output_text.delta" => {

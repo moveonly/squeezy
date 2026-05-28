@@ -474,6 +474,7 @@ fn anthropic_stream_attempt(
 
         let mut decoder = SseDecoder::default();
         let mut state = AnthropicStreamState::default();
+        let mut server_model_echo = crate::ServerModelEcho::default();
         let mut saw_completed = false;
         let mut saw_visible_output = false;
         // Resolved context window for the SilentUsage path. `None` when the
@@ -497,7 +498,17 @@ fn anthropic_stream_attempt(
             let Some(chunk) = next else { break; };
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
             for event in decoder.push(&chunk) {
-                for llm_event in parse_anthropic_event(&event, &mut state)? {
+                let parsed = parse_anthropic_event(&event, &mut state)?;
+                // `message_start` populates `state.server_model` but
+                // yields no `LlmEvent`s, so drain the field at the
+                // frame boundary rather than per-event to make sure
+                // `ServerModel` lands even on the first frame.
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for llm_event in parsed {
                     match &llm_event {
                         LlmEvent::TextDelta(text) if !text.is_empty() => {
                             saw_visible_output = true;
@@ -521,7 +532,13 @@ fn anthropic_stream_attempt(
         }
 
         for event in decoder.finish() {
-            for llm_event in parse_anthropic_event(&event, &mut state)? {
+            let parsed = parse_anthropic_event(&event, &mut state)?;
+            if let Some(server) = state.server_model.take()
+                && let Some(echo) = server_model_echo.observe(&request.model, &server)
+            {
+                yield echo;
+            }
+            for llm_event in parsed {
                 match &llm_event {
                     LlmEvent::TextDelta(text) if !text.is_empty() => {
                         saw_visible_output = true;
@@ -595,6 +612,14 @@ struct AnthropicStreamState {
     thinking_blocks: BTreeMap<u64, AnthropicThinkingBlock>,
     finished_thinking: Vec<AnthropicThinkingBlock>,
     emitted_reasoning_done: bool,
+    /// Server-echoed model id captured from `message_start.message.model`
+    /// the first time the field is seen. Drained by the outer attempt
+    /// loop to drive [`crate::ServerModelEcho`] before any other event
+    /// is yielded downstream. `None` until Anthropic announces the
+    /// chosen model (the docs guarantee `message_start` is the first
+    /// SSE frame of every successful turn) and once the outer loop
+    /// has drained it, it stays `None` for the rest of the stream.
+    server_model: Option<String>,
 }
 
 impl AnthropicStreamState {
@@ -633,6 +658,17 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             if let Some(message) = value.get("message") {
                 state.response_id = message
                     .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // Capture the server-chosen model id so the outer
+                // attempt loop can compare it against `request.model`
+                // and emit `LlmEvent::ServerModel` when Anthropic
+                // silently substitutes (regional fallback, alias
+                // resolution, etc.). The parser writes the field
+                // here; the outer loop drains it before any other
+                // event is yielded downstream.
+                state.server_model = message
+                    .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 merge_usage(state, message.get("usage"));

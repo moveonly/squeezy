@@ -152,6 +152,8 @@ impl LlmProvider for GoogleProvider {
             let mut decoder = SseDecoder::default();
             let mut last_cost = CostSnapshot::default();
             let mut last_finish_reason: Option<String> = None;
+            let mut server_model_slot: Option<String> = None;
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut saw_any = false;
             let mut reasoning_buf = GoogleReasoningBuffer::default();
             let mut bytes = response.bytes_stream();
@@ -170,14 +172,38 @@ impl LlmProvider for GoogleProvider {
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
                     saw_any = true;
-                    for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
+                    let parsed = parse_google_event(
+                        &event,
+                        &mut last_cost,
+                        &mut last_finish_reason,
+                        &mut reasoning_buf,
+                        &mut server_model_slot,
+                    )?;
+                    if let Some(server) = server_model_slot.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for llm_event in parsed {
                         yield llm_event;
                     }
                 }
             }
             for event in decoder.finish() {
                 saw_any = true;
-                for llm_event in parse_google_event(&event, &mut last_cost, &mut last_finish_reason, &mut reasoning_buf)? {
+                let parsed = parse_google_event(
+                    &event,
+                    &mut last_cost,
+                    &mut last_finish_reason,
+                    &mut reasoning_buf,
+                    &mut server_model_slot,
+                )?;
+                if let Some(server) = server_model_slot.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for llm_event in parsed {
                     yield llm_event;
                 }
             }
@@ -314,6 +340,7 @@ fn parse_google_event(
     cost: &mut CostSnapshot,
     last_finish_reason: &mut Option<String>,
     reasoning_buf: &mut GoogleReasoningBuffer,
+    server_model_slot: &mut Option<String>,
 ) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(data)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Google SSE JSON: {err}")))?;
@@ -323,6 +350,17 @@ fn parse_google_event(
             .and_then(Value::as_str)
             .unwrap_or("Google stream error");
         return Err(SqueezyError::ProviderStream(message.to_string()));
+    }
+    if server_model_slot.is_none()
+        && let Some(server_model) = value.get("modelVersion").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Google's `streamGenerateContent` echoes `modelVersion` on
+        // every chunk (the pinned snapshot id, e.g. `gemini-2.5-pro` →
+        // `gemini-2.5-pro-002`). Capture the first occurrence; the
+        // outer stream loop drains the slot and emits `ServerModel`
+        // once when the snapshot id differs from `request.model`.
+        *server_model_slot = Some(server_model.to_string());
     }
     if let Some(usage) = value.get("usageMetadata") {
         cost.input_tokens = usage.get("promptTokenCount").and_then(Value::as_u64);

@@ -85,11 +85,17 @@ fn request_body_preserves_function_tool_order() {
 
 #[test]
 fn parser_extracts_text_tool_calls_and_usage() {
+    let mut server_model_slot: Option<String> = None;
     let events = parse_ollama_line(
-        r#"{"message":{"content":"hi","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]},"done":true,"prompt_eval_count":10,"eval_count":2}"#,
+        r#"{"model":"llama3:8b-instruct-q4_0","message":{"content":"hi","tool_calls":[{"function":{"name":"grep","arguments":{"pattern":"needle"}}}]},"done":true,"prompt_eval_count":10,"eval_count":2}"#,
+        &mut server_model_slot,
     )
     .expect("valid event");
 
+    assert_eq!(
+        server_model_slot.as_deref(),
+        Some("llama3:8b-instruct-q4_0")
+    );
     assert_eq!(events[0], LlmEvent::TextDelta("hi".to_string()));
     assert_eq!(
         events[1],

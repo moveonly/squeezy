@@ -72,7 +72,8 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
             }
             LlmEvent::ReasoningDelta { .. }
             | LlmEvent::ReasoningDone(_)
-            | LlmEvent::ContextOverflow { .. } => {}
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
 

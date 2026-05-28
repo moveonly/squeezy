@@ -515,6 +515,7 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
             let mut decoder = SseDecoder::default();
             let mut state = StreamState::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
             loop {
@@ -533,7 +534,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    for emitted in parse_chat_event(&event, &mut state)? {
+                    let parsed = parse_chat_event(&event, &mut state)?;
+                    if let Some(server) = state.server_model.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for emitted in parsed {
                         yield emitted;
                     }
                     if state.completed_emitted {
@@ -543,7 +550,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             }
 
             for event in decoder.finish() {
-                for emitted in parse_chat_event(&event, &mut state)? {
+                let parsed = parse_chat_event(&event, &mut state)?;
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for emitted in parsed {
                     yield emitted;
                 }
                 if state.completed_emitted {
@@ -714,6 +727,15 @@ struct StreamState {
     /// because the normalized `StopReason::EndTurn` alone can't
     /// disambiguate "clean stop" from "reasoning-only stop".
     reasoning_only_stop: bool,
+    /// Buffers the server-echoed top-level `model` field of a
+    /// chat-completions chunk the first time the stream surfaces it.
+    /// The outer `stream_response` loop drains the slot after each
+    /// `parse_chat_event` call and feeds the value into
+    /// [`crate::ServerModelEcho`] so [`LlmEvent::ServerModel`] lands
+    /// additively right after [`LlmEvent::Started`]. Stays `None` for
+    /// every later chunk because the helper short-circuits once the
+    /// echo has been latched.
+    server_model: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -925,6 +947,17 @@ fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Vec<LlmEvent>
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         state.response_id.get_or_insert_with(|| id.to_string());
+    }
+
+    if state.server_model.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Chat-completions chunks repeat the top-level `model` field on
+        // every event. Stash the value the first time we see it; the
+        // outer stream loop drains the slot and feeds it to
+        // `ServerModelEcho`, which suppresses duplicate emissions.
+        state.server_model = Some(server_model.to_string());
     }
 
     if let Some(usage) = value.get("usage") {
