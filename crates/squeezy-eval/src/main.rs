@@ -65,6 +65,12 @@ enum Command {
         /// Output format: `markdown` (default) or `json`.
         #[arg(long, default_value = "markdown")]
         format: String,
+        /// Refuse to diff when the two runs have different trace
+        /// `schema_version` (v2 vs v3+). Defaults to off for
+        /// backwards compatibility — old `diff` callers keep
+        /// working.
+        #[arg(long)]
+        schema_check: bool,
     },
     /// Run every scenario in a directory and exit non-zero if any
     /// scenario violates the `--fail-on` policy.
@@ -81,6 +87,10 @@ enum Command {
         /// Output root directory; defaults to `target/eval`.
         #[arg(long, default_value = "target/eval")]
         out: PathBuf,
+        /// Max scenarios to run concurrently. Defaults to 1
+        /// (serial); use a higher number for fan-out CI runs.
+        #[arg(long)]
+        parallelism: Option<usize>,
     },
 }
 
@@ -111,13 +121,19 @@ async fn main() -> ExitCode {
         Command::List { dir } => list_cmd(dir),
         Command::Replay { trace } => replay_cmd(trace),
         Command::View { run } => view_cmd(run),
-        Command::Diff { a, b, format } => diff_cmd(a, b, format),
+        Command::Diff {
+            a,
+            b,
+            format,
+            schema_check,
+        } => diff_cmd(a, b, format, schema_check),
         Command::Check {
             dir,
             junit,
             fail_on,
             out,
-        } => check_cmd(dir, junit, fail_on, out).await,
+            parallelism,
+        } => check_cmd(dir, junit, fail_on, out, parallelism).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -211,12 +227,14 @@ async fn check_cmd(
     junit: Option<PathBuf>,
     fail_on: String,
     out: PathBuf,
+    parallelism: Option<usize>,
 ) -> Result<(), squeezy_eval::driver::EvalError> {
     let opts = squeezy_eval::ci::CheckOptions {
         dir,
         out_root: out,
         fail_on: squeezy_eval::ci::FailOn::parse(&fail_on),
         junit_path: junit,
+        parallelism,
     };
     let report = squeezy_eval::ci::run_check(opts).await?;
     let total = report.results.len();
@@ -244,9 +262,14 @@ async fn check_cmd(
     }
 }
 
-fn diff_cmd(a: PathBuf, b: PathBuf, format: String) -> Result<(), squeezy_eval::driver::EvalError> {
+fn diff_cmd(
+    a: PathBuf,
+    b: PathBuf,
+    format: String,
+    schema_check: bool,
+) -> Result<(), squeezy_eval::driver::EvalError> {
     let fmt = squeezy_eval::diff::DiffFormat::parse(&format);
-    let report = squeezy_eval::diff::diff_runs(&a, &b, fmt)?;
+    let report = squeezy_eval::diff::diff_runs_with_schema_check(&a, &b, fmt, schema_check)?;
     print!("{report}");
     Ok(())
 }

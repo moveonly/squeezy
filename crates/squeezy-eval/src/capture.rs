@@ -50,6 +50,19 @@ pub enum EvalEventKind {
         /// content or tool call).
         #[serde(default)]
         reasoning_only_stop: bool,
+        /// Final assistant transcript item (role, text, optional
+        /// reasoning snapshot). Schema v3+. Older v2 traces omit
+        /// this; consumers must handle `null`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<Value>,
+        /// Provider response id when surfaced. Schema v3+.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        /// Post-turn context-window estimate (bytes / tokens / items).
+        /// Schema v3+. Lets context-window regressions be diffable
+        /// across runs without re-deriving from the request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_estimate: Option<Value>,
     },
     TurnFailed {
         error: String,
@@ -57,6 +70,29 @@ pub enum EvalEventKind {
     TurnCancelled,
     AssistantDelta {
         delta: String,
+    },
+    /// Schema v3+. Per-token reasoning chunk streaming from the
+    /// provider. Captures the live "thinking" surface so regressions
+    /// in reasoning emission (silent loss, truncation) are diffable.
+    /// Older v2 traces never emitted these; rules that key on
+    /// reasoning must tolerate absent variants.
+    ReasoningDelta {
+        delta: String,
+    },
+    /// Schema v3+. A complete reasoning segment landing as a
+    /// structured snapshot (the TUI uses this to swap the live
+    /// "thinking..." buffer into a permanent collapsible transcript
+    /// entry). The full `ReasoningSnapshot` is preserved.
+    ReasoningSegment {
+        display_text: String,
+        payload: Value,
+    },
+    /// Schema v3+. The shell tool's OS sandbox backend degraded to
+    /// best-effort mode at least once during the run. Emitted at
+    /// most once per session by the agent.
+    ShellSandboxDegraded {
+        backend: String,
+        fallback_count: u64,
     },
     ToolCallQueued {
         call: Value,
@@ -79,6 +115,14 @@ pub enum EvalEventKind {
     ContextCompacted {
         report: Value,
     },
+    /// Schema v3+: `snapshot` is the full
+    /// `squeezy_core::TaskStateSnapshot` serialized as JSON, so rules
+    /// can read structured `steps`, `blocker`, `next_action`,
+    /// `verification`, `recent_changes`, `replan_reason`. v2 traces
+    /// emitted `{"debug": ..., "summary": ..., "status": ...}` — the
+    /// `summary` field is still present in v3 traces under the same
+    /// key so the existing `ungrounded_citation` Squeezy-help bypass
+    /// works on both.
     TaskStateUpdated {
         snapshot: Value,
     },
@@ -92,6 +136,45 @@ pub enum EvalEventKind {
         action: Value,
         status: String,
     },
+    /// Schema v3+. Typed McpStatusUpdated. Was folded into
+    /// `Snapshot{snapshot_kind:"mcp_status"}` in v2.
+    McpStatusUpdated {
+        servers: Value,
+        generated_unix_millis: u128,
+    },
+    /// Schema v3+. Typed JobUpdated with structured snapshot fields.
+    /// Was folded into `Snapshot{snapshot_kind:"job"}` in v2.
+    JobUpdated {
+        job: Value,
+    },
+    /// Schema v3+. Typed JobNotification with structured fields.
+    /// Was folded into `Snapshot{snapshot_kind:"job_notification"}`
+    /// in v2.
+    JobNotification {
+        job_id: u64,
+        job_kind: String,
+        status: String,
+        title: String,
+        summary: String,
+        ts_unix_ms: u64,
+    },
+    /// Schema v3+. Typed CostWarning carrying the broker's structured
+    /// CostCapStatus (`spent_usd_micros`, `cap_usd_micros`, `percent`).
+    /// Was folded into `Snapshot{snapshot_kind:"cost_warning"}` in v2.
+    CostWarning {
+        spent_usd_micros: u64,
+        cap_usd_micros: u64,
+        percent: u8,
+    },
+    /// Schema v3+. Typed AiReviewerTripped event. Was folded into
+    /// `Snapshot{snapshot_kind:"ai_reviewer_tripped"}` in v2.
+    AiReviewerTripped {
+        reason: String,
+    },
+    /// Legacy / forward-compat catch-all kept so old v2 traces still
+    /// load through `serde`. v3 producers should not emit `Snapshot`
+    /// — use the typed variants above. `view` and `diff` accept this
+    /// when replaying older runs.
     Snapshot {
         #[serde(rename = "snapshot_kind")]
         snapshot_kind: String,
@@ -121,7 +204,17 @@ pub enum EvalEventKind {
     },
 }
 
-pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 2;
+/// Trace schema version. Bumped to 3 in 2026-05 to add typed variants
+/// for `ReasoningDelta`, `ReasoningSegment`, `ShellSandboxDegraded`,
+/// `McpStatusUpdated`, `JobUpdated`, `JobNotification`, `CostWarning`,
+/// `AiReviewerTripped`, and to widen `TurnCompleted` with `message` /
+/// `response_id` / `context_estimate` and `TaskStateUpdated.snapshot`
+/// to the full `TaskStateSnapshot`. v2 traces still deserialize: every
+/// new field is `#[serde(default)]` or `Option`, and the legacy
+/// `Snapshot { snapshot_kind, payload }` catch-all variant is kept so
+/// old `snapshot_kind = "mcp_status"|"job"|"job_notification"|
+/// "cost_warning"|"ai_reviewer_tripped"` records keep parsing.
+pub const EVAL_TRACE_SCHEMA_VERSION: u32 = 3;
 
 fn default_tool_origin() -> String {
     "model".to_string()

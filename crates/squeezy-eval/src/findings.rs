@@ -1258,7 +1258,742 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(StopWithIntentTextNoToolCall),
         Box::new(ExpectFinishReasonNot),
         Box::new(ExpectationsAsFindings),
+        // Phase 4 additions
+        Box::new(CrossTurnDuplicateToolCall),
+        Box::new(PostCompactionFailure),
+        Box::new(EmptyAssistantText),
+        Box::new(SubagentFailure),
+        Box::new(McpServerFailure),
+        Box::new(CostWarningRaised),
+        Box::new(AiReviewerTrippedRule),
+        Box::new(LengthTruncation),
+        Box::new(SandboxDegraded),
+        Box::new(SlowFirstToken),
+        Box::new(CompactionLoop),
+        Box::new(DeferredFindingFired),
+        Box::new(ExpectDroppedToolCalls),
+        // Phase 5 additions (TUI-coverage rules)
+        Box::new(TuiOverlayUnhandled),
+        Box::new(TuiUserInputAutoCancelled),
+        // Phase 7 additions
+        Box::new(PlatformMismatch),
     ]
+}
+
+/// Phase 7: scenario opted into a specific OS platform; the host
+/// doesn't match. Soft-assertion: produces a finding but does not
+/// abort the run.
+pub struct PlatformMismatch;
+impl Rule for PlatformMismatch {
+    fn rule_id(&self) -> &'static str {
+        "platform_mismatch"
+    }
+    fn check(&self, _ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
+        let Some(expected) = scenario.platform.as_deref() else {
+            return Vec::new();
+        };
+        let actual = match std::env::consts::OS {
+            "linux" => "linux",
+            "macos" => "macos",
+            "windows" => "windows",
+            other => other,
+        };
+        if !expected.eq_ignore_ascii_case(actual) {
+            vec![Finding {
+                rule_id: "platform_mismatch".into(),
+                severity: Severity::Minor,
+                category: "infra".into(),
+                summary: format!(
+                    "Scenario pinned `platform = \"{expected}\"` but the host is `{actual}` — \
+                     OS-specific behavior (sandbox backends, shell semantics) won't match the \
+                     scenario's intent."
+                ),
+                evidence: vec![],
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// Phase 5: any overlay-triggering event (approval / MCP elicitation /
+/// user-input) was auto-cancelled because the scenario didn't queue a
+/// matching action. Complements the existing `approval_unanswered`
+/// rule by extending the same signal to elicitation and user-input
+/// surfaces.
+pub struct TuiOverlayUnhandled;
+impl Rule for TuiOverlayUnhandled {
+    fn rule_id(&self) -> &'static str {
+        "tui_overlay_unhandled"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (seq, kind, status) in &ctx.action_steps {
+            let is_overlay = matches!(kind.as_str(), "mcp_elicitation" | "request_user_input");
+            if is_overlay && status == "auto_cancelled" {
+                out.push(Finding {
+                    rule_id: "tui_overlay_unhandled".into(),
+                    severity: Severity::Major,
+                    category: "ux".into(),
+                    summary: format!(
+                        "Overlay-triggering event `{kind}` was auto-cancelled — \
+                         no scenario `RespondElicitation` / `RespondUserInput` matched."
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(*seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Phase 5: a typed RequestUserInput auto-cancelled. Split from
+/// `tui_overlay_unhandled` so triage can route the two surfaces
+/// separately when needed.
+pub struct TuiUserInputAutoCancelled;
+impl Rule for TuiUserInputAutoCancelled {
+    fn rule_id(&self) -> &'static str {
+        "tui_user_input_auto_cancelled"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (seq, kind, status) in &ctx.action_steps {
+            if kind == "request_user_input" && status == "auto_cancelled" {
+                out.push(Finding {
+                    rule_id: "tui_user_input_auto_cancelled".into(),
+                    severity: Severity::Minor,
+                    category: "ux".into(),
+                    summary: "RequestUserInput overlay opened but the scenario auto-cancelled the prompt.".into(),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(*seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+// ---------- Phase 4 rules ----------
+
+/// Same `(name, args_sha256)` fires across ≥3 distinct turns. The
+/// turn-local `DuplicateToolCall` rule only catches same-turn
+/// repeats; this catches the "agent re-runs the identical grep
+/// across turns 1, 2, 3" pattern that wastes provider input tokens.
+pub struct CrossTurnDuplicateToolCall;
+impl Rule for CrossTurnDuplicateToolCall {
+    fn rule_id(&self) -> &'static str {
+        "cross_turn_duplicate_tool_call"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut by_key: BTreeMap<(String, String), Vec<(String, u64)>> = BTreeMap::new();
+        for (turn, calls) in &ctx.tool_calls_by_turn {
+            for (name, sha, seq) in calls {
+                by_key
+                    .entry((name.clone(), sha.clone()))
+                    .or_default()
+                    .push((turn.clone(), *seq));
+            }
+        }
+        let mut out = Vec::new();
+        for ((name, sha), entries) in by_key {
+            let distinct_turns = entries
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            if distinct_turns >= 3 {
+                out.push(Finding {
+                    rule_id: "cross_turn_duplicate_tool_call".into(),
+                    severity: Severity::Major,
+                    category: "perf".into(),
+                    summary: format!(
+                        "{} fired with identical args (sha256 {}…) across {} distinct turns",
+                        name,
+                        &sha[..8.min(sha.len())],
+                        distinct_turns
+                    ),
+                    evidence: entries
+                        .into_iter()
+                        .map(|(_, seq)| EvidencePointer {
+                            trace_event: Some(seq),
+                            frame: None,
+                        })
+                        .collect(),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// The turn immediately after `ContextCompacted` ends in `TurnFailed`
+/// OR emits empty assistant text with zero tool calls. Catches the
+/// "compact left the conversation broken" regression.
+pub struct PostCompactionFailure;
+impl Rule for PostCompactionFailure {
+    fn rule_id(&self) -> &'static str {
+        "post_compaction_failure"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        let mut compaction_seen = false;
+        let mut last_compaction_seq: Option<u64> = None;
+        for event in &ctx.events {
+            match &event.kind {
+                EvalEventKind::ContextCompacted { .. } => {
+                    compaction_seen = true;
+                    last_compaction_seq = Some(event.sequence);
+                }
+                EvalEventKind::TurnFailed { error } if compaction_seen => {
+                    out.push(Finding {
+                        rule_id: "post_compaction_failure".into(),
+                        severity: Severity::Critical,
+                        category: "correctness".into(),
+                        summary: format!(
+                            "Turn after /compact failed: {}",
+                            error.chars().take(160).collect::<String>()
+                        ),
+                        evidence: vec![
+                            EvidencePointer {
+                                trace_event: last_compaction_seq,
+                                frame: None,
+                            },
+                            EvidencePointer {
+                                trace_event: Some(event.sequence),
+                                frame: None,
+                            },
+                        ],
+                    });
+                    compaction_seen = false;
+                }
+                EvalEventKind::TurnCompleted { .. } if compaction_seen => {
+                    if let Some(turn) = &event.turn_id {
+                        let text = ctx
+                            .assistant_text_by_turn
+                            .get(turn)
+                            .cloned()
+                            .unwrap_or_default();
+                        let tool_count = ctx
+                            .tool_calls_by_turn
+                            .get(turn)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                        if text.trim().is_empty() && tool_count == 0 {
+                            out.push(Finding {
+                                rule_id: "post_compaction_failure".into(),
+                                severity: Severity::Critical,
+                                category: "correctness".into(),
+                                summary: format!(
+                                    "Turn {turn} after /compact emitted no assistant text and no tool calls"
+                                ),
+                                evidence: vec![
+                                    EvidencePointer {
+                                        trace_event: last_compaction_seq,
+                                        frame: None,
+                                    },
+                                    EvidencePointer {
+                                        trace_event: Some(event.sequence),
+                                        frame: None,
+                                    },
+                                ],
+                            });
+                        }
+                    }
+                    compaction_seen = false;
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// A turn finished cleanly but produced no assistant text and no
+/// tool calls. The user sees an empty answer.
+pub struct EmptyAssistantText;
+impl Rule for EmptyAssistantText {
+    fn rule_id(&self) -> &'static str {
+        "empty_assistant_text"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if let EvalEventKind::TurnCompleted { .. } = &event.kind
+                && let Some(turn) = &event.turn_id
+            {
+                let text = ctx
+                    .assistant_text_by_turn
+                    .get(turn)
+                    .cloned()
+                    .unwrap_or_default();
+                let tool_count = ctx
+                    .tool_calls_by_turn
+                    .get(turn)
+                    .map(|v| v.len())
+                    .unwrap_or(0);
+                if text.trim().is_empty() && tool_count == 0 {
+                    out.push(Finding {
+                        rule_id: "empty_assistant_text".into(),
+                        severity: Severity::Major,
+                        category: "correctness".into(),
+                        summary: format!(
+                            "Turn {turn} completed with empty assistant text and zero tool calls"
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(event.sequence),
+                            frame: None,
+                        }],
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Any `SubagentEvent` with `kind: failed` or `kind: rejected`.
+pub struct SubagentFailure;
+impl Rule for SubagentFailure {
+    fn rule_id(&self) -> &'static str {
+        "subagent_failure"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if let EvalEventKind::SubagentEvent { event: sub } = &event.kind {
+                let kind = sub.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if matches!(kind, "failed" | "rejected") {
+                    let agent = sub.get("agent").and_then(|v| v.as_str()).unwrap_or("?");
+                    let detail = match kind {
+                        "failed" => sub
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                        "rejected" => format!(
+                            "reason={}",
+                            sub.get("reason")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                        ),
+                        _ => String::new(),
+                    };
+                    out.push(Finding {
+                        rule_id: "subagent_failure".into(),
+                        severity: Severity::Major,
+                        category: "correctness".into(),
+                        summary: format!(
+                            "Subagent `{agent}` {kind}: {}",
+                            detail.chars().take(200).collect::<String>()
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(event.sequence),
+                            frame: None,
+                        }],
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Any `McpStatusUpdated` (typed or legacy Snapshot) reports a server
+/// in `Failed`. Catches MCP regressions silently degrading tool
+/// availability.
+pub struct McpServerFailure;
+impl Rule for McpServerFailure {
+    fn rule_id(&self) -> &'static str {
+        "mcp_server_failure"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        let mut reported: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for event in &ctx.events {
+            let servers = match &event.kind {
+                EvalEventKind::McpStatusUpdated { servers, .. } => servers.clone(),
+                EvalEventKind::Snapshot {
+                    snapshot_kind,
+                    payload,
+                } if snapshot_kind == "mcp_status" => {
+                    // v2 stored only `{"debug": "..."}`; nothing
+                    // structured to scan. Skip silently — the same
+                    // regression in a v3 run lights up.
+                    let _ = payload;
+                    continue;
+                }
+                _ => continue,
+            };
+            let Some(obj) = servers.as_object() else {
+                continue;
+            };
+            for (server, status) in obj {
+                let failed = status.is_object() && status.get("Failed").is_some()
+                    || status.as_str() == Some("Failed");
+                if failed && reported.insert(server.clone()) {
+                    let err = status
+                        .get("Failed")
+                        .and_then(|v| v.get("error"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no error message)");
+                    out.push(Finding {
+                        rule_id: "mcp_server_failure".into(),
+                        severity: Severity::Major,
+                        category: "tooling".into(),
+                        summary: format!(
+                            "MCP server `{server}` reported Failed: {}",
+                            err.chars().take(160).collect::<String>()
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(event.sequence),
+                            frame: None,
+                        }],
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Any `CostWarning` typed event fired (the broker crossed the
+/// configured cap percentage).
+pub struct CostWarningRaised;
+impl Rule for CostWarningRaised {
+    fn rule_id(&self) -> &'static str {
+        "cost_warning_raised"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if let EvalEventKind::CostWarning {
+                spent_usd_micros,
+                cap_usd_micros,
+                percent,
+            } = &event.kind
+            {
+                out.push(Finding {
+                    rule_id: "cost_warning_raised".into(),
+                    severity: Severity::Minor,
+                    category: "cost".into(),
+                    summary: format!(
+                        "Session crossed cost cap warning threshold: spent=${:.4} cap=${:.4} ({}%)",
+                        *spent_usd_micros as f64 / 1_000_000.0,
+                        *cap_usd_micros as f64 / 1_000_000.0,
+                        percent
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(event.sequence),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Any `AiReviewerTripped` event recorded. The reviewer's auto-veto
+/// path is rare; a hit usually signals a regression worth surfacing.
+pub struct AiReviewerTrippedRule;
+impl Rule for AiReviewerTrippedRule {
+    fn rule_id(&self) -> &'static str {
+        "ai_reviewer_tripped"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if let EvalEventKind::AiReviewerTripped { reason } = &event.kind {
+                out.push(Finding {
+                    rule_id: "ai_reviewer_tripped".into(),
+                    severity: Severity::Major,
+                    category: "correctness".into(),
+                    summary: format!(
+                        "AI reviewer tripped: {}",
+                        reason.chars().take(200).collect::<String>()
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(event.sequence),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Any turn finished with `StopReason::MaxTokens` — provider hit the
+/// output-token cap mid-response. Always-on; users who explicitly
+/// opted into length truncation via `expect.finish_reason_not =
+/// ["max_tokens"]` get a redundant hit, but that's intentional —
+/// the rule surfaces the same regression from two angles.
+pub struct LengthTruncation;
+impl Rule for LengthTruncation {
+    fn rule_id(&self) -> &'static str {
+        "length_truncation"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for (turn, (seq, stop, _)) in &ctx.turn_finish_states {
+            if matches!(stop, Some(squeezy_llm::StopReason::MaxTokens)) {
+                out.push(Finding {
+                    rule_id: "length_truncation".into(),
+                    severity: Severity::Major,
+                    category: "correctness".into(),
+                    summary: format!("Turn {turn} ended with stop_reason=MaxTokens — provider truncated the response"),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(*seq),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Any `ShellSandboxDegraded` event recorded by the agent. Each
+/// fallback indicates the OS sandbox failed for at least one shell
+/// invocation and the run silently downgraded to best-effort
+/// isolation.
+pub struct SandboxDegraded;
+impl Rule for SandboxDegraded {
+    fn rule_id(&self) -> &'static str {
+        "sandbox_degraded"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if let EvalEventKind::ShellSandboxDegraded {
+                backend,
+                fallback_count,
+            } = &event.kind
+            {
+                out.push(Finding {
+                    rule_id: "sandbox_degraded".into(),
+                    severity: Severity::Minor,
+                    category: "tooling".into(),
+                    summary: format!(
+                        "Shell sandbox `{backend}` fell back to best-effort isolation ({fallback_count} time(s))"
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(event.sequence),
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// The first `AssistantDelta` (or any tool/turn-ending event) arrived
+/// more than 5 seconds after the matching `TurnStarted`. Catches
+/// providers that are silently slow on the first byte; pair with
+/// Phase 7's heartbeat-aware timeout for full coverage.
+pub struct SlowFirstToken;
+impl Rule for SlowFirstToken {
+    fn rule_id(&self) -> &'static str {
+        "slow_first_token"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const THRESHOLD_MS: u64 = 5_000;
+        let mut out = Vec::new();
+        let mut turn_start_ts: BTreeMap<String, (u64, u64)> = BTreeMap::new(); // turn -> (ts, seq)
+        for event in &ctx.events {
+            match &event.kind {
+                EvalEventKind::TurnStarted => {
+                    if let Some(turn) = &event.turn_id {
+                        turn_start_ts.insert(turn.clone(), (event.ts_unix_ms, event.sequence));
+                    }
+                }
+                EvalEventKind::AssistantDelta { .. } | EvalEventKind::ToolCallStarted { .. } => {
+                    if let Some(turn) = &event.turn_id
+                        && let Some((start_ts, start_seq)) = turn_start_ts.remove(turn)
+                    {
+                        let elapsed = event.ts_unix_ms.saturating_sub(start_ts);
+                        if elapsed > THRESHOLD_MS {
+                            out.push(Finding {
+                                rule_id: "slow_first_token".into(),
+                                severity: Severity::Minor,
+                                category: "perf".into(),
+                                summary: format!(
+                                    "Turn {turn} first byte arrived after {elapsed}ms (threshold {THRESHOLD_MS}ms)"
+                                ),
+                                evidence: vec![
+                                    EvidencePointer {
+                                        trace_event: Some(start_seq),
+                                        frame: None,
+                                    },
+                                    EvidencePointer {
+                                        trace_event: Some(event.sequence),
+                                        frame: None,
+                                    },
+                                ],
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+/// Two `ContextCompacted` events within 5 turns. Tight back-to-back
+/// compaction is a strong indicator that the threshold is misconfigured
+/// or that the model keeps re-bloating context after each compaction.
+pub struct CompactionLoop;
+impl Rule for CompactionLoop {
+    fn rule_id(&self) -> &'static str {
+        "compaction_loop"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const TURN_WINDOW: u64 = 5;
+        let mut compactions: Vec<(u64, u64)> = Vec::new(); // (sequence, turn_count_at_time)
+        let mut turns_so_far = 0u64;
+        for event in &ctx.events {
+            match &event.kind {
+                EvalEventKind::TurnStarted => turns_so_far += 1,
+                EvalEventKind::ContextCompacted { .. } => {
+                    compactions.push((event.sequence, turns_so_far));
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for win in compactions.windows(2) {
+            let (seq_a, turn_a) = win[0];
+            let (seq_b, turn_b) = win[1];
+            if turn_b.saturating_sub(turn_a) <= TURN_WINDOW {
+                out.push(Finding {
+                    rule_id: "compaction_loop".into(),
+                    severity: Severity::Major,
+                    category: "perf".into(),
+                    summary: format!(
+                        "Two /compact events landed within {} turn(s); window threshold is {TURN_WINDOW}",
+                        turn_b - turn_a
+                    ),
+                    evidence: vec![
+                        EvidencePointer {
+                            trace_event: Some(seq_a),
+                            frame: None,
+                        },
+                        EvidencePointer {
+                            trace_event: Some(seq_b),
+                            frame: None,
+                        },
+                    ],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Validates the Phase 2 `Assertion::FindingFired { rule_id }`
+/// deferred markers: for each `deferred_finding_fired:<rule_id>`
+/// action step, check whether the named rule actually emitted a
+/// finding in this run. Failure becomes a finding so the scenario's
+/// expectation isn't silently dropped.
+pub struct DeferredFindingFired;
+impl Rule for DeferredFindingFired {
+    fn rule_id(&self) -> &'static str {
+        "deferred_finding_fired"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut requested: Vec<(u64, String)> = Vec::new();
+        for (seq, _kind, status) in &ctx.action_steps {
+            if let Some(rest) = status.strip_prefix("deferred_finding_fired:") {
+                requested.push((*seq, rest.to_string()));
+            }
+        }
+        if requested.is_empty() {
+            return Vec::new();
+        }
+        let mut fired: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for event in &ctx.events {
+            if let EvalEventKind::Finding { rule_id, .. } = &event.kind {
+                fired.insert(rule_id.clone());
+            }
+        }
+        requested
+            .into_iter()
+            .filter_map(|(seq, rule_id)| {
+                if fired.contains(&rule_id) {
+                    None
+                } else {
+                    Some(Finding {
+                        rule_id: "deferred_finding_fired".into(),
+                        severity: Severity::Major,
+                        category: "scenario".into(),
+                        summary: format!(
+                            "Scenario asserted `{rule_id}` would fire, but no Finding with that rule_id was emitted"
+                        ),
+                        evidence: vec![EvidencePointer {
+                            trace_event: Some(seq),
+                            frame: None,
+                        }],
+                    })
+                }
+            })
+            .collect()
+    }
+}
+
+/// `expect.max_dropped_tool_calls` is set and the total observed
+/// `dropped_tool_calls` (read from per-turn frames via the metrics
+/// JSON) exceeded it. The producer-side wiring for the counter lives
+/// in `squeezy-llm`; until that lands the metric stays at 0 and this
+/// rule is a no-op, but the scenario-side knob is now plumbed.
+pub struct ExpectDroppedToolCalls;
+impl Rule for ExpectDroppedToolCalls {
+    fn rule_id(&self) -> &'static str {
+        "expect_dropped_tool_calls"
+    }
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
+        let Some(max) = scenario.expect.max_dropped_tool_calls else {
+            return Vec::new();
+        };
+        let mut total: u64 = 0;
+        let mut last_seq: Option<u64> = None;
+        for event in &ctx.events {
+            if let EvalEventKind::TurnCompleted { metrics, .. } = &event.kind {
+                let n = metrics
+                    .get("dropped_tool_calls")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                total = total.saturating_add(n);
+                last_seq = Some(event.sequence);
+            }
+        }
+        if total > max as u64 {
+            vec![Finding {
+                rule_id: "expect_dropped_tool_calls".into(),
+                severity: Severity::Major,
+                category: "correctness".into(),
+                summary: format!(
+                    "Observed {total} dropped tool-call frames across the run; max allowed {max}"
+                ),
+                evidence: last_seq
+                    .into_iter()
+                    .map(|s| EvidencePointer {
+                        trace_event: Some(s),
+                        frame: None,
+                    })
+                    .collect(),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 pub struct FindingsLog {

@@ -24,13 +24,51 @@ pub fn render(run_dir: &Path) -> Result<String, EvalError> {
     let manifest = read_manifest(&run_dir.join("run.json"))?;
     let events = read_events(&run_dir.join("trace.jsonl"))?;
     let findings = read_findings(&run_dir.join("findings.jsonl"))?;
+    // Phase 6: pull `ansi` re-renderings from frames.jsonl so the
+    // timeline preserves bold/italic/colors from the TUI markdown
+    // pipeline. Missing or malformed frames.jsonl falls back to the
+    // plain-text block-quote path.
+    let frame_ansi = read_frame_ansi_by_turn(&run_dir.join("frames.jsonl"));
 
     let mut out = String::new();
     write_header(&mut out, run_dir, &manifest);
     write_findings_summary(&mut out, &findings);
-    write_timeline(&mut out, &events);
+    write_timeline(&mut out, &events, &frame_ansi);
     write_footer(&mut out, &events);
     Ok(out)
+}
+
+/// Best-effort read of `frames.jsonl` into a `turn_id -> ansi` map.
+/// Failures degrade silently: returns an empty map and timeline falls
+/// back to the plain-text path.
+fn read_frame_ansi_by_turn(path: &Path) -> BTreeMap<String, String> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return BTreeMap::new();
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut out = BTreeMap::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value): Result<Value, _> = serde_json::from_str(&line) else {
+            continue;
+        };
+        let turn = value
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if turn.is_empty() {
+            continue;
+        }
+        if let Some(ansi) = value.get("ansi").and_then(Value::as_str) {
+            out.insert(turn, ansi.to_string());
+        }
+    }
+    out
 }
 
 fn write_header(out: &mut String, run_dir: &Path, manifest: &Value) {
@@ -95,7 +133,7 @@ fn write_findings_summary(out: &mut String, findings: &[Finding]) {
     let _ = writeln!(out);
 }
 
-fn write_timeline(out: &mut String, events: &[EvalEvent]) {
+fn write_timeline(out: &mut String, events: &[EvalEvent], frame_ansi: &BTreeMap<String, String>) {
     let _ = writeln!(out, "## Timeline");
     let _ = writeln!(out);
 
@@ -105,7 +143,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
     let mut assistant_buf = String::new();
     let mut turn_start_ts: BTreeMap<String, u64> = BTreeMap::new();
 
-    let flush_assistant = |buf: &mut String, out: &mut String| {
+    let flush_assistant = |buf: &mut String, out: &mut String, turn: Option<&str>| {
         if buf.is_empty() {
             return;
         }
@@ -115,6 +153,20 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
             let _ = writeln!(out, "> {line}");
         }
         let _ = writeln!(out);
+        // Phase 6: also emit the TUI-styled ANSI for this turn (when
+        // captured in frames.jsonl) as a fenced code block. The
+        // block-quote stays for plain-markdown viewers; the fenced
+        // block carries colors / bold / italic for terminal-capable
+        // pipes (`bat`, `less -R`, `cat`).
+        if let Some(turn) = turn
+            && let Some(ansi) = frame_ansi.get(turn)
+            && !ansi.is_empty()
+        {
+            let _ = writeln!(out, "```ansi");
+            let _ = writeln!(out, "{}", ansi.trim_end_matches('\n'));
+            let _ = writeln!(out, "```");
+            let _ = writeln!(out);
+        }
         buf.clear();
     };
 
@@ -130,7 +182,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
         if let Some(t) = &event.turn_id
             && current_turn.as_ref() != Some(t)
         {
-            flush_assistant(&mut assistant_buf, out);
+            flush_assistant(&mut assistant_buf, out, current_turn.as_deref());
             let _ = writeln!(out, "### Turn {}", short_turn(t));
             let _ = writeln!(out);
             turn_start_ts.entry(t.clone()).or_insert(event.ts_unix_ms);
@@ -149,7 +201,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out);
             }
             EvalEventKind::TurnCompleted { cost, metrics, .. } => {
-                flush_assistant(&mut assistant_buf, out);
+                flush_assistant(&mut assistant_buf, out, current_turn.as_deref());
                 let input = cost
                     .get("input_tokens")
                     .and_then(Value::as_u64)
@@ -174,7 +226,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out);
             }
             EvalEventKind::TurnFailed { error } => {
-                flush_assistant(&mut assistant_buf, out);
+                flush_assistant(&mut assistant_buf, out, current_turn.as_deref());
                 let _ = writeln!(
                     out,
                     "**🚨 turn failed:** `{}`",
@@ -183,7 +235,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 let _ = writeln!(out);
             }
             EvalEventKind::TurnCancelled => {
-                flush_assistant(&mut assistant_buf, out);
+                flush_assistant(&mut assistant_buf, out, current_turn.as_deref());
                 let _ = writeln!(out, "_(turn cancelled)_");
                 let _ = writeln!(out);
             }
@@ -279,8 +331,126 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
                 // Heartbeats are noise in a post-run timeline; the
                 // ToolCallCompleted event carries the final duration.
             }
-            EvalEventKind::TaskStateUpdated { .. }
-            | EvalEventKind::SubagentEvent { .. }
+            EvalEventKind::TaskStateUpdated { snapshot } => {
+                if let Some(summary) = snapshot.get("summary").and_then(Value::as_str)
+                    && !summary.trim().is_empty()
+                {
+                    let _ = writeln!(out, "📋 _task:_ {}", trim_oneline(summary, 200));
+                    let _ = writeln!(out);
+                }
+            }
+            EvalEventKind::SubagentEvent { event } => {
+                let kind = event.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
+                let icon = match kind {
+                    "started" => "🤖",
+                    "completed" => "✅",
+                    "failed" => "🚨",
+                    "rejected" => "⛔",
+                    _ => "·",
+                };
+                let detail = match kind {
+                    "completed" => event
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(" — {}", trim_oneline(s, 160)))
+                        .unwrap_or_default(),
+                    "failed" => event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(" — {}", trim_oneline(s, 200)))
+                        .unwrap_or_default(),
+                    "rejected" => event
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(" ({s})"))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let _ = writeln!(out, "{icon} **subagent {kind}** `{agent}`{detail}");
+                let _ = writeln!(out);
+            }
+            EvalEventKind::McpStatusUpdated { servers, .. } => {
+                if let Some(obj) = servers.as_object() {
+                    let failed: Vec<&String> = obj
+                        .iter()
+                        .filter_map(|(name, status)| {
+                            if status.is_object() && status.get("Failed").is_some() {
+                                Some(name)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !failed.is_empty() {
+                        let _ = writeln!(
+                            out,
+                            "🛰 **mcp**: failed servers [{}]",
+                            failed
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        let _ = writeln!(out);
+                    }
+                }
+            }
+            EvalEventKind::JobNotification {
+                title,
+                summary,
+                status,
+                ..
+            } => {
+                let _ = writeln!(
+                    out,
+                    "📢 **job {status}** `{}` — {}",
+                    trim_oneline(title, 60),
+                    trim_oneline(summary, 200)
+                );
+                let _ = writeln!(out);
+            }
+            EvalEventKind::CostWarning {
+                spent_usd_micros,
+                cap_usd_micros,
+                percent,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "⚠ **cost warning**: spent ${:.4} / cap ${:.4} ({}%)",
+                    *spent_usd_micros as f64 / 1_000_000.0,
+                    *cap_usd_micros as f64 / 1_000_000.0,
+                    percent
+                );
+                let _ = writeln!(out);
+            }
+            EvalEventKind::AiReviewerTripped { reason } => {
+                let _ = writeln!(
+                    out,
+                    "🛑 **ai reviewer tripped**: {}",
+                    trim_oneline(reason, 240)
+                );
+                let _ = writeln!(out);
+            }
+            EvalEventKind::ShellSandboxDegraded {
+                backend,
+                fallback_count,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "🪨 **sandbox degraded**: backend=`{backend}` fallback_count={fallback_count}"
+                );
+                let _ = writeln!(out);
+            }
+            EvalEventKind::ReasoningSegment { display_text, .. } => {
+                let _ = writeln!(out, "▾ _thinking:_ {}", trim_oneline(display_text, 300));
+                let _ = writeln!(out);
+            }
+            EvalEventKind::ReasoningDelta { .. } => {
+                // Per-token noise; the terminal ReasoningSegment
+                // carries the final assembled snapshot.
+            }
+            EvalEventKind::JobUpdated { .. }
             | EvalEventKind::Snapshot { .. }
             | EvalEventKind::PerfSample { .. } => {
                 // Quiet noise; full detail available in trace.jsonl.
@@ -289,7 +459,7 @@ fn write_timeline(out: &mut String, events: &[EvalEvent]) {
         let _ = turn_label;
     }
     // Final flush in case a stream ended mid-assistant.
-    flush_assistant(&mut assistant_buf, out);
+    flush_assistant(&mut assistant_buf, out, current_turn.as_deref());
 }
 
 fn write_footer(out: &mut String, events: &[EvalEvent]) {

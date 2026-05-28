@@ -2796,6 +2796,7 @@ dependencies = [
 name = "squeezy-eval"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "clap",
  "futures-util",
  "ignore",

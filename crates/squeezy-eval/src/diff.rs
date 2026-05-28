@@ -31,12 +31,56 @@ impl DiffFormat {
 }
 
 pub fn diff_runs(a: &Path, b: &Path, format: DiffFormat) -> Result<String, EvalError> {
+    diff_runs_with_schema_check(a, b, format, false)
+}
+
+/// Like [`diff_runs`] but with an optional schema-version check.
+/// When `schema_check` is true, the diff bails with a clear error if
+/// the two runs' trace `schema_version` (v2 vs v3+) differ. Useful
+/// in CI where a v2/v3 mix would otherwise produce confusing
+/// "missing variant" diffs.
+pub fn diff_runs_with_schema_check(
+    a: &Path,
+    b: &Path,
+    format: DiffFormat,
+    schema_check: bool,
+) -> Result<String, EvalError> {
     let run_a = RunSnapshot::load(a)?;
     let run_b = RunSnapshot::load(b)?;
+    if schema_check {
+        let sa = read_schema_version(&run_a.dir.join("trace.jsonl")).unwrap_or(2);
+        let sb = read_schema_version(&run_b.dir.join("trace.jsonl")).unwrap_or(2);
+        if sa != sb {
+            return Err(EvalError::Internal(format!(
+                "trace schema mismatch: {sa} vs {sb}. Re-run the older side or pass --no-schema-check to diff anyway."
+            )));
+        }
+    }
     match format {
         DiffFormat::Markdown => Ok(render_markdown(&run_a, &run_b)),
         DiffFormat::Json => Ok(render_json(&run_a, &run_b)),
     }
+}
+
+/// Read the first non-empty line of a trace.jsonl and parse its
+/// `schema_version` field. Returns `None` if the file is empty or
+/// malformed; callers should default to schema v2.
+fn read_schema_version(path: &Path) -> Option<u32> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).ok()?;
+        return value
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32);
+    }
+    None
 }
 
 struct RunSnapshot {
