@@ -281,27 +281,35 @@ impl SessionStore {
         Self::append_global_index_entry(&entry);
     }
 
+    /// Start a fresh session.
+    ///
+    /// The handle returned is in the *pending* state: no `metadata.json`
+    /// or `resume_state.json` has been written and no events.jsonl writer
+    /// thread has been spawned. The on-disk session directory is created
+    /// lazily by [`SessionHandle::ensure_live`], which is called the
+    /// first time the handle observes a substantive append (i.e. any
+    /// event whose kind is not a pure lifecycle marker like
+    /// `session_started`). Quick-exit code paths — for example
+    /// `squeezy --prompt --help`, which constructs an `Agent` and bails
+    /// before the model loop runs — therefore leave no on-disk stub
+    /// behind, while any real interaction materialises the session in
+    /// place before the first substantive event is recorded.
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
         metadata.session_id = next_session_id();
         metadata.started_at_ms = now_ms();
         metadata.status = SessionStatus::Running;
         metadata.resume_available = true;
-        let dir = self.session_dir(&metadata.session_id);
-        fs::create_dir_all(&dir)?;
-        write_json(&dir.join("metadata.json"), &metadata)?;
-        write_json(
-            &dir.join("resume_state.json"),
-            &SessionResumeState {
-                resume_available: true,
-                ..SessionResumeState::default()
-            },
-        )?;
-        Self::record_global_index(&metadata);
+        let session_id = metadata.session_id.clone();
         Ok(SessionHandle {
             store: self.clone(),
-            session_id: metadata.session_id,
+            session_id,
             counters: Arc::new(HandleCounters::default()),
-            event_writer: SessionLogWriter::spawn(self.clone(), dir),
+            state: Arc::new(InnerStateGuard {
+                inner: StdMutex::new(InnerState::Pending(Box::new(PendingState {
+                    metadata,
+                    buffered_events: Vec::new(),
+                }))),
+            }),
         })
     }
 
@@ -327,11 +335,15 @@ impl SessionStore {
                 .replay_count
                 .store(tape.events.len() as u64, Ordering::Relaxed);
         }
+        let dir = self.session_dir(&session_id);
+        let writer = SessionLogWriter::spawn(self.clone(), dir);
         SessionHandle {
             store: self.clone(),
-            session_id: session_id.clone(),
+            session_id,
             counters: Arc::new(counters),
-            event_writer: SessionLogWriter::spawn(self.clone(), self.session_dir(&session_id)),
+            state: Arc::new(InnerStateGuard {
+                inner: StdMutex::new(InnerState::Live(writer)),
+            }),
         }
     }
 
@@ -366,8 +378,13 @@ impl SessionStore {
             })?;
         metadata.parent_id = Some(parent_session_id.to_string());
         let handle = self.start_session(metadata)?;
+        // Route the parent resume snapshot through the handle so the
+        // child session materialises (creates dir, writes metadata.json,
+        // writes resume_state.json) before any sibling files are written
+        // alongside it. Fork is itself a substantive event, so deferring
+        // here would not save any disk activity.
+        handle.write_resume_state(&parent_resume)?;
         let dir = self.session_dir(handle.session_id());
-        write_json(&dir.join("resume_state.json"), &parent_resume)?;
         let parent_attachments = parent_dir.join("attachments");
         if parent_attachments.exists() {
             let child_attachments = dir.join("attachments");
@@ -514,7 +531,20 @@ impl SessionStore {
 
     pub fn show(&self, session_id: &str) -> Result<SessionRecord> {
         let dir = self.locate_session_dir(session_id);
-        let metadata = read_json(&dir.join("metadata.json"))?;
+        let metadata_path = dir.join("metadata.json");
+        // Lazy materialisation means a session can exist in memory (held by
+        // a live `SessionHandle`) without any on-disk footprint until its
+        // first substantive event. From the store's perspective those
+        // sessions are simply not visible; return a clean "not found"
+        // error rather than letting the underlying `read_to_string`
+        // failure surface as a generic IO error.
+        if !metadata_path.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "session {session_id} not found (no metadata.json at {})",
+                metadata_path.display(),
+            )));
+        }
+        let metadata = read_json(&metadata_path)?;
         let (events, event_warnings) = read_jsonl(&dir.join("events.jsonl"))?;
         let resume_state = read_json(&dir.join("resume_state.json")).ok();
         let attachments = read_context_attachments(&dir.join("attachments"))?;
@@ -842,7 +872,10 @@ pub struct SessionHandle {
     // avoid the read-mutate-write of `metadata.json` for routine events that
     // don't change any user-visible discovery field.
     counters: Arc<HandleCounters>,
-    event_writer: Arc<SessionLogWriter>,
+    /// Lazy materialisation state. Shared by every clone of the handle so
+    /// the first substantive append from any clone promotes the entire
+    /// session to the on-disk Live form.
+    state: Arc<InnerStateGuard>,
 }
 
 #[derive(Debug, Default)]
@@ -850,6 +883,64 @@ struct HandleCounters {
     event_count: AtomicU64,
     replay_count: AtomicU64,
     has_first_user_task: AtomicBool,
+}
+
+/// Lazy materialisation state for a `SessionHandle`.
+///
+/// A fresh session begins as [`InnerState::Pending`] — the metadata
+/// lives in memory and no `metadata.json` / `resume_state.json` has
+/// been written. The first substantive event (or an explicit
+/// materialising call such as `write_resume_state`) promotes the
+/// session to [`InnerState::Live`], at which point the on-disk
+/// session directory is created, the writer thread is spawned, and
+/// any buffered lifecycle events are flushed in arrival order.
+///
+/// Sessions opened via [`SessionStore::open_session`] start out
+/// [`InnerState::Live`] because the on-disk artefact already exists.
+#[derive(Debug)]
+struct InnerStateGuard {
+    inner: StdMutex<InnerState>,
+}
+
+#[derive(Debug)]
+enum InnerState {
+    // `PendingState` is large (it holds an entire `SessionMetadata`
+    // and a `Vec<SessionEvent>` buffer) compared to the other variants,
+    // so box it to keep `InnerState` itself a small tagged pointer.
+    // Promotion is rare enough that the extra indirection is irrelevant
+    // next to the cost of writing `metadata.json`.
+    Pending(Box<PendingState>),
+    Live(Arc<SessionLogWriter>),
+    /// Sentinel observed only inside [`SessionHandle::ensure_live`]
+    /// while the pending state is being moved out of the mutex during
+    /// promotion. The mutex is held throughout the transition so no
+    /// other caller can ever read this variant.
+    Transitioning,
+}
+
+#[derive(Debug)]
+struct PendingState {
+    /// Metadata snapshot built by `start_session`. Updated in place
+    /// by `update_metadata` while the session remains pending; written
+    /// to `metadata.json` on promotion.
+    metadata: SessionMetadata,
+    /// Lifecycle-only events (e.g. `session_started`) appended before
+    /// the session materialised. Flushed in arrival order through the
+    /// writer on promotion. The in-memory counters track them too, so
+    /// the handle's view of `event_count` stays consistent across the
+    /// promotion boundary.
+    buffered_events: Vec<SessionEvent>,
+}
+
+/// Event kinds that on their own should not promote a pending session
+/// to live: they are pure lifecycle bookkeeping and represent no real
+/// interaction. Any other kind triggers materialisation so the durable
+/// log captures it from the first byte forward.
+fn is_substantive_event_kind(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "session_started" | "session_resumed" | "session_ended"
+    )
 }
 
 #[derive(Debug)]
@@ -1076,7 +1167,20 @@ impl SessionHandle {
     }
 
     pub fn metadata(&self) -> Result<SessionMetadata> {
-        let mut metadata: SessionMetadata = read_json(&self.dir().join("metadata.json"))?;
+        let pending_snapshot = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                InnerState::Pending(pending) => Some(pending.metadata.clone()),
+                InnerState::Live(_) => None,
+                InnerState::Transitioning => {
+                    unreachable!("SessionHandle observed Transitioning state outside ensure_live")
+                }
+            }
+        };
+        let mut metadata = match pending_snapshot {
+            Some(metadata) => metadata,
+            None => read_json(&self.dir().join("metadata.json"))?,
+        };
         // Surface the in-memory event_count even when we have intentionally
         // skipped writing metadata.json for routine events.
         let cached = self.counters.event_count.load(Ordering::Relaxed);
@@ -1087,13 +1191,92 @@ impl SessionHandle {
     }
 
     pub fn update_metadata(&self, update: impl FnOnce(&mut SessionMetadata)) -> Result<()> {
+        // Pending sessions keep their metadata fully in memory; mutate in
+        // place and let materialisation flush it to disk later.
+        {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                update(&mut pending.metadata);
+                return Ok(());
+            }
+        }
         let mut metadata = self.metadata()?;
         update(&mut metadata);
         write_json(&self.dir().join("metadata.json"), &metadata)
     }
 
     pub fn flush_events(&self) -> Result<()> {
-        self.event_writer.flush()
+        let writer = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                // Pending sessions have nothing on disk and no writer thread
+                // — a flush is a no-op rather than an error.
+                InnerState::Pending(_) => return Ok(()),
+                InnerState::Live(writer) => writer.clone(),
+                InnerState::Transitioning => unreachable!(),
+            }
+        };
+        writer.flush()
+    }
+
+    /// Promote a pending session to the live form: create the session
+    /// directory, write `metadata.json` and `resume_state.json`, record
+    /// the cross-project global index entry, spawn the events.jsonl
+    /// writer thread, and flush any buffered lifecycle events through
+    /// the writer in arrival order. No-op when the session is already
+    /// live.
+    ///
+    /// Returns an Arc clone of the writer so the caller can immediately
+    /// queue further appends without re-locking the state mutex.
+    fn ensure_live(&self) -> Result<Arc<SessionLogWriter>> {
+        let mut guard = self.state.inner.lock().expect("session handle state");
+        match &*guard {
+            InnerState::Live(writer) => return Ok(writer.clone()),
+            InnerState::Pending(_) => {}
+            InnerState::Transitioning => {
+                unreachable!("ensure_live observed Transitioning state under its own lock")
+            }
+        }
+        let pending = match std::mem::replace(&mut *guard, InnerState::Transitioning) {
+            InnerState::Pending(pending) => pending,
+            _ => unreachable!(),
+        };
+        let dir = self.store.session_dir(&self.session_id);
+        let prepare = || -> Result<()> {
+            fs::create_dir_all(&dir)?;
+            write_json(&dir.join("metadata.json"), &pending.metadata)?;
+            write_json(
+                &dir.join("resume_state.json"),
+                &SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                },
+            )?;
+            Ok(())
+        };
+        if let Err(error) = prepare() {
+            // Restore the pending state so the caller can retry without
+            // losing the metadata snapshot or any buffered events.
+            *guard = InnerState::Pending(pending);
+            return Err(error);
+        }
+        SessionStore::record_global_index(&pending.metadata);
+        let writer = SessionLogWriter::spawn(self.store.clone(), dir);
+        // Replay buffered lifecycle events through the writer so any
+        // pre-promotion bookkeeping (`session_started`, …) lands in
+        // events.jsonl before the substantive event that triggered
+        // promotion does. We hold the state mutex throughout, so no
+        // other caller can interleave a fresh append between the
+        // buffer flush and the state flip.
+        for event in &pending.buffered_events {
+            let payload = match serialize_event_payload(event, self.store.max_event_bytes) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            let _ = writer.append(SessionLogAppend { payload });
+        }
+        *guard = InnerState::Live(writer.clone());
+        Ok(writer)
     }
 
     /// Typed convenience wrapper for [`append_event`]. Producers that want
@@ -1114,6 +1297,31 @@ impl SessionHandle {
     pub fn append_event(&self, event: SessionEvent) -> Result<()> {
         let event_kind = event.kind.clone();
         let event_summary = event.summary.clone();
+        let substantive = is_substantive_event_kind(&event_kind);
+
+        // Lifecycle-only events on a pending session do not promote the
+        // session; they are buffered in memory and either flushed at
+        // materialisation time (when a substantive event arrives) or
+        // discarded when the handle drops without ever materialising.
+        // This is what keeps quick-exit code paths — `squeezy --prompt
+        // --help` and friends — from leaving a stub session directory
+        // behind on disk.
+        if !substantive {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                let new_count = self.counters.event_count.fetch_add(1, Ordering::Relaxed) + 1;
+                pending.metadata.event_count = new_count;
+                pending.buffered_events.push(event);
+                return Ok(());
+            }
+        }
+
+        // Otherwise: substantive append (or a lifecycle event on an
+        // already-live session). Make sure the on-disk artefact exists
+        // before queueing this event, so buffered lifecycle events land
+        // in events.jsonl first and the ordering invariant holds.
+        let writer = self.ensure_live()?;
+
         let mut payload = to_json_vec(&event)?;
         if payload.len() > self.store.max_event_bytes {
             payload = to_json_vec(&SessionEvent {
@@ -1131,7 +1339,7 @@ impl SessionHandle {
         }
         payload.push(b'\n');
 
-        self.event_writer.append(SessionLogAppend { payload })?;
+        writer.append(SessionLogAppend { payload })?;
         // Hot-path bookkeeping lives in memory: the on-disk event_count is
         // resynced lazily during `metadata()` / `update_metadata`, and the
         // metadata write below only fires when a discovery-visible field is
@@ -1169,6 +1377,10 @@ impl SessionHandle {
     }
 
     pub fn append_replay_event(&self, mut event: SessionReplayEvent) -> Result<()> {
+        // Replay events describe model interaction; they are always
+        // substantive enough to promote a pending session to live so
+        // the events.jsonl + replay.jsonl pair stays consistent.
+        let _ = self.ensure_live()?;
         let dir = self.dir();
         fs::create_dir_all(&dir)?;
         let path = dir.join("replay.jsonl");
@@ -1202,10 +1414,33 @@ impl SessionHandle {
     }
 
     pub fn write_resume_state(&self, state: &SessionResumeState) -> Result<()> {
+        // Materialise before writing: an explicit resume checkpoint means
+        // the caller wants this persisted, so there is no benefit to
+        // continuing to defer the session directory.
+        let _ = self.ensure_live()?;
         write_json(&self.dir().join("resume_state.json"), state)
     }
 
     pub fn read_resume_state(&self) -> Result<SessionResumeState> {
+        // A pending session has no `resume_state.json` on disk yet but
+        // is implicitly resumable (no events have been recorded, so
+        // resuming yields an empty conversation). Surface that view as
+        // the default snapshot rather than erroring with "file not
+        // found".
+        let pending_snapshot = {
+            let guard = self.state.inner.lock().expect("session handle state");
+            match &*guard {
+                InnerState::Pending(pending) => Some(SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                }),
+                InnerState::Live(_) => None,
+                InnerState::Transitioning => unreachable!(),
+            }
+        };
+        if let Some(state) = pending_snapshot {
+            return Ok(state);
+        }
         read_json(&self.dir().join("resume_state.json"))
     }
 
@@ -1217,6 +1452,18 @@ impl SessionHandle {
     /// (snap-to-checkpoint) and forward-applies only the newer events. When
     /// no checkpoint is found, replay starts from an empty conversation.
     pub fn replay_resume_state(&self) -> Result<SessionResumeState> {
+        // Pending sessions have no events.jsonl yet; surface a default
+        // empty resume state rather than letting `read_jsonl` propagate
+        // an arbitrary IO error from the missing file.
+        {
+            let guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &*guard {
+                return Ok(SessionResumeState {
+                    resume_available: pending.metadata.resume_available,
+                    ..SessionResumeState::default()
+                });
+            }
+        }
         let (events, _warnings) = read_jsonl(&self.dir().join("events.jsonl"))?;
         let mut conversation: Vec<ResumeItem> = Vec::new();
         let mut transcript: Vec<TranscriptItem> = Vec::new();
@@ -1262,6 +1509,9 @@ impl SessionHandle {
         attachment: &ContextAttachment,
         redacted_text: Option<&str>,
     ) -> Result<()> {
+        // Attaching context is substantive — the caller is asking us to
+        // pin a real piece of state alongside the session.
+        let _ = self.ensure_live()?;
         let dir = self.dir().join("attachments");
         fs::create_dir_all(&dir)?;
         let stem = attachment_file_stem(&attachment.id)?;
@@ -1273,6 +1523,15 @@ impl SessionHandle {
     }
 
     pub fn context_attachments(&self) -> Result<Vec<ContextAttachment>> {
+        // A pending session has no attachments dir on disk yet — return
+        // an empty list rather than letting the underlying `read_dir`
+        // call surface a NotFound IO error.
+        {
+            let guard = self.state.inner.lock().expect("session handle state");
+            if matches!(&*guard, InnerState::Pending(_)) {
+                return Ok(Vec::new());
+            }
+        }
         read_context_attachments(&self.dir().join("attachments"))
     }
 
@@ -1283,6 +1542,25 @@ impl SessionHandle {
         metrics: SessionMetrics,
         redactions: u64,
     ) -> Result<()> {
+        // A `finish` on a still-pending session means the session ran
+        // but never produced any substantive event (e.g. `--prompt
+        // --help`). Keep the no-stub invariant: mutate the in-memory
+        // metadata so a same-process caller still sees Completed/Failed
+        // bookkeeping, but do not promote the session to its on-disk
+        // form just to record an end timestamp.
+        {
+            let mut guard = self.state.inner.lock().expect("session handle state");
+            if let InnerState::Pending(pending) = &mut *guard {
+                pending.metadata.ended_at_ms = Some(now_ms());
+                if matches!(pending.metadata.status, SessionStatus::Running) {
+                    pending.metadata.status = status;
+                }
+                pending.metadata.cost = cost;
+                pending.metadata.metrics = metrics;
+                pending.metadata.redactions = redactions;
+                return Ok(());
+            }
+        }
         self.flush_events()?;
         self.update_metadata(|metadata| {
             metadata.ended_at_ms = Some(now_ms());
@@ -2475,6 +2753,31 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
 
 fn to_json_vec(value: &impl Serialize) -> Result<Vec<u8>> {
     serde_json::to_vec(value).map_err(json_error)
+}
+
+/// Serialise a `SessionEvent` to its newline-terminated events.jsonl
+/// payload, applying the per-event truncation policy that `append_event`
+/// uses inline. Extracted so the lazy materialisation path can flush
+/// buffered lifecycle events through the writer without duplicating the
+/// truncation logic.
+fn serialize_event_payload(event: &SessionEvent, max_event_bytes: usize) -> Result<Vec<u8>> {
+    let mut payload = to_json_vec(event)?;
+    if payload.len() > max_event_bytes {
+        payload = to_json_vec(&SessionEvent {
+            ts_unix_ms: event.ts_unix_ms,
+            kind: event.kind.clone(),
+            turn_id: event.turn_id.clone(),
+            summary: event.summary.clone(),
+            payload: json!({
+                "truncated": true,
+                "reason": "event exceeded max_event_bytes",
+                "original_bytes": payload.len(),
+            }),
+            parent_event_sequence: event.parent_event_sequence,
+        })?;
+    }
+    payload.push(b'\n');
+    Ok(payload)
 }
 
 fn json_error(error: serde_json::Error) -> SqueezyError {

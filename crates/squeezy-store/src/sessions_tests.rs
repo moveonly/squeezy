@@ -226,6 +226,10 @@ fn malformed_event_lines_are_counted_as_warnings() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    // Lazy materialisation defers the on-disk session dir until a
+    // substantive event arrives. Seed one so the test can overwrite
+    // events.jsonl with a malformed line afterwards.
+    materialise_session(&handle);
     fs::write(
         store.root().join(handle.session_id()).join("events.jsonl"),
         b"{not json}\n",
@@ -290,6 +294,7 @@ fn replay_tape_counts_tampered_lines_as_warnings() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    materialise_session(&handle);
     fs::write(
         store.root().join(handle.session_id()).join("replay.jsonl"),
         br#"{"schema_version":1,"ts_unix_ms":1,"sequence":1,"kind":"user_message","turn_id":"1","payload_sha256":"bad","payload":{"input":"changed"}}"#,
@@ -508,18 +513,37 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
         .expect("start session");
 
     let metadata_path = store.root().join(handle.session_id()).join("metadata.json");
-    let mtime_after_create = fs::metadata(&metadata_path)
-        .expect("stat fresh metadata")
-        .modified()
-        .expect("mtime");
+    // Lazy materialisation: a freshly started session is in-memory only,
+    // so metadata.json must not exist until the first substantive event
+    // arrives.
+    assert!(
+        !metadata_path.exists(),
+        "metadata.json must stay absent until a substantive event arrives",
+    );
 
-    // A burst of routine events (the kinds the agent emits per tool call /
-    // tool result / approval round trip) must not touch metadata.json. Many
-    // filesystems, including APFS on macOS, have second-granularity mtimes,
-    // so we rely on a content hash plus a file-size check instead of trying
-    // to race the clock.
+    // The first substantive event materialises the on-disk session
+    // artefacts (creates the dir, writes metadata.json + resume_state.json,
+    // spawns the events.jsonl writer thread).
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            Some("1".to_string()),
+            Some("tool 0".to_string()),
+            json!({"index": 0}),
+        ))
+        .expect("first substantive event must materialise");
+    assert!(
+        metadata_path.exists(),
+        "metadata.json must be written when the first substantive event arrives",
+    );
+
+    // A burst of further routine events (the kinds the agent emits per
+    // tool call / tool result / approval round trip) must not touch
+    // metadata.json. Many filesystems, including APFS on macOS, have
+    // second-granularity mtimes, so we rely on a content hash plus a
+    // file-size check instead of trying to race the clock.
     let before_bytes = fs::read(&metadata_path).expect("read metadata before");
-    for index in 0..20 {
+    for index in 1..20 {
         handle
             .append_event(SessionEvent::new(
                 "tool_call",
@@ -534,7 +558,6 @@ fn routine_events_skip_metadata_writes_but_event_count_stays_accurate() {
         before_bytes, after_bytes,
         "routine events must not rewrite metadata.json",
     );
-    let _ = mtime_after_create;
 
     // event_count is still surfaced accurately via the in-memory counter so
     // `sessions show` and `sessions list` consumers see a current value even
@@ -654,6 +677,11 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
     let running = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start running");
+    // Both sessions need to be materialised on disk so the retention
+    // sweep can find them by reading `metadata.json`. Lazy materialisation
+    // means we have to drive at least one substantive event through each
+    // handle before backdating the on-disk timestamp.
+    materialise_session(&running);
     // Forge an ancient start time. A retention sweep would normally pick
     // this up, but the session is still Running so cleanup must skip it.
     running
@@ -664,6 +692,7 @@ fn cleanup_does_not_sweep_running_sessions_via_retention() {
     let completed = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start completed");
+    materialise_session(&completed);
     completed
         .finish(
             SessionStatus::Completed,
@@ -727,6 +756,11 @@ fn cleanup_excluding_skips_protected_session() {
     let collateral = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start collateral");
+    // Lazy materialisation means cleanup_excluding cannot find a session
+    // until it has materialised to disk. Seed both with a substantive
+    // event so the explicit-ids sweep can target them.
+    materialise_session(&protected);
+    materialise_session(&collateral);
 
     let report = store
         .cleanup_excluding(
@@ -978,10 +1012,13 @@ fn token_calibration_round_trips_through_metadata_and_global_file() {
     assert_eq!(reloaded, calibration);
 
     // The same calibration must also survive being written into a session's
-    // metadata.json and read back via `show`.
+    // metadata.json and read back via `show`. Materialise the session
+    // before dropping the handle so the on-disk metadata snapshot is
+    // visible to `SessionStore::show`.
     let mut metadata = SessionMetadata::new(&config, "openai");
     metadata.token_calibration = calibration.clone();
     let handle = store.start_session(metadata).expect("start session");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     drop(handle);
     let record = store.show(&session_id).expect("show session");
@@ -994,6 +1031,246 @@ fn temp_root(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create temp root");
     root
+}
+
+/// Force a pending session to materialise its on-disk artefacts so a
+/// test that exercises archive/cleanup/show semantics can rely on a
+/// real `metadata.json` + `events.jsonl` pair existing.
+///
+/// Production callers materialise implicitly the first time a
+/// substantive event lands on the handle — this helper mirrors that by
+/// queueing a single `tool_call` and waiting for the writer to drain.
+fn materialise_session(handle: &SessionHandle) {
+    handle
+        .append_event(SessionEvent::new(
+            "tool_call",
+            None,
+            Some("test materialise".to_string()),
+            json!({}),
+        ))
+        .expect("seed materialising event");
+    handle.flush_events().expect("flush seed event");
+}
+
+/// Acceptance for `F12-pi-lazy-session-file-creation`: a freshly
+/// started session must not leave any on-disk artefact behind until a
+/// substantive event arrives. Quick-exit code paths such as `squeezy
+/// --prompt --help` build an `Agent` and tear it down before any user
+/// turn runs, so the only events that ever reach the handle are
+/// lifecycle markers like `session_started`. Those must stay
+/// in-memory.
+#[test]
+fn start_session_does_not_create_disk_artefacts_until_first_substantive_event() {
+    let root = temp_root("lazy-no-disk-until-substantive");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+
+    assert!(
+        !session_dir.exists(),
+        "start_session must not create the on-disk session directory",
+    );
+
+    // The in-memory metadata view still works while the session stays
+    // pending — `metadata()` falls back to the cached snapshot rather
+    // than reading a non-existent file.
+    let metadata = handle.metadata().expect("metadata while pending");
+    assert_eq!(metadata.session_id, handle.session_id());
+    assert_eq!(metadata.status, SessionStatus::Running);
+    assert!(metadata.resume_available);
+
+    // A lifecycle-only event (the agent emits one of these right after
+    // `start_session_log`) is buffered in memory and must not trigger
+    // materialisation: a `squeezy --prompt --help` that exits before
+    // any real turn would otherwise leave a stub session dir behind.
+    handle
+        .append_event(SessionEvent::new(
+            "session_started",
+            None,
+            Some("session started".to_string()),
+            json!({}),
+        ))
+        .expect("buffered lifecycle event");
+    assert!(
+        !session_dir.exists(),
+        "lifecycle-only events must not materialise the session directory",
+    );
+
+    // flush_events on a pending session is a no-op; it must not race a
+    // lazy materialisation by sneaking the dir into existence.
+    handle.flush_events().expect("flush while pending");
+    assert!(
+        !session_dir.exists(),
+        "flush_events on a pending session must remain a no-op",
+    );
+
+    // The first substantive event promotes the session: dir,
+    // metadata.json, and resume_state.json all appear.
+    handle
+        .append_event(SessionEvent::new(
+            "user_message",
+            None,
+            Some("first task".to_string()),
+            json!({}),
+        ))
+        .expect("first substantive event must materialise");
+    handle.flush_events().expect("flush after promotion");
+
+    assert!(
+        session_dir.exists(),
+        "session dir must exist after promotion"
+    );
+    assert!(
+        session_dir.join("metadata.json").exists(),
+        "metadata.json must exist after promotion",
+    );
+    assert!(
+        session_dir.join("resume_state.json").exists(),
+        "resume_state.json must exist after promotion",
+    );
+
+    // The buffered lifecycle event lands in events.jsonl ahead of the
+    // substantive event that triggered promotion, preserving the
+    // arrival order the caller asked for.
+    let record = store.show(handle.session_id()).expect("show");
+    assert_eq!(
+        record
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session_started", "user_message"],
+        "buffered lifecycle event must be replayed before the promoting event",
+    );
+    assert_eq!(
+        record.metadata.first_user_task.as_deref(),
+        Some("first task")
+    );
+}
+
+/// A session that never sees a substantive event must leave no on-disk
+/// trace when its handle drops — even if the agent appended lifecycle
+/// events and called `finish` on it (mirroring the `--prompt --help`
+/// shutdown path).
+#[test]
+fn pending_session_with_only_lifecycle_events_leaves_no_disk_dir_on_drop() {
+    let root = temp_root("lazy-drop-no-disk");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let session_id = {
+        let handle = store
+            .start_session(SessionMetadata::new(&config, "test-provider"))
+            .expect("start session");
+        handle
+            .append_event(SessionEvent::new(
+                "session_started",
+                None,
+                Some("session started".to_string()),
+                json!({}),
+            ))
+            .expect("buffered session_started");
+        handle
+            .finish(
+                SessionStatus::Completed,
+                CostSnapshot::default(),
+                SessionMetrics::default(),
+                0,
+            )
+            .expect("finish while still pending");
+        handle.session_id().to_string()
+    };
+    let session_dir = store.root().join(&session_id);
+    assert!(
+        !session_dir.exists(),
+        "a session that never saw a substantive event must leave no on-disk dir",
+    );
+    let listed = store
+        .list(&SessionQuery::default())
+        .expect("list after pending finish");
+    assert!(
+        listed
+            .iter()
+            .all(|metadata| metadata.session_id != session_id),
+        "pending-only sessions must not appear in the on-disk listing",
+    );
+}
+
+/// `SessionStore::show` is the read surface the CLI calls to inspect a
+/// session by id. When asked for a session that was started but never
+/// materialised (no `metadata.json` on disk), it must surface a clean
+/// "not found" error rather than a raw IO failure.
+#[test]
+fn show_returns_clean_not_found_for_unmaterialised_session_id() {
+    let root = temp_root("lazy-show-not-found");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_id = handle.session_id().to_string();
+    let error = store
+        .show(&session_id)
+        .expect_err("show must error on a pending-only session");
+    let message = error.to_string();
+    assert!(
+        message.contains("not found"),
+        "show should mention not-found semantics, got: {message}",
+    );
+    assert!(
+        message.contains(&session_id),
+        "show should mention the session id, got: {message}",
+    );
+}
+
+/// `write_resume_state` is an explicit "make my checkpoint durable"
+/// call. It must promote a pending session to its on-disk form so the
+/// fork path (and any other caller that explicitly persists resume
+/// state) sees a real session directory afterwards.
+#[test]
+fn write_resume_state_materialises_pending_session() {
+    let root = temp_root("lazy-write-resume-materialises");
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..AppConfig::default()
+    };
+    let store = SessionStore::open(&config);
+    let handle = store
+        .start_session(SessionMetadata::new(&config, "test-provider"))
+        .expect("start session");
+    let session_dir = store.root().join(handle.session_id());
+    assert!(!session_dir.exists());
+
+    handle
+        .write_resume_state(&SessionResumeState {
+            resume_available: true,
+            conversation: vec![ResumeItem::UserText {
+                text: "carry me forward".to_string(),
+            }],
+            ..SessionResumeState::default()
+        })
+        .expect("write resume promotes");
+
+    assert!(
+        session_dir.join("metadata.json").exists(),
+        "metadata.json must exist after write_resume_state",
+    );
+    let resume: SessionResumeState =
+        serde_json::from_str(&fs::read_to_string(session_dir.join("resume_state.json")).unwrap())
+            .expect("parse resume");
+    assert!(resume.resume_available);
+    assert_eq!(resume.conversation.len(), 1);
 }
 
 #[test]
@@ -1421,7 +1698,7 @@ fn archive_excludes_session_from_default_list() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1452,7 +1729,7 @@ fn cleanup_skips_archived_sessions() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1506,7 +1783,7 @@ fn cleanup_deletes_archived_sessions_past_archive_retention() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
 
@@ -1563,7 +1840,7 @@ fn cleanup_with_archive_retention_disabled_keeps_archived_sessions() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
 
@@ -1597,7 +1874,7 @@ fn remove_session_archives_live_session() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     // Drop the handle so the session log writer thread shuts down
     // before we move the directory out from under it.
@@ -1660,7 +1937,7 @@ fn unarchive_round_trip_restores_session() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive");
     store.unarchive_session(&session_id).expect("unarchive");
@@ -1690,7 +1967,7 @@ fn archived_session_excluded_from_list_default() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
-    handle.flush_events().expect("flush events");
+    materialise_session(&handle);
     let session_id = handle.session_id().to_string();
     store.archive_session(&session_id).expect("archive session");
 
@@ -1729,14 +2006,14 @@ fn cleanup_with_purge_hard_deletes_live_and_archived_sessions() {
     let live = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start live session");
-    live.flush_events().expect("flush live events");
+    materialise_session(&live);
     let live_id = live.session_id().to_string();
     drop(live);
 
     let archived = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start archived session");
-    archived.flush_events().expect("flush archived events");
+    materialise_session(&archived);
     let archived_id = archived.session_id().to_string();
     drop(archived);
     store
@@ -1912,6 +2189,12 @@ fn bundle_rollout_trace_merges_events_and_replay_by_timestamp() {
     let handle = store
         .start_session(SessionMetadata::new(&config, "test-provider"))
         .expect("start session");
+    // The test fabricates events.jsonl + replay.jsonl with fixed
+    // timestamps by writing the files directly. Lazy materialisation
+    // would otherwise leave the session dir absent, so seed a single
+    // event to force the directory + writer into existence before we
+    // overwrite both logs.
+    materialise_session(&handle);
     let session_dir = store.root().join(handle.session_id());
 
     // Fabricate both logs with controlled timestamps so the merge order is
