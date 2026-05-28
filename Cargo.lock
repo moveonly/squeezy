@@ -2877,6 +2877,7 @@ dependencies = [
  "squeezy-core",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
 ]
 

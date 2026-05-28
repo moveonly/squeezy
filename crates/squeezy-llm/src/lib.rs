@@ -19,6 +19,7 @@ mod anthropic_betas;
 mod bedrock;
 mod cache_policy;
 mod compatible;
+mod contribution;
 mod credentials;
 mod google;
 mod lmstudio;
@@ -40,6 +41,11 @@ pub use tokens::{
 pub use anthropic::AnthropicProvider;
 pub use bedrock::BedrockProvider;
 pub use compatible::OpenAiCompatibleProvider;
+pub use contribution::{
+    AnthropicContribution, AnthropicContributionConfig, GoogleContribution,
+    GoogleContributionConfig, LoadedContributions, OllamaContribution, OllamaContributionConfig,
+    OpenAiContribution, OpenAiContributionConfig, ProviderContribution, ProviderContributions,
+};
 pub use credentials::{
     ApiKeyFuture, ApiKeySource, KeySource, RefreshableToken, ResolvedKey, StaticApiKey, TokenState,
     delete_api_key, resolve_api_key, resolve_api_key_with_inline, static_api_key_source,
