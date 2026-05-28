@@ -276,7 +276,7 @@ fn base64_decode_loose(input: &str) -> Option<Vec<u8>> {
             _ => return None,
         }
     }
-    while value.len() % 4 != 0 {
+    while !value.len().is_multiple_of(4) {
         value.push('=');
     }
     let mut out = Vec::with_capacity(value.len() / 4 * 3);

@@ -75,8 +75,10 @@ async fn invalidate_then_current_key_triggers_refresh_through_mock_endpoint() {
     .await;
 
     let path = temp_token_path("invalidate");
-    let mut config = AnthropicLoginConfig::default();
-    config.token_url = token_url;
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
     let source = AnthropicOAuthSource::with_parts(
         fresh_persisted_tokens("orig"),
         path.clone(),
@@ -111,8 +113,10 @@ async fn expired_token_refreshes_automatically_on_current_key() {
     .await;
 
     let path = temp_token_path("expired");
-    let mut config = AnthropicLoginConfig::default();
-    config.token_url = token_url;
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
     let source = AnthropicOAuthSource::with_parts(
         expired_persisted_tokens("e"),
         path.clone(),
@@ -151,8 +155,10 @@ async fn current_key_concurrent_calls_share_a_single_refresh() {
     .await;
 
     let path = temp_token_path("concurrent");
-    let mut config = AnthropicLoginConfig::default();
-    config.token_url = token_url;
+    let config = AnthropicLoginConfig {
+        token_url,
+        ..AnthropicLoginConfig::default()
+    };
     let source = Arc::new(AnthropicOAuthSource::with_parts(
         expired_persisted_tokens("c"),
         path,
@@ -323,10 +329,10 @@ async fn spawn_token_mock(responses: Vec<serde_json::Value>) -> String {
                     if line == "\r\n" || line.is_empty() {
                         break;
                     }
-                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        if let Ok(len) = rest.trim().parse::<usize>() {
-                            content_length = len;
-                        }
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:")
+                        && let Ok(len) = rest.trim().parse::<usize>()
+                    {
+                        content_length = len;
                     }
                 }
                 if content_length > 0 {
@@ -353,7 +359,7 @@ async fn spawn_token_mock(responses: Vec<serde_json::Value>) -> String {
                 let response = format!(
                     "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
                     status = status,
-                    len = body.as_bytes().len(),
+                    len = body.len(),
                     body = body,
                 );
                 let _ = socket.write_all(response.as_bytes()).await;

@@ -115,7 +115,7 @@ impl PersistedTokens {
     pub fn from_token_response(response: &TokenResponse, now_ms: u64) -> Self {
         let expires_at_unix_ms = now_ms
             .saturating_add(response.expires_in.saturating_mul(1000))
-            .saturating_sub((REFRESH_LEAD_TIME.as_secs() as u64).saturating_mul(1000));
+            .saturating_sub(REFRESH_LEAD_TIME.as_secs().saturating_mul(1000));
         Self {
             access_token: response.access_token.clone(),
             refresh_token: response.refresh_token.clone(),
