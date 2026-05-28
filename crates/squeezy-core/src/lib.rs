@@ -6296,6 +6296,11 @@ pub struct TuiConfig {
     pub transcript_default: TranscriptDefault,
     pub alternate_screen: TuiAlternateScreen,
     pub show_reasoning_usage: bool,
+    /// Render-time grouping of adjacent same-tool same-status calls into
+    /// one card (e.g. three back-to-back `read_file` calls become "Read 3
+    /// files"). Independent of the push-time retry coalescer. Default
+    /// `true`; flip to `false` to keep every tool call on its own row.
+    pub coalesce_tool_runs: bool,
     /// Ordered list of status-line item identifiers. `None` means
     /// "use the built-in default list"; an empty list means the user
     /// deliberately disabled the detail line.
@@ -6336,6 +6341,7 @@ impl TuiConfig {
                 .alternate_screen
                 .unwrap_or(TuiAlternateScreen::Auto),
             show_reasoning_usage: settings.show_reasoning_usage.unwrap_or(true),
+            coalesce_tool_runs: settings.coalesce_tool_runs.unwrap_or(true),
             status_line: settings.status_line,
             status_line_use_colors: settings.status_line_use_colors.unwrap_or(true),
             theme: settings.theme.unwrap_or(TuiTheme::System),
@@ -6362,6 +6368,7 @@ pub struct TuiSettings {
     pub transcript_default: Option<TranscriptDefault>,
     pub alternate_screen: Option<TuiAlternateScreen>,
     pub show_reasoning_usage: Option<bool>,
+    pub coalesce_tool_runs: Option<bool>,
     pub status_line: Option<Vec<String>>,
     pub status_line_use_colors: Option<bool>,
     pub theme: Option<TuiTheme>,
@@ -6381,6 +6388,7 @@ impl TuiSettings {
                 "transcript_default",
                 "alternate_screen",
                 "show_reasoning_usage",
+                "coalesce_tool_runs",
                 "status_line",
                 "status_line_use_colors",
                 "theme",
@@ -6427,6 +6435,12 @@ impl TuiSettings {
                 "show_reasoning_usage",
                 source,
                 &field(path, "show_reasoning_usage"),
+            )?,
+            coalesce_tool_runs: bool_value(
+                table,
+                "coalesce_tool_runs",
+                source,
+                &field(path, "coalesce_tool_runs"),
             )?,
             status_line: string_array_value(
                 table,

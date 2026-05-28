@@ -668,6 +668,19 @@ pub const CONFIG_SECTIONS: &[ConfigSectionMeta] = &[
                 secret: false,
             },
             FieldMeta {
+                label: "coalesce_tool_runs",
+                toml_path: &["tui", "coalesce_tool_runs"],
+                kind: FieldKind::Bool,
+                tier: ApplyTier::Immediate,
+                get: get_coalesce_tool_runs,
+                set: set_coalesce_tool_runs,
+                default_display: "true",
+                default: || FieldValue::Bool(true),
+                help: "Group consecutive same-tool calls (e.g. a fan-out of `read_file`s) into one card.",
+                env_override: None,
+                secret: false,
+            },
+            FieldMeta {
                 label: "alternate_screen",
                 toml_path: &["tui", "alternate_screen"],
                 kind: FieldKind::Enum {
@@ -1783,6 +1796,19 @@ fn set_show_reasoning_usage(cfg: &mut AppConfig, value: FieldValue) -> Result<()
     match value {
         FieldValue::Bool(v) => {
             cfg.tui.show_reasoning_usage = v;
+            Ok(())
+        }
+        _ => Err("expects bool"),
+    }
+}
+
+fn get_coalesce_tool_runs(cfg: &AppConfig) -> FieldValue {
+    FieldValue::Bool(cfg.tui.coalesce_tool_runs)
+}
+fn set_coalesce_tool_runs(cfg: &mut AppConfig, value: FieldValue) -> Result<(), &'static str> {
+    match value {
+        FieldValue::Bool(v) => {
+            cfg.tui.coalesce_tool_runs = v;
             Ok(())
         }
         _ => Err("expects bool"),

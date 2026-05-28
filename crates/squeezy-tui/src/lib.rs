@@ -4994,6 +4994,23 @@ fn transcript_lines_for_overlay(app: &TuiApp, width: Option<u16>) -> Vec<Line<'s
             }
             None => {}
         }
+        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
+            Some(ToolRun::Suppressed) => continue,
+            Some(ToolRun::Lead { extras }) => {
+                let members = collect_tool_run_members(&app.transcript, index, extras);
+                // Overlay always forces expanded form so users browsing
+                // the full transcript can read every member's body.
+                lines.extend(format_grouped_tool_result_entry(
+                    &members,
+                    false,
+                    app.selected_entry == Some(index),
+                    app.tool_output_verbosity,
+                    width,
+                ));
+                continue;
+            }
+            None => {}
+        }
         lines.extend(format_transcript_entry_expanded(
             entry,
             app.selected_entry == Some(index),
@@ -5063,6 +5080,21 @@ fn transcript_lines_for_render(
                     ));
                     lines.push(Line::from(""));
                 }
+                continue;
+            }
+            None => {}
+        }
+        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
+            Some(ToolRun::Suppressed) => continue,
+            Some(ToolRun::Lead { extras }) => {
+                let members = collect_tool_run_members(&app.transcript, index, extras);
+                lines.extend(format_grouped_tool_result_entry(
+                    &members,
+                    item.collapsed,
+                    app.selected_entry == Some(index),
+                    app.tool_output_verbosity,
+                    width,
+                ));
                 continue;
             }
             None => {}
@@ -6291,6 +6323,112 @@ fn reasoning_run_info(transcript: &[TranscriptEntry], index: usize) -> Option<Re
     }
 }
 
+/// Outcome of inspecting a `ToolResult` entry for render-time coalescing.
+/// Independent from [`coalesce_tool_transcript_entry`] which mutates the
+/// previous entry's `repeat_count` at push time for *retry* attempts of
+/// the same tool+path. `tool_run_info` is a pure render-time decision over
+/// already-stored entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolRun {
+    /// Lead of a run of ≥2 adjacent same-tool same-status entries.
+    /// `extras` is the number of additional entries this lead absorbs.
+    Lead { extras: usize },
+    /// A non-lead member of a run — caller should render nothing.
+    Suppressed,
+}
+
+/// If `index` is a `ToolResult` that can fold into a same-tool run,
+/// classify it. Returns `None` for non-tool entries, singletons, or
+/// any tool that fails the [`tool_run_coalesce_eligible`] gate. Caller
+/// supplies the config switch so the function stays pure.
+fn tool_run_info(
+    transcript: &[TranscriptEntry],
+    index: usize,
+    coalesce_enabled: bool,
+) -> Option<ToolRun> {
+    if !coalesce_enabled {
+        return None;
+    }
+    let entry = transcript.get(index)?;
+    let TranscriptEntryKind::ToolResult(tool) = &entry.kind else {
+        return None;
+    };
+    if !tool_run_coalesce_eligible(tool) {
+        return None;
+    }
+    let tool_name = tool.result.tool_name.clone();
+    let status = tool.result.status;
+    let prev_matches = index > 0
+        && match &transcript[index - 1].kind {
+            TranscriptEntryKind::ToolResult(prev) => {
+                tool_run_coalesce_eligible(prev)
+                    && prev.result.tool_name == tool_name
+                    && prev.result.status == status
+            }
+            _ => false,
+        };
+    if prev_matches {
+        return Some(ToolRun::Suppressed);
+    }
+    let mut extras = 0usize;
+    let mut j = index + 1;
+    while let Some(next) = transcript.get(j) {
+        let TranscriptEntryKind::ToolResult(next_tool) = &next.kind else {
+            break;
+        };
+        if !tool_run_coalesce_eligible(next_tool)
+            || next_tool.result.tool_name != tool_name
+            || next_tool.result.status != status
+        {
+            break;
+        }
+        extras += 1;
+        j += 1;
+    }
+    if extras == 0 {
+        None
+    } else {
+        Some(ToolRun::Lead { extras })
+    }
+}
+
+/// Whether a tool entry is eligible for render-time run coalescing.
+/// Retry-coalesced entries (`repeat_count > 1`) keep their visible
+/// multiplier and stay standalone. Body-as-card tools (`apply_patch`,
+/// `write_file`, `plan_patch`, `diff_context`) bypass the preview cap
+/// because their card IS the body — folding them into a one-line summary
+/// would discard the signal. Hidden-by-default entries are excluded
+/// defensively for snapshot / overlay paths.
+fn tool_run_coalesce_eligible(tool: &ToolTranscript) -> bool {
+    tool.repeat_count == 1
+        && !tool_bypasses_preview_cap(tool.result.tool_name.as_str())
+        && !tool_result_hidden_by_default(&tool.result)
+}
+
+/// Pull out the lead + extras `ToolTranscript` references for a grouped
+/// card. Caller must have classified `index` as `ToolRun::Lead` with the
+/// matching `extras` count.
+fn collect_tool_run_members(
+    transcript: &[TranscriptEntry],
+    lead_index: usize,
+    extras: usize,
+) -> Vec<&ToolTranscript> {
+    let mut members = Vec::with_capacity(extras + 1);
+    for offset in 0..=extras {
+        let entry = transcript
+            .get(lead_index + offset)
+            .expect("collect_tool_run_members called with out-of-range index");
+        if let TranscriptEntryKind::ToolResult(tool) = &entry.kind {
+            members.push(tool.as_ref());
+        } else {
+            // Defensive: should never fire because `tool_run_info`
+            // already verified each member is a `ToolResult`.
+            break;
+        }
+    }
+    members
+}
+
 fn collapsed_content_summary(content: &str) -> String {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.len() > 1 {
@@ -6321,10 +6459,16 @@ fn format_tool_result_entry(
     } else {
         expanded_tool_detail_lines(tool, tool_output_verbosity)
     };
-    // Visually group the action header with its detail rows by tinting
-    // both with a subtle card surface. Bail out gracefully on terminals
-    // that can't render bg blends — `card_background_style()` returns
-    // `None` and the layout falls back to today's flat row stack.
+    wrap_tool_card(header, body)
+}
+
+/// Visually group an action header with its detail rows by tinting both
+/// with a subtle card surface. Bails out gracefully on terminals that
+/// can't render bg blends — `card_background_style()` returns `None` and
+/// the layout falls back to today's flat row stack. Shared between the
+/// singleton renderer ([`format_tool_result_entry`]) and the grouped
+/// renderer ([`format_grouped_tool_result_entry`]).
+fn wrap_tool_card(header: Line<'static>, body: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let bg = render::card::card_background_style();
     if bg.is_none() {
         let mut lines = vec![header];
@@ -6340,6 +6484,115 @@ fn format_tool_result_entry(
         lines.push(trailer);
     }
     lines
+}
+
+/// Render a `ToolRun::Lead { extras }` as a single grouped card spanning
+/// `extras + 1` consecutive same-tool same-status entries.
+///
+/// In collapsed form the header reads `"Read 3 files"` etc., the body is
+/// one summary row per member followed by a `(Ctrl-E to expand all)`
+/// affordance row. In expanded form the header is followed by each
+/// member's normal tool-card body rendered inline so the user can scan
+/// their full output.
+fn format_grouped_tool_result_entry(
+    members: &[&ToolTranscript],
+    collapsed: bool,
+    selected: bool,
+    tool_output_verbosity: ToolOutputVerbosity,
+    width: Option<u16>,
+) -> Vec<Line<'static>> {
+    debug_assert!(members.len() >= 2, "grouped card needs at least 2 members");
+    let lead = members[0];
+    let count = members.len();
+    let (marker, _) = tool_result_action(lead);
+    let color = tool_result_display_color(lead);
+    let action_label = grouped_action_label(lead);
+    let header_summary = vec![Span::styled(
+        format!("{count} {}", grouped_action_noun(lead, count)),
+        Style::default().fg(QUIET),
+    )];
+    let header = action_line_spans(selected, marker, color, action_label, color, header_summary);
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if collapsed {
+        for member in members {
+            body.push(detail_spans_line(tool_oneline_summary(member)));
+        }
+        body.push(detail_line(
+            false,
+            QUIET,
+            "(Ctrl-E to expand all)".to_string(),
+        ));
+    } else {
+        // Stack each child's full single-tool render. Each is already
+        // its own card via `wrap_tool_card`; emit them back-to-back so
+        // the grouped card visually contains them.
+        for (idx, member) in members.iter().enumerate() {
+            if idx > 0 {
+                body.push(Line::from(""));
+            }
+            body.extend(format_tool_result_entry(
+                member,
+                false,
+                false,
+                tool_output_verbosity,
+                width,
+            ));
+        }
+    }
+    wrap_tool_card(header, body)
+}
+
+/// Verb that titles a grouped run — `"Read"`, `"Searched"`, etc. Falls
+/// back to the singular action label when a tool doesn't have a distinct
+/// grouped form.
+fn grouped_action_label(lead: &ToolTranscript) -> &'static str {
+    match lead.result.tool_name.as_str() {
+        "read_file" | "read_slice" | "read_tool_output" => "Read",
+        "glob" => "Globbed",
+        "grep" => "Searched",
+        "decl_search" => "Searched decls",
+        "definition_search" => "Searched defs",
+        "reference_search" => "Searched refs",
+        "symbol_context" => "Inspected",
+        "hierarchy" => "Walked hierarchy",
+        "upstream_flow" => "Traced upstream",
+        "downstream_flow" => "Traced downstream",
+        "repo_map" => "Mapped",
+        "shell" | "verify" => "Ran",
+        "webfetch" => "Fetched",
+        "websearch" => "Searched web",
+        _ => tool_result_action(lead).1,
+    }
+}
+
+/// Noun + plural-aware suffix that follows the count in the grouped
+/// header — `"3 files"`, `"2 patterns"`, `"4 commands"`.
+fn grouped_action_noun(lead: &ToolTranscript, count: usize) -> String {
+    let singular = match lead.result.tool_name.as_str() {
+        "read_file" | "read_slice" | "read_tool_output" | "glob" => "file",
+        "grep" | "decl_search" | "definition_search" | "reference_search" => "search",
+        "symbol_context" => "symbol",
+        "hierarchy" | "upstream_flow" | "downstream_flow" => "trace",
+        "repo_map" => "map",
+        "shell" | "verify" => "command",
+        "webfetch" | "websearch" => "request",
+        _ => "call",
+    };
+    if count == 1 {
+        singular.to_string()
+    } else {
+        format!("{singular}s")
+    }
+}
+
+/// One-line summary for a tool result, used as a row inside a grouped
+/// card. Reuses [`tool_result_summary_spans`] which already produces a
+/// concise per-tool summary (e.g. `path · 4.9KB of 26.4KB` for reads,
+/// `pattern · N matches` for grep). The group header already carries
+/// the verb and status color, so the row itself stays QUIET.
+fn tool_oneline_summary(tool: &ToolTranscript) -> Vec<Span<'static>> {
+    tool_result_summary_spans(tool)
 }
 
 /// Whether this tool result was triggered by the user typing `!<command>`
@@ -9695,6 +9948,12 @@ pub(crate) struct TuiApp {
     pub(crate) tool_output_verbosity: ToolOutputVerbosity,
     pub(crate) transcript_default: TranscriptDefault,
     pub(crate) show_reasoning_usage: bool,
+    /// Render-time grouping of adjacent same-tool same-status calls into
+    /// one card. Mirrors `config.tui.coalesce_tool_runs` at startup;
+    /// flipped at runtime via `/config coalesce_tool_runs = …`. Default
+    /// `true`. Independent of the push-time retry coalescer
+    /// ([`coalesce_tool_transcript_entry`]).
+    pub(crate) coalesce_tool_runs: bool,
     pub(crate) repo: RepoStatus,
     pub(crate) permissions: PermissionStatus,
     pub(crate) telemetry: TelemetryStatus,
@@ -10042,6 +10301,7 @@ impl TuiApp {
             tool_output_verbosity: config.tui.tool_output_verbosity,
             transcript_default: config.tui.transcript_default,
             show_reasoning_usage: config.tui.show_reasoning_usage,
+            coalesce_tool_runs: config.tui.coalesce_tool_runs,
             repo: RepoStatus::detect(config),
             permissions: PermissionStatus::from_policy(&config.permissions),
             telemetry: TelemetryStatus::from_config(&config.telemetry),
@@ -11155,6 +11415,21 @@ fn inline_history_lines_for_flush(
                     ));
                     lines.push(Line::from(""));
                 }
+                continue;
+            }
+            None => {}
+        }
+        match tool_run_info(&app.transcript, index, app.coalesce_tool_runs) {
+            Some(ToolRun::Suppressed) => continue,
+            Some(ToolRun::Lead { extras }) => {
+                let members = collect_tool_run_members(&app.transcript, index, extras);
+                lines.extend(format_grouped_tool_result_entry(
+                    &members,
+                    item.collapsed,
+                    false,
+                    app.tool_output_verbosity,
+                    Some(width),
+                ));
                 continue;
             }
             None => {}

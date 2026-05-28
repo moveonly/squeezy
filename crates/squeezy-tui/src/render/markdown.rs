@@ -214,10 +214,10 @@ impl Writer {
                 self.finish_line();
             }
             Event::TaskListMarker(checked) => {
-                self.push_text(
-                    if checked { "[x] " } else { "[ ] " },
-                    Style::default().fg(palette::GOLD),
-                );
+                // Mirror Codex: checkboxes render unstyled. The `[ ]` /
+                // `[x]` glyph itself is structural enough; painting it
+                // (GOLD or QUIET) competes with the item content.
+                self.push_text(if checked { "[x] " } else { "[ ] " }, Style::default());
             }
             Event::InlineMath(text) | Event::DisplayMath(text) | Event::FootnoteReference(text) => {
                 self.push_text(&text, self.current_style);
@@ -229,7 +229,13 @@ impl Writer {
         match tag {
             Tag::Paragraph => {}
             Tag::Heading { level, .. } => self.push_style(heading_style(level)),
-            Tag::BlockQuote(_) => self.quote_depth += 1,
+            Tag::BlockQuote(_) => {
+                self.quote_depth += 1;
+                // Mirror Codex: block-quote *content* paints the same
+                // green as the leading `> ` prefix so the whole quoted
+                // run reads as one visual region.
+                self.push_style(Style::default().fg(Color::Green));
+            }
             Tag::CodeBlock(kind) => {
                 self.finish_line();
                 self.code_block = Some(CodeBlock {
@@ -249,6 +255,15 @@ impl Writer {
             }
             Tag::Link { dest_url, .. } => {
                 self.link_stack.push(dest_url.into_string());
+                // Mirror Codex: link text reads in the same `Cyan` as
+                // inline code, with `underlined` to disambiguate from
+                // identifiers. The trailing `(url)` follows the same
+                // style because it's pushed via `current_style`.
+                self.push_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
             }
             Tag::Image { .. } => {}
             Tag::Table(_) => {
@@ -279,6 +294,7 @@ impl Writer {
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
+                self.pop_style();
             }
             TagEnd::CodeBlock => self.finish_code_block(),
             TagEnd::List(_) => {
@@ -301,6 +317,7 @@ impl Writer {
                         self.push_text(&text, self.current_style);
                     }
                 }
+                self.pop_style();
             }
             TagEnd::TableCell => {
                 if let Some(table) = self.table.as_mut() {
@@ -358,18 +375,28 @@ impl Writer {
         if depth > 0 {
             self.push_text(&"  ".repeat(depth), Style::default());
         }
-        let marker = if let Some(list) = self.list_stack.last_mut() {
+        let (marker, ordered) = if let Some(list) = self.list_stack.last_mut() {
             if list.ordered {
                 let marker = format!("{}. ", list.next);
                 list.next += 1;
-                marker
+                (marker, true)
             } else {
-                "- ".to_string()
+                ("- ".to_string(), false)
             }
         } else {
-            "- ".to_string()
+            ("- ".to_string(), false)
         };
-        self.push_text(&marker, Style::default().fg(palette::GOLD));
+        // Mirror Codex's discipline: ordered markers carry a single
+        // semantic color (`LightBlue` for "this is a numbered step");
+        // unordered markers stay unstyled so a long bullet list reads as
+        // structure, not as a wall of color. The prior `GOLD` painted
+        // every marker bright yellow on every line.
+        let style = if ordered {
+            Style::default().fg(Color::LightBlue)
+        } else {
+            Style::default()
+        };
+        self.push_text(&marker, style);
     }
 
     fn push_style(&mut self, style: Style) {
@@ -460,20 +487,27 @@ impl Writer {
 }
 
 fn heading_style(level: HeadingLevel) -> Style {
-    let heading_color = match palette::palette_tone() {
-        palette::PaletteTone::Dark => palette::GOLD,
-        palette::PaletteTone::Light => palette::best_color((92, 65, 12)),
-    };
-    let mut style = Style::default()
-        .fg(heading_color)
-        .add_modifier(Modifier::BOLD);
-    if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
-        style = style.add_modifier(Modifier::UNDERLINED);
+    // Mirror Codex: hierarchy through modifiers, not color. A wall of
+    // GOLD-painted headings competed with everything else for the eye.
+    // Bold for every level; underline H1/H2; italic for H3-H6 so the
+    // deeper levels still differ from H2.
+    let mut style = Style::default().add_modifier(Modifier::BOLD);
+    match level {
+        HeadingLevel::H1 | HeadingLevel::H2 => {
+            style = style.add_modifier(Modifier::UNDERLINED);
+        }
+        _ => {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
     }
     style
 }
 
 fn inline_code_style() -> Style {
+    // Mirror Codex: inline code is the one place a single semantic color
+    // earns its keep — the eye learns "cyan = identifier" instantly.
+    // Standard `Cyan`, not bright/light, so it sits beside prose
+    // without screaming.
     Style::default().fg(Color::Cyan)
 }
 
