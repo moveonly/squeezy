@@ -206,6 +206,129 @@ fn native_project_overrides_compat_project() {
 }
 
 #[test]
+fn skill_in_extra_root_is_discovered_as_extra_root_source() {
+    // A skill that only exists under `SkillsConfig::extra_roots` must
+    // surface in the catalog with the `ExtraRoot` source so operators
+    // can see at-a-glance which shared root contributed which skill.
+    let root = temp_workspace("skills_extra_root_loads");
+    let extra = root.join("team-skills");
+    write_skill(
+        &extra.join("rust-nav"),
+        "rust-nav",
+        "Team Rust nav",
+        &["rust symbol"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![extra],
+        ..Default::default()
+    };
+
+    let catalog = SkillCatalog::discover(&root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "rust-nav")
+        .expect("extra-root skill must surface in the catalog");
+    assert_eq!(summary.source, SkillSource::ExtraRoot);
+    assert_eq!(summary.description, "Team Rust nav");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn project_root_overrides_extra_root_on_same_name_collision() {
+    // The whole point of project-local skills is they win over shared
+    // catalogs. When the team-shared `extra_roots` ships a skill that
+    // collides with a workspace's `.squeezy/skills/` entry, the project
+    // copy must take precedence and the shared copy must be shadowed.
+    let root = temp_workspace("skills_extra_root_project_override");
+    let extra = root.join("team-skills");
+    write_skill(
+        &extra.join("rust-nav"),
+        "rust-nav",
+        "Team Rust nav",
+        &["team trigger"],
+    );
+    write_skill(
+        &root.join(".squeezy/skills/rust-nav"),
+        "rust-nav",
+        "Project Rust nav",
+        &["project trigger"],
+    );
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![extra],
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    let summary = catalog
+        .summaries()
+        .into_iter()
+        .find(|summary| summary.name == "rust-nav")
+        .expect("collision must still surface a single rust-nav entry");
+    assert_eq!(summary.source, SkillSource::Project);
+    assert_eq!(summary.description, "Project Rust nav");
+    assert!(
+        logs.contains("skill name reused at higher precedence"),
+        "expected shadow warning for the extra-root copy: {logs}"
+    );
+    assert!(
+        logs.contains("overriding_source=\"project\"")
+            || logs.contains("overriding_source=project"),
+        "expected project as overriding source: {logs}"
+    );
+    assert!(
+        logs.contains("overridden_source=\"extra_root\"")
+            || logs.contains("overridden_source=extra_root"),
+        "expected extra_root as overridden source: {logs}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn missing_extra_root_warns_without_failing_discovery() {
+    // Operators commonly point `extra_roots` at a network mount or a
+    // git submodule that may not be present in every checkout. A
+    // missing entry must surface a load-time warning (so the mistake is
+    // visible) but must not prevent the remaining roots from loading.
+    let root = temp_workspace("skills_extra_root_missing_warns");
+    let present = root.join("present-team-skills");
+    write_skill(&present.join("good"), "good", "Loadable skill", &[]);
+    let missing = root.join("absent-team-skills");
+
+    let config = SkillsConfig {
+        user_dir: root.join("user-noop"),
+        compat_user_dir: root.join("compat-noop"),
+        extra_roots: vec![missing.clone(), present],
+        ..Default::default()
+    };
+
+    let (catalog, logs) = capture_discover_logs(&root, &config);
+    let names: Vec<String> = catalog
+        .summaries()
+        .into_iter()
+        .map(|summary| summary.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["good"],
+        "the present extra root must still load alongside a missing one"
+    );
+    assert!(
+        logs.contains("skills.extra_roots") && logs.contains("does not exist"),
+        "expected a not-found warning for {}: {logs}",
+        missing.display()
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn explicit_and_trigger_activation_loads_lazily() {
     let root = temp_workspace("skills_activation");
     let config = SkillsConfig {

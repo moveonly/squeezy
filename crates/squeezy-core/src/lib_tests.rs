@@ -500,6 +500,32 @@ compat_user_dir = "/custom/agent-skills"
 }
 
 #[test]
+fn config_reads_skill_extra_roots_from_settings_file() {
+    // Operators ship the same `extra_roots` value via a shared settings
+    // file (network drive, vendored submodule). The loader must accept a
+    // string array and pass each path through tilde expansion so a team
+    // root like `~/team-skills` resolves the same way `user_dir` would.
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return;
+    };
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[skills]
+extra_roots = ["/mnt/team-skills", "~/team-skills"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |_| None);
+
+    assert_eq!(
+        config.skills.extra_roots,
+        vec![PathBuf::from("/mnt/team-skills"), home.join("team-skills"),]
+    );
+}
+
+#[test]
 fn config_expands_tilde_skill_dirs_from_settings_file() {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return;

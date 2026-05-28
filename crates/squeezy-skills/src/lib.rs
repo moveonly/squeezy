@@ -109,6 +109,12 @@ pub fn bundled_skills() -> Vec<LoadedSkill> {
 pub enum SkillSource {
     CompatUser,
     User,
+    /// Skill loaded from a `SkillsConfig::extra_roots` entry — typically a
+    /// team-shared mount or vendored git submodule. Ranks above the
+    /// personal `user_dir` (so an explicitly configured shared root
+    /// wins over the per-user default) but below project-local skills
+    /// so a workspace's `.squeezy/skills/` still overrides on collision.
+    ExtraRoot,
     CompatProject,
     Project,
 }
@@ -118,8 +124,9 @@ impl SkillSource {
         match self {
             Self::CompatUser => 0,
             Self::User => 1,
-            Self::CompatProject => 2,
-            Self::Project => 3,
+            Self::ExtraRoot => 2,
+            Self::CompatProject => 3,
+            Self::Project => 4,
         }
     }
 
@@ -127,6 +134,7 @@ impl SkillSource {
         match self {
             Self::CompatUser => "compat_user",
             Self::User => "user",
+            Self::ExtraRoot => "extra_root",
             Self::CompatProject => "compat_project",
             Self::Project => "project",
         }
@@ -414,6 +422,7 @@ impl SkillCatalog {
         };
         catalog.discover_dir(&config.compat_user_dir, SkillSource::CompatUser);
         catalog.discover_dir(&config.user_dir, SkillSource::User);
+        catalog.discover_extra_roots(&config.extra_roots);
         catalog.discover_dir(
             &workspace_root.join(COMPAT_PROJECT_SKILLS_DIR),
             SkillSource::CompatProject,
@@ -572,6 +581,45 @@ impl SkillCatalog {
             &self.implicit_by_doc_path,
             &self.skills,
         )
+    }
+
+    /// Walk each configured extra skills root. Unlike the default user
+    /// and project roots, these are explicitly opted-in by the operator
+    /// via `SkillsConfig::extra_roots`, so a missing or non-directory
+    /// entry is reported with a `tracing::warn!` rather than skipped
+    /// silently — the typical failure mode is a network mount that did
+    /// not come up or a stale path baked into a shared settings file.
+    /// Discovery continues for the remaining roots regardless.
+    fn discover_extra_roots(&mut self, roots: &[PathBuf]) {
+        for root in roots {
+            match fs::metadata(root) {
+                Ok(metadata) if metadata.is_dir() => {
+                    self.discover_dir(root, SkillSource::ExtraRoot);
+                }
+                Ok(_) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        root = %root.display(),
+                        "ignoring skills.extra_roots entry: not a directory"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    warn!(
+                        target: "squeezy_skills",
+                        root = %root.display(),
+                        "ignoring skills.extra_roots entry: directory does not exist"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        target: "squeezy_skills",
+                        root = %root.display(),
+                        error = %error,
+                        "ignoring skills.extra_roots entry: cannot stat"
+                    );
+                }
+            }
+        }
     }
 
     fn discover_dir(&mut self, dir: &Path, source: SkillSource) {

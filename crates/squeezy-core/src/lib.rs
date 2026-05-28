@@ -5762,6 +5762,14 @@ impl WebSettings {
 pub struct SkillsSettings {
     pub user_dir: Option<PathBuf>,
     pub compat_user_dir: Option<PathBuf>,
+    /// Additional filesystem roots scanned during skill discovery. Each
+    /// entry is treated like a user-level skills directory: skills loaded
+    /// from these roots use [`SkillSource::ExtraRoot`] precedence, which
+    /// sits above the personal `user_dir` but below project-local skills
+    /// so a workspace's `.squeezy/skills/` still wins on name collisions.
+    /// Use this to point at a shared mount, network drive, or vendored
+    /// git submodule without standing up a marketplace or plugin host.
+    pub extra_roots: Vec<PathBuf>,
     pub active_budget_chars: Option<usize>,
     pub active_body_cap_chars: Option<usize>,
     pub preamble_enabled: Option<bool>,
@@ -5783,6 +5791,7 @@ impl SkillsSettings {
             &[
                 "user_dir",
                 "compat_user_dir",
+                "extra_roots",
                 "active_budget_chars",
                 "active_body_cap_chars",
                 "preamble_enabled",
@@ -5802,6 +5811,12 @@ impl SkillsSettings {
                 "compat_user_dir",
                 source,
                 &field(path, "compat_user_dir"),
+            )?,
+            extra_roots: path_array_value(
+                table,
+                "extra_roots",
+                source,
+                &field(path, "extra_roots"),
             )?,
             active_budget_chars: usize_value(
                 table,
@@ -5847,6 +5862,7 @@ impl SkillsSettings {
     fn merge(&mut self, next: Self) {
         replace_if_some(&mut self.user_dir, next.user_dir);
         replace_if_some(&mut self.compat_user_dir, next.compat_user_dir);
+        self.extra_roots.extend(next.extra_roots);
         replace_if_some(&mut self.active_budget_chars, next.active_budget_chars);
         replace_if_some(&mut self.active_body_cap_chars, next.active_body_cap_chars);
         replace_if_some(&mut self.preamble_enabled, next.preamble_enabled);
@@ -5938,6 +5954,14 @@ impl SkillsBudgetMode {
 pub struct SkillsConfig {
     pub user_dir: PathBuf,
     pub compat_user_dir: PathBuf,
+    /// Additional filesystem roots walked during skill discovery. Their
+    /// skills live at [`SkillSource::ExtraRoot`] precedence, above the
+    /// personal `user_dir` and below project-local skills, so a workspace
+    /// can still override a shared catalog by dropping a same-name skill
+    /// in `.squeezy/skills/`. Non-existent entries are reported via
+    /// `tracing::warn!` at discovery time and otherwise skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_roots: Vec<PathBuf>,
     pub active_budget_chars: usize,
     pub active_body_cap_chars: usize,
     pub preamble_enabled: bool,
@@ -6010,6 +6034,11 @@ impl SkillsConfig {
                     .or(settings.compat_user_dir)
                     .unwrap_or_else(default_agent_compat_skills_dir),
             ),
+            extra_roots: settings
+                .extra_roots
+                .into_iter()
+                .map(expand_home_path)
+                .collect(),
             active_budget_chars,
             active_body_cap_chars: settings
                 .active_body_cap_chars
@@ -6056,6 +6085,7 @@ impl Default for SkillsConfig {
         Self {
             user_dir: default_squeezy_skills_dir(),
             compat_user_dir: default_agent_compat_skills_dir(),
+            extra_roots: Vec::new(),
             active_budget_chars: DEFAULT_SKILLS_ACTIVE_BUDGET_CHARS,
             active_body_cap_chars: DEFAULT_SKILLS_ACTIVE_BODY_CAP_CHARS,
             preamble_enabled: DEFAULT_SKILLS_PREAMBLE_ENABLED,
@@ -8116,6 +8146,17 @@ fn path_value(
     path: &str,
 ) -> Result<Option<PathBuf>> {
     Ok(string_value(table, key, source, path)?.map(PathBuf::from))
+}
+
+fn path_array_value(
+    table: &toml::value::Table,
+    key: &str,
+    source: &str,
+    path: &str,
+) -> Result<Vec<PathBuf>> {
+    Ok(string_array_value(table, key, source, path)?
+        .map(|values| values.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default())
 }
 
 fn skills_budget_mode_value(
