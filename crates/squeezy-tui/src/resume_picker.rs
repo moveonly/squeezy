@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 use squeezy_core::{AppConfig, SqueezyError};
-use squeezy_store::{SessionMetadata, SessionQuery, SessionStore};
+use squeezy_store::{GlobalSessionIndexEntry, SessionMetadata, SessionQuery, SessionStore};
 
 use crate::render::palette::{AMBER, GOLD, MODE_PURPLE, QUIET};
 
@@ -66,6 +66,22 @@ impl SessionSummary {
             turn_count: metadata.metrics.turns,
             cwd: metadata.cwd.clone(),
             repo_root: metadata.repo_root.clone(),
+        }
+    }
+
+    /// Build a summary from a cross-project index entry. The global index
+    /// only persists a single `title` field — surface it as
+    /// `first_user_task` so the picker label code (which prefers
+    /// `first_user_task` over `latest_summary`) reads naturally.
+    fn from_global_index_entry(entry: &GlobalSessionIndexEntry) -> Self {
+        Self {
+            session_id: entry.session_id.clone(),
+            started_at_ms: entry.started_at_ms,
+            first_user_task: entry.title.clone(),
+            latest_summary: None,
+            turn_count: entry.turn_count,
+            cwd: entry.cwd.clone(),
+            repo_root: entry.repo_root.clone(),
         }
     }
 
@@ -143,6 +159,10 @@ pub(crate) fn filter_candidates(
 
 /// Cross-project view: drop the cwd filter so sessions from sibling repos
 /// surface in the picker. The recency and resumable filters still apply.
+/// Test-only — production now flows through [`merge_candidates_for_picker`]
+/// which fans the per-project metadata together with the cross-project
+/// index snapshots.
+#[cfg(test)]
 pub(crate) fn filter_candidates_all_projects(
     sessions: &[SessionMetadata],
     now_ms: u64,
@@ -150,6 +170,7 @@ pub(crate) fn filter_candidates_all_projects(
     filter_inner(sessions, now_ms, |_| true)
 }
 
+#[cfg(test)]
 fn filter_inner(
     sessions: &[SessionMetadata],
     now_ms: u64,
@@ -164,6 +185,47 @@ fn filter_inner(
         .collect();
     // `SessionStore::list` already sorts newest-first, but we re-sort here
     // so a caller passing a raw vec still sees the right order.
+    out.sort_by_key(|summary| std::cmp::Reverse(summary.started_at_ms));
+    out.truncate(MAX_PICKER_ENTRIES);
+    out
+}
+
+/// Cross-project view over the recency-filtered union of per-project
+/// metadata and cross-project index entries. Per-project entries take
+/// precedence when the same `session_id` appears in both — they carry
+/// richer state (latest_summary, finalised turn count) than the index
+/// snapshot. Returns at most [`MAX_PICKER_ENTRIES`] newest-first.
+pub(crate) fn merge_candidates_for_picker(
+    local: &[SessionMetadata],
+    global: &[GlobalSessionIndexEntry],
+    now_ms: u64,
+) -> Vec<SessionSummary> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<SessionSummary> = Vec::new();
+    for meta in local {
+        if !meta.resume_available {
+            continue;
+        }
+        if now_ms.saturating_sub(meta.started_at_ms) > RECENT_WINDOW_MS {
+            continue;
+        }
+        if !seen.insert(meta.session_id.clone()) {
+            continue;
+        }
+        out.push(SessionSummary::from_metadata(meta));
+    }
+    for entry in global {
+        if !entry.resume_available {
+            continue;
+        }
+        if now_ms.saturating_sub(entry.started_at_ms) > RECENT_WINDOW_MS {
+            continue;
+        }
+        if !seen.insert(entry.session_id.clone()) {
+            continue;
+        }
+        out.push(SessionSummary::from_global_index_entry(entry));
+    }
     out.sort_by_key(|summary| std::cmp::Reverse(summary.started_at_ms));
     out.truncate(MAX_PICKER_ENTRIES);
     out
@@ -282,20 +344,23 @@ fn scoped_view(all: &[SessionSummary], cwd_str: &str) -> Vec<SessionSummary> {
 /// Pull recent resumable sessions across every cwd. The picker filters
 /// down to the current cwd by default but keeps the broader list around
 /// so Tab can flip into a cross-project view without a second store read.
-/// On error we log to stderr and start fresh — the picker is a convenience,
-/// not a hard dependency.
+/// Per-project entries (richer state) merge over the cross-project index
+/// snapshots so sibling-repo sessions surface alongside the local ones.
+/// On error we log to stderr and start fresh — the picker is a
+/// convenience, not a hard dependency.
 pub(crate) fn load_candidates(config: &AppConfig) -> Vec<SessionSummary> {
     let store = SessionStore::open(config);
-    let sessions = match store.list(&SessionQuery::default()) {
+    let local = match store.list(&SessionQuery::default()) {
         Ok(sessions) => sessions,
         Err(error) => {
             let _: SqueezyError = error;
             eprintln!("squeezy: failed to list sessions for resume picker: {error}");
-            return Vec::new();
+            Vec::new()
         }
     };
+    let global = SessionStore::list_global_index();
     let now_ms = current_unix_ms();
-    filter_candidates_all_projects(&sessions, now_ms)
+    merge_candidates_for_picker(&local, &global, now_ms)
 }
 
 fn current_unix_ms() -> u64 {

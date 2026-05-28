@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, OpenOptions},
     io::Write,
@@ -31,6 +32,15 @@ pub const ROLLOUT_TRACE_SCHEMA_VERSION: u32 = 1;
 /// Subdirectory under the session root that holds archived sessions.
 /// Sibling to live session ids; never used as a session id itself.
 pub const ARCHIVED_SUBDIR: &str = "archived";
+
+/// Rewrite the cross-project session index when it grows beyond this many
+/// bytes. Append-only writes are cheap, but unbounded growth would slow
+/// every `list_global_index` startup read, so the next call after the
+/// cap is exceeded dedupes by `session_id` and rewrites the file with
+/// the latest snapshot per session. The threshold trades a rare full
+/// rewrite for a fast hot path; at ~500B/line a 256KiB cap holds roughly
+/// 500 unique sessions before compaction kicks in.
+pub const GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -167,6 +177,110 @@ impl SessionStore {
         Some(truncated)
     }
 
+    /// Path to the cross-project session index, an append-only JSONL file
+    /// at `~/.squeezy/sessions/index.jsonl`. Per-project session roots
+    /// live under each workspace, so a global index is the only way the
+    /// resume picker can show sessions started from sibling repos.
+    /// Returns `None` when `HOME` is unset — same condition under which
+    /// the user-global memory file declines to operate.
+    pub fn global_index_path() -> Option<PathBuf> {
+        let home = env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join(".squeezy")
+                .join("sessions")
+                .join("index.jsonl"),
+        )
+    }
+
+    /// Append a snapshot of a session to the global cross-project index.
+    /// Errors are intentionally swallowed: the index is best-effort
+    /// enrichment, the per-project session store is authoritative.
+    /// Append-only writes keep the hot path cheap; readers dedupe by
+    /// `session_id` and compaction is deferred to `list_global_index`.
+    pub fn append_global_index_entry(entry: &GlobalSessionIndexEntry) {
+        let Some(path) = Self::global_index_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(mut payload) = serde_json::to_vec(entry) else {
+            return;
+        };
+        payload.push(b'\n');
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+            return;
+        };
+        let _ = file.write_all(&payload);
+    }
+
+    /// Read the cross-project session index, deduping by `session_id` and
+    /// keeping the entry with the largest `last_event_at_ms` for each id.
+    /// When the file exceeds [`GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES`], the
+    /// deduped snapshot is rewritten atomically (tmp + rename) so the
+    /// next read stays fast. Returns entries newest-first by
+    /// `started_at_ms` so callers can take a recency-prefixed slice
+    /// without re-sorting.
+    pub fn list_global_index() -> Vec<GlobalSessionIndexEntry> {
+        let Some(path) = Self::global_index_path() else {
+            return Vec::new();
+        };
+        if !path.exists() {
+            return Vec::new();
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let mut by_id: HashMap<String, GlobalSessionIndexEntry> = HashMap::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(entry) = serde_json::from_str::<GlobalSessionIndexEntry>(line) else {
+                continue;
+            };
+            match by_id.get(&entry.session_id) {
+                Some(existing) if existing.last_event_at_ms >= entry.last_event_at_ms => continue,
+                _ => {
+                    by_id.insert(entry.session_id.clone(), entry);
+                }
+            }
+        }
+        let should_compact = fs::metadata(&path)
+            .map(|meta| meta.len() > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES)
+            .unwrap_or(false);
+        if should_compact {
+            let mut entries: Vec<&GlobalSessionIndexEntry> = by_id.values().collect();
+            // Compact in oldest-first order so future appends keep the
+            // newest entries at the tail — matches how readers see time.
+            entries.sort_by_key(|entry| entry.started_at_ms);
+            let _ = rewrite_global_index(&path, &entries);
+        }
+        let mut entries: Vec<GlobalSessionIndexEntry> = by_id.into_values().collect();
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.started_at_ms));
+        entries
+    }
+
+    /// Append the metadata snapshot to the cross-project session index.
+    /// Failures are silent — see [`Self::append_global_index_entry`].
+    ///
+    /// Skips the write when the workspace_root is under the system temp
+    /// dir but the resolved global index lives under the user's real
+    /// HOME — that combination is unique to `cargo test` runs whose
+    /// session stores point at sandboxed workspaces but never redirected
+    /// HOME. The guard prevents test runs from polluting a developer's
+    /// `~/.squeezy/sessions/index.jsonl`; tests that want to exercise
+    /// the global index redirect HOME explicitly so the destination
+    /// also lives under temp, and the guard becomes a no-op.
+    fn record_global_index(metadata: &SessionMetadata) {
+        if skip_global_index_for_test_workspace(&metadata.workspace_root) {
+            return;
+        }
+        let entry = GlobalSessionIndexEntry::from_metadata(metadata, now_ms());
+        Self::append_global_index_entry(&entry);
+    }
+
     pub fn start_session(&self, mut metadata: SessionMetadata) -> Result<SessionHandle> {
         metadata.session_id = next_session_id();
         metadata.started_at_ms = now_ms();
@@ -182,6 +296,7 @@ impl SessionStore {
                 ..SessionResumeState::default()
             },
         )?;
+        Self::record_global_index(&metadata);
         Ok(SessionHandle {
             store: self.clone(),
             session_id: metadata.session_id,
@@ -363,6 +478,7 @@ impl SessionStore {
                 metadata.ended_at_ms = Some(stamp);
             }
             let _ = write_json(&metadata_path, &metadata);
+            Self::record_global_index(&metadata);
         }
         Ok(())
     }
@@ -391,6 +507,7 @@ impl SessionStore {
             metadata.status = SessionStatus::Completed;
             metadata.archived_at_ms = None;
             let _ = write_json(&metadata_path, &metadata);
+            Self::record_global_index(&metadata);
         }
         Ok(())
     }
@@ -954,6 +1071,13 @@ impl SessionHandle {
                     metadata.latest_summary = event_summary;
                 }
             })?;
+            // Mirror the title-bearing snapshot into the cross-project
+            // index so the resume picker can surface this session from
+            // sibling repos. Cheap read of metadata.json keeps the
+            // global index decoupled from the in-memory counters.
+            if let Ok(metadata) = self.metadata() {
+                SessionStore::record_global_index(&metadata);
+            }
         }
         Ok(())
     }
@@ -1086,11 +1210,68 @@ impl SessionHandle {
             metadata.cost = cost;
             metadata.metrics = metrics;
             metadata.redactions = redactions;
-        })
+        })?;
+        if let Ok(metadata) = self.metadata() {
+            SessionStore::record_global_index(&metadata);
+        }
+        Ok(())
     }
 
     fn dir(&self) -> PathBuf {
         self.store.session_dir(&self.session_id)
+    }
+}
+
+/// One line of the cross-project session index. Append-only writes are
+/// produced by [`SessionStore::record_global_index`] on session create,
+/// title-bearing event commit, finish, and archive/unarchive transitions.
+/// Readers (`list_global_index`) dedupe by `session_id` keeping the
+/// largest `last_event_at_ms`, so missing intermediate writes are
+/// tolerable — the most recent snapshot wins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalSessionIndexEntry {
+    pub session_id: String,
+    pub cwd: String,
+    pub workspace_root: String,
+    #[serde(default)]
+    pub repo_root: Option<String>,
+    /// Human-readable label used by the resume picker. Sourced from
+    /// `first_user_task` and falling back to `latest_summary` so freshly
+    /// started sessions that have not seen a user message yet still get
+    /// a placeholder label once any assistant turn completes.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub started_at_ms: u64,
+    pub last_event_at_ms: u64,
+    #[serde(default)]
+    pub turn_count: u64,
+    pub resume_available: bool,
+}
+
+impl GlobalSessionIndexEntry {
+    /// Project a `SessionMetadata` snapshot onto the wire shape persisted
+    /// in the global index. `last_event_at_ms` is the wall-clock moment
+    /// the snapshot was taken — each write is itself the "event" that
+    /// advances the timeline, so callers do not need a separate event
+    /// timestamp argument.
+    pub fn from_metadata(metadata: &SessionMetadata, last_event_at_ms: u64) -> Self {
+        let resume_available =
+            metadata.resume_available && !matches!(metadata.status, SessionStatus::Archived);
+        let title = metadata
+            .first_user_task
+            .clone()
+            .or_else(|| metadata.latest_summary.clone());
+        Self {
+            session_id: metadata.session_id.clone(),
+            cwd: metadata.cwd.clone(),
+            workspace_root: metadata.workspace_root.clone(),
+            repo_root: metadata.repo_root.clone(),
+            title,
+            started_at_ms: metadata.started_at_ms,
+            last_event_at_ms,
+            turn_count: metadata.metrics.turns,
+            resume_available,
+        }
     }
 }
 
@@ -1729,6 +1910,66 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value).map_err(json_error)?;
     fs::write(path, bytes)?;
     Ok(())
+}
+
+/// Heuristic guard for [`SessionStore::record_global_index`].
+///
+/// Returns `true` only when the workspace_root resolves under the system
+/// temp directory AND `HOME` does not. That combination is overwhelmingly
+/// a `cargo test` setup that created its session store via
+/// `temp_root(..)` but never redirected `HOME` to a test sandbox — i.e.
+/// the test is not exercising the global index and a write would pollute
+/// the developer's real `~/.squeezy/sessions/index.jsonl`.
+///
+/// Production binaries run from a real workspace (not under `temp_dir`)
+/// so the guard does not fire. Tests that *do* want to exercise the
+/// global index redirect `HOME` to a temp sandbox (see `with_home` in
+/// `sessions_tests.rs`); the bypass keeps those tests working without
+/// needing a config knob.
+fn skip_global_index_for_test_workspace(workspace_root: &str) -> bool {
+    let Ok(temp_dir) = std::env::temp_dir().canonicalize() else {
+        return false;
+    };
+    let workspace_under_temp = Path::new(workspace_root)
+        .canonicalize()
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    if !workspace_under_temp {
+        return false;
+    }
+    let home_under_temp = env::var_os("HOME")
+        .and_then(|home| Path::new(&home).canonicalize().ok())
+        .map(|canonical| canonical.starts_with(&temp_dir))
+        .unwrap_or(false);
+    !home_under_temp
+}
+
+/// Replace the global session index file with the supplied entries via a
+/// tmp + rename so concurrent readers never see a half-written file. The
+/// caller chooses the iteration order; readers re-sort by
+/// `started_at_ms`.
+fn rewrite_global_index(path: &Path, entries: &[&GlobalSessionIndexEntry]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        for entry in entries {
+            let mut payload = match serde_json::to_vec(entry) {
+                Ok(payload) => payload,
+                Err(_) => continue,
+            };
+            payload.push(b'\n');
+            file.write_all(&payload)?;
+        }
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, path)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {

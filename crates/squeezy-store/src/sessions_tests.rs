@@ -2189,3 +2189,276 @@ fn memory_path_is_none_when_home_unset() {
         "remember fails loudly when HOME is unset"
     );
 }
+
+#[test]
+fn global_index_aggregates_sessions_across_projects() {
+    let home = temp_root("global-index-cross-project");
+    let project_a = temp_root("global-index-project-a");
+    let project_b = temp_root("global-index-project-b");
+    with_home(&home, || {
+        let config_a = AppConfig {
+            workspace_root: project_a.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let config_b = AppConfig {
+            workspace_root: project_b.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let store_a = SessionStore::open(&config_a);
+        let store_b = SessionStore::open(&config_b);
+
+        let mut meta_a = SessionMetadata::new(&config_a, "test-provider");
+        meta_a.cwd = project_a.display().to_string();
+        let handle_a = store_a.start_session(meta_a).expect("start project A");
+        handle_a
+            .append_event(SessionEvent::new(
+                "user_message",
+                None,
+                Some("fix payment bug".to_string()),
+                json!({}),
+            ))
+            .expect("append A");
+        handle_a.flush_events().expect("flush A");
+
+        let mut meta_b = SessionMetadata::new(&config_b, "test-provider");
+        meta_b.cwd = project_b.display().to_string();
+        let handle_b = store_b.start_session(meta_b).expect("start project B");
+        handle_b
+            .append_event(SessionEvent::new(
+                "user_message",
+                None,
+                Some("rewrite cache layer".to_string()),
+                json!({}),
+            ))
+            .expect("append B");
+        handle_b.flush_events().expect("flush B");
+
+        // Per-project listings stay scoped — A sees only A, B only B.
+        let listed_a = store_a.list(&SessionQuery::default()).expect("list A");
+        let listed_b = store_b.list(&SessionQuery::default()).expect("list B");
+        assert_eq!(listed_a.len(), 1, "project A list is project-local");
+        assert_eq!(listed_b.len(), 1, "project B list is project-local");
+
+        // The global index lifts both sessions out of their per-project
+        // session roots so a resume picker run from either cwd can see them.
+        let global = SessionStore::list_global_index();
+        let ids: BTreeSet<String> = global.iter().map(|e| e.session_id.clone()).collect();
+        assert!(
+            ids.contains(handle_a.session_id()),
+            "project A session missing from global index: {ids:?}",
+        );
+        assert!(
+            ids.contains(handle_b.session_id()),
+            "project B session missing from global index: {ids:?}",
+        );
+
+        // Each entry retains its source cwd + title so the picker can
+        // render the "(repo) prompt" hint without re-reading metadata.
+        let entry_a = global
+            .iter()
+            .find(|e| e.session_id == handle_a.session_id())
+            .expect("entry A");
+        let entry_b = global
+            .iter()
+            .find(|e| e.session_id == handle_b.session_id())
+            .expect("entry B");
+        assert_eq!(entry_a.cwd, project_a.display().to_string());
+        assert_eq!(entry_b.cwd, project_b.display().to_string());
+        assert_eq!(entry_a.title.as_deref(), Some("fix payment bug"));
+        assert_eq!(entry_b.title.as_deref(), Some("rewrite cache layer"));
+        assert!(entry_a.resume_available);
+        assert!(entry_b.resume_available);
+    });
+}
+
+#[test]
+fn global_index_dedupes_by_session_id_keeping_latest() {
+    let home = temp_root("global-index-dedup");
+    with_home(&home, || {
+        let entry_v1 = GlobalSessionIndexEntry {
+            session_id: "sess-1".to_string(),
+            cwd: "/work/repo".to_string(),
+            workspace_root: "/work/repo".to_string(),
+            repo_root: None,
+            title: Some("initial".to_string()),
+            started_at_ms: 1_000,
+            last_event_at_ms: 1_000,
+            turn_count: 0,
+            resume_available: true,
+        };
+        let entry_v2 = GlobalSessionIndexEntry {
+            title: Some("after first prompt".to_string()),
+            last_event_at_ms: 2_000,
+            turn_count: 1,
+            ..entry_v1.clone()
+        };
+        let entry_v3 = GlobalSessionIndexEntry {
+            title: Some("session finished".to_string()),
+            last_event_at_ms: 3_000,
+            turn_count: 4,
+            resume_available: false,
+            ..entry_v1.clone()
+        };
+
+        SessionStore::append_global_index_entry(&entry_v1);
+        SessionStore::append_global_index_entry(&entry_v2);
+        SessionStore::append_global_index_entry(&entry_v3);
+
+        let listed = SessionStore::list_global_index();
+        assert_eq!(
+            listed.len(),
+            1,
+            "duplicate session_id rows must collapse to one entry",
+        );
+        let entry = &listed[0];
+        assert_eq!(entry.session_id, "sess-1");
+        assert_eq!(
+            entry.title.as_deref(),
+            Some("session finished"),
+            "latest last_event_at_ms wins",
+        );
+        assert_eq!(entry.turn_count, 4);
+        assert!(
+            !entry.resume_available,
+            "terminal snapshot overrides earlier resume_available",
+        );
+    });
+}
+
+#[test]
+fn global_index_compacts_when_file_grows_past_threshold() {
+    let home = temp_root("global-index-compaction");
+    with_home(&home, || {
+        // Pad the title so every append crosses ~1.5KB on disk; with the
+        // 256KiB threshold this is far less than 500 rewrites but still
+        // exercises the rewrite branch deterministically.
+        let payload = "x".repeat(2_000);
+        for i in 0..200u32 {
+            SessionStore::append_global_index_entry(&GlobalSessionIndexEntry {
+                session_id: format!("sess-{i}"),
+                cwd: format!("/work/project-{i}"),
+                workspace_root: format!("/work/project-{i}"),
+                repo_root: None,
+                title: Some(payload.clone()),
+                started_at_ms: i as u64,
+                last_event_at_ms: i as u64,
+                turn_count: 0,
+                resume_available: true,
+            });
+        }
+        // Duplicate a subset so compaction has something to coalesce.
+        for i in 0..50u32 {
+            SessionStore::append_global_index_entry(&GlobalSessionIndexEntry {
+                session_id: format!("sess-{i}"),
+                cwd: format!("/work/project-{i}"),
+                workspace_root: format!("/work/project-{i}"),
+                repo_root: None,
+                title: Some(payload.clone()),
+                started_at_ms: i as u64,
+                last_event_at_ms: (i as u64) + 1_000,
+                turn_count: 7,
+                resume_available: true,
+            });
+        }
+
+        let path = SessionStore::global_index_path().expect("HOME set");
+        let size_before = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size_before > GLOBAL_INDEX_COMPACT_THRESHOLD_BYTES,
+            "test setup must exceed compaction threshold (got {size_before} bytes)",
+        );
+
+        let listed = SessionStore::list_global_index();
+        assert_eq!(listed.len(), 200, "dedupe keeps one entry per session_id");
+
+        let size_after = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            size_after < size_before,
+            "list_global_index must rewrite the file when it exceeds the threshold (before={size_before}, after={size_after})",
+        );
+
+        // The rewritten file is still a valid newline-delimited JSONL
+        // stream that a second read sees identically — important because
+        // the next session start will append straight to its tail.
+        let again = SessionStore::list_global_index();
+        let ids_again: BTreeSet<String> = again.iter().map(|e| e.session_id.clone()).collect();
+        let ids_first: BTreeSet<String> = listed.iter().map(|e| e.session_id.clone()).collect();
+        assert_eq!(ids_again, ids_first);
+    });
+}
+
+#[test]
+fn global_index_path_is_none_when_home_unset() {
+    let _guard = HOME_LOCK.lock().expect("HOME lock");
+    let previous = std::env::var_os("HOME");
+    unsafe {
+        std::env::remove_var("HOME");
+    }
+    let path = SessionStore::global_index_path();
+    let listed = SessionStore::list_global_index();
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+    assert!(path.is_none(), "HOME unset means no global index path");
+    assert!(
+        listed.is_empty(),
+        "HOME unset surfaces no entries — the index is best-effort enrichment",
+    );
+}
+
+#[test]
+fn archive_session_marks_global_index_entry_unresumable() {
+    let home = temp_root("global-index-archive");
+    let project = temp_root("global-index-archive-project");
+    with_home(&home, || {
+        let config = AppConfig {
+            workspace_root: project.clone(),
+            session_logs: SessionLogConfig {
+                log_dir: Some(PathBuf::from(".squeezy/sessions")),
+                ..SessionLogConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        let store = SessionStore::open(&config);
+        let mut meta = SessionMetadata::new(&config, "test-provider");
+        meta.cwd = project.display().to_string();
+        let handle = store.start_session(meta).expect("start");
+        let id = handle.session_id().to_string();
+
+        let live = SessionStore::list_global_index();
+        let live_entry = live
+            .iter()
+            .find(|e| e.session_id == id)
+            .expect("entry recorded on start");
+        assert!(
+            live_entry.resume_available,
+            "fresh session must be resumable",
+        );
+
+        // Drop the handle first so the async writer doesn't fight us
+        // for the session dir during the rename.
+        drop(handle);
+        store.archive_session(&id).expect("archive");
+
+        let archived = SessionStore::list_global_index();
+        let entry = archived
+            .iter()
+            .find(|e| e.session_id == id)
+            .expect("archived entry still visible");
+        assert!(
+            !entry.resume_available,
+            "archive must flip resume_available off so the picker hides the entry",
+        );
+    });
+}

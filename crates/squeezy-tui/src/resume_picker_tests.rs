@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use squeezy_store::{SessionMetadata, SessionStatus};
+use squeezy_store::{GlobalSessionIndexEntry, SessionMetadata, SessionStatus};
 
 use super::*;
 
@@ -297,5 +297,107 @@ fn filter_all_projects_keeps_cross_cwd_entries() {
             .map(|s| s.session_id.as_str())
             .collect::<Vec<_>>(),
         vec!["scoped", "sibling"]
+    );
+}
+
+fn global_entry(
+    id: &str,
+    cwd: &str,
+    started_at_ms: u64,
+    resume_available: bool,
+) -> GlobalSessionIndexEntry {
+    GlobalSessionIndexEntry {
+        session_id: id.to_string(),
+        cwd: cwd.to_string(),
+        workspace_root: cwd.to_string(),
+        repo_root: None,
+        title: Some(format!("global task for {id}")),
+        started_at_ms,
+        last_event_at_ms: started_at_ms,
+        turn_count: 0,
+        resume_available,
+    }
+}
+
+#[test]
+fn merge_surfaces_cross_project_sessions_from_global_index() {
+    // Per-project store only contains the local session; the cross-project
+    // index supplies the sibling-repo entry. The picker needs both so the
+    // Tab toggle can flip into a cross-project view.
+    let now = 5_000_000;
+    let local = vec![meta("local", "/work/repo", now - 1_000, true)];
+    let global = vec![global_entry("sibling", "/work/other", now - 2_000, true)];
+
+    let out = merge_candidates_for_picker(&local, &global, now);
+    let ids: Vec<&str> = out.iter().map(|s| s.session_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["local", "sibling"],
+        "merge must surface both local + global entries newest-first",
+    );
+    // The sibling row keeps the cwd we put in the global index so the
+    // picker can render the "(other)" hint.
+    let sibling = out
+        .iter()
+        .find(|s| s.session_id == "sibling")
+        .expect("sibling present");
+    assert_eq!(sibling.cwd, "/work/other");
+    assert_eq!(
+        sibling.first_user_task.as_deref(),
+        Some("global task for sibling"),
+    );
+}
+
+#[test]
+fn merge_prefers_local_metadata_when_session_id_overlaps() {
+    // The local SessionMetadata carries the richer title; the global
+    // index entry for the same session_id must lose so the picker shows
+    // the finalized state, not the stale snapshot.
+    let now = 5_000_000;
+    let mut local_meta = meta("shared", "/work/repo", now - 1_000, true);
+    local_meta.first_user_task = Some("local prompt wins".to_string());
+    let local = vec![local_meta];
+    let global = vec![GlobalSessionIndexEntry {
+        title: Some("global prompt loses".to_string()),
+        ..global_entry("shared", "/work/repo", now - 1_000, true)
+    }];
+
+    let out = merge_candidates_for_picker(&local, &global, now);
+    assert_eq!(
+        out.len(),
+        1,
+        "duplicate session_ids must collapse to one row"
+    );
+    assert_eq!(
+        out[0].first_user_task.as_deref(),
+        Some("local prompt wins"),
+        "local SessionMetadata must win over the global index snapshot",
+    );
+}
+
+#[test]
+fn merge_drops_unresumable_global_entries() {
+    let now = 5_000_000;
+    let global = vec![global_entry("done", "/work/other", now - 1_000, false)];
+    let out = merge_candidates_for_picker(&[], &global, now);
+    assert!(
+        out.is_empty(),
+        "resume_available=false in the index must hide the row from the picker",
+    );
+}
+
+#[test]
+fn merge_drops_stale_global_entries() {
+    let now = 30 * 24 * 60 * 60 * 1_000;
+    let global = vec![global_entry(
+        "ancient",
+        "/work/other",
+        now - 30 * 24 * 60 * 60 * 1_000 + 1,
+        true,
+    )];
+    let out = merge_candidates_for_picker(&[], &global, now);
+    assert!(
+        out.is_empty(),
+        "entries older than the recency window must be dropped"
     );
 }
