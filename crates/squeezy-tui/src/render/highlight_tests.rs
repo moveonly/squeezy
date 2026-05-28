@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::render::palette::ColorLevel;
 
@@ -54,4 +56,36 @@ fn light_tone_keyword_is_darker_than_dark_tone() {
 
 fn avg((r, g, b): (u8, u8, u8)) -> u32 {
     (r as u32 + g as u32 + b as u32) / 3
+}
+
+/// Two consecutive lookups for the same language must return the same
+/// `Arc<HighlightConfiguration>`. Without the per-language cache the TUI
+/// pays a multi-millisecond `HighlightConfiguration::new` +
+/// `configure(&HIGHLIGHT_NAMES)` rebuild on every render — this is the
+/// regression guard for F09.
+#[test]
+fn highlight_config_is_arc_ptr_eq_on_repeat() {
+    let first = highlight_config(HighlightLanguage::Rust)
+        .expect("rust highlight config must build from the bundled grammar");
+    let second = highlight_config(HighlightLanguage::Rust)
+        .expect("rust highlight config must build from the bundled grammar");
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "consecutive lookups for HighlightLanguage::Rust must return the cached Arc, \
+         not a freshly rebuilt HighlightConfiguration",
+    );
+}
+
+/// Different languages must produce distinct cached configs. Without
+/// this isolation a fence tagged ```python` would reuse the Rust grammar
+/// (or vice versa) and emit nonsense highlights.
+#[test]
+fn highlight_config_isolates_languages() {
+    let rust = highlight_config(HighlightLanguage::Rust).expect("rust highlight config must build");
+    let python =
+        highlight_config(HighlightLanguage::Python).expect("python highlight config must build");
+    assert!(
+        !Arc::ptr_eq(&rust, &python),
+        "Rust and Python must have distinct cached HighlightConfiguration entries",
+    );
 }
