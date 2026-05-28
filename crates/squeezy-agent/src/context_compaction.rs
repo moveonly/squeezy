@@ -573,6 +573,16 @@ pub(crate) async fn compact_conversation_with_strategy(
     trigger: ContextCompactionTrigger,
     force: bool,
 ) -> Option<ContextCompactionReport> {
+    // Capture the prior compaction's summary BEFORE `compact_conversation`
+    // overwrites `state.summary` with the new extractive blob. The
+    // structured-template prompt surfaces this prior chain as a separate
+    // `<previous-summary>` block so the model can update slot contents
+    // iteratively instead of re-truncating the entire summary every round.
+    // Without this capture the model only sees the prior summary embedded
+    // inline in the new extractive output — the same chained-truncate
+    // shape that loses ~60% of high-signal slots after a handful of
+    // compactions (F12-pi-iterative-summary-update).
+    let previous_summary_before = state.summary.clone();
     let report = compact_conversation(
         conversation,
         state,
@@ -622,16 +632,14 @@ pub(crate) async fn compact_conversation_with_strategy(
     let max_output = config.context_compaction.model_assisted_max_output_tokens;
     let timeout_secs = config.context_compaction.model_assisted_timeout_secs;
     let extractive_summary = report.summary.clone();
-    let prompt = format!(
-        "Rewrite the conversation summary below verbatim in <= {max_output} tokens. \
-         Keep every decision, plan, dead-end, attachment, receipt, and unresolved \
-         question. Do not invent new facts. Output the summary only.\n\n{extractive_summary}"
+    let prompt = build_structured_compaction_prompt(
+        previous_summary_before.as_deref(),
+        &extractive_summary,
+        max_output,
     );
     let request = LlmRequest {
         model: Arc::from(model.as_str()),
-        instructions: Arc::from(
-            "You compact conversation summaries faithfully. Never add new facts; never omit decisions.",
-        ),
+        instructions: Arc::from(STRUCTURED_COMPACTION_SYSTEM_PROMPT),
         input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(max_output),
         response_verbosity: None,
@@ -676,6 +684,15 @@ pub(crate) async fn compact_conversation_with_strategy(
             "model_assisted_error"
         }
         Ok(Ok(())) if buffer.trim().is_empty() => "model_assisted_empty",
+        Ok(Ok(())) if !is_structured_compaction_summary(buffer.trim()) => {
+            // The model returned text but it does not carry all four
+            // required slots (`## Goal`, `## Progress`, `## Decisions`,
+            // `## Next`). A partial output is strictly worse than the
+            // deterministic extractive baseline because slot detection
+            // upstream — and the file-lineage append pass — both rely on
+            // the named-section shape. Fall back verbatim.
+            "model_assisted_missing_slots"
+        }
         Ok(Ok(())) => {
             let new_summary = buffer.trim().to_string();
             if let Some(LlmInputItem::UserText(slot)) = conversation.first_mut() {
@@ -708,6 +725,129 @@ pub(crate) async fn compact_conversation_with_strategy(
         json!({ "reason": reason, "strategy": strategy.as_str() }),
     );
     Some(report)
+}
+
+/// System prompt for the model-assisted compaction call. Pinned to the
+/// "compact a context checkpoint" framing so the model never tries to
+/// continue the embedded conversation, and so the four-slot output shape
+/// stays stable across calls and providers.
+pub(crate) const STRUCTURED_COMPACTION_SYSTEM_PROMPT: &str = "You compact conversation context into a structured checkpoint. \
+Update the existing summary in place — preserve every prior decision, \
+progress entry, and next-step. Never invent new facts. Output only the \
+four required sections in this exact order: `## Goal`, `## Progress`, \
+`## Decisions`, `## Next`.";
+
+/// Slot headers the model-assisted compaction output MUST carry. The
+/// names are kept short and lowercase here for case-insensitive matching;
+/// see `is_structured_compaction_summary` for the detection contract.
+/// File-lineage tags (`<read-files>` / `<modified-files>`) are appended
+/// by a sibling pass below `## Next`; they intentionally sit outside
+/// this slot set so the file-lineage pass can land without conflict.
+const REQUIRED_COMPACTION_SLOTS: [&str; 4] = ["goal", "progress", "decisions", "next"];
+
+/// Build the model-assisted compaction prompt. Asks the model to emit
+/// four named slots — `## Goal`, `## Progress`, `## Decisions`,
+/// `## Next` — that survive across N compactions. The legacy "rewrite
+/// this summary verbatim" prompt chain-truncated the same blob every
+/// round and lost roughly 60% of high-signal content after a handful of
+/// generations (audit finding `F12-pi-iterative-summary-update`);
+/// pinning the model to a fixed slot shape gives it an explicit
+/// "preserve these" target instead.
+///
+/// When the caller has a prior compaction summary it is surfaced as a
+/// dedicated `<previous-summary>` block alongside the freshly built
+/// extractive output (`<new-conversation>`). The model updates the
+/// slots iteratively: carry forward every entry from the prior block,
+/// fold in new actions/decisions from the new conversation, and emit
+/// the merged result. The instructions are deterministic-ish — the
+/// section order, names, and rules are pinned text, even though the
+/// model's exact wording inside each slot will vary.
+fn build_structured_compaction_prompt(
+    previous_summary: Option<&str>,
+    new_conversation: &str,
+    max_output_tokens: u32,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "Update the structured project context checkpoint below. Emit only the four \
+         sections in this EXACT order: `## Goal`, `## Progress`, `## Decisions`, `## Next`.\n\n",
+    );
+    prompt.push_str("<new-conversation>\n");
+    prompt.push_str(new_conversation);
+    if !new_conversation.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("</new-conversation>\n\n");
+    if let Some(prev) = previous_summary
+        && !prev.trim().is_empty()
+    {
+        prompt.push_str("<previous-summary>\n");
+        prompt.push_str(prev);
+        if !prev.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str("</previous-summary>\n\n");
+    }
+    prompt.push_str(
+        "Template:\n\n\
+         ## Goal\n\
+         <one-paragraph statement of what the user is trying to accomplish>\n\n\
+         ## Progress\n\
+         - <what's been done; preserve prior items and append newly completed actions, decisions, file edits>\n\n\
+         ## Decisions\n\
+         - <decisions made — chosen approach, rejected options, constraints discovered; preserve every prior decision>\n\n\
+         ## Next\n\
+         - <remaining steps to complete the task; update based on new progress>\n\n",
+    );
+    prompt.push_str(&format!(
+        "Rules:\n\
+         - PRESERVE every entry from `<previous-summary>` unless `<new-conversation>` explicitly invalidates it.\n\
+         - ADD new entries from `<new-conversation>` into the matching slot.\n\
+         - UPDATE the `## Next` slot to drop steps that `<new-conversation>` shows are complete; add steps it surfaces as outstanding.\n\
+         - KEEP exact file paths, function names, error messages, tool call names, and SHA prefixes verbatim.\n\
+         - Do NOT invent new facts. Do NOT omit prior decisions.\n\
+         - Token budget: <= {max_output_tokens} tokens.\n\
+         - Output only the four sections (`## Goal`, `## Progress`, `## Decisions`, `## Next`). No preamble, no commentary, no trailing prose.\n"
+    ));
+    prompt
+}
+
+/// Verify a model-assisted compaction output carries every required
+/// structured slot. Returns `true` when all of `## Goal`, `## Progress`,
+/// `## Decisions`, and `## Next` are present as markdown headings; the
+/// caller falls back to the extractive summary verbatim otherwise.
+///
+/// Detection is intentionally lenient: any markdown heading line (one or
+/// more leading `#` characters) that contains the slot keyword as a
+/// whole word counts. This accepts model variations like `### Goal`,
+/// `## Key Decisions`, `## Next Steps`, and `## Goal:` while still
+/// catching outputs that drop a section entirely (which is the failure
+/// mode the structured template exists to prevent). Sibling passes may
+/// append additional XML-tagged sections (e.g. `<read-files>`,
+/// `<modified-files>`) below `## Next` without breaking this check —
+/// the validator only cares that the four slots are present, not that
+/// the document ends with them.
+fn is_structured_compaction_summary(text: &str) -> bool {
+    let mut found = [false; REQUIRED_COMPACTION_SLOTS.len()];
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        let body = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+        for (idx, keyword) in REQUIRED_COMPACTION_SLOTS.iter().enumerate() {
+            if found[idx] {
+                continue;
+            }
+            if body
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == *keyword)
+            {
+                found[idx] = true;
+            }
+        }
+    }
+    found.iter().all(|f| *f)
 }
 
 pub(crate) fn build_compaction_summary(

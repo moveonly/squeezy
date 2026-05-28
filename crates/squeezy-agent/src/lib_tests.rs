@@ -4978,6 +4978,280 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
     );
 }
 
+#[tokio::test]
+async fn compact_with_strategy_accepts_structured_template_output() {
+    // End-to-end: when the model returns a four-slot structured document,
+    // `compact_conversation_with_strategy` accepts it verbatim and stamps
+    // it into both the returned report and the in-memory state. This is
+    // the happy path that F12-pi-iterative-summary-update unlocks; the
+    // legacy "rewrite verbatim" prompt would have accepted any string,
+    // including ones that silently dropped `## Decisions`.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("structured compaction should accept the model output");
+
+    assert_eq!(report.summary.trim(), structured.trim());
+    assert_eq!(state.summary.as_deref(), Some(structured.trim()));
+    assert_eq!(
+        conversation.first().and_then(|item| match item {
+            LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        }),
+        Some(structured.trim()),
+        "synthetic summary head must carry the structured output"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "model-assisted compaction issues exactly one request"
+    );
+    let prompt = match requests[0].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+    for slot in ["## Goal", "## Progress", "## Decisions", "## Next"] {
+        assert!(
+            prompt.contains(slot),
+            "model prompt must advertise slot header {slot}"
+        );
+    }
+    assert!(
+        prompt.contains("<new-conversation>"),
+        "model prompt must wrap the extractive output in a `<new-conversation>` block"
+    );
+}
+
+#[tokio::test]
+async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
+    // The validator is the safety net: if the model returns prose without
+    // all four required slots, `compact_conversation_with_strategy` keeps
+    // the deterministic extractive summary so the file-lineage append pass
+    // still has a stable anchor. Any model that ignored the structured
+    // template instructions would otherwise quietly degrade the summary
+    // chain — the same failure mode F12-pi-iterative-summary-update fixes.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let unstructured = "Here is a freeform summary that drops decisions and next steps entirely.";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(unstructured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("compaction should still produce extractive output");
+
+    assert!(
+        report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "missing-slot output must fall back to the extractive summary, got: {}",
+        report.summary,
+    );
+    assert!(
+        !report.summary.contains(unstructured),
+        "unstructured model output must not be promoted to the final summary"
+    );
+}
+
+#[tokio::test]
+async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compaction() {
+    // The iterative-update contract: on the second compaction the prior
+    // summary must reach the model as a *dedicated* `<previous-summary>`
+    // block so it can deterministically carry forward slot contents.
+    // Embedding it only inline inside the extractive output (the legacy
+    // behaviour) is what made the slot chain lose ~60% of content after
+    // a handful of generations.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let structured =
+        "## Goal\ngoal text\n\n## Progress\n- p1\n\n## Decisions\n- d1\n\n## Next\n- n1\n";
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(structured.to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("compaction-1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(structured.to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("compaction-2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+
+    let mut conversation = mid_turn_test_conversation();
+    super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("first compaction");
+    assert_eq!(state.summary.as_deref(), Some(structured.trim()));
+
+    let mut conversation = mid_turn_test_conversation();
+    super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("second compaction");
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "each compaction issues exactly one model-assisted request"
+    );
+    let first_prompt = match requests[0].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+    let second_prompt = match requests[1].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+
+    // Match the actual block opening (`<previous-summary>\n`) — the Rules
+    // text also references the tag inside backticks, so the bare string
+    // would over-match on cold start.
+    assert!(
+        !first_prompt.contains("<previous-summary>\n"),
+        "cold-start compaction must not emit a `<previous-summary>` block; got prompt:\n{first_prompt}"
+    );
+    assert!(
+        second_prompt.contains("<previous-summary>\n"),
+        "iterative compaction must surface the prior summary as a `<previous-summary>` block; got prompt:\n{second_prompt}"
+    );
+    assert!(
+        second_prompt.contains("- d1"),
+        "iterative compaction must embed the prior summary's `## Decisions` body verbatim; got prompt:\n{second_prompt}"
+    );
+}
+
 #[test]
 fn parse_subagent_structured_tail_extracts_findings_object() {
     let text = "Here is the plan.\n\n{\"findings\": [{\"finding\": \"missing tracing\", \"recommendation\": \"add span\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span\"}";

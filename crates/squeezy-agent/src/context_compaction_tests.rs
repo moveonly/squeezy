@@ -1,7 +1,10 @@
 use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
 
-use super::{build_compaction_summary, strip_media_for_compaction};
+use super::{
+    build_compaction_summary, build_structured_compaction_prompt, is_structured_compaction_summary,
+    strip_media_for_compaction,
+};
 
 /// A 220-byte base64 blob built from a repeating pattern. Long enough to
 /// exceed `STRIP_MEDIA_MIN_LEN` (100) and to survive `compact_text`'s
@@ -179,5 +182,179 @@ fn compaction_summary_does_not_carry_base64_image_payload() {
     assert!(
         !summary.contains("data:image/png;base64,"),
         "data URI prefix reached the compaction summary"
+    );
+}
+
+#[test]
+fn structured_compaction_prompt_pins_all_four_slot_names() {
+    // The whole point of the structured template is that the model-assisted
+    // prompt names exactly the four slots that survive across N compactions.
+    // If any of these strings drift, the slot validator and the file-lineage
+    // sibling pass (which appends `<read-files>` / `<modified-files>` below
+    // `## Next`) lose their shared contract.
+    let prompt = build_structured_compaction_prompt(None, "extractive body", 500);
+    for slot in ["## Goal", "## Progress", "## Decisions", "## Next"] {
+        assert!(
+            prompt.contains(slot),
+            "structured compaction prompt is missing slot header {slot}; prompt was:\n{prompt}"
+        );
+    }
+    assert!(
+        prompt.contains("<new-conversation>") && prompt.contains("</new-conversation>"),
+        "prompt must wrap the new extractive output in a `<new-conversation>` block"
+    );
+    assert!(
+        prompt.contains("Do NOT invent new facts")
+            || prompt.contains("Do NOT omit prior decisions"),
+        "prompt must carry the no-fabrication / no-decision-drop guardrails: {prompt}"
+    );
+    assert!(
+        prompt.contains("500"),
+        "prompt must surface the configured max_output_tokens budget"
+    );
+}
+
+#[test]
+fn structured_compaction_prompt_attaches_previous_summary_block_when_present() {
+    // Iterative update is the load-bearing piece of F12-pi-iterative-summary-update.
+    // The model must see the prior compaction's output as a *separate* tagged
+    // block, not just inline inside the new extractive body, so it can carry
+    // forward `## Decisions` and `## Progress` entries deterministically.
+    // Check for the actual block opening `<previous-summary>\n` rather than
+    // the bare tag string, which the Rules text also references (e.g.
+    // "PRESERVE every entry from `<previous-summary>` ...").
+    let prev = "## Goal\nbuild a parser\n\n## Decisions\n- use tree-sitter";
+    let prompt = build_structured_compaction_prompt(Some(prev), "extractive body", 800);
+
+    assert!(
+        prompt.contains("<previous-summary>\n") && prompt.contains("\n</previous-summary>\n"),
+        "prompt must wrap the prior summary in a `<previous-summary>` block when one exists"
+    );
+    assert!(
+        prompt.contains("use tree-sitter"),
+        "prompt must embed the verbatim prior summary contents"
+    );
+    assert!(
+        prompt.contains("PRESERVE every entry from `<previous-summary>`"),
+        "prompt must instruct the model to preserve prior slot entries"
+    );
+}
+
+#[test]
+fn structured_compaction_prompt_omits_previous_summary_block_on_cold_start() {
+    // First-ever compaction has no prior summary. The actual
+    // `<previous-summary>\n` block opening should be absent — emitting an
+    // empty block would tempt the model to fabricate "prior decisions"
+    // from thin air, and the iterative-update contract explicitly forbids
+    // that. The Rules text still mentions the block by name so the model
+    // knows the slot semantics; assert only on the block opening, not the
+    // bare tag string.
+    let prompt = build_structured_compaction_prompt(None, "extractive body", 500);
+    assert!(
+        !prompt.contains("<previous-summary>\n"),
+        "cold-start prompt must not emit a `<previous-summary>` block opening"
+    );
+
+    // Whitespace-only previous summary is treated the same as `None` —
+    // it carries no slot content worth preserving.
+    let prompt_blank =
+        build_structured_compaction_prompt(Some("   \n\n  "), "extractive body", 500);
+    assert!(
+        !prompt_blank.contains("<previous-summary>\n"),
+        "blank previous summary must not produce a `<previous-summary>` block opening"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_accepts_complete_template() {
+    let body = "\
+## Goal\nbuild a parser\n\n\
+## Progress\n- wrote lexer\n\n\
+## Decisions\n- use tree-sitter\n\n\
+## Next\n- wire grammar tests\n";
+    assert!(
+        is_structured_compaction_summary(body),
+        "complete four-slot output should validate"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_accepts_lenient_heading_variants() {
+    // Models drift in predictable ways: deeper heading levels, trailing
+    // colons, and decorator words like "Key Decisions" or "Next Steps" all
+    // still represent the four slots and must validate. The validator only
+    // catches *missing* slots, not stylistic variation.
+    let body = "\
+### Goal:\nship structured compaction\n\n\
+## Progress\n- merged prompt change\n\n\
+## Key Decisions\n- match keyword as whole word\n\n\
+## Next Steps\n- ship file-lineage sibling\n";
+    assert!(
+        is_structured_compaction_summary(body),
+        "lenient header variants should validate; body was:\n{body}"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_accepts_file_lineage_blocks_below_next() {
+    // The file-lineage sibling pass (F12-pi-file-lineage-in-summary) appends
+    // `<read-files>` / `<modified-files>` XML blocks below `## Next`. The
+    // validator must not reject the document just because more content
+    // appears after the fourth slot.
+    let body = "\
+## Goal\nbuild a parser\n\n\
+## Progress\n- wrote lexer\n\n\
+## Decisions\n- use tree-sitter\n\n\
+## Next\n- wire grammar tests\n\n\
+<read-files>\n/repo/src/parser.rs\n</read-files>\n\n\
+<modified-files>\n/repo/src/lexer.rs\n</modified-files>\n";
+    assert!(
+        is_structured_compaction_summary(body),
+        "file-lineage trailer must not invalidate the structured output"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_rejects_missing_slot() {
+    // Drop `## Decisions` — the slot most likely to be silently lost under
+    // the old "rewrite verbatim" prompt. The validator must reject so the
+    // caller can fall back to the deterministic extractive baseline.
+    let body = "\
+## Goal\nbuild a parser\n\n\
+## Progress\n- wrote lexer\n\n\
+## Next\n- wire grammar tests\n";
+    assert!(
+        !is_structured_compaction_summary(body),
+        "missing `## Decisions` slot must invalidate the structured output"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_rejects_free_text_output() {
+    // Legacy "rewrite verbatim" output is plain prose with no markdown
+    // headings. The validator should reject so the strategy gate falls
+    // back to the extractive summary instead of accepting an unstructured
+    // blob the file-lineage append pass cannot anchor onto.
+    let body = "We rewrote the conversation summary. Decisions were preserved. \
+                Next step is to wire grammar tests.";
+    assert!(
+        !is_structured_compaction_summary(body),
+        "free-text output without headings must fail validation"
+    );
+}
+
+#[test]
+fn is_structured_compaction_summary_rejects_keyword_in_prose_without_heading() {
+    // A model that prepends commentary like "Goal: foo\nProgress: bar" using
+    // plain text labels rather than markdown headings must not pass — the
+    // file-lineage / TUI render pipeline both rely on the `##` heading shape
+    // to split the document into slots.
+    let body = "Goal: build a parser\n\
+                Progress: wrote lexer\n\
+                Decisions: use tree-sitter\n\
+                Next: wire grammar tests\n";
+    assert!(
+        !is_structured_compaction_summary(body),
+        "plain-text labels without `#` headings must fail validation"
     );
 }
