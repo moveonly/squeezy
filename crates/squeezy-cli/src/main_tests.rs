@@ -253,6 +253,130 @@ fn cli_continue_and_session_are_mutually_exclusive() {
     );
 }
 
+#[test]
+fn cli_session_dir_defaults_to_none_when_flag_omitted() {
+    let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
+    assert_eq!(cli.session_dir, None);
+}
+
+#[test]
+fn cli_session_dir_parses_value_as_pathbuf() {
+    let cli = Cli::try_parse_from(["squeezy", "--session-dir", "/var/log/squeezy"]).expect("parse");
+    assert_eq!(
+        cli.session_dir.as_deref(),
+        Some(std::path::Path::new("/var/log/squeezy"))
+    );
+}
+
+// `config_from_cli` reads real process env vars and HOME-anchored settings
+// files; serialize the precedence tests below so they don't race each other
+// or other env-mutating tests in this module.
+static SESSION_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Point `HOME` and `SQUEEZY_SESSION_DIR` at known values inside a single
+/// guarded section, then restore the previous environment when the returned
+/// guard drops.  Keeps the precedence tests isolated from the dev's real
+/// `~/.squeezy/settings.toml` and any ambient session-dir env.
+struct SessionDirEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    prev_home: Option<std::ffi::OsString>,
+    prev_session_dir: Option<std::ffi::OsString>,
+    home_dir: PathBuf,
+}
+
+impl SessionDirEnvGuard {
+    fn install(home_label: &str, session_dir_env: Option<&str>) -> Self {
+        let lock = SESSION_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home_dir = temp_dir(home_label);
+        let prev_home = env::var_os("HOME");
+        let prev_session_dir = env::var_os("SQUEEZY_SESSION_DIR");
+        // SAFETY: SESSION_DIR_ENV_LOCK serializes all callers in this module.
+        unsafe {
+            env::set_var("HOME", &home_dir);
+            match session_dir_env {
+                Some(value) => env::set_var("SQUEEZY_SESSION_DIR", value),
+                None => env::remove_var("SQUEEZY_SESSION_DIR"),
+            }
+        }
+        Self {
+            _lock: lock,
+            prev_home,
+            prev_session_dir,
+            home_dir,
+        }
+    }
+}
+
+impl Drop for SessionDirEnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: the lock held in `_lock` keeps these mutations serialized.
+        unsafe {
+            match &self.prev_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+            match &self.prev_session_dir {
+                Some(value) => env::set_var("SQUEEZY_SESSION_DIR", value),
+                None => env::remove_var("SQUEEZY_SESSION_DIR"),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.home_dir);
+    }
+}
+
+#[test]
+fn config_from_cli_uses_env_session_dir_when_flag_omitted() {
+    let _guard = SessionDirEnvGuard::install("session-dir-env-only", Some("/env/sessions"));
+
+    let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
+    let config = config_from_cli(&cli).expect("resolve config");
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/env/sessions"))
+    );
+    assert!(
+        config.config_sources.iter().any(|source| source == "env"),
+        "env source should be tagged when SQUEEZY_SESSION_DIR is consumed; got {:?}",
+        config.config_sources,
+    );
+}
+
+#[test]
+fn config_from_cli_session_dir_flag_overrides_env_session_dir() {
+    // CLI flag must beat both env and config; we set the env to verify the
+    // flag is the final word in the resolution order.
+    let _guard = SessionDirEnvGuard::install("session-dir-cli-vs-env", Some("/env/sessions"));
+
+    let cli = Cli::try_parse_from(["squeezy", "--session-dir", "/cli/sessions"]).expect("parse");
+    let config = config_from_cli(&cli).expect("resolve config");
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/cli/sessions"))
+    );
+    assert!(
+        config.config_sources.iter().any(|source| source == "cli"),
+        "cli source should be tagged when --session-dir is consumed; got {:?}",
+        config.config_sources,
+    );
+}
+
+#[test]
+fn config_from_cli_session_dir_falls_back_to_default_without_flag_or_env() {
+    let _guard = SessionDirEnvGuard::install("session-dir-default", None);
+
+    let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
+    let config = config_from_cli(&cli).expect("resolve config");
+
+    // No flag, no env, and the temp HOME has no settings.toml → the resolved
+    // log_dir stays unset and downstream callers fall back to the documented
+    // default of `.squeezy/sessions`.
+    assert_eq!(config.session_logs.log_dir, None);
+}
+
 /// Scripted `LlmProvider` used by the print-mode tool-loop tests.  Each
 /// `stream_response` call drains the next pre-baked event list, so a
 /// test can simulate "first round emits a tool call, second round emits

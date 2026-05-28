@@ -77,6 +77,12 @@ struct Cli {
     max_output_tokens: Option<u32>,
     #[arg(long, help = "Start session mode: plan or build")]
     mode: Option<String>,
+    #[arg(
+        long = "session-dir",
+        value_name = "PATH",
+        help = "Directory for session traces; overrides [session].log_dir and SQUEEZY_SESSION_DIR"
+    )]
+    session_dir: Option<PathBuf>,
     #[arg(long, help = "List configured built-in providers")]
     list_providers: bool,
     #[arg(long, help = "List built-in model metadata")]
@@ -628,6 +634,10 @@ fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
                 "cli: --mode: invalid session mode {mode:?}; expected plan or build"
             ))
         })?;
+    }
+    if let Some(session_dir) = &cli.session_dir {
+        cli_used = true;
+        config.session_logs.log_dir = Some(session_dir.clone());
     }
     if cli_used && !config.config_sources.iter().any(|source| source == "cli") {
         config.config_sources.push("cli".to_string());

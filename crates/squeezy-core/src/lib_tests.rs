@@ -2668,6 +2668,75 @@ max_session_bytes = 5678
 }
 
 #[test]
+fn session_log_dir_env_var_overrides_settings_file_value() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[session]
+log_dir = ".squeezy/from-config"
+"#,
+        "test",
+    )
+    .expect("parse settings");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        "SQUEEZY_SESSION_DIR" => Some("/tmp/from-env/sessions".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/tmp/from-env/sessions"))
+    );
+    assert!(
+        config.config_sources.iter().any(|source| source == "env"),
+        "env source should be tagged when SQUEEZY_SESSION_DIR is consumed; got {:?}",
+        config.config_sources,
+    );
+}
+
+#[test]
+fn session_log_dir_env_var_resolves_when_settings_absent() {
+    let config =
+        AppConfig::from_settings_and_env_vars(SettingsFile::default(), |name| match name {
+            "SQUEEZY_SESSION_DIR" => Some("  /var/log/squeezy  ".to_string()),
+            _ => None,
+        });
+
+    // Whitespace is trimmed so shell pipelines that append `\n` (e.g.
+    // `$(printf '%s\n' "$dir")`) don't end up writing into a literal
+    // ".../squeezy\n/" directory.
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from("/var/log/squeezy"))
+    );
+}
+
+#[test]
+fn session_log_dir_env_var_is_ignored_when_blank() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[session]
+log_dir = ".squeezy/from-config"
+"#,
+        "test",
+    )
+    .expect("parse settings");
+
+    let config = AppConfig::from_settings_and_env_vars(settings, |name| match name {
+        // A user can unset the var via `unset SQUEEZY_SESSION_DIR`, but they
+        // can also accidentally `export SQUEEZY_SESSION_DIR=` and expect the
+        // settings.toml value to remain in force.
+        "SQUEEZY_SESSION_DIR" => Some("   ".to_string()),
+        _ => None,
+    });
+
+    assert_eq!(
+        config.session_logs.log_dir,
+        Some(PathBuf::from(".squeezy/from-config"))
+    );
+}
+
+#[test]
 fn init_user_template_contains_no_uncommented_assignments() {
     for line in user_settings_template().lines() {
         let trimmed = line.trim_start();

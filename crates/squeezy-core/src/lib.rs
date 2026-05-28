@@ -816,11 +816,25 @@ impl AppConfig {
             &workspace_root,
             &mut get_var,
         )?;
-        let session_settings = settings.session.unwrap_or_default();
+        let mut session_settings = settings.session.unwrap_or_default();
         let session_mode = parse_session_mode(
             get_var("SQUEEZY_SESSION_MODE"),
             session_settings.mode.unwrap_or_default(),
         );
+        // `SQUEEZY_SESSION_DIR` overrides `[session].log_dir` so operators can
+        // redirect session traces (CI runners, ephemeral sandboxes, multi-user
+        // hosts) without rewriting settings.toml. Whitespace-only values are
+        // treated as unset so a stray `export SQUEEZY_SESSION_DIR=` cannot
+        // silently clear a configured directory. The CLI `--session-dir`
+        // overlay in `squeezy-cli` mutates `AppConfig.session_logs.log_dir`
+        // directly on top of this resolved value, giving the final order
+        // flag > env > config > default.
+        if let Some(raw) = get_var("SQUEEZY_SESSION_DIR") {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                session_settings.log_dir = Some(PathBuf::from(trimmed));
+            }
+        }
         let mut skills = SkillsConfig::from_settings_and_env_vars(
             settings.skills.unwrap_or_default(),
             &mut get_var,
