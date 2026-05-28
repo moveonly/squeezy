@@ -1,26 +1,38 @@
 //! Minimal hook system for Squeezy.
 //!
-//! Skills and other agent extensions can register handlers against
-//! lifecycle events ([`HookEvent`]). The agent loop dispatches events
-//! through a [`HookRegistry`]; each registered [`HookHandler`] returns a
-//! [`HookResult`] that can advise the caller to deny the action or
-//! mutate its payload.
+//! Two trait surfaces coexist here:
 //!
-//! The dispatched call sites today are `PreTurn`, `PreToolUse`,
-//! `PostToolUse`, `PreCompact`, and `PostCompact` (see
-//! `squeezy-agent`). The remaining variants — `PostToolUseFailure`,
-//! `PostTool`, `SubagentStart`, `SubagentStop`, `PermissionRequest`,
-//! `PermissionDenied`, `UserPromptSubmit`, `SessionStart`, `Stop`,
-//! `Setup` — are reserved as named enum entries so handlers can match
-//! against them now and follow-up call-site wiring can land
-//! incrementally without forcing the trait surface to evolve.
+//! * [`AgentHook`] — typed, mutation-capable async surface for
+//!   skills, MCP, telemetry, and any new extension that needs to
+//!   intercept the agent loop with structured input. Handlers receive
+//!   `&mut` views over the LLM request, tool call, and tool result
+//!   payloads and can rewrite them in place. This is the contract new
+//!   integrations should target.
+//! * [`HookHandler`] — the older synchronous observation-only API
+//!   keyed by [`HookEvent`]. It is preserved for skill hook scripts
+//!   and the squeezy-agent dispatch sites that already consume it,
+//!   and is bridged into the typed surface by
+//!   [`LegacyHookForwarder`].
 //!
-//! Mutation results are recorded by the agent today but not yet
-//! applied; the contract here is shaped for a future commit that wires
-//! mutation into the per-turn instruction pipeline.
+//! The observation pipeline still drives the agent today: the
+//! [`HookRegistry`] is plugged into `squeezy-agent` and fans events
+//! out at `PreTurn`, `PreToolUse`, `PostToolUse`, `PreCompact`, and
+//! `PostCompact`. The typed [`AgentHookBus`] is the integration point
+//! a follow-up commit will wire into those same call sites so
+//! handlers can mutate the LLM request and tool inputs without
+//! routing through `serde_json::Value` payload conventions.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+/// Convenience alias for the boxed futures returned by [`AgentHook`]
+/// methods. The trait stays object-safe by erasing the concrete
+/// future type behind `Pin<Box<dyn Future>>`, which mirrors the
+/// pattern used elsewhere in the workspace (e.g. `LlmProvider`).
+pub type HookFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Lifecycle points at which the agent fans out to registered handlers.
 ///
@@ -210,6 +222,324 @@ impl std::fmt::Debug for HookRegistry {
         f.debug_struct("HookRegistry")
             .field("handlers", &self.handlers.len())
             .finish()
+    }
+}
+
+/// Mutable view of an outbound provider request handed to
+/// [`AgentHook::before_provider_request`].
+///
+/// `payload` is intentionally kept as a `serde_json::Value` so this
+/// crate does not have to depend on `squeezy-llm`; the agent rebuilds
+/// the typed `LlmRequest` from the (possibly mutated) JSON payload
+/// after the bus has run. Hooks should mutate `payload` in place to
+/// rewrite the request before it is sent.
+#[derive(Debug, Clone)]
+pub struct LlmRequestView {
+    /// Stable identifier for the turn issuing this request.
+    pub turn_id: String,
+    /// JSON-shaped request body. Hooks may rewrite this in place.
+    pub payload: Value,
+}
+
+impl LlmRequestView {
+    pub fn new(turn_id: impl Into<String>, payload: Value) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            payload,
+        }
+    }
+}
+
+/// Mutable view of a tool call about to be executed. Handlers may
+/// rewrite `arguments` in place to patch the call before
+/// [`AgentHook::before_tool_call`] returns.
+#[derive(Debug, Clone)]
+pub struct ToolCallView {
+    /// Identifier of the turn that issued the call.
+    pub turn_id: String,
+    /// Per-call identifier emitted by the provider.
+    pub call_id: String,
+    /// Registered tool name (e.g. `read_file`).
+    pub tool_name: String,
+    /// JSON-shaped argument object. Hooks may rewrite in place.
+    pub arguments: Value,
+}
+
+impl ToolCallView {
+    pub fn new(
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: Value,
+    ) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            arguments,
+        }
+    }
+}
+
+/// Mutable view of a tool result before it is appended to the
+/// conversation. Handlers may rewrite `output` (and `status`) in
+/// place to redact, summarize, or annotate the result.
+#[derive(Debug, Clone)]
+pub struct ToolResultView {
+    pub turn_id: String,
+    pub call_id: String,
+    pub tool_name: String,
+    /// Outcome label (e.g. `"success"`, `"error"`, `"denied"`).
+    pub status: String,
+    /// JSON-shaped result payload. Hooks may rewrite in place.
+    pub output: Value,
+}
+
+impl ToolResultView {
+    pub fn new(
+        turn_id: impl Into<String>,
+        call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        status: impl Into<String>,
+        output: Value,
+    ) -> Self {
+        Self {
+            turn_id: turn_id.into(),
+            call_id: call_id.into(),
+            tool_name: tool_name.into(),
+            status: status.into(),
+            output,
+        }
+    }
+}
+
+/// Outcome of [`AgentHook::before_tool_call`].
+///
+/// Returning [`Decision::Deny`] short-circuits the bus and tells the
+/// agent to skip the tool call, surfacing `message` to the model as
+/// the would-be tool result. Later hooks in the bus are not invoked
+/// after a deny so handler ordering is observable.
+#[derive(Debug, Clone)]
+pub enum Decision {
+    /// Continue executing the tool call.
+    Allow,
+    /// Skip the tool call; the agent surfaces `message` in place of
+    /// the real result.
+    Deny { message: String },
+}
+
+impl Decision {
+    #[must_use]
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Self::Allow)
+    }
+
+    #[must_use]
+    pub fn is_deny(&self) -> bool {
+        matches!(self, Self::Deny { .. })
+    }
+}
+
+/// Typed mutation-capable extension surface for the agent loop.
+///
+/// Replaces the observation-only [`HookHandler`] pipeline as the
+/// primary integration point for skills, MCP, telemetry, and any
+/// future extension that needs to intercept the agent loop with
+/// structured input. Each method takes a mutable view of the
+/// relevant payload so handlers can rewrite the request, tool
+/// arguments, or tool result in place. All methods have no-op
+/// default implementations so concrete handlers only override the
+/// lifecycle points they care about.
+///
+/// The trait is object-safe (no generic methods, no `Self: Sized`
+/// bounds) so the dispatcher in [`AgentHookBus`] can store
+/// heterogeneous handlers behind `Box<dyn AgentHook>`. Futures are
+/// boxed via [`HookFuture`] to keep the trait dyn-compatible under
+/// stable Rust.
+pub trait AgentHook: Send + Sync {
+    /// Fires before the agent issues an LLM request. Handlers may
+    /// rewrite `req.payload` in place. The default implementation is
+    /// a no-op.
+    fn before_provider_request<'a>(&'a self, _req: &'a mut LlmRequestView) -> HookFuture<'a, ()> {
+        Box::pin(async {})
+    }
+
+    /// Fires before a tool call executes. Handlers may rewrite
+    /// `call.arguments` in place; the returned [`Decision`] decides
+    /// whether the call proceeds. The default implementation allows
+    /// the call without mutation.
+    fn before_tool_call<'a>(&'a self, _call: &'a mut ToolCallView) -> HookFuture<'a, Decision> {
+        Box::pin(async { Decision::Allow })
+    }
+
+    /// Fires after a tool call completes, before the result is
+    /// appended to the conversation. Handlers may rewrite the result
+    /// payload in place. The default implementation is a no-op.
+    fn after_tool_result<'a>(&'a self, _result: &'a mut ToolResultView) -> HookFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// Sequential dispatcher for [`AgentHook`] implementations.
+///
+/// Owns a vector of trait objects and fans out lifecycle calls in
+/// registration order. Each handler observes the mutations made by
+/// the handlers that ran before it, so ordering is meaningful. The
+/// bus is intentionally simple (no per-event filtering, no
+/// priorities) so the agent loop can reach for it on the hot path
+/// without ceremony.
+#[derive(Default)]
+pub struct AgentHookBus {
+    hooks: Vec<Box<dyn AgentHook>>,
+}
+
+impl AgentHookBus {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a new hook. Returns `&mut self` so callers can chain.
+    pub fn register(&mut self, hook: Box<dyn AgentHook>) -> &mut Self {
+        self.hooks.push(hook);
+        self
+    }
+
+    /// Number of registered hooks.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hooks.len()
+    }
+
+    /// `true` when no hooks are registered. Callers can skip the
+    /// dispatch entirely on this path.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty()
+    }
+
+    /// Fan out `before_provider_request` to every registered hook in
+    /// registration order, awaiting each handler so later handlers
+    /// see earlier mutations.
+    pub async fn before_provider_request(&self, req: &mut LlmRequestView) {
+        for hook in &self.hooks {
+            hook.before_provider_request(req).await;
+        }
+    }
+
+    /// Fan out `before_tool_call` and short-circuit on the first
+    /// [`Decision::Deny`]. The (possibly mutated) `call` always
+    /// reflects every handler that ran, including the one that
+    /// denied.
+    pub async fn before_tool_call(&self, call: &mut ToolCallView) -> Decision {
+        for hook in &self.hooks {
+            match hook.before_tool_call(call).await {
+                Decision::Allow => continue,
+                deny @ Decision::Deny { .. } => return deny,
+            }
+        }
+        Decision::Allow
+    }
+
+    /// Fan out `after_tool_result` to every registered hook in
+    /// registration order.
+    pub async fn after_tool_result(&self, result: &mut ToolResultView) {
+        for hook in &self.hooks {
+            hook.after_tool_result(result).await;
+        }
+    }
+}
+
+impl std::fmt::Debug for AgentHookBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentHookBus")
+            .field("hooks", &self.hooks.len())
+            .finish()
+    }
+}
+
+/// Adapter that bridges legacy observation-style [`HookHandler`]s
+/// (registered against a [`HookRegistry`]) into the new typed
+/// [`AgentHook`] surface.
+///
+/// Register one of these on the typed [`AgentHookBus`] to keep skill
+/// hook scripts, telemetry sinks, and other existing handlers wired
+/// while the rest of `squeezy-agent` migrates to the typed views.
+///
+/// Mutations proposed by legacy handlers via [`HookResult::mutate`]
+/// remain advisory here — the typed views are not rewritten from the
+/// legacy JSON reply — preserving the documented "mutations are
+/// recorded but not yet applied" contract that squeezy-agent expects
+/// today. Legacy deny replies for `PreToolUse` are honored by
+/// translating them into a [`Decision::Deny`] so the typed dispatch
+/// path inherits the same blocking behavior the observation path
+/// already implements.
+#[derive(Clone)]
+pub struct LegacyHookForwarder {
+    registry: Arc<HookRegistry>,
+}
+
+impl LegacyHookForwarder {
+    #[must_use]
+    pub fn new(registry: Arc<HookRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// Borrow the wrapped registry. Useful for tests and for callers
+    /// that want to introspect the legacy handler set.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<HookRegistry> {
+        &self.registry
+    }
+}
+
+impl AgentHook for LegacyHookForwarder {
+    fn before_provider_request<'a>(&'a self, req: &'a mut LlmRequestView) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            if self.registry.is_empty() {
+                return;
+            }
+            let payload = json!({ "turn_index": req.turn_id });
+            let _ = self.registry.dispatch(HookEvent::PreTurn, payload);
+        })
+    }
+
+    fn before_tool_call<'a>(&'a self, call: &'a mut ToolCallView) -> HookFuture<'a, Decision> {
+        Box::pin(async move {
+            if self.registry.is_empty() {
+                return Decision::Allow;
+            }
+            let payload = json!({
+                "turn_id": call.turn_id,
+                "tool_name": call.tool_name,
+                "call_id": call.call_id,
+            });
+            let results = self.registry.dispatch(HookEvent::PreToolUse, payload);
+            for result in results {
+                if !result.allow {
+                    let message = result
+                        .message
+                        .unwrap_or_else(|| "tool call denied by legacy hook".to_string());
+                    return Decision::Deny { message };
+                }
+            }
+            Decision::Allow
+        })
+    }
+
+    fn after_tool_result<'a>(&'a self, result: &'a mut ToolResultView) -> HookFuture<'a, ()> {
+        Box::pin(async move {
+            if self.registry.is_empty() {
+                return;
+            }
+            let payload = json!({
+                "turn_id": result.turn_id,
+                "tool_name": result.tool_name,
+                "call_id": result.call_id,
+                "status": result.status,
+            });
+            let _ = self.registry.dispatch(HookEvent::PostToolUse, payload);
+        })
     }
 }
 
