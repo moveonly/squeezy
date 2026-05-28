@@ -3021,6 +3021,7 @@ dependencies = [
  "supports-color",
  "tokio",
  "tokio-util",
+ "toml",
  "toml_edit",
  "tracing",
  "tree-sitter",

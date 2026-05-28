@@ -21,6 +21,9 @@ development conventions.
   `scripts/check_test_layout.py`.
 - [Telemetry worker](TELEMETRY_WORKER.md): Cloudflare Worker deployment and
   PostHog forwarding details.
+- [Keybindings](KEYBINDINGS.md): action namespace, layered override surface
+  (`settings.toml` + `~/.squeezy/keybindings.toml`), and the reserved-binding
+  set.
 
 External user-help docs live in [`../external/`](../external/). Do not put
 private deployment notes, implementation-only tradeoffs, benchmark details, or

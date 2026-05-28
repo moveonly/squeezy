@@ -62,6 +62,7 @@ mod events;
 mod history;
 mod input;
 mod keymap;
+mod keymap_config;
 mod mention;
 mod notification;
 mod overlay;
@@ -10357,6 +10358,27 @@ pub(crate) struct PendingDiffResult {
     pub(crate) card: Option<DiffCardData>,
 }
 
+/// Build the runtime [`keymap::KeymapResolver`] by layering the optional
+/// user-editable `~/.squeezy/keybindings.toml` on top of the
+/// `[tui.keymap]` overrides from `settings.toml`. Failures (missing
+/// `$HOME`, unreadable file, malformed TOML, reserved-key violation)
+/// emit a warning and fall back to the base overrides so a broken
+/// keybindings file never prevents the TUI from starting.
+fn build_keymap_resolver(base: &BTreeMap<String, String>) -> keymap::KeymapResolver {
+    let user_path = keymap_config::default_keybindings_path();
+    match keymap_config::merge_user_overrides(base.clone(), user_path.as_deref()) {
+        Ok(merged) => keymap::KeymapResolver::from_overrides(&merged),
+        Err(err) => {
+            tracing::warn!(
+                target: "squeezy_tui::keymap_config",
+                error = %err,
+                "ignoring ~/.squeezy/keybindings.toml; falling back to defaults"
+            );
+            keymap::KeymapResolver::from_overrides(base)
+        }
+    }
+}
+
 impl TuiApp {
     /// Clear the click-target registry at the start of each frame.
     /// Called from `render` / `render_inline` before any widget draws.
@@ -10449,6 +10471,7 @@ impl TuiApp {
         let transcript = Vec::new();
         let status = "ready".to_string();
         let next_entry_id = transcript.len() as u64;
+        let keymap = build_keymap_resolver(&config.tui.keymap);
         Self {
             provider_name,
             version: env!("CARGO_PKG_VERSION"),
@@ -10550,7 +10573,7 @@ impl TuiApp {
             status_line_use_colors: config.tui.status_line_use_colors,
             status_line_setup: None,
             latest_plan_progress: None,
-            keymap: keymap::KeymapResolver::from_overrides(&config.tui.keymap),
+            keymap,
             pending_diff: None,
             pending_diff_started_at: None,
             prompt_queue: VecDeque::new(),
