@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_stream::try_stream;
@@ -31,6 +32,10 @@ pub struct OpenAiProvider {
     api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     api_version: Option<String>,
+    /// Logical model id → Azure-deployment name. Populated only from
+    /// [`AzureOpenAiConfig::deployment_name_map`]; every other constructor
+    /// leaves this empty so the model id passes through verbatim.
+    deployment_name_map: BTreeMap<String, String>,
     transport: ProviderTransportConfig,
 }
 
@@ -42,6 +47,7 @@ impl std::fmt::Debug for OpenAiProvider {
             .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("api_version", &self.api_version)
+            .field("deployment_name_map", &self.deployment_name_map)
             .field("transport", &self.transport)
             .finish()
     }
@@ -68,13 +74,15 @@ impl OpenAiProvider {
         }
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self::with_api_key_source(
+        let mut provider = Self::with_api_key_source(
             "azure_openai",
             static_api_key_source(api_key, "azure_openai"),
             config.base_url.trim_end_matches('/').to_string(),
             Some(config.api_version.clone()),
             config.transport,
-        ))
+        );
+        provider.deployment_name_map = config.deployment_name_map.clone();
+        Ok(provider)
     }
 
     /// Build an OpenAI Responses-API client targeting xAI's `/responses`
@@ -120,8 +128,22 @@ impl OpenAiProvider {
             api_key,
             base_url,
             api_version,
+            deployment_name_map: BTreeMap::new(),
             transport,
         }
+    }
+
+    /// Resolve a caller-supplied model id to the Azure-deployment name the
+    /// provider should send in the request body. Falls back to the input
+    /// model id when no entry is present, preserving the historical
+    /// "deployment id is the model id" behavior for users who never
+    /// configured `[providers.azure_openai.deployment_name_map]`.
+    ///
+    /// The lookup is exact-match; Azure deployment ids are case-sensitive
+    /// and the surrounding registry already canonicalizes model ids to
+    /// their on-disk shape, so we do not lowercase here.
+    pub(crate) fn resolve_deployment_name<'a>(&'a self, model: &'a str) -> &'a str {
+        resolve_deployment_name(&self.deployment_name_map, model)
     }
 
     pub(crate) fn request_body(request: &LlmRequest, provider_name: &str) -> Value {
@@ -255,6 +277,19 @@ fn openai_text_verbosity(verbosity: ResponseVerbosity) -> &'static str {
     }
 }
 
+/// Translate a logical model id into an Azure-deployment id using
+/// `map`. Unmapped ids fall through verbatim so callers without a
+/// configured `deployment_name_map` keep the historical contract where
+/// `[model].name` *is* the deployment id. Split out as a free function
+/// so unit tests can exercise the substitution table without
+/// constructing a real provider/client.
+pub(crate) fn resolve_deployment_name<'a>(
+    map: &'a BTreeMap<String, String>,
+    model: &'a str,
+) -> &'a str {
+    map.get(model).map(String::as_str).unwrap_or(model)
+}
+
 fn openai_text_format(schema: &LlmOutputSchema) -> Value {
     json!({
         "type": "json_schema",
@@ -282,7 +317,19 @@ impl LlmProvider for OpenAiProvider {
             url.push_str("?api-version=");
             url.push_str(api_version);
         }
-        let body = Self::request_body(&request, provider_name);
+        let mut body = Self::request_body(&request, provider_name);
+        // Azure resources expose deployments under user-chosen ids (e.g.
+        // `my-deployment-gpt-4o`). The Responses route reads the body's
+        // `model` field as the deployment selector, so callers who keep
+        // logical OpenAI model ids in `[model]` must have them rewritten
+        // here. The map is empty for the OpenAI / Codex / xAI constructors,
+        // making this a no-op in those paths. Capability lookups above
+        // intentionally ran against the *original* `request.model` so
+        // the reasoning/effort decision still uses our static registry.
+        let deployment = self.resolve_deployment_name(&request.model);
+        if deployment != request.model.as_ref() {
+            body["model"] = json!(deployment);
+        }
         let affinity_headers = Self::affinity_headers(&request);
 
         Box::pin(try_stream! {

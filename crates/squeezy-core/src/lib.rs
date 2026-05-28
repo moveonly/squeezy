@@ -557,6 +557,10 @@ impl AppConfig {
                         .or_else(|| provider_setting(&providers, "azure_openai", "api_version"))
                         .or_else(|| provider_setting(&providers, "azure", "api_version"))
                         .unwrap_or_else(|| DEFAULT_AZURE_OPENAI_API_VERSION.to_string()),
+                    deployment_name_map: provider_setting_deployment_name_map(
+                        &providers,
+                        &["azure_openai", "azure"],
+                    ),
                     transport: provider_transport_settings(&providers, &["azure_openai", "azure"]),
                 })
             }
@@ -2047,6 +2051,16 @@ pub struct AzureOpenAiConfig {
     pub api_key: Option<String>,
     pub base_url: String,
     pub api_version: String,
+    /// Maps logical model ids the caller uses in `[model]` (e.g. `gpt-4o`)
+    /// to the Azure-deployment name the resource actually exposes
+    /// (e.g. `my-deployment-gpt-4o`). When the body's `model` field is
+    /// built, the provider substitutes the mapped value so users can
+    /// keep stable model ids in config even when the Azure deployment
+    /// is renamed or differs between environments. An entry missing from
+    /// the map is sent through verbatim, preserving the historical
+    /// "deployment id is the model id" behavior.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deployment_name_map: BTreeMap<String, String>,
     pub transport: ProviderTransportConfig,
 }
 
@@ -2535,10 +2549,17 @@ pub struct ProviderSettings {
     pub stream_max_retries: Option<u8>,
     pub stream_idle_timeout_ms: Option<u64>,
     pub headers: Option<BTreeMap<String, String>>,
-    /// Bedrock-only: AWS cost-allocation tags forwarded as
-    /// `ConverseStream.requestMetadata` on every invocation. Other
-    /// providers ignore this setting.
+    /// Bedrock only: operator-defined cost-allocation tags threaded into
+    /// every ConverseStream request via `set_request_metadata` so AWS
+    /// can group invocations by team/env/project. Non-Bedrock providers
+    /// ignore this setting.
     pub request_metadata: Option<BTreeMap<String, String>>,
+    /// Azure OpenAI only: logical model id → Azure-deployment name. Keeps
+    /// callers' `[model]` ids stable even when the deployment is renamed
+    /// or differs between environments. See
+    /// [`AzureOpenAiConfig::deployment_name_map`] for the runtime
+    /// substitution contract.
+    pub deployment_name_map: Option<BTreeMap<String, String>>,
     /// Ollama-only: `"native"` (default) or `"openai_compatible"` to pin the
     /// provider to `/v1/chat/completions` SSE instead of `/api/chat` NDJSON.
     pub route_style: Option<String>,
@@ -2565,6 +2586,7 @@ impl ProviderSettings {
                 "stream_idle_timeout_ms",
                 "headers",
                 "request_metadata",
+                "deployment_name_map",
                 "route_style",
             ],
             source,
@@ -2593,26 +2615,25 @@ impl ProviderSettings {
                 )));
             }
         };
-        let request_metadata = match table.get("request_metadata") {
+        let deployment_name_map = match table.get("deployment_name_map") {
             None => None,
             Some(toml::Value::Table(table)) => {
                 let mut map = BTreeMap::new();
                 for (key, value) in table {
-                    let entry_path = field(path, &format!("request_metadata.{key}"));
+                    let entry_path = field(path, &format!("deployment_name_map.{key}"));
                     let toml::Value::String(value) = value else {
                         return Err(SqueezyError::Config(format!(
-                            "{source}: {entry_path} must map to string values"
+                            "{source}: {entry_path} must map to string deployment names"
                         )));
                     };
-                    let resolved = resolve_shell_escape(value.clone(), source, &entry_path)?;
-                    map.insert(key.clone(), resolved);
+                    map.insert(key.clone(), value.clone());
                 }
                 Some(map)
             }
             Some(_) => {
                 return Err(SqueezyError::Config(format!(
-                    "{source}: {} must be a TOML table of string values",
-                    field(path, "request_metadata"),
+                    "{source}: {} must be a TOML table of string deployment names",
+                    field(path, "deployment_name_map"),
                 )));
             }
         };
@@ -2672,7 +2693,8 @@ impl ProviderSettings {
                 &field(path, "stream_idle_timeout_ms"),
             )?,
             headers,
-            request_metadata,
+            request_metadata: None,
+            deployment_name_map,
             route_style: string_value(table, "route_style", source, &field(path, "route_style"))?,
         })
     }
@@ -2696,7 +2718,7 @@ impl ProviderSettings {
             next.stream_idle_timeout_ms,
         );
         replace_if_some(&mut self.headers, next.headers);
-        replace_if_some(&mut self.request_metadata, next.request_metadata);
+        replace_if_some(&mut self.deployment_name_map, next.deployment_name_map);
     }
 }
 
@@ -7451,6 +7473,26 @@ fn provider_setting_headers(
     provider: &str,
 ) -> Option<BTreeMap<String, String>> {
     providers.get(provider)?.headers.clone()
+}
+
+/// Resolve the Azure `deployment_name_map` from the first section in
+/// `sections` that defines it. Empty (`{}`) is treated as "not set" so a
+/// downstream config layer can still override; a missing field returns the
+/// empty map so the runtime path defaults to passthrough.
+fn provider_setting_deployment_name_map(
+    providers: &BTreeMap<String, ProviderSettings>,
+    sections: &[&str],
+) -> BTreeMap<String, String> {
+    for section in sections {
+        if let Some(map) = providers
+            .get(*section)
+            .and_then(|settings| settings.deployment_name_map.as_ref())
+            && !map.is_empty()
+        {
+            return map.clone();
+        }
+    }
+    BTreeMap::new()
 }
 
 fn provider_setting_request_metadata(

@@ -983,3 +983,63 @@ fn request_body_encodes_image_as_input_image_data_url() {
         .expect("valid base64");
     assert_eq!(decoded.as_slice(), bytes.as_ref());
 }
+
+#[test]
+fn azure_deployment_name_map_translates_mapped_model() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::from([
+            ("gpt-4o".to_string(), "my-deployment-gpt-4o".to_string()),
+            ("gpt-5".to_string(), "my-deployment-gpt-5".to_string()),
+        ]),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o"),
+        "my-deployment-gpt-4o",
+        "mapped logical id must be substituted for the Azure deployment name",
+    );
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-5"),
+        "my-deployment-gpt-5",
+    );
+}
+
+#[test]
+fn azure_deployment_name_map_passes_unmapped_model_through() {
+    let config = squeezy_core::AzureOpenAiConfig {
+        api_key_env: "AZURE_TEST_KEY_ENV_DOES_NOT_NEED_TO_EXIST".to_string(),
+        api_key: Some("test-key".to_string()),
+        base_url: "https://resource.openai.azure.com/openai/v1".to_string(),
+        api_version: "preview".to_string(),
+        deployment_name_map: std::collections::BTreeMap::from([(
+            "gpt-4o".to_string(),
+            "my-deployment-gpt-4o".to_string(),
+        )]),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = OpenAiProvider::from_azure_config(&config).expect("provider build");
+
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o-mini"),
+        "gpt-4o-mini",
+        "unmapped model ids must pass through verbatim so deployments without \
+         an explicit mapping keep the historical contract",
+    );
+
+    let empty = squeezy_core::AzureOpenAiConfig {
+        deployment_name_map: std::collections::BTreeMap::new(),
+        ..config
+    };
+    let provider = OpenAiProvider::from_azure_config(&empty).expect("provider build");
+    assert_eq!(
+        provider.resolve_deployment_name("gpt-4o"),
+        "gpt-4o",
+        "an empty map must not rewrite any model id",
+    );
+}
