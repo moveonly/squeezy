@@ -384,7 +384,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
-        Some(Command::Auth { command }) => return handle_auth_command(command),
+        Some(Command::Auth { command }) => return handle_auth_command(command).await,
         Some(Command::Doctor(args)) => {
             let report = doctor::run(args).await?;
             report.print();

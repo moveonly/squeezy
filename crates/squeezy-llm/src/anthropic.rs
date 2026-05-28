@@ -15,12 +15,26 @@ use crate::{
     anthropic_betas::anthropic_header_value,
     cache_policy::{CachePolicy, json_markers, should_apply_caching},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
+
+/// Identity preamble Anthropic requires on OAuth-driven requests so
+/// the call counts against the Claude Pro/Max subscription quota
+/// rather than failing the OAuth quota check. Mirrors pi's verbatim
+/// string. The user's real instructions ride after this in a second
+/// system block.
+const OAUTH_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// `User-Agent` value that marks a Squeezy-issued OAuth request as
+/// Claude-Code-compatible. Anthropic gates the OAuth quota on this
+/// identity envelope (beta header + UA + `x-app`); changing the
+/// values risks the platform rejecting the request.
+const OAUTH_USER_AGENT: &str = "claude-cli/2.1.0";
 
 #[derive(Clone)]
 pub struct AnthropicProvider {
@@ -69,7 +83,12 @@ impl AnthropicProvider {
         }
     }
 
-    pub(crate) fn request_body(request: &LlmRequest) -> Value {
+    /// Build the `/messages` JSON body. Parameterized on the auth
+    /// scheme so the OAuth (Claude Pro/Max) path can prepend the
+    /// Claude Code identity preamble to `system`: Anthropic gates
+    /// the OAuth quota on this envelope; the API-key path doesn't
+    /// need it.
+    pub(crate) fn request_body(request: &LlmRequest, auth: AnthropicAuthScheme) -> Value {
         let policy = CachePolicy::AUTO;
         let prompt_caching = should_apply_caching("anthropic", request);
         let max_tokens = request
@@ -83,7 +102,11 @@ impl AnthropicProvider {
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
         let mut body = json!({
             "model": request.model,
-            "system": anthropic_system(&request.instructions, prompt_caching && policy.system),
+            "system": anthropic_system(
+                &request.instructions,
+                prompt_caching && policy.system,
+                auth,
+            ),
             "messages": anthropic_messages(&request.input, prompt_caching, policy),
             "max_tokens": max_tokens,
             "stream": true,
@@ -120,9 +143,86 @@ impl AnthropicProvider {
     }
 }
 
-fn anthropic_system(instructions: &str, prompt_caching: bool) -> Value {
+/// Identifies whether the next HTTP attempt will authenticate with a
+/// raw API key (`x-api-key`) or an OAuth bearer token. Used to drive
+/// the OAuth identity envelope — Anthropic gates the Claude Pro/Max
+/// quota on a Claude-Code-shaped request, so OAuth-driven requests
+/// have to prepend a fixed system preamble, set
+/// `Authorization: Bearer`, and stamp the Claude Code beta header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnthropicAuthScheme {
+    ApiKey,
+    Oauth,
+}
+
+impl AnthropicAuthScheme {
+    fn for_key(key: &str) -> Self {
+        if is_anthropic_oauth_token(key) {
+            Self::Oauth
+        } else {
+            Self::ApiKey
+        }
+    }
+}
+
+/// Combine the caller's `anthropic-beta` header value with the OAuth
+/// beta opt-in. The OAuth marker has to be present on every Claude
+/// Pro/Max request or Anthropic will route the call to the API-key
+/// quota (or reject it). Returns `None` when neither side has any
+/// value so the caller can skip the header entirely.
+fn merge_oauth_beta_header(caller: Option<&str>, auth: AnthropicAuthScheme) -> Option<String> {
+    match auth {
+        AnthropicAuthScheme::ApiKey => caller.map(str::to_string),
+        AnthropicAuthScheme::Oauth => {
+            let oauth = anthropic_oauth_beta_header();
+            let merged = match caller {
+                Some(value) if !value.trim().is_empty() => {
+                    let mut seen: Vec<&str> = Vec::new();
+                    for token in oauth.split(',').chain(value.split(',')) {
+                        let trimmed = token.trim();
+                        if trimmed.is_empty() || seen.contains(&trimmed) {
+                            continue;
+                        }
+                        seen.push(trimmed);
+                    }
+                    seen.join(",")
+                }
+                _ => oauth.to_string(),
+            };
+            Some(merged)
+        }
+    }
+}
+
+fn anthropic_system(instructions: &str, prompt_caching: bool, auth: AnthropicAuthScheme) -> Value {
+    let identity_first = matches!(auth, AnthropicAuthScheme::Oauth);
     if !prompt_caching {
+        if identity_first {
+            return Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": OAUTH_SYSTEM_IDENTITY,
+                }),
+                json!({
+                    "type": "text",
+                    "text": instructions,
+                }),
+            ]);
+        }
         return json!(instructions);
+    }
+    if identity_first {
+        let mut blocks = vec![json!({
+            "type": "text",
+            "text": OAUTH_SYSTEM_IDENTITY,
+        })];
+        let with_user = json_markers::system_array_with_marker(instructions);
+        if let Value::Array(items) = with_user {
+            blocks.extend(items);
+        } else {
+            blocks.push(with_user);
+        }
+        return Value::Array(blocks);
     }
     json_markers::system_array_with_marker(instructions)
 }
@@ -234,9 +334,9 @@ impl LlmProvider for AnthropicProvider {
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
-        let body = Self::request_body(&request);
-        let beta_header = anthropic_header_value(&request.beta_headers);
+        let caller_beta_header = anthropic_header_value(&request.beta_headers);
         let transport = self.transport;
+        let request_for_attempts = request.clone();
 
         let attempt_cancel = cancel.clone();
         let make_attempt = move || -> LlmStream {
@@ -244,8 +344,8 @@ impl LlmProvider for AnthropicProvider {
                 client.clone(),
                 api_key.clone(),
                 url.clone(),
-                body.clone(),
-                beta_header.clone(),
+                request_for_attempts.clone(),
+                caller_beta_header.clone(),
                 transport,
                 attempt_cancel.clone(),
             )
@@ -264,8 +364,8 @@ fn anthropic_stream_attempt(
     client: reqwest::Client,
     api_key: Arc<dyn ApiKeySource>,
     url: String,
-    body: Value,
-    beta_header: Option<String>,
+    request: LlmRequest,
+    caller_beta_header: Option<String>,
     transport: ProviderTransportConfig,
     cancel: CancellationToken,
 ) -> LlmStream {
@@ -275,10 +375,19 @@ fn anthropic_stream_attempt(
             RetryPolicy::provider_requests(transport),
             &cancel,
             |key| {
+                let auth = AnthropicAuthScheme::for_key(key);
+                let body = AnthropicProvider::request_body(&request, auth);
+                let beta_header = merge_oauth_beta_header(caller_beta_header.as_deref(), auth);
                 let mut builder = client
                     .post(&url)
-                    .header("x-api-key", key)
                     .header("anthropic-version", ANTHROPIC_VERSION);
+                builder = match auth {
+                    AnthropicAuthScheme::Oauth => builder
+                        .header("authorization", format!("Bearer {key}"))
+                        .header("user-agent", OAUTH_USER_AGENT)
+                        .header("x-app", "cli"),
+                    AnthropicAuthScheme::ApiKey => builder.header("x-api-key", key),
+                };
                 if let Some(value) = beta_header.as_deref() {
                     builder = builder.header("anthropic-beta", value);
                 }

@@ -2,11 +2,17 @@ use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
 use squeezy_core::{
     SeparatedSources, SqueezyError, load_separated_settings_sources,
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
+};
+use squeezy_llm::{
+    AnthropicLoginConfig, AnthropicOAuthSource, PersistedTokens, exchange_authorization_code,
+    generate_pkce, parse_authorization_input,
 };
 
 /// Every `[providers.<section>]` name that can carry an inline `api_key`,
@@ -164,6 +170,35 @@ pub enum AuthCommand {
     Remove(AuthRemoveArgs),
     #[command(about = "Report which providers have a key (inline or env) and where it resolves")]
     Status(AuthStatusArgs),
+    #[command(
+        about = "Anthropic Claude Pro/Max OAuth login (subscription quota instead of an API key)"
+    )]
+    Anthropic {
+        #[command(subcommand)]
+        command: AnthropicOauthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AnthropicOauthCommand {
+    #[command(
+        about = "Open the Claude.ai consent screen and persist the OAuth tokens for this user"
+    )]
+    Login(AnthropicLoginArgs),
+    #[command(about = "Remove the persisted Anthropic OAuth tokens")]
+    Logout,
+    #[command(
+        about = "Show whether Anthropic OAuth tokens are persisted and (roughly) when they expire"
+    )]
+    Status,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct AnthropicLoginArgs {
+    /// Skip the best-effort `open`/`xdg-open` browser launch and only
+    /// print the authorize URL. Useful in headless or SSH sessions.
+    #[arg(long, help = "Do not try to launch a browser; just print the URL")]
+    pub no_browser: bool,
 }
 
 #[derive(Debug, Args)]
@@ -214,12 +249,13 @@ pub struct AuthStatusArgs {
     pub json: bool,
 }
 
-pub fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<()> {
+pub async fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<()> {
     match command {
         AuthCommand::Set(args) => handle_auth_set(args, read_api_key_from_stdin),
         AuthCommand::List(args) => handle_auth_list(args),
         AuthCommand::Remove(args) => handle_auth_remove(args),
         AuthCommand::Status(args) => handle_auth_status(args),
+        AuthCommand::Anthropic { command } => handle_anthropic_oauth(command).await,
     }
 }
 
@@ -756,6 +792,216 @@ fn print_table_rows(rows: &[[String; 4]]) {
             w2 = widths[2],
         );
     }
+}
+
+// --- Anthropic OAuth subcommand --------------------------------------------
+
+async fn handle_anthropic_oauth(command: &AnthropicOauthCommand) -> squeezy_core::Result<()> {
+    match command {
+        AnthropicOauthCommand::Login(args) => run_anthropic_oauth_login(args).await,
+        AnthropicOauthCommand::Logout => run_anthropic_oauth_logout(),
+        AnthropicOauthCommand::Status => run_anthropic_oauth_status(),
+    }
+}
+
+async fn run_anthropic_oauth_login(args: &AnthropicLoginArgs) -> squeezy_core::Result<()> {
+    let storage_path = squeezy_llm::oauth_anthropic_default_storage_path()?;
+    let config = AnthropicLoginConfig::default();
+    let codes = generate_pkce()?;
+    let authorize_url = config.authorize_url(&codes);
+
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Squeezy Anthropic OAuth login")?;
+    writeln!(
+        stdout,
+        "  Tokens will be stored at: {}",
+        storage_path.display()
+    )?;
+    writeln!(stdout, "  Authorize URL:")?;
+    writeln!(stdout, "    {authorize_url}")?;
+    if !args.no_browser {
+        if try_open_browser(&authorize_url) {
+            writeln!(stdout, "  Opened the authorize URL in your browser.")?;
+        } else {
+            writeln!(
+                stdout,
+                "  Could not auto-open a browser; copy the URL above by hand."
+            )?;
+        }
+    } else {
+        writeln!(stdout, "  --no-browser: not launching a browser.")?;
+    }
+    writeln!(
+        stdout,
+        "  After approving the consent screen, copy the redirect URL (or the code) here."
+    )?;
+    stdout.flush()?;
+    drop(stdout);
+
+    let raw_input = read_authorization_input()?;
+    let parsed = parse_authorization_input(&raw_input);
+    let code = parsed.code.ok_or_else(|| {
+        SqueezyError::Config(
+            "no `code` parameter found in the pasted input; paste either the full \
+             callback URL (http://localhost:54545/callback?code=...&state=...), \
+             the bare code, or a `code#state` pair"
+                .to_string(),
+        )
+    })?;
+    let state = parsed.state.unwrap_or_else(|| codes.verifier.clone());
+    if state != codes.verifier {
+        return Err(SqueezyError::Config(
+            "OAuth state mismatch: the pasted `state` parameter did not match the value \
+             squeezy generated for this login. Re-run `squeezy auth anthropic login` from \
+             the same terminal session."
+                .to_string(),
+        ));
+    }
+
+    let http = reqwest::Client::new();
+    let response =
+        exchange_authorization_code(&http, &config, &code, &state, &codes.verifier).await?;
+    let now_ms = current_unix_ms();
+    let tokens = PersistedTokens::from_token_response(&response, now_ms);
+    squeezy_llm::oauth_anthropic_write_tokens(&storage_path, &tokens)?;
+    println!(
+        "Saved Anthropic OAuth tokens to {} (mode 0600).",
+        storage_path.display()
+    );
+    Ok(())
+}
+
+fn run_anthropic_oauth_logout() -> squeezy_core::Result<()> {
+    let path = squeezy_llm::oauth_anthropic_default_storage_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("removed {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("no Anthropic OAuth tokens at {}", path.display());
+            Ok(())
+        }
+        Err(err) => Err(SqueezyError::Config(format!(
+            "failed to remove {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
+fn run_anthropic_oauth_status() -> squeezy_core::Result<()> {
+    let path = squeezy_llm::oauth_anthropic_default_storage_path()?;
+    match squeezy_llm::oauth_anthropic_read_tokens(&path)? {
+        None => {
+            println!(
+                "no Anthropic OAuth tokens at {}; run `squeezy auth anthropic login`",
+                path.display()
+            );
+            Ok(())
+        }
+        Some(tokens) => {
+            println!("anthropic oauth: configured");
+            println!("  path: {}", path.display());
+            println!(
+                "  access_token: {}",
+                redact_oauth_token(&tokens.access_token)
+            );
+            println!(
+                "  refresh_token: {}",
+                redact_oauth_token(&tokens.refresh_token)
+            );
+            let now = current_unix_ms();
+            let label = if tokens.expires_at_unix_ms <= now {
+                "expired".to_string()
+            } else {
+                let secs = (tokens.expires_at_unix_ms - now) / 1000;
+                let minutes = secs / 60;
+                format!("expires in {minutes}m ({secs}s)")
+            };
+            println!("  expiry: {label}");
+            if let Some(scope) = tokens.scope.as_deref() {
+                println!("  scope: {scope}");
+            }
+            // Surface the AnthropicOAuthSource label without exposing the
+            // token so a follow-up `doctor` step can shell out to this
+            // command for diagnostics.
+            let _ = AnthropicOAuthSource::from_tokens(tokens, path.clone());
+            Ok(())
+        }
+    }
+}
+
+fn redact_oauth_token(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_string();
+    }
+    let prefix: String = trimmed.chars().take(12).collect();
+    format!("{prefix}…")
+}
+
+fn read_authorization_input() -> squeezy_core::Result<String> {
+    if io::stdin().is_terminal() {
+        eprint!("Paste authorization code or full redirect URL: ");
+        let _ = io::stderr().flush();
+    }
+    let mut reader = BufReader::new(io::stdin());
+    let mut buffer = String::new();
+    reader.read_line(&mut buffer).map_err(|err| {
+        SqueezyError::Config(format!(
+            "failed to read OAuth authorization input from stdin: {err}"
+        ))
+    })?;
+    Ok(buffer)
+}
+
+/// Best-effort browser launch. Returns `false` when no launcher
+/// succeeded — the caller falls back to printing the URL for manual
+/// copy-paste. Honors `SQUEEZY_OAUTH_BROWSER` for headless tests so
+/// they can confirm the URL was emitted without spawning a process.
+fn try_open_browser(url: &str) -> bool {
+    if let Ok(override_cmd) = env::var("SQUEEZY_OAUTH_BROWSER")
+        && override_cmd.trim() == "0"
+    {
+        return false;
+    }
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "macos") {
+        &[("open", &[])]
+    } else if cfg!(target_os = "windows") {
+        // `cmd /c start "" <url>` is the canonical Windows shell launcher;
+        // the empty title string keeps `start` from swallowing the URL as
+        // the window title.
+        &[("cmd", &["/c", "start", ""])]
+    } else {
+        // Most Linux desktops + BSDs ship xdg-open; fall back to a couple
+        // of common alternates so an unusual installation still works.
+        &[
+            ("xdg-open", &[]),
+            ("gio", &["open"]),
+            ("sensible-browser", &[]),
+        ]
+    };
+    for (cmd, extra_args) in candidates {
+        let mut command = Command::new(cmd);
+        for arg in *extra_args {
+            command.arg(arg);
+        }
+        command.arg(url);
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
+        if command.status().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

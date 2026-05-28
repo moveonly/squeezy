@@ -36,7 +36,7 @@ fn request_body_uses_messages_streaming_shape() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["model"], "claude-test");
     assert_eq!(body["system"], "be brief");
@@ -86,7 +86,7 @@ fn request_body_preserves_function_tool_order() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["tools"][0]["name"], "write_file");
     assert_eq!(body["tools"][1]["name"], "grep");
@@ -111,7 +111,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["max_tokens"], 64_000);
 }
@@ -146,7 +146,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"][0]["text"], "read config");
@@ -188,7 +188,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     // System tail carries an ephemeral cache_control marker.
     assert_eq!(body["system"][0]["type"], "text");
@@ -251,7 +251,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
     assert!(
@@ -313,7 +313,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 4);
     assert!(tools[0].get("cache_control").is_none());
@@ -364,7 +364,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
     assert!(tools[0].get("cache_control").is_none());
@@ -398,7 +398,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert!(
         tools[0].get("cache_control").is_none(),
@@ -425,7 +425,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     // Without a cache_key the system field stays a plain string and no
     // cache_control markers appear in messages.
@@ -772,7 +772,7 @@ fn beta_headers_route_into_http_header() {
         parallel_tool_calls: None,
         beta_headers: betas,
     };
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert!(
         body.get("anthropic_beta").is_none(),
         "1P Anthropic transport sends betas via header, never inside the JSON body",
@@ -810,4 +810,116 @@ fn beta_headers_dedup_when_capability_and_request_overlap() {
     ]);
     let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
     assert_eq!(header, "a,b,c");
+}
+
+#[test]
+fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
+    // The OAuth quota check requires every Claude Pro/Max request to
+    // identify itself as Claude Code in the system block. Build a
+    // request body under the OAuth auth scheme and verify the
+    // identity preamble lands ahead of the user's instructions.
+    let request = LlmRequest {
+        model: "claude-opus-4-7".to_string().into(),
+        instructions: "user-supplied instructions".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: Some(64),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::Oauth);
+    let system = body.get("system").expect("system block must be present");
+    let system = system
+        .as_array()
+        .expect("OAuth scheme must serialize `system` as an array");
+    assert!(
+        system
+            .first()
+            .and_then(|item| item.get("text"))
+            .and_then(|text| text.as_str())
+            .is_some_and(|text| text.contains("Claude Code")),
+        "first system block must declare the Claude Code identity, got {system:?}"
+    );
+    assert!(
+        system.iter().any(|item| item
+            .get("text")
+            .and_then(|text| text.as_str())
+            .is_some_and(|text| text == "user-supplied instructions")),
+        "user instructions must still ride alongside the identity preamble: {system:?}"
+    );
+}
+
+#[test]
+fn api_key_auth_scheme_keeps_system_string_unchanged() {
+    // Static-key callers shouldn't see the identity preamble — the
+    // body's `system` stays the same single string the existing tests
+    // already lock in.
+    let request = LlmRequest {
+        model: "claude-opus-4-7".to_string().into(),
+        instructions: "user-supplied instructions".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: Some(64),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"], "user-supplied instructions");
+}
+
+#[test]
+fn merge_oauth_beta_header_unions_caller_and_oauth_marker() {
+    // OAuth-driven requests must always carry the Claude Code beta
+    // marker. A caller-supplied beta value should merge without
+    // duplicating entries.
+    let oauth_marker = crate::oauth::anthropic_oauth_beta_header();
+    let merged =
+        super::merge_oauth_beta_header(Some("context-1m-2025-08-07"), AnthropicAuthScheme::Oauth)
+            .expect("oauth scheme must produce a header value");
+    for piece in oauth_marker.split(',') {
+        assert!(
+            merged.contains(piece),
+            "merged header must keep oauth marker {piece}; got {merged}",
+        );
+    }
+    assert!(
+        merged.contains("context-1m-2025-08-07"),
+        "merged header must keep caller beta; got {merged}",
+    );
+    let pieces: Vec<&str> = merged.split(',').collect();
+    let mut dedup = pieces.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(
+        pieces.len(),
+        dedup.len(),
+        "merged header must not duplicate entries: {merged}"
+    );
+}
+
+#[test]
+fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
+    assert!(
+        super::merge_oauth_beta_header(None, AnthropicAuthScheme::ApiKey).is_none(),
+        "API-key callers with no betas should produce no header"
+    );
+    assert_eq!(
+        super::merge_oauth_beta_header(Some("a,b"), AnthropicAuthScheme::ApiKey),
+        Some("a,b".to_string()),
+        "API-key path passes the caller's value through unchanged"
+    );
 }
