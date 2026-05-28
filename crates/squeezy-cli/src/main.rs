@@ -510,9 +510,23 @@ async fn main() -> squeezy_core::Result<()> {
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
     let provider = provider_from_app_config(&config);
+    // Resolve `--session <prefix>` against the on-disk session store
+    // before any downstream code sees it, so the user can pass a short
+    // unique prefix (`squeezy --session abc12`) the same way `squeezy
+    // sessions resume abc12` works. Ambiguous and unknown prefixes
+    // fail fast with a clear message instead of being forwarded into a
+    // generic "session not found" later.
+    let resolved_session_id: Option<String> = match cli.session.as_deref() {
+        Some(id) => Some(
+            SessionStore::open(&config)
+                .resolve_session_id_prefix(id)
+                .map_err(|err| SqueezyError::Tool(format!("--session: {err}")))?,
+        ),
+        None => None,
+    };
     let resume_flag = if cli.continue_session {
         ResumeFlag::Continue
-    } else if let Some(id) = cli.session.as_deref() {
+    } else if let Some(id) = resolved_session_id.as_deref() {
         ResumeFlag::Explicit(id)
     } else {
         ResumeFlag::None
@@ -1141,8 +1155,17 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             Ok(())
         }
         SessionsCommand::Resume { id } => {
+            // Pi-style prefix resolution: the user can type a short
+            // unique prefix of a session id (e.g. `squeezy sessions
+            // resume abc12`) and the store expands it to the full id
+            // before we hand it to the TUI. Ambiguous and unknown
+            // prefixes surface as actionable errors instead of being
+            // forwarded as-is into a "session not found" downstream.
+            let resolved = store
+                .resolve_session_id_prefix(id)
+                .map_err(|err| SqueezyError::Tool(err.to_string()))?;
             let provider = provider_from_app_config(&config);
-            squeezy_tui::resume(config, provider, id.clone()).await
+            squeezy_tui::resume(config, provider, resolved).await
         }
         SessionsCommand::Fork { id } => {
             // Offline fork: stamp a child with the parent's resume state

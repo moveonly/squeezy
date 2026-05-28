@@ -2330,3 +2330,103 @@ fn detect_branches_ignores_self_or_out_of_range_parent() {
     ];
     assert!(detect_branches(&events).is_empty());
 }
+
+/// Seed a session directory under the store root without going through
+/// `start_session`. The resolver only enumerates directory names, so we
+/// don't need a full event log — this keeps the prefix tests independent
+/// of `next_session_id`'s timestamp/pid format, which would otherwise
+/// make ambiguity hard to construct in a single millisecond.
+fn seed_session_dir(store: &SessionStore, id: &str) {
+    fs::create_dir_all(store.root().join(id)).expect("seed live session dir");
+}
+
+fn seed_archived_session_dir(store: &SessionStore, id: &str) {
+    fs::create_dir_all(store.root().join(super::ARCHIVED_SUBDIR).join(id))
+        .expect("seed archived session dir");
+}
+
+#[test]
+fn resolve_session_id_prefix_exact_match_wins_over_longer_ids() {
+    // An exact match must resolve to itself even when a longer id would
+    // otherwise share the same prefix. Without this guard, typing the
+    // full id of a short session would surface as ambiguous as soon as a
+    // longer id began with the same characters.
+    let (_root, store, _) = open_test_store("resolve-exact-match");
+    seed_session_dir(&store, "abc12345");
+    seed_session_dir(&store, "abc12345-extra-suffix");
+
+    let resolved = store
+        .resolve_session_id_prefix("abc12345")
+        .expect("exact match must resolve");
+    assert_eq!(resolved, "abc12345");
+}
+
+#[test]
+fn resolve_session_id_prefix_unique_prefix_resolves() {
+    // The headline ergonomics target: typing a short prefix of a unique
+    // session id resolves to the full id. Archived sessions count just
+    // like live ones so `squeezy sessions resume abc12` keeps working
+    // after the session has aged into `archived/`.
+    let (_root, store, _) = open_test_store("resolve-unique-prefix");
+    seed_session_dir(&store, "alpha-001-live");
+    seed_archived_session_dir(&store, "beta-002-archived");
+
+    assert_eq!(
+        store
+            .resolve_session_id_prefix("alph")
+            .expect("unique live prefix"),
+        "alpha-001-live",
+    );
+    assert_eq!(
+        store
+            .resolve_session_id_prefix("beta")
+            .expect("unique archived prefix"),
+        "beta-002-archived",
+    );
+}
+
+#[test]
+fn resolve_session_id_prefix_ambiguous_lists_all_candidates() {
+    // When the prefix is ambiguous the error must carry every matching
+    // candidate, sorted ascending so a downstream CLI can render a
+    // stable hint. Mixing live and archived ids in the candidate list
+    // exercises the cross-tree enumeration too.
+    let (_root, store, _) = open_test_store("resolve-ambiguous");
+    seed_session_dir(&store, "shared-001-live");
+    seed_archived_session_dir(&store, "shared-002-archived");
+    seed_session_dir(&store, "other-id");
+
+    match store.resolve_session_id_prefix("shared") {
+        Err(ResolveError::AmbiguousPrefix { prefix, matches }) => {
+            assert_eq!(prefix, "shared");
+            assert_eq!(
+                matches,
+                vec![
+                    "shared-001-live".to_string(),
+                    "shared-002-archived".to_string(),
+                ],
+            );
+        }
+        other => panic!("expected AmbiguousPrefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_session_id_prefix_not_found_when_no_candidate_matches() {
+    // A prefix with no live or archived match must produce NotFound,
+    // and an empty prefix must do the same so accidental `--session ""`
+    // invocations don't silently grab the first directory the OS
+    // enumerates.
+    let (_root, store, _) = open_test_store("resolve-not-found");
+    seed_session_dir(&store, "live-001");
+    seed_archived_session_dir(&store, "archived-001");
+
+    match store.resolve_session_id_prefix("zzz") {
+        Err(ResolveError::NotFound { prefix }) => assert_eq!(prefix, "zzz"),
+        other => panic!("expected NotFound for unmatched prefix, got {other:?}"),
+    }
+    match store.resolve_session_id_prefix("") {
+        Err(ResolveError::NotFound { prefix }) => assert!(prefix.is_empty()),
+        other => panic!("expected NotFound for empty prefix, got {other:?}"),
+    }
+}

@@ -728,6 +728,91 @@ impl SessionStore {
         Ok(CleanupReport { archived, removed })
     }
 
+    /// Resolve a free-form session id *prefix* to the full session id of
+    /// the matching session. An exact match always wins — so a full id
+    /// is returned verbatim even if it would also be a prefix of a
+    /// longer id — and ties on the prefix produce
+    /// [`ResolveError::AmbiguousPrefix`] with every candidate listed so
+    /// the CLI can render an actionable disambiguation hint.
+    ///
+    /// Both the live root and the `archived/` subtree are searched so
+    /// `squeezy sessions resume abc12` works the same way for a recent
+    /// session and for one that has since been soft-archived. The empty
+    /// prefix is rejected as [`ResolveError::NotFound`] rather than
+    /// silently picking an arbitrary session — accidentally typing
+    /// `squeezy sessions resume ""` should fail loudly.
+    ///
+    /// Filesystem failures (permission errors, unreadable directories)
+    /// are surfaced as [`ResolveError::Io`]; missing roots are not an
+    /// error because a fresh install simply has no sessions yet.
+    pub fn resolve_session_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> std::result::Result<String, ResolveError> {
+        if prefix.is_empty() {
+            return Err(ResolveError::NotFound {
+                prefix: prefix.to_string(),
+            });
+        }
+        let ids = self.collect_session_ids()?;
+        if let Some(exact) = ids.iter().find(|id| id.as_str() == prefix) {
+            return Ok(exact.clone());
+        }
+        let mut matches: Vec<String> = ids
+            .into_iter()
+            .filter(|id| id.starts_with(prefix))
+            .collect();
+        matches.sort();
+        match matches.len() {
+            0 => Err(ResolveError::NotFound {
+                prefix: prefix.to_string(),
+            }),
+            1 => Ok(matches.into_iter().next().expect("len == 1")),
+            _ => Err(ResolveError::AmbiguousPrefix {
+                prefix: prefix.to_string(),
+                matches,
+            }),
+        }
+    }
+
+    /// Enumerate every session id known to this store across the live
+    /// root and the `archived/` subtree. Missing roots silently return
+    /// an empty list — a brand-new install has no sessions yet and that
+    /// should not be a hard error. The list mirrors what
+    /// [`resolve_session_id_prefix`] needs and stays intentionally tiny
+    /// (no metadata reads): the resolver only cares about directory
+    /// names.
+    fn collect_session_ids(&self) -> std::result::Result<Vec<String>, ResolveError> {
+        let mut ids = Vec::new();
+        if self.root.exists() {
+            for entry in fs::read_dir(&self.root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if entry.file_name() == ARCHIVED_SUBDIR {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        let archived_root = self.root.join(ARCHIVED_SUBDIR);
+        if archived_root.exists() {
+            for entry in fs::read_dir(&archived_root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                if let Some(name) = entry.file_name().to_str() {
+                    ids.push(name.to_string());
+                }
+            }
+        }
+        Ok(ids)
+    }
+
     /// Soft-delete that prefers archiving over permanent removal.
     /// Live sessions are moved into `archived/<id>/` (same path as
     /// [`archive_session`]); archived sessions are left in place because
@@ -2005,6 +2090,58 @@ pub struct CleanupReport {
     /// outlived `retention_archive_days`, and when [`CleanupMode::Purge`]
     /// is requested for explicit `ids`.
     pub removed: Vec<String>,
+}
+
+/// Errors produced by [`SessionStore::resolve_session_id_prefix`].
+///
+/// The CLI / TUI surface bubbles these up directly so the user can see
+/// whether the typed prefix matched nothing, matched several sessions
+/// (with the conflicting ids listed for follow-up), or hit a filesystem
+/// failure while enumerating session ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveError {
+    /// No session id starts with the supplied prefix. Also returned for
+    /// an empty prefix so accidental `--session ""` invocations fail
+    /// loudly instead of silently picking an arbitrary session.
+    NotFound { prefix: String },
+    /// More than one session id starts with the supplied prefix. The
+    /// `matches` vector carries every candidate, sorted ascending so
+    /// the disambiguation hint the CLI renders is stable across runs.
+    AmbiguousPrefix {
+        prefix: String,
+        matches: Vec<String>,
+    },
+    /// Underlying filesystem failure while enumerating session ids
+    /// (e.g. unreadable directory). Stored as a string so the error
+    /// type stays `Clone + Eq`, which makes it cheap to use in
+    /// pattern-matched tests.
+    Io(String),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound { prefix } => {
+                write!(f, "no session matches the id prefix {prefix:?}")
+            }
+            Self::AmbiguousPrefix { prefix, matches } => {
+                write!(
+                    f,
+                    "session id prefix {prefix:?} is ambiguous; candidates: {}",
+                    matches.join(", ")
+                )
+            }
+            Self::Io(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}
+
+impl From<std::io::Error> for ResolveError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
 }
 
 /// Soft-archive vs hard-delete policy for [`SessionStore::cleanup_with`].
