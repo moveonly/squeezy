@@ -304,6 +304,8 @@ fn request_body_emits_image_in_native_images_array() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+
+        cache: crate::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

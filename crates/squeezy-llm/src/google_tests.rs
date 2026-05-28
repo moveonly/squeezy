@@ -199,6 +199,8 @@ fn request_body_encodes_image_as_inline_data_part() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+
+        cache: crate::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

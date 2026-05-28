@@ -606,6 +606,8 @@ fn ensure_vision_support_rejects_text_only_model() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+
+        cache: crate::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -643,6 +645,8 @@ fn ensure_vision_support_accepts_vision_capable_model() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+
+        cache: crate::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -667,6 +671,8 @@ fn ensure_vision_support_is_noop_for_text_only_request() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+
+        cache: crate::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
