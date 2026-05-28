@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fmt, fs,
     path::{Path, PathBuf},
+    process,
     time::Duration,
 };
 
@@ -2560,13 +2561,14 @@ impl ProviderSettings {
             Some(toml::Value::Table(table)) => {
                 let mut map = BTreeMap::new();
                 for (key, value) in table {
+                    let header_path = field(path, &format!("headers.{key}"));
                     let toml::Value::String(value) = value else {
                         return Err(SqueezyError::Config(format!(
-                            "{source}: {} must map to string values",
-                            field(path, &format!("headers.{key}")),
+                            "{source}: {header_path} must map to string values"
                         )));
                     };
-                    map.insert(key.clone(), value.clone());
+                    let resolved = resolve_shell_escape(value.clone(), source, &header_path)?;
+                    map.insert(key.clone(), resolved);
                 }
                 Some(map)
             }
@@ -8048,6 +8050,79 @@ fn optional_table<'a>(
     }
 }
 
+// SECURITY: `resolve_shell_escape` executes arbitrary shell commands as the
+// invoking user, at config-load time. Any TOML string whose first byte is `!`
+// (after any quoting the TOML parser already stripped) is passed verbatim to
+// `/bin/sh -c` on Unix and `cmd.exe /C` on Windows. A malicious or hijacked
+// `settings.toml` therefore has the same blast radius as a malicious shell
+// rc-file: it runs before sandboxing, the agent loop, or the permission
+// engine. This is intentional so users can wire in credential helpers like
+// `!op read op://…` and `!gcloud auth …` without writing keys to disk, but it
+// means settings files must be treated as code, not data. See
+// `docs/internal/CONFIG_SHELL_ESCAPES.md` for the full guardrail note.
+fn resolve_shell_escape(value: String, source: &str, path: &str) -> Result<String> {
+    // Only the literal `!`-prefix form triggers execution; strings that merely
+    // contain `!` anywhere else are passed through unchanged, e.g.
+    // `prompt = "hello!"` or `regex = "[a-z]!\\d+"`.
+    if !value.starts_with('!') {
+        return Ok(value);
+    }
+    let command = &value[1..];
+    if command.trim().is_empty() {
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!` is empty; expected `!<command>`"
+        )));
+    }
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = process::Command::new("cmd");
+        c.args(["/C", command]);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = process::Command::new("/bin/sh");
+        c.args(["-c", command]);
+        c
+    };
+
+    let output = cmd.output().map_err(|err| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: failed to spawn shell escape `!{command}`: {err}"
+        ))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let code_part = output
+            .status
+            .code()
+            .map(|c| format!("exit code {c}"))
+            .unwrap_or_else(|| "no exit code (signal)".to_string());
+        let stderr_part = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!{command}` failed with {code_part}{stderr_part}"
+        )));
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|err| {
+        SqueezyError::Config(format!(
+            "{source}: {path}: shell escape `!{command}` produced non-UTF-8 stdout: {err}"
+        ))
+    })?;
+
+    // Trim a single trailing newline (the common shell-echo case) plus any
+    // additional trailing whitespace. Mirrors pi's `.trim()` behavior while
+    // staying lenient about credential helpers that emit `secret\n`.
+    Ok(stdout.trim_end().to_string())
+}
+
 fn string_value(
     table: &toml::value::Table,
     key: &str,
@@ -8056,11 +8131,13 @@ fn string_value(
 ) -> Result<Option<String>> {
     match table.get(key) {
         None => Ok(None),
-        Some(value) => value
-            .as_str()
-            .map(str::to_string)
-            .map(Some)
-            .ok_or_else(|| type_error(source, path, "string")),
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| type_error(source, path, "string"))?;
+            resolve_shell_escape(raw, source, path).map(Some)
+        }
     }
 }
 
@@ -8325,10 +8402,12 @@ fn string_array_value(
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            value
+            let element_path = format!("{path}.{index}");
+            let raw = value
                 .as_str()
                 .map(str::to_string)
-                .ok_or_else(|| type_error(source, &format!("{path}.{index}"), "string"))
+                .ok_or_else(|| type_error(source, &element_path, "string"))?;
+            resolve_shell_escape(raw, source, &element_path)
         })
         .collect::<Result<Vec<_>>>()
         .map(Some)
@@ -8349,10 +8428,13 @@ fn string_map_value(
     values
         .iter()
         .map(|(key, value)| {
-            value
+            let entry_path = field(path, key);
+            let raw = value
                 .as_str()
-                .map(|value| (key.clone(), value.to_string()))
-                .ok_or_else(|| type_error(source, &field(path, key), "string"))
+                .map(str::to_string)
+                .ok_or_else(|| type_error(source, &entry_path, "string"))?;
+            let resolved = resolve_shell_escape(raw, source, &entry_path)?;
+            Ok((key.clone(), resolved))
         })
         .collect::<Result<BTreeMap<_, _>>>()
         .map(Some)

@@ -3208,3 +3208,138 @@ base_url = "http://192.168.1.50:8080/v1"
         .expect_err("LAN http base_url must be rejected");
     assert!(error.to_string().contains("https://"));
 }
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_resolves_string_value_to_stdout() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!echo hello"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("hello"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_trims_only_trailing_whitespace() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!printf '  spaced-secret  \n\n'"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("  spaced-secret"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_failure_aborts_config_load_with_clear_error() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!squeezy_definitely_not_a_real_command_f07 2>/dev/null"
+"#,
+        "test",
+    )
+    .expect_err("non-zero exit must fail config load");
+    let message = err.to_string();
+    assert!(
+        message.contains("providers.openai.api_key"),
+        "error mentions key path: {message}"
+    );
+    assert!(
+        message.contains("shell escape"),
+        "error labels the failure: {message}"
+    );
+    assert!(
+        message.contains("squeezy_definitely_not_a_real_command_f07"),
+        "error includes the failing command: {message}"
+    );
+}
+
+#[test]
+fn shell_escape_does_not_trigger_when_bang_is_not_leading() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "value with ! in it"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    assert_eq!(openai.api_key.as_deref(), Some("value with ! in it"));
+}
+
+#[test]
+fn shell_escape_rejects_empty_command() {
+    let err = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+api_key = "!"
+"#,
+        "test",
+    )
+    .expect_err("empty `!` must fail config load");
+    let message = err.to_string();
+    assert!(
+        message.contains("providers.openai.api_key"),
+        "error mentions key path: {message}"
+    );
+    assert!(
+        message.contains("empty"),
+        "error labels the empty command: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_applies_inside_string_array_values() {
+    // `graph.languages` is a plain `Option<Vec<String>>` read via
+    // `string_array_value`, so it exercises the per-element resolver path.
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[graph]
+languages = ["!echo rust", "python"]
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let graph = settings.graph.expect("graph table");
+    let langs = graph.languages.expect("languages array");
+    assert_eq!(langs, vec!["rust".to_string(), "python".to_string()]);
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_escape_applies_inside_provider_headers_map() {
+    let settings = SettingsFile::from_toml_str(
+        r#"
+[providers.openai]
+[providers.openai.headers]
+"x-static" = "literal"
+"x-dynamic" = "!echo dynamic-value"
+"#,
+        "test",
+    )
+    .expect("settings parse");
+    let providers = settings.providers.expect("providers map");
+    let openai = providers.get("openai").expect("openai provider");
+    let headers = openai.headers.as_ref().expect("headers map");
+    assert_eq!(headers.get("x-static").map(String::as_str), Some("literal"));
+    assert_eq!(
+        headers.get("x-dynamic").map(String::as_str),
+        Some("dynamic-value")
+    );
+}

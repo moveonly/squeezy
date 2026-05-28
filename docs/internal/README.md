@@ -24,6 +24,9 @@ development conventions.
 - [Keybindings](KEYBINDINGS.md): action namespace, layered override surface
   (`settings.toml` + `~/.squeezy/keybindings.toml`), and the reserved-binding
   set.
+- [Config shell escapes](CONFIG_SHELL_ESCAPES.md): why `!cmd` strings in
+  `settings.toml` execute at config-load time and how that affects threat
+  model for the settings file.
 
 External user-help docs live in [`../external/`](../external/). Do not put
 private deployment notes, implementation-only tradeoffs, benchmark details, or
