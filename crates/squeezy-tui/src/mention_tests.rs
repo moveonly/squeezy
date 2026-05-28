@@ -212,3 +212,36 @@ fn workspace_cache_files_includes_walked_paths() {
     assert!(names.iter().any(|n| n == "alpha.rs"), "got: {names:?}");
     assert!(names.iter().any(|n| n == "beta.rs"), "got: {names:?}");
 }
+
+#[test]
+fn detect_mention_unquoted_token_terminates_at_whitespace() {
+    // Sanity check that the unquoted parse is unaffected by the quoted
+    // extension: `@foo` followed by a space yields just `foo`.
+    let q = detect_mention("hello @foo bar", 10).expect("unquoted mention");
+    assert_eq!(q.start, 6);
+    assert_eq!(q.end, 10);
+    assert_eq!(q.query, "foo");
+}
+
+#[test]
+fn detect_mention_quoted_token_keeps_embedded_spaces() {
+    let input = "hello @\"docs/my notes.md\" trailing";
+    // Cursor inside the quoted span (between 'n' of "notes" and ' ' would
+    // have broken the original detector; here it stays inside the token).
+    let cursor = input.find("notes").expect("test fixture") + 1;
+    let q = detect_mention(input, cursor).expect("quoted mention");
+    assert_eq!(q.start, 6);
+    assert_eq!(q.end, 25);
+    assert_eq!(q.query, "docs/my notes.md");
+}
+
+#[test]
+fn detect_mention_mismatched_quote_falls_back_to_unquoted() {
+    // No closing `"`: the parser must behave like the original unquoted
+    // detector, where the leading quote is a literal character in the
+    // token and the token still terminates at the first whitespace.
+    let q = detect_mention("@\"docs has-space", 6).expect("falls back to unquoted");
+    assert_eq!(q.start, 0);
+    assert_eq!(q.end, 6);
+    assert_eq!(q.query, "\"docs");
+}

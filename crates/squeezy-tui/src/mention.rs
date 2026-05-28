@@ -34,40 +34,58 @@ pub(crate) struct MentionQuery {
 
 /// Returns `Some(MentionQuery)` if the cursor sits inside an `@<word>`
 /// token preceded by start-of-input or whitespace. `None` otherwise.
+///
+/// The token is normally read up to the next whitespace, but `@"..."`
+/// and `@'...'` quoted forms keep their inner spaces and strip the
+/// surrounding quotes from the returned `query`. A mismatched quote (no
+/// matching close before EOF) falls back to the unquoted form so the
+/// leading `"`/`'` is treated as a literal character, preserving the
+/// original detector's behaviour for malformed input.
 pub(crate) fn detect_mention(input: &str, cursor: usize) -> Option<MentionQuery> {
     let bytes = input.as_bytes();
     let cursor = cursor.min(input.len());
-    // Walk left from cursor until whitespace or '@'.
-    let mut i = cursor;
-    while i > 0 {
-        let b = bytes[i - 1];
-        if b == b'@' {
-            // Found the marker. Verify the byte before is whitespace or absent.
-            if i >= 2 {
-                let prev = bytes[i - 2];
-                if !prev.is_ascii_whitespace() {
-                    return None;
-                }
-            }
-            // Collect the token from `@` (exclusive) to next whitespace right.
-            let start = i - 1;
-            let mut end = cursor;
-            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            let query = input[i..end].to_string();
-            // Reject if there's an embedded whitespace before cursor (shouldn't happen).
-            if query.contains(char::is_whitespace) {
-                return None;
-            }
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip until we find an `@` preceded by start-of-input or whitespace.
+        if bytes[i] != b'@' || (i > 0 && !bytes[i - 1].is_ascii_whitespace()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let after_at = i + 1;
+        let (end, query) = parse_mention_token(input, bytes, after_at);
+        if cursor > start && cursor <= end {
             return Some(MentionQuery { start, end, query });
         }
-        if b.is_ascii_whitespace() {
-            return None;
-        }
-        i -= 1;
+        i = end + 1;
     }
     None
+}
+
+/// Parse the token immediately after `@`. Returns the end byte index
+/// (one past the last byte of the token) and the query string with any
+/// surrounding `"`/`'` quotes stripped.
+///
+/// `@"..."` and `@'...'` are honoured as quoted spans that may contain
+/// whitespace. If the opening quote has no matching close before EOF the
+/// parse falls back to the unquoted form, so the leading quote ends up
+/// inside the returned query and the token terminates at the next
+/// whitespace — matching what the original detector produced for that
+/// input.
+fn parse_mention_token(input: &str, bytes: &[u8], after_at: usize) -> (usize, String) {
+    if after_at < bytes.len() && (bytes[after_at] == b'"' || bytes[after_at] == b'\'') {
+        let quote = bytes[after_at];
+        let content_start = after_at + 1;
+        if let Some(rel) = bytes[content_start..].iter().position(|&b| b == quote) {
+            let close = content_start + rel;
+            return (close + 1, input[content_start..close].to_string());
+        }
+    }
+    let mut end = after_at;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    (end, input[after_at..end].to_string())
 }
 
 /// Walk the workspace rooted at `root` (respecting .gitignore via the
