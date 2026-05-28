@@ -6594,3 +6594,128 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
         "Let me think about this. The answer depends on what you mean by X.",
     ));
 }
+
+#[tokio::test]
+async fn fork_into_writes_child_under_target_workspace() {
+    // Acceptance for F12-pi-fork-cross-cwd: a fork triggered in repo A
+    // must land its new session artifact under repo B's project dir, with
+    // metadata.cwd / workspace_root rewritten to point at the target so
+    // `squeezy sessions resume` and the missing-cwd guard both pick the
+    // target on open. The running agent stays bound to repo A.
+    let source_root = temp_workspace("fork_into_source");
+    let target_root = temp_workspace("fork_into_target");
+    let config = AppConfig {
+        workspace_root: source_root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ack".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_fork_into".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let mut agent = Agent::new(config.clone(), provider);
+
+    // Drive one turn so the parent session has user/assistant items to
+    // carry across the fork. Without this the resume_state snapshot is
+    // trivially empty and the test would not exercise the conversation
+    // copy path.
+    let mut rx = agent.start_turn("carry me across".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+    let parent_session_id = agent.session_id().expect("parent session id");
+
+    let new_session_id = agent
+        .fork_into(&target_root)
+        .await
+        .expect("fork_into target workspace");
+    assert_ne!(new_session_id, parent_session_id);
+
+    // The new session artifact must live under the *target* workspace's
+    // `.squeezy/sessions/` tree, not the source.
+    let target_session_dir = target_root
+        .join(".squeezy")
+        .join("sessions")
+        .join(&new_session_id);
+    assert!(
+        target_session_dir.join("metadata.json").exists(),
+        "expected metadata.json under target session dir {target_session_dir:?}",
+    );
+    assert!(
+        target_session_dir.join("resume_state.json").exists(),
+        "expected resume_state.json under target session dir {target_session_dir:?}",
+    );
+    let source_session_root = source_root.join(".squeezy").join("sessions");
+    assert!(
+        !source_session_root.join(&new_session_id).exists(),
+        "child session must not be persisted under the source workspace",
+    );
+
+    // Open the new session via a SessionStore rooted at the target so we
+    // exercise the same path `squeezy --workspace <target>` would use.
+    let target_config = AppConfig {
+        workspace_root: target_root.clone(),
+        session_logs: SessionLogConfig {
+            log_dir: Some(PathBuf::from(".squeezy/sessions")),
+            ..SessionLogConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let target_store = SessionStore::open(&target_config);
+    let record = target_store
+        .show(&new_session_id)
+        .expect("show child session from target store");
+    let canonical_target = std::fs::canonicalize(&target_root)
+        .unwrap_or_else(|_| target_root.clone())
+        .display()
+        .to_string();
+    assert_eq!(record.metadata.cwd, canonical_target);
+    assert_eq!(record.metadata.workspace_root, canonical_target);
+    assert_eq!(
+        record.metadata.parent_id.as_deref(),
+        Some(parent_session_id.as_str()),
+        "cross-workspace fork must retain parent_id lineage",
+    );
+
+    // resume_state.json carries the parent's conversation snapshot so a
+    // subsequent `squeezy sessions resume <new_id>` in the target dir
+    // picks up where the fork branched.
+    let resume_state = target_store
+        .show(&new_session_id)
+        .expect("show resume")
+        .resume_state
+        .expect("resume state");
+    assert!(
+        resume_state
+            .conversation
+            .iter()
+            .any(|item| matches!(item, ResumeItem::UserText { text } if text == "carry me across")),
+        "fork must carry the parent's user message into the new session: {:?}",
+        resume_state.conversation,
+    );
+
+    // The running agent stays bound to the source session — fork_into is
+    // deliberately not an in-process cd. The constraint matters because
+    // the live tool/cache state is still scoped to repo A.
+    assert_eq!(
+        agent.session_id().as_deref(),
+        Some(parent_session_id.as_str()),
+        "fork_into must not auto-cd the running process",
+    );
+
+    // The parent session is still listed under the source workspace and
+    // remains resumable. `fork_into` does not finalise it.
+    let source_store = SessionStore::open(&config);
+    let parent_record = source_store
+        .show(&parent_session_id)
+        .expect("show parent session in source");
+    assert_eq!(parent_record.metadata.session_id, parent_session_id);
+    assert!(parent_record.metadata.parent_id.is_none());
+}

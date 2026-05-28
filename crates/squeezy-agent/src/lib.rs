@@ -2017,6 +2017,84 @@ impl Agent {
         Ok(new_session_id)
     }
 
+    /// Branch the active session into a sibling that lives under a
+    /// **different** workspace's project dir. Unlike [`fork_current`], the
+    /// running process keeps writing to its current session — only the new
+    /// child artifact is stamped under `target_workspace_root`'s
+    /// `.squeezy/sessions/` tree, with `metadata.cwd` /
+    /// `metadata.workspace_root` rewritten to point at the target and
+    /// `metadata.parent_id` retaining the cross-workspace lineage. The user
+    /// then opens the new session manually in the target dir, or via
+    /// `squeezy --workspace <target> sessions resume <new_id>`; this method
+    /// deliberately does **not** auto-cd the running process.
+    ///
+    /// Returns the new session id, or an error if no active session log is
+    /// attached (e.g. when session logging was disabled at startup) or the
+    /// target workspace cannot be prepared for writes.
+    pub async fn fork_into(
+        &mut self,
+        target_workspace_root: &Path,
+    ) -> squeezy_core::Result<String> {
+        let Some(parent) = self.session_log.clone() else {
+            return Err(SqueezyError::Agent("no active session to fork".to_string()));
+        };
+        // Make sure the target dir exists before we ask `SessionStore::open`
+        // to resolve `.squeezy/sessions/` against it. Without this a typo
+        // surfaces deep inside `create_dir_all` with a path that mixes the
+        // canonicalisation fallback with the user's relative input, which
+        // is much harder to diagnose than a clean "target not found".
+        fs::create_dir_all(target_workspace_root)?;
+        let target_root = fs::canonicalize(target_workspace_root)
+            .unwrap_or_else(|_| target_workspace_root.to_path_buf());
+        let parent_session_id = parent.session_id().to_string();
+        let state = self.conversation_state.lock().await.clone();
+        let resume_state = state.to_resume_state();
+        // Rewrite workspace_root in a config clone so the target store
+        // resolves `.squeezy/sessions/` (and any relative `cache.root` /
+        // `session_logs.log_dir`) against the target dir. Absolute paths in
+        // the user's config keep their original behaviour, which is the
+        // documented expectation for absolutely-rooted caches.
+        let mut target_config = self.config.clone();
+        target_config.workspace_root = target_root.clone();
+        let store = SessionStore::open(&target_config);
+        let mut metadata = SessionMetadata {
+            cost: state.cost.clone(),
+            metrics: state.metrics.clone(),
+            redactions: state.redactions,
+            token_calibration: state.token_calibration.clone(),
+            parent_id: Some(parent_session_id.clone()),
+            ..SessionMetadata::new(&target_config, self.provider.name())
+        };
+        // `SessionMetadata::new` picks `cwd` from the running process via
+        // `env::current_dir()`, which would still be repo A. Pin it to the
+        // target so `squeezy sessions resume` and the missing-cwd guard
+        // both pick the target on open.
+        metadata.cwd = target_root.display().to_string();
+        let child = store.start_session(metadata)?;
+        let new_session_id = child.session_id().to_string();
+        child.write_resume_state(&resume_state)?;
+        // Record cross-workspace fork lineage so replay / bug-report tooling
+        // and the TUI session list can attribute the child to its parent
+        // even when the two live in different project trees.
+        let _ = child.append_event(SessionEvent::new(
+            "session_forked",
+            None,
+            Some(format!(
+                "forked from {parent_session_id} into {}",
+                target_root.display()
+            )),
+            json!({
+                "parent_session_id": parent_session_id,
+                "target_workspace_root": target_root.display().to_string(),
+            }),
+        ));
+        // Deliberately do not swap `self.session_log` — the in-process agent
+        // is still bound to repo A's filesystem and tools, so we let the user
+        // open the new session manually in the target dir (or via
+        // session-id resume) rather than auto-cd-ing the running process.
+        Ok(new_session_id)
+    }
+
     pub async fn finish_session(&self, status: SessionStatus) {
         let Some(session) = &self.session_log else {
             return;

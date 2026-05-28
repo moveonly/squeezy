@@ -2418,15 +2418,32 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
             return true;
         }
         "/fork" => {
-            match agent.fork_current().await {
-                Ok(new_id) => {
-                    app.status = format!("forked session → {new_id}");
-                    app.push_transcript_item(TranscriptItem::system(format!(
-                        "/fork started session {new_id}; the original session is saved and \
-                         remains resumable via /resume."
-                    )));
+            match parts.next() {
+                None => match agent.fork_current().await {
+                    Ok(new_id) => {
+                        app.status = format!("forked session → {new_id}");
+                        app.push_transcript_item(TranscriptItem::system(format!(
+                            "/fork started session {new_id}; the original session is saved and \
+                             remains resumable via /resume."
+                        )));
+                    }
+                    Err(error) => app.status = format!("fork failed: {error}"),
+                },
+                Some(raw_path) => {
+                    let target = PathBuf::from(raw_path);
+                    match agent.fork_into(&target).await {
+                        Ok(new_id) => {
+                            app.status = format!("forked session → {new_id} ({raw_path})");
+                            app.push_transcript_item(TranscriptItem::system(format!(
+                                "/fork wrote session {new_id} under {raw_path}; this process \
+                                 stays on the current session. Open the new session manually in \
+                                 the target dir or via `squeezy --workspace {raw_path} sessions \
+                                 resume {new_id}`."
+                            )));
+                        }
+                        Err(error) => app.status = format!("fork into {raw_path} failed: {error}"),
+                    }
                 }
-                Err(error) => app.status = format!("fork failed: {error}"),
             }
             return true;
         }

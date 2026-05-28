@@ -31,16 +31,6 @@ const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
     }
 }
 
-const fn slash_locked(name: &'static str, description: &'static str) -> SlashCommand {
-    SlashCommand {
-        name,
-        description,
-        available_during_task: false,
-        parameter_hint: None,
-        capabilities: &[],
-    }
-}
-
 const fn slash_args(
     name: &'static str,
     description: &'static str,
@@ -244,9 +234,11 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read],
     ),
-    slash_locked(
+    slash_args(
         "/fork",
-        "branch the current session into a sibling with the same transcript",
+        "branch the current session into a sibling (optionally under another workspace)",
+        false,
+        "[<workspace_path>]",
     ),
     slash_args_caps(
         "/session-export",
