@@ -1,0 +1,128 @@
+name: Scheduled advisory rescan
+
+on:
+  schedule:
+    # Daily at 06:00 UTC. Picks up RustSec advisories published since the last
+    # PR/release-time `cargo deny check` against the current `Cargo.lock`.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: advisory-rescan
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TRACKING_LABEL: advisory-rescan
+  TRACKING_TITLE: "Scheduled advisory rescan: RustSec findings against Cargo.lock"
+
+jobs:
+  rescan:
+    name: cargo deny check advisories
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cace7d8762492808237e791b718365fe6f57c8b2 # cargo-deny
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo deny check advisories
+        id: deny
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo deny --all-features check advisories 2>&1 | tee advisory-output.txt
+
+      - name: Summarize cargo deny outcome
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Scheduled \`cargo deny check advisories\`"
+            echo
+            if [[ "${{ steps.deny.outcome }}" == "success" ]]; then
+              echo "No new advisories surfaced against the current \`Cargo.lock\`."
+            else
+              echo "Advisories surfaced. See the tracking issue and the full log."
+            fi
+            echo
+            echo '```text'
+            tail -n 200 advisory-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update tracking issue
+        if: steps.deny.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          lock_sha=$(sha256sum Cargo.lock | awk '{print $1}')
+          today=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          body_file=$(mktemp)
+          {
+            echo "Scheduled \`cargo deny check advisories\` surfaced advisories against the current \`Cargo.lock\`."
+            echo
+            echo "- Run: $run_url"
+            echo "- Timestamp: \`$today\`"
+            echo "- Commit: \`$GITHUB_SHA\`"
+            echo "- \`Cargo.lock\` sha256: \`$lock_sha\`"
+            echo
+            echo "<details><summary>cargo deny output (tail)</summary>"
+            echo
+            echo '```text'
+            tail -n 200 advisory-output.txt
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "Resolve by upgrading the affected dependency, or by adding an explicit, justified entry to \`[advisories.ignore]\` in \`deny.toml\`. Close this issue once a clean scheduled rescan passes."
+          } > "$body_file"
+
+          gh label create "$TRACKING_LABEL" \
+            --color B60205 \
+            --description "Scheduled cargo-deny advisory rescan finding" \
+            --force >/dev/null
+
+          existing=$(gh issue list \
+            --state open \
+            --label "$TRACKING_LABEL" \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [[ -n "$existing" ]]; then
+            echo "Commenting on existing tracking issue #$existing"
+            gh issue comment "$existing" --body-file "$body_file"
+          else
+            echo "Opening new tracking issue"
+            gh issue create \
+              --title "$TRACKING_TITLE" \
+              --body-file "$body_file" \
+              --label "$TRACKING_LABEL"
+          fi
+
+      - name: Fail job if advisories surfaced
+        if: steps.deny.outcome == 'failure'
+        run: |
+          echo "cargo deny check advisories reported advisories; see the tracking issue." >&2
+          exit 1
