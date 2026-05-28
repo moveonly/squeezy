@@ -558,3 +558,137 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
     assert!(estimate.remaining_input_tokens.is_some());
     assert!(estimate.used_input_percent_x100.is_some());
 }
+
+#[test]
+fn infer_image_mime_detects_canonical_magic_numbers() {
+    let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+    assert_eq!(infer_image_mime(png), Some("image/png"));
+
+    let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    assert_eq!(infer_image_mime(jpeg), Some("image/jpeg"));
+
+    let gif87a: &[u8] = b"GIF87a\x00\x00";
+    assert_eq!(infer_image_mime(gif87a), Some("image/gif"));
+
+    let gif89a: &[u8] = b"GIF89a\x00\x00";
+    assert_eq!(infer_image_mime(gif89a), Some("image/gif"));
+
+    let mut webp = Vec::with_capacity(20);
+    webp.extend_from_slice(b"RIFF");
+    webp.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+    webp.extend_from_slice(b"WEBPVP8 ");
+    assert_eq!(infer_image_mime(&webp), Some("image/webp"));
+
+    // Non-image bytes don't match.
+    assert_eq!(infer_image_mime(b"plain text content"), None);
+    assert_eq!(infer_image_mime(&[]), None);
+}
+
+#[test]
+fn ensure_vision_support_rejects_text_only_model() {
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "deepseek-chat".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("describe this".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: png_bytes,
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let err = request
+        .ensure_vision_support("deepseek")
+        .expect_err("text-only model must refuse image inputs");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support image inputs"),
+        "error must explain the rejection: got {message}"
+    );
+    assert!(
+        message.contains("deepseek-chat"),
+        "error must mention the rejected model id: got {message}"
+    );
+}
+
+#[test]
+fn ensure_vision_support_accepts_vision_capable_model() {
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: png_bytes,
+        }]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    request
+        .ensure_vision_support("anthropic")
+        .expect("vision-capable model must accept image inputs");
+}
+
+#[test]
+fn ensure_vision_support_is_noop_for_text_only_request() {
+    let request = LlmRequest {
+        model: "deepseek-chat".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    request
+        .ensure_vision_support("deepseek")
+        .expect("text-only request must skip the vision check");
+}
+
+#[test]
+fn llm_input_item_image_round_trips_through_serde() {
+    let original = LlmInputItem::Image {
+        media_type: "image/png".to_string(),
+        bytes: Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+    };
+    let json = serde_json::to_string(&original).expect("serialize image item");
+    // The wire form stores bytes as a base64 string, not a byte array,
+    // so a JSON checkpoint stays compact and human-debuggable.
+    assert!(
+        json.contains("\"AQIDBAUGBwg=\""),
+        "image bytes must serialize as base64: {json}"
+    );
+    let decoded: LlmInputItem = serde_json::from_str(&json).expect("deserialize image item");
+    assert_eq!(original, decoded);
+}

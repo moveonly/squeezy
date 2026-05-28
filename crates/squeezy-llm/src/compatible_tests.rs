@@ -866,3 +866,43 @@ fn preset_full_tier_matches_documented_set() {
         ]
     );
 }
+
+#[test]
+fn request_body_encodes_image_as_image_url_data_url() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let mut request = sample_request();
+    // Wipe the prior input shape so we can focus on the image encoding;
+    // text-only items already have full coverage above.
+    request.input = Arc::from(vec![
+        LlmInputItem::UserText("what is this?".to_string()),
+        LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: bytes.clone(),
+        },
+    ]);
+
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let messages = body["messages"].as_array().expect("messages array");
+    // system + user text + user image
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "what is this?");
+    assert_eq!(messages[2]["role"], "user");
+    let image_part = &messages[2]["content"][0];
+    assert_eq!(image_part["type"], "image_url");
+    let url = image_part["image_url"]["url"]
+        .as_str()
+        .expect("data URL string");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "Chat Completions image must use a data URL: `{url}`"
+    );
+    use base64::Engine as _;
+    let encoded = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("data URL prefix");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}

@@ -177,3 +177,46 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(cost.output_tokens, Some(3));
     assert_eq!(cost.cached_input_tokens, Some(2));
 }
+
+#[test]
+fn request_body_encodes_image_as_inline_data_part() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = GoogleProvider::request_body(&request);
+    let contents = body["contents"].as_array().expect("contents array");
+    assert_eq!(contents.len(), 2);
+    // Text turn.
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[0]["parts"][0]["text"], "what is this?");
+    // Image turn.
+    assert_eq!(contents[1]["role"], "user");
+    let inline = &contents[1]["parts"][0]["inlineData"];
+    assert_eq!(inline["mimeType"], "image/png");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(inline["data"].as_str().expect("base64 string"))
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}

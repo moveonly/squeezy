@@ -928,3 +928,53 @@ fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
         "API-key path passes the caller's value through unchanged"
     );
 }
+
+#[test]
+fn request_body_encodes_image_as_base64_content_block() {
+    // Synthetic 8-byte PNG-magic prefix; the bytes here don't have to be
+    // a real image because we're only inspecting the wire shape.
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "claude-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    // The user text and image must coalesce into one user message with
+    // two content blocks (text then image) so Anthropic sees them as a
+    // single multimodal turn.
+    let content = body["messages"][0]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    let encoded = content[1]["source"]["data"]
+        .as_str()
+        .expect("base64 string");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}

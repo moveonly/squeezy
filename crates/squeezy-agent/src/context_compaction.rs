@@ -569,6 +569,11 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
         } => call_id.len() + name.len() + arguments.to_string().len(),
         LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
         LlmInputItem::Reasoning(payload) => payload.display_text().len(),
+        // Image bytes don't consume model context tokens directly (the
+        // provider's vision encoder charges its own per-image token
+        // budget). Bill the raw byte count here so compaction's "context
+        // pressure" signal still reflects payload size on the wire.
+        LlmInputItem::Image { bytes, .. } => bytes.len(),
     }
 }
 
@@ -1182,6 +1187,10 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
             // assistant text that follows captures the conclusion; the raw
             // chain-of-thought is intentionally excluded from the summary.
             LlmInputItem::Reasoning(_) => None,
+            // Image attachments don't carry summarisable text; mention the
+            // MIME type so the summary preserves a hint that an image was
+            // shown but skip the raw bytes.
+            LlmInputItem::Image { media_type, .. } => Some(format!("- user image: {media_type}")),
         })
         .take(COMPACTION_DURABLE_LINES_LIMIT)
         .collect()

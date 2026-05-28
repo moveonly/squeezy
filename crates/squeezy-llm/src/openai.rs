@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -240,6 +242,9 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support(self.name) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let provider_name = self.name;
@@ -509,6 +514,17 @@ fn openai_input_item(item: &LlmInputItem) -> Option<Value> {
             "type": "function_call_output",
             "call_id": call_id,
             "output": output,
+        }),
+        LlmInputItem::Image { media_type, bytes } => json!({
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": format!(
+                    "data:{media_type};base64,{}",
+                    BASE64_STANDARD.encode(bytes.as_ref())
+                ),
+            }],
         }),
         LlmInputItem::Reasoning(ReasoningPayload::OpenAi {
             item_id,

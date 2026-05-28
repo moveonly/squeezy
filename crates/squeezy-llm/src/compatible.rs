@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -403,6 +405,9 @@ impl LlmProvider for OpenAiCompatibleProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support(self.preset.as_str()) {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
@@ -605,6 +610,18 @@ fn chat_message(item: &LlmInputItem, cache_control: Option<&Value>) -> Option<Va
             "role": "tool",
             "tool_call_id": call_id,
             "content": output,
+        }),
+        LlmInputItem::Image { media_type, bytes } => json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{media_type};base64,{}",
+                        BASE64_STANDARD.encode(bytes.as_ref())
+                    ),
+                },
+            }],
         }),
         // Chat Completions has no signed reasoning replay format. Reasoning
         // items are rendered in the UI but skipped when replaying.

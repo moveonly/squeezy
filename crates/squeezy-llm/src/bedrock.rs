@@ -10,9 +10,10 @@ use aws_sdk_bedrockruntime::{
     primitives::event_stream::EventReceiver,
     types::{
         CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
-        ConversationRole, Message, ReasoningContentBlock, ReasoningContentBlockDelta,
-        ReasoningTextBlock, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-        ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+        ConversationRole, ImageBlock, ImageFormat, ImageSource, Message, ReasoningContentBlock,
+        ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock, Tool,
+        ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+        ToolSpecification, ToolUseBlock,
     },
 };
 use aws_smithy_types::{Blob, Document, Number};
@@ -77,6 +78,9 @@ impl LlmProvider for BedrockProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("bedrock") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let provider = self.clone();
         let transport = provider.transport;
         Box::pin(try_stream! {
@@ -468,6 +472,14 @@ pub(crate) fn conversation_messages(
                     ContentBlock::ToolResult(tool_result),
                 )?;
             }
+            LlmInputItem::Image { media_type, bytes } => {
+                let image = bedrock_image_block(media_type, bytes)?;
+                push_message(
+                    &mut messages,
+                    ConversationRole::User,
+                    ContentBlock::Image(image),
+                )?;
+            }
             LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
                 for block in blocks {
                     let reasoning = match block.kind {
@@ -593,6 +605,33 @@ pub(crate) fn tool_configuration(
             SqueezyError::ProviderRequest(format!("failed to build Bedrock toolConfig: {err}"))
         })?;
     Ok(Some(config))
+}
+
+/// Build a Bedrock `ImageBlock` from an `LlmInputItem::Image` payload.
+/// Maps the canonical `image/{png,jpeg,gif,webp}` MIME strings to the
+/// SDK's `ImageFormat` enum and wraps the raw bytes in a `Blob` so the
+/// Converse API receives the binary payload directly (no base64 wrap —
+/// the SDK does that on the wire). Returns a structured error for
+/// unknown MIME types instead of silently dropping the image.
+pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result<ImageBlock> {
+    let format = match media_type.to_ascii_lowercase().as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::Webp,
+        other => {
+            return Err(SqueezyError::ProviderRequest(format!(
+                "Bedrock does not support image MIME `{other}`; expected one of image/png, image/jpeg, image/gif, image/webp",
+            )));
+        }
+    };
+    ImageBlock::builder()
+        .format(format)
+        .source(ImageSource::Bytes(Blob::new(bytes.as_ref().to_vec())))
+        .build()
+        .map_err(|err| {
+            SqueezyError::ProviderRequest(format!("failed to build Bedrock image block: {err}"))
+        })
 }
 
 pub(crate) fn json_to_document(value: &Value) -> Document {

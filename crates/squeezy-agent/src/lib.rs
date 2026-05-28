@@ -490,9 +490,11 @@ pub struct ConversationShape {
     pub function_calls: usize,
     pub function_outputs: usize,
     pub reasoning_items: usize,
+    pub image_items: usize,
     pub text_bytes: usize,
     pub tool_output_bytes: usize,
     pub reasoning_bytes: usize,
+    pub image_bytes: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -10086,6 +10088,10 @@ fn conversation_shape(conversation: &[LlmInputItem]) -> ConversationShape {
                 shape.reasoning_items += 1;
                 shape.reasoning_bytes += payload.display_text().len();
             }
+            LlmInputItem::Image { bytes, .. } => {
+                shape.image_items += 1;
+                shape.image_bytes += bytes.len();
+            }
         }
     }
     shape
@@ -10353,6 +10359,11 @@ fn redact_input_item(item: LlmInputItem, redactor: &Redactor) -> LlmInputItem {
         LlmInputItem::Reasoning(payload) => {
             LlmInputItem::Reasoning(redact_reasoning_payload(payload, redactor))
         }
+        // Image payloads are raw binary content (PNG/JPEG/...); secret
+        // detection runs on text, not pixels. Pass the bytes through
+        // unchanged so the provider's vision pipeline still receives the
+        // original image.
+        LlmInputItem::Image { media_type, bytes } => LlmInputItem::Image { media_type, bytes },
     }
 }
 
@@ -10825,6 +10836,8 @@ fn tool_output_summary(item: &LlmInputItem) -> Option<String> {
 }
 
 pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     match item {
         LlmInputItem::UserText(text) => ResumeItem::UserText { text },
         LlmInputItem::AssistantText(text) => ResumeItem::AssistantText { text },
@@ -10841,6 +10854,10 @@ pub(crate) fn llm_input_to_resume_item(item: LlmInputItem) -> ResumeItem {
             ResumeItem::FunctionCallOutput { call_id, output }
         }
         LlmInputItem::Reasoning(payload) => ResumeItem::Reasoning { payload },
+        LlmInputItem::Image { media_type, bytes } => ResumeItem::Image {
+            media_type,
+            data_base64: BASE64_STANDARD.encode(bytes.as_ref()),
+        },
     }
 }
 
@@ -10850,6 +10867,8 @@ fn resume_item_for_json(item: LlmInputItem) -> Value {
 }
 
 fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     match item {
         ResumeItem::UserText { text } => LlmInputItem::UserText(text),
         ResumeItem::AssistantText { text } => LlmInputItem::AssistantText(text),
@@ -10866,6 +10885,18 @@ fn resume_item_to_llm_input(item: ResumeItem) -> LlmInputItem {
             LlmInputItem::FunctionCallOutput { call_id, output }
         }
         ResumeItem::Reasoning { payload } => LlmInputItem::Reasoning(payload),
+        ResumeItem::Image {
+            media_type,
+            data_base64,
+        } => {
+            let bytes = BASE64_STANDARD
+                .decode(data_base64.as_bytes())
+                .unwrap_or_default();
+            LlmInputItem::Image {
+                media_type,
+                bytes: std::sync::Arc::from(bytes.into_boxed_slice()),
+            }
+        }
     }
 }
 

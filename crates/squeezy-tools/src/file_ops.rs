@@ -3,6 +3,8 @@ use std::{
     path::Path,
 };
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
@@ -21,6 +23,28 @@ use crate::{
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
 pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
+
+/// Detect the canonical image MIME type from a byte prefix using magic
+/// numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP (RIFF / WEBP
+/// container) — the set of formats the upstream vision providers
+/// (Anthropic, OpenAI, Google, Bedrock) all accept. Returns `None` when
+/// the prefix does not match a known image format so the caller can
+/// fall back to the default text path.
+pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -483,6 +507,51 @@ impl ToolRegistry {
         let ignored_reason = self
             .policy_exclusion_for_file(&path, &rel, prefix_bytes.as_deref())
             .map(ExclusionReason::as_str);
+
+        // F18: detect image MIME via magic bytes on the prefix we already
+        // read for policy checks. PNG, JPEG, GIF, and WEBP all surface in
+        // the first 12 bytes, so the policy-prefix read covers detection
+        // without an extra syscall. When the file is an image, return a
+        // structured payload (path / mime / base64 data / sha256) so the
+        // agent can wrap the bytes in `LlmInputItem::Image` instead of
+        // re-serialising binary content as lossy UTF-8 text.
+        if let Some(mime) = prefix_bytes.as_deref().and_then(detect_image_mime) {
+            let bytes = match read_range(&path, 0, total_bytes as usize) {
+                Ok(bytes) => bytes,
+                Err(err) => return tool_error(call, err),
+            };
+            let content_sha256 = match sha256_file(&path) {
+                Ok(hash) => hash,
+                Err(err) => return tool_error(call, err),
+            };
+            let data_base64 = BASE64_STANDARD.encode(&bytes);
+            let encoded_len = data_base64.len() as u64;
+            let mut payload = serde_json::Map::new();
+            payload.insert("path".to_string(), json!(&rel_str));
+            payload.insert("image".to_string(), json!(true));
+            payload.insert("mime_type".to_string(), json!(mime));
+            payload.insert("total_bytes".to_string(), json!(total_bytes));
+            payload.insert("sha256".to_string(), json!(&content_sha256));
+            payload.insert("data_base64".to_string(), Value::String(data_base64));
+            if let Some(reason) = ignored_reason {
+                payload.insert("ignored".to_string(), json!(true));
+                payload.insert("ignored_reason".to_string(), json!(reason));
+            }
+            let cost = ToolCostHint {
+                bytes_read: total_bytes,
+                output_bytes: encoded_len,
+                truncated: false,
+                ..ToolCostHint::default()
+            };
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                cost,
+                Some(content_sha256),
+            );
+        }
+
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
 

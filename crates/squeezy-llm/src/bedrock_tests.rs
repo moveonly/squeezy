@@ -322,3 +322,60 @@ fn message_stop_without_metadata_leaves_usage_unset() {
         "cost reports None when Metadata never arrived, signalling missing usage rather than zero"
     );
 }
+
+#[test]
+fn conversation_messages_emit_image_content_block() {
+    use aws_sdk_bedrockruntime::types::ImageFormat;
+
+    let bytes: Arc<[u8]> = Arc::from(vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3,
+    ]);
+    let messages = conversation_messages(
+        &[
+            LlmInputItem::UserText("describe this".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ],
+        false,
+    )
+    .expect("build messages");
+
+    // User text + image coalesce into a single user message with two
+    // content blocks so the Converse API sees them as one multimodal
+    // turn.
+    assert_eq!(messages.len(), 1);
+    assert_eq!(*messages[0].role(), ConversationRole::User);
+    let content = messages[0].content();
+    assert_eq!(content.len(), 2);
+    assert!(matches!(&content[0], ContentBlock::Text(text) if text == "describe this"));
+    let ContentBlock::Image(image) = &content[1] else {
+        panic!(
+            "expected ContentBlock::Image for image input, got {:?}",
+            content[1]
+        );
+    };
+    assert_eq!(image.format(), &ImageFormat::Png);
+    let source = image.source().expect("image source");
+    let blob = source.as_bytes().expect("Bytes source");
+    assert_eq!(blob.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn conversation_messages_reject_unknown_image_mime() {
+    let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
+    let err = conversation_messages(
+        &[LlmInputItem::Image {
+            media_type: "image/avif".to_string(),
+            bytes,
+        }],
+        false,
+    )
+    .expect_err("unsupported MIME must surface an explicit ProviderRequest error");
+    let message = err.to_string();
+    assert!(
+        message.contains("image/avif"),
+        "error must mention the unsupported MIME: {message}"
+    );
+}

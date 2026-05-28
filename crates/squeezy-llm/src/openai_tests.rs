@@ -664,3 +664,56 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
         );
     }
 }
+
+#[test]
+fn request_body_encodes_image_as_input_image_data_url() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    let input = body["input"].as_array().expect("input array (text+image)");
+    assert_eq!(input.len(), 2);
+    // First entry: plain user-text message.
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"], "what is this?");
+    // Second entry: user message with one `input_image` content part
+    // carrying a data URL.
+    assert_eq!(input[1]["role"], "user");
+    let image_block = &input[1]["content"][0];
+    assert_eq!(image_block["type"], "input_image");
+    assert_eq!(image_block["detail"], "auto");
+    let url = image_block["image_url"].as_str().expect("image_url string");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "Responses image must use a data URL, got `{url}`"
+    );
+    use base64::Engine as _;
+    let encoded = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("data URL prefix");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}

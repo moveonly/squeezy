@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -107,6 +109,9 @@ impl LlmProvider for GoogleProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("google") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         // Keep the API key off the URL: `reqwest::Error::Display` appends
         // `" for url ({url})"` to every transport/stream error message, so a
@@ -235,6 +240,15 @@ fn google_contents(input: &[LlmInputItem]) -> Value {
                 }}],
                 }));
             }
+            LlmInputItem::Image { media_type, bytes } => contents.push(json!({
+                "role": "user",
+                "parts": [{
+                    "inlineData": {
+                        "mimeType": media_type,
+                        "data": BASE64_STANDARD.encode(bytes.as_ref()),
+                    },
+                }],
+            })),
             LlmInputItem::Reasoning(ReasoningPayload::Google {
                 summary,
                 thought_signature,

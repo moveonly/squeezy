@@ -1906,6 +1906,14 @@ pub enum ResumeItem {
     Reasoning {
         payload: squeezy_core::ReasoningPayload,
     },
+    /// Inline image attachment captured from a `read_file` returning
+    /// PNG/JPEG/GIF/WEBP bytes. Stored as base64 so the JSON checkpoint
+    /// stays compact and human-debuggable; rehydrates into
+    /// `LlmInputItem::Image` on resume.
+    Image {
+        media_type: String,
+        data_base64: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

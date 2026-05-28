@@ -2762,6 +2762,7 @@ dependencies = [
 name = "squeezy-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "futures-core",
  "futures-util",
  "serde",
@@ -2969,6 +2970,7 @@ dependencies = [
 name = "squeezy-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "futures-util",
  "globset",
  "ignore",

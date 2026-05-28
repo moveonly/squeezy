@@ -1,7 +1,9 @@
 use std::{pin::Pin, sync::Arc};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_core::Stream;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 pub use squeezy_core::{
     AnthropicThinkingBlock, AnthropicThinkingKind, ReasoningKind, ReasoningPayload,
@@ -202,6 +204,103 @@ pub enum LlmInputItem {
         output: String,
     },
     Reasoning(ReasoningPayload),
+    /// Inline image attached to a user turn. `media_type` is an
+    /// `image/{png,jpeg,gif,webp}` MIME string; `bytes` carries the raw
+    /// image payload (each provider's `request_body` re-encodes as
+    /// needed — base64 data URL, `inlineData`, Bedrock `Blob`, etc.).
+    /// Stored serialized as a base64 string so checkpoints stay JSON-
+    /// safe without bloating to a byte array.
+    Image {
+        media_type: String,
+        #[serde(serialize_with = "serialize_image_bytes_b64")]
+        #[serde(deserialize_with = "deserialize_image_bytes_b64")]
+        bytes: Arc<[u8]>,
+    },
+}
+
+impl LlmInputItem {
+    /// Construct an `Image` item from a media-type string and raw bytes.
+    /// Convenience to keep call sites short.
+    pub fn image(media_type: impl Into<String>, bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self::Image {
+            media_type: media_type.into(),
+            bytes: bytes.into(),
+        }
+    }
+
+    /// `true` for the `Image` variant. Used by the per-provider request
+    /// builders and the vision-capability check below.
+    pub fn is_image(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
+}
+
+fn serialize_image_bytes_b64<S: Serializer>(
+    bytes: &Arc<[u8]>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&BASE64_STANDARD.encode(bytes.as_ref()))
+}
+
+fn deserialize_image_bytes_b64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Arc<[u8]>, D::Error> {
+    use serde::de::Error;
+    let encoded: String = String::deserialize(deserializer)?;
+    let bytes = BASE64_STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|err| Error::custom(format!("invalid base64 image payload: {err}")))?;
+    Ok(Arc::from(bytes.into_boxed_slice()))
+}
+
+/// Detect the canonical image MIME type from a byte prefix using magic
+/// numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP (RIFF / WEBP
+/// container). Returns `None` when the prefix does not match a known
+/// image format. The exhaustive variant list matches what the upstream
+/// providers (Anthropic / OpenAI / Google / Bedrock) accept for inline
+/// image content blocks; everything else has to round-trip as text.
+pub fn infer_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
+
+impl LlmRequest {
+    /// Refuse to ship a request that carries `LlmInputItem::Image`
+    /// payloads when the destination model's
+    /// [`crate::ModelCapabilities::vision`] flag is false. Each provider's
+    /// `stream_response` calls this before building the wire body so the
+    /// caller sees a structured error (`SqueezyError::ProviderRequest`)
+    /// instead of an upstream-rejected 4xx with a vendor-specific
+    /// message. Models that are unknown to the registry (custom presets,
+    /// fresh aggregator SKUs) fall back to the conservative
+    /// `vision: false` default and surface the same error — callers can
+    /// extend `models.json` or attach `model_discovery::ResolvedCapabilities`
+    /// to opt in.
+    pub fn ensure_vision_support(&self, provider: &str) -> Result<()> {
+        if !self.input.iter().any(LlmInputItem::is_image) {
+            return Ok(());
+        }
+        let supports_vision =
+            crate::capabilities_for(provider, &self.model).is_some_and(|caps| caps.vision);
+        if supports_vision {
+            return Ok(());
+        }
+        Err(SqueezyError::ProviderRequest(format!(
+            "model `{model}` on provider `{provider}` does not support image inputs (capabilities.vision = false); pick a vision-capable model before attaching an image",
+            model = self.model,
+        )))
+    }
 }
 
 /// Normalize tool-call IDs across a replay sequence so providers see

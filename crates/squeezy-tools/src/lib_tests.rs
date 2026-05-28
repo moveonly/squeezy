@@ -787,6 +787,49 @@ async fn read_file_returns_bounded_content_and_hash() {
 }
 
 #[tokio::test]
+async fn read_file_returns_image_payload_when_file_is_png() {
+    use base64::Engine as _;
+    let root = temp_workspace("read_file_image");
+    // Synthetic PNG: 8-byte magic header followed by a minimal IHDR-like
+    // payload. The bytes don't have to form a renderable image — the
+    // tool only inspects magic bytes for MIME detection.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    bytes.extend_from_slice(b"synthetic-image-body");
+    fs::write(root.join("logo.png"), &bytes).expect("write png");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "read_image".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "logo.png"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["image"], true);
+    assert_eq!(result.content["mime_type"], "image/png");
+    assert!(
+        result.content.get("content").is_none(),
+        "image payload must not include raw text `content`: {:?}",
+        result.content,
+    );
+    let encoded = result.content["data_base64"]
+        .as_str()
+        .expect("base64 string");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded, bytes);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn read_file_returns_dedup_stub_when_unchanged_since_last_receipt() {
     let root = temp_workspace("read_file_dedup_unchanged");
     // Use a multi-KB body so the audit's "stub output < full output / 10"

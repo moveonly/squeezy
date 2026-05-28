@@ -1,4 +1,6 @@
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -186,6 +188,9 @@ impl LlmProvider for OllamaProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("ollama") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         if let Some(compat) = &self.compat {
             return compat.stream_response(request, cancel);
         }
@@ -269,6 +274,21 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             }
             LlmInputItem::FunctionCallOutput { call_id: _, output } => {
                 messages.push(json!({ "role": "tool", "content": output }));
+            }
+            // Ollama's native chat API puts images on the message itself
+            // (`{"role": "user", "content": "...", "images": ["<b64>"]}`)
+            // instead of a content-block array; emit a standalone user
+            // message with an empty `content` string so vision-capable
+            // local models (llava, llama3.2-vision) see the bytes.
+            LlmInputItem::Image {
+                media_type: _,
+                bytes,
+            } => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": "",
+                    "images": [BASE64_STANDARD.encode(bytes.as_ref())],
+                }));
             }
             // Ollama has no signed reasoning replay format. Skip on replay.
             LlmInputItem::Reasoning(_) => {}

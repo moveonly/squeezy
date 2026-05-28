@@ -463,6 +463,19 @@ fn estimate_input_item_tokens(item: &LlmInputItem, bytes_per_token: f64) -> u64 
             let text = payload.display_text();
             estimate_text_tokens(&text, bytes_per_token).saturating_add(8)
         }
+        // Vision providers convert images to token-equivalent "tiles" on
+        // the server side (Claude ≈ 1 tile per 750 image pixels, OpenAI
+        // ≈ 85 base + 170 per high-detail tile, Gemini ≈ 258 per image).
+        // Without per-provider tile geometry we approximate as a flat
+        // 1024-token attachment plus the byte cost of the base64 wire
+        // form — high enough that the agent budgets headroom for an
+        // attached image, low enough that text-heavy turns are
+        // unaffected.
+        LlmInputItem::Image { bytes, .. } => {
+            let wire_bytes = (bytes.len() as f64 * 4.0 / 3.0).ceil();
+            let wire_tokens = (wire_bytes / bytes_per_token.max(0.1)).ceil() as u64;
+            wire_tokens.saturating_add(1024)
+        }
     }
 }
 

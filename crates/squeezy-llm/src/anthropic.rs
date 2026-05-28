@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -283,6 +285,18 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: Cach
                     "content": output,
                 })],
             ),
+            LlmInputItem::Image { media_type, bytes } => push_anthropic_message(
+                &mut messages,
+                "user",
+                vec![json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": BASE64_STANDARD.encode(bytes.as_ref()),
+                    },
+                })],
+            ),
             LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
                 let blocks_json: Vec<Value> = blocks
                     .iter()
@@ -344,6 +358,9 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("anthropic") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
