@@ -11,9 +11,9 @@ use crossterm::{
     Command,
     cursor::MoveTo,
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     style::Print,
@@ -546,7 +546,14 @@ async fn run_inner(
         }
         drain_pending_diff(&mut app);
 
-        app.animation_tick = app.animation_tick.wrapping_add(1);
+        // Skip the animation-tick driver while the host terminal is
+        // unfocused. Freezing the counter pins the spinner glyph and
+        // the title clock, which removes the per-frame draw work that
+        // would otherwise keep a background window's GPU and emulator
+        // pipeline busy.
+        if app.focused {
+            app.animation_tick = app.animation_tick.wrapping_add(1);
+        }
         if app.app_notifications.tick() {
             app.needs_redraw = true;
         }
@@ -984,7 +991,24 @@ async fn poll_input(app: &mut TuiApp, agent: &mut Agent, tick_rate: Duration) ->
             app.pending_resize = true;
             Ok(false)
         }
-        _ => Ok(false),
+        // Crossterm only emits these after `EnableFocusChange` succeeded
+        // on a focus-aware terminal. Terminals that ignore the enable
+        // sequence (older xterm / Apple Terminal / SSH targets without
+        // focus reporting) simply never reach this arm, so `focused`
+        // stays `true` and animations run as before. We force a redraw
+        // on both transitions (via the unconditional `needs_redraw =
+        // true` above): focus-regain wants the spinner to catch up to
+        // wall-clock state, and focus-loss wants the final "paused"
+        // frame to land before the animation tick driver freezes so
+        // the spinner is not stuck mid-cycle when the user tabs back.
+        Event::FocusGained => {
+            app.focused = true;
+            Ok(false)
+        }
+        Event::FocusLost => {
+            app.focused = false;
+            Ok(false)
+        }
     }
 }
 
@@ -10341,6 +10365,15 @@ pub(crate) struct TuiApp {
     pub(crate) last_terminal_title: Option<String>,
     pub(crate) animation_tick: u64,
     pub(crate) animation_tick_rate: Duration,
+    /// Tracks terminal-focus state for the host tty. The main loop
+    /// freezes the animation tick driver and short-circuits
+    /// [`Self::has_active_animation`] while this is `false`, so an
+    /// idle background window stops repainting its spinner and the
+    /// terminal-title clock. Driven by crossterm's `FocusGained` /
+    /// `FocusLost` events when `EnableFocusChange` is in effect.
+    /// Terminals that do not emit focus events keep this stuck at
+    /// `true`, which preserves the pre-existing animation behaviour.
+    pub(crate) focused: bool,
     /// Set by any state mutator that requires the next frame to repaint.
     /// Cleared by the main loop immediately after `draw_app`. Without
     /// this gate the loop redraws every ~50 ms and idle terminals show
@@ -10678,6 +10711,11 @@ impl TuiApp {
             last_terminal_title: None,
             animation_tick: 0,
             animation_tick_rate: config.tick_rate,
+            // Assume focused at startup. Crossterm only emits `FocusLost`
+            // after `EnableFocusChange` lands, and terminals that do not
+            // support the protocol never flip the flag — so the worst
+            // case for a non-emitter is the pre-existing behaviour.
+            focused: true,
             // Start dirty so the first iteration of the main loop paints
             // the initial frame.
             needs_redraw: true,
@@ -10816,7 +10854,18 @@ impl TuiApp {
     /// catches the case where nothing has mutated but the on-screen
     /// content is still moving (working spinner, title spinner, etc.).
     /// When neither is true the main loop skips `draw_app` entirely.
+    ///
+    /// Returns `false` whenever the host terminal reports the window
+    /// is unfocused — paired with the animation-tick gate in the main
+    /// loop this stops the spinner from repainting in the background,
+    /// which is the primary battery sink on idle laptops. State
+    /// mutations (e.g. agent events arriving while we are unfocused)
+    /// still flip `needs_redraw` and force a draw, so we never miss a
+    /// material update.
     pub(crate) fn has_active_animation(&self) -> bool {
+        if !self.focused {
+            return false;
+        }
         matches!(self.turn_visual, TurnVisualState::Running)
             || self.terminal_title_state == TerminalTitleState::Working
             || self.pending_diff.is_some()
@@ -11604,7 +11653,8 @@ impl TerminalGuard {
                     Print(CLEAR_SCROLLBACK_AND_VISIBLE),
                     Print(DISABLE_MOUSE_MODES),
                     DisableAlternateScroll,
-                    EnableBracketedPaste
+                    EnableBracketedPaste,
+                    EnableFocusChange
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
@@ -11620,7 +11670,8 @@ impl TerminalGuard {
                     EnableAlternateScroll,
                     Clear(ClearType::All),
                     MoveTo(0, 0),
-                    EnableBracketedPaste
+                    EnableBracketedPaste,
+                    EnableFocusChange
                 )
                 .map_err(|err| SqueezyError::Terminal(err.to_string()))?;
                 if mouse_capture {
@@ -11781,6 +11832,7 @@ impl Drop for TerminalGuard {
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
                     DisableBracketedPaste,
+                    DisableFocusChange,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Print("\x1b]0;\x07"),
@@ -11794,6 +11846,7 @@ impl Drop for TerminalGuard {
                     Print(RESET_KEYBOARD_ENHANCEMENT_FLAGS),
                     DisableModifyOtherKeys,
                     DisableBracketedPaste,
+                    DisableFocusChange,
                     DisableAlternateScroll,
                     Print(DISABLE_MOUSE_MODES),
                     Print("\x1b]0;\x07"),

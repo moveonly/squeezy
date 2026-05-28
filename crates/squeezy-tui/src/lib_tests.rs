@@ -9091,6 +9091,61 @@ fn note_turn_started_marks_dirty_and_animation_active() {
 }
 
 #[test]
+fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
+    // The main loop drives `animation_tick` from a focused/unfocused
+    // gate (`if app.focused { app.animation_tick = … }`) and
+    // short-circuits `has_active_animation()` while the host terminal
+    // is unfocused. This test pins both halves of the contract.
+    let mut app = test_app(SessionMode::Build);
+    // Simulate a turn in flight: spinner + working title would
+    // normally keep the loop redrawing every iteration.
+    app.turn_visual = TurnVisualState::Running;
+    app.terminal_title_state = TerminalTitleState::Working;
+    assert!(
+        app.has_active_animation(),
+        "focused running turn must advertise an active animation"
+    );
+
+    // FocusLost arrived. The animation gate clamps every motion
+    // signal so the main loop stops repainting and stops ticking
+    // the spinner driver until focus returns.
+    app.focused = false;
+    assert!(
+        !app.has_active_animation(),
+        "unfocused TUI must not advertise any active animation, even mid-turn"
+    );
+
+    // Drive the loop body's animation-tick gate directly: the
+    // counter MUST NOT advance while unfocused, even across many
+    // iterations.
+    let baseline = app.animation_tick;
+    for _ in 0..32 {
+        if app.focused {
+            app.animation_tick = app.animation_tick.wrapping_add(1);
+        }
+    }
+    assert_eq!(
+        app.animation_tick, baseline,
+        "no animation tick may fire while focus is lost"
+    );
+
+    // FocusGained restores both signals.
+    app.focused = true;
+    assert!(
+        app.has_active_animation(),
+        "refocus must re-arm the active-animation predicate"
+    );
+    if app.focused {
+        app.animation_tick = app.animation_tick.wrapping_add(1);
+    }
+    assert_eq!(
+        app.animation_tick,
+        baseline + 1,
+        "tick driver must resume incrementing once focus returns"
+    );
+}
+
+#[test]
 fn idle_prompt_coin_is_frozen_regardless_of_animation_tick() {
     let mut app = test_app(SessionMode::Build);
     app.turn_visual = TurnVisualState::Idle;
