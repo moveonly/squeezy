@@ -1,4 +1,5 @@
 pub(crate) mod ansi;
+pub(crate) mod button;
 pub(crate) mod cache;
 pub(crate) mod card;
 pub(crate) mod diff;

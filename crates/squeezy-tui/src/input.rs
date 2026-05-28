@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use squeezy_agent::RequestUserInputResponse;
 use squeezy_core::PermissionCapability;
 
-use crate::{TranscriptItem, TuiApp, mention, overlay};
+use crate::{PendingRequestUserInput, TranscriptItem, TuiApp, mention, overlay};
 
 pub(crate) const WORD_SEPARATORS: &str = "`~!@#$%^&*()-=+[{]}\\|;:'\",.<>/?";
 
@@ -901,6 +901,7 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
         return false;
     };
     let choice_count = pending.request.choices.len();
+    let allow_freeform = pending.request.allow_freeform;
     match key.code {
         KeyCode::Up => {
             if choice_count > 0 {
@@ -926,9 +927,9 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
                 app.status = format!("answered: {}", choice.label);
                 return true;
             }
-            if pending.request.allow_freeform && !app.input.trim().is_empty() {
-                let text = std::mem::take(&mut app.input);
-                app.input_cursor = 0;
+            if allow_freeform && !pending.answer.trim().is_empty() {
+                let text = std::mem::take(&mut pending.answer);
+                pending.answer_cursor = 0;
                 let _ = pending
                     .response_tx
                     .send(RequestUserInputResponse::freeform(text));
@@ -946,31 +947,31 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
             app.status = "plan-mode question cancelled".to_string();
             true
         }
-        KeyCode::Backspace if pending.request.allow_freeform => {
-            delete_before_cursor(app);
+        KeyCode::Backspace if allow_freeform => {
+            delete_answer_before_cursor(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
-        KeyCode::Delete if pending.request.allow_freeform => {
-            delete_at_cursor(app);
+        KeyCode::Delete if allow_freeform => {
+            delete_answer_at_cursor(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
-        KeyCode::Left if pending.request.allow_freeform => {
-            move_input_cursor_left(app);
+        KeyCode::Left if allow_freeform => {
+            move_answer_cursor_left(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
-        KeyCode::Right if pending.request.allow_freeform => {
-            move_input_cursor_right(app);
+        KeyCode::Right if allow_freeform => {
+            move_answer_cursor_right(&mut pending);
             app.pending_request_user_input = Some(pending);
             true
         }
         KeyCode::Char(ch)
-            if pending.request.allow_freeform
+            if allow_freeform
                 && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
         {
-            insert_input_char(app, ch);
+            insert_answer_char(&mut pending, ch);
             app.pending_request_user_input = Some(pending);
             true
         }
@@ -979,6 +980,70 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
             true
         }
     }
+}
+
+fn insert_answer_char(pending: &mut PendingRequestUserInput, ch: char) {
+    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
+    pending.answer.insert(cursor, ch);
+    pending.answer_cursor = cursor + ch.len_utf8();
+}
+
+fn delete_answer_before_cursor(pending: &mut PendingRequestUserInput) {
+    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
+    if cursor == 0 {
+        return;
+    }
+    let mut prev = cursor - 1;
+    while prev > 0 && !pending.answer.is_char_boundary(prev) {
+        prev -= 1;
+    }
+    pending.answer.replace_range(prev..cursor, "");
+    pending.answer_cursor = prev;
+}
+
+fn delete_answer_at_cursor(pending: &mut PendingRequestUserInput) {
+    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
+    if cursor >= pending.answer.len() {
+        return;
+    }
+    let mut next = cursor + 1;
+    while next < pending.answer.len() && !pending.answer.is_char_boundary(next) {
+        next += 1;
+    }
+    pending.answer.replace_range(cursor..next, "");
+    pending.answer_cursor = cursor;
+}
+
+fn move_answer_cursor_left(pending: &mut PendingRequestUserInput) {
+    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
+    if cursor == 0 {
+        return;
+    }
+    let mut prev = cursor - 1;
+    while prev > 0 && !pending.answer.is_char_boundary(prev) {
+        prev -= 1;
+    }
+    pending.answer_cursor = prev;
+}
+
+fn move_answer_cursor_right(pending: &mut PendingRequestUserInput) {
+    let cursor = clamp_byte_cursor(&pending.answer, pending.answer_cursor);
+    if cursor >= pending.answer.len() {
+        return;
+    }
+    let mut next = cursor + 1;
+    while next < pending.answer.len() && !pending.answer.is_char_boundary(next) {
+        next += 1;
+    }
+    pending.answer_cursor = next;
+}
+
+fn clamp_byte_cursor(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
 }
 
 #[cfg(test)]

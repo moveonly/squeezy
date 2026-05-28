@@ -172,6 +172,564 @@ async fn shift_tab_toggles_mode() {
 }
 
 #[tokio::test]
+async fn freeform_modal_keeps_typing_out_of_main_composer() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    // Open a freeform-allowed modal.
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: Vec::new(),
+        allow_freeform: true,
+    };
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: String::new(),
+        answer_cursor: 0,
+    });
+    // Pre-populate the main composer to simulate a half-typed next prompt.
+    app.input = "draft next prompt".to_string();
+    app.input_cursor = app.input.len();
+
+    for ch in "yes please".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+
+    let pending = app.pending_request_user_input.as_ref().expect("modal");
+    assert_eq!(pending.answer, "yes please");
+    assert_eq!(
+        app.input, "draft next prompt",
+        "modal typing must not touch the main composer",
+    );
+}
+
+#[tokio::test]
+async fn enter_during_running_turn_enqueues_prompt() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    // Fake a running turn.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    // Type "hello" + Enter.
+    for ch in "hello".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    assert_eq!(
+        app.prompt_queue.iter().collect::<Vec<_>>(),
+        vec![&"hello".to_string()],
+        "prompt should be queued while a turn is running",
+    );
+    assert_eq!(app.input, "", "composer should clear after enqueue");
+    assert_eq!(app.status, "queued (1)");
+}
+
+#[tokio::test]
+async fn enter_when_idle_starts_turn_not_enqueues() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    assert!(app.turn_rx.is_none());
+
+    for ch in "hi".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    assert!(app.prompt_queue.is_empty(), "idle Enter should not queue");
+    assert!(app.turn_rx.is_some(), "idle Enter should start a turn");
+}
+
+#[tokio::test]
+async fn ctrl_x_q_chord_toggles_queue_overlay() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("first stroke");
+    assert_eq!(app.pending_chord, Some(ChordPrefix::CtrlX));
+    assert!(app.prompt_queue_overlay.is_none());
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("second stroke");
+    assert!(app.pending_chord.is_none(), "chord must clear");
+    assert!(app.prompt_queue_overlay.is_some(), "overlay should open");
+
+    // Second chord toggles closed.
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("first stroke");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("second stroke");
+    assert!(app.prompt_queue_overlay.is_none(), "overlay should close");
+}
+
+#[test]
+fn meta_modifier_normalises_to_alt() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::META);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::ALT));
+    assert!(!out.modifiers.contains(KeyModifiers::META));
+}
+
+#[test]
+fn uppercase_letter_with_control_normalises_to_lowercase() {
+    use super::normalise_control_byte;
+    // Kitty REPORT_ALTERNATE_KEYS can deliver Ctrl+E as `Char('E') + CONTROL`.
+    let raw = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::CONTROL);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+}
+
+#[test]
+fn ctrl_letter_with_stray_shift_drops_shift() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+    assert!(!out.modifiers.contains(KeyModifiers::SHIFT));
+}
+
+#[test]
+fn alt_letter_with_meta_modifier_normalises() {
+    use super::normalise_control_byte;
+    // Terminal delivers Option+E with META instead of ALT.
+    let raw = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::META | KeyModifiers::SHIFT);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::ALT));
+    assert!(!out.modifiers.contains(KeyModifiers::META));
+    assert!(!out.modifiers.contains(KeyModifiers::SHIFT));
+}
+
+#[test]
+fn raw_control_byte_normalises_to_char_plus_control() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+
+    let modern = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+    let out = normalise_control_byte(modern);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+
+    // Tab/Enter/CR/Esc/Backspace bytes stay as Char form (they have
+    // dedicated KeyCode variants in the well-behaved path).
+    for byte in ['\u{09}', '\u{0A}', '\u{0D}', '\u{1B}', '\u{08}'] {
+        let raw = KeyEvent::new(KeyCode::Char(byte), KeyModifiers::NONE);
+        let out = normalise_control_byte(raw);
+        assert_eq!(out.code, KeyCode::Char(byte));
+        assert!(!out.modifiers.contains(KeyModifiers::CONTROL));
+    }
+}
+
+#[tokio::test]
+async fn raw_ctrl_e_dispatches_expand_action() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    app.push_tool_result(sample_tool_result("grep", "needle found"));
+    assert!(app.transcript[0].collapsed);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("raw ctrl+e");
+    assert!(
+        !app.transcript[0].collapsed,
+        "raw \\x05 must reach the ExpandSelectedTranscriptEntry keymap arm",
+    );
+}
+
+#[tokio::test]
+async fn chord_leader_accepts_raw_ctrl_x_byte() {
+    // Some terminals emit Ctrl+X as the literal ASCII control byte
+    // (`\x18`) with no modifiers when they don't fully honour kitty's
+    // DISAMBIGUATE_ESCAPE_CODES. Make sure the chord arms in that case.
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('\u{18}'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("raw ctrl+x");
+    assert_eq!(app.pending_chord, Some(ChordPrefix::CtrlX));
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("q follow-up");
+    assert!(app.prompt_queue_overlay.is_some());
+    assert!(
+        app.input.is_empty(),
+        "Q must NOT leak into composer when chord fires",
+    );
+}
+
+#[tokio::test]
+async fn chord_accepts_uppercase_q_with_or_without_shift() {
+    for (code, modifiers) in [
+        (KeyCode::Char('q'), KeyModifiers::NONE),
+        (KeyCode::Char('Q'), KeyModifiers::NONE),
+        (KeyCode::Char('Q'), KeyModifiers::SHIFT),
+        (KeyCode::Char('q'), KeyModifiers::SHIFT),
+    ] {
+        let mut agent = test_agent(SessionMode::Build);
+        let mut app = test_app(SessionMode::Build);
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .await
+        .expect("first stroke");
+        handle_key(&mut app, &mut agent, KeyEvent::new(code, modifiers))
+            .await
+            .expect("second stroke");
+        assert!(
+            app.prompt_queue_overlay.is_some(),
+            "chord should open overlay for code={code:?} modifiers={modifiers:?}",
+        );
+        assert!(
+            app.input.is_empty(),
+            "second stroke must NOT leak into the composer for code={code:?} modifiers={modifiers:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn ctrl_x_then_other_key_clears_chord_without_firing_queue() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+    )
+    .await
+    .expect("leader");
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+    )
+    .await
+    .expect("non-chord follow-up");
+    assert!(app.pending_chord.is_none(), "chord must clear");
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "queue overlay must NOT open for an unknown chord follow-up",
+    );
+    // The follow-up character should have been inserted into the composer.
+    assert_eq!(app.input, "a");
+}
+
+#[tokio::test]
+async fn left_click_on_indicator_rect_toggles_queue_overlay() {
+    let mut app = test_app(SessionMode::Build);
+    // Stash a known indicator rect as if render_input had set it.
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 4,
+            width: 80,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.prompt_queue_overlay.is_some(),
+        "click inside the indicator should toggle the overlay open",
+    );
+
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(
+        app.prompt_queue_overlay.is_none(),
+        "second click toggles closed",
+    );
+}
+
+#[tokio::test]
+async fn topmost_overlapping_click_target_wins() {
+    let app = test_app(SessionMode::Build);
+    // Two overlapping rects registered in render order: the second
+    // (later-rendered "overlay") should shadow the first.
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 4,
+            width: 80,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+    app.register_click(
+        Rect {
+            x: 5,
+            y: 4,
+            width: 10,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+    let hit = app.click_target_at(7, 4);
+    assert_eq!(hit, Some(ClickAction::ToggleQueueOverlay));
+    // Sanity: a coord only inside the FIRST rect still hits the first.
+    let outside_overlap = app.click_target_at(50, 4);
+    assert_eq!(outside_overlap, Some(ClickAction::ToggleQueueOverlay));
+}
+
+#[tokio::test]
+async fn begin_frame_clickables_clears_registry() {
+    let app = test_app(SessionMode::Build);
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+    assert!(app.click_target_at(5, 0).is_some());
+    app.begin_frame_clickables();
+    assert!(
+        app.click_target_at(5, 0).is_none(),
+        "begin_frame_clickables must wipe per-frame state",
+    );
+}
+
+#[tokio::test]
+async fn wheel_scroll_works_in_inline_mode() {
+    let mut app = test_app(SessionMode::Build);
+    // Inline mode → alternate_scroll_enabled is false. Pre-fix this
+    // dropped wheel events entirely. After the fix, wheel scrolls the
+    // transcript regardless.
+    app.alternate_scroll_enabled = false;
+    app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(
+        app.transcript_scroll_from_bottom, 3,
+        "wheel must scroll transcript even when alternate_scroll_enabled is false",
+    );
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert_eq!(app.transcript_scroll_from_bottom, 0);
+}
+
+#[tokio::test]
+async fn left_click_outside_indicator_does_not_open_overlay() {
+    let mut app = test_app(SessionMode::Build);
+    app.register_click(
+        Rect {
+            x: 0,
+            y: 4,
+            width: 80,
+            height: 1,
+        },
+        ClickAction::ToggleQueueOverlay,
+    );
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(app.prompt_queue_overlay.is_none());
+}
+
+#[tokio::test]
+async fn cancelled_turn_auto_drains_next_queued_prompt() {
+    let mut app = test_app(SessionMode::Build);
+
+    // Pretend a turn is running and the user has queued one prompt.
+    let (tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+    app.prompt_queue.push_back("follow-up".to_string());
+
+    // Simulate the agent emitting Cancelled.
+    tx.send(AgentEvent::Cancelled {
+        turn_id: TurnId::new(1),
+    })
+    .await
+    .expect("send cancelled");
+    drop(tx);
+    drain_agent_events(&mut app).await;
+
+    assert!(
+        app.auto_drain_queue,
+        "Cancelled with a non-empty queue must set the auto-drain flag",
+    );
+}
+
+#[tokio::test]
+async fn push_warn_emits_single_warn_log_when_no_cancel_card() {
+    let mut app = test_app(SessionMode::Build);
+    let pushed = app.push_warn("turn cancelled".to_string());
+    assert!(pushed, "should push when no prior cancel card");
+    let entry = app.transcript.last().expect("entry should exist");
+    match &entry.kind {
+        TranscriptEntryKind::Log(log) => assert_eq!(log.kind, LogKind::Warn),
+        _ => panic!("expected a Log entry"),
+    }
+}
+
+#[tokio::test]
+async fn push_warn_suppresses_when_last_tool_card_is_cancelled() {
+    let mut app = test_app(SessionMode::Build);
+    let mut result = sample_tool_result("request_user_input", "");
+    result.status = ToolStatus::Cancelled;
+    app.push_tool_result_with_call(result, None);
+    let pushed = app.push_warn("turn cancelled".to_string());
+    assert!(
+        !pushed,
+        "redundant warn should be suppressed when a cancelled tool card is at the tail",
+    );
+    // Ensure no extra entry was appended either.
+    let log_count = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e.kind, TranscriptEntryKind::Log(_)))
+        .count();
+    assert_eq!(log_count, 0);
+}
+
+#[tokio::test]
+async fn slash_command_does_not_enqueue_mid_turn() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Build);
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    for ch in "/help".chars() {
+        handle_key(
+            &mut app,
+            &mut agent,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        )
+        .await
+        .expect("handle char");
+    }
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    assert!(
+        app.prompt_queue.is_empty(),
+        "slash commands should execute immediately, never queue",
+    );
+}
+
+#[tokio::test]
 async fn proposed_plan_block_opens_post_plan_choice_prompt() {
     let root = temp_workspace("plan_choice_prompt");
     let config = test_config_with_root(SessionMode::Plan, root.clone());
@@ -1877,15 +2435,28 @@ async fn alternate_screen_arrows_keep_scrolling_when_transcript_is_already_scrol
 }
 
 #[test]
-fn default_mouse_wheel_does_not_touch_prompt_history_or_transcript_scroll() {
+fn default_mouse_wheel_scrolls_transcript_without_touching_input_or_history() {
+    // Wheel events scroll the transcript in BOTH inline and alt-screen
+    // mode (since mouse capture is unconditional, wheel arrives as a
+    // MouseEvent and we always route it to the transcript). What must
+    // NOT happen: the composer or prompt-history cursor shouldn't move.
     let mut app = test_app(SessionMode::Build);
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
 
-    handle_mouse(&mut app, MouseEventKind::ScrollUp);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
 
-    assert_eq!(app.transcript_scroll_from_bottom, 0);
+    assert_eq!(app.transcript_scroll_from_bottom, 3);
     assert!(app.input.is_empty());
+    assert!(app.input_history_index.is_none());
 }
 
 #[test]
@@ -1896,12 +2467,28 @@ fn explicit_alternate_screen_mouse_wheel_scrolls_transcript_without_prompt_histo
     app.push_transcript_item(TranscriptItem::user("first turn".to_string()));
     push_input_history(&mut app, "previous prompt".to_string());
 
-    handle_mouse(&mut app, MouseEventKind::ScrollUp);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
 
     assert_eq!(app.transcript_scroll_from_bottom, 3);
     assert!(app.input.is_empty());
 
-    handle_mouse(&mut app, MouseEventKind::ScrollDown);
+    handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
 
     assert_eq!(app.transcript_scroll_from_bottom, 0);
     assert!(app.input.is_empty());
@@ -3257,6 +3844,8 @@ fn plan_mode_question_renders_with_choices_and_freeform_hint() {
         request,
         response_tx,
         selection_index: 1,
+        answer: String::new(),
+        answer_cursor: 0,
     });
 
     let output = render_to_string(&app, 140, 24);

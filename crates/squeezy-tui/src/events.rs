@@ -314,6 +314,8 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                         request,
                         response_tx,
                         selection_index: 0,
+                        answer: String::new(),
+                        answer_cursor: 0,
                     });
                     break;
                 }
@@ -352,6 +354,10 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     // mid-turn we shouldn't snap them down on completion.
                     app.cancel = None;
                     keep_rx = false;
+                    // Signal the main loop to drain the next queued prompt
+                    // (if any) outside this function — we don't have an
+                    // `Agent` handle here.
+                    app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
                 AgentEvent::CostWarning { status, .. } => {
@@ -412,7 +418,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.status = message;
                     app.turn_visual = TurnVisualState::Failed;
-                    app.push_log("turn cancelled".to_string());
+                    app.push_warn("turn cancelled".to_string());
                     if app.last_turn_had_edits {
                         app.push_log(
                             "/diff to inspect changes · /undo to revert this turn".to_string(),
@@ -427,8 +433,15 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     cancel_pending_request_user_input(app);
                     app.note_turn_finished();
                     app.cancel = None;
-                    input::restore_prompt_after_cancel(app);
+                    // Restore the cancelled prompt only when no queued
+                    // prompt is about to take over — otherwise the queued
+                    // prompt would race the restore and the composer would
+                    // get clobbered.
+                    if app.prompt_queue.is_empty() {
+                        input::restore_prompt_after_cancel(app);
+                    }
                     keep_rx = false;
+                    app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
                 AgentEvent::Failed { error, .. } => {
@@ -438,7 +451,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     }
                     app.status = status;
                     app.turn_visual = TurnVisualState::Failed;
-                    app.push_log(format!("turn failed: {}", app.status));
+                    app.push_warn(format!("turn failed: {}", app.status));
                     if app.last_turn_had_edits {
                         app.last_turn_had_edits = false;
                     }
@@ -451,6 +464,7 @@ pub(crate) async fn drain_agent_events(app: &mut TuiApp) {
                     app.note_turn_finished();
                     app.cancel = None;
                     keep_rx = false;
+                    app.auto_drain_queue = !app.prompt_queue.is_empty();
                     break;
                 }
             }
