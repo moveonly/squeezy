@@ -261,6 +261,19 @@ pub struct ToolSpec {
     /// shell → git via the shell classifier); session mode gating in the agent
     /// applies on top of both layers.
     pub capability: PermissionCapability,
+    /// Whether multiple calls to this tool in the same model turn can execute
+    /// concurrently. Read-only navigation tools (graph lookups, `read_file`,
+    /// `grep`, `glob`, …) set this to `true` so the agent dispatcher groups
+    /// them into a single `buffer_unordered` batch; tools that mutate the
+    /// workspace, run shell, or depend on observable side effects keep the
+    /// default `false` so the dispatcher serializes them and flushes any
+    /// pending parallel batch around them.
+    ///
+    /// Defaults via `#[serde(default)]` so a `ToolSpec` payload serialized by
+    /// an older Squeezy build (or a forwards-compatible deserializer such as
+    /// the MCP wire surface) still loads with the conservative `false` value.
+    #[serde(default)]
+    pub parallel_safe: bool,
     /// Optional soft-validation hook that mutates the raw `arguments` JSON
     /// before typed deserialization. `None` means dispatch deserializes the
     /// arguments as-is. Never serialized — function pointers are a runtime
@@ -292,11 +305,12 @@ impl PartialEq for ToolSpec {
         // Hooks are runtime-only (see `prepare_arguments` doc): rust does
         // not guarantee unique function-pointer addresses across codegen
         // units, so structural equality skips that field. All
-        // model-visible fields are compared.
+        // model-visible and dispatcher-visible fields are compared.
         self.name == other.name
             && self.description == other.description
             && self.parameters == other.parameters
             && self.capability == other.capability
+            && self.parallel_safe == other.parallel_safe
     }
 }
 
@@ -307,6 +321,20 @@ pub struct ToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: Value,
+}
+
+/// One batch in a parallel execution plan computed by
+/// [`ToolRegistry::plan_parallel_batches`]. A batch with
+/// `parallel_safe = true` may run all its calls concurrently; a batch
+/// with `parallel_safe = false` always holds exactly one call that
+/// must run alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParallelExecutionBatch {
+    /// Indices into the input slice, in original order.
+    pub indices: Vec<usize>,
+    /// True when every call in `indices` is safe to run concurrently
+    /// with the others in the same batch.
+    pub parallel_safe: bool,
 }
 
 /// Render a one-phrase English description of a tool call from its name
@@ -1790,34 +1818,55 @@ impl ToolRegistry {
         preview::CatalogPreview.preview_lines(request, call, self.root.as_ref())
     }
 
+    /// Whether the call's tool is marked `parallel_safe` in its spec. The
+    /// dispatcher uses this to group consecutive safe calls into one
+    /// `buffer_unordered` batch; unsafe calls flush the pending batch and
+    /// run alone. Unknown tools fall back to `false` so a stale call name
+    /// (or a model misspelling) never opportunistically races a write.
+    ///
+    /// Reads from the cached spec list (`O(N)` over the current catalog,
+    /// bounded to dozens of entries). Going through the spec keeps the
+    /// per-tool parallelism contract single-sourced from the
+    /// `crate::specs` constructors instead of duplicating the safe-set in
+    /// a hardcoded match here.
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
-        matches!(
-            call.name.as_str(),
-            "checkpoint_list"
-                | "checkpoint_show"
-                | "decl_search"
-                | "definition_search"
-                | "diff_context"
-                | "downstream_flow"
-                | "glob"
-                | "grep"
-                | "hierarchy"
-                | "plan_patch"
-                | "read_file"
-                | "read_slice"
-                | "read_tool_output"
-                | "reference_search"
-                | "repo_map"
-                | "symbol_context"
-                | "upstream_flow"
-                | "webfetch"
-                | "websearch"
-                | "mcp_list_resources"
-                | "mcp_list_resource_templates"
-                | "mcp_read_resource"
-                | "list_skills"
-                | "load_skill"
-        )
+        self.specs()
+            .iter()
+            .find(|spec| spec.name == call.name)
+            .is_some_and(|spec| spec.parallel_safe)
+    }
+
+    /// Group consecutive parallel-safe tool calls into batches so the
+    /// dispatcher can run a safe run via `buffer_unordered` and break
+    /// the run around any unsafe call.
+    ///
+    /// The result is a `Vec<ParallelExecutionBatch>` aligned to `calls`
+    /// in original order; each batch carries either a single unsafe call
+    /// (`parallel_safe = false`) or a contiguous run of safe calls
+    /// (`parallel_safe = true`, `indices.len() >= 1`). Unknown tools are
+    /// treated as unsafe (consistent with `is_parallel_safe`).
+    ///
+    /// This is the pure form of the grouping invariant the live
+    /// dispatcher implements inline in
+    /// `squeezy_agent::execute_tool_calls`, exposed here so the layout
+    /// can be unit-tested without spinning up a full agent runtime.
+    pub fn plan_parallel_batches(&self, calls: &[ToolCall]) -> Vec<ParallelExecutionBatch> {
+        let mut batches: Vec<ParallelExecutionBatch> = Vec::new();
+        for (index, call) in calls.iter().enumerate() {
+            let safe = self.is_parallel_safe(call);
+            if safe
+                && let Some(last) = batches.last_mut()
+                && last.parallel_safe
+            {
+                last.indices.push(index);
+                continue;
+            }
+            batches.push(ParallelExecutionBatch {
+                indices: vec![index],
+                parallel_safe: safe,
+            });
+        }
+        batches
     }
 
     pub fn describe_call(&self, call: &ToolCall) -> String {

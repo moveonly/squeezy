@@ -109,6 +109,123 @@ fn registry_with_state_store_and_checkpoints(
 }
 
 #[test]
+fn plan_parallel_batches_coalesces_consecutive_parallel_safe_calls() {
+    // Shape the input as a real model turn that emits read-only
+    // navigation calls back-to-back. Every spec involved here is
+    // `parallel_safe: true`, so the planner must produce a single
+    // batch covering all indices so the dispatcher's
+    // `buffer_unordered` loop can run them concurrently instead of
+    // serializing the run.
+    let root = temp_workspace("plan_parallel_batches_safe");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("c1", "read_file", json!({"path": "Cargo.toml"})),
+        make_call("c2", "grep", json!({"pattern": "fn main"})),
+        make_call("c3", "decl_search", json!({"query": "main"})),
+        make_call("c4", "symbol_context", json!({"query": "main"})),
+    ];
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![ParallelExecutionBatch {
+            indices: vec![0, 1, 2, 3],
+            parallel_safe: true,
+        }],
+        "all-parallel-safe calls must coalesce into one concurrent batch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
+    // Mix unsafe calls (shell, apply_patch) between read-only ones to
+    // confirm each unsafe call splits the surrounding parallel run.
+    // Each unsafe call must land alone in its own batch, and the
+    // contiguous safe runs on either side must stay coalesced.
+    let root = temp_workspace("plan_parallel_batches_mixed");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("c0", "read_file", json!({"path": "Cargo.toml"})),
+        make_call("c1", "grep", json!({"pattern": "fn main"})),
+        make_call(
+            "c2",
+            "shell",
+            json!({"command": "echo hi", "description": "smoke"}),
+        ),
+        make_call("c3", "read_slice", json!({"path": "src/lib.rs"})),
+        make_call(
+            "c4",
+            "apply_patch",
+            json!({"operations": [{"kind": "create_file", "path": "notes.txt", "contents": "x"}]}),
+        ),
+        make_call("c5", "decl_search", json!({"query": "main"})),
+        make_call("c6", "symbol_context", json!({"query": "main"})),
+    ];
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![
+            ParallelExecutionBatch {
+                indices: vec![0, 1],
+                parallel_safe: true,
+            },
+            ParallelExecutionBatch {
+                indices: vec![2],
+                parallel_safe: false,
+            },
+            ParallelExecutionBatch {
+                indices: vec![3],
+                parallel_safe: true,
+            },
+            ParallelExecutionBatch {
+                indices: vec![4],
+                parallel_safe: false,
+            },
+            ParallelExecutionBatch {
+                indices: vec![5, 6],
+                parallel_safe: true,
+            },
+        ],
+        "unsafe calls must land in singleton batches that split the surrounding parallel runs"
+    );
+
+    // The dispatcher consults is_parallel_safe at execution time. The
+    // matching property here documents that the planner's batch flag
+    // tracks the per-call lookup the dispatcher uses to flush vs.
+    // continue a pending parallel run.
+    for batch in &batches {
+        let expected = batch.parallel_safe;
+        for &idx in &batch.indices {
+            assert_eq!(
+                registry.is_parallel_safe(&calls[idx]),
+                expected,
+                "is_parallel_safe must agree with the planner batch flag for {}",
+                calls[idx].name
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
     let registry = registry_with_shell_sandbox_off(&root);
