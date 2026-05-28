@@ -113,6 +113,14 @@ cargo test -p squeezy-llm --features costly-tests --test anthropic_costly -- --i
 
 Use `SQUEEZY_COSTLY_OPENAI_MODEL` or `SQUEEZY_COSTLY_ANTHROPIC_MODEL` to test a different cheap model for one provider. `SQUEEZY_COSTLY_MODEL` is the shared fallback. The default costly OpenAI model is `gpt-5-nano`; the default costly Anthropic model is `claude-3-5-haiku-20241022`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke run is truncated by the provider before returning the expected text.
 
+For non-costly test runs where you want a hard guarantee that no paid provider call can fire, invoke nextest through the clean-env wrapper:
+
+```sh
+scripts/test_clean_env.sh --workspace --all-targets
+```
+
+The wrapper unsets every vendor API key, every `SQUEEZY_<PROVIDER>_KEY` fallback, the `SQUEEZY_RUN_COSTLY_TESTS` master flag, and the `SQUEEZY_CREDENTIALS_JSON` / `SQUEEZY_CREDENTIALS_FILE` aggregate channels before forwarding the remaining arguments to `cargo nextest run`. CI uses it as the default test invocation so a misconfigured runner or a stray `export` in a debug step cannot accidentally bill a real provider; use it locally before merging changes to any `*_costly.rs` file to confirm the gates still skip cleanly. The list of stripped variables lives in the script itself — keep it in sync when adding a new provider.
+
 ## Clippy and Formatting
 
 ```sh
