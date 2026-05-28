@@ -1,13 +1,25 @@
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
+// The helpers below are only referenced by `#[cfg(unix)]` worktree
+// tests (git-worktree exercises require POSIX permissions / fork
+// semantics that don't translate cleanly to Windows). Gate the
+// helpers the same way so Windows builds (which exclude those tests)
+// don't trip `-D warnings` on `dead_code`.
+#[cfg(unix)]
 static WORKTREE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(unix)]
 fn temp_repo() -> std::path::PathBuf {
     let nonce = WORKTREE_NONCE.fetch_add(1, Ordering::Relaxed);
     let micros = SystemTime::now()
@@ -25,6 +37,7 @@ fn temp_repo() -> std::path::PathBuf {
     root
 }
 
+#[cfg(unix)]
 fn run_git(cwd: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args(args)
