@@ -16,6 +16,12 @@ use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRule};
 
 use crate::{AMBER, GOLD, QUIET, compact_text};
 
+/// Maximum number of diff lines we surface inline in an approval preview.
+/// Anything beyond this is summarised by a "… (N more lines)" tail so the
+/// prompt stays scannable on short terminals — reviewers can still see the
+/// full patch via `/diff` once the call lands.
+const APPROVAL_DIFF_BODY_CAP: usize = 40;
+
 /// Render the preview block above the option menu.
 pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>> {
     let permission = &request.permission;
@@ -109,9 +115,6 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
     if let Some(root) = permission.metadata.get("write_root") {
         lines.push(dim(format!("write root {root}")));
     }
-    if let Some(diff_lines) = permission.metadata.get("diff_lines") {
-        lines.push(dim(format!("{diff_lines} diff line(s)")));
-    }
     if let Some(diff) = permission.metadata.get("unified_diff") {
         let hint = path_list
             .first()
@@ -119,12 +122,22 @@ fn append_edit(lines: &mut Vec<Line<'static>>, permission: &PermissionRequest) {
             .and_then(crate::render::diff::language_hint_from_path)
             .map(str::to_string);
         let body = crate::render::diff::render_patch_full_lines(diff, hint.as_deref());
-        for mut line in body {
+        let total = body.len();
+        let shown = total.min(APPROVAL_DIFF_BODY_CAP);
+        for mut line in body.into_iter().take(shown) {
             // Indent the diff body two spaces so it aligns with the other
             // preview lines (`✎`, `context:`, `Allow Project:`).
             line.spans.insert(0, Span::raw("  "));
             lines.push(line);
         }
+        if total > shown {
+            lines.push(dim(format!("… ({} more lines)", total - shown)));
+        }
+    } else if let Some(diff_lines) = permission.metadata.get("diff_lines") {
+        // Fallback for tool emitters that only know the line count, not the
+        // full unified-diff blob. Newer tools synthesise `unified_diff` and
+        // skip this branch.
+        lines.push(dim(format!("{diff_lines} diff line(s)")));
     }
 }
 
