@@ -71,6 +71,7 @@ mod micro_compaction;
 mod permission_persist;
 mod plan_mode;
 mod roles;
+pub mod subagent_catalog;
 
 use cancel::{CancelErr, OrCancelExt};
 use context_compaction::{
@@ -91,6 +92,9 @@ pub use context_compaction::ContextCompactionReport;
 pub use cost_broker::CostCapStatus;
 pub use export_html::{ExportError, ExportOpts, ExportTheme, export_session_to_html};
 pub use plan_mode::{PROPOSED_PLAN_CLOSE_TAG, PROPOSED_PLAN_OPEN_TAG, strip_proposed_plan_blocks};
+pub use subagent_catalog::{
+    PROJECT_SUBAGENTS_DIR, SubagentCatalog, SubagentDefinition, SubagentSource, USER_SUBAGENTS_DIR,
+};
 
 // Emergency belt on tool rounds per turn — codex and opencode loop
 // unbounded; CC only caps explicit-purpose subagents (its
