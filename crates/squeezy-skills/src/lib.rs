@@ -14,11 +14,17 @@ use tracing::warn;
 
 pub mod help;
 pub mod implicit;
+pub mod prompt_templates;
 pub mod render;
 
 pub use help::{
     APPROVAL_POLICY_DOC_PATH, BundledDoc, HelpAnswer, HelpCitation, HelpStatus, SqueezyHelp,
     bundled_doc, bundled_doc_paths, bundled_docs, matches_squeezy_help_input,
+};
+pub use prompt_templates::{
+    PROJECT_PROMPTS_DIR, PromptTemplate, PromptTemplateCatalog, PromptTemplateSource,
+    USER_PROMPTS_SUBPATH, parse_command_args as parse_prompt_template_args,
+    substitute_args as substitute_prompt_template_args,
 };
 pub use render::SkillPreambleRender;
 

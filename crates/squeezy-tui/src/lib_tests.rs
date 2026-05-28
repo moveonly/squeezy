@@ -731,6 +731,108 @@ async fn slash_command_does_not_enqueue_mid_turn() {
 }
 
 #[tokio::test]
+async fn slash_prompt_template_expands_unknown_head_into_user_turn() {
+    let root = temp_workspace("prompt_template_expand");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("review.md"),
+        "---\ndescription: review file\nargs: [file]\n---\nReview {file} for issues.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/review src/lib.rs").await);
+    assert!(
+        app.turn_rx.is_some(),
+        "expanded template should start a user turn",
+    );
+    assert_eq!(
+        app.cancelled_prompt.as_deref(),
+        Some("Review src/lib.rs for issues."),
+        "cancelled_prompt should mirror the rendered template body so Ctrl-R can restore it",
+    );
+}
+
+#[tokio::test]
+async fn slash_prompt_template_queues_when_turn_in_progress() {
+    let root = temp_workspace("prompt_template_queue");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("ship.md"),
+        "---\ndescription: ship\nargs: [target]\n---\nShip {target}.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Fake a running turn so the second template invocation queues.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/ship prod").await);
+    assert_eq!(
+        app.prompt_queue.iter().collect::<Vec<_>>(),
+        vec![&"Ship prod.".to_string()],
+        "expanded template should queue rather than start a competing turn",
+    );
+    assert_eq!(app.status, "queued (1)");
+}
+
+#[tokio::test]
+async fn slash_prompt_template_does_not_shadow_builtin_command() {
+    // A template literally named after a built-in must not shadow the
+    // built-in slot — `/cost` should still hit the cost handler so a
+    // typo in `~/.squeezy/prompts/cost.md` cannot lock users out of
+    // the built-in surface.
+    let root = temp_workspace("prompt_template_shadow");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("cost.md"),
+        "---\ndescription: shadow attempt\n---\nshould not run as a model turn.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/cost").await);
+    assert_eq!(
+        app.status, "cost snapshot",
+        "/cost should resolve to the built-in cost handler",
+    );
+    assert!(
+        app.turn_rx.is_none(),
+        "built-in /cost does not start a user turn; template would have",
+    );
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "built-in /cost does not set cancelled_prompt; template would have",
+    );
+}
+
+#[tokio::test]
+async fn slash_prompt_template_passes_through_when_no_match() {
+    // An unknown slash command with no matching template must still
+    // fall through so `reject_unknown_slash_command` can flag it.
+    let root = temp_workspace("prompt_template_miss");
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(!handle_slash_command(&mut app, &mut agent, "/totally-unknown arg").await);
+    assert!(app.turn_rx.is_none());
+}
+
+#[tokio::test]
 async fn proposed_plan_block_opens_post_plan_choice_prompt() {
     let root = temp_workspace("plan_choice_prompt");
     let config = test_config_with_root(SessionMode::Plan, root.clone());

@@ -45,6 +45,7 @@ use squeezy_core::{
     TranscriptDefault, TranscriptItem, TuiAlternateScreen, TuiSynchronizedOutput, TuiTheme,
 };
 use squeezy_llm::LlmProvider;
+use squeezy_skills::PromptTemplateCatalog;
 use squeezy_store::{BugReportBundle, BugReportOptions, CleanupMode, SessionQuery};
 use squeezy_telemetry::PreparedFeedback;
 use squeezy_tools::{
@@ -1965,11 +1966,17 @@ fn should_echo_slash_command(command: &str, rest: &str) -> bool {
 async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
     let cmd = match DispatchCommand::parse(input) {
         Ok(cmd) => cmd,
-        // Unknown heads fall through so the input is treated as a
-        // normal user prompt (echoed as a slash echo upstream by
+        // Unknown heads fall through to the user-authored prompt
+        // template catalog. A match expands the template body and
+        // routes it through the regular user-turn machinery so the
+        // model sees the rendered prompt, not the literal slash text.
+        // No match keeps the legacy behaviour: the input is treated as
+        // a normal user prompt (echoed as a slash echo upstream by
         // `reject_unknown_slash_command`).
-        Err(DispatchCommandParseError::Unknown { .. })
-        | Err(DispatchCommandParseError::NotASlashCommand)
+        Err(DispatchCommandParseError::Unknown { .. }) => {
+            return expand_prompt_template_or_fallthrough(app, agent, input);
+        }
+        Err(DispatchCommandParseError::NotASlashCommand)
         | Err(DispatchCommandParseError::Empty) => return false,
         // Required-arg failures preserve the pre-refactor `usage:`
         // strings so the visible affordance is unchanged.
@@ -1994,6 +2001,32 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &mut Agent, input: &str) 
     }
 
     apply_dispatch_command(app, agent, cmd).await;
+    true
+}
+
+/// Attempt to resolve an unknown `/foo …` head against the user-
+/// authored prompt-template catalog. On a hit the rendered body is
+/// routed through the normal user-turn flow (echo + history + queue
+/// or start) so the model sees the expanded prompt; on a miss this
+/// returns `false` so the legacy "unknown command" path runs and the
+/// input becomes a regular user prompt.
+///
+/// Templates take precedence only over the *unknown* slot — built-in
+/// `DispatchCommand` heads (e.g. `/help`, `/diff`) cannot be shadowed
+/// by a same-named template file so muscle memory keeps working.
+fn expand_prompt_template_or_fallthrough(app: &mut TuiApp, agent: &mut Agent, input: &str) -> bool {
+    let Some(expanded) = app.prompt_templates.expand(input) else {
+        return false;
+    };
+    app.push_slash_command_echo(input);
+    if app.turn_rx.is_some() {
+        app.prompt_queue.push_back(expanded);
+        app.status = format!("queued ({})", app.prompt_queue.len());
+        return true;
+    }
+    app.cancelled_prompt = Some(expanded.clone());
+    push_input_history(app, expanded.clone());
+    start_user_turn(app, agent, expanded);
     true
 }
 
@@ -10344,6 +10377,12 @@ pub(crate) struct TuiApp {
     /// the topmost (later-rendered) hit wins. Cleared at the start of
     /// every draw via `begin_frame_clickables`.
     pub(crate) clickables: std::cell::RefCell<Vec<Clickable>>,
+    /// User-authored slash macros loaded from `~/.squeezy/prompts/` and
+    /// `<workspace>/.squeezy/prompts/`. Consulted by
+    /// [`handle_slash_command`] when the typed head isn't a built-in
+    /// `DispatchCommand`; a match expands the template body and routes
+    /// it through [`start_user_turn`] like any other typed prompt.
+    pub(crate) prompt_templates: PromptTemplateCatalog,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10606,6 +10645,7 @@ impl TuiApp {
             auto_drain_queue: false,
             pending_chord: None,
             clickables: std::cell::RefCell::new(Vec::new()),
+            prompt_templates: PromptTemplateCatalog::discover(&config.workspace_root),
         }
     }
 
