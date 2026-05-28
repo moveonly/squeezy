@@ -90,11 +90,12 @@ impl OpenAiCompatibleProvider {
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
         // Anthropic-via-aggregator routes accept the same ephemeral
         // cache_control markers as the native Anthropic API. We attach them
-        // when the caller has supplied a cache_key and the destination model
-        // is namespaced under `anthropic/` (covers OpenRouter, Vercel AI
-        // Gateway, and any other aggregator that uses that namespace
-        // convention). Without this the aggregator route reports zero cached
-        // tokens, which silently inflates cost vs. a direct vendor call.
+        // when the caller has supplied a cache_key and the destination
+        // model classifies as an Anthropic-compatible flavor in the
+        // [`COMPAT_TABLE`] (covers OpenRouter, Vercel AI Gateway, and any
+        // other aggregator that exposes the `anthropic/` namespace).
+        // Without this the aggregator route reports zero cached tokens,
+        // which silently inflates cost vs. a direct vendor call.
         let cache_control =
             if request.cache_key.is_some() && supports_anthropic_caching(&request.model) {
                 Some(json!({ "type": "ephemeral" }))
@@ -210,13 +211,144 @@ impl OpenAiCompatibleProvider {
     }
 }
 
+/// Coarse classification of an OpenAI-compatible model namespace.
+///
+/// The Chat-Completions transport speaks one wire shape, but each upstream
+/// vendor has small quirks (Anthropic-style `cache_control` markers,
+/// `reasoning_effort` shapes, etc.). Branching on a typed flavor instead of
+/// re-running `model.starts_with("anthropic/")` everywhere keeps the matrix
+/// reviewable and makes adding a new aggregator namespace a one-line edit
+/// to [`COMPAT_TABLE`].
+///
+/// `OpenAi`, `GoogleCompat`, `XaiCompat`, and `Generic` are descriptive
+/// today — production code only branches on `AnthropicCompat` via the
+/// `supports_cache_control` flag — but exposed so the next per-vendor
+/// branch in `request_body` has a typed slot to attach to instead of
+/// growing a fresh `starts_with` test.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompatFlavor {
+    /// Vanilla OpenAI completions/responses shape (`openai/*` via an
+    /// aggregator). Honors `prompt_cache_key`, `reasoning_effort`.
+    OpenAi,
+    /// Anthropic `/v1/messages`-style shape proxied over chat-completions
+    /// (`anthropic/*`). Honors ephemeral `cache_control` markers on text
+    /// blocks and the system prompt.
+    AnthropicCompat,
+    /// Google Gemini routed via an OpenAI-compatible aggregator
+    /// (`google/*`).
+    GoogleCompat,
+    /// xAI Grok routed via an OpenAI-compatible aggregator (`xai/*`).
+    XaiCompat,
+    /// Unknown namespace. Treated as best-effort: no cache markers, no
+    /// vendor-specific flags. Matches the historical default for any model
+    /// id that did not start with a recognized prefix.
+    Generic,
+}
+
+/// Per-namespace compatibility row. The struct mirrors pi's
+/// `OpenAICompletionsCompat` interface (`others/pi/packages/ai/src/types.ts`)
+/// in spirit: a typed set of capability flags that drive wire-shape choices
+/// without scattering substring tests across the request builder.
+///
+/// `flavor`, `supports_tool_calls`, and `supports_reasoning` are read by
+/// the unit tests in `compatible_tests.rs` and exposed for the next
+/// per-vendor branch to consume; production code today only reads
+/// `supports_cache_control`. The `#[allow(dead_code)]` keeps the typed
+/// surface intact without lying about which fields are wired up.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct CompatEntry {
+    /// Lowercase model-id prefix. Matched against `model.to_ascii_lowercase()`
+    /// so user-supplied casing does not bypass the table.
+    pub model_prefix: &'static str,
+    pub flavor: CompatFlavor,
+    /// Function-calling support. Today every recognized flavor supports
+    /// tools; the flag is here so future entries (e.g. a tool-less namespace)
+    /// can be declared without breaking the table shape.
+    pub supports_tool_calls: bool,
+    /// Whether the aggregator forwards Anthropic-style ephemeral
+    /// `cache_control` markers on text content parts. Drives the
+    /// `supports_anthropic_caching` decision in [`OpenAiCompatibleProvider::request_body`].
+    pub supports_cache_control: bool,
+    /// Whether models in this namespace honor `reasoning_effort` /
+    /// `reasoning.effort`. Currently descriptive only — the request builder
+    /// emits both shapes unconditionally because aggregators ignore unknown
+    /// fields — but exposed here so future per-flavor branching has a
+    /// single place to consult.
+    pub supports_reasoning: bool,
+}
+
+/// Single source of truth for OpenAI-compatible namespace quirks. Order
+/// matters: the table is walked top-to-bottom and the first prefix match
+/// wins, so list more-specific aggregator prefixes (e.g. a future
+/// `openrouter/anthropic/`) before broader vendor prefixes.
+///
+/// Adding a new aggregator namespace is a one-line edit: append a row and
+/// no further changes are needed in `request_body` or the stream path.
+pub(crate) static COMPAT_TABLE: &[CompatEntry] = &[
+    CompatEntry {
+        model_prefix: "anthropic/",
+        flavor: CompatFlavor::AnthropicCompat,
+        supports_tool_calls: true,
+        supports_cache_control: true,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "openai/",
+        flavor: CompatFlavor::OpenAi,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "google/",
+        flavor: CompatFlavor::GoogleCompat,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+    CompatEntry {
+        model_prefix: "xai/",
+        flavor: CompatFlavor::XaiCompat,
+        supports_tool_calls: true,
+        supports_cache_control: false,
+        supports_reasoning: true,
+    },
+];
+
+/// Classify a model id into a [`CompatFlavor`]. Returns
+/// [`CompatFlavor::Generic`] for any namespace not represented in
+/// [`COMPAT_TABLE`], preserving the historical "fall through with best-effort
+/// defaults" behavior. Today this is exercised by the unit tests and is the
+/// recommended entry point for adding the next per-vendor branch — production
+/// code currently reads the more specific `supports_cache_control` flag
+/// directly via [`compat_entry`].
+#[allow(dead_code)]
+pub(crate) fn classify(model: &str) -> CompatFlavor {
+    compat_entry(model)
+        .map(|entry| entry.flavor)
+        .unwrap_or(CompatFlavor::Generic)
+}
+
+/// Look up the full [`CompatEntry`] for a model id, or `None` when no
+/// prefix in [`COMPAT_TABLE`] matches.
+pub(crate) fn compat_entry(model: &str) -> Option<&'static CompatEntry> {
+    let lowered = model.to_ascii_lowercase();
+    COMPAT_TABLE
+        .iter()
+        .find(|entry| lowered.starts_with(entry.model_prefix))
+}
+
+/// Whether the destination model honors Anthropic-style ephemeral
+/// `cache_control` markers on text content parts. The decision is read
+/// directly from [`COMPAT_TABLE`] so this file no longer carries an
+/// ad-hoc `starts_with("anthropic/")` substring test — see F11.
+///
+/// Direct Anthropic calls do not go through this client (the native
+/// Anthropic provider handles them with its own cache markers).
 fn supports_anthropic_caching(model: &str) -> bool {
-    // Aggregator routes that proxy Anthropic models use a `vendor/model`
-    // namespace; OpenRouter's docs treat the `anthropic/` prefix as the
-    // signal to enable cache_control. We mirror that. Direct Anthropic calls
-    // do not go through this client (the native Anthropic provider handles
-    // them with its own cache markers).
-    model.to_ascii_lowercase().starts_with("anthropic/")
+    compat_entry(model).is_some_and(|entry| entry.supports_cache_control)
 }
 
 impl LlmProvider for OpenAiCompatibleProvider {

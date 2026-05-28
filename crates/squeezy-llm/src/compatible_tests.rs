@@ -625,6 +625,98 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 }
 
 #[test]
+fn classify_recognizes_known_namespaces() {
+    // The typed compat table is the single source of truth for namespace
+    // → wire-shape decisions. Every known vendor prefix must classify to
+    // its declared flavor so adding/expanding an aggregator only requires
+    // a row in COMPAT_TABLE, not a fresh substring test in request_body.
+    assert_eq!(
+        classify("anthropic/claude-opus-4-7"),
+        CompatFlavor::AnthropicCompat,
+    );
+    assert_eq!(classify("openai/gpt-5.5"), CompatFlavor::OpenAi);
+    assert_eq!(
+        classify("google/gemini-2.5-pro"),
+        CompatFlavor::GoogleCompat
+    );
+    assert_eq!(classify("xai/grok-4"), CompatFlavor::XaiCompat);
+}
+
+#[test]
+fn classify_is_case_insensitive() {
+    // User-supplied model strings (config files, env overrides) can show
+    // up with arbitrary casing. The match runs against the lowercased
+    // form so casing never silently disables a capability flag.
+    assert_eq!(
+        classify("Anthropic/Claude-Opus-4-7"),
+        CompatFlavor::AnthropicCompat,
+    );
+    assert_eq!(classify("OPENAI/GPT-5.5"), CompatFlavor::OpenAi);
+}
+
+#[test]
+fn classify_falls_back_to_generic_for_unknown_namespace() {
+    // Unknown namespaces (custom self-hosted ids, brand-new aggregators)
+    // must fall through to Generic instead of crashing or accidentally
+    // picking up Anthropic-style cache markers. Mirrors pi's behavior in
+    // `others/pi/packages/ai/src/types.ts` where compat overrides default
+    // to "ignore" rather than "panic" for unknown providers.
+    assert_eq!(classify("groq/llama-3.3-70b"), CompatFlavor::Generic);
+    assert_eq!(classify("custom-self-hosted-model"), CompatFlavor::Generic);
+    assert_eq!(classify(""), CompatFlavor::Generic);
+}
+
+#[test]
+fn compat_entry_exposes_capability_flags_for_anthropic() {
+    // Reading the entry directly is the typed alternative to
+    // `model.starts_with("anthropic/")`. Callers that need the cache
+    // flag specifically can branch on the bool without re-deriving the
+    // namespace.
+    let entry =
+        compat_entry("anthropic/claude-3.7-sonnet").expect("anthropic/ prefix must classify");
+    assert_eq!(entry.flavor, CompatFlavor::AnthropicCompat);
+    assert!(entry.supports_cache_control);
+    assert!(entry.supports_tool_calls);
+    assert!(entry.supports_reasoning);
+}
+
+#[test]
+fn compat_entry_marks_non_anthropic_namespaces_as_cache_disabled() {
+    // Behavior parity with the legacy `starts_with("anthropic/")`
+    // substring test: every non-Anthropic namespace must report
+    // `supports_cache_control == false` so request_body never attaches
+    // ephemeral cache markers to a route that would silently drop them.
+    for model in [
+        "openai/gpt-5.5",
+        "google/gemini-2.5-pro",
+        "xai/grok-4",
+        "groq/llama-3.3-70b",
+        "unknown",
+    ] {
+        let cache_control = compat_entry(model).is_some_and(|e| e.supports_cache_control);
+        assert!(
+            !cache_control,
+            "{model} must not opt into anthropic cache_control",
+        );
+    }
+}
+
+#[test]
+fn compat_table_prefixes_are_lowercase() {
+    // Invariant: prefixes must be stored lowercased because lookup
+    // lowercases the input. A capitalized prefix in the table would
+    // silently never match and the row would become dead code.
+    for entry in COMPAT_TABLE {
+        assert_eq!(
+            entry.model_prefix,
+            entry.model_prefix.to_ascii_lowercase(),
+            "compat-table prefix must be lowercase: {}",
+            entry.model_prefix,
+        );
+    }
+}
+
+#[test]
 fn preset_full_tier_matches_documented_set() {
     let full: Vec<_> = OpenAiCompatiblePreset::all()
         .iter()
