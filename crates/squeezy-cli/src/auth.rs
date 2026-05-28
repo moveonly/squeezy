@@ -11,10 +11,14 @@ use squeezy_core::{
     settings_writer::{EditOp, SettingsEdit, SettingsScope, apply_edits},
 };
 use squeezy_llm::{
-    AnthropicLoginConfig, AnthropicOAuthSource, OpenAiCodexLoginOutcome, PersistedTokens,
-    codex_auth_file_path, exchange_authorization_code, generate_pkce,
-    login_openai_codex_interactive, parse_authorization_input,
+    AnthropicLoginConfig, AnthropicOAuthSource, DEFAULT_POLICY_MODELS,
+    GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
+    OpenAiCodexLoginOutcome, PersistedTokens, codex_auth_file_path, exchange_authorization_code,
+    generate_pkce, github_copilot_auth_file_path, github_copilot_read_tokens,
+    login_github_copilot_interactive, login_openai_codex_interactive, normalize_github_domain,
+    parse_authorization_input,
 };
+use tokio_util::sync::CancellationToken;
 
 /// Every `[providers.<section>]` name that can carry an inline `api_key`,
 /// paired with the CLI alias used in error messages. Order is the
@@ -186,6 +190,14 @@ pub enum AuthCommand {
         #[command(subcommand)]
         command: OpenAiCodexCommand,
     },
+    #[command(
+        name = "github-copilot",
+        about = "GitHub Copilot subscription OAuth (device code) and per-model policy"
+    )]
+    GitHubCopilot {
+        #[command(subcommand)]
+        command: GitHubCopilotCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +222,41 @@ pub enum OpenAiCodexCommand {
     Logout,
     #[command(about = "Show whether a Codex token is currently persisted")]
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GitHubCopilotCommand {
+    #[command(about = "Run the device-code OAuth flow and persist the Copilot Chat API tokens")]
+    Login(GitHubCopilotLoginArgs),
+    #[command(about = "Remove the persisted Copilot tokens (sign out)")]
+    Logout,
+    #[command(about = "Show whether Copilot tokens are persisted and how long they're valid")]
+    Status,
+}
+
+#[derive(Debug, Args, Default)]
+pub struct GitHubCopilotLoginArgs {
+    /// Optional GitHub Enterprise hostname (e.g. `acme.ghe.com`). Leave
+    /// empty for the standard `github.com` account.
+    #[arg(long, help = "GitHub Enterprise hostname; leave unset for github.com")]
+    pub enterprise_domain: Option<String>,
+    /// Skip the best-effort browser launch and only print the
+    /// verification URI. Useful in headless or SSH sessions.
+    #[arg(long, help = "Do not try to launch a browser; just print the URL")]
+    pub no_browser: bool,
+    /// Skip the per-model policy-enablement step entirely. Off by
+    /// default so a fresh login also flips the per-user "enabled"
+    /// gates GitHub requires for the curated model list.
+    #[arg(long, help = "Skip the post-login per-model policy POSTs")]
+    pub skip_policy: bool,
+    /// Override the model list whose policy gates get flipped after
+    /// login. Comma-separated; defaults to [`DEFAULT_POLICY_MODELS`].
+    #[arg(
+        long,
+        value_name = "MODELS",
+        help = "Comma-separated model ids to enable (default: curated bundle)"
+    )]
+    pub models: Option<String>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -289,6 +336,7 @@ pub async fn handle_auth_command(command: &AuthCommand) -> squeezy_core::Result<
         AuthCommand::Status(args) => handle_auth_status(args),
         AuthCommand::Anthropic { command } => handle_anthropic_oauth(command).await,
         AuthCommand::OpenAiCodex { command } => handle_openai_codex_command(command),
+        AuthCommand::GitHubCopilot { command } => handle_github_copilot_command(command),
     }
 }
 
@@ -415,6 +463,200 @@ fn handle_openai_codex_status() -> squeezy_core::Result<()> {
         None => {
             println!(
                 "no codex token at {} — run `squeezy auth openai-codex login`",
+                auth_path.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+fn handle_github_copilot_command(command: &GitHubCopilotCommand) -> squeezy_core::Result<()> {
+    match command {
+        GitHubCopilotCommand::Login(args) => handle_github_copilot_login(args),
+        GitHubCopilotCommand::Logout => handle_github_copilot_logout(),
+        GitHubCopilotCommand::Status => handle_github_copilot_status(),
+    }
+}
+
+fn handle_github_copilot_login(args: &GitHubCopilotLoginArgs) -> squeezy_core::Result<()> {
+    let auth_path = github_copilot_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_GITHUB_COPILOT_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    let enterprise_domain = match args.enterprise_domain.as_deref() {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(normalize_github_domain(trimmed).ok_or_else(|| {
+                    SqueezyError::Config(format!(
+                        "invalid GitHub Enterprise URL/domain `{trimmed}`"
+                    ))
+                })?)
+            }
+        }
+        None => None,
+    };
+
+    // Owned policy-model strings, materialized outside the async block
+    // so the `&[&str]` we hand to the login orchestrator borrows from a
+    // value with a known lifetime.
+    let policy_models_owned: Vec<String> = match args.models.as_deref() {
+        Some(raw) => raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => DEFAULT_POLICY_MODELS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
+    };
+
+    let no_browser = args.no_browser;
+    let skip_policy = args.skip_policy;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| SqueezyError::Config(format!("tokio runtime build failed: {err}")))?;
+
+    let on_device_code = move |device: &GitHubCopilotDeviceCodeResponse| {
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(stderr, "Open this URL to authorize squeezy on GitHub:");
+        let _ = writeln!(stderr);
+        let _ = writeln!(stderr, "    {}", device.verification_uri);
+        let _ = writeln!(stderr);
+        let _ = writeln!(stderr, "Enter the device code: {}", device.user_code);
+        let _ = writeln!(stderr);
+        let interval = device.interval.unwrap_or(5);
+        let _ = writeln!(
+            stderr,
+            "(polling every ~{interval}s; the prompt expires in {expires}s)",
+            expires = device.expires_in
+        );
+    };
+    let on_browser_open = move |url: &str| {
+        if no_browser {
+            eprintln!("--no-browser: not launching a browser; waiting for authorization…");
+            return;
+        }
+        match open_browser(url) {
+            Ok(()) => eprintln!("Browser launched. Waiting for authorization…"),
+            Err(err) => eprintln!(
+                "Could not launch browser ({err}). Open the URL above manually and authorize the device code."
+            ),
+        }
+    };
+    let on_progress = move |message: &str| {
+        eprintln!("{message}");
+    };
+
+    let outcome: GitHubCopilotLoginOutcome = runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        let model_refs: Vec<&str> = policy_models_owned.iter().map(String::as_str).collect();
+        let hooks = GitHubCopilotLoginHooks {
+            on_device_code: &on_device_code,
+            on_browser_open: &on_browser_open,
+            on_progress: &on_progress,
+        };
+        login_github_copilot_interactive(
+            enterprise_domain.as_deref(),
+            &auth_path,
+            &hooks,
+            &cancel,
+            skip_policy,
+            &model_refs,
+        )
+        .await
+    })?;
+
+    let expires_in = expires_in_human(outcome.expires_at_unix_ms);
+    let domain_label = outcome.enterprise_domain.as_deref().unwrap_or("github.com");
+    println!(
+        "signed in to GitHub Copilot ({}); token saved to {}{}",
+        domain_label,
+        outcome.auth_file.display(),
+        expires_in
+            .map(|s| format!("; copilot token valid for ~{s}"))
+            .unwrap_or_default()
+    );
+    if !outcome.policy_outcomes.is_empty() {
+        let total = outcome.policy_outcomes.len();
+        let enabled = outcome.policy_outcomes.iter().filter(|o| o.success).count();
+        println!("models with policy enabled: {enabled}/{total}");
+        for entry in &outcome.policy_outcomes {
+            let label = if entry.success { "ok" } else { "skipped" };
+            println!("  [{label}] {}", entry.model_id);
+        }
+    } else if skip_policy {
+        println!("(--skip-policy: did not flip per-model policy gates)");
+    }
+    Ok(())
+}
+
+fn handle_github_copilot_logout() -> squeezy_core::Result<()> {
+    let auth_path = github_copilot_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_GITHUB_COPILOT_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    match std::fs::remove_file(&auth_path) {
+        Ok(()) => {
+            println!("removed github-copilot tokens at {}", auth_path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            println!("no github-copilot tokens at {}", auth_path.display());
+            Ok(())
+        }
+        Err(err) => Err(SqueezyError::Config(format!(
+            "could not remove {}: {err}",
+            auth_path.display()
+        ))),
+    }
+}
+
+fn handle_github_copilot_status() -> squeezy_core::Result<()> {
+    let auth_path = github_copilot_auth_file_path().ok_or_else(|| {
+        SqueezyError::Config(
+            "could not determine ~/.squeezy auth directory; \
+             set SQUEEZY_GITHUB_COPILOT_AUTH_FILE or HOME"
+                .to_string(),
+        )
+    })?;
+    match github_copilot_read_tokens(&auth_path)? {
+        Some(tokens) => {
+            let domain = tokens.enterprise_domain.as_deref().unwrap_or("github.com");
+            let expires_in = expires_in_human(tokens.expires_at_unix_ms);
+            println!(
+                "github-copilot token present at {} for {}{}",
+                auth_path.display(),
+                domain,
+                expires_in
+                    .map(|s| format!(" (copilot token valid for ~{s})"))
+                    .unwrap_or_else(|| {
+                        " (copilot token expired; will refresh on next request)".to_string()
+                    })
+            );
+            println!(
+                "  github_token: {}",
+                redact_oauth_token(&tokens.github_token)
+            );
+            println!(
+                "  copilot_token: {}",
+                redact_oauth_token(&tokens.copilot_token)
+            );
+            Ok(())
+        }
+        None => {
+            println!(
+                "no github-copilot tokens at {} — run `squeezy auth github-copilot login`",
                 auth_path.display()
             );
             Ok(())

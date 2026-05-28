@@ -71,14 +71,22 @@ pub use model_discovery::{
 };
 pub use oauth::{
     ANTHROPIC_OAUTH_TOKEN_PREFIX, AnthropicLoginConfig, AnthropicOAuthSource,
+    DEFAULT_POLICY_MODELS, DevicePollOutcome, GITHUB_COPILOT_AUTH_FILE_NAME,
+    GitHubCopilotDeviceCodeResponse, GitHubCopilotLoginHooks, GitHubCopilotLoginOutcome,
+    GitHubCopilotOAuthSource, GitHubCopilotProvider, GitHubCopilotUrls,
     OPENAI_CODEX_AUTH_FILE_NAME, OpenAiCodexLoginOutcome, OpenAiCodexOAuthSource,
-    OpenAiCodexProvider, PersistedTokens, PkceCodes, TokenResponse,
+    OpenAiCodexProvider, PersistedGitHubCopilotTokens, PersistedTokens, PkceCodes,
+    PolicyEnablementOutcome, TokenResponse,
     anthropic_default_storage_path as oauth_anthropic_default_storage_path,
     anthropic_oauth_beta_header, anthropic_read_tokens as oauth_anthropic_read_tokens,
     anthropic_write_tokens as oauth_anthropic_write_tokens, codex_auth_file_path,
-    default_codex_auth_path, exchange_authorization_code, generate_pkce, is_anthropic_oauth_token,
-    load_codex_token, login_openai_codex_interactive, parse_authorization_input,
-    refresh_anthropic_token, save_codex_token,
+    default_codex_auth_path, default_github_copilot_auth_path, enable_copilot_models,
+    exchange_authorization_code, generate_pkce, github_copilot_auth_file_path,
+    github_copilot_base_url_from_token, github_copilot_read_tokens, github_copilot_write_tokens,
+    is_anthropic_oauth_token, load_codex_token, login_github_copilot_interactive,
+    login_openai_codex_interactive, normalize_github_domain, parse_authorization_input,
+    poll_for_github_token, refresh_anthropic_token, refresh_copilot_token,
+    resolve_github_copilot_base_url, save_codex_token, start_github_copilot_device_flow,
 };
 pub use ollama::{
     OllamaProvider, PullEvent, PullStream, fetch_ollama_context_window, fetch_ollama_model_names,
