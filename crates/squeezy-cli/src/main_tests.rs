@@ -252,3 +252,285 @@ fn cli_continue_and_session_are_mutually_exclusive() {
         err.kind()
     );
 }
+
+/// Scripted `LlmProvider` used by the print-mode tool-loop tests.  Each
+/// `stream_response` call drains the next pre-baked event list, so a
+/// test can simulate "first round emits a tool call, second round emits
+/// the final answer" against a real `Agent::new` instance — which is
+/// the only way to verify that print mode now sees the same tool
+/// registry as interactive mode.
+struct PrintModeScriptedProvider {
+    name: &'static str,
+    responses: std::sync::Mutex<std::collections::VecDeque<Vec<squeezy_llm::LlmEvent>>>,
+}
+
+impl PrintModeScriptedProvider {
+    fn new(responses: Vec<Vec<squeezy_llm::LlmEvent>>) -> Self {
+        Self {
+            name: "print-mode-scripted",
+            responses: std::sync::Mutex::new(responses.into()),
+        }
+    }
+}
+
+impl squeezy_llm::LlmProvider for PrintModeScriptedProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn stream_response(
+        &self,
+        _request: squeezy_llm::LlmRequest,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> squeezy_llm::LlmStream {
+        let events = self
+            .responses
+            .lock()
+            .expect("scripted responses")
+            .pop_front()
+            .expect("scripted response present");
+        let mapped = events
+            .into_iter()
+            .map(Ok::<_, squeezy_core::SqueezyError>)
+            .collect::<Vec<_>>();
+        let stream: std::pin::Pin<
+            Box<
+                dyn futures_core::Stream<Item = squeezy_core::Result<squeezy_llm::LlmEvent>> + Send,
+            >,
+        > = Box::pin(futures_util::stream::iter(mapped));
+        stream
+    }
+}
+
+fn print_mode_test_config(workspace_root: PathBuf) -> AppConfig {
+    AppConfig {
+        workspace_root,
+        permissions: squeezy_core::PermissionPolicy {
+            edit: squeezy_core::PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn print_mode_runs_tools_through_agent_loop_in_text_mode() {
+    // This is the load-bearing regression test for F07: print mode used
+    // to advertise zero tools, so any `read_file` request the model
+    // emitted vanished into "tool call requested but prompt mode has no
+    // tools". Building the same `Agent` interactive mode uses must now
+    // actually drive the tool — observe that by checking the file
+    // contents flow back to the model's second-round assistant text.
+    let root = temp_dir("print-mode-text");
+    fs::write(root.join("README.md"), "# squeezy readme\n").expect("write readme");
+
+    let provider = Arc::new(PrintModeScriptedProvider::new(vec![
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::ToolCall(squeezy_llm::LlmToolCall {
+                call_id: "read_readme".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_round_1".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::TextDelta("Title: # squeezy readme".to_string()),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_round_final".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+    ]));
+
+    let config = print_mode_test_config(root.clone());
+    let agent = Agent::new(config, provider);
+    let rx = agent.start_turn(
+        "read README.md and tell me the title".to_string(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
+        .await
+        .expect("print-mode turn completes");
+
+    let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+
+    assert!(
+        stdout_text.contains("Title: # squeezy readme"),
+        "stdout should carry the final assistant text; got: {stdout_text:?}"
+    );
+    assert!(
+        stderr_text.contains("read_file"),
+        "stderr should announce the read_file call; got: {stderr_text:?}"
+    );
+    assert!(
+        stderr_text.contains("-> ok"),
+        "stderr should show a successful tool status; got: {stderr_text:?}"
+    );
+    assert!(
+        stderr_text.contains("tokens:"),
+        "stderr should print the cost summary on completion; got: {stderr_text:?}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn print_mode_emits_tool_events_as_jsonl() {
+    // Same flow as the text-mode regression test, but verifies the
+    // experimental `--format json` schema picked up tool events.  Each
+    // newline-delimited object must be a valid `PromptWireEvent`; the
+    // `tool_call_started` / `tool_call_completed` entries are the
+    // user-visible contract that print mode now has tools.
+    let root = temp_dir("print-mode-json");
+    fs::write(root.join("README.md"), "# squeezy readme\n").expect("write readme");
+
+    let provider = Arc::new(PrintModeScriptedProvider::new(vec![
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::ToolCall(squeezy_llm::LlmToolCall {
+                call_id: "read_readme".to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({"path": "README.md"}),
+            }),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_round_1".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+        vec![
+            squeezy_llm::LlmEvent::Started,
+            squeezy_llm::LlmEvent::TextDelta("done".to_string()),
+            squeezy_llm::LlmEvent::completed(
+                Some("resp_round_final".to_string()),
+                squeezy_core::CostSnapshot::default(),
+            ),
+        ],
+    ]));
+
+    let config = print_mode_test_config(root.clone());
+    let agent = Agent::new(config, provider);
+    let rx = agent.start_turn(
+        "read README.md".to_string(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(rx, PromptFormat::Json, &mut stdout, &mut stderr)
+        .await
+        .expect("print-mode JSON turn completes");
+
+    let stdout_text = String::from_utf8(stdout).expect("utf-8 stdout");
+    let mut types = Vec::new();
+    let mut saw_tool_started = false;
+    let mut saw_tool_completed = false;
+    for line in stdout_text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("non-JSON line {line:?}: {err}"));
+        let ty = value["type"].as_str().expect("type tag").to_string();
+        if ty == "tool_call_started" {
+            saw_tool_started = true;
+            assert_eq!(value["data"]["name"], "read_file");
+            assert_eq!(value["data"]["call_id"], "read_readme");
+        }
+        if ty == "tool_call_completed" {
+            saw_tool_completed = true;
+            assert_eq!(value["data"]["tool_name"], "read_file");
+            assert_eq!(value["data"]["status"], "Success");
+        }
+        types.push(ty);
+    }
+    assert!(
+        saw_tool_started,
+        "expected a tool_call_started event; saw {types:?}"
+    );
+    assert!(
+        saw_tool_completed,
+        "expected a tool_call_completed event; saw {types:?}"
+    );
+    assert!(
+        types.iter().any(|t| t == "completed"),
+        "expected a final completed event; saw {types:?}",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn print_mode_auto_approves_ask_capability_so_ci_does_not_hang() {
+    // Permission policy with `shell = Ask` would have stalled the CLI
+    // forever waiting for an operator in print mode; the auto-approval
+    // path in `pump_prompt_events` is what unblocks scripted callers.
+    // Exercising the approval channel directly keeps this test fast
+    // (no real shell process) while still proving the wiring.
+    use squeezy_agent::{ToolApprovalDecision, ToolApprovalRequest};
+    use squeezy_core::{PermissionCapability, PermissionRequest, PermissionRisk, PermissionScope};
+
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+
+    let permission = PermissionRequest {
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        capability: PermissionCapability::Shell,
+        target: "echo hi".to_string(),
+        risk: PermissionRisk::Medium,
+        summary: "echo hi".to_string(),
+        metadata: Default::default(),
+        suggested_rules: Vec::new(),
+    };
+    let request = ToolApprovalRequest {
+        id: 1,
+        call_id: "shell_call".to_string(),
+        tool_name: "shell".to_string(),
+        scope: PermissionScope::Shell,
+        permission,
+        matched_rule: None,
+        reason: "default shell permission is ask".to_string(),
+        context: None,
+        preview: Vec::new(),
+    };
+    tx.send(squeezy_agent::AgentEvent::ApprovalRequested {
+        turn_id: squeezy_core::TurnId::new(0),
+        request,
+        decision_tx,
+    })
+    .await
+    .expect("send approval request");
+    tx.send(squeezy_agent::AgentEvent::Completed {
+        turn_id: squeezy_core::TurnId::new(0),
+        message: squeezy_core::TranscriptItem::assistant(String::new()),
+        response_id: None,
+        cost: squeezy_core::CostSnapshot::default(),
+        metrics: squeezy_core::TurnMetrics::default(),
+        context_estimate: squeezy_core::ContextEstimate::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })
+    .await
+    .expect("send completed");
+    drop(tx);
+
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    pump_prompt_events(rx, PromptFormat::Default, &mut stdout, &mut stderr)
+        .await
+        .expect("pump completes");
+
+    let decision = decision_rx.await.expect("approval decided");
+    assert!(matches!(decision, ToolApprovalDecision::AllowOnce));
+    let stderr_text = String::from_utf8(stderr).expect("utf-8 stderr");
+    assert!(
+        stderr_text.contains("auto-approving shell"),
+        "stderr should announce the auto-approval; got: {stderr_text:?}"
+    );
+}

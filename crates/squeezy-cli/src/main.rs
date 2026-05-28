@@ -9,17 +9,16 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use futures_util::StreamExt;
-use squeezy_agent::Agent;
+use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport, ModelProfile,
-    OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
-    ResponseVerbosity, SessionMode, SettingsFile, SqueezyError, default_settings_path,
-    find_project_settings_path, project_settings_template, user_settings_template,
+    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
+    ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
+    SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
+    project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, ModelInfo, PROVIDERS, UnavailableProvider,
-    capabilities_for, fetch_ollama_model_names, models_for_provider, provider_from_config,
+    LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
+    fetch_ollama_model_names, models_for_provider, provider_from_config,
 };
 
 mod auth;
@@ -31,13 +30,14 @@ use auth::handle_auth_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, CleanupMode, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent,
-    SessionMetadata, SessionQuery, SessionResumeState, SessionStatus, SessionStore,
-    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
+    SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
+    parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
+use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -2031,221 +2031,240 @@ async fn run_prompts(
     format: PromptFormat,
     resume_session_id: Option<String>,
 ) -> squeezy_core::Result<()> {
-    let redactor = config.redaction.redactor()?;
-    let store = SessionStore::open(&config);
-    // When `--continue` or `--session` resolved to an existing session,
-    // append onto it instead of spawning a fresh row. The previous
-    // response id (if any) is fed back so a server-side conversation
-    // thread carries over even though prompt mode runs single-shot.
-    let (session, mut previous_response_id) = if let Some(id) = resume_session_id {
-        let handle = store.open_session(id);
-        let previous = store
-            .show(handle.session_id())
-            .ok()
-            .and_then(|record| record.resume_state)
-            .and_then(|state| state.previous_response_id);
-        (Some(handle), previous)
+    // Print mode used to skip the agent loop entirely and stream the
+    // provider response with `tools: []`, which meant the model couldn't
+    // call `read_file`, `apply_patch`, `bash`, MCP, or anything else. CI
+    // and scripted callers therefore got an LLM-only single-shot — not
+    // the agent they expected from `--prompt`. Routing through
+    // `Agent::new` / `Agent::resume` mirrors what the TUI does, so the
+    // same tool registry (semantic graph tools, file ops, shell, MCP,
+    // skills) is available; session persistence and redaction now live
+    // inside the agent and don't need to be re-implemented here.
+    let agent = if let Some(id) = resume_session_id {
+        Agent::resume(config, provider, &id)?.0
     } else {
-        (
-            store
-                .start_session(SessionMetadata::new(&config, provider.name()))
-                .ok(),
-            None,
-        )
+        Agent::new(config, provider)
     };
+    let rx = agent.start_turn(prompt, CancellationToken::new());
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = stdout.lock();
+    let mut stderr = stderr.lock();
+    pump_prompt_events(rx, format, &mut stdout, &mut stderr).await
+}
 
-    let redacted_instructions_full = redactor.redact(&config.instructions);
-    let mut total_redactions: u64 = redacted_instructions_full.redactions;
-    let redacted_instructions = redacted_instructions_full.text;
+/// Drive a single `Agent::start_turn` mpsc receiver to completion and
+/// surface the relevant events on `stdout`/`stderr`. Extracted so
+/// `main_tests.rs` can exercise the end-to-end print-mode wiring with
+/// captured writers and a scripted provider — verifying that print mode
+/// actually runs tools end-to-end.
+async fn pump_prompt_events<O, E>(
+    mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    format: PromptFormat,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> squeezy_core::Result<()>
+where
+    O: Write,
+    E: Write,
+{
+    let mut result: squeezy_core::Result<()> = Ok(());
+    let mut completed = false;
 
-    let mut conversation: Vec<ResumeItem> = Vec::with_capacity(prompts.len() * 2);
-    let mut transcript: Vec<squeezy_core::TranscriptItem> = Vec::with_capacity(prompts.len() * 2);
-    let mut total_cost = squeezy_core::CostSnapshot::default();
-    let mut total_output_bytes: u64 = 0;
-    let mut turns_completed: u64 = 0;
-    let mut stop_status = SessionStatus::Completed;
-
-    for prompt in prompts {
-        let redacted_prompt_full = redactor.redact(&prompt);
-        total_redactions = total_redactions.saturating_add(redacted_prompt_full.redactions);
-        let redacted_prompt = redacted_prompt_full.text;
-        if let Some(session) = &session {
-            let _ = session.append_event(SessionEvent::new(
-                "user_message",
-                None,
-                Some(redacted_prompt.clone()),
-                serde_json::json!({}),
-            ));
-        }
-        let request = LlmRequest {
-            model: Arc::from(config.model.as_str()),
-            instructions: Arc::from(redacted_instructions.clone()),
-            input: Arc::from(vec![LlmInputItem::UserText(redacted_prompt.clone())]),
-            max_output_tokens: config.max_output_tokens,
-            response_verbosity: request_response_verbosity(&config, provider.name()),
-            reasoning_effort: request_reasoning_effort(&config, provider.name()),
-            previous_response_id: previous_response_id.clone(),
-            cache_key: session
-                .as_ref()
-                .map(|session| format!("squeezy::{}", session.session_id())),
-            tools: Arc::from(Vec::new()),
-            store: config.store_responses,
-            tool_choice: None,
-            output_schema: None,
-            parallel_tool_calls: None,
-            beta_headers: std::sync::Arc::from(Vec::new()),
-        };
-        let mut stream = provider.stream_response(request, CancellationToken::new());
-        let mut stdout = io::stdout().lock();
-        let mut assistant = String::new();
-        let mut turn_response_id: Option<String> = None;
-        let mut turn_cost = squeezy_core::CostSnapshot::default();
-        let mut cancelled = false;
-
-        while let Some(event) = stream.next().await {
-            let event = event?;
-            if format == PromptFormat::Json {
-                // Emit one JSON object per line for every event. The schema is
-                // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
-                // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
-                // Newline-delimited so callers can `jq -c` or `read -r` line
-                // by line; flushing on every line keeps the pipe responsive
-                // when the consumer is a long-running script.
-                let line = serde_json::to_string(&event).map_err(|err| {
-                    SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
-                })?;
-                writeln!(stdout, "{line}")?;
-                stdout.flush()?;
+    while let Some(event) = rx.recv().await {
+        match event {
+            AgentEvent::Started { .. } if format == PromptFormat::Json => {
+                emit_prompt_event(stdout, &PromptWireEvent::Started)?;
             }
-            match event {
-                LlmEvent::Started => {}
-                LlmEvent::TextDelta(delta) => {
-                    assistant.push_str(&delta);
-                    if format == PromptFormat::Default {
-                        write!(stdout, "{delta}")?;
-                        stdout.flush()?;
+            AgentEvent::Started { .. } => {}
+            AgentEvent::AssistantDelta { delta, .. } => match format {
+                PromptFormat::Default => {
+                    write!(stdout, "{delta}")?;
+                    stdout.flush()?;
+                }
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::TextDelta(delta))?;
+                }
+            },
+            AgentEvent::ReasoningDelta { delta, .. } if format == PromptFormat::Json => {
+                emit_prompt_event(stdout, &PromptWireEvent::ReasoningDelta(delta))?;
+            }
+            AgentEvent::ReasoningDelta { .. } => {}
+            AgentEvent::ToolCallStarted { call, .. } => match format {
+                PromptFormat::Default => {
+                    let label = squeezy_tools::human_label_for_call(&call.name, &call.arguments);
+                    writeln!(stderr, "tool: {} {label}", call.name)?;
+                    stderr.flush()?;
+                }
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::ToolCallStarted(call))?;
+                }
+            },
+            AgentEvent::ToolCallCompleted {
+                result: tool_result,
+                ..
+            } => match format {
+                PromptFormat::Default => {
+                    writeln!(
+                        stderr,
+                        "tool: {} -> {}",
+                        tool_result.tool_name,
+                        tool_status_label(tool_result.status),
+                    )?;
+                    stderr.flush()?;
+                }
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::ToolCallCompleted(tool_result))?;
+                }
+            },
+            AgentEvent::ApprovalRequested {
+                request,
+                decision_tx,
+                ..
+            } => {
+                // There is nobody to prompt in print mode. The
+                // permission policy already filtered out the
+                // hard-default deny cases (read=Allow, edit=Allow),
+                // so anything that reaches here was flagged Ask by
+                // configuration. Approving once keeps CI moving;
+                // operators who want stricter control can set
+                // permission rules in settings.toml or pin Plan
+                // mode via `--mode plan`.
+                let tool_name = request.tool_name.clone();
+                let reason = request.reason.clone();
+                match format {
+                    PromptFormat::Default => {
+                        writeln!(stderr, "approval: auto-approving {tool_name} ({reason})")?;
+                        stderr.flush()?;
+                    }
+                    PromptFormat::Json => {
+                        emit_prompt_event(
+                            stdout,
+                            &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
+                        )?;
                     }
                 }
-                LlmEvent::ToolCall(tool_call) => {
-                    if format == PromptFormat::Default {
-                        eprintln!(
-                            "tool call requested but prompt mode has no tools: {}",
-                            tool_call.name
-                        );
-                    }
-                }
-                LlmEvent::Completed {
-                    response_id, cost, ..
-                } => {
-                    if format == PromptFormat::Default {
+                let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
+            }
+            AgentEvent::McpElicitationRequested { response_tx, .. } => {
+                let _ = response_tx.send(McpElicitationResponse::cancel());
+            }
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                let _ = response_tx.send(RequestUserInputResponse::cancelled());
+            }
+            AgentEvent::Completed {
+                response_id, cost, ..
+            } => {
+                completed = true;
+                match format {
+                    PromptFormat::Default => {
                         writeln!(stdout)?;
                         stdout.flush()?;
+                        writeln!(
+                            stderr,
+                            "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
+                            format_token(cost.input_tokens),
+                            format_token(cost.output_tokens),
+                            format_token(cost.cached_input_tokens),
+                            format_token(cost.cache_write_input_tokens),
+                            format_usd_micros(cost.estimated_usd_micros),
+                        )?;
+                        stderr.flush()?;
                     }
-                    turn_response_id = response_id;
-                    turn_cost = cost;
+                    PromptFormat::Json => {
+                        emit_prompt_event(
+                            stdout,
+                            &PromptWireEvent::Completed { response_id, cost },
+                        )?;
+                    }
                 }
-                LlmEvent::Cancelled => {
-                    if format == PromptFormat::Default {
-                        eprintln!("cancelled");
-                    }
-                    cancelled = true;
-                    break;
+                break;
+            }
+            AgentEvent::Failed { error, .. } => {
+                if format == PromptFormat::Json {
+                    let _ = emit_prompt_event(stdout, &PromptWireEvent::Failed(error.to_string()));
+                } else {
+                    let _ = writeln!(stderr, "error: {error}");
+                    let _ = stderr.flush();
+                }
+                result = Err(error);
+                break;
+            }
+            AgentEvent::Cancelled { .. } => {
+                if format == PromptFormat::Json {
+                    let _ = emit_prompt_event(stdout, &PromptWireEvent::Cancelled);
+                } else {
+                    let _ = writeln!(stderr, "cancelled");
+                    let _ = stderr.flush();
                 }
                 LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
             }
-        }
-        drop(stdout);
-
-        let redacted_assistant_full = redactor.redact(&assistant);
-        total_redactions = total_redactions.saturating_add(redacted_assistant_full.redactions);
-        let redacted_assistant = redacted_assistant_full.text;
-
-        if let Some(session) = &session {
-            let _ = session.append_event(SessionEvent::new(
-                "assistant_completed",
-                None,
-                Some(redacted_assistant.clone()),
-                serde_json::json!({ "response_id": turn_response_id, "cost": turn_cost }),
-            ));
-        }
-
-        conversation.push(ResumeItem::UserText {
-            text: redacted_prompt.clone(),
-        });
-        conversation.push(ResumeItem::AssistantText {
-            text: redacted_assistant.clone(),
-        });
-        transcript.push(squeezy_core::TranscriptItem::user(redacted_prompt));
-        transcript.push(squeezy_core::TranscriptItem::assistant(
-            redacted_assistant.clone(),
-        ));
-        total_output_bytes = total_output_bytes.saturating_add(redacted_assistant.len() as u64);
-        turns_completed = turns_completed.saturating_add(1);
-        previous_response_id = turn_response_id;
-        add_cost(&mut total_cost, &turn_cost);
-
-        if format == PromptFormat::Default {
-            eprintln!(
-                "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
-                format_token(turn_cost.input_tokens),
-                format_token(turn_cost.output_tokens),
-                format_token(turn_cost.cached_input_tokens),
-                format_token(turn_cost.cache_write_input_tokens),
-                format_usd_micros(turn_cost.estimated_usd_micros)
-            );
-        }
-
-        if cancelled {
-            stop_status = SessionStatus::Cancelled;
-            break;
+            // Bookkeeping events (job notifications, MCP status, cost
+            // updates, context compactions, sub-agent lifecycle, etc.)
+            // are silent in print mode. They are still recorded in the
+            // session log that the agent maintains internally, so
+            // `squeezy sessions show <id>` keeps the full record for
+            // post-mortem.
+            _ => {}
         }
     }
 
-    if let Some(session) = &session {
-        let _ = session.write_resume_state(&SessionResumeState {
-            resume_available: matches!(stop_status, SessionStatus::Completed),
-            previous_response_id: previous_response_id.clone(),
-            conversation,
-            transcript,
-            context_attachments: Vec::new(),
-            context_compaction: Default::default(),
-        });
-        let metrics = squeezy_core::SessionMetrics {
-            turns: turns_completed,
-            model_output_bytes: total_output_bytes,
-            redactions: total_redactions,
-            provider: total_cost.clone(),
-            ..squeezy_core::SessionMetrics::default()
-        };
-        let _ = session.finish(stop_status, total_cost.clone(), metrics, total_redactions);
+    if !completed && result.is_ok() && format == PromptFormat::Default {
+        // Receiver closed without a Completed event (e.g. the agent
+        // dropped the channel because the user hit Ctrl-C externally).
+        // Make sure stdout ends on a newline so the shell prompt is not
+        // glued to the last assistant token.
+        let _ = writeln!(stdout);
+        let _ = stdout.flush();
     }
+    result
+}
 
+/// Wire-friendly subset of `AgentEvent` used by `--prompt --format
+/// json`. Keeps the `{"type": ..., "data": ...}` tag/content shape that
+/// the previous `LlmEvent`-based stream documented; adds `tool_*` and
+/// `approval_auto_approved` entries so callers can observe the new
+/// tool-loop behaviour. Schema is still labeled experimental in the CLI
+/// help — additive changes are fine, but breaking ones should bump that
+/// disclaimer.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PromptWireEvent {
+    Started,
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolCallStarted(ToolCall),
+    ToolCallCompleted(ToolResult),
+    ApprovalAutoApproved {
+        tool_name: String,
+        reason: String,
+    },
+    Completed {
+        response_id: Option<String>,
+        cost: CostSnapshot,
+    },
+    Failed(String),
+    Cancelled,
+}
+
+fn emit_prompt_event<W: Write>(
+    writer: &mut W,
+    event: &PromptWireEvent,
+) -> squeezy_core::Result<()> {
+    let line = serde_json::to_string(event)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize prompt event: {err}")))?;
+    writeln!(writer, "{line}")?;
+    writer.flush()?;
     Ok(())
 }
 
-/// Sum two [`squeezy_core::CostSnapshot`] values component-wise so the
-/// session metrics still reflect the aggregate token / dollar spend when
-/// a single `squeezy --prompt` invocation queues several prompts.
-fn add_cost(total: &mut squeezy_core::CostSnapshot, next: &squeezy_core::CostSnapshot) {
-    total.input_tokens = add_optional(total.input_tokens, next.input_tokens);
-    total.output_tokens = add_optional(total.output_tokens, next.output_tokens);
-    total.reasoning_output_tokens =
-        add_optional(total.reasoning_output_tokens, next.reasoning_output_tokens);
-    total.cached_input_tokens = add_optional(total.cached_input_tokens, next.cached_input_tokens);
-    total.cache_write_input_tokens = add_optional(
-        total.cache_write_input_tokens,
-        next.cache_write_input_tokens,
-    );
-    total.estimated_usd_micros =
-        add_optional(total.estimated_usd_micros, next.estimated_usd_micros);
-}
-
-fn add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(a), Some(b)) => Some(a.saturating_add(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "ok",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
     }
 }
 
@@ -2278,22 +2297,6 @@ fn config_from_cli_provider(
         return AppConfig::from_env_and_settings();
     };
     AppConfig::from_env_and_settings_with_provider(provider)
-}
-
-fn request_response_verbosity(
-    config: &AppConfig,
-    provider_name: &str,
-) -> Option<ResponseVerbosity> {
-    capabilities_for(provider_name, &config.model)
-        .filter(|capabilities| capabilities.text_verbosity)
-        .map(|_| config.tui.response_verbosity)
-}
-
-fn request_reasoning_effort(config: &AppConfig, provider_name: &str) -> Option<ReasoningEffort> {
-    let effort = config.reasoning_effort?;
-    capabilities_for(provider_name, &config.model)
-        .filter(|capabilities| capabilities.reasoning_effort)
-        .map(|_| effort)
 }
 
 fn show_telemetry_notice_once(config: &AppConfig) {

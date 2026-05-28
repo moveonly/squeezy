@@ -2740,6 +2740,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dirs",
+ "futures-core",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
