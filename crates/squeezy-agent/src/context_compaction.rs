@@ -96,6 +96,24 @@ const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
 /// re-request the full body via `read_file` if needed.
 const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
 
+// --- FILE_LINEAGE family: per-session path map of read vs modified files ---
+
+/// Per-list cap on the `<read-files>` / `<modified-files>` blocks
+/// appended to the summary. Pi (the reference) emits unbounded sets;
+/// Squeezy adds a hard ceiling so a long session that touches hundreds
+/// of files cannot blow past the summary budget. 50 covers the working
+/// set of a typical multi-turn debugging or refactor session. When a
+/// list overflows the cap the *chronologically oldest* entries are
+/// dropped first — the older slice is walked in order so the most
+/// recent file touches survive.
+///
+/// Reference: pi's emission shape lives at
+/// `others/pi/packages/coding-agent/src/core/compaction/utils.ts:62-82`
+/// (`computeFileLists` / `formatFileOperations`). Squeezy reproduces the
+/// XML-tag shape verbatim so a swap-in summarizer can re-extract the
+/// lists with the same regex.
+const COMPACTION_FILE_LINEAGE_LIMIT: usize = 50;
+
 // --- STATE retention (non-summary) ---
 
 /// In-memory history of compaction records retained on
@@ -938,8 +956,197 @@ pub(crate) fn build_compaction_summary(
         "Compacted {} older model-visible item(s); the most recent context remains verbatim after this summary.",
         older.len()
     ));
+    // File lineage blocks are emitted last so they survive cleanly when a
+    // structured summary template (## Goal / ## Progress / ## Next, …)
+    // lands above. Sibling finding F12-pi-iterative-summary-update is
+    // expected to introduce that template; this commit is stack-safe
+    // either way because the blocks are simply tacked onto the final
+    // line list.
+    lines.extend(file_lineage_blocks(older, state.summary.as_deref()));
     let summary = lines.join("\n");
     context_attachment_preview(&summary, config.context_compaction.max_summary_bytes).0
+}
+
+/// Build the `<read-files>` / `<modified-files>` block pair that pi emits at
+/// the end of every compaction summary (see
+/// `others/pi/packages/coding-agent/src/core/compaction/utils.ts:62-82`).
+///
+/// Inputs:
+/// - `older`: the dropped conversation slice; walked in chronological
+///   order so `oldest-dropped` semantics work when the per-list cap fires.
+/// - `previous_summary`: the prior compaction's summary text. Lineage
+///   that survives across compactions is recovered by re-parsing the
+///   `<read-files>` / `<modified-files>` blocks out of that string. The
+///   alternative — adding new fields to `ContextCompactionState` — would
+///   force a redb schema bump and a session-replay migration for one
+///   isolated piece of derived metadata.
+///
+/// Rules (mirroring pi's `computeFileLists`):
+/// - A file appearing in both read- and modify-class tool calls is
+///   reported only under `<modified-files>` (modification dominates).
+/// - Paths are emitted alphabetically and de-duplicated.
+/// - Each list is capped at `COMPACTION_FILE_LINEAGE_LIMIT`; when the
+///   cap fires, the chronologically oldest paths are dropped (head of
+///   the chronological vec) before sorting.
+///
+/// Returns 0, 1, or 2 lines depending on which sets ended up non-empty.
+/// The caller `.extend()`s the result into the summary line list.
+fn file_lineage_blocks(older: &[LlmInputItem], previous_summary: Option<&str>) -> Vec<String> {
+    let mut read = Vec::<String>::new();
+    let mut modified = Vec::<String>::new();
+    let mut read_set = BTreeSet::<String>::new();
+    let mut modified_set = BTreeSet::<String>::new();
+
+    // Carry forward the prior summary's lineage so the chain accumulates
+    // across compaction generations. Prior paths appear chronologically
+    // *before* the current `older` slice, so we seed them first.
+    if let Some(previous) = previous_summary {
+        for path in parse_file_lineage_block(previous, "read-files") {
+            if read_set.insert(path.clone()) {
+                read.push(path);
+            }
+        }
+        for path in parse_file_lineage_block(previous, "modified-files") {
+            if modified_set.insert(path.clone()) {
+                modified.push(path);
+            }
+        }
+    }
+
+    for item in older {
+        let LlmInputItem::FunctionCall {
+            name, arguments, ..
+        } = item
+        else {
+            continue;
+        };
+        match classify_file_tool(name) {
+            FileOpClass::Read => {
+                for path in extract_tool_paths(name, arguments) {
+                    if read_set.insert(path.clone()) {
+                        read.push(path);
+                    }
+                }
+            }
+            FileOpClass::Modified => {
+                for path in extract_tool_paths(name, arguments) {
+                    if modified_set.insert(path.clone()) {
+                        modified.push(path);
+                    }
+                }
+            }
+            FileOpClass::None => {}
+        }
+    }
+
+    // Modification dominates: a file that was both read and modified is
+    // reported only in `<modified-files>`. Mirrors pi's
+    // `computeFileLists` rule.
+    read.retain(|path| !modified_set.contains(path));
+
+    if read.len() > COMPACTION_FILE_LINEAGE_LIMIT {
+        let excess = read.len() - COMPACTION_FILE_LINEAGE_LIMIT;
+        read.drain(0..excess);
+    }
+    if modified.len() > COMPACTION_FILE_LINEAGE_LIMIT {
+        let excess = modified.len() - COMPACTION_FILE_LINEAGE_LIMIT;
+        modified.drain(0..excess);
+    }
+
+    read.sort();
+    modified.sort();
+
+    let mut blocks = Vec::with_capacity(2);
+    if !read.is_empty() {
+        blocks.push(format!("<read-files>\n{}\n</read-files>", read.join("\n")));
+    }
+    if !modified.is_empty() {
+        blocks.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified.join("\n")
+        ));
+    }
+    blocks
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileOpClass {
+    Read,
+    Modified,
+    None,
+}
+
+fn classify_file_tool(name: &str) -> FileOpClass {
+    // The classification mirrors `permission_scope_for` in
+    // `crates/squeezy-tools/src/lib.rs`: `Read` scope tools that target a
+    // single file land in the read set; `Edit` scope tools that mutate
+    // bytes land in the modified set. Search-class tools (grep, glob)
+    // do *not* target a specific file — their `path` argument is a
+    // starting directory — so they are intentionally excluded.
+    match name {
+        "read_file" | "read_slice" => FileOpClass::Read,
+        "write_file" | "notebook_edit" | "apply_patch" => FileOpClass::Modified,
+        _ => FileOpClass::None,
+    }
+}
+
+/// Pull every workspace-relative file path out of a tool call's JSON
+/// arguments. Only tools known to `classify_file_tool` should reach this
+/// function; for `apply_patch` we also walk both the legacy `patches[]`
+/// shape and the modern `operations[]` shape (including `MoveFile`'s
+/// `from`/`to` pair) so the modified set is exhaustive.
+fn extract_tool_paths(name: &str, arguments: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        paths.push(path.to_string());
+    }
+    if name == "apply_patch" {
+        if let Some(patches) = arguments.get("patches").and_then(Value::as_array) {
+            for entry in patches {
+                if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        if let Some(ops) = arguments.get("operations").and_then(Value::as_array) {
+            for op in ops {
+                if let Some(path) = op.get("path").and_then(Value::as_str) {
+                    paths.push(path.to_string());
+                }
+                if let Some(from) = op.get("from").and_then(Value::as_str) {
+                    paths.push(from.to_string());
+                }
+                if let Some(to) = op.get("to").and_then(Value::as_str) {
+                    paths.push(to.to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Pull the line list out of the `<tag>...</tag>` block in
+/// `summary`. Returns an empty vec when the block is missing, empty, or
+/// malformed. The matcher is substring-based, not XML-parsed: pi emits
+/// these tags verbatim, never nests them, and never wraps them in any
+/// other markup, so a substring match is faithful and avoids dragging
+/// in an XML dependency for two well-known tags.
+fn parse_file_lineage_block(summary: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(open_pos) = summary.find(&open) else {
+        return Vec::new();
+    };
+    let body_start = open_pos + open.len();
+    let Some(close_rel) = summary[body_start..].find(&close) else {
+        return Vec::new();
+    };
+    let body = &summary[body_start..body_start + close_rel];
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {

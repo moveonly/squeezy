@@ -1,3 +1,4 @@
+use serde_json::json;
 use squeezy_core::{AppConfig, ContextCompactionState};
 use squeezy_llm::LlmInputItem;
 
@@ -5,6 +6,14 @@ use super::{
     build_compaction_summary, build_structured_compaction_prompt, is_structured_compaction_summary,
     strip_media_for_compaction,
 };
+
+fn function_call(call_id: &str, name: &str, arguments: serde_json::Value) -> LlmInputItem {
+    LlmInputItem::FunctionCall {
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        arguments,
+    }
+}
 
 /// A 220-byte base64 blob built from a repeating pattern. Long enough to
 /// exceed `STRIP_MEDIA_MIN_LEN` (100) and to survive `compact_text`'s
@@ -240,6 +249,50 @@ fn structured_compaction_prompt_attaches_previous_summary_block_when_present() {
     );
 }
 
+fn lineage_block<'a>(summary: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>\n");
+    let close = format!("\n</{tag}>");
+    let start = summary.find(&open)? + open.len();
+    let end_rel = summary[start..].find(&close)?;
+    Some(&summary[start..start + end_rel])
+}
+
+#[test]
+fn compaction_summary_emits_read_files_block() {
+    // Two read_file calls land in <read-files>; the closing line of the
+    // base summary stays put so the blocks really are an *append*.
+    let older = vec![
+        function_call(
+            "call-1",
+            "read_file",
+            json!({"path": "crates/squeezy-tui/src/render/cache.rs"}),
+        ),
+        function_call(
+            "call-2",
+            "read_file",
+            json!({"path": "crates/squeezy-llm/src/anthropic.rs"}),
+        ),
+    ];
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    let body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
+    assert_eq!(
+        body, "crates/squeezy-llm/src/anthropic.rs\ncrates/squeezy-tui/src/render/cache.rs",
+        "read-files block content mismatch (alphabetic, deduped)"
+    );
+    assert!(
+        !summary.contains("<modified-files>"),
+        "modified block should not appear when no edits occurred"
+    );
+    assert!(
+        summary.contains("Compacted 2 older model-visible item(s)"),
+        "base summary tail must remain before the lineage blocks"
+    );
+}
+
 #[test]
 fn structured_compaction_prompt_omits_previous_summary_block_on_cold_start() {
     // First-ever compaction has no prior summary. The actual
@@ -262,6 +315,61 @@ fn structured_compaction_prompt_omits_previous_summary_block_on_cold_start() {
     assert!(
         !prompt_blank.contains("<previous-summary>\n"),
         "blank previous summary must not produce a `<previous-summary>` block opening"
+    );
+}
+
+#[test]
+fn compaction_summary_emits_modified_files_block_for_write_apply_and_notebook() {
+    // write_file, notebook_edit, and apply_patch all feed <modified-files>.
+    // apply_patch is special: both legacy patches[] and modern operations[]
+    // (including MoveFile's from/to) must populate the set.
+    let older = vec![
+        function_call(
+            "call-1",
+            "write_file",
+            json!({"path": "crates/squeezy-tools/src/patch.rs", "content": "// ..."}),
+        ),
+        function_call(
+            "call-2",
+            "notebook_edit",
+            json!({"path": "notebooks/explore.ipynb"}),
+        ),
+        function_call(
+            "call-3",
+            "apply_patch",
+            json!({
+                "patches": [
+                    {"path": "crates/squeezy-agent/src/lib.rs", "search": "a", "replace": "b"}
+                ],
+                "operations": [
+                    {"type": "move_file", "from": "old/file.rs", "to": "new/file.rs"},
+                    {"type": "create_file", "path": "fresh/file.rs", "contents": ""}
+                ]
+            }),
+        ),
+    ];
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    let body = lineage_block(&summary, "modified-files").expect("<modified-files> block missing");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "crates/squeezy-agent/src/lib.rs",
+            "crates/squeezy-tools/src/patch.rs",
+            "fresh/file.rs",
+            "new/file.rs",
+            "notebooks/explore.ipynb",
+            "old/file.rs",
+        ],
+        "modified-files block must include every write/apply_patch/notebook_edit path",
+    );
+    assert!(
+        !summary.contains("<read-files>"),
+        "read block should not appear when no reads occurred"
     );
 }
 
@@ -315,6 +423,61 @@ fn is_structured_compaction_summary_accepts_file_lineage_blocks_below_next() {
 }
 
 #[test]
+fn compaction_summary_modified_files_supersedes_read_files() {
+    // Pi rule (computeFileLists): a file that is both read and modified
+    // is reported only under <modified-files>.
+    let older = vec![
+        function_call("call-1", "read_file", json!({"path": "src/a.rs"})),
+        function_call("call-2", "read_file", json!({"path": "src/b.rs"})),
+        function_call(
+            "call-3",
+            "write_file",
+            json!({"path": "src/a.rs", "content": "// ..."}),
+        ),
+    ];
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    let read_body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
+    let modified_body =
+        lineage_block(&summary, "modified-files").expect("<modified-files> block missing");
+    assert_eq!(
+        read_body, "src/b.rs",
+        "src/a.rs should be promoted to modified-only",
+    );
+    assert_eq!(modified_body, "src/a.rs");
+}
+
+#[test]
+fn compaction_summary_omits_lineage_blocks_when_no_file_ops() {
+    // Search-class tools (grep) target a starting directory, not a file,
+    // so they are intentionally excluded from the lineage map.
+    let older = vec![
+        LlmInputItem::UserText("hello".to_string()),
+        function_call(
+            "call-1",
+            "grep",
+            json!({"pattern": "todo", "path": "crates"}),
+        ),
+    ];
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    assert!(
+        !summary.contains("<read-files>"),
+        "no file-class tools were invoked; <read-files> must be absent"
+    );
+    assert!(
+        !summary.contains("<modified-files>"),
+        "no file-class tools were invoked; <modified-files> must be absent"
+    );
+}
+
+#[test]
 fn is_structured_compaction_summary_rejects_missing_slot() {
     // Drop `## Decisions` — the slot most likely to be silently lost under
     // the old "rewrite verbatim" prompt. The validator must reject so the
@@ -326,6 +489,49 @@ fn is_structured_compaction_summary_rejects_missing_slot() {
     assert!(
         !is_structured_compaction_summary(body),
         "missing `## Decisions` slot must invalidate the structured output"
+    );
+}
+
+#[test]
+fn compaction_summary_carries_lineage_across_generations() {
+    // The prior summary already lists paths; the current `older` slice
+    // adds new ones and promotes one read into modified. The output
+    // must reflect the union, with modified-wins semantics and dedup.
+    let previous = "Some prose.\n\
+        <read-files>\n\
+        prior/read-only.rs\n\
+        prior/shared.rs\n\
+        </read-files>\n\
+        <modified-files>\n\
+        prior/changed.rs\n\
+        </modified-files>";
+    let state = ContextCompactionState {
+        summary: Some(previous.to_string()),
+        ..ContextCompactionState::default()
+    };
+
+    let older = vec![
+        function_call("call-1", "read_file", json!({"path": "current/look.rs"})),
+        function_call(
+            "call-2",
+            "write_file",
+            json!({"path": "prior/shared.rs", "content": "// ..."}),
+        ),
+    ];
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(2, &state, &older, &[], None, &config);
+
+    let read_body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
+    let modified_body =
+        lineage_block(&summary, "modified-files").expect("<modified-files> block missing");
+    assert_eq!(
+        read_body, "current/look.rs\nprior/read-only.rs",
+        "prior/shared.rs must be promoted out of read; prior/read-only.rs survives",
+    );
+    assert_eq!(
+        modified_body, "prior/changed.rs\nprior/shared.rs",
+        "modified set must accumulate across generations",
     );
 }
 
@@ -344,6 +550,45 @@ fn is_structured_compaction_summary_rejects_free_text_output() {
 }
 
 #[test]
+fn compaction_summary_caps_lineage_at_limit_keeping_newest() {
+    // Build 60 read calls. The cap should fire and keep the 50 most
+    // recent paths (i.e., drop the chronologically oldest 10). Sorted
+    // output then makes the kept set easy to assert as `file_010..file_059`.
+    let older: Vec<LlmInputItem> = (0..60)
+        .map(|i| {
+            function_call(
+                &format!("call-{i}"),
+                "read_file",
+                json!({"path": format!("crates/a/file_{i:03}.rs")}),
+            )
+        })
+        .collect();
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    let body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
+    let lines: Vec<&str> = body.lines().collect();
+    assert_eq!(
+        lines.len(),
+        50,
+        "lineage list must be capped at 50 entries; got {}",
+        lines.len()
+    );
+    assert_eq!(
+        lines.first(),
+        Some(&"crates/a/file_010.rs"),
+        "oldest-dropped: file_000..file_009 should have been evicted before sort",
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&"crates/a/file_059.rs"),
+        "newest entry must survive the cap",
+    );
+}
+
+#[test]
 fn is_structured_compaction_summary_rejects_keyword_in_prose_without_heading() {
     // A model that prepends commentary like "Goal: foo\nProgress: bar" using
     // plain text labels rather than markdown headings must not pass — the
@@ -357,4 +602,26 @@ fn is_structured_compaction_summary_rejects_keyword_in_prose_without_heading() {
         !is_structured_compaction_summary(body),
         "plain-text labels without `#` headings must fail validation"
     );
+}
+
+#[test]
+fn compaction_summary_dedups_repeated_file_touches() {
+    // The same read_file call repeated 5 times still produces a single
+    // entry in <read-files>.
+    let older: Vec<LlmInputItem> = (0..5)
+        .map(|i| {
+            function_call(
+                &format!("call-{i}"),
+                "read_file",
+                json!({"path": "crates/squeezy-core/src/lib.rs"}),
+            )
+        })
+        .collect();
+    let state = ContextCompactionState::default();
+    let config = AppConfig::default();
+
+    let summary = build_compaction_summary(1, &state, &older, &[], None, &config);
+
+    let body = lineage_block(&summary, "read-files").expect("<read-files> block missing");
+    assert_eq!(body, "crates/squeezy-core/src/lib.rs");
 }
