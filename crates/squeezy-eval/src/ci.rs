@@ -6,6 +6,9 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use tokio::sync::Semaphore;
 
 use crate::driver::{EvalError, RunOptions, run_scenario};
 use crate::scenario;
@@ -16,6 +19,12 @@ pub struct CheckOptions {
     pub out_root: PathBuf,
     pub fail_on: FailOn,
     pub junit_path: Option<PathBuf>,
+    /// Phase 7: max concurrent scenarios. Defaults to 1 (serial) for
+    /// back-compat. Workspaces are already per-run-isolated, so
+    /// higher values are safe modulo the process-wide env mutation
+    /// in `Driver::run_scenario` (which a parallel runner needs to
+    /// either accept or split into separate processes).
+    pub parallelism: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +63,7 @@ impl Default for CheckOptions {
                 errors: true,
             },
             junit_path: None,
+            parallelism: None,
         }
     }
 }
@@ -94,74 +104,111 @@ pub async fn run_check(opts: CheckOptions) -> Result<CheckReport, EvalError> {
         .collect();
     entries.sort();
 
-    let mut report = CheckReport::default();
+    // Phase 7: parallel runner. `parallelism = None | Some(1)` means
+    // serial (back-compat); higher values run scenarios concurrently
+    // behind a tokio Semaphore. Workspaces are isolated per run, but
+    // env-var mutations in `run_scenario` are process-wide and can
+    // race; callers who set `[env_vars]` on multiple scenarios should
+    // either keep parallelism at 1 or ensure the keys don't collide.
+    let parallelism = opts.parallelism.unwrap_or(1).max(1);
+    let fail_on_findings = opts.fail_on.findings;
+    let fail_on_expectations = opts.fail_on.expectations;
+    let fail_on_errors = opts.fail_on.errors;
+    let out_root = opts.out_root.clone();
+    let semaphore = Arc::new(Semaphore::new(parallelism));
+
+    let mut handles = Vec::with_capacity(entries.len());
     for path in entries {
-        let started = std::time::Instant::now();
-        let scenario = match scenario::load(&path) {
-            Ok(s) => s,
-            Err(err) => {
-                report.results.push(ScenarioResult {
-                    name: path.display().to_string(),
-                    path,
-                    passed: !opts.fail_on.errors,
+        let permit_owner = semaphore.clone();
+        let path_clone = path.clone();
+        let out_root = out_root.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = permit_owner
+                .acquire_owned()
+                .await
+                .expect("semaphore closed");
+            let started = std::time::Instant::now();
+            let scenario = match scenario::load(&path_clone) {
+                Ok(s) => s,
+                Err(err) => {
+                    return ScenarioResult {
+                        name: path_clone.display().to_string(),
+                        path: path_clone,
+                        passed: !fail_on_errors,
+                        error: Some(format!("{err}")),
+                        finding_rule_ids: vec![],
+                        expectation_rule_ids: vec![],
+                        elapsed_ms: started.elapsed().as_millis(),
+                    };
+                }
+            };
+            let name = scenario.id.clone();
+            let run_options = RunOptions {
+                scenario_path: path_clone.clone(),
+                out_root,
+                run_triage: false,
+                emit_github: false,
+                gh_repo: None,
+                live: false,
+            };
+            match run_scenario(scenario, run_options).await {
+                Ok(outcome) => {
+                    let (expectations, others): (Vec<_>, Vec<_>) = outcome
+                        .findings
+                        .iter()
+                        .partition(|s| s.starts_with("[expect_"));
+                    let expectation_rule_ids = rule_ids(&expectations);
+                    let finding_rule_ids = rule_ids(&others);
+                    let mut passed = true;
+                    if fail_on_expectations && !expectation_rule_ids.is_empty() {
+                        passed = false;
+                    }
+                    if fail_on_findings && !finding_rule_ids.is_empty() {
+                        passed = false;
+                    }
+                    ScenarioResult {
+                        name,
+                        path: path_clone,
+                        passed,
+                        error: None,
+                        finding_rule_ids,
+                        expectation_rule_ids,
+                        elapsed_ms: started.elapsed().as_millis(),
+                    }
+                }
+                Err(err) => ScenarioResult {
+                    name,
+                    path: path_clone,
+                    passed: !fail_on_errors,
                     error: Some(format!("{err}")),
                     finding_rule_ids: vec![],
                     expectation_rule_ids: vec![],
                     elapsed_ms: started.elapsed().as_millis(),
-                });
-                continue;
+                },
             }
-        };
-        let name = scenario.id.clone();
-        let run_options = RunOptions {
-            scenario_path: path.clone(),
-            out_root: opts.out_root.clone(),
-            run_triage: false,
-            emit_github: false,
-            gh_repo: None,
-            // CI runs are unattended; the per-scenario PASS/FAIL summary
-            // line is the right granularity here, not a streamed
-            // narration per turn.
-            live: false,
-        };
-        match run_scenario(scenario, run_options).await {
-            Ok(outcome) => {
-                let (expectations, others): (Vec<_>, Vec<_>) = outcome
-                    .findings
-                    .iter()
-                    .partition(|s| s.starts_with("[expect_"));
-                let expectation_rule_ids = rule_ids(&expectations);
-                let finding_rule_ids = rule_ids(&others);
-                let mut passed = true;
-                if opts.fail_on.expectations && !expectation_rule_ids.is_empty() {
-                    passed = false;
-                }
-                if opts.fail_on.findings && !finding_rule_ids.is_empty() {
-                    passed = false;
-                }
-                report.results.push(ScenarioResult {
-                    name,
-                    path,
-                    passed,
-                    error: None,
-                    finding_rule_ids,
-                    expectation_rule_ids,
-                    elapsed_ms: started.elapsed().as_millis(),
-                });
-            }
+        });
+        handles.push(handle);
+    }
+
+    let mut report = CheckReport::default();
+    for handle in handles {
+        match handle.await {
+            Ok(result) => report.results.push(result),
             Err(err) => {
                 report.results.push(ScenarioResult {
-                    name,
-                    path,
+                    name: "<panicked>".into(),
+                    path: PathBuf::new(),
                     passed: !opts.fail_on.errors,
-                    error: Some(format!("{err}")),
+                    error: Some(format!("scenario task panicked: {err}")),
                     finding_rule_ids: vec![],
                     expectation_rule_ids: vec![],
-                    elapsed_ms: started.elapsed().as_millis(),
+                    elapsed_ms: 0,
                 });
             }
         }
     }
+    // Restore deterministic ordering (parallel tasks can finish out of order).
+    report.results.sort_by(|a, b| a.path.cmp(&b.path));
 
     if let Some(junit_path) = &opts.junit_path {
         write_junit(junit_path, &report)?;

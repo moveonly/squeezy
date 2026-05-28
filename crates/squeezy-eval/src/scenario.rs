@@ -24,6 +24,46 @@ pub struct Scenario {
     /// Optional scripted responses used when `[squeezy] provider = "mock"`.
     #[serde(default)]
     pub mock: MockProviderConfig,
+    /// Optional TUI render capture. When enabled, the driver emits a
+    /// `frames_tui.jsonl` artifact per turn carrying a cell grid +
+    /// ANSI re-render of the assistant text as it would appear in the
+    /// TUI. Phase 5 of the eval-harness plan.
+    #[serde(default)]
+    pub tui_capture: TuiCaptureConfig,
+    /// Environment variables exported into the agent process before
+    /// `Agent::new`. Required for MCP servers that need API keys,
+    /// and for `SQUEEZY_PROVIDER`-style overrides. Process-wide
+    /// `unsafe` env mutation; eval runs one scenario per process
+    /// today, so the blast radius is per-run.
+    #[serde(default)]
+    pub env_vars: std::collections::BTreeMap<String, String>,
+    /// Soft platform pin. When set, the driver records a finding
+    /// (`platform_mismatch`) if the host OS doesn't match. Useful
+    /// for sandbox-related scenarios that are OS-specific. Values:
+    /// `"linux"`, `"macos"`, `"windows"`. Case-insensitive.
+    #[serde(default)]
+    pub platform: Option<String>,
+}
+
+/// Per-scenario TUI render-capture knobs. Empty/default disables the
+/// feature (no `frames_tui.jsonl` is written).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TuiCaptureConfig {
+    /// Enable per-turn TUI render capture. Off by default to keep
+    /// existing scenarios cheap.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cell-grid width to render into. Defaults to 120.
+    #[serde(default)]
+    pub width: Option<u16>,
+    /// Cell-grid height. Defaults to 40.
+    #[serde(default)]
+    pub height: Option<u16>,
+    /// Force a specific palette tone (`"dark"` or `"light"`) so
+    /// captures are reproducible regardless of the surrounding
+    /// terminal. Defaults to `"dark"`.
+    #[serde(default)]
+    pub palette_tone: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +211,62 @@ pub enum Action {
         #[serde(default)]
         when: Option<When>,
     },
+    /// Scripted response to an `McpElicitationRequested` event. Replaces
+    /// the Phase 1 auto-cancel: queue a `RespondElicitation` action and
+    /// the driver sends the configured decision through the agent's
+    /// `response_tx` when a matching request arrives.
+    RespondElicitation {
+        #[serde(default)]
+        r#match: Option<ElicitationMatch>,
+        decision: ElicitationDecision,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Scripted response to a `RequestUserInputRequested` event.
+    /// Mirrors `RespondElicitation` for the agent-side
+    /// `RequestUserInputResponse` channel (choice / freeform / cancel).
+    RespondUserInput {
+        #[serde(default)]
+        r#match: Option<UserInputMatch>,
+        decision: UserInputDecision,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Apply a unified diff to a workspace file mid-run. Lets scenarios
+    /// stage a deliberate broken-build state without requiring a
+    /// fixture branch on disk. Diffs that don't apply cleanly produce
+    /// an `asserted_fail` ActionStep instead of aborting the run.
+    ApplyDiff {
+        path: PathBuf,
+        unified_diff: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Switch the session mode mid-run via `/plan` / `/build`. Maps to
+    /// `Agent::dispatch_command` so the existing slash-handler logic
+    /// (mode-change events, plan-mode indicator updates) fires.
+    SwitchMode {
+        /// `"plan"` or `"build"`. Validated when the action fires; an
+        /// unknown value produces an `asserted_fail` ActionStep.
+        mode: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Attach a file (or pasted text) as conversation context. Maps to
+    /// `Agent::attach_file_context` / `attach_pasted_context`.
+    AttachFile {
+        /// Path relative to the workspace root. Absolute paths are
+        /// honored as-is.
+        path: PathBuf,
+        #[serde(default)]
+        when: Option<When>,
+    },
+    /// Detach a previously-attached context entry by attachment id.
+    DetachAttachment {
+        id: String,
+        #[serde(default)]
+        when: Option<When>,
+    },
 }
 
 impl Action {
@@ -183,9 +279,67 @@ impl Action {
             | Action::WaitSeconds { when, .. }
             | Action::CancelTurn { when, .. }
             | Action::Assert { when, .. }
-            | Action::InjectUserText { when, .. } => when.as_ref(),
+            | Action::InjectUserText { when, .. }
+            | Action::RespondElicitation { when, .. }
+            | Action::RespondUserInput { when, .. }
+            | Action::ApplyDiff { when, .. }
+            | Action::SwitchMode { when, .. }
+            | Action::AttachFile { when, .. }
+            | Action::DetachAttachment { when, .. } => when.as_ref(),
         }
     }
+}
+
+/// Matcher used by `Action::RespondElicitation`. All fields are
+/// optional; an unset field matches anything. An empty `ElicitationMatch`
+/// matches the first incoming MCP elicitation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ElicitationMatch {
+    #[serde(default)]
+    pub server: Option<String>,
+    /// `"form"` or `"url"` — matches `McpElicitationKind`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+/// The decision payload the driver sends back through the agent's
+/// `McpElicitationResponse` oneshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ElicitationDecision {
+    /// Accept the elicitation. `content` is forwarded verbatim into
+    /// `McpElicitationResponse.content`; the MCP server interprets the
+    /// shape per its schema.
+    Accept {
+        #[serde(default)]
+        content: Option<serde_json::Value>,
+    },
+    /// Decline the elicitation (the user-visible "deny" path).
+    Decline,
+    /// Cancel — same effect as the pre-Phase-2 auto-cancel.
+    Cancel,
+}
+
+/// Matcher used by `Action::RespondUserInput`. Both fields are
+/// optional; an unset field matches anything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UserInputMatch {
+    /// Substring match against `RequestUserInputRequest.question`.
+    #[serde(default)]
+    pub prompt_contains: Option<String>,
+}
+
+/// The decision payload the driver sends back through the agent's
+/// `RequestUserInputResponse` oneshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum UserInputDecision {
+    /// Select a multiple-choice option by `value`.
+    Choice { value: String },
+    /// Submit free-form text.
+    Freeform { text: String },
+    /// Cancel — same effect as the pre-Phase-2 auto-cancel.
+    Cancel,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -217,6 +371,42 @@ pub enum Assertion {
     TextContains { text: String },
     /// At most this many tool calls have been observed in the run so far.
     MaxToolCalls { max: u64 },
+    /// A `ToolCallStarted` event for `tool` was observed with
+    /// arguments JSON containing `args_contains` as a substring of its
+    /// serialized form. Useful for "assert the agent ran `grep` with
+    /// pattern X" without spelling out the full arg shape.
+    ToolCallWithArgs { tool: String, args_contains: String },
+    /// The named finding rule fired at least once during this run.
+    /// Deferred: the check runs after the run-time auto-findings
+    /// scan, so during dispatch this records a pending status.
+    FindingFired { rule_id: String },
+    /// The most-recent `TurnCompleted.stop_reason` (mapped through
+    /// `stop_reason_label`) matches the constraint. Both `equals` and
+    /// `not_in` are optional; an assertion with neither always passes.
+    StopReason {
+        /// Required exact match (lowercase label like `"end_turn"` /
+        /// `"max_tokens"` / `"refusal"`).
+        #[serde(default)]
+        equals: Option<String>,
+        /// Set of forbidden labels — failure when the actual label is
+        /// in this set.
+        #[serde(default)]
+        not_in: Vec<String>,
+    },
+    /// At least one `TaskStateUpdated` snapshot satisfies the
+    /// constraints. Both fields are optional; an unset field matches
+    /// anything.
+    TaskStateContains {
+        /// A step title (or step.detail) substring match. The
+        /// assertion passes when ANY captured snapshot has a step
+        /// whose `title` OR `detail` contains this substring.
+        #[serde(default)]
+        step_matches: Option<String>,
+        /// A `blocker` substring match against any captured snapshot's
+        /// `blocker` field.
+        #[serde(default)]
+        blocker_contains: Option<String>,
+    },
 }
 
 /// Soft expectations evaluated at the end of the run; failures produce
@@ -255,6 +445,15 @@ pub struct Expect {
     /// "I'll do X then stop" Qwen pattern. Default 0.
     #[serde(default)]
     pub max_dropped_tool_calls: Option<u32>,
+    /// Per-event timeout for the driver's `start_turn` event pump.
+    /// Defaults to 60s (replaces the legacy hardcoded 10s). A
+    /// `ToolProgress` heartbeat resets the timer so long-running
+    /// tools that emit regular progress events no longer
+    /// silently truncate. Set lower in scenarios that should bail
+    /// quickly on stalled providers; set higher (or omit) for
+    /// scenarios with deliberately slow tools.
+    #[serde(default)]
+    pub event_timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

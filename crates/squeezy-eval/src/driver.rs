@@ -9,9 +9,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-use squeezy_agent::{
-    Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision, ToolOrigin,
-};
+use squeezy_agent::{Agent, AgentEvent, ToolApprovalDecision, ToolOrigin};
 use squeezy_core::{AppConfig, PermissionMode, SessionMode};
 use squeezy_llm::provider_from_config;
 
@@ -83,11 +81,31 @@ pub async fn run_scenario(
         Some(live_printer.clone()),
     )?);
     let frames = Arc::new(FrameWriter::create(&run_dir)?);
+    // Phase 5: optional per-turn TUI render capture. `provision`
+    // returns `None` when the scenario didn't opt in, so the default
+    // path stays zero-cost.
+    let tui_capture =
+        crate::tui_capture::TuiCaptureWriter::provision(&run_dir, &scenario.tui_capture)?
+            .map(Arc::new);
     if options.live {
         println!(
             "▶ squeezy-eval running: {} ({})",
             scenario.title, scenario.id
         );
+    }
+
+    // Phase 7: scenario-scoped env vars. Exported BEFORE workspace
+    // provisioning and AppConfig build so providers that depend on
+    // env (api keys, SQUEEZY_PROVIDER overrides, MCP server creds)
+    // pick them up. The mutation is process-wide; the eval runs one
+    // scenario per process today, so blast radius is per-run.
+    //
+    // SAFETY: documented per-run blast radius. Parallel runners
+    // need a separate process per scenario or per-process scoping.
+    for (key, value) in &scenario.env_vars {
+        unsafe {
+            std::env::set_var(key, value);
+        }
     }
 
     // 1. Provision the workspace.
@@ -145,6 +163,11 @@ pub async fn run_scenario(
         session_id: session_id.clone(),
         total_cost_micro_usd: TokioMutex::new(0),
         live_printer: live_printer.clone(),
+        last_stop_reason: TokioMutex::new(None),
+        observed_tool_calls: TokioMutex::new(Vec::new()),
+        task_snapshots: TokioMutex::new(Vec::new()),
+        tui_capture: tui_capture.clone(),
+        pending_overlays: TokioMutex::new(Vec::new()),
     };
 
     driver.dispatch_steps().await?;
@@ -482,6 +505,24 @@ struct Driver {
     session_id: String,
     total_cost_micro_usd: TokioMutex<u64>,
     live_printer: Arc<crate::live::LivePrinter>,
+    /// Stop reason of the most recently completed turn. Drives the
+    /// Phase 2 `Assertion::StopReason` evaluator.
+    last_stop_reason: TokioMutex<Option<squeezy_llm::StopReason>>,
+    /// Per-turn breadcrumb of `(name, arguments_json)` for every
+    /// `ToolCallStarted` event observed during the run. Drives
+    /// `Assertion::ToolCallWithArgs`. Keyed by turn id is unnecessary
+    /// here — the assertion is "any tool call so far".
+    observed_tool_calls: TokioMutex<Vec<(String, Value)>>,
+    /// Every `TaskStateSnapshot` the agent emitted, in arrival order.
+    /// Drives `Assertion::TaskStateContains`.
+    task_snapshots: TokioMutex<Vec<squeezy_core::TaskStateSnapshot>>,
+    /// Phase 5 TUI render-capture writer. `None` when the scenario
+    /// didn't opt in via `[tui_capture] enabled = true`.
+    tui_capture: Option<Arc<crate::tui_capture::TuiCaptureWriter>>,
+    /// Overlays opened during the in-flight turn, populated as
+    /// approval / elicitation / user-input events arrive. Cleared at
+    /// turn-start and emitted into the next `TuiFrame`.
+    pending_overlays: TokioMutex<Vec<crate::tui_capture::TuiOverlayEvent>>,
 }
 
 impl Driver {
@@ -490,6 +531,25 @@ impl Driver {
             // Announce the step on the live printer so a watching user
             // sees `━━━ step 1: prompt` before any squeezy activity.
             self.live_printer.step(idx, &step);
+            // Phase 6: persist step boundaries into the trace so a
+            // post-hoc replay can reconstruct the scenario shape
+            // (previously this was stdout-only on the live printer,
+            // making the artifact incomplete).
+            let step_kind = match &step {
+                Step::Prompt { .. } => "prompt".to_string(),
+                Step::Action(action) => format!("action:{}", action_kind_label(action)),
+            };
+            self.capture.record(
+                None,
+                EvalEventKind::ActionStep {
+                    action: json!({
+                        "kind": "step_boundary",
+                        "index": idx + 1,
+                        "step_kind": step_kind,
+                    }),
+                    status: "started".into(),
+                },
+            )?;
             match step {
                 Step::Prompt { text, wait_for } => {
                     self.run_prompt(text, wait_for).await?;
@@ -591,6 +651,13 @@ impl Driver {
                 // ApprovalRequested arrives in the next turn.
                 self.action_queue.lock().await.push(action.clone());
             }
+            Action::RespondElicitation { .. } | Action::RespondUserInput { .. } => {
+                // Same queue-then-consume pattern as Approve/Deny. The
+                // McpElicitationRequested / RequestUserInputRequested
+                // handler in `run_prompt` pops a matching action and
+                // sends its decision through the agent's response_tx.
+                self.action_queue.lock().await.push(action.clone());
+            }
             Action::Assert { check, .. } => {
                 let status = self.evaluate_assertion(check).await;
                 self.capture.record(
@@ -608,6 +675,69 @@ impl Driver {
                     EvalEventKind::ActionStep {
                         action: payload,
                         status: format!("injected:{}", text.chars().take(60).collect::<String>()),
+                    },
+                )?;
+            }
+            Action::ApplyDiff {
+                path, unified_diff, ..
+            } => {
+                let status = self.apply_unified_diff(path, unified_diff)?;
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
+            Action::SwitchMode { mode, .. } => {
+                let normalized = mode.trim().to_ascii_lowercase();
+                let status = match normalized.as_str() {
+                    "plan" => self.dispatch_slash_command("/plan").await?,
+                    "build" => self.dispatch_slash_command("/build").await?,
+                    other => format!("asserted_fail: unknown mode {other:?}"),
+                };
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
+            Action::AttachFile { path, .. } => {
+                let resolved = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    self.agent.as_ref().workspace_root_clone().join(path)
+                };
+                let status = match self.agent.attach_file_context(resolved.clone()).await {
+                    Ok(update) => format!(
+                        "attached:id={} bytes={} status={}",
+                        update.attachment.id,
+                        update.attachment.stored_bytes,
+                        update.attachment.status.as_str()
+                    ),
+                    Err(err) => format!("asserted_fail: attach_file: {err}"),
+                };
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
+                    },
+                )?;
+            }
+            Action::DetachAttachment { id, .. } => {
+                let status = match self.agent.detach_context_attachment(id).await {
+                    Ok(attachment) => format!("detached:id={}", attachment.id),
+                    Err(err) => format!("asserted_fail: detach_attachment: {err}"),
+                };
+                self.capture.record(
+                    None,
+                    EvalEventKind::ActionStep {
+                        action: payload,
+                        status,
                     },
                 )?;
             }
@@ -690,6 +820,102 @@ impl Driver {
                     format!("asserted_fail: tool calls {count} exceeded max {max}")
                 }
             }
+            Assertion::ToolCallWithArgs {
+                tool,
+                args_contains,
+            } => {
+                let observed = self.observed_tool_calls.lock().await;
+                let hit = observed.iter().any(|(name, args)| {
+                    name == tool
+                        && serde_json::to_string(args)
+                            .map(|s| s.contains(args_contains))
+                            .unwrap_or(false)
+                });
+                if hit {
+                    "asserted_pass".into()
+                } else {
+                    format!(
+                        "asserted_fail: no `{tool}` tool call carrying args containing {args_contains:?}"
+                    )
+                }
+            }
+            Assertion::FindingFired { rule_id } => {
+                // The findings scan runs after dispatch completes, so
+                // we record a deferred marker. The Phase 2 follow-up
+                // (or a small in-line check in `run_scenario` after
+                // `default_rules` runs) re-evaluates these markers
+                // and emits a Finding when the named rule didn't
+                // fire. Until then the status carries the request
+                // so triage can spot pending checks.
+                format!("deferred_finding_fired:{rule_id}")
+            }
+            Assertion::StopReason { equals, not_in } => {
+                let actual = self.last_stop_reason.lock().await.clone();
+                let actual_label = actual.as_ref().map(|r| match r {
+                    squeezy_llm::StopReason::EndTurn => "end_turn".to_string(),
+                    squeezy_llm::StopReason::ToolUse => "tool_use".to_string(),
+                    squeezy_llm::StopReason::MaxTokens => "max_tokens".to_string(),
+                    squeezy_llm::StopReason::ContextWindowExceeded => {
+                        "context_window_exceeded".to_string()
+                    }
+                    squeezy_llm::StopReason::StopSequence => "stop_sequence".to_string(),
+                    squeezy_llm::StopReason::Refusal => "refusal".to_string(),
+                    squeezy_llm::StopReason::Other(other) => other.clone(),
+                });
+                if let Some(expected) = equals
+                    && actual_label.as_deref() != Some(expected.as_str())
+                {
+                    return format!(
+                        "asserted_fail: stop_reason={actual_label:?} expected {expected:?}"
+                    );
+                }
+                if let Some(label) = actual_label.as_ref()
+                    && not_in.iter().any(|forbidden| forbidden == label)
+                {
+                    return format!(
+                        "asserted_fail: stop_reason={label:?} in forbidden set {not_in:?}"
+                    );
+                }
+                "asserted_pass".into()
+            }
+            Assertion::TaskStateContains {
+                step_matches,
+                blocker_contains,
+            } => {
+                let snapshots = self.task_snapshots.lock().await;
+                if snapshots.is_empty() {
+                    return "asserted_fail: no task_state_updated snapshots observed".into();
+                }
+                if let Some(needle) = step_matches.as_deref() {
+                    let hit = snapshots.iter().any(|snap| {
+                        snap.steps.iter().any(|step| {
+                            step.title.contains(needle)
+                                || step
+                                    .detail
+                                    .as_deref()
+                                    .map(|d| d.contains(needle))
+                                    .unwrap_or(false)
+                        })
+                    });
+                    if !hit {
+                        return format!(
+                            "asserted_fail: no task_state step title/detail contains {needle:?}"
+                        );
+                    }
+                }
+                if let Some(needle) = blocker_contains.as_deref() {
+                    let hit = snapshots.iter().any(|snap| {
+                        snap.blocker
+                            .as_deref()
+                            .map(|b| b.contains(needle))
+                            .unwrap_or(false)
+                    });
+                    if !hit {
+                        return format!("asserted_fail: no task_state blocker contains {needle:?}");
+                    }
+                }
+                "asserted_pass".into()
+            }
         }
     }
 
@@ -717,9 +943,18 @@ impl Driver {
 
         // Reset per-turn assistant text accumulator.
         self.last_assistant_text.lock().await.clear();
+        // Phase 5: per-turn overlay tracker. Cleared so each captured
+        // TuiFrame only carries the overlays that opened during *this*
+        // turn.
+        self.pending_overlays.lock().await.clear();
 
-        // Hard ceiling so an infinite stream never wedges the driver.
-        let event_timeout = Duration::from_secs(10);
+        // Phase 7: configurable per-event timeout with a
+        // `ToolProgress`-aware reset. Default 60s (was 10s hardcoded);
+        // any `ToolProgress` heartbeat received during the loop body
+        // means the agent is still alive and the timeout resets on
+        // the next iteration.
+        let event_timeout =
+            Duration::from_secs(self.scenario.expect.event_timeout_seconds.unwrap_or(60));
 
         while let Ok(Some(event)) = timeout(event_timeout, rx.recv()).await {
             match event {
@@ -777,7 +1012,16 @@ impl Driver {
                     // rules can detect them at a glance.
                     let summary = ToolCallSummary::from_call(&call.name, &call.arguments);
                     frame.tool_calls.push(summary);
+                    // Phase 2: also keep a typed (name, args) tuple so
+                    // `Assertion::ToolCallWithArgs` can scan the full
+                    // arg JSON instead of working off the truncated
+                    // `args_preview` string.
+                    self.observed_tool_calls
+                        .lock()
+                        .await
+                        .push((call.name.clone(), call.arguments.clone()));
                     self.fire_on_tool_actions(&call.name).await?;
+
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ToolCallStarted {
@@ -839,6 +1083,14 @@ impl Driver {
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     let (decision, recorded) = self.decide_approval(&request.tool_name).await;
+                    self.pending_overlays
+                        .lock()
+                        .await
+                        .push(crate::tui_capture::TuiOverlayEvent {
+                            kind: "approval".into(),
+                            summary: request.tool_name.clone(),
+                            disposition: recorded.clone(),
+                        });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::Approval {
@@ -853,38 +1105,85 @@ impl Driver {
                 }
                 AgentEvent::McpElicitationRequested {
                     turn_id,
+                    request,
                     response_tx,
-                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
+                    let body = serde_json::to_value(&request).unwrap_or(Value::Null);
+                    // Phase 2: consult the scenario action queue. A
+                    // matching `RespondElicitation` consumes the slot
+                    // and decides; absent any match we fall back to
+                    // Cancel (mirrors the pre-Phase-2 behavior).
+                    let (response, status) = self.decide_elicitation(&request).await;
+                    self.pending_overlays
+                        .lock()
+                        .await
+                        .push(crate::tui_capture::TuiOverlayEvent {
+                            kind: "mcp_elicitation".into(),
+                            summary: format!("server={}", request.server),
+                            disposition: status.clone(),
+                        });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ActionStep {
-                            action: json!({"kind": "mcp_elicitation"}),
-                            status: "auto_cancelled".into(),
+                            action: json!({
+                                "kind": "mcp_elicitation",
+                                "request": body,
+                            }),
+                            status,
                         },
                     )?;
-                    // Drop the sender so the agent observes a cancelled elicitation.
-                    drop(response_tx);
+                    match response {
+                        Some(reply) => {
+                            let _ = response_tx.send(reply);
+                        }
+                        None => drop(response_tx),
+                    }
                 }
                 AgentEvent::RequestUserInputRequested {
                     turn_id,
+                    request,
                     response_tx,
-                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
+                    let body = serde_json::to_value(&request).unwrap_or(Value::Null);
+                    let (response, status) = self.decide_user_input(&request).await;
+                    self.pending_overlays
+                        .lock()
+                        .await
+                        .push(crate::tui_capture::TuiOverlayEvent {
+                            kind: "request_user_input".into(),
+                            summary: request.question.chars().take(80).collect(),
+                            disposition: status.clone(),
+                        });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ActionStep {
-                            action: json!({"kind": "request_user_input"}),
-                            status: "auto_cancelled".into(),
+                            action: json!({
+                                "kind": "request_user_input",
+                                "request": body,
+                            }),
+                            status,
                         },
                     )?;
-                    let _ = response_tx.send(RequestUserInputResponse::cancelled());
+                    let _ = response_tx.send(response);
                 }
                 AgentEvent::ContextCompacted { turn_id, report } => {
                     let turn_str = format!("{turn_id:?}");
-                    let value = json!({"debug": format!("{:?}", report)});
+                    // `ContextCompactionReport` carries `record` (a
+                    // `ContextCompactionRecord`) + `summary` + a
+                    // `dropped` Vec. The record itself is Serialize via
+                    // `squeezy-core`, so capturing the structured form
+                    // gives findings rules a typed handle on
+                    // before/after token totals and trigger reason.
+                    // Fall back to debug if serialization ever fails.
+                    let report_value = serde_json::to_value(&report.record)
+                        .unwrap_or_else(|_| json!({"debug": format!("{:?}", report.record)}));
+                    let value = json!({
+                        "record": report_value,
+                        "summary": report.summary,
+                        "dropped_items": report.dropped.len(),
+                    });
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ContextCompacted { report: value },
@@ -892,14 +1191,24 @@ impl Driver {
                 }
                 AgentEvent::TaskStateUpdated { turn_id, snapshot } => {
                     let turn_str = format!("{turn_id:?}");
-                    // Emit both the debug rendering (retained for old viewers)
-                    // and a structured `summary` field so rule code does not
-                    // have to parse the debug string.
-                    let value = json!({
-                        "debug": format!("{:?}", snapshot),
-                        "summary": snapshot.summary,
-                        "status": format!("{:?}", snapshot.status),
+                    // v3: emit the full TaskStateSnapshot as structured
+                    // JSON so rules can read `steps`, `blocker`,
+                    // `next_action`, `verification`, `recent_changes`,
+                    // `replan_reason` without re-parsing a debug
+                    // string. `summary` and `status` still live at the
+                    // same JSON path so the existing
+                    // `task_snapshot_marks_help` helper keeps working.
+                    let value = serde_json::to_value(&snapshot).unwrap_or_else(|_| {
+                        json!({
+                            "debug": format!("{:?}", snapshot),
+                            "summary": snapshot.summary,
+                            "status": snapshot.status.as_str(),
+                        })
                     });
+                    // Phase 2: keep the typed snapshot so
+                    // `Assertion::TaskStateContains` can match on
+                    // step titles / blockers without re-parsing JSON.
+                    self.task_snapshots.lock().await.push(snapshot.clone());
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::TaskStateUpdated { snapshot: value },
@@ -907,32 +1216,59 @@ impl Driver {
                 }
                 AgentEvent::McpStatusUpdated { turn_id, snapshot } => {
                     let turn_str = format!("{turn_id:?}");
-                    let value = json!({"debug": format!("{:?}", snapshot)});
+                    // v3 typed variant: serialize the per-server map
+                    // (each McpServerStatus is Serialize) so rules can
+                    // detect Failed / Disconnected entries.
+                    let servers = serde_json::to_value(&snapshot.per_server).unwrap_or(Value::Null);
                     self.capture.record(
                         Some(turn_str),
-                        EvalEventKind::Snapshot {
-                            snapshot_kind: "mcp_status".into(),
-                            payload: value,
+                        EvalEventKind::McpStatusUpdated {
+                            servers,
+                            generated_unix_millis: snapshot.generated_unix_millis,
                         },
                     )?;
                 }
                 AgentEvent::JobUpdated { job } => {
-                    let value = json!({"debug": format!("{:?}", job)});
-                    self.capture.record(
-                        None,
-                        EvalEventKind::Snapshot {
-                            snapshot_kind: "job".into(),
-                            payload: value,
-                        },
-                    )?;
+                    // v3 typed variant: build a structured JSON view
+                    // of the snapshot. JobSnapshot is not Serialize
+                    // upstream, so construct fields explicitly to
+                    // keep the schema diffable.
+                    let progress = job.progress.as_ref().map(|p| {
+                        json!({
+                            "completed": p.completed,
+                            "total": p.total,
+                            "message": p.message,
+                        })
+                    });
+                    let job_value = json!({
+                        "id": job.id,
+                        "kind": job.kind.as_str(),
+                        "status": job.status.as_str(),
+                        "title": job.title,
+                        "progress": progress,
+                        "result_summary": job.result_summary,
+                        "output_handle": job.output_handle,
+                        "turn_id": job.turn_id.map(|t| format!("{t:?}")),
+                        "tool_name": job.tool_name,
+                        "call_id": job.call_id,
+                        "subagent_id": job.subagent_id,
+                        "created_at_ms": job.created_at_ms,
+                        "updated_at_ms": job.updated_at_ms,
+                        "ended_at_ms": job.ended_at_ms,
+                    });
+                    self.capture
+                        .record(None, EvalEventKind::JobUpdated { job: job_value })?;
                 }
                 AgentEvent::JobNotification { notification } => {
-                    let value = json!({"debug": format!("{:?}", notification)});
                     self.capture.record(
                         None,
-                        EvalEventKind::Snapshot {
-                            snapshot_kind: "job_notification".into(),
-                            payload: value,
+                        EvalEventKind::JobNotification {
+                            job_id: notification.job_id,
+                            job_kind: notification.kind.as_str().to_string(),
+                            status: notification.status.as_str().to_string(),
+                            title: notification.title.clone(),
+                            summary: notification.summary.clone(),
+                            ts_unix_ms: notification.ts_unix_ms,
                         },
                     )?;
                 }
@@ -1000,21 +1336,17 @@ impl Driver {
                 }
                 AgentEvent::AiReviewerTripped { turn_id, reason } => {
                     let turn_str = format!("{turn_id:?}");
-                    self.capture.record(
-                        Some(turn_str),
-                        EvalEventKind::Snapshot {
-                            snapshot_kind: "ai_reviewer_tripped".into(),
-                            payload: json!({"reason": reason}),
-                        },
-                    )?;
+                    self.capture
+                        .record(Some(turn_str), EvalEventKind::AiReviewerTripped { reason })?;
                 }
                 AgentEvent::CostWarning { turn_id, status } => {
                     let turn_str = format!("{turn_id:?}");
                     self.capture.record(
                         Some(turn_str),
-                        EvalEventKind::Snapshot {
-                            snapshot_kind: "cost_warning".into(),
-                            payload: json!({"debug": format!("{:?}", status)}),
+                        EvalEventKind::CostWarning {
+                            spent_usd_micros: status.spent_usd_micros,
+                            cap_usd_micros: status.cap_usd_micros,
+                            percent: status.percent,
                         },
                     )?;
                 }
@@ -1050,16 +1382,45 @@ impl Driver {
                         },
                     )?;
                 }
-                AgentEvent::ReasoningDelta { .. }
-                | AgentEvent::ReasoningSegment { .. }
-                | AgentEvent::ShellSandboxBestEffortFallback { .. } => {}
+                AgentEvent::ReasoningDelta { turn_id, delta } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture
+                        .record(Some(turn_str), EvalEventKind::ReasoningDelta { delta })?;
+                }
+                AgentEvent::ReasoningSegment { turn_id, snapshot } => {
+                    let turn_str = format!("{turn_id:?}");
+                    let payload = serde_json::to_value(&snapshot.payload).unwrap_or(Value::Null);
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ReasoningSegment {
+                            display_text: snapshot.display_text,
+                            payload,
+                        },
+                    )?;
+                }
+                AgentEvent::ShellSandboxBestEffortFallback {
+                    turn_id,
+                    backend,
+                    fallback_count,
+                } => {
+                    let turn_str = format!("{turn_id:?}");
+                    self.capture.record(
+                        Some(turn_str),
+                        EvalEventKind::ShellSandboxDegraded {
+                            backend,
+                            fallback_count,
+                        },
+                    )?;
+                }
                 AgentEvent::Completed {
                     turn_id,
+                    message,
+                    response_id,
                     cost,
                     metrics,
+                    context_estimate,
                     stop_reason,
                     reasoning_only_stop,
-                    ..
                 } => {
                     let turn_str = format!("{turn_id:?}");
                     frame.elapsed_ms = turn_start.elapsed().as_millis() as u64;
@@ -1068,6 +1429,7 @@ impl Driver {
                     frame.finish = FrameFinish::Completed;
                     frame.stop_reason = stop_reason.clone();
                     frame.reasoning_only_stop = reasoning_only_stop;
+                    *self.last_stop_reason.lock().await = stop_reason.clone();
                     let cost_micro =
                         squeezy_llm::estimate_cost(self.provider_name, &self.model, &cost)
                             .unwrap_or(0);
@@ -1077,6 +1439,19 @@ impl Driver {
                     *self.total_cost_micro_usd.lock().await += cost_micro;
                     let metrics_v = serde_json::to_value(&metrics).unwrap_or(Value::Null);
                     let cost_v = serde_json::to_value(&cost).unwrap_or(Value::Null);
+                    let message_v = serde_json::to_value(&message).ok();
+                    let context_estimate_v = serde_json::to_value(&context_estimate).ok();
+                    // Surface `dropped_tool_calls` if a future
+                    // `TurnMetrics.dropped_tool_calls` field lands
+                    // upstream. Read positionally so eval keeps
+                    // working without a squeezy-core change; reads as
+                    // 0 today. The `expect_dropped_tool_calls` rule
+                    // (Phase 4) lights up automatically once the
+                    // chat-completions provider wires its counter.
+                    frame.dropped_tool_calls = metrics_v
+                        .get("dropped_tool_calls")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32;
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::TurnCompleted {
@@ -1084,6 +1459,9 @@ impl Driver {
                             cost: cost_v,
                             stop_reason: stop_reason.clone(),
                             reasoning_only_stop,
+                            message: message_v,
+                            response_id: response_id.clone(),
+                            context_estimate: context_estimate_v,
                         },
                     )?;
                     completed = true;
@@ -1143,8 +1521,161 @@ impl Driver {
         frame.styled_lines = styled;
         frame.ansi = ansi;
         self.frames.write(&frame)?;
+        // Phase 5: optional per-turn TUI capture into frames_tui.jsonl.
+        // Skipped unless `[tui_capture] enabled = true` is set on the
+        // scenario.
+        if let Some(writer) = self.tui_capture.as_ref() {
+            let (cells, plain_text, ansi_grid) = crate::tui_capture::render_markdown_to_grid(
+                &frame.assistant_text,
+                writer.width(),
+                writer.height(),
+            )?;
+            let overlays = self.pending_overlays.lock().await.clone();
+            let tui_frame = crate::tui_capture::TuiFrame {
+                turn_id: frame.turn_id.clone(),
+                width: writer.width(),
+                height: writer.height(),
+                cells,
+                plain_text,
+                ansi: ansi_grid,
+                overlays,
+            };
+            writer.write(&tui_frame)?;
+        }
         *self.wall_clock_seconds.lock().await = self.run_start.elapsed().as_secs();
         Ok(())
+    }
+
+    /// Apply a unified diff to a single workspace file via `git apply`.
+    /// We shell out instead of writing our own patch applier so multi-hunk,
+    /// context-fuzzy, and rename-style diffs behave identically to what a
+    /// human would expect — and so the failure surface (`error: corrupt
+    /// patch ...`) is the same one a developer recognizes from CI.
+    fn apply_unified_diff(&self, path: &Path, unified_diff: &str) -> Result<String, EvalError> {
+        use std::io::Write as _;
+        let workspace_root = self.agent.as_ref().workspace_root_clone();
+        // Materialize the diff to disk so `git apply -` is not at the
+        // mercy of stdin lifetimes on slow CI; the tempfile lives only
+        // for the duration of the apply.
+        let mut tmp =
+            workspace_root.join(format!(".squeezy-eval-apply-{}.patch", std::process::id()));
+        // Avoid collisions when multiple parallel applies fire.
+        let mut n: u32 = 0;
+        while tmp.exists() {
+            n = n.wrapping_add(1);
+            tmp = workspace_root.join(format!(
+                ".squeezy-eval-apply-{}-{}.patch",
+                std::process::id(),
+                n
+            ));
+        }
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|err| EvalError::Io(format!("create {tmp:?}: {err}")))?;
+            f.write_all(unified_diff.as_bytes())
+                .map_err(|err| EvalError::Io(format!("write {tmp:?}: {err}")))?;
+        }
+        let output = std::process::Command::new("git")
+            .current_dir(&workspace_root)
+            .args([
+                "apply",
+                "--whitespace=nowarn",
+                tmp.to_string_lossy().as_ref(),
+            ])
+            .output()
+            .map_err(|err| EvalError::Workspace(format!("spawn git apply: {err}")))?;
+        let _ = std::fs::remove_file(&tmp);
+        if output.status.success() {
+            Ok(format!("applied_diff:{}", path.display()))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Ok(format!(
+                "asserted_fail: git apply rejected {}: {}",
+                path.display(),
+                stderr.trim().chars().take(200).collect::<String>()
+            ))
+        }
+    }
+
+    /// Look for a queued `RespondElicitation` that matches `request`,
+    /// consume it, and produce the response payload + status string.
+    /// Falls back to `Cancel` (mirrors pre-Phase-2 behavior) so a
+    /// missing scripted response never hangs the agent.
+    async fn decide_elicitation(
+        &self,
+        request: &squeezy_tools::McpElicitationRequest,
+    ) -> (Option<squeezy_tools::McpElicitationResponse>, String) {
+        let mut queue = self.action_queue.lock().await;
+        let mut found_index: Option<usize> = None;
+        for (idx, action) in queue.iter().enumerate() {
+            if elicitation_matches(action, request) {
+                found_index = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = found_index {
+            let action = queue.remove(idx);
+            drop(queue);
+            if let Action::RespondElicitation { decision, .. } = action {
+                let (resp, status) = match decision {
+                    crate::scenario::ElicitationDecision::Accept { content } => (
+                        squeezy_tools::McpElicitationResponse::accept(content),
+                        "accepted".to_string(),
+                    ),
+                    crate::scenario::ElicitationDecision::Decline => (
+                        squeezy_tools::McpElicitationResponse::decline(),
+                        "declined".into(),
+                    ),
+                    crate::scenario::ElicitationDecision::Cancel => (
+                        squeezy_tools::McpElicitationResponse::cancel(),
+                        "cancelled".into(),
+                    ),
+                };
+                return (Some(resp), status);
+            }
+        }
+        // No scripted response — fall back to auto-cancel and flag the
+        // status so triage can spot the gap.
+        (None, "auto_cancelled".into())
+    }
+
+    /// Same shape as `decide_elicitation` but for `RequestUserInput`.
+    async fn decide_user_input(
+        &self,
+        request: &squeezy_agent::RequestUserInputRequest,
+    ) -> (squeezy_agent::RequestUserInputResponse, String) {
+        let mut queue = self.action_queue.lock().await;
+        let mut found_index: Option<usize> = None;
+        for (idx, action) in queue.iter().enumerate() {
+            if user_input_matches(action, request) {
+                found_index = Some(idx);
+                break;
+            }
+        }
+        if let Some(idx) = found_index {
+            let action = queue.remove(idx);
+            drop(queue);
+            if let Action::RespondUserInput { decision, .. } = action {
+                return match decision {
+                    crate::scenario::UserInputDecision::Choice { value } => (
+                        squeezy_agent::RequestUserInputResponse::choice(value.clone()),
+                        format!("choice:{value}"),
+                    ),
+                    crate::scenario::UserInputDecision::Freeform { text } => (
+                        squeezy_agent::RequestUserInputResponse::freeform(text.clone()),
+                        format!("freeform:{}", text.chars().take(60).collect::<String>()),
+                    ),
+                    crate::scenario::UserInputDecision::Cancel => (
+                        squeezy_agent::RequestUserInputResponse::cancelled(),
+                        "cancelled".into(),
+                    ),
+                };
+            }
+        }
+        (
+            squeezy_agent::RequestUserInputResponse::cancelled(),
+            "auto_cancelled".into(),
+        )
     }
 
     async fn fire_on_tool_actions(&self, tool_name: &str) -> Result<(), EvalError> {
@@ -1216,8 +1747,70 @@ fn approval_matches(action: &Action, tool_name: &str) -> bool {
     }
 }
 
+fn elicitation_matches(action: &Action, request: &squeezy_tools::McpElicitationRequest) -> bool {
+    let Action::RespondElicitation { r#match, .. } = action else {
+        return false;
+    };
+    let Some(m) = r#match.as_ref() else {
+        // Empty match → fire on the first elicitation we see.
+        return true;
+    };
+    if let Some(server) = &m.server
+        && server != &request.server
+    {
+        return false;
+    }
+    if let Some(kind) = &m.kind {
+        let actual = match request.kind {
+            squeezy_tools::McpElicitationKind::Form => "form",
+            squeezy_tools::McpElicitationKind::Url => "url",
+        };
+        if !kind.eq_ignore_ascii_case(actual) {
+            return false;
+        }
+    }
+    true
+}
+
+fn user_input_matches(action: &Action, request: &squeezy_agent::RequestUserInputRequest) -> bool {
+    let Action::RespondUserInput { r#match, .. } = action else {
+        return false;
+    };
+    let Some(m) = r#match.as_ref() else {
+        return true;
+    };
+    if let Some(needle) = &m.prompt_contains
+        && !request.question.contains(needle)
+    {
+        return false;
+    }
+    true
+}
+
 fn action_to_value(action: &Action) -> Value {
     serde_json::to_value(action).unwrap_or(Value::Null)
+}
+
+/// Short label for an `Action` used in trace step-boundary records.
+/// Lives next to the dispatch helpers so it stays in sync with the
+/// `Action` enum without exposing the full serialized shape.
+fn action_kind_label(action: &Action) -> &'static str {
+    match action {
+        Action::Approve { .. } => "approve",
+        Action::Deny { .. } => "deny",
+        Action::SlashCommand { .. } => "slash_command",
+        Action::EditFile { .. } => "edit_file",
+        Action::WaitSeconds { .. } => "wait_seconds",
+        Action::CancelTurn { .. } => "cancel_turn",
+        Action::Assert { .. } => "assert",
+        Action::InjectUserText { .. } => "inject_user_text",
+        Action::RespondElicitation { .. } => "respond_elicitation",
+        Action::RespondUserInput { .. } => "respond_user_input",
+        Action::ApplyDiff { .. } => "apply_diff",
+        Action::SwitchMode { .. } => "switch_mode",
+        Action::AttachFile { .. } => "attach_file",
+        Action::DetachAttachment { .. } => "detach_attachment",
+    }
 }
 
 fn origin_label(origin: ToolOrigin) -> &'static str {

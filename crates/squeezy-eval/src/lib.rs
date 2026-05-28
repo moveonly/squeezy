@@ -18,6 +18,7 @@ pub mod mock_provider;
 pub mod scenario;
 pub mod tickets;
 pub mod triage;
+pub mod tui_capture;
 pub mod view;
 pub mod workspace;
 

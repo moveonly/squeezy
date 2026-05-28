@@ -224,6 +224,106 @@ impl LivePrinter {
                 );
                 let _ = g.writer.flush();
             }
+            // Phase 6: surface the events that previously only landed
+            // in trace.jsonl. A watcher of `squeezy-eval run` sees
+            // the same critical UX signals the real TUI shows.
+            EvalEventKind::SubagentEvent { event } => {
+                g.finish_assistant_chunk_inplace();
+                let kind = event.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
+                let icon = match kind {
+                    "started" => "🤖",
+                    "completed" => "✅",
+                    "failed" => "🚨",
+                    "rejected" => "⛔",
+                    _ => "·",
+                };
+                let detail = match kind {
+                    "completed" => event
+                        .get("summary")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(": {}", trim_oneline(s, 80)))
+                        .unwrap_or_default(),
+                    "failed" => event
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(": {}", trim_oneline(s, 120)))
+                        .unwrap_or_default(),
+                    "rejected" => event
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .map(|s| format!(": {s}"))
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let _ = writeln!(g.writer, "  {icon} subagent {kind} ({agent}){detail}");
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::McpStatusUpdated { servers, .. } => {
+                g.finish_assistant_chunk_inplace();
+                let summary = summarize_mcp_status(servers);
+                let _ = writeln!(g.writer, "  🛰 mcp status: {summary}");
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::JobNotification {
+                title,
+                summary,
+                status,
+                ..
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  📢 job {status}: {} — {}",
+                    trim_oneline(title, 60),
+                    trim_oneline(summary, 120)
+                );
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::CostWarning {
+                spent_usd_micros,
+                cap_usd_micros,
+                percent,
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  ⚠ cost warning: spent ${:.4} / cap ${:.4} ({}%)",
+                    *spent_usd_micros as f64 / 1_000_000.0,
+                    *cap_usd_micros as f64 / 1_000_000.0,
+                    percent
+                );
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::AiReviewerTripped { reason } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  🛑 ai reviewer tripped: {}",
+                    trim_oneline(reason, 200)
+                );
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::ShellSandboxDegraded {
+                backend,
+                fallback_count,
+            } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  🪨 sandbox degraded: backend={backend} fallback_count={fallback_count}"
+                );
+                let _ = g.writer.flush();
+            }
+            EvalEventKind::ReasoningSegment { display_text, .. } => {
+                g.finish_assistant_chunk_inplace();
+                let _ = writeln!(
+                    g.writer,
+                    "  ▾ thinking: {}",
+                    trim_oneline(display_text, 200)
+                );
+                let _ = g.writer.flush();
+            }
             _ => {}
         }
     }
@@ -275,6 +375,37 @@ fn describe_action(action: &Action) -> String {
         Action::InjectUserText { text, .. } => {
             format!("inject_user_text: {}", trim_oneline(text, 80))
         }
+        Action::RespondElicitation {
+            r#match, decision, ..
+        } => {
+            let label = r#match
+                .as_ref()
+                .and_then(|m| m.server.as_deref())
+                .map(|s| format!("server={s}"))
+                .unwrap_or_else(|| "any".into());
+            let decision_label = match decision {
+                crate::scenario::ElicitationDecision::Accept { .. } => "accept",
+                crate::scenario::ElicitationDecision::Decline => "decline",
+                crate::scenario::ElicitationDecision::Cancel => "cancel",
+            };
+            format!("respond_elicitation {label} → {decision_label}")
+        }
+        Action::RespondUserInput { decision, .. } => {
+            let decision_label = match decision {
+                crate::scenario::UserInputDecision::Choice { value } => {
+                    format!("choice={}", trim_oneline(value, 40))
+                }
+                crate::scenario::UserInputDecision::Freeform { text } => {
+                    format!("freeform={}", trim_oneline(text, 40))
+                }
+                crate::scenario::UserInputDecision::Cancel => "cancel".to_string(),
+            };
+            format!("respond_user_input → {decision_label}")
+        }
+        Action::ApplyDiff { path, .. } => format!("apply_diff: {}", path.display()),
+        Action::SwitchMode { mode, .. } => format!("switch_mode: {mode}"),
+        Action::AttachFile { path, .. } => format!("attach_file: {}", path.display()),
+        Action::DetachAttachment { id, .. } => format!("detach_attachment: {id}"),
     }
 }
 
@@ -298,6 +429,43 @@ fn format_token_count(tokens: u64) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// Render an MCP per-server status map (as emitted by the typed
+/// `McpStatusUpdated` event) into a compact one-line summary that
+/// mirrors the TUI's status line shape.
+fn summarize_mcp_status(servers: &Value) -> String {
+    let Some(obj) = servers.as_object() else {
+        return "no servers".into();
+    };
+    let mut ready = 0usize;
+    let mut starting = 0usize;
+    let mut failed = 0usize;
+    let mut cancelled = 0usize;
+    let mut failed_names: Vec<String> = Vec::new();
+    for (name, status) in obj {
+        if status.as_str() == Some("Starting") {
+            starting += 1;
+        } else if status.as_str() == Some("Cancelled") {
+            cancelled += 1;
+        } else if status.is_object() && status.get("Ready").is_some() {
+            ready += 1;
+        } else if status.is_object() && status.get("Failed").is_some() {
+            failed += 1;
+            failed_names.push(name.clone());
+        }
+    }
+    let mut parts = vec![format!("{ready} ready")];
+    if starting > 0 {
+        parts.push(format!("{starting} starting"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed [{}]", failed_names.join(", ")));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} cancelled"));
+    }
+    parts.join(" · ")
 }
 
 fn format_micro_usd(micro: u64) -> String {

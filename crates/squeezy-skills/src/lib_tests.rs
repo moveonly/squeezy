@@ -6,6 +6,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+// `json!` is only referenced by `#[cfg(unix)]` tests below; gate the
+// import the same way so Windows builds (which exclude those tests)
+// don't fail under `-D warnings`.
+#[cfg(unix)]
 use serde_json::json;
 use squeezy_core::{SkillConfigEntry, SkillsBudgetMode, SkillsConfig};
 use squeezy_hooks::{HookEvent, HookRegistry};

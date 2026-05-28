@@ -299,6 +299,9 @@ fn trivial_answer_over_fetch_flags_short_output_with_burst() {
                 cost: serde_json::json!({"output_tokens": 6, "input_tokens": 9000}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -334,6 +337,9 @@ fn trivial_answer_over_fetch_quiet_for_long_answers() {
                 cost: serde_json::json!({"output_tokens": 500, "input_tokens": 9000}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -357,6 +363,9 @@ fn expect_input_tokens_per_turn_flags_one_turn() {
             cost: serde_json::json!({"input_tokens": 250000, "output_tokens": 200}),
             stop_reason: None,
             reasoning_only_stop: false,
+            message: None,
+            response_id: None,
+            context_estimate: None,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -381,6 +390,9 @@ fn expect_input_tokens_per_turn_quiet_when_unset() {
             cost: serde_json::json!({"input_tokens": 250000}),
             stop_reason: None,
             reasoning_only_stop: false,
+            message: None,
+            response_id: None,
+            context_estimate: None,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -414,6 +426,9 @@ fn ungrounded_citation_flags_zero_tools_with_path() {
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 20}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -446,6 +461,9 @@ fn ungrounded_citation_quiet_when_tool_call_ran() {
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 20}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -475,6 +493,9 @@ fn ungrounded_citation_quiet_for_no_path() {
                 cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 5}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -520,6 +541,9 @@ fn incomplete_confidence_labels_flags_partial_compliance() {
                 cost: serde_json::json!({}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -555,6 +579,9 @@ fn incomplete_confidence_labels_quiet_when_no_prompt_asks() {
                 cost: serde_json::json!({}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -587,6 +614,9 @@ fn incomplete_confidence_labels_quiet_when_all_labeled() {
             cost: serde_json::json!({}),
             stop_reason: None,
             reasoning_only_stop: false,
+            message: None,
+            response_id: None,
+            context_estimate: None,
         },
     }];
     let ctx = ctx_from_events(events);
@@ -625,6 +655,9 @@ fn exact_syntax_without_source_flags_label_without_read_slice() {
                 cost: serde_json::json!({}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -662,6 +695,9 @@ fn exact_syntax_without_source_quiet_when_read_slice_ran() {
                 cost: serde_json::json!({}),
                 stop_reason: None,
                 reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
             },
         },
     ];
@@ -710,6 +746,9 @@ fn turn_completed_with(
             cost: serde_json::json!({}),
             stop_reason,
             reasoning_only_stop,
+            message: None,
+            response_id: None,
+            context_estimate: None,
         },
     }
 }
