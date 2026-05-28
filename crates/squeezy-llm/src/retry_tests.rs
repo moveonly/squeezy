@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     JITTER_FRACTION, RetryPolicy, apply_jitter, backoff, idle_timeout, jitter_sample,
-    parse_retry_after, send_with_auth_retry, with_stream_retry,
+    parse_retry_after, send_with_auth_retry, send_with_retry, with_stream_retry,
 };
 use crate::credentials::{ApiKeyFuture, ApiKeySource};
 use crate::{LlmEvent, LlmStream};
@@ -431,6 +431,53 @@ fn retry_policy_inherits_max_retry_delay_from_transport_config() {
     let stream_policy = RetryPolicy::provider_stream(transport);
     assert_eq!(request_policy.max_retry_delay, Duration::from_millis(5_000));
     assert_eq!(stream_policy.max_retry_delay, Duration::from_millis(5_000));
+}
+
+/// Closes the protocol loop on the parse-level None tests above: when a
+/// retryable response carries neither `Retry-After-Ms` nor `Retry-After`,
+/// `send_with_retry` must fall through to the exponential `backoff` schedule
+/// rather than reconnecting immediately. Measures elapsed wall-clock between
+/// the first (429) and second (200) attempts and asserts it lands inside the
+/// jittered backoff window for `attempt = 0`.
+#[tokio::test]
+async fn send_with_retry_uses_exponential_backoff_when_no_retry_after_headers() {
+    let (addr, attempts) = spawn_status_server(vec![429, 200]).await;
+    let client = reqwest::Client::new();
+    let cancel = CancellationToken::new();
+    let url = format!("http://{addr}");
+
+    let base_delay = Duration::from_millis(120);
+    let policy = RetryPolicy {
+        max_retries: 1,
+        base_delay,
+        retry_429: true,
+        retry_5xx: false,
+        retry_transport: false,
+        max_retry_delay: Duration::from_secs(60),
+    };
+
+    let started = Instant::now();
+    let response = send_with_retry(policy, &cancel, || client.post(&url))
+        .await
+        .expect("send");
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "429 then 200 = exactly two HTTP attempts"
+    );
+
+    // `backoff(base_delay, 0)` is in `[base * (1 - JITTER_FRACTION), base * (1
+    // + JITTER_FRACTION)]`. The 5ms floor absorbs scheduler/timer imprecision
+    // on contended CI runners; the assertion still fails loudly if a
+    // regression skips the sleep entirely (elapsed would round to ~0).
+    let lower_bound = base_delay.mul_f64(1.0 - JITTER_FRACTION) - Duration::from_millis(5);
+    assert!(
+        elapsed >= lower_bound,
+        "without Retry-After headers send_with_retry must back off (elapsed = {elapsed:?}, lower bound = {lower_bound:?})",
+    );
 }
 
 // --- send_with_auth_retry --------------------------------------------------
