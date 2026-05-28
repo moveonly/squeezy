@@ -8754,6 +8754,155 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
 }
 
 #[test]
+fn streaming_chunks_emit_partial_previews_with_growing_content() {
+    use super::streaming_patch::{
+        JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
+    };
+
+    // F14: simulate the provider streaming the apply_patch args in five
+    // chunks. After each chunk, every `Partial` event must reflect the
+    // fields that have actually finished streaming — none should claim
+    // to know `search` before its closing quote has arrived.
+    let chunks = [
+        r#"{"patches":[{"#,
+        r#""path":"src/foo.rs""#,
+        r#","search":"old line""#,
+        r#","replace":"new line""#,
+        r#"}]}"#,
+    ];
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let mut events: Vec<PatchPreviewEvent> = Vec::new();
+    let mut snapshot_per_chunk: Vec<PatchPartial> = Vec::new();
+    for chunk in chunks {
+        events.extend(parser.push_delta(chunk));
+        snapshot_per_chunk.push(parser.latest_partial().clone());
+    }
+    events.extend(parser.finish());
+
+    let partials: Vec<&PatchPartial> = events
+        .iter()
+        .filter_map(|e| match e {
+            PatchPreviewEvent::Partial(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        partials.len() >= 3,
+        "expected at least one Partial per tracked field (path/search/replace), got {} \
+         partial events: {events:?}",
+        partials.len(),
+    );
+
+    let final_partial = partials
+        .last()
+        .copied()
+        .expect("at least one partial recorded");
+    assert_eq!(final_partial.path.as_deref(), Some("src/foo.rs"));
+    assert_eq!(final_partial.search.as_deref(), Some("old line"));
+    assert_eq!(final_partial.replace.as_deref(), Some("new line"));
+
+    // Snapshots taken before the value strings closed must NOT yet
+    // claim those fields — that would render a half-streamed diff body
+    // and confuse a watching user.
+    assert!(
+        snapshot_per_chunk[0].path.is_none(),
+        "no fields should be visible while only `{{\"patches\":[{{` has streamed; got {:?}",
+        snapshot_per_chunk[0]
+    );
+    assert!(
+        snapshot_per_chunk[1].path.as_deref() == Some("src/foo.rs")
+            && snapshot_per_chunk[1].search.is_none()
+            && snapshot_per_chunk[1].replace.is_none(),
+        "path should be visible but not search/replace; got {:?}",
+        snapshot_per_chunk[1]
+    );
+    assert!(
+        snapshot_per_chunk[2].search.as_deref() == Some("old line")
+            && snapshot_per_chunk[2].replace.is_none(),
+        "search should be visible but not replace; got {:?}",
+        snapshot_per_chunk[2]
+    );
+
+    // Render the diff for the snapshot captured BEFORE `replace` had
+    // arrived — the preview must show the deletion side but no
+    // additions yet, matching what the user would see frame-by-frame.
+    let search_only_lines = render_streaming_preview(&snapshot_per_chunk[2]);
+    let search_only_text = lines_to_string(&search_only_lines);
+    assert!(
+        search_only_text.contains("-old line"),
+        "search-only preview must render the deletion line: {search_only_text}",
+    );
+    assert!(
+        !search_only_text.contains("+old line") && !search_only_text.contains("+new line"),
+        "search-only preview must not render any addition yet: {search_only_text}",
+    );
+
+    // Once replace has streamed, the preview must show both sides.
+    let final_lines = render_streaming_preview(final_partial);
+    let final_text = lines_to_string(&final_lines);
+    assert!(
+        final_text.contains("-old line") && final_text.contains("+new line"),
+        "final preview must render both deletion and addition: {final_text}",
+    );
+    assert!(
+        final_text.contains("src/foo.rs"),
+        "preview header should surface the target path: {final_text}",
+    );
+}
+
+#[test]
+fn render_streaming_preview_renders_partial_search_only() {
+    use super::streaming_patch::{PatchPartial, render_streaming_preview};
+
+    // The provisional preview must handle a snapshot where `search`
+    // has closed but `replace` has not yet streamed — i.e. mid-frame
+    // state during a live edit. The render must produce deletions and
+    // omit additions entirely.
+    let partial = PatchPartial {
+        index: 0,
+        path: Some("src/lib.rs".to_string()),
+        search: Some("first\nsecond".to_string()),
+        replace: None,
+    };
+    let lines = render_streaming_preview(&partial);
+    let text = lines_to_string(&lines);
+    assert!(
+        text.contains("-first") && text.contains("-second"),
+        "multi-line search must produce one deletion per line: {text}",
+    );
+    assert!(
+        !text.contains("+first") && !text.contains("+second"),
+        "no replace yet → no additions in preview: {text}",
+    );
+}
+
+#[test]
+fn render_streaming_preview_for_empty_snapshot_is_empty() {
+    use super::streaming_patch::{PatchPartial, render_streaming_preview};
+
+    // Until any field has closed, the streaming preview must render
+    // nothing — there is nothing meaningful to show, and a stray
+    // header would suggest a patch is queued before one actually is.
+    let lines = render_streaming_preview(&PatchPartial::default());
+    assert!(
+        lines.is_empty(),
+        "empty partial must render no preview lines: {lines:?}",
+    );
+}
+
+fn lines_to_string(lines: &[ratatui::text::Line<'static>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for span in &line.spans {
+            out.push_str(&span.content);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
 fn idle_app_reports_no_active_animation() {
     let mut app = test_app(SessionMode::Build);
     // Fresh `TuiApp` starts with needs_redraw = true so the first frame

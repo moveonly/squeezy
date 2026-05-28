@@ -78,7 +78,9 @@ mod streaming;
 mod streaming_patch;
 mod toast;
 pub use render::markdown::render_markdown;
-pub use streaming_patch::{JsonPatchPreviewParser, PatchPreviewEvent};
+pub use streaming_patch::{
+    JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
+};
 
 #[cfg(test)]
 pub(crate) use events::apply_mcp_status_update;
