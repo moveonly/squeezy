@@ -922,51 +922,78 @@ fn handle_mouse(app: &mut TuiApp, mouse: crossterm::event::MouseEvent) {
     }
 }
 
-/// Rewrite a `KeyEvent` carrying a raw ASCII control byte
-/// (`\x01`..=`\x1A`) as the canonical `Char(<lowercase letter>) +
-/// CONTROL` form so downstream dispatchers see a single shape.
-/// Skips `\x08`/`\x09`/`\x0A`/`\x0D` (Backspace/Tab/Enter/CR are
-/// already distinct `KeyCode` variants) and `\x1B` (Esc). Pass-through
-/// when the event already carries CONTROL.
+/// Canonicalise a `KeyEvent` so every downstream dispatcher sees a
+/// single shape regardless of which terminal-protocol level emitted it.
+///
+/// Three normalisations live here, in order:
+///
+/// 1. **`META` modifier → `ALT`.** Some terminal protocols carry
+///    `Option`/`Alt` as `KeyModifiers::META` rather than `ALT`. We
+///    flatten so keymap lookups don't have to know.
+///
+/// 2. **Raw ASCII control byte → `Char(letter) + CONTROL`.** Terminals
+///    that don't honour kitty's `DISAMBIGUATE_ESCAPE_CODES` deliver
+///    `Ctrl+E` as the literal byte `\x05` with empty modifiers. We
+///    map `\x01..=\x1A` (skipping `\x08`/`\x09`/`\x0A`/`\x0D`/`\x1B`
+///    which have dedicated `KeyCode` variants).
+///
+/// 3. **Lowercase the letter + drop SHIFT in Ctrl/Alt+letter combos.**
+///    Kitty's `REPORT_ALTERNATE_KEYS` can deliver `Ctrl+E` as
+///    `Char('E') + CONTROL` (the base-layout key), and a user holding
+///    Shift can leak an extra `SHIFT` bit. Either would miss the
+///    keymap entry stored as `Char('e') + CONTROL`.
 fn normalise_control_byte(mut key: KeyEvent) -> KeyEvent {
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        return key;
+    if key.modifiers.contains(KeyModifiers::META) {
+        key.modifiers.remove(KeyModifiers::META);
+        key.modifiers.insert(KeyModifiers::ALT);
     }
-    let KeyCode::Char(ch) = key.code else {
-        return key;
-    };
-    let byte = ch as u32;
-    let is_remappable = matches!(
-        byte,
-        0x01 | 0x02
-            | 0x03
-            | 0x04
-            | 0x05
-            | 0x06
-            | 0x07
-            | 0x0B
-            | 0x0C
-            | 0x0E
-            | 0x0F
-            | 0x10
-            | 0x11
-            | 0x12
-            | 0x13
-            | 0x14
-            | 0x15
-            | 0x16
-            | 0x17
-            | 0x18
-            | 0x19
-            | 0x1A
-    );
-    if !is_remappable {
-        return key;
+    if !key.modifiers.contains(KeyModifiers::CONTROL)
+        && let KeyCode::Char(ch) = key.code
+    {
+        let byte = ch as u32;
+        let is_remappable = matches!(
+            byte,
+            0x01..=0x07 | 0x0B..=0x0C | 0x0E..=0x1A,
+        );
+        if is_remappable {
+            let letter = char::from_u32(byte + 0x60).expect("0x01..0x1A maps into 'a'..'z'");
+            key.code = KeyCode::Char(letter);
+            key.modifiers |= KeyModifiers::CONTROL;
+        }
     }
-    let letter = char::from_u32(byte + 0x60).expect("0x01..0x1A maps into 'a'..'z'");
-    key.code = KeyCode::Char(letter);
-    key.modifiers |= KeyModifiers::CONTROL;
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && let KeyCode::Char(ch) = key.code
+        && ch.is_ascii_alphabetic()
+    {
+        key.code = KeyCode::Char(ch.to_ascii_lowercase());
+        key.modifiers.remove(KeyModifiers::SHIFT);
+    }
+    debug_log_key_event(&key);
     key
+}
+
+/// Append a one-line summary of `key` to the path named by the
+/// `SQUEEZY_DEBUG_KEYS` env var. Silent no-op when unset or when the
+/// file can't be opened — diagnostics must never break the TUI.
+fn debug_log_key_event(key: &KeyEvent) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("SQUEEZY_DEBUG_KEYS") else {
+        return;
+    };
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = writeln!(
+        f,
+        "{:?} mods={:?} kind={:?}",
+        key.code, key.modifiers, key.kind
+    );
 }
 
 async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Result<bool> {

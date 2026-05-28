@@ -318,6 +318,51 @@ async fn ctrl_x_q_chord_toggles_queue_overlay() {
 }
 
 #[test]
+fn meta_modifier_normalises_to_alt() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::META);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::ALT));
+    assert!(!out.modifiers.contains(KeyModifiers::META));
+}
+
+#[test]
+fn uppercase_letter_with_control_normalises_to_lowercase() {
+    use super::normalise_control_byte;
+    // Kitty REPORT_ALTERNATE_KEYS can deliver Ctrl+E as `Char('E') + CONTROL`.
+    let raw = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::CONTROL);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+}
+
+#[test]
+fn ctrl_letter_with_stray_shift_drops_shift() {
+    use super::normalise_control_byte;
+    let raw = KeyEvent::new(
+        KeyCode::Char('e'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    );
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+    assert!(!out.modifiers.contains(KeyModifiers::SHIFT));
+}
+
+#[test]
+fn alt_letter_with_meta_modifier_normalises() {
+    use super::normalise_control_byte;
+    // Terminal delivers Option+E with META instead of ALT.
+    let raw = KeyEvent::new(KeyCode::Char('E'), KeyModifiers::META | KeyModifiers::SHIFT);
+    let out = normalise_control_byte(raw);
+    assert_eq!(out.code, KeyCode::Char('e'));
+    assert!(out.modifiers.contains(KeyModifiers::ALT));
+    assert!(!out.modifiers.contains(KeyModifiers::META));
+    assert!(!out.modifiers.contains(KeyModifiers::SHIFT));
+}
+
+#[test]
 fn raw_control_byte_normalises_to_char_plus_control() {
     use super::normalise_control_byte;
     let raw = KeyEvent::new(KeyCode::Char('\u{05}'), KeyModifiers::NONE);
