@@ -59,6 +59,7 @@ mod approval;
 mod commands;
 mod config_screen;
 mod events;
+mod fuzzy;
 mod history;
 mod input;
 mod keymap;

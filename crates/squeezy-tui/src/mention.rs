@@ -173,12 +173,12 @@ fn git_index_mtime(root: &Path) -> Option<SystemTime> {
 
 /// Rank `files` against `query`. Returns up to `MAX_MATCHES` paths.
 ///
-/// Delegates to `squeezy_rank::fuzzy::fuzzy_path_score` (lower is better)
-/// for the core scoring so the composer typeahead shares the same
-/// path-separator normalisation and subsequence matcher as the rest of
-/// the workspace ranking surface. A synthetic bonus is layered on top so
-/// paths whose basename starts with the query stay at the top of the
-/// list (`@lib` → `lib.rs` before `crates/.../lib.rs`).
+/// Delegates to [`crate::fuzzy::score`] (higher is better) so the
+/// composer typeahead shares the same word-boundary / consecutive-run
+/// scoring as the slash menu. Filename-prefix hits stay on top
+/// naturally — `@lib` matched against `lib.rs` earns word-boundary
+/// bonuses on every char and ties with `crates/.../lib.rs` are broken
+/// by the shorter-path rule below.
 pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
     if query.is_empty() {
         return files
@@ -191,14 +191,15 @@ pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
     let mut scored: Vec<(i32, &Path)> = files
         .iter()
         .filter_map(|path| {
-            let score = score_path(&query_lower, path)?;
+            let display = path.to_string_lossy();
+            let score = crate::fuzzy::score(&display, &query_lower)?;
             Some((score, path.as_path()))
         })
         .collect();
-    // Lower score first (fuzzy is min-score); on tie shorter path first
-    // since it is usually closer to what the user meant.
+    // Higher score first; on tie shorter path first since it is
+    // usually closer to what the user meant.
     scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
+        b.0.cmp(&a.0)
             .then(a.1.as_os_str().len().cmp(&b.1.as_os_str().len()))
     });
     scored
@@ -206,21 +207,6 @@ pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
         .take(MAX_MATCHES)
         .map(|(_, p)| p.to_path_buf())
         .collect()
-}
-
-fn score_path(query: &str, path: &Path) -> Option<i32> {
-    let display = path.to_string_lossy();
-    let mut score = squeezy_rank::fuzzy_path_score(&display, query)?;
-    if let Some(name) = path.file_name().and_then(|n| n.to_str())
-        && name.to_ascii_lowercase().starts_with(query)
-    {
-        // Synthetic bias so a filename-prefix hit always outranks a
-        // mid-path subsequence hit even when the latter happens to score
-        // lower. Matches the ergonomics of the previous hand-rolled
-        // scorer where filename prefix was the top tier.
-        score -= 1000;
-    }
-    Some(score)
 }
 
 /// Popup state attached to the app.

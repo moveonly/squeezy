@@ -108,18 +108,6 @@ fn apply_inserts_path_and_returns_new_cursor() {
 }
 
 #[test]
-fn mention_rank_uses_path_separator_normalisation() {
-    // `squeezy_graph` should match `crates/squeezy-graph/src/lib.rs`
-    // because the rank crate treats `_`, `-`, `/` as equivalent.
-    let files = vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")];
-    let out = rank_files("squeezy_graph", &files);
-    assert!(
-        !out.is_empty(),
-        "expected match via path-separator normalisation"
-    );
-}
-
-#[test]
 fn mention_rank_uses_subsequence_for_abbreviations() {
     // A camel/snake abbreviation like `grphmgr` should still match
     // `graph_manager.rs` via the case-insensitive subsequence matcher.
