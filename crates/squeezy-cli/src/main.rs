@@ -121,6 +121,11 @@ struct Cli {
         help = "Resume an explicit session id"
     )]
     session: Option<String>,
+    #[arg(
+        long = "force-cross-project",
+        help = "Bypass the cross-project confirmation when resuming a session whose recorded cwd differs from the current one"
+    )]
+    force_cross_project: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -283,7 +288,15 @@ enum SessionsCommand {
     #[command(about = "Show a local session summary")]
     Show { id: String },
     #[command(about = "Resume a local session in the TUI")]
-    Resume { id: String },
+    Resume {
+        id: String,
+        /// Bypass the cross-project confirmation prompt when the recorded
+        /// `metadata.cwd` differs from the current working directory.
+        /// Equivalent to typing `y` at the prompt; useful for scripted
+        /// callers that intentionally resume sessions across checkouts.
+        #[arg(long = "force-cross-project")]
+        force_cross_project: bool,
+    },
     #[command(about = "Fork a local session into a new child and resume it in the TUI")]
     Fork { id: String },
     #[command(about = "Replay a recorded local session deterministically")]
@@ -552,6 +565,23 @@ async fn main() -> squeezy_core::Result<()> {
     if let Some(note) = &resume_resolution.note {
         eprintln!("{note}");
     }
+    // F07: gate cross-project resumes behind a y/N prompt so that
+    // `squeezy --session <id>` (or `--continue` falling back to an
+    // arbitrary id) cannot silently drag a session into an unrelated
+    // checkout. `--continue` already filters by cwd equality, so this
+    // is effectively a no-op for that path — the lookup is only on the
+    // explicit `--session <id>` flow in practice.
+    let resume_session_id_opt = if let Some(id) = resume_resolution.session_id.as_deref() {
+        let store = SessionStore::open(&config);
+        if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
+            println!("resume cancelled");
+            let _ = telemetry.flush().await;
+            return Ok(());
+        }
+        Some(id.to_string())
+    } else {
+        None
+    };
     if prompt_mode_active {
         let prompts = print_mode::resolve_prompt_inputs(
             &cli.prompt,
@@ -572,14 +602,8 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompts(
-            config,
-            provider,
-            prompts,
-            cli.format,
-            resume_resolution.session_id,
-        )
-        .await;
+        let result =
+            run_prompts(config, provider, prompts, cli.format, resume_session_id_opt).await;
         let _ = telemetry.flush().await;
         return result;
     }
@@ -589,7 +613,7 @@ async fn main() -> squeezy_core::Result<()> {
     // startups; the banner stays quiet unless GitHub reports a new release
     // we haven't already nagged the user about.
     let update_banner = update::banner_for_startup(&update::check_for_update().await);
-    let resume_session_id = resume_resolution.session_id;
+    let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
         config,
@@ -1164,7 +1188,10 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             Ok(())
         }
-        SessionsCommand::Resume { id } => {
+        SessionsCommand::Resume {
+            id,
+            force_cross_project,
+        } => {
             // Pi-style prefix resolution: the user can type a short
             // unique prefix of a session id (e.g. `squeezy sessions
             // resume abc12`) and the store expands it to the full id
@@ -1174,6 +1201,18 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             let resolved = store
                 .resolve_session_id_prefix(id)
                 .map_err(|err| SqueezyError::Tool(err.to_string()))?;
+            // F07: when the recorded `metadata.cwd` differs from the
+            // caller's current directory, gate the resume behind a y/N
+            // prompt so a stray `squeezy sessions resume <id>` from an
+            // unrelated checkout cannot silently mutate a session that
+            // expected a different repo. `--force-cross-project` on
+            // either the top-level CLI or this subcommand bypasses the
+            // prompt for scripted callers.
+            let force = cli.force_cross_project || *force_cross_project;
+            if !confirm_cross_project_resume_stdio(&store, &resolved, force)? {
+                println!("resume cancelled");
+                return Ok(());
+            }
             let provider = provider_from_app_config(&config);
             squeezy_tui::resume(config, provider, resolved).await
         }
@@ -1375,6 +1414,91 @@ fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Render the cross-project resume prompt body when the recorded
+/// session cwd differs from the caller's current cwd; return `None`
+/// when the two refer to the same location so callers can skip the
+/// confirmation entirely.
+///
+/// Kept pure (no I/O) so it round-trips cleanly in unit tests and can be
+/// reused by any future surface (e.g. TUI) that needs the same warning
+/// string. Trailing path separators are trimmed before comparison so a
+/// recorded `"/repo"` and a current `"/repo/"` are treated as equal —
+/// the message itself preserves the original strings so the operator
+/// can spot the discrepancy.
+fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<String> {
+    fn normalize(value: &str) -> &str {
+        value.trim_end_matches(['/', std::path::MAIN_SEPARATOR])
+    }
+    if normalize(session_cwd) == normalize(current_cwd) {
+        return None;
+    }
+    Some(format!(
+        "Resume session from {session_cwd} in current cwd {current_cwd}? [y/N] "
+    ))
+}
+
+/// Drive a y/N confirmation through caller-supplied I/O. Returns `true`
+/// when the resume should proceed: the cwd already matches, the caller
+/// passed `force = true` (matching `--force-cross-project`), or the
+/// operator typed `y`/`yes`. Any other input — including end-of-stream
+/// — defaults to declining the resume, matching the documented "[y/N]"
+/// shape.
+fn confirm_cross_project_resume<R, W>(
+    session_cwd: &str,
+    current_cwd: &str,
+    force: bool,
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<bool>
+where
+    R: io::BufRead,
+    W: Write,
+{
+    if force {
+        return Ok(true);
+    }
+    let Some(prompt) = cross_project_resume_prompt(session_cwd, current_cwd) else {
+        return Ok(true);
+    };
+    writer.write_all(prompt.as_bytes())?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// `confirm_cross_project_resume` wired to real `stdin`/`stderr`. Looks
+/// up the session metadata via [`SessionStore::read_metadata`] so the
+/// caller only needs to know the resolved session id, and resolves
+/// `current_cwd` through `std::env::current_dir()` (falling back to
+/// `"."` if the process has no working directory — same fallback
+/// `SessionMetadata::new` uses when recording the original cwd).
+fn confirm_cross_project_resume_stdio(
+    store: &SessionStore,
+    session_id: &str,
+    force: bool,
+) -> squeezy_core::Result<bool> {
+    let metadata = store.read_metadata(session_id)?;
+    let current_cwd = env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string();
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    let mut reader = stdin.lock();
+    let mut writer = stderr.lock();
+    Ok(confirm_cross_project_resume(
+        &metadata.cwd,
+        &current_cwd,
+        force,
+        &mut reader,
+        &mut writer,
+    )?)
 }
 
 fn parse_excluded_sections(values: &[String]) -> squeezy_core::Result<BTreeSet<String>> {

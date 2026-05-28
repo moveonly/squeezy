@@ -254,6 +254,245 @@ fn cli_continue_and_session_are_mutually_exclusive() {
 }
 
 #[test]
+fn cli_force_cross_project_defaults_to_false() {
+    let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
+    assert!(!cli.force_cross_project);
+}
+
+#[test]
+fn cli_force_cross_project_parses_top_level_flag() {
+    let cli = Cli::try_parse_from(["squeezy", "--force-cross-project", "--session", "abc"])
+        .expect("parse force flag with session");
+    assert!(cli.force_cross_project);
+    assert_eq!(cli.session.as_deref(), Some("abc"));
+}
+
+#[test]
+fn cli_force_cross_project_attaches_to_sessions_resume() {
+    // Mirror the subcommand's own opt-in flag so scripted callers can
+    // type `squeezy sessions resume <id> --force-cross-project` without
+    // hoisting the flag above the subcommand boundary.
+    let cli = Cli::try_parse_from([
+        "squeezy",
+        "sessions",
+        "resume",
+        "abc",
+        "--force-cross-project",
+    ])
+    .expect("parse sessions resume --force-cross-project");
+    match cli.command {
+        Some(Command::Sessions {
+            command:
+                SessionsCommand::Resume {
+                    id,
+                    force_cross_project,
+                },
+        }) => {
+            assert_eq!(id, "abc");
+            assert!(force_cross_project);
+        }
+        other => panic!("expected sessions resume command, got {other:?}"),
+    }
+}
+
+#[test]
+fn cross_project_resume_prompt_skips_when_paths_match() {
+    assert!(cross_project_resume_prompt("/repo", "/repo").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_ignores_trailing_separator() {
+    // The original cwd was `current_dir().display()` which never carries
+    // a trailing separator on real filesystems, but defensively normalize
+    // so a hand-edited or migrated metadata.json doesn't trigger a
+    // spurious prompt.
+    assert!(cross_project_resume_prompt("/repo/", "/repo").is_none());
+    assert!(cross_project_resume_prompt("/repo", "/repo/").is_none());
+}
+
+#[test]
+fn cross_project_resume_prompt_renders_y_n_message() {
+    let prompt = cross_project_resume_prompt("/old/repo", "/new/repo")
+        .expect("differing cwds should require a prompt");
+    assert!(prompt.contains("/old/repo"));
+    assert!(prompt.contains("/new/repo"));
+    assert!(prompt.contains("[y/N]"));
+}
+
+#[test]
+fn confirm_cross_project_resume_proceeds_when_cwds_match() {
+    let mut reader = io::Cursor::new(Vec::<u8>::new());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/repo", "/repo", false, &mut reader, &mut writer)
+        .expect("matching cwds skip the prompt entirely");
+
+    assert!(proceed, "matching cwds must proceed");
+    assert!(
+        writer.is_empty(),
+        "no prompt should have been written for matching cwds; got {:?}",
+        String::from_utf8_lossy(&writer)
+    );
+}
+
+#[test]
+fn confirm_cross_project_resume_force_bypasses_prompt_for_mismatch() {
+    let mut reader = io::Cursor::new(Vec::<u8>::new());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", true, &mut reader, &mut writer)
+        .expect("force bypasses the prompt");
+
+    assert!(proceed, "force-cross-project must proceed");
+    assert!(
+        writer.is_empty(),
+        "force should suppress the prompt; got {:?}",
+        String::from_utf8_lossy(&writer)
+    );
+}
+
+#[test]
+fn confirm_cross_project_resume_accepts_lowercase_yes() {
+    let mut reader = io::Cursor::new(b"y\n".to_vec());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", false, &mut reader, &mut writer)
+        .expect("scripted stdin");
+
+    assert!(proceed, "`y` should proceed");
+    let rendered = String::from_utf8(writer).expect("utf-8 prompt");
+    assert!(rendered.contains("/old"));
+    assert!(rendered.contains("/new"));
+    assert!(rendered.contains("[y/N]"));
+}
+
+#[test]
+fn confirm_cross_project_resume_accepts_full_word_yes_and_trims_whitespace() {
+    let mut reader = io::Cursor::new(b"  YES \n".to_vec());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", false, &mut reader, &mut writer)
+        .expect("scripted stdin");
+
+    assert!(proceed, "`YES` (with whitespace) should proceed");
+}
+
+#[test]
+fn confirm_cross_project_resume_defaults_to_no_on_blank_input() {
+    let mut reader = io::Cursor::new(b"\n".to_vec());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", false, &mut reader, &mut writer)
+        .expect("scripted stdin");
+
+    assert!(!proceed, "blank input must default to N");
+}
+
+#[test]
+fn confirm_cross_project_resume_defaults_to_no_on_eof() {
+    let mut reader = io::Cursor::new(Vec::<u8>::new());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", false, &mut reader, &mut writer)
+        .expect("empty stdin returns EOF, not an io error");
+
+    assert!(!proceed, "EOF (e.g. closed pipe) must default to N");
+}
+
+#[test]
+fn confirm_cross_project_resume_rejects_unrelated_input() {
+    let mut reader = io::Cursor::new(b"nope\n".to_vec());
+    let mut writer: Vec<u8> = Vec::new();
+
+    let proceed = confirm_cross_project_resume("/old", "/new", false, &mut reader, &mut writer)
+        .expect("scripted stdin");
+
+    assert!(!proceed, "`nope` must not be treated as `yes`");
+}
+
+#[test]
+fn confirm_cross_project_resume_stdio_reads_metadata_and_skips_when_match() {
+    // Plant a session metadata file on disk with `cwd` matching the
+    // process's real `current_dir`. The stdio wrapper should consult
+    // the store, decide no prompt is needed, and return `true` without
+    // touching stdin — which is what makes this safe to run in `cargo
+    // test` (no scripted I/O required).
+    let root = temp_dir("cross-project-stdio-match");
+    let cwd_str = env::current_dir()
+        .expect("current dir")
+        .display()
+        .to_string();
+    let session_id = plant_session_metadata(&root, "match-id", &cwd_str);
+
+    let store = open_store_at(&root);
+    let proceed = confirm_cross_project_resume_stdio(&store, &session_id, false)
+        .expect("matching cwd should bypass the prompt");
+    assert!(proceed);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn confirm_cross_project_resume_stdio_force_skips_metadata_lookup_decision() {
+    // Even with mismatched cwds, the `--force-cross-project` short-circuit
+    // must return `true` without ever reading stdin. We assert via the
+    // stdio wrapper to cover the real public entry point used by the CLI.
+    let root = temp_dir("cross-project-stdio-force");
+    let session_id = plant_session_metadata(&root, "force-id", "/some/old/cwd");
+
+    let store = open_store_at(&root);
+    let proceed = confirm_cross_project_resume_stdio(&store, &session_id, true)
+        .expect("force bypasses the prompt regardless of metadata cwd");
+    assert!(proceed);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn confirm_cross_project_resume_stdio_errors_on_unknown_session() {
+    let root = temp_dir("cross-project-stdio-missing");
+    let store = open_store_at(&root);
+    let err = confirm_cross_project_resume_stdio(&store, "ghost-id", false)
+        .expect_err("unknown session id must surface an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ghost-id"),
+        "error should mention the missing session id; got: {msg}",
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Write a minimal `metadata.json` for a session id under `root` so the
+/// CLI cross-project tests can exercise the real `SessionStore::read_metadata`
+/// path. Only the fields the prompt depends on (`session_id`, `cwd`) are
+/// populated; everything else falls back to `SessionMetadata::default()`.
+fn plant_session_metadata(root: &Path, session_id: &str, cwd: &str) -> String {
+    let dir = root.join("sessions").join(session_id);
+    fs::create_dir_all(&dir).expect("session dir");
+    let metadata = SessionMetadata {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        ..SessionMetadata::default()
+    };
+    let body = serde_json::to_string_pretty(&metadata).expect("serialize metadata");
+    fs::write(dir.join("metadata.json"), body).expect("write metadata.json");
+    session_id.to_string()
+}
+
+/// Open a `SessionStore` rooted at `<root>/sessions` by routing the path
+/// through `AppConfig::session_logs.log_dir`, which is the supported
+/// public lever for redirecting the on-disk session root.
+fn open_store_at(root: &Path) -> SessionStore {
+    let mut config = AppConfig {
+        workspace_root: root.to_path_buf(),
+        ..AppConfig::default()
+    };
+    config.session_logs.log_dir = Some(root.join("sessions"));
+    SessionStore::open(&config)
+}
+
+#[test]
 fn cli_session_dir_defaults_to_none_when_flag_omitted() {
     let cli = Cli::try_parse_from(["squeezy"]).expect("parse");
     assert_eq!(cli.session_dir, None);

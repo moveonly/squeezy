@@ -566,6 +566,25 @@ impl SessionStore {
         })
     }
 
+    /// Read just `metadata.json` for `session_id` without loading events,
+    /// the resume snapshot, attachments, or the replay tape. Used by the
+    /// CLI cross-project resume confirmation prompt where only
+    /// `metadata.cwd` is needed and pulling in megabytes of events would
+    /// be wasteful right before the TUI resumes the session anyway.
+    /// Resolves through `locate_session_dir` so archived sessions stay
+    /// readable.
+    pub fn read_metadata(&self, session_id: &str) -> Result<SessionMetadata> {
+        let dir = self.locate_session_dir(session_id);
+        let metadata_path = dir.join("metadata.json");
+        if !metadata_path.exists() {
+            return Err(SqueezyError::Tool(format!(
+                "session {session_id} not found (no metadata.json at {})",
+                metadata_path.display(),
+            )));
+        }
+        read_json(&metadata_path)
+    }
+
     pub fn replay_tape(&self, session_id: &str) -> Result<SessionReplayTape> {
         let (events, warnings) =
             read_replay_jsonl(&self.locate_session_dir(session_id).join("replay.jsonl"))?;
