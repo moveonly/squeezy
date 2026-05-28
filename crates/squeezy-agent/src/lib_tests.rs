@@ -3167,7 +3167,8 @@ fn test_advertised_tool(name: &str, capability: PermissionCapability) -> Adverti
         name: name.to_string(),
         description: format!("{name} test tool"),
         capability,
-        parameters: json!({"type": "object"}),
+        parameters: squeezy_tools::parse_strict_tool_parameters(json!({"type": "object"}))
+            .expect("typed tool schema"),
         prepare_arguments: None,
     })
 }

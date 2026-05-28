@@ -9953,7 +9953,16 @@ pub(crate) fn advertised_tool(spec: ToolSpec) -> AdvertisedTool {
         spec: Arc::new(LlmToolSpec {
             name: spec.name,
             description: spec.description,
-            parameters: spec.parameters,
+            // LlmToolSpec is the provider-facing surface and intentionally
+            // stays a free-shape `Value` so it can be embedded directly into
+            // every provider request body. Serializing the typed
+            // [`squeezy_tools::JsonSchema`] back into a `Value` here is the
+            // only boundary point where the conversion runs; the
+            // registration-time `deny_unknown_fields` guard on
+            // [`squeezy_tools::ToolSpec::parameters`] has already rejected
+            // any first-party drift before this point.
+            parameters: serde_json::to_value(&spec.parameters)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
             strict: false,
         }),
     }

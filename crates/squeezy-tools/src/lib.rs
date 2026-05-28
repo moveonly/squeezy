@@ -78,7 +78,11 @@ use patch::{
     render_write_file_diff,
 };
 pub use safety::{ShellPreClassification, pre_classify_shell};
-use schema::compact_tool_parameters;
+use schema::compact_typed_tool_parameters;
+pub use schema::{
+    AdditionalProperties, JsonSchema, JsonSchemaPrimitiveType, JsonSchemaType,
+    parse_lossy_tool_parameters, parse_strict_tool_parameters,
+};
 pub use shell::direct_user_shell_nonce;
 pub(crate) use shell::{ShellArgs, ShellExecutionGuard, ShellRunOutcome};
 #[cfg(test)]
@@ -239,7 +243,16 @@ pub type PrepareArgumentsHook = fn(&mut Value) -> std::result::Result<(), String
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub parameters: Value,
+    /// Typed JSON-Schema fragment advertised to the model. Holding the
+    /// schema as a [`JsonSchema`] (rather than a raw [`Value`]) is the
+    /// registration-time guard against silent drift: every first-party
+    /// spec routes through [`parse_strict_tool_parameters`], so a
+    /// misspelled JSON-Schema keyword in `crate::specs` makes the spec
+    /// constructor panic at startup instead of shipping a degraded schema
+    /// to the model. External MCP schemas come in via the tolerant
+    /// [`parse_lossy_tool_parameters`] path so unknown third-party
+    /// keywords degrade gracefully to the modeled subset.
+    pub parameters: JsonSchema,
     /// The capability that approximates this tool's lowest-risk form, used at
     /// advertisement time (before any arguments are bound) to decide whether a
     /// tool should be visible to the model in a given session mode. Runtime
@@ -262,7 +275,7 @@ impl ToolSpec {
     /// Apply the schema-compaction pipeline to `parameters`. Idempotent — safe
     /// to call on a spec that has already been compacted.
     pub(crate) fn with_compacted_parameters(mut self) -> Self {
-        compact_tool_parameters(&mut self.parameters);
+        compact_typed_tool_parameters(&mut self.parameters);
         self
     }
 
@@ -729,8 +742,8 @@ pub struct ToolRegistry {
     /// F04: cache for the per-turn `specs()` advertisement. The agent calls
     /// this at least once per round for cost accounting plus once more when
     /// building the LLM request; recomputing means cloning ~30 `ToolSpec`s
-    /// with their `parameters: Value` blobs every time. The cache is
-    /// invalidated whenever MCP refresh changes the external tool set.
+    /// with their typed `parameters: JsonSchema` trees every time. The cache
+    /// is invalidated whenever MCP refresh changes the external tool set.
     cached_specs: Arc<StdMutex<Option<Arc<Vec<ToolSpec>>>>>,
     /// Plans registered by `plan_patch` and consulted by `apply_patch` to enforce
     /// the model's stated semantic neighborhood. Keyed by `plan_id`; entries
@@ -1323,7 +1336,7 @@ impl ToolRegistry {
         // through the compaction pipeline so the budget contract holds
         // uniformly regardless of how a spec was built.
         for spec in specs.iter_mut() {
-            compact_tool_parameters(&mut spec.parameters);
+            compact_typed_tool_parameters(&mut spec.parameters);
         }
         // `mcp_tool_spec` already compacts at construction; append after the
         // first-party loop to avoid double work.

@@ -163,3 +163,72 @@ fn compact_keeps_top_level_properties_after_oversized_mcp_schema() {
     // Top-level properties survive (just stripped of descriptions).
     assert!(schema.get("properties").is_some());
 }
+
+#[test]
+fn strict_parse_rejects_misspelled_keyword() {
+    // `propeties` is the classic typo. Strict parsing surfaces it at
+    // registration time so the spec constructor in `crate::specs` panics
+    // instead of silently shipping a JSON Schema without `properties`.
+    let result = parse_strict_tool_parameters(json!({
+        "type": "object",
+        "propeties": {"path": {"type": "string"}}
+    }));
+    let err = result.expect_err("misspelled keyword must fail strict parse");
+    assert!(
+        err.contains("propeties"),
+        "error must name the bad key: {err}"
+    );
+}
+
+#[test]
+fn strict_parse_accepts_valid_first_party_schema() {
+    let schema = parse_strict_tool_parameters(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "path": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3}
+        },
+        "required": ["path"]
+    }))
+    .expect("valid first-party schema must parse");
+    // `default` is modeled now so first-party specs don't silently drop it.
+    let limit = schema
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("limit"))
+        .expect("limit property survives");
+    assert!(limit.default.is_some(), "default must survive: {limit:?}");
+}
+
+#[test]
+fn lossy_parse_drops_unknown_external_keywords() {
+    // External MCP servers ship JSON Schema keywords we don't model. The
+    // tolerant path strips them rather than collapsing the whole schema to
+    // `JsonSchema::default()`.
+    let schema = parse_lossy_tool_parameters(json!({
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "pattern": "^[A-Z]+$",
+                "examples": ["AB", "CD"],
+                "description": "Upper-case marker"
+            }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [{"pattern": "AB"}]
+    }));
+    let prop = schema
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("pattern"))
+        .expect("modeled property survives");
+    assert_eq!(prop.description.as_deref(), Some("Upper-case marker"));
+    assert!(matches!(
+        prop.schema_type,
+        Some(super::JsonSchemaType::Single(
+            super::JsonSchemaPrimitiveType::String
+        ))
+    ));
+}

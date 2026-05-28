@@ -5,23 +5,27 @@
 //! deeply nested `$defs`, long descriptions, and unreachable definitions.
 //! Every byte of that schema costs tokens on every turn the tool is loaded.
 //!
-//! The pipeline runs against a typed [`JsonSchema`] (not raw [`serde_json::Value`])
-//! so the parameter shape is validated once on entry and once on exit. Any
-//! schema fragment that survives compaction must round-trip through the typed
-//! enum, so a tool emitting an unsupported `"type"` value or a stray
-//! `additionalProperties: 42` is normalized in one place rather than at every
-//! downstream provider translator.
+//! `ToolSpec::parameters` holds a typed [`JsonSchema`] (not a raw
+//! [`serde_json::Value`]), so the parameter shape is validated once on entry
+//! and once on exit. Internal specs route through
+//! [`parse_strict_tool_parameters`] which uses
+//! `#[serde(deny_unknown_fields)]`: a misspelled JSON-Schema keyword in a
+//! first-party spec (such as `"propeties"` instead of `"properties"`) makes
+//! `serde_json::from_value` fail and the spec constructor panics at process
+//! startup, surfacing the drift at registration time instead of silently
+//! shipping an empty schema to the model. External MCP schemas come from
+//! untrusted servers and route through [`parse_lossy_tool_parameters`],
+//! which first strips fields outside our typed surface so unknown
+//! JSON-Schema-isms degrade gracefully to the modeled subset.
 //!
-//! [`compact_tool_parameters`] runs three logical stages on the value:
-//! 1. **Sanitize** — coerce boolean schemas to permissive object schemas,
-//!    infer missing `type` keywords from sibling hints, normalize child
-//!    tables, coerce `const` into single-element `enum`.
-//! 2. **Prune** — remove `$defs` / `definitions` entries unreachable from any
-//!    `$ref`.
-//! 3. **Compact** — when the sanitized + pruned schema still serializes above
-//!    [`MAX_TOOL_SCHEMA_BYTES`], apply increasingly lossy passes until it fits:
-//!    strip descriptions, drop definitions (rewriting `$ref` to `{}`), then
-//!    collapse objects deeper than [`MAX_TOOL_SCHEMA_DEPTH`].
+//! [`compact_typed_tool_parameters`] runs three logical passes on the
+//! typed schema:
+//! 1. **Prune** — remove `$defs` / `definitions` entries unreachable from
+//!    any `$ref`.
+//! 2. **Compact** — when the pruned schema still serializes above
+//!    [`MAX_TOOL_SCHEMA_BYTES`], apply increasingly lossy passes until it
+//!    fits: strip descriptions, drop definitions (rewriting `$ref` to
+//!    `{}`), then collapse objects deeper than [`MAX_TOOL_SCHEMA_DEPTH`].
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -66,11 +70,19 @@ pub enum AdditionalProperties {
 
 /// Typed JSON-Schema subset used for tool parameter schemas.
 ///
-/// Round-tripping a `Value` through this struct is the drift-prevention
-/// invariant: any field not listed here is dropped, any field with an
-/// incompatible shape fails deserialization. The pipeline catches both and
-/// degrades gracefully (see [`compact_tool_parameters`]).
+/// `#[serde(deny_unknown_fields)]` is the registration-time guard that
+/// keeps first-party specs honest: a misspelled keyword inside a
+/// `parse_strict_tool_parameters` call (used by every first-party
+/// [`crate::ToolSpec`] constructor in `crate::specs`) makes `from_value`
+/// return an error, and the wrapping `tool_schema!` helper panics at
+/// startup. Without the typed surface a typo would silently disappear and
+/// the model would receive a degraded schema only visible at dispatch
+/// time. External MCP schemas (built via
+/// [`parse_lossy_tool_parameters`]) are pre-stripped down to the modeled
+/// subset before strict deserialization so this guard does not reject
+/// arbitrary external JSON Schemas.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct JsonSchema {
     #[serde(rename = "$ref", skip_serializing_if = "Option::is_none")]
     pub schema_ref: Option<String>,
@@ -113,6 +125,18 @@ pub struct JsonSchema {
     pub minimum: Option<serde_json::Number>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maximum: Option<serde_json::Number>,
+    #[serde(rename = "minLength", skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u64>,
+    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u64>,
+    #[serde(rename = "minItems", skip_serializing_if = "Option::is_none")]
+    pub min_items: Option<u64>,
+    #[serde(rename = "maxItems", skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u64>,
+    /// Default suggestion shown to the model. Arbitrary JSON value — not
+    /// recursed into by [`strip_unknown_schema_fields`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
 }
 
 impl JsonSchema {
@@ -131,45 +155,86 @@ impl JsonSchema {
     }
 }
 
-/// Run the sanitize → prune → compact pipeline in-place on a raw
-/// `serde_json::Value`. Internally the value is parsed into a [`JsonSchema`]
-/// so type drift is caught at the boundary; the result is re-serialized back
-/// into `value`.
+/// JSON-Schema keys covered by the typed [`JsonSchema`] surface. Used by
+/// [`strip_unknown_schema_fields`] to drop everything else before the
+/// strict-parse pass.
+const KNOWN_SCHEMA_KEYS: &[&str] = &[
+    "$ref",
+    "type",
+    "description",
+    "title",
+    "enum",
+    "format",
+    "items",
+    "prefixItems",
+    "properties",
+    "required",
+    "additionalProperties",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "not",
+    "$defs",
+    "definitions",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "default",
+];
+
+/// Sanitize and strict-parse a raw [`Value`] into a [`JsonSchema`].
+/// Returns `Err` when the value contains any keyword outside the typed
+/// surface — exactly the registration-time guard that catches misspellings
+/// in first-party tool specs (see [`crate::specs`] callers).
+pub fn parse_strict_tool_parameters(value: Value) -> Result<JsonSchema, String> {
+    let mut sanitized = value;
+    sanitize_value(&mut sanitized);
+    serde_json::from_value::<JsonSchema>(sanitized).map_err(|err| err.to_string())
+}
+
+/// Tolerant counterpart for external schemas (MCP servers): first strips
+/// every field outside the typed surface so strict deserialization succeeds
+/// on arbitrary third-party JSON Schemas, then degrades to
+/// `JsonSchema::default()` if even the stripped value fails to parse.
+pub fn parse_lossy_tool_parameters(value: Value) -> JsonSchema {
+    let mut sanitized = value;
+    sanitize_value(&mut sanitized);
+    strip_unknown_schema_fields(&mut sanitized);
+    serde_json::from_value::<JsonSchema>(sanitized).unwrap_or_default()
+}
+
+/// Run prune-then-compact passes on an already-typed schema in place.
+/// Equivalent to the original [`compact_tool_parameters`] pipeline but
+/// without the round-trip through [`Value`].
+pub fn compact_typed_tool_parameters(schema: &mut JsonSchema) {
+    prune_unreachable_definitions(schema);
+    if fits_budget(schema) {
+        return;
+    }
+    strip_schema_descriptions(schema);
+    if fits_budget(schema) {
+        return;
+    }
+    drop_schema_definitions(schema);
+    if fits_budget(schema) {
+        return;
+    }
+    collapse_deep_schema_objects(schema, 0);
+}
+
+/// Sanitize-parse-compact a raw [`Value`] in place. Backward-compatibility
+/// shim retained for the existing tests in `schema_tests` — production
+/// callers use the strict / lossy parsers plus
+/// [`compact_typed_tool_parameters`] directly so the typed schema never
+/// round-trips through `Value` once built.
+#[cfg(test)]
 pub(crate) fn compact_tool_parameters(value: &mut Value) {
-    sanitize_value(value);
-    let mut schema = value_to_schema(value);
-    prune_unreachable_definitions(&mut schema);
-
-    if fits_budget(&schema) {
-        write_schema_back(value, &schema);
-        return;
-    }
-    strip_schema_descriptions(&mut schema);
-    if fits_budget(&schema) {
-        write_schema_back(value, &schema);
-        return;
-    }
-    drop_schema_definitions(&mut schema);
-    if fits_budget(&schema) {
-        write_schema_back(value, &schema);
-        return;
-    }
-    collapse_deep_schema_objects(&mut schema, 0);
-    write_schema_back(value, &schema);
-}
-
-/// Parse `value` into a [`JsonSchema`]. Any field outside the typed surface is
-/// discarded, and incompatible shapes degrade to default — the pipeline still
-/// produces a well-typed schema rather than refusing the tool altogether.
-fn value_to_schema(value: &Value) -> JsonSchema {
-    serde_json::from_value::<JsonSchema>(value.clone()).unwrap_or_default()
-}
-
-/// Re-serialize the typed schema back into the in-place `Value`. Falls back
-/// to `{}` if serialization somehow fails so the caller never sees a stale
-/// value.
-fn write_schema_back(value: &mut Value, schema: &JsonSchema) {
-    *value = serde_json::to_value(schema).unwrap_or(Value::Object(Map::new()));
+    let mut schema = parse_lossy_tool_parameters(value.clone());
+    compact_typed_tool_parameters(&mut schema);
+    *value = serde_json::to_value(&schema).unwrap_or(Value::Object(Map::new()));
 }
 
 fn fits_budget(schema: &JsonSchema) -> bool {
@@ -262,6 +327,56 @@ fn sanitize_object(map: &mut Map<String, Value>) {
         && !matches!(additional, Value::Bool(_))
     {
         sanitize_value(additional);
+    }
+}
+
+/// Recursively drop keys not in [`KNOWN_SCHEMA_KEYS`] from a raw [`Value`]
+/// shaped like a JSON Schema. Walks schema-positional locations only —
+/// `enum` value arrays and `default` payloads carry arbitrary user JSON
+/// and are deliberately left untouched.
+fn strip_unknown_schema_fields(value: &mut Value) {
+    let Value::Object(obj) = value else {
+        return;
+    };
+
+    obj.retain(|key, _| KNOWN_SCHEMA_KEYS.contains(&key.as_str()));
+
+    if let Some(Value::Object(properties)) = obj.get_mut("properties") {
+        for (_, child) in properties.iter_mut() {
+            strip_unknown_schema_fields(child);
+        }
+    }
+    if let Some(items) = obj.get_mut("items") {
+        match items {
+            Value::Array(children) => {
+                for child in children.iter_mut() {
+                    strip_unknown_schema_fields(child);
+                }
+            }
+            other => strip_unknown_schema_fields(other),
+        }
+    }
+    for key in ["anyOf", "oneOf", "allOf", "prefixItems"] {
+        if let Some(Value::Array(children)) = obj.get_mut(key) {
+            for child in children.iter_mut() {
+                strip_unknown_schema_fields(child);
+            }
+        }
+    }
+    if let Some(not) = obj.get_mut("not") {
+        strip_unknown_schema_fields(not);
+    }
+    for key in ["$defs", "definitions"] {
+        if let Some(Value::Object(defs)) = obj.get_mut(key) {
+            for (_, child) in defs.iter_mut() {
+                strip_unknown_schema_fields(child);
+            }
+        }
+    }
+    if let Some(additional) = obj.get_mut("additionalProperties")
+        && !matches!(additional, Value::Bool(_))
+    {
+        strip_unknown_schema_fields(additional);
     }
 }
 
