@@ -36,14 +36,15 @@ pub use squeezy_mcp::{
 use squeezy_skills::{LoadedSkill, SkillActivation, SkillCatalog, SkillPreambleRender};
 use squeezy_store::{Observation, ObservationKind, SqueezyStore};
 use squeezy_vcs::{
-    CheckpointRecord, CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions,
-    DiffSnapshot, GitVcs, WorkspaceSnapshot, canonicalize_workspace_root, strip_verbatim_prefix,
+    CheckpointStore, DiffFile, DiffFileStatus, DiffMode, DiffOptions, DiffSnapshot, GitVcs,
+    canonicalize_workspace_root, strip_verbatim_prefix,
 };
 use squeezy_workspace::{CompiledIndexingPolicy, CrawlOptions, ExclusionReason, IndexingPolicy};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use unicode_normalization::UnicodeNormalization;
 
+mod checkpoint_provider;
 mod checkpoints;
 mod file_mutation_queue;
 mod file_ops;
@@ -66,6 +67,10 @@ mod web;
 mod win_job;
 mod windows_cmd;
 
+pub use checkpoint_provider::{
+    CheckpointEditContext, CheckpointProvider, CheckpointSnapshot, JournalCheckpointProvider,
+    checkpoint_record_to_json,
+};
 use checkpoints::{CheckpointRevertArgs, CheckpointShowArgs};
 use file_ops::{GlobArgs, GrepArgs, ReadFileArgs, ReadToolOutputArgs};
 use graph_tools::{
@@ -756,6 +761,15 @@ pub struct ToolRegistry {
     /// [`ToolRegistryRuntime`].
     pub(crate) state_store: Option<Arc<SqueezyStore>>,
     pub(crate) checkpoints: Option<Arc<CheckpointStore>>,
+    /// Pluggable pre/post-edit snapshot bridge. Defaults to a
+    /// [`JournalCheckpointProvider`] wired to [`Self::checkpoints`] when
+    /// the journal is enabled; external integrations (e.g. a git-stash
+    /// snapshotter) can replace it via
+    /// [`ToolRegistry::register_checkpoint_provider`] without forking
+    /// core. The slot itself is mutable to support post-construction
+    /// registration; the inner `Arc<dyn ...>` is shared across registry
+    /// clones so a swap is visible everywhere.
+    pub(crate) checkpoint_provider: Arc<StdMutex<Option<Arc<dyn CheckpointProvider>>>>,
     diff_cache: Arc<StdMutex<DiffSnapshotCache>>,
     pub(crate) skills: Arc<SkillCatalog>,
     pub(crate) redactor: Arc<Redactor>,
@@ -1035,6 +1049,11 @@ impl ToolRegistry {
         } else {
             None
         };
+        let checkpoint_provider: Option<Arc<dyn CheckpointProvider>> =
+            checkpoints.as_ref().map(|store| {
+                Arc::new(JournalCheckpointProvider::new(Arc::clone(store)))
+                    as Arc<dyn CheckpointProvider>
+            });
         let shell_sandbox = normalize_shell_sandbox_paths(config.shell_sandbox);
         Ok(Self {
             root: Arc::new(root),
@@ -1046,6 +1065,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             state_store: state_store.clone(),
             checkpoints,
+            checkpoint_provider: Arc::new(StdMutex::new(checkpoint_provider)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(skills),
             redactor,
@@ -1093,6 +1113,7 @@ impl ToolRegistry {
             vcs: Arc::new(vcs),
             state_store: None,
             checkpoints: None,
+            checkpoint_provider: Arc::new(StdMutex::new(None)),
             diff_cache: Arc::new(StdMutex::new(DiffSnapshotCache::default())),
             skills: Arc::new(SkillCatalog::empty()),
             redactor: Arc::new(Redactor::default()),
@@ -3835,36 +3856,75 @@ impl ToolRegistry {
             .to_path_buf()
     }
 
-    pub(crate) fn track_checkpoint_tree(&self) -> Result<Option<WorkspaceSnapshot>> {
-        self.checkpoints
-            .as_ref()
-            .map(|checkpoints| checkpoints.track_tree())
-            .transpose()
+    /// Replace the currently registered [`CheckpointProvider`] (if any)
+    /// with `provider`. Returns the previously installed provider so the
+    /// caller can chain or restore.
+    ///
+    /// Intended for extensions (e.g. a git-stash bridge) that want to
+    /// take over pre/post-edit snapshotting from the built-in
+    /// [`JournalCheckpointProvider`]. The journal-backed CRUD tools
+    /// (`checkpoint_list`/`checkpoint_show`/`checkpoint_undo`/
+    /// `checkpoint_revert`) still operate against the registry's own
+    /// `CheckpointStore` — they do not route through the provider trait —
+    /// so installing a replacement does not silently break the existing
+    /// rollback surface.
+    pub fn register_checkpoint_provider(
+        &self,
+        provider: Arc<dyn CheckpointProvider>,
+    ) -> Option<Arc<dyn CheckpointProvider>> {
+        let mut slot = self
+            .checkpoint_provider
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        slot.replace(provider)
+    }
+
+    /// True when a [`CheckpointProvider`] is currently installed. Used by
+    /// edit-bearing tools (notably `shell`) to skip the workspace-tree
+    /// snapshot when no provider would consume it.
+    pub(crate) fn has_checkpoint_provider(&self) -> bool {
+        self.checkpoint_provider
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
+    fn checkpoint_provider(&self) -> Option<Arc<dyn CheckpointProvider>> {
+        self.checkpoint_provider
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+    }
+
+    pub(crate) fn track_checkpoint_tree(&self) -> Result<Option<CheckpointSnapshot>> {
+        match self.checkpoint_provider() {
+            Some(provider) => provider.before_edit(),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn append_checkpoint_to_content(
         &self,
         content: &mut Value,
-        before: Option<&WorkspaceSnapshot>,
+        before: Option<&CheckpointSnapshot>,
         call: &ToolCall,
         group_id: &str,
         status: ToolStatus,
         coverage_warnings: Vec<String>,
     ) {
-        let (Some(checkpoints), Some(before)) = (self.checkpoints.as_ref(), before) else {
+        let Some(before) = before else { return };
+        let Some(provider) = self.checkpoint_provider() else {
             return;
         };
-        match checkpoints.create_checkpoint(
-            before,
-            &call.name,
-            &call.call_id,
-            group_id,
-            checkpoint_status_label(status),
+        let context = CheckpointEditContext {
+            tool_name: call.name.clone(),
+            call_id: call.call_id.clone(),
+            group_id: group_id.to_string(),
+            status: checkpoint_status_label(status),
             coverage_warnings,
-        ) {
-            Ok(Some(checkpoint)) => {
-                insert_content_field(content, "checkpoint", checkpoint_json(&checkpoint));
-            }
+        };
+        match provider.after_edit(before, &context) {
+            Ok(Some(value)) => insert_content_field(content, "checkpoint", value),
             Ok(None) => {}
             Err(err) => {
                 insert_content_field(content, "checkpoint_error", json!(err.to_string()));
@@ -3887,30 +3947,6 @@ fn checkpoint_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Stale => "stale",
         ToolStatus::Cancelled => "cancelled",
     }
-}
-
-fn checkpoint_json(record: &CheckpointRecord) -> Value {
-    let mut value = json!({
-        "id": record.id,
-        "group_id": record.group_id,
-        "tool_name": record.tool_name,
-        "call_id": record.call_id,
-        "status": record.status,
-        "summary": record.summary,
-        "files": record.files,
-    });
-    if let Some(object) = value.as_object_mut() {
-        if !record.skipped_files.is_empty() {
-            object.insert("skipped_files".to_string(), json!(record.skipped_files));
-        }
-        if !record.coverage_warnings.is_empty() {
-            object.insert(
-                "coverage_warnings".to_string(),
-                json!(record.coverage_warnings),
-            );
-        }
-    }
-    value
 }
 
 fn redact_tool_result(mut result: ToolResult, redactor: &Redactor) -> ToolResult {

@@ -4185,6 +4185,201 @@ async fn checkpointing_is_disabled_by_default_for_mutations() {
 }
 
 #[tokio::test]
+async fn checkpoint_provider_default_journal_still_records_through_trait() {
+    // F14: when `checkpoints_enabled` is set, the registry must
+    // auto-install the journal-backed CheckpointProvider, and edits must
+    // still flow through it. The shape of the `checkpoint` field on the
+    // tool result is the contract external tooling (TUI, undo flow)
+    // depends on, so we assert both that the bridge fired and that the
+    // record is in the legacy CRUD surface.
+    let root = temp_workspace("checkpoint_provider_default_journal");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    assert!(
+        registry.has_checkpoint_provider(),
+        "registry_with_checkpoints must auto-install the journal provider",
+    );
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-journal".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("default provider must attach a checkpoint field");
+    assert_eq!(checkpoint["tool_name"], "write_file");
+    assert_eq!(checkpoint["group_id"], "turn-journal");
+    assert!(
+        checkpoint["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "journal record should list the mutated file: {checkpoint}",
+    );
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "list".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    let listed = list.content["checkpoints"]
+        .as_array()
+        .expect("checkpoints array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["tool_name"], "write_file");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_provider_mock_observes_before_and_after_callbacks() {
+    // F14: an external impl must be able to replace the journal-backed
+    // provider on a stock registry and observe both halves of the bridge.
+    // We construct a registry with checkpoints disabled (so no journal
+    // provider is auto-installed), register a counting mock, and confirm
+    // a single write_file call drives one before_edit / one after_edit
+    // pair with the expected context and that the mock's JSON value is
+    // surfaced under `checkpoint`.
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[derive(Default)]
+    struct CountingProvider {
+        before_calls: AtomicUsize,
+        after_calls: AtomicUsize,
+        last_tool: Mutex<Option<String>>,
+        last_group: Mutex<Option<String>>,
+        last_call_id: Mutex<Option<String>>,
+        last_status: Mutex<Option<String>>,
+    }
+
+    impl CheckpointProvider for CountingProvider {
+        fn before_edit(&self) -> squeezy_core::Result<Option<CheckpointSnapshot>> {
+            self.before_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            // Encode a sentinel string in the opaque snapshot so the
+            // matching after_edit can prove the registry round-tripped
+            // the exact value back to us.
+            Ok(Some(CheckpointSnapshot::new(
+                "mock-sentinel-v1".to_string(),
+            )))
+        }
+
+        fn after_edit(
+            &self,
+            before: &CheckpointSnapshot,
+            context: &CheckpointEditContext,
+        ) -> squeezy_core::Result<Option<Value>> {
+            self.after_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            *self.last_tool.lock().unwrap() = Some(context.tool_name.clone());
+            *self.last_group.lock().unwrap() = Some(context.group_id.clone());
+            *self.last_call_id.lock().unwrap() = Some(context.call_id.clone());
+            *self.last_status.lock().unwrap() = Some(context.status.to_string());
+            let sentinel = before
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(Some(json!({
+                "mock": true,
+                "sentinel": sentinel,
+                "tool_name": context.tool_name,
+                "group_id": context.group_id,
+            })))
+        }
+    }
+
+    let root = temp_workspace("checkpoint_provider_mock");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    // Default-config registry has no journal: the bridge must still
+    // accept an externally-registered provider so a git-stash-style
+    // extension can plug in without forking core.
+    let registry = registry_with_shell_sandbox_off(&root);
+    assert!(
+        !registry.has_checkpoint_provider(),
+        "default registry without checkpoints must start with no provider",
+    );
+
+    let mock = Arc::new(CountingProvider::default());
+    let previous =
+        registry.register_checkpoint_provider(mock.clone() as Arc<dyn CheckpointProvider>);
+    assert!(
+        previous.is_none(),
+        "no provider was installed before this test"
+    );
+    assert!(registry.has_checkpoint_provider());
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write-mock".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-mock".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        mock.before_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "before_edit must fire exactly once per edit-bearing tool call",
+    );
+    assert_eq!(
+        mock.after_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "after_edit must fire exactly once per edit-bearing tool call",
+    );
+    assert_eq!(
+        mock.last_tool.lock().unwrap().as_deref(),
+        Some("write_file"),
+    );
+    assert_eq!(
+        mock.last_group.lock().unwrap().as_deref(),
+        Some("turn-mock")
+    );
+    assert_eq!(
+        mock.last_call_id.lock().unwrap().as_deref(),
+        Some("write-mock"),
+    );
+    assert_eq!(mock.last_status.lock().unwrap().as_deref(), Some("success"));
+
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("mock-provided checkpoint must be attached to the result");
+    assert_eq!(checkpoint["mock"], true);
+    assert_eq!(checkpoint["sentinel"], "mock-sentinel-v1");
+    assert_eq!(checkpoint["tool_name"], "write_file");
+    assert_eq!(checkpoint["group_id"], "turn-mock");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn write_file_identical_content_is_noop_and_preserves_mtime() {
     // F14: writing the same bytes that are already on disk must
     // short-circuit. The tool result signals `noop=true`, no `fs::write`

@@ -171,7 +171,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
         let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis)
-            && self.checkpoints.is_some()
+            && self.has_checkpoint_provider()
         {
             match self.track_checkpoint_tree() {
                 Ok(snapshot) => snapshot,
