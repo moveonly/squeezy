@@ -43,6 +43,7 @@ async fn anthropic_messages_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: std::sync::Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

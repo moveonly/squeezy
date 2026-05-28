@@ -374,6 +374,7 @@ fn codex_request_body_forces_store_false_and_encrypted_content() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: crate::CacheSpec::default(),
         tools: std::sync::Arc::from(Vec::new()),
         // Caller may have set `store=true`; the codex provider must
         // override it because the backend rejects `store=true`.

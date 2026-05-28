@@ -144,8 +144,12 @@ impl OpenAiProvider {
         if let Some(previous_response_id) = &request.previous_response_id {
             body["previous_response_id"] = json!(previous_response_id);
         }
-        if let Some(cache_key) = &request.cache_key {
-            body["prompt_cache_key"] = json!(cache_key);
+        let cache_spec = request.effective_cache_spec();
+        if let Some(key) = cache_spec.key.as_deref() {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if cache_spec.retention == crate::CacheRetention::Long {
+            body["prompt_cache_retention"] = json!("24h");
         }
         if let Some(max_output_tokens) = request.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);

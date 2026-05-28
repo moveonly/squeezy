@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::*;
-use crate::{LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolSpec};
 
 #[test]
 fn request_body_uses_chat_stream_shape() {
@@ -15,6 +15,7 @@ fn request_body_uses_chat_stream_shape() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -52,6 +53,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),

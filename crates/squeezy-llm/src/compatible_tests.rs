@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
 use serde_json::{Value, json};
 use squeezy_core::OpenAiCompatiblePreset;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ fn sample_request() -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -167,6 +168,7 @@ fn request_body_serialises_assistant_function_call_history() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -752,6 +754,62 @@ fn request_body_forwards_prompt_cache_key_alongside_anthropic_cache_control() {
 fn request_body_omits_prompt_cache_key_when_unset() {
     let body = OpenAiCompatibleProvider::request_body(&sample_request());
     assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn request_body_emits_prompt_cache_retention_24h_for_long_retention_openai_route() {
+    // F11: OpenAI-via-OpenRouter (Chat Completions route) must surface
+    // `CacheRetention::Long` as the top-level `prompt_cache_retention: "24h"`
+    // body field so the cached prefix lifetime matches the native OpenAI
+    // provider. Mirrors pi's `streamOpenAICompletions`
+    // (`others/pi/packages/ai/src/providers/openai-completions.ts:517-522`).
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache = crate::CacheSpec {
+        key: Some("repo-context".to_string()),
+        retention: crate::CacheRetention::Long,
+    };
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert_eq!(
+        body["prompt_cache_retention"], "24h",
+        "Long retention must propagate to the chat-completions body field"
+    );
+}
+
+#[test]
+fn request_body_emits_one_hour_ttl_marker_for_long_retention_anthropic_aggregator() {
+    // F11: Anthropic-via-aggregator routes must mirror the native
+    // Anthropic adapter — `CacheRetention::Long` upgrades every breakpoint
+    // marker to `cache_control: { type: "ephemeral", ttl: "1h" }` so the
+    // cached prefix survives Anthropic's default short window.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache = crate::CacheSpec {
+        key: Some("repo-context".to_string()),
+        retention: crate::CacheRetention::Long,
+    };
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let system = &body["messages"][0];
+    assert_eq!(system["content"][0]["cache_control"]["ttl"], "1h");
+    let last_user = &body["messages"][1];
+    assert_eq!(last_user["content"][0]["cache_control"]["ttl"], "1h");
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools[0]["cache_control"]["ttl"], "1h");
+}
+
+#[test]
+fn request_body_omits_prompt_cache_retention_for_short_retention_legacy_cache_key() {
+    // Regression guard: callers using the deprecated `cache_key` field
+    // get `Short` retention via `effective_cache_spec()`, which must
+    // leave `prompt_cache_retention` off the wire.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert!(body.get("prompt_cache_retention").is_none());
 }
 
 #[test]

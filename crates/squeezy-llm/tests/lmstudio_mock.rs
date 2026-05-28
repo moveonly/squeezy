@@ -9,7 +9,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use squeezy_core::ProviderTransportConfig;
 use squeezy_llm::{
-    LMStudioConfig, LMStudioProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
+    CacheSpec, LMStudioConfig, LMStudioProvider, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -72,6 +72,7 @@ fn build_request(model: &str) -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,

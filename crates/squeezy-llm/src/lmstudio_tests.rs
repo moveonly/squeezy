@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ fn sample_request() -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),

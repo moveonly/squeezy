@@ -72,6 +72,7 @@ pub fn echo_request(model: &str, prompt: &str) -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

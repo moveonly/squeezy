@@ -1,6 +1,6 @@
 use super::*;
 use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
 
 #[test]
@@ -14,6 +14,7 @@ fn request_body_uses_messages_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
@@ -63,6 +64,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -103,6 +105,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -138,6 +141,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -185,6 +189,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -233,6 +238,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -281,6 +287,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "apply_patch".to_string(),
@@ -346,6 +353,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "mcp__linear__create_issue".to_string(),
@@ -387,6 +395,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -412,6 +421,111 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
 }
 
 #[test]
+fn request_body_emits_one_hour_ttl_marker_for_long_retention() {
+    // F11: `CacheRetention::Long` must surface on the Anthropic Messages
+    // wire as `cache_control: { type: "ephemeral", ttl: "1h" }` on every
+    // breakpoint (system, last user, last stable tool) so the cached
+    // prefix survives Anthropic's default ~5m short window. Mirrors pi's
+    // `cacheRetention = "long"` behavior
+    // (`others/pi/packages/ai/src/providers/anthropic.ts:62-66`).
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("first turn".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-long".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "tool_a".to_string(),
+                description: "first".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "tool_b".to_string(),
+                description: "second".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    // System tail: `ttl: "1h"` rides alongside the `ephemeral` marker.
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body["system"][0]["cache_control"]["ttl"], "1h",
+        "Long retention must extend Anthropic's cached prefix lifetime via ttl=1h"
+    );
+
+    // Last user block: same marker shape.
+    let messages = body["messages"].as_array().expect("messages array");
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|msg| msg["role"] == "user")
+        .expect("user message");
+    let last_block = last_user["content"]
+        .as_array()
+        .expect("content")
+        .last()
+        .expect("last block");
+    assert_eq!(last_block["cache_control"]["ttl"], "1h");
+
+    // Last stable tool: same marker shape.
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools[1]["cache_control"]["ttl"], "1h");
+    assert!(tools[0].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_omits_ttl_for_short_retention_via_legacy_cache_key() {
+    // Regression guard for the `From<Option<String>>` lift in
+    // `effective_cache_spec()`: setting only the deprecated `cache_key`
+    // must yield Short retention, leaving the marker bare so Anthropic
+    // applies its built-in short window (~5m).
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(
+        body["system"][0]["cache_control"].get("ttl").is_none(),
+        "Short retention (from the legacy cache_key migration path) must not emit a ttl field"
+    );
+}
+
+#[test]
 fn request_body_skips_cache_control_when_cache_key_is_absent() {
     let request = LlmRequest {
         model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
@@ -422,6 +536,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -733,7 +848,12 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
         LlmInputItem::Reasoning(payload),
         LlmInputItem::AssistantText("answer".to_string()),
     ];
-    let messages = anthropic_messages(&input, false, CachePolicy::AUTO);
+    let messages = anthropic_messages(
+        &input,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
     let arr = messages.as_array().expect("array");
     assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
     let content = arr[0]["content"].as_array().expect("content array");
@@ -770,6 +890,7 @@ fn beta_headers_route_into_http_header() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -832,6 +953,7 @@ fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -875,6 +997,7 @@ fn api_key_auth_scheme_keeps_system_string_unchanged() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

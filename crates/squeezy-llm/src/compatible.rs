@@ -27,7 +27,7 @@ use crate::{
     INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, INVALID_TOOL_ARGUMENTS_RAW_KEY,
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall, ReasoningKind,
     ReasoningPayload,
-    cache_policy::{ephemeral_marker, json_markers, last_stable_tool_index},
+    cache_policy::{CacheRetention, ephemeral_marker, json_markers, last_stable_tool_index},
     credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
     retry::{RetryPolicy, idle_timeout, send_with_auth_retry},
     sse::SseDecoder,
@@ -127,9 +127,11 @@ impl OpenAiCompatibleProvider {
         // adapter only emits the protocol-specific shape (`cache_control`
         // objects on JSON content blocks and tool entries) at the spots
         // that policy module identifies.
+        let cache_spec = request.effective_cache_spec();
+        let cache_retention = cache_spec.retention;
         let anthropic_caching =
-            request.cache_key.is_some() && supports_anthropic_caching(&request.model);
-        let cache_control = anthropic_caching.then(ephemeral_marker);
+            cache_retention != CacheRetention::None && supports_anthropic_caching(&request.model);
+        let cache_control = anthropic_caching.then(|| ephemeral_marker(cache_retention));
         // Canonicalize cross-provider tool-call ids and synthesize
         // placeholders for orphan tool results BEFORE the
         // chat-completions message rewrite. Aggregator routes (PortKey
@@ -160,7 +162,10 @@ impl OpenAiCompatibleProvider {
             if anthropic_caching {
                 messages.push(json!({
                     "role": "system",
-                    "content": json_markers::system_array_with_marker(&request.instructions),
+                    "content": json_markers::system_array_with_marker(
+                        &request.instructions,
+                        cache_retention,
+                    ),
                 }));
             } else {
                 messages.push(json!({
@@ -198,7 +203,7 @@ impl OpenAiCompatibleProvider {
             body["reasoning_effort"] = json!(effort_str);
             body["reasoning"] = json!({ "effort": effort_str });
         }
-        if let Some(cache_key) = &request.cache_key {
+        if let Some(key) = cache_spec.key.as_deref() {
             // OpenAI's Chat Completions / Responses APIs honor a top-level
             // `prompt_cache_key` that groups requests for prompt-cache
             // affinity. OpenRouter forwards the field verbatim to OpenAI-
@@ -207,7 +212,16 @@ impl OpenAiCompatibleProvider {
             // nothing and recovers cached-input billing for OpenAI-via-
             // OpenRouter traffic that the Anthropic-only `cache_control`
             // path above does not cover.
-            body["prompt_cache_key"] = json!(cache_key);
+            body["prompt_cache_key"] = json!(key);
+        }
+        if cache_retention == CacheRetention::Long {
+            // Mirror the OpenAI native provider's extended-retention opt-in
+            // so OpenAI-hosted models proxied via an aggregator (OpenRouter
+            // `openai/*`, Vercel AI Gateway, etc.) still get the 24h
+            // window. Anthropic-hosted aggregator routes have already
+            // emitted the `ttl: "1h"` marker above; OpenAI ignores
+            // `prompt_cache_retention` from non-OpenAI flavors.
+            body["prompt_cache_retention"] = json!("24h");
         }
         if !request.tools.is_empty() {
             let mut tool_values: Vec<Value> = request
@@ -238,7 +252,10 @@ impl OpenAiCompatibleProvider {
                     last_stable_tool_index(request.tools.iter().map(|tool| tool.name.as_str()))
                     && let Some(obj) = tool_values.get_mut(idx).and_then(Value::as_object_mut)
                 {
-                    obj.insert("cache_control".to_string(), ephemeral_marker());
+                    obj.insert(
+                        "cache_control".to_string(),
+                        ephemeral_marker(cache_retention),
+                    );
                 }
             }
             body["tools"] = Value::Array(tool_values);

@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::*;
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 
 #[test]
 fn stream_url_does_not_contain_api_key() {
@@ -31,6 +31,7 @@ fn request_body_uses_generate_content_shape() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
@@ -70,6 +71,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -123,6 +125,7 @@ fn request_body_preserves_function_response_name() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,

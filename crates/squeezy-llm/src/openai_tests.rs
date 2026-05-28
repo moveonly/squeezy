@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmOutputSchema, LlmToolCall, LlmToolSpec};
 use serde_json::json;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ fn request_body_uses_responses_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("resp_123".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -81,6 +82,7 @@ fn request_body_serializes_tool_outputs_as_input_items() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -107,6 +109,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -148,6 +151,7 @@ fn request_body_includes_reasoning_and_text_verbosity_when_set() {
         reasoning_effort: Some(squeezy_core::ReasoningEffort::High),
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -181,6 +185,7 @@ fn request_body_maps_squeezy_verbosity_to_openai_values() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             tool_choice: None,
@@ -206,6 +211,7 @@ fn request_body_emits_prompt_cache_key_when_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -229,6 +235,7 @@ fn request_body_omits_prompt_cache_key_when_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -239,6 +246,71 @@ fn request_body_omits_prompt_cache_key_when_unset() {
 
     let body = OpenAiProvider::request_body(&request, "openai");
     assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn request_body_emits_prompt_cache_retention_24h_for_long_retention() {
+    // F11: `CacheRetention::Long` must surface on the OpenAI Responses
+    // wire as the top-level `prompt_cache_retention: "24h"` field. Mirrors
+    // pi's `getPromptCacheRetention`
+    // (`others/pi/packages/ai/src/providers/openai-responses.ts:48-53`).
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-long".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], "squeezy::session-long");
+    assert_eq!(
+        body["prompt_cache_retention"], "24h",
+        "Long retention must extend OpenAI's cached-prefix lifetime to 24h"
+    );
+}
+
+#[test]
+fn request_body_omits_prompt_cache_retention_for_short_retention() {
+    // Regression guard for the legacy-field migration path: callers that
+    // still set the deprecated `cache_key` slot get `Short` retention via
+    // `effective_cache_spec()`, which must leave `prompt_cache_retention`
+    // off the wire so the default short window applies.
+    let request = LlmRequest {
+        model: "gpt-test".to_string().into(),
+        instructions: "hi".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = OpenAiProvider::request_body(&request, "openai");
+    assert_eq!(body["prompt_cache_key"], "squeezy::session-1");
+    assert!(body.get("prompt_cache_retention").is_none());
 }
 
 #[test]
@@ -533,6 +605,7 @@ fn request_body_emits_text_format_when_output_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         parallel_tool_calls: None,
@@ -566,6 +639,7 @@ fn request_body_omits_text_format_when_output_schema_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -595,6 +669,7 @@ fn request_body_emits_text_format_without_verbosity_when_only_schema_set() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: Some(LlmOutputSchema {
@@ -624,6 +699,7 @@ fn request_body_emits_parallel_tool_calls_false_when_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         output_schema: None,
@@ -648,6 +724,7 @@ fn request_body_omits_parallel_tool_calls_when_unset_or_default_true() {
             reasoning_effort: None,
             previous_response_id: None,
             cache_key: None,
+            cache: CacheSpec::default(),
             tools: Arc::from(Vec::new()),
             store: false,
             output_schema: None,
