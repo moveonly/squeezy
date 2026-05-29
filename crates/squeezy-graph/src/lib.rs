@@ -1845,6 +1845,37 @@ impl GraphManager {
         Arc::clone(&self.pending_changed_paths)
     }
 
+    /// Best-effort write of the V2 resolver-cache rows. Per-file entries
+    /// carry the workspace-side fingerprint that future warm-start reads
+    /// will compare against. The single-blob import adjacency is mirrored
+    /// from [`SemanticGraph::importers_by_file`]. Failures are swallowed
+    /// so persistence errors cannot poison the in-memory graph.
+    fn persist_resolver_cache(&self, store: &SqueezyStore) {
+        for (file_id, file) in &self.graph.files {
+            let Some(slot) = self.graph.resolver_slots.get(file_id) else {
+                continue;
+            };
+            let entry = resolver_cache::ResolverFileEntry {
+                fingerprint: resolver_cache::FileFingerprint {
+                    modified_unix_millis: file.modified_unix_millis,
+                    size_bytes: file.size_bytes,
+                },
+                exports: slot.exports.clone(),
+                imports: slot.imports.clone(),
+                supertypes: slot.supertypes.clone(),
+                builder_snapshot: resolver_cache::BuilderSnapshot::default(),
+            };
+            let _ = store.put_resolver_entry(file_id, &entry);
+        }
+        let mut snapshot = resolver_cache::ResolverSnapshot::new();
+        for (target, importers) in &self.graph.importers_by_file {
+            for importer in importers {
+                snapshot.record_edge(importer, target);
+            }
+        }
+        let _ = store.put_import_graph(&snapshot);
+    }
+
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
         let pending_empty = self
             .pending_changed_paths
@@ -2086,6 +2117,13 @@ impl GraphManager {
             && !graph_batch.is_empty()
         {
             let _ = store.apply_graph_batch(&graph_batch);
+        }
+        // Persist the resolver-cache rows for every file the rebuild
+        // touched. Best-effort: encoding or write failure must not poison
+        // the in-memory graph update; the warm-start path will fall back
+        // to a full rebuild when it cannot find an entry.
+        if let Some(store) = self.store.as_deref() {
+            self.persist_resolver_cache(store);
         }
 
         if let Ok(mut paths) = self.pending_changed_paths.lock() {
