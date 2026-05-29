@@ -25,6 +25,7 @@ confidence-threshold = 0.8
 exceptions = [
     { allow = ["CDLA-Permissive-2.0"], crate = "webpki-roots" },
     { allow = ["Zlib"], crate = "foldhash" },
+    { allow = ["CC0-1.0"], crate = "notify" },
 ]
 
 [licenses.private]

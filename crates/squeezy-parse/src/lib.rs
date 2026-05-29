@@ -89,9 +89,10 @@ pub struct ParsedSymbol {
 
 /// Shape of an import binding, classified so the cross-file resolver can
 /// route the binding through the right path-resolution rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ImportKind {
     /// Untyped/legacy: parser did not classify the binding shape.
+    #[default]
     Unspecified,
     /// `import { foo } from 'm'`, `from m import foo`, `use m::foo`.
     Named,
@@ -103,12 +104,6 @@ pub enum ImportKind {
     Static,
     /// `from m import *`, `use m::*`, `#include "x.h"`, `using namespace N;`.
     Wildcard,
-}
-
-impl Default for ImportKind {
-    fn default() -> Self {
-        Self::Unspecified
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

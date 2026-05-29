@@ -17,10 +17,9 @@ use serde::{Deserialize, Serialize};
 use squeezy_core::FileId;
 
 /// Maximum fixpoint iterations inside one strongly-connected component.
-/// Peer value: semsitter's `udg-gen` uses the same cap for `pub use` /
-/// `export * from` cycles where each pass can expose new bindings; in
-/// practice the cycle converges in 3-5 iterations and a hard cap prevents
-/// pathological corner cases from spinning forever.
+/// `pub use` / `export * from` cycles can expose new bindings on each
+/// pass; in practice they converge in 3-5 iterations and a hard cap
+/// prevents pathological corner cases from spinning forever.
 pub const SCC_FIXPOINT_MAX_ITERATIONS: u32 = 64;
 
 /// Directed graph of resolved file-to-file import edges. Internally

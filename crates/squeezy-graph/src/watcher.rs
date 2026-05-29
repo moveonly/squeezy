@@ -40,9 +40,9 @@ pub struct WatcherConfig {
     pub debounce_ms: u64,
 }
 
-/// Default debounce window. Picked to match semsitter's `udg-gen`, where it
-/// is the production default for editor-driven watches over multi-thousand-file
-/// trees.
+/// Default debounce window. Long enough that an editor "save all" or a
+/// branch switch coalesces into one batch; short enough that the next
+/// query sees the change without a perceptible wait.
 pub const DEFAULT_DEBOUNCE_MS: u64 = 10_000;
 
 impl Default for WatcherConfig {

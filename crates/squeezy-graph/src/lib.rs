@@ -1736,7 +1736,7 @@ impl GraphManager {
         let handle = Arc::clone(&manager.pending_changed_paths);
         let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
             if let Ok(mut paths) = handle.lock() {
-                for path in batch.modified.into_iter().chain(batch.removed.into_iter()) {
+                for path in batch.modified.into_iter().chain(batch.removed) {
                     paths.insert(path);
                 }
             }
@@ -2667,10 +2667,10 @@ fn symbol_is_exported(symbol: &GraphSymbol) -> bool {
     ) {
         return false;
     }
-    match symbol.visibility.as_deref() {
-        Some("private") | Some("protected") | Some("internal") => false,
-        _ => true,
-    }
+    !matches!(
+        symbol.visibility.as_deref(),
+        Some("private") | Some("protected") | Some("internal")
+    )
 }
 
 fn last_path_segment(path: &str) -> String {

@@ -7,9 +7,6 @@
 //! site to consume them. The single-pass [`crate::resolution::SemanticGraph::resolve_call`]
 //! continues to drive resolution; the types below are populated and ready
 //! for the per-language flips that follow.
-//!
-//! Inspired by `semsitter/udg-gen/src/cross_file/`; nothing is copied, only
-//! the shape is mirrored so the consumer side lines up.
 
 pub mod scheduler;
 
