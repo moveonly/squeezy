@@ -1,14 +1,17 @@
 id = "tui-reasoning-expand-anthropic"
-title = "Reproduce: Ctrl+O on reasoning entries"
+title = "Reproduce: Ctrl+O on reasoning entries (real LLM)"
 description = """
 Drives the live TuiApp end-to-end via the eval `TuiHarness`. A real
-Anthropic call (`claude-haiku-4-5-20251001` with reasoning_effort =
-high) produces a reasoning segment in the transcript. The scenario
-then presses `Ctrl+O` and asserts on what the status bar and
-transcript state report. Used to pin the "Ctrl+O doesn't expand
-reasoning" behaviour: on main, the toggle handler picks the
-reasoning entry and silently flips its `collapsed` flag without
-producing a visible chevron change.
+Anthropic call (`claude-haiku-4-5-20251001` with
+reasoning_effort = high) produces a reasoning segment in the
+transcript. The scenario then presses `Ctrl+O` and asserts on the
+rendered frame text — not just the collapsed flag — so the test
+catches the symptom the user reports: pressing the expand key but
+seeing no visible change.
+
+Before Ctrl+O the frame must contain `▸ reasoning:` (the collapsed
+chip with summary). After Ctrl+O the frame must contain
+`▾ reasoning` (the expanded header) plus a body line marker `▏`.
 
 Requires `ANTHROPIC_API_KEY`. Run with:
 
@@ -26,11 +29,10 @@ mode = "build"
 permission_mode = "allow"
 reasoning_effort = "high"
 max_output_tokens = 2000
-# Force the bug-triggering configuration: hide reasoning in the
-# rendered transcript. Now Ctrl+O still picks the reasoning entry
-# as toggle target but the flip has zero visual effect — that's the
-# "Ctrl+O does nothing" sensation the user reported.
-show_reasoning_usage = false
+# Pin the user-visible config (reasoning chip ON) so the scenario
+# repros the bug the user actually sees, regardless of the host's
+# global `show_reasoning_usage` setting.
+show_reasoning_usage = true
 
 [tui_capture]
 enabled = true
@@ -43,37 +45,47 @@ kind = "prompt"
 text = "Think about the trade-offs between a hash map and a B-tree for a small (~100 entry) keyed cache. Answer in one short sentence."
 wait_for = "turn_completed"
 
+# Sanity: the rendered frame shows the collapsed reasoning chip.
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_transcript_entry"
-[steps.check.index]
-by = "last_of_kind"
-entry_kind = "reasoning"
-collapsed = true
+kind = "tui_frame_contains"
+text = "▸ reasoning"
 
 [[steps]]
 kind = "action"
 action = "send_key"
 key = "Ctrl+O"
 
+# After the toggle, the chip must flip from ▸ to ▾ AND a body line
+# marker (▏) must appear in the rendered frame. Asserting on cells,
+# not on the collapsed flag, is what makes this a real repro of the
+# user-visible bug — flipping the flag is necessary but not
+# sufficient.
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_status_contains"
-text = "transcript entry"
+kind = "tui_frame_contains"
+text = "▾ reasoning"
 
 [[steps]]
 kind = "action"
 action = "assert"
 [steps.check]
-kind = "tui_transcript_entry"
-[steps.check.index]
-by = "last_of_kind"
-entry_kind = "reasoning"
-collapsed = false
+kind = "tui_frame_contains"
+text = "▏"
+
+# Belt-and-braces: the status line still reports the toggle so the
+# user gets feedback even on terminals where the chevron change is
+# easy to miss.
+[[steps]]
+kind = "action"
+action = "assert"
+[steps.check]
+kind = "tui_status_contains"
+text = "expanded"
 
 [expect]
 max_wall_clock_seconds = 120

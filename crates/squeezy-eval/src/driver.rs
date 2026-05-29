@@ -1187,7 +1187,32 @@ impl Driver {
                 if frame.plain_text.contains(text) {
                     "asserted_pass".into()
                 } else {
-                    format!("asserted_fail: frame does not contain {text:?}")
+                    // Compress each line: trim trailing spaces; skip
+                    // empty / box-drawing-only lines so the preview
+                    // shows transcript content, not the startup card
+                    // border.
+                    let preview: String = frame
+                        .plain_text
+                        .lines()
+                        .map(|l| l.trim_end())
+                        .filter(|l| {
+                            !l.is_empty()
+                                && !l
+                                    .chars()
+                                    .all(|c| matches!(c, '╭' | '╰' | '│' | '─' | '╮' | '╯' | ' '))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    let preview = preview.chars().take(700).collect::<String>();
+                    let entries = h.transcript_entries();
+                    let entry_dump = entries
+                        .iter()
+                        .map(|e| format!("[{}|col={}|{:.30?}]", e.kind, e.collapsed, e.preview))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    format!(
+                        "asserted_fail: frame does not contain {text:?} · entries: {entry_dump} · preview: {preview}"
+                    )
                 }
             }
             Err(err) => format!("asserted_fail: render: {err}"),

@@ -3331,7 +3331,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
     assert!(!collapsed.contains("receipt="), "{collapsed}");
     assert!(!collapsed.contains("B receipt"), "{collapsed}");
     assert!(
-        collapsed.contains("Ctrl-E to expand"),
+        collapsed.contains("Ctrl-O to expand"),
         "collapsed view should show truncation hint: {collapsed}"
     );
     assert!(
@@ -3873,7 +3873,7 @@ fn expanded_edit_diff_does_not_claim_ctrl_e_can_expand_further() {
         .join("\n");
 
     assert!(output.contains("+line 20"), "{output}");
-    assert!(!output.contains("Ctrl-E to expand"), "{output}");
+    assert!(!output.contains("Ctrl-O to expand"), "{output}");
 }
 
 #[test]
@@ -8827,7 +8827,7 @@ fn tool_card_truncates_model_shell_to_five_lines_with_head_tail() {
         "middle should be elided: {output}"
     );
     assert!(
-        output.contains("Ctrl-E to expand"),
+        output.contains("Ctrl-O to expand"),
         "ellipsis hint missing: {output}"
     );
 }
@@ -8863,7 +8863,7 @@ fn tool_card_user_shell_keeps_fifty_line_cap() {
     // expect NO truncation. Render area is intentionally tall.
     let output = render_to_string(&app, 140, 200);
     assert!(
-        !output.contains("Ctrl-E to expand"),
+        !output.contains("Ctrl-O to expand"),
         "user-shell under 2*cap should not be truncated: {output}"
     );
     assert!(output.contains("line-40"), "mid line missing: {output}");
@@ -8890,7 +8890,7 @@ fn apply_patch_card_is_not_truncated_to_five_lines() {
 
     let output = render_to_string(&app, 140, 60);
     assert!(
-        !output.contains("Ctrl-E to expand"),
+        !output.contains("Ctrl-O to expand"),
         "apply_patch must bypass the 5-line cap: {output}"
     );
     assert!(output.contains("foo.rs"), "header missing: {output}");
@@ -8962,7 +8962,7 @@ fn transcript_overlay_renders_entries_uncollapsed() {
         "overlay must show full body: {output}"
     );
     assert!(
-        !output.contains("Ctrl-E to expand"),
+        !output.contains("Ctrl-O to expand"),
         "overlay should not show truncation ellipsis: {output}"
     );
 }
