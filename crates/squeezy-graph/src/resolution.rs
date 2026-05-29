@@ -344,6 +344,9 @@ impl SemanticGraph {
                     Vec::new(),
                 );
             }
+            if let Some(id) = self.arity_unique_candidate(&candidates, call) {
+                return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
+            }
             return match candidates.as_slice() {
                 [] => (None, Confidence::External, "method external", Vec::new()),
                 _ => (
@@ -359,6 +362,9 @@ impl SemanticGraph {
         }
 
         if call.receiver.is_some() {
+            if let Some(id) = self.arity_unique_candidate(&candidates, call) {
+                return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
+            }
             return match candidates.as_slice() {
                 [] => (None, Confidence::External, "receiver external", Vec::new()),
                 _ => (
@@ -414,6 +420,9 @@ impl SemanticGraph {
         if let Some(id) = self.package_local_direct_call(&candidates, caller_id) {
             return (Some(id), Confidence::Heuristic, "package local", Vec::new());
         }
+        if let Some(id) = self.arity_unique_candidate(&candidates, call) {
+            return (Some(id), Confidence::Heuristic, "arity match", Vec::new());
+        }
         match candidates.as_slice() {
             [] => (None, Confidence::External, "external", Vec::new()),
             _ => (
@@ -426,6 +435,35 @@ impl SemanticGraph {
                     .collect(),
             ),
         }
+    }
+
+    /// Item 5: when the candidate name+arity uniquely identifies one of
+    /// the candidates, pick it. We only fire when more than one candidate
+    /// is in play and exactly one matches the call's fixed-arity count;
+    /// otherwise the rule is too eager and would mis-bind variadic/default
+    /// arguments. Returns `None` when the call's arity does not fit in a
+    /// `u8` (the parsed value is `usize`).
+    pub(crate) fn arity_unique_candidate(
+        &self,
+        candidates: &[SymbolId],
+        call: &ParsedCall,
+    ) -> Option<SymbolId> {
+        if candidates.len() < 2 {
+            return None;
+        }
+        let arity: u8 = call.arity.try_into().ok()?;
+        let mut matches = candidates.iter().filter(|id| {
+            self.symbols
+                .get(id)
+                .and_then(|symbol| symbol.arity)
+                .map(|symbol_arity| symbol_arity == arity)
+                .unwrap_or(false)
+        });
+        let first = matches.next()?.clone();
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 
     pub(crate) fn qualified_direct_call(

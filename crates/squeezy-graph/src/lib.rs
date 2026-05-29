@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub mod affected;
 pub mod backend;
 pub mod cross_file;
 mod languages;
