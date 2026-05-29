@@ -68,6 +68,33 @@ jobs:
       - name: Run cargo-shear
         run: cargo shear
 
+  build-script-allowlist:
+    name: Build-script allowlist
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.inputs.checkout_ref || github.ref }}
+
+      - name: Show Rust toolchain
+        run: |
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-targets: false
+
+      - name: Self-test build-script scanner
+        run: python3 scripts/check_build_scripts.py --self-test
+
+      - name: Enforce build-script allowlist
+        run: python3 scripts/check_build_scripts.py
+
   build-test-lint-coverage:
     name: Validate and debug artifact (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
@@ -157,11 +184,11 @@ jobs:
           if [[ "${{ matrix.platform }}" == "linux" ]]; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
-            cargo nextest run --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
+            scripts/test_clean_env.sh --workspace --all-targets --profile ci --target x86_64-unknown-linux-musl
           elif [[ "${{ matrix.platform }}" == "windows" ]]; then
-            SQUEEZY_SHELL=gitbash cargo nextest run --workspace --all-targets --profile ci
+            SQUEEZY_SHELL=gitbash scripts/test_clean_env.sh --workspace --all-targets --profile ci
           else
-            cargo nextest run --workspace --all-targets --profile ci
+            scripts/test_clean_env.sh --workspace --all-targets --profile ci
           fi
 
       - name: Lint Rust

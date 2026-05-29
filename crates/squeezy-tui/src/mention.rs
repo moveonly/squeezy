@@ -2,8 +2,9 @@
 //!
 //! Detects an `@`-prefixed token at the cursor and lists matching
 //! workspace files ranked by a simple subsequence/prefix scorer. The
-//! popup is small (10 entries) and dismisses on Esc or when the
-//! cursor leaves the `@<word>` token.
+//! popup shows up to `MAX_MATCHES` (10) entries plus an `(idx/total)`
+//! footer that reflects the pre-truncation candidate count, and
+//! dismisses on Esc or when the cursor leaves the `@<word>` token.
 
 #![allow(dead_code)]
 
@@ -33,40 +34,58 @@ pub(crate) struct MentionQuery {
 
 /// Returns `Some(MentionQuery)` if the cursor sits inside an `@<word>`
 /// token preceded by start-of-input or whitespace. `None` otherwise.
+///
+/// The token is normally read up to the next whitespace, but `@"..."`
+/// and `@'...'` quoted forms keep their inner spaces and strip the
+/// surrounding quotes from the returned `query`. A mismatched quote (no
+/// matching close before EOF) falls back to the unquoted form so the
+/// leading `"`/`'` is treated as a literal character, preserving the
+/// original detector's behaviour for malformed input.
 pub(crate) fn detect_mention(input: &str, cursor: usize) -> Option<MentionQuery> {
     let bytes = input.as_bytes();
     let cursor = cursor.min(input.len());
-    // Walk left from cursor until whitespace or '@'.
-    let mut i = cursor;
-    while i > 0 {
-        let b = bytes[i - 1];
-        if b == b'@' {
-            // Found the marker. Verify the byte before is whitespace or absent.
-            if i >= 2 {
-                let prev = bytes[i - 2];
-                if !prev.is_ascii_whitespace() {
-                    return None;
-                }
-            }
-            // Collect the token from `@` (exclusive) to next whitespace right.
-            let start = i - 1;
-            let mut end = cursor;
-            while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            let query = input[i..end].to_string();
-            // Reject if there's an embedded whitespace before cursor (shouldn't happen).
-            if query.contains(char::is_whitespace) {
-                return None;
-            }
+    let mut i = 0;
+    while i < bytes.len() {
+        // Skip until we find an `@` preceded by start-of-input or whitespace.
+        if bytes[i] != b'@' || (i > 0 && !bytes[i - 1].is_ascii_whitespace()) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let after_at = i + 1;
+        let (end, query) = parse_mention_token(input, bytes, after_at);
+        if cursor > start && cursor <= end {
             return Some(MentionQuery { start, end, query });
         }
-        if b.is_ascii_whitespace() {
-            return None;
-        }
-        i -= 1;
+        i = end + 1;
     }
     None
+}
+
+/// Parse the token immediately after `@`. Returns the end byte index
+/// (one past the last byte of the token) and the query string with any
+/// surrounding `"`/`'` quotes stripped.
+///
+/// `@"..."` and `@'...'` are honoured as quoted spans that may contain
+/// whitespace. If the opening quote has no matching close before EOF the
+/// parse falls back to the unquoted form, so the leading quote ends up
+/// inside the returned query and the token terminates at the next
+/// whitespace — matching what the original detector produced for that
+/// input.
+fn parse_mention_token(input: &str, bytes: &[u8], after_at: usize) -> (usize, String) {
+    if after_at < bytes.len() && (bytes[after_at] == b'"' || bytes[after_at] == b'\'') {
+        let quote = bytes[after_at];
+        let content_start = after_at + 1;
+        if let Some(rel) = bytes[content_start..].iter().position(|&b| b == quote) {
+            let close = content_start + rel;
+            return (close + 1, input[content_start..close].to_string());
+        }
+    }
+    let mut end = after_at;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    (end, input[after_at..end].to_string())
 }
 
 /// Walk the workspace rooted at `root` (respecting .gitignore via the
@@ -171,56 +190,48 @@ fn git_index_mtime(root: &Path) -> Option<SystemTime> {
         .and_then(|m| m.modified().ok())
 }
 
-/// Rank `files` against `query`. Returns up to `MAX_MATCHES` paths.
+/// Rank `files` against `query`. Returns up to `MAX_MATCHES` paths
+/// plus the total candidate count *before* truncation so the popup
+/// can render a `(idx/total)` footer that still reflects how many
+/// matches exist beyond the displayed window.
 ///
-/// Delegates to `squeezy_rank::fuzzy::fuzzy_path_score` (lower is better)
-/// for the core scoring so the composer typeahead shares the same
-/// path-separator normalisation and subsequence matcher as the rest of
-/// the workspace ranking surface. A synthetic bonus is layered on top so
-/// paths whose basename starts with the query stay at the top of the
-/// list (`@lib` → `lib.rs` before `crates/.../lib.rs`).
-pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> Vec<PathBuf> {
+/// Delegates to [`crate::fuzzy::score`] (higher is better) so the
+/// composer typeahead shares the same word-boundary / consecutive-run
+/// scoring as the slash menu. Filename-prefix hits stay on top
+/// naturally — `@lib` matched against `lib.rs` earns word-boundary
+/// bonuses on every char and ties with `crates/.../lib.rs` are broken
+/// by the shorter-path rule below.
+pub(crate) fn rank_files(query: &str, files: &[PathBuf]) -> (Vec<PathBuf>, usize) {
     if query.is_empty() {
-        return files
+        let matches: Vec<PathBuf> = files
             .iter()
             .take(MAX_MATCHES)
             .map(|p| p.to_path_buf())
             .collect();
+        return (matches, files.len());
     }
     let query_lower = query.to_ascii_lowercase();
     let mut scored: Vec<(i32, &Path)> = files
         .iter()
         .filter_map(|path| {
-            let score = score_path(&query_lower, path)?;
+            let display = path.to_string_lossy();
+            let score = crate::fuzzy::score(&display, &query_lower)?;
             Some((score, path.as_path()))
         })
         .collect();
-    // Lower score first (fuzzy is min-score); on tie shorter path first
-    // since it is usually closer to what the user meant.
+    let total = scored.len();
+    // Higher score first; on tie shorter path first since it is
+    // usually closer to what the user meant.
     scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
+        b.0.cmp(&a.0)
             .then(a.1.as_os_str().len().cmp(&b.1.as_os_str().len()))
     });
-    scored
+    let matches: Vec<PathBuf> = scored
         .into_iter()
         .take(MAX_MATCHES)
         .map(|(_, p)| p.to_path_buf())
-        .collect()
-}
-
-fn score_path(query: &str, path: &Path) -> Option<i32> {
-    let display = path.to_string_lossy();
-    let mut score = squeezy_rank::fuzzy_path_score(&display, query)?;
-    if let Some(name) = path.file_name().and_then(|n| n.to_str())
-        && name.to_ascii_lowercase().starts_with(query)
-    {
-        // Synthetic bias so a filename-prefix hit always outranks a
-        // mid-path subsequence hit even when the latter happens to score
-        // lower. Matches the ergonomics of the previous hand-rolled
-        // scorer where filename prefix was the top tier.
-        score -= 1000;
-    }
-    Some(score)
+        .collect();
+    (matches, total)
 }
 
 /// Popup state attached to the app.
@@ -231,16 +242,21 @@ pub(crate) struct MentionPopup {
     pub end: usize,
     pub matches: Vec<PathBuf>,
     pub selected: usize,
+    /// Total candidates that matched `query` *before* truncation to
+    /// `MAX_MATCHES`. Drives the `(idx/total)` footer so the user can
+    /// see when more matches exist than the popup shows.
+    pub total: usize,
 }
 
 impl MentionPopup {
-    pub(crate) fn from_query(q: MentionQuery, matches: Vec<PathBuf>) -> Self {
+    pub(crate) fn from_query(q: MentionQuery, matches: Vec<PathBuf>, total: usize) -> Self {
         Self {
             query: q.query,
             start: q.start,
             end: q.end,
             matches,
             selected: 0,
+            total,
         }
     }
 

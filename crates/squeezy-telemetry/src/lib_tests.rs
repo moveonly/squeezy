@@ -271,7 +271,7 @@ fn graph_navigation_tool_events_are_classified_as_graph_family() {
 
 #[test]
 fn ai_reviewer_allow_downgrade_event_tags_capability() {
-    // squeezy-2so: the reviewer silently downgrades model `allow` decisions
+    // Reviewer downgrade-audit: the reviewer silently downgrades model `allow` decisions
     // when the capability is not in the operator's allowlist. The counter
     // must carry the capability label so operators can pivot dashboards on
     // it and decide which capability deserves to be added to the allowlist.

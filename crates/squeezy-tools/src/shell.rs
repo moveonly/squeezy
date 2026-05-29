@@ -45,6 +45,7 @@ use crate::shell_sandbox::{
     shell_sandbox_best_effort_fallback_reason, shell_sandbox_runtime_unavailable,
     shell_sandbox_status_metadata,
 };
+use crate::shell_spillover::ShellSpilloverInfo;
 #[cfg(windows)]
 use crate::win_job::ShellJob;
 use crate::{
@@ -170,7 +171,7 @@ impl ToolRegistry {
             .unwrap_or(DEFAULT_SHELL_OUTPUT_BYTE_CAP)
             .min(MAX_SHELL_OUTPUT_BYTE_CAP);
         let checkpoint_before = if shell_command_needs_checkpoint(direct_user_shell, &analysis)
-            && self.checkpoints.is_some()
+            && self.has_checkpoint_provider()
         {
             match self.track_checkpoint_tree() {
                 Ok(snapshot) => snapshot,
@@ -401,6 +402,17 @@ impl ToolRegistry {
         let stdout = redacted_stdout.text;
         let stderr = redacted_stderr.text;
         let truncated = stdout_truncated || stderr_truncated || timed_out;
+        // Preserve the redacted bytes the agent would otherwise lose to
+        // middle-truncation by writing them to a per-session tempfile.
+        // Failures here are non-fatal (budget exhausted, temp disk full,
+        // etc.); the shell tool still returns the truncated body so the
+        // model can make a decision with the bytes it has.
+        let spillover = if truncated {
+            self.shell_spillover
+                .spill(&call.call_id, stdout.as_bytes(), stderr.as_bytes())
+        } else {
+            None
+        };
         let cost = ToolCostHint {
             output_bytes: (stdout.len() + stderr.len()) as u64,
             redactions: redacted_stdout.redactions + redacted_stderr.redactions,
@@ -505,6 +517,13 @@ impl ToolRegistry {
                 }),
             );
         }
+        if let Some(spill) = spillover.as_ref() {
+            insert_content_field(
+                &mut raw_content,
+                "spillover",
+                shell_spillover_metadata(spill),
+            );
+        }
         if let Some(checkpoint_before) = checkpoint_before.as_ref() {
             self.append_checkpoint_to_content(
                 &mut raw_content,
@@ -523,9 +542,10 @@ impl ToolRegistry {
         }
 
         let shaped = shape_shell_output(&args.command, &stdout, &stderr, truncated, exit_code);
+        let shaped_stdout = append_spillover_footer(&shaped.stdout, spillover.as_ref());
         let mut content = raw_content;
         if let Some(object) = content.as_object_mut() {
-            object.insert("stdout".to_string(), json!(shaped.stdout));
+            object.insert("stdout".to_string(), json!(shaped_stdout));
             object.insert("stderr".to_string(), json!(shaped.stderr));
             object.insert(
                 "output_shape".to_string(),
@@ -535,7 +555,7 @@ impl ToolRegistry {
                     "kind": shaped.kind,
                     "raw_stdout_bytes": stdout.len(),
                     "raw_stderr_bytes": stderr.len(),
-                    "shaped_stdout_bytes": shaped.stdout.len(),
+                    "shaped_stdout_bytes": shaped_stdout.len(),
                     "shaped_stderr_bytes": shaped.stderr.len(),
                     "raw_output_sha256": raw_output_sha256.clone(),
                     "fallback_reason": shaped.fallback_reason,
@@ -801,6 +821,45 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+/// Render the structured spillover metadata the shell tool surfaces in
+/// the result content. The `path` is the absolute spillover location
+/// (under `$TMPDIR/squeezy-spillover/<session>/`) and `bytes` is the
+/// payload size — both are model-consumable arguments for the
+/// `read_tool_output` tool.
+pub(crate) fn shell_spillover_metadata(info: &ShellSpilloverInfo) -> serde_json::Value {
+    json!({
+        "path": info.path.to_string_lossy(),
+        "bytes": info.bytes,
+        "format": "stdout-then-stderr",
+    })
+}
+
+/// Append the model-facing spillover footer line to a shaped stdout
+/// block. The footer is a stable text marker so the model can spot the
+/// spillover even when the structured `spillover` field gets stripped
+/// during further compaction. It names `read_tool_output` and embeds
+/// the path as a copy-pasteable usage example so the model can pivot
+/// directly to the recovery call without inferring the contract.
+pub(crate) fn append_spillover_footer(
+    shaped_stdout: &str,
+    spillover: Option<&ShellSpilloverInfo>,
+) -> String {
+    let Some(spill) = spillover else {
+        return shaped_stdout.to_string();
+    };
+    let path = spill.path.display();
+    let bytes = spill.bytes;
+    let footer = format!(
+        "[truncated; full output: {path} ({bytes} bytes); recover via read_tool_output {{\"path\": \"{path}\"}}]"
+    );
+    if shaped_stdout.is_empty() {
+        return footer;
+    }
+    let needs_newline = !shaped_stdout.ends_with('\n');
+    let separator = if needs_newline { "\n" } else { "" };
+    format!("{shaped_stdout}{separator}{footer}")
 }
 
 pub(crate) fn shell_termination_reason(

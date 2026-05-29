@@ -2,7 +2,7 @@ use std::{
     env,
     sync::{
         OnceLock,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -82,6 +82,32 @@ const ACCENT_DEFAULT: u8 = 0;
 const ACCENT_CATPPUCCIN: u8 = 1;
 const ACCENT_HIGH_CONTRAST: u8 = 2;
 
+/// Monotonic generation counter bumped whenever a runtime palette knob
+/// changes (tone override, accent variant). Downstream render caches
+/// (notably the per-entry transcript cache in `render::cache`) capture
+/// this value in their cache key so a `/theme` switch invalidates every
+/// memoised line that was rendered against the prior palette.
+///
+/// `Ordering::Relaxed` is sufficient: the counter has no causal
+/// relationship with other state; readers only need *some* fresh value
+/// after each write, not strict cross-thread ordering against unrelated
+/// data. The render loop is single-threaded, but theme overrides may be
+/// triggered from background tasks during config reloads — the relaxed
+/// monotonic semantics handle that case correctly.
+static PALETTE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current palette generation. The value is stable across reads
+/// as long as no theme override fires between them; render caches store
+/// the value observed at insertion time and recompute when the live
+/// value moves past it.
+pub(crate) fn palette_generation() -> u64 {
+    PALETTE_GENERATION.load(Ordering::Relaxed)
+}
+
+fn bump_palette_generation() {
+    PALETTE_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn palette_tone() -> PaletteTone {
     match TONE_OVERRIDE.load(Ordering::Relaxed) {
         TONE_OVERRIDE_DARK => PaletteTone::Dark,
@@ -106,7 +132,12 @@ pub(crate) fn set_palette_tone_override(tone: Option<PaletteTone>) {
         Some(PaletteTone::Dark) => TONE_OVERRIDE_DARK,
         Some(PaletteTone::Light) => TONE_OVERRIDE_LIGHT,
     };
-    TONE_OVERRIDE.store(encoded, Ordering::Relaxed);
+    let prior = TONE_OVERRIDE.swap(encoded, Ordering::Relaxed);
+    // Only bump when the override actually changed, so a noop set (same
+    // tone reapplied during config reload) doesn't churn cached lines.
+    if prior != encoded {
+        bump_palette_generation();
+    }
 }
 
 /// Read the active accent variant. The default keeps the amber/gold
@@ -126,7 +157,10 @@ pub(crate) fn set_accent_variant(variant: AccentVariant) {
         AccentVariant::Catppuccin => ACCENT_CATPPUCCIN,
         AccentVariant::HighContrast => ACCENT_HIGH_CONTRAST,
     };
-    ACCENT_OVERRIDE.store(encoded, Ordering::Relaxed);
+    let prior = ACCENT_OVERRIDE.swap(encoded, Ordering::Relaxed);
+    if prior != encoded {
+        bump_palette_generation();
+    }
 }
 
 /// Primary accent — the AMBER-equivalent. Surfaces that opt into theming

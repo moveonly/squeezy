@@ -22,10 +22,14 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use squeezy_core::{FileId, Result, SqueezyError};
 
+pub mod migrations;
 pub mod repo_profile;
 pub mod reports;
 pub mod sessions;
 
+pub use migrations::{
+    Migration, MigrationRegistry, default_registry, run_migrations, run_registry,
+};
 pub use repo_profile::*;
 pub use reports::*;
 pub use sessions::*;
@@ -64,22 +68,38 @@ pub struct SqueezyStore {
 
 impl SqueezyStore {
     pub fn open(workspace_root: impl AsRef<Path>, cache_root: Option<&Path>) -> Result<Self> {
-        let path = state_path(workspace_root.as_ref(), cache_root);
+        let workspace_root = workspace_root.as_ref();
+        let path = state_path(workspace_root, cache_root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut database = open_database(&path)?;
-        match current_schema_version(&database)? {
-            Some(SCHEMA_VERSION) => {}
+        let initial = open_database(&path)?;
+        // Three cases:
+        //   * On-disk schema already at target → reuse the open handle.
+        //   * On-disk schema at an unknown version → back up the file and
+        //     fall through to bootstrap, which reinitialises from scratch.
+        //   * No schema stamped yet → bootstrap to the target version.
+        // For the default cache layout we delegate bootstrap to the
+        // centralised [`migrations::run_migrations`] orchestrator so new
+        // migrations can be added without touching this call site. The
+        // override cache layout keeps the inline path because the
+        // `Migration` trait operates on `cwd` and assumes the default
+        // state path.
+        let database = match current_schema_version(&initial)? {
+            Some(SCHEMA_VERSION) => initial,
             Some(old_version) => {
-                drop(database);
+                drop(initial);
                 let backup = backup_path(&path, old_version);
                 fs::rename(&path, &backup)?;
-                database = open_database(&path)?;
-                initialize_schema(&database)?;
+                bootstrap_store(workspace_root, cache_root)?;
+                open_database(&path)?
             }
-            None => initialize_schema(&database)?,
-        }
+            None => {
+                drop(initial);
+                bootstrap_store(workspace_root, cache_root)?;
+                open_database(&path)?
+            }
+        };
         Ok(Self { path, database })
     }
 
@@ -611,7 +631,28 @@ pub struct CompactionCheckpoint {
     pub created_unix_millis: u128,
 }
 
-fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
+/// Bootstrap a freshly created store at the target schema version.
+///
+/// Default cache layout (`cache_root` is `None`) routes through the
+/// [`migrations`] registry so newly registered migrations apply on the
+/// next open without modifying [`SqueezyStore::open`]. The override
+/// path keeps the inline initialiser because the [`Migration`] trait
+/// resolves its target file from `cwd` and would otherwise miss a
+/// caller-pinned cache root.
+fn bootstrap_store(workspace_root: &Path, cache_root: Option<&Path>) -> Result<()> {
+    if cache_root.is_none() {
+        migrations::run_migrations(workspace_root)
+    } else {
+        let path = state_path(workspace_root, cache_root);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let database = open_database(&path)?;
+        initialize_schema(&database)
+    }
+}
+
+pub(crate) fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     match cache_root {
         Some(path) if path.is_absolute() => path.join("state.redb"),
         Some(path) => workspace_root.join(path).join("state.redb"),
@@ -622,11 +663,11 @@ fn state_path(workspace_root: &Path, cache_root: Option<&Path>) -> PathBuf {
     }
 }
 
-fn open_database(path: &Path) -> Result<Database> {
+pub(crate) fn open_database(path: &Path) -> Result<Database> {
     Database::create(path).map_err(store_error)
 }
 
-fn initialize_schema(database: &Database) -> Result<()> {
+pub(crate) fn initialize_schema(database: &Database) -> Result<()> {
     let write = database.begin_write().map_err(store_error)?;
     {
         let mut meta = write.open_table(META).map_err(store_error)?;
@@ -644,7 +685,7 @@ fn initialize_schema(database: &Database) -> Result<()> {
     write.commit().map_err(store_error)
 }
 
-fn current_schema_version(database: &Database) -> Result<Option<u64>> {
+pub(crate) fn current_schema_version(database: &Database) -> Result<Option<u64>> {
     let read = database.begin_read().map_err(store_error)?;
     let table = match read.open_table(META) {
         Ok(table) => table,

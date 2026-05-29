@@ -1,4 +1,6 @@
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -14,6 +16,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     lmstudio::{LMStudioConfig, LMStudioProvider},
     retry::{RetryPolicy, idle_timeout, send_with_retry},
+    transport::shared_client,
 };
 
 #[derive(Debug, Clone)]
@@ -36,7 +39,7 @@ impl OllamaProvider {
             })),
         };
         Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             base_url,
             transport: config.transport,
             compat,
@@ -44,9 +47,19 @@ impl OllamaProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
+        // Canonicalize tool-call ids and synthesize placeholders for
+        // orphan tool results before building Ollama's `messages`
+        // array. Ollama's native route drops the `call_id` on the
+        // wire entirely (it pairs by surrounding role/tool blocks),
+        // but normalization still synthesizes the assistant
+        // tool-call message that an orphan tool-result needs to sit
+        // after — without that the `role:"tool"` message appears in
+        // the chat with no preceding assistant call and the model
+        // gets confused about the conversation order.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
-            "messages": ollama_messages(&request.instructions, &request.input),
+            "messages": ollama_messages(&request.instructions, &normalized_input),
             "stream": true,
         });
         if let Some(max_output_tokens) = request.max_output_tokens {
@@ -175,6 +188,9 @@ impl LlmProvider for OllamaProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("ollama") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         if let Some(compat) = &self.compat {
             return compat.stream_response(request, cancel);
         }
@@ -198,6 +214,8 @@ impl LlmProvider for OllamaProvider {
 
             yield LlmEvent::Started;
             let mut decoder = JsonLineDecoder::default();
+            let mut server_model_slot: Option<String> = None;
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
             loop {
                 let polled = tokio::select! {
@@ -213,13 +231,25 @@ impl LlmProvider for OllamaProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for line in decoder.push(&chunk) {
-                    for event in parse_ollama_line(&line)? {
+                    let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
+                    if let Some(server) = server_model_slot.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for event in parsed {
                         yield event;
                     }
                 }
             }
             for line in decoder.finish() {
-                for event in parse_ollama_line(&line)? {
+                let parsed = parse_ollama_line(&line, &mut server_model_slot)?;
+                if let Some(server) = server_model_slot.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for event in parsed {
                     yield event;
                 }
             }
@@ -258,6 +288,21 @@ fn ollama_messages(instructions: &str, input: &[LlmInputItem]) -> Value {
             }
             LlmInputItem::FunctionCallOutput { call_id: _, output } => {
                 messages.push(json!({ "role": "tool", "content": output }));
+            }
+            // Ollama's native chat API puts images on the message itself
+            // (`{"role": "user", "content": "...", "images": ["<b64>"]}`)
+            // instead of a content-block array; emit a standalone user
+            // message with an empty `content` string so vision-capable
+            // local models (llava, llama3.2-vision) see the bytes.
+            LlmInputItem::Image {
+                media_type: _,
+                bytes,
+            } => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": "",
+                    "images": [BASE64_STANDARD.encode(bytes.as_ref())],
+                }));
             }
             // Ollama has no signed reasoning replay format. Skip on replay.
             LlmInputItem::Reasoning(_) => {}
@@ -301,11 +346,23 @@ impl JsonLineDecoder {
     }
 }
 
-fn parse_ollama_line(line: &str) -> Result<Vec<LlmEvent>> {
+fn parse_ollama_line(line: &str, server_model_slot: &mut Option<String>) -> Result<Vec<LlmEvent>> {
     let value: Value = serde_json::from_str(line)
         .map_err(|err| SqueezyError::ProviderStream(format!("invalid Ollama JSON: {err}")))?;
     if let Some(error) = value.get("error").and_then(Value::as_str) {
         return Err(SqueezyError::ProviderStream(error.to_string()));
+    }
+
+    if server_model_slot.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        // Ollama echoes `model` on every NDJSON chunk. Capture the
+        // first occurrence — the outer stream loop drains it and
+        // emits `ServerModel` once when the canonical tag (e.g.
+        // `llama3:latest` → `llama3:8b-instruct-q4_0`) differs from
+        // the user-supplied request model.
+        *server_model_slot = Some(server_model.to_string());
     }
 
     let mut events = Vec::new();

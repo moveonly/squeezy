@@ -21,6 +21,16 @@ development conventions.
   `scripts/check_test_layout.py`.
 - [Telemetry worker](TELEMETRY_WORKER.md): Cloudflare Worker deployment and
   PostHog forwarding details.
+- [Keybindings](KEYBINDINGS.md): action namespace, layered override surface
+  (`settings.toml` + `~/.squeezy/keybindings.toml`), and the reserved-binding
+  set.
+- [Config shell escapes](CONFIG_SHELL_ESCAPES.md): why `!cmd` strings in
+  `settings.toml` execute at config-load time and how that affects threat
+  model for the settings file.
+- [Release smoke](RELEASE_SMOKE.md): local pre-publish validation for
+  every release channel (`cargo publish --dry-run`, `install.sh`,
+  Homebrew formula, winget manifest) via
+  `scripts/local_release_smoke.sh`.
 
 External user-help docs live in [`../external/`](../external/). Do not put
 private deployment notes, implementation-only tradeoffs, benchmark details, or

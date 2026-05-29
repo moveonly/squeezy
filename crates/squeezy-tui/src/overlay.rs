@@ -28,6 +28,112 @@ pub(crate) enum Overlay {
     Permissions(ReadOnlyOverlay),
 }
 
+/// Where focus should return to when an overlay closes.
+///
+/// The TUI does not have a generic focus manager today: the resting
+/// input owner is always the composer, and modal overlays / popups
+/// borrow keys while they are open. This enum is the contract the
+/// audit note for the OpenCode parity follow-up — callers tell
+/// [`DialogHandle::open`] what was focused, and [`DialogHandle::restore_focus`]
+/// hands that hint back at close time so future focusables can be
+/// added without changing call sites.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum PriorFocus {
+    /// The composer (prompt input). The default for slash-command
+    /// overlays: closing the overlay returns focus to the composer
+    /// because that is the TUI's resting input owner.
+    #[default]
+    Composer,
+    /// No specific holder; `restore_focus` is a no-op hint.
+    None,
+}
+
+/// Typed handle returned by [`DialogHandle::open`] so callers can manipulate
+/// the overlay (`hide`, `set`, `restore_focus`) without poking
+/// `app.overlay` and the active-dialog id directly.
+///
+/// Each `open()` bumps the per-app generation id; `hide`, `set`, and
+/// `restore_focus` check that id against the slot's `active_id`, so a
+/// stale handle for an already-closed or replaced dialog is a no-op
+/// instead of clobbering the newer dialog that now owns the slot.
+#[derive(Debug, Clone)]
+pub(crate) struct DialogHandle {
+    id: u64,
+    prior_focus: PriorFocus,
+}
+
+impl DialogHandle {
+    /// Open `content` as a typed dialog. `next_id` is the per-app
+    /// generation counter (incremented in place); `active_id` records
+    /// which dialog currently owns the slot. Any previous overlay is
+    /// replaced and any outstanding handle to it becomes stale.
+    pub(crate) fn open(
+        slot: &mut Option<Overlay>,
+        next_id: &mut u64,
+        active_id: &mut Option<u64>,
+        content: Overlay,
+        prior_focus: PriorFocus,
+    ) -> Self {
+        *next_id = next_id.wrapping_add(1);
+        let id = *next_id;
+        *slot = Some(content);
+        *active_id = Some(id);
+        DialogHandle { id, prior_focus }
+    }
+
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn prior_focus(&self) -> &PriorFocus {
+        &self.prior_focus
+    }
+
+    /// Close this dialog if it is still the active one. Returns `true`
+    /// when the overlay was hidden, `false` for stale handles (the
+    /// caller's dialog is already gone).
+    pub(crate) fn hide(&self, slot: &mut Option<Overlay>, active_id: &mut Option<u64>) -> bool {
+        if *active_id == Some(self.id) {
+            *slot = None;
+            *active_id = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Replace the overlay content while keeping this handle valid.
+    /// Returns `false` for stale handles, in which case the slot is
+    /// unchanged so a newer dialog cannot be clobbered.
+    pub(crate) fn set(
+        &self,
+        slot: &mut Option<Overlay>,
+        active_id: &Option<u64>,
+        content: Overlay,
+    ) -> bool {
+        if *active_id == Some(self.id) {
+            *slot = Some(content);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hide this dialog (if still active) and return the focus hint
+    /// captured at open time. Today the only restorable target is the
+    /// composer, which is implicit focus once no overlay is open; the
+    /// hint exists so additional focusables (e.g. an inline picker)
+    /// can be wired in without changing the close protocol.
+    pub(crate) fn restore_focus(
+        &self,
+        slot: &mut Option<Overlay>,
+        active_id: &mut Option<u64>,
+    ) -> PriorFocus {
+        let _ = self.hide(slot, active_id);
+        self.prior_focus.clone()
+    }
+}
+
 impl Overlay {
     pub(crate) fn title(&self) -> &'static str {
         match self {

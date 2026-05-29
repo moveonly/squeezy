@@ -42,6 +42,7 @@ async fn openai_responses_streaming_costly() -> Result<()> {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: std::sync::Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -67,7 +68,10 @@ async fn openai_responses_streaming_costly() -> Result<()> {
                     "costly OpenAI smoke test was cancelled".to_string(),
                 ));
             }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+            LlmEvent::ReasoningDelta { .. }
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
 

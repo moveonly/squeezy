@@ -170,6 +170,7 @@ pub(crate) async fn review_permission(input: AiReviewerInput<'_>) -> AiReviewerO
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -325,7 +326,9 @@ async fn collect_reviewer_text(
             LlmEvent::Started
             | LlmEvent::ToolCall(_)
             | LlmEvent::ReasoningDelta { .. }
-            | LlmEvent::ReasoningDone(_) => {}
+            | LlmEvent::ReasoningDone(_)
+            | LlmEvent::ContextOverflow { .. }
+            | LlmEvent::ServerModel(_) => {}
         }
     }
     Ok(text)

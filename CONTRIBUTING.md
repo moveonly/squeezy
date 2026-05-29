@@ -113,6 +113,14 @@ cargo test -p squeezy-llm --features costly-tests --test anthropic_costly -- --i
 
 Use `SQUEEZY_COSTLY_OPENAI_MODEL` or `SQUEEZY_COSTLY_ANTHROPIC_MODEL` to test a different cheap model for one provider. `SQUEEZY_COSTLY_MODEL` is the shared fallback. The default costly OpenAI model is `gpt-5-nano`; the default costly Anthropic model is `claude-3-5-haiku-20241022`. Use `SQUEEZY_COSTLY_MAX_OUTPUT_TOKENS=256` if a smoke run is truncated by the provider before returning the expected text.
 
+For non-costly test runs where you want a hard guarantee that no paid provider call can fire, invoke nextest through the clean-env wrapper:
+
+```sh
+scripts/test_clean_env.sh --workspace --all-targets
+```
+
+The wrapper unsets every vendor API key, every `SQUEEZY_<PROVIDER>_KEY` fallback, the `SQUEEZY_RUN_COSTLY_TESTS` master flag, and the `SQUEEZY_CREDENTIALS_JSON` / `SQUEEZY_CREDENTIALS_FILE` aggregate channels before forwarding the remaining arguments to `cargo nextest run`. CI uses it as the default test invocation so a misconfigured runner or a stray `export` in a debug step cannot accidentally bill a real provider; use it locally before merging changes to any `*_costly.rs` file to confirm the gates still skip cleanly. The list of stripped variables lives in the script itself — keep it in sync when adding a new provider.
+
 ## Clippy and Formatting
 
 ```sh
@@ -160,6 +168,17 @@ On every pull request and every push to `main`, CI runs:
 - debug artifact build and smoke-test
 
 The dependency policy in `deny.toml` covers RustSec advisories, duplicate dependencies, license allow-lists, and registry/git source policy for the macOS targets and the Linux musl release target. The Linux job runs clippy, tests, harness validation, coverage, and artifact packaging against `x86_64-unknown-linux-musl`. The coverage step writes its text summary to the GitHub job summary.
+
+Separately from the per-PR / per-release dependency policy job, the
+`Scheduled advisory rescan` workflow (`.github/workflows/advisory-rescan.yml`)
+runs `cargo deny --all-features check advisories` against the committed
+`Cargo.lock` every day at 06:00 UTC (and on manual `workflow_dispatch`). When
+RustSec publishes a new advisory that affects a pinned dependency, the
+scheduled job opens a tracking issue labelled `advisory-rescan` (or comments on
+the existing open one) with the cargo-deny output, the run URL, and the
+`Cargo.lock` sha256. Resolve by upgrading the affected crate or by adding a
+justified entry to `[advisories.ignore]` in `deny.toml`, then close the issue
+after the next clean rescan.
 
 Pushing a `v*` tag runs the release workflow. It builds and smoke-tests downloadable archives for `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-unknown-linux-musl`, uploads checksum files, and publishes a GitHub Release with generated notes. Dependabot tracks Cargo workspace dependencies, benchmark harness dependencies, and GitHub Actions updates weekly.
 

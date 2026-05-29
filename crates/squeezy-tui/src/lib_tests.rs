@@ -11,7 +11,8 @@ use squeezy_core::{
     ContextAttachmentStatus, ContextEstimate, CostSnapshot, PermissionCapability, PermissionMode,
     PermissionPolicy, PermissionRequest, PermissionRisk, PermissionScope, SessionMode,
     StatusVerbosity, TaskStateSnapshot, TaskStateStatus, TaskStateStep, TaskStepStatus,
-    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig, TurnId, TurnMetrics,
+    TaskVerificationState, ToolOutputVerbosity, TuiAlternateScreen, TuiConfig,
+    TuiSynchronizedOutput, TurnId, TurnMetrics,
 };
 use squeezy_llm::UnavailableProvider;
 use squeezy_tools::{ToolCostHint, ToolReceipt, ToolResult, ToolStatus};
@@ -727,6 +728,108 @@ async fn slash_command_does_not_enqueue_mid_turn() {
         app.prompt_queue.is_empty(),
         "slash commands should execute immediately, never queue",
     );
+}
+
+#[tokio::test]
+async fn slash_prompt_template_expands_unknown_head_into_user_turn() {
+    let root = temp_workspace("prompt_template_expand");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("review.md"),
+        "---\ndescription: review file\nargs: [file]\n---\nReview {file} for issues.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/review src/lib.rs").await);
+    assert!(
+        app.turn_rx.is_some(),
+        "expanded template should start a user turn",
+    );
+    assert_eq!(
+        app.cancelled_prompt.as_deref(),
+        Some("Review src/lib.rs for issues."),
+        "cancelled_prompt should mirror the rendered template body so Ctrl-R can restore it",
+    );
+}
+
+#[tokio::test]
+async fn slash_prompt_template_queues_when_turn_in_progress() {
+    let root = temp_workspace("prompt_template_queue");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("ship.md"),
+        "---\ndescription: ship\nargs: [target]\n---\nShip {target}.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    // Fake a running turn so the second template invocation queues.
+    let (_tx, rx) = mpsc::channel(8);
+    app.turn_rx = Some(rx);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/ship prod").await);
+    assert_eq!(
+        app.prompt_queue.iter().collect::<Vec<_>>(),
+        vec![&"Ship prod.".to_string()],
+        "expanded template should queue rather than start a competing turn",
+    );
+    assert_eq!(app.status, "queued (1)");
+}
+
+#[tokio::test]
+async fn slash_prompt_template_does_not_shadow_builtin_command() {
+    // A template literally named after a built-in must not shadow the
+    // built-in slot — `/cost` should still hit the cost handler so a
+    // typo in `~/.squeezy/prompts/cost.md` cannot lock users out of
+    // the built-in surface.
+    let root = temp_workspace("prompt_template_shadow");
+    let prompts_dir = root.join(".squeezy/prompts");
+    fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+    fs::write(
+        prompts_dir.join("cost.md"),
+        "---\ndescription: shadow attempt\n---\nshould not run as a model turn.",
+    )
+    .expect("write template");
+
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/cost").await);
+    assert_eq!(
+        app.status, "cost snapshot",
+        "/cost should resolve to the built-in cost handler",
+    );
+    assert!(
+        app.turn_rx.is_none(),
+        "built-in /cost does not start a user turn; template would have",
+    );
+    assert!(
+        app.cancelled_prompt.is_none(),
+        "built-in /cost does not set cancelled_prompt; template would have",
+    );
+}
+
+#[tokio::test]
+async fn slash_prompt_template_passes_through_when_no_match() {
+    // An unknown slash command with no matching template must still
+    // fall through so `reject_unknown_slash_command` can flag it.
+    let root = temp_workspace("prompt_template_miss");
+    let config = test_config_with_root(SessionMode::Build, root);
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+    let mut agent = test_agent(SessionMode::Build);
+
+    assert!(!handle_slash_command(&mut app, &mut agent, "/totally-unknown arg").await);
+    assert!(app.turn_rx.is_none());
 }
 
 #[tokio::test]
@@ -2962,14 +3065,39 @@ async fn slash_attach_and_detach_update_active_context() {
 }
 
 #[tokio::test]
-async fn slash_attach_surfaces_unsupported_images() {
-    let root = temp_workspace("tui_attach_image");
+async fn slash_attach_routes_canonical_images_to_vision_kind() {
+    // F18 wires PNG/JPEG/GIF/WEBP magic-byte hits through to a
+    // routable `Image` attachment that fans into `LlmInputItem::Image`
+    // on the next turn. The TUI status surfaces the active attach
+    // instead of the legacy "unsupported file" rejection.
+    let root = temp_workspace("tui_attach_image_png");
     fs::write(root.join("shot.png"), b"\x89PNG\r\n\x1a\nimage").expect("write image");
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let mut agent = test_agent_with_config(config.clone());
     let mut app = test_app_with_config(&config, SessionMode::Build);
 
     assert!(handle_slash_command(&mut app, &mut agent, "/attach shot.png").await);
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.attachments[0].kind, ContextAttachmentKind::Image);
+    assert!(app.status.contains("attached file"), "{}", app.status);
+    assert!(app.status.contains("kind=image"), "{}", app.status);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn slash_attach_surfaces_unsupported_label_only_images() {
+    // Image-shaped labels whose bytes never trip the magic-byte sniff
+    // (HEIC/BMP/TIFF and the long tail) stay `UnsupportedImage` — the
+    // attach surfaces the legacy "unsupported file" status because no
+    // provider can decode a non-canonical payload.
+    let root = temp_workspace("tui_attach_image_heic");
+    fs::write(root.join("snap.heic"), b"not real heic content").expect("write image");
+    let config = test_config_with_root(SessionMode::Build, root.clone());
+    let mut agent = test_agent_with_config(config.clone());
+    let mut app = test_app_with_config(&config, SessionMode::Build);
+
+    assert!(handle_slash_command(&mut app, &mut agent, "/attach snap.heic").await);
     assert!(app.attachments.is_empty());
     assert!(app.status.contains("unsupported file"), "{}", app.status);
 
@@ -5460,6 +5588,61 @@ fn live_prompt_marks_first_nonempty_bang_dark_red() {
 }
 
 #[test]
+fn submitted_double_bang_prompt_marks_both_bangs_dark_red() {
+    // `!!cmd` runs locally but skips the LLM context (F01). Both bangs
+    // need to glow `BANG_RED` so the user can tell quiet bangs apart from
+    // the regular single-bang at a glance.
+    let item = TranscriptItem::user("  !!git status");
+
+    let lines = format_message_entry(&item, false, false, MessageOutcome::Normal);
+    let bang = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!!")
+        .expect("double-bang marker span");
+    let rest = lines[1]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "git status")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+    assert!(
+        lines[1]
+            .spans
+            .iter()
+            .all(|span| span.content.as_ref() != "!"),
+        "the two `!` chars should merge into a single `!!` red span",
+    );
+}
+
+#[test]
+fn live_double_bang_prompt_marks_both_bangs_dark_red() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "  !!git status".to_string());
+
+    let lines = prompt_input_content_lines(&app);
+    let bang = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "!!")
+        .expect("double-bang marker span");
+    let rest = lines[0]
+        .spans
+        .iter()
+        .find(|span| span.content.as_ref() == "git status")
+        .expect("command body span");
+
+    assert_eq!(bang.style.fg, Some(BANG_RED));
+    assert_eq!(bang.style.bg, Some(PROMPT_BG));
+    assert_eq!(rest.style.fg, Some(Color::White));
+    assert_eq!(rest.style.bg, Some(PROMPT_BG));
+}
+
+#[test]
 fn prompt_height_grows_for_multiline_input() {
     let mut app = test_app(SessionMode::Build);
     assert_eq!(input_panel_height(&app, 100), 3);
@@ -7445,6 +7628,8 @@ fn sample_attachment(id: &str) -> ContextAttachment {
         preview: "map · output shortened  ✖ Failed decl_search · invalid tool arguments"
             .to_string(),
         truncated: true,
+        image_media_type: None,
+        image_data_base64: None,
     }
 }
 
@@ -8281,6 +8466,7 @@ fn slash_commands_have_documented_capability_for_every_entry() {
         "/resume",
         "/fork",
         "/session-export",
+        "/session-export-html",
         "/session-cleanup",
         "/undo",
         "/revert-turn",
@@ -8752,6 +8938,155 @@ fn json_patch_preview_parser_handles_escaped_quotes_in_search() {
 }
 
 #[test]
+fn streaming_chunks_emit_partial_previews_with_growing_content() {
+    use super::streaming_patch::{
+        JsonPatchPreviewParser, PatchPartial, PatchPreviewEvent, render_streaming_preview,
+    };
+
+    // F14: simulate the provider streaming the apply_patch args in five
+    // chunks. After each chunk, every `Partial` event must reflect the
+    // fields that have actually finished streaming — none should claim
+    // to know `search` before its closing quote has arrived.
+    let chunks = [
+        r#"{"patches":[{"#,
+        r#""path":"src/foo.rs""#,
+        r#","search":"old line""#,
+        r#","replace":"new line""#,
+        r#"}]}"#,
+    ];
+
+    let mut parser = JsonPatchPreviewParser::new();
+    let mut events: Vec<PatchPreviewEvent> = Vec::new();
+    let mut snapshot_per_chunk: Vec<PatchPartial> = Vec::new();
+    for chunk in chunks {
+        events.extend(parser.push_delta(chunk));
+        snapshot_per_chunk.push(parser.latest_partial().clone());
+    }
+    events.extend(parser.finish());
+
+    let partials: Vec<&PatchPartial> = events
+        .iter()
+        .filter_map(|e| match e {
+            PatchPreviewEvent::Partial(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        partials.len() >= 3,
+        "expected at least one Partial per tracked field (path/search/replace), got {} \
+         partial events: {events:?}",
+        partials.len(),
+    );
+
+    let final_partial = partials
+        .last()
+        .copied()
+        .expect("at least one partial recorded");
+    assert_eq!(final_partial.path.as_deref(), Some("src/foo.rs"));
+    assert_eq!(final_partial.search.as_deref(), Some("old line"));
+    assert_eq!(final_partial.replace.as_deref(), Some("new line"));
+
+    // Snapshots taken before the value strings closed must NOT yet
+    // claim those fields — that would render a half-streamed diff body
+    // and confuse a watching user.
+    assert!(
+        snapshot_per_chunk[0].path.is_none(),
+        "no fields should be visible while only `{{\"patches\":[{{` has streamed; got {:?}",
+        snapshot_per_chunk[0]
+    );
+    assert!(
+        snapshot_per_chunk[1].path.as_deref() == Some("src/foo.rs")
+            && snapshot_per_chunk[1].search.is_none()
+            && snapshot_per_chunk[1].replace.is_none(),
+        "path should be visible but not search/replace; got {:?}",
+        snapshot_per_chunk[1]
+    );
+    assert!(
+        snapshot_per_chunk[2].search.as_deref() == Some("old line")
+            && snapshot_per_chunk[2].replace.is_none(),
+        "search should be visible but not replace; got {:?}",
+        snapshot_per_chunk[2]
+    );
+
+    // Render the diff for the snapshot captured BEFORE `replace` had
+    // arrived — the preview must show the deletion side but no
+    // additions yet, matching what the user would see frame-by-frame.
+    let search_only_lines = render_streaming_preview(&snapshot_per_chunk[2]);
+    let search_only_text = lines_to_string(&search_only_lines);
+    assert!(
+        search_only_text.contains("-old line"),
+        "search-only preview must render the deletion line: {search_only_text}",
+    );
+    assert!(
+        !search_only_text.contains("+old line") && !search_only_text.contains("+new line"),
+        "search-only preview must not render any addition yet: {search_only_text}",
+    );
+
+    // Once replace has streamed, the preview must show both sides.
+    let final_lines = render_streaming_preview(final_partial);
+    let final_text = lines_to_string(&final_lines);
+    assert!(
+        final_text.contains("-old line") && final_text.contains("+new line"),
+        "final preview must render both deletion and addition: {final_text}",
+    );
+    assert!(
+        final_text.contains("src/foo.rs"),
+        "preview header should surface the target path: {final_text}",
+    );
+}
+
+#[test]
+fn render_streaming_preview_renders_partial_search_only() {
+    use super::streaming_patch::{PatchPartial, render_streaming_preview};
+
+    // The provisional preview must handle a snapshot where `search`
+    // has closed but `replace` has not yet streamed — i.e. mid-frame
+    // state during a live edit. The render must produce deletions and
+    // omit additions entirely.
+    let partial = PatchPartial {
+        index: 0,
+        path: Some("src/lib.rs".to_string()),
+        search: Some("first\nsecond".to_string()),
+        replace: None,
+    };
+    let lines = render_streaming_preview(&partial);
+    let text = lines_to_string(&lines);
+    assert!(
+        text.contains("-first") && text.contains("-second"),
+        "multi-line search must produce one deletion per line: {text}",
+    );
+    assert!(
+        !text.contains("+first") && !text.contains("+second"),
+        "no replace yet → no additions in preview: {text}",
+    );
+}
+
+#[test]
+fn render_streaming_preview_for_empty_snapshot_is_empty() {
+    use super::streaming_patch::{PatchPartial, render_streaming_preview};
+
+    // Until any field has closed, the streaming preview must render
+    // nothing — there is nothing meaningful to show, and a stray
+    // header would suggest a patch is queued before one actually is.
+    let lines = render_streaming_preview(&PatchPartial::default());
+    assert!(
+        lines.is_empty(),
+        "empty partial must render no preview lines: {lines:?}",
+    );
+}
+
+fn lines_to_string(lines: &[ratatui::text::Line<'static>]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        for span in &line.spans {
+            out.push_str(&span.content);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
 fn idle_app_reports_no_active_animation() {
     let mut app = test_app(SessionMode::Build);
     // Fresh `TuiApp` starts with needs_redraw = true so the first frame
@@ -8779,6 +9114,61 @@ fn note_turn_started_marks_dirty_and_animation_active() {
     assert!(
         app.has_active_animation(),
         "running turn should keep animations alive"
+    );
+}
+
+#[test]
+fn focus_lost_freezes_animation_tick_and_active_animation_predicate() {
+    // The main loop drives `animation_tick` from a focused/unfocused
+    // gate (`if app.focused { app.animation_tick = … }`) and
+    // short-circuits `has_active_animation()` while the host terminal
+    // is unfocused. This test pins both halves of the contract.
+    let mut app = test_app(SessionMode::Build);
+    // Simulate a turn in flight: spinner + working title would
+    // normally keep the loop redrawing every iteration.
+    app.turn_visual = TurnVisualState::Running;
+    app.terminal_title_state = TerminalTitleState::Working;
+    assert!(
+        app.has_active_animation(),
+        "focused running turn must advertise an active animation"
+    );
+
+    // FocusLost arrived. The animation gate clamps every motion
+    // signal so the main loop stops repainting and stops ticking
+    // the spinner driver until focus returns.
+    app.focused = false;
+    assert!(
+        !app.has_active_animation(),
+        "unfocused TUI must not advertise any active animation, even mid-turn"
+    );
+
+    // Drive the loop body's animation-tick gate directly: the
+    // counter MUST NOT advance while unfocused, even across many
+    // iterations.
+    let baseline = app.animation_tick;
+    for _ in 0..32 {
+        if app.focused {
+            app.animation_tick = app.animation_tick.wrapping_add(1);
+        }
+    }
+    assert_eq!(
+        app.animation_tick, baseline,
+        "no animation tick may fire while focus is lost"
+    );
+
+    // FocusGained restores both signals.
+    app.focused = true;
+    assert!(
+        app.has_active_animation(),
+        "refocus must re-arm the active-animation predicate"
+    );
+    if app.focused {
+        app.animation_tick = app.animation_tick.wrapping_add(1);
+    }
+    assert_eq!(
+        app.animation_tick,
+        baseline + 1,
+        "tick driver must resume incrementing once focus returns"
     );
 }
 
@@ -8975,10 +9365,10 @@ async fn alt_one_resumes_most_recent_non_active_session() {
     let store = squeezy_store::SessionStore::open(&config);
 
     let older = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed older session");
     let newer = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed newer session");
     // Force an explicit ordering so the test does not depend on
     // back-to-back `now_ms()` calls landing on different millisecond
@@ -9021,7 +9411,7 @@ async fn alt_nine_reports_no_session_when_slot_is_empty() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let store = squeezy_store::SessionStore::open(&config);
     let only = store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed only peer");
     let only_id = only.session_id().to_string();
 
@@ -9056,6 +9446,94 @@ async fn alt_nine_reports_no_session_when_slot_is_empty() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn synchronized_output_resolver_honours_always_and_never_without_env() {
+    // `Always` must short-circuit env probing so capability detection
+    // never demotes an explicit opt-in to off.
+    assert!(super::resolve_synchronized_output(
+        TuiSynchronizedOutput::Always
+    ));
+    assert!(!super::resolve_synchronized_output(
+        TuiSynchronizedOutput::Never
+    ));
+}
+
+#[test]
+fn synchronized_output_auto_detects_known_capable_terminals() {
+    // Each row covers one of the capability signals advertised by the
+    // terminals listed in the F09 finding — when only that variable is
+    // set, `auto` must resolve to enabled.
+    let signals: &[&[(&str, &str)]] = &[
+        &[("KITTY_WINDOW_ID", "42")],
+        &[("WEZTERM_PANE", "0")],
+        &[("WEZTERM_EXECUTABLE", "/usr/local/bin/wezterm")],
+        &[(
+            "GHOSTTY_RESOURCES_DIR",
+            "/Applications/Ghostty.app/Contents/Resources",
+        )],
+        &[("ALACRITTY_LOG", "/tmp/alacritty.log")],
+        &[("ALACRITTY_WINDOW_ID", "1")],
+        &[("ITERM_SESSION_ID", "w0t0p0")],
+        &[("TERM_PROGRAM", "iTerm.app")],
+        &[("TERM_PROGRAM", "WezTerm")],
+        &[("TERM_PROGRAM", "ghostty")],
+        &[("TERM_PROGRAM", "kitty")],
+        &[("TERM_PROGRAM", "vscode")],
+        &[("TERM", "xterm-kitty")],
+        &[("TERM", "wezterm")],
+        &[("TERM", "alacritty")],
+        &[("TERM", "xterm-ghostty")],
+        &[("TERM", "foot")],
+        &[("TERM", "contour")],
+    ];
+    for fixture in signals {
+        let lookup = |key: &str| -> Option<std::ffi::OsString> {
+            fixture
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| std::ffi::OsString::from(*v))
+        };
+        assert!(
+            super::detect_synchronized_output_support_from_env(lookup),
+            "capability detection should flag {fixture:?}"
+        );
+    }
+}
+
+#[test]
+fn synchronized_output_auto_stays_off_for_unknown_terminals() {
+    // No env signals: capability detection must NOT speculatively
+    // enable sync mode. Users on terminals we have no evidence about
+    // still get the no-op-safe codes via `Always`, but `Auto` errs on
+    // the side of leaving them alone.
+    let empty = |_: &str| -> Option<std::ffi::OsString> { None };
+    assert!(!super::detect_synchronized_output_support_from_env(empty));
+
+    let only_screen = |key: &str| -> Option<std::ffi::OsString> {
+        if key == "TERM" {
+            Some(std::ffi::OsString::from("screen-256color"))
+        } else {
+            None
+        }
+    };
+    assert!(
+        !super::detect_synchronized_output_support_from_env(only_screen),
+        "screen/tmux passthrough must not auto-enable BSU"
+    );
+
+    let only_dumb = |key: &str| -> Option<std::ffi::OsString> {
+        if key == "TERM" {
+            Some(std::ffi::OsString::from("dumb"))
+        } else {
+            None
+        }
+    };
+    assert!(
+        !super::detect_synchronized_output_support_from_env(only_dumb),
+        "dumb terminal must not auto-enable BSU"
+    );
+}
+
 #[tokio::test]
 async fn alt_one_skips_when_an_approval_is_pending() {
     // Modal-blocking states (approval, plan choice, config screen, …)
@@ -9065,7 +9543,7 @@ async fn alt_one_skips_when_an_approval_is_pending() {
     let config = test_config_with_root(SessionMode::Build, root.clone());
     let store = squeezy_store::SessionStore::open(&config);
     store
-        .start_session(squeezy_store::SessionMetadata::new(&config, "scripted"))
+        .start_session_eager(squeezy_store::SessionMetadata::new(&config, "scripted"))
         .expect("seed peer session");
 
     let mut agent = test_agent_with_config(config.clone());

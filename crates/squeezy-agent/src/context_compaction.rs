@@ -96,6 +96,24 @@ const COMPACTION_UNRESOLVED_LINES_LIMIT: usize = 8;
 /// re-request the full body via `read_file` if needed.
 const COMPACTION_ATTACHMENT_PREVIEW_MAX_CHARS: usize = 220;
 
+// --- FILE_LINEAGE family: per-session path map of read vs modified files ---
+
+/// Per-list cap on the `<read-files>` / `<modified-files>` blocks
+/// appended to the summary. Pi (the reference) emits unbounded sets;
+/// Squeezy adds a hard ceiling so a long session that touches hundreds
+/// of files cannot blow past the summary budget. 50 covers the working
+/// set of a typical multi-turn debugging or refactor session. When a
+/// list overflows the cap the *chronologically oldest* entries are
+/// dropped first — the older slice is walked in order so the most
+/// recent file touches survive.
+///
+/// Reference: pi's emission shape lives at
+/// `others/pi/packages/coding-agent/src/core/compaction/utils.ts:62-82`
+/// (`computeFileLists` / `formatFileOperations`). Squeezy reproduces the
+/// XML-tag shape verbatim so a swap-in summarizer can re-extract the
+/// lists with the same regex.
+const COMPACTION_FILE_LINEAGE_LIMIT: usize = 50;
+
 // --- STATE retention (non-summary) ---
 
 /// In-memory history of compaction records retained on
@@ -551,6 +569,11 @@ fn llm_item_estimated_bytes(item: &LlmInputItem) -> usize {
         } => call_id.len() + name.len() + arguments.to_string().len(),
         LlmInputItem::FunctionCallOutput { call_id, output } => call_id.len() + output.len(),
         LlmInputItem::Reasoning(payload) => payload.display_text().len(),
+        // Image bytes don't consume model context tokens directly (the
+        // provider's vision encoder charges its own per-image token
+        // budget). Bill the raw byte count here so compaction's "context
+        // pressure" signal still reflects payload size on the wire.
+        LlmInputItem::Image { bytes, .. } => bytes.len(),
     }
 }
 
@@ -573,6 +596,16 @@ pub(crate) async fn compact_conversation_with_strategy(
     trigger: ContextCompactionTrigger,
     force: bool,
 ) -> Option<ContextCompactionReport> {
+    // Capture the prior compaction's summary BEFORE `compact_conversation`
+    // overwrites `state.summary` with the new extractive blob. The
+    // structured-template prompt surfaces this prior chain as a separate
+    // `<previous-summary>` block so the model can update slot contents
+    // iteratively instead of re-truncating the entire summary every round.
+    // Without this capture the model only sees the prior summary embedded
+    // inline in the new extractive output — the same chained-truncate
+    // shape that loses ~60% of high-signal slots after a handful of
+    // compactions (F12-pi-iterative-summary-update).
+    let previous_summary_before = state.summary.clone();
     let report = compact_conversation(
         conversation,
         state,
@@ -622,16 +655,14 @@ pub(crate) async fn compact_conversation_with_strategy(
     let max_output = config.context_compaction.model_assisted_max_output_tokens;
     let timeout_secs = config.context_compaction.model_assisted_timeout_secs;
     let extractive_summary = report.summary.clone();
-    let prompt = format!(
-        "Rewrite the conversation summary below verbatim in <= {max_output} tokens. \
-         Keep every decision, plan, dead-end, attachment, receipt, and unresolved \
-         question. Do not invent new facts. Output the summary only.\n\n{extractive_summary}"
+    let prompt = build_structured_compaction_prompt(
+        previous_summary_before.as_deref(),
+        &extractive_summary,
+        max_output,
     );
     let request = LlmRequest {
         model: Arc::from(model.as_str()),
-        instructions: Arc::from(
-            "You compact conversation summaries faithfully. Never add new facts; never omit decisions.",
-        ),
+        instructions: Arc::from(STRUCTURED_COMPACTION_SYSTEM_PROMPT),
         input: Arc::from(vec![LlmInputItem::UserText(prompt)]),
         max_output_tokens: Some(max_output),
         response_verbosity: None,
@@ -640,6 +671,7 @@ pub(crate) async fn compact_conversation_with_strategy(
         tools: Arc::from(Vec::new()),
         store: false,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tool_choice: None,
         output_schema: None,
         parallel_tool_calls: None,
@@ -676,6 +708,15 @@ pub(crate) async fn compact_conversation_with_strategy(
             "model_assisted_error"
         }
         Ok(Ok(())) if buffer.trim().is_empty() => "model_assisted_empty",
+        Ok(Ok(())) if !is_structured_compaction_summary(buffer.trim()) => {
+            // The model returned text but it does not carry all four
+            // required slots (`## Goal`, `## Progress`, `## Decisions`,
+            // `## Next`). A partial output is strictly worse than the
+            // deterministic extractive baseline because slot detection
+            // upstream — and the file-lineage append pass — both rely on
+            // the named-section shape. Fall back verbatim.
+            "model_assisted_missing_slots"
+        }
         Ok(Ok(())) => {
             let new_summary = buffer.trim().to_string();
             if let Some(LlmInputItem::UserText(slot)) = conversation.first_mut() {
@@ -708,6 +749,129 @@ pub(crate) async fn compact_conversation_with_strategy(
         json!({ "reason": reason, "strategy": strategy.as_str() }),
     );
     Some(report)
+}
+
+/// System prompt for the model-assisted compaction call. Pinned to the
+/// "compact a context checkpoint" framing so the model never tries to
+/// continue the embedded conversation, and so the four-slot output shape
+/// stays stable across calls and providers.
+pub(crate) const STRUCTURED_COMPACTION_SYSTEM_PROMPT: &str = "You compact conversation context into a structured checkpoint. \
+Update the existing summary in place — preserve every prior decision, \
+progress entry, and next-step. Never invent new facts. Output only the \
+four required sections in this exact order: `## Goal`, `## Progress`, \
+`## Decisions`, `## Next`.";
+
+/// Slot headers the model-assisted compaction output MUST carry. The
+/// names are kept short and lowercase here for case-insensitive matching;
+/// see `is_structured_compaction_summary` for the detection contract.
+/// File-lineage tags (`<read-files>` / `<modified-files>`) are appended
+/// by a sibling pass below `## Next`; they intentionally sit outside
+/// this slot set so the file-lineage pass can land without conflict.
+const REQUIRED_COMPACTION_SLOTS: [&str; 4] = ["goal", "progress", "decisions", "next"];
+
+/// Build the model-assisted compaction prompt. Asks the model to emit
+/// four named slots — `## Goal`, `## Progress`, `## Decisions`,
+/// `## Next` — that survive across N compactions. The legacy "rewrite
+/// this summary verbatim" prompt chain-truncated the same blob every
+/// round and lost roughly 60% of high-signal content after a handful of
+/// generations (audit finding `F12-pi-iterative-summary-update`);
+/// pinning the model to a fixed slot shape gives it an explicit
+/// "preserve these" target instead.
+///
+/// When the caller has a prior compaction summary it is surfaced as a
+/// dedicated `<previous-summary>` block alongside the freshly built
+/// extractive output (`<new-conversation>`). The model updates the
+/// slots iteratively: carry forward every entry from the prior block,
+/// fold in new actions/decisions from the new conversation, and emit
+/// the merged result. The instructions are deterministic-ish — the
+/// section order, names, and rules are pinned text, even though the
+/// model's exact wording inside each slot will vary.
+fn build_structured_compaction_prompt(
+    previous_summary: Option<&str>,
+    new_conversation: &str,
+    max_output_tokens: u32,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str(
+        "Update the structured project context checkpoint below. Emit only the four \
+         sections in this EXACT order: `## Goal`, `## Progress`, `## Decisions`, `## Next`.\n\n",
+    );
+    prompt.push_str("<new-conversation>\n");
+    prompt.push_str(new_conversation);
+    if !new_conversation.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str("</new-conversation>\n\n");
+    if let Some(prev) = previous_summary
+        && !prev.trim().is_empty()
+    {
+        prompt.push_str("<previous-summary>\n");
+        prompt.push_str(prev);
+        if !prev.ends_with('\n') {
+            prompt.push('\n');
+        }
+        prompt.push_str("</previous-summary>\n\n");
+    }
+    prompt.push_str(
+        "Template:\n\n\
+         ## Goal\n\
+         <one-paragraph statement of what the user is trying to accomplish>\n\n\
+         ## Progress\n\
+         - <what's been done; preserve prior items and append newly completed actions, decisions, file edits>\n\n\
+         ## Decisions\n\
+         - <decisions made — chosen approach, rejected options, constraints discovered; preserve every prior decision>\n\n\
+         ## Next\n\
+         - <remaining steps to complete the task; update based on new progress>\n\n",
+    );
+    prompt.push_str(&format!(
+        "Rules:\n\
+         - PRESERVE every entry from `<previous-summary>` unless `<new-conversation>` explicitly invalidates it.\n\
+         - ADD new entries from `<new-conversation>` into the matching slot.\n\
+         - UPDATE the `## Next` slot to drop steps that `<new-conversation>` shows are complete; add steps it surfaces as outstanding.\n\
+         - KEEP exact file paths, function names, error messages, tool call names, and SHA prefixes verbatim.\n\
+         - Do NOT invent new facts. Do NOT omit prior decisions.\n\
+         - Token budget: <= {max_output_tokens} tokens.\n\
+         - Output only the four sections (`## Goal`, `## Progress`, `## Decisions`, `## Next`). No preamble, no commentary, no trailing prose.\n"
+    ));
+    prompt
+}
+
+/// Verify a model-assisted compaction output carries every required
+/// structured slot. Returns `true` when all of `## Goal`, `## Progress`,
+/// `## Decisions`, and `## Next` are present as markdown headings; the
+/// caller falls back to the extractive summary verbatim otherwise.
+///
+/// Detection is intentionally lenient: any markdown heading line (one or
+/// more leading `#` characters) that contains the slot keyword as a
+/// whole word counts. This accepts model variations like `### Goal`,
+/// `## Key Decisions`, `## Next Steps`, and `## Goal:` while still
+/// catching outputs that drop a section entirely (which is the failure
+/// mode the structured template exists to prevent). Sibling passes may
+/// append additional XML-tagged sections (e.g. `<read-files>`,
+/// `<modified-files>`) below `## Next` without breaking this check —
+/// the validator only cares that the four slots are present, not that
+/// the document ends with them.
+fn is_structured_compaction_summary(text: &str) -> bool {
+    let mut found = [false; REQUIRED_COMPACTION_SLOTS.len()];
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            continue;
+        }
+        let body = trimmed.trim_start_matches('#').trim().to_ascii_lowercase();
+        for (idx, keyword) in REQUIRED_COMPACTION_SLOTS.iter().enumerate() {
+            if found[idx] {
+                continue;
+            }
+            if body
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == *keyword)
+            {
+                found[idx] = true;
+            }
+        }
+    }
+    found.iter().all(|f| *f)
 }
 
 pub(crate) fn build_compaction_summary(
@@ -798,8 +962,197 @@ pub(crate) fn build_compaction_summary(
         "Compacted {} older model-visible item(s); the most recent context remains verbatim after this summary.",
         older.len()
     ));
+    // File lineage blocks are emitted last so they survive cleanly when a
+    // structured summary template (## Goal / ## Progress / ## Next, …)
+    // lands above. Sibling finding F12-pi-iterative-summary-update is
+    // expected to introduce that template; this commit is stack-safe
+    // either way because the blocks are simply tacked onto the final
+    // line list.
+    lines.extend(file_lineage_blocks(older, state.summary.as_deref()));
     let summary = lines.join("\n");
     context_attachment_preview(&summary, config.context_compaction.max_summary_bytes).0
+}
+
+/// Build the `<read-files>` / `<modified-files>` block pair that pi emits at
+/// the end of every compaction summary (see
+/// `others/pi/packages/coding-agent/src/core/compaction/utils.ts:62-82`).
+///
+/// Inputs:
+/// - `older`: the dropped conversation slice; walked in chronological
+///   order so `oldest-dropped` semantics work when the per-list cap fires.
+/// - `previous_summary`: the prior compaction's summary text. Lineage
+///   that survives across compactions is recovered by re-parsing the
+///   `<read-files>` / `<modified-files>` blocks out of that string. The
+///   alternative — adding new fields to `ContextCompactionState` — would
+///   force a redb schema bump and a session-replay migration for one
+///   isolated piece of derived metadata.
+///
+/// Rules (mirroring pi's `computeFileLists`):
+/// - A file appearing in both read- and modify-class tool calls is
+///   reported only under `<modified-files>` (modification dominates).
+/// - Paths are emitted alphabetically and de-duplicated.
+/// - Each list is capped at `COMPACTION_FILE_LINEAGE_LIMIT`; when the
+///   cap fires, the chronologically oldest paths are dropped (head of
+///   the chronological vec) before sorting.
+///
+/// Returns 0, 1, or 2 lines depending on which sets ended up non-empty.
+/// The caller `.extend()`s the result into the summary line list.
+fn file_lineage_blocks(older: &[LlmInputItem], previous_summary: Option<&str>) -> Vec<String> {
+    let mut read = Vec::<String>::new();
+    let mut modified = Vec::<String>::new();
+    let mut read_set = BTreeSet::<String>::new();
+    let mut modified_set = BTreeSet::<String>::new();
+
+    // Carry forward the prior summary's lineage so the chain accumulates
+    // across compaction generations. Prior paths appear chronologically
+    // *before* the current `older` slice, so we seed them first.
+    if let Some(previous) = previous_summary {
+        for path in parse_file_lineage_block(previous, "read-files") {
+            if read_set.insert(path.clone()) {
+                read.push(path);
+            }
+        }
+        for path in parse_file_lineage_block(previous, "modified-files") {
+            if modified_set.insert(path.clone()) {
+                modified.push(path);
+            }
+        }
+    }
+
+    for item in older {
+        let LlmInputItem::FunctionCall {
+            name, arguments, ..
+        } = item
+        else {
+            continue;
+        };
+        match classify_file_tool(name) {
+            FileOpClass::Read => {
+                for path in extract_tool_paths(name, arguments) {
+                    if read_set.insert(path.clone()) {
+                        read.push(path);
+                    }
+                }
+            }
+            FileOpClass::Modified => {
+                for path in extract_tool_paths(name, arguments) {
+                    if modified_set.insert(path.clone()) {
+                        modified.push(path);
+                    }
+                }
+            }
+            FileOpClass::None => {}
+        }
+    }
+
+    // Modification dominates: a file that was both read and modified is
+    // reported only in `<modified-files>`. Mirrors pi's
+    // `computeFileLists` rule.
+    read.retain(|path| !modified_set.contains(path));
+
+    if read.len() > COMPACTION_FILE_LINEAGE_LIMIT {
+        let excess = read.len() - COMPACTION_FILE_LINEAGE_LIMIT;
+        read.drain(0..excess);
+    }
+    if modified.len() > COMPACTION_FILE_LINEAGE_LIMIT {
+        let excess = modified.len() - COMPACTION_FILE_LINEAGE_LIMIT;
+        modified.drain(0..excess);
+    }
+
+    read.sort();
+    modified.sort();
+
+    let mut blocks = Vec::with_capacity(2);
+    if !read.is_empty() {
+        blocks.push(format!("<read-files>\n{}\n</read-files>", read.join("\n")));
+    }
+    if !modified.is_empty() {
+        blocks.push(format!(
+            "<modified-files>\n{}\n</modified-files>",
+            modified.join("\n")
+        ));
+    }
+    blocks
+}
+
+#[derive(Debug, Clone, Copy)]
+enum FileOpClass {
+    Read,
+    Modified,
+    None,
+}
+
+fn classify_file_tool(name: &str) -> FileOpClass {
+    // The classification mirrors `permission_scope_for` in
+    // `crates/squeezy-tools/src/lib.rs`: `Read` scope tools that target a
+    // single file land in the read set; `Edit` scope tools that mutate
+    // bytes land in the modified set. Search-class tools (grep, glob)
+    // do *not* target a specific file — their `path` argument is a
+    // starting directory — so they are intentionally excluded.
+    match name {
+        "read_file" | "read_slice" => FileOpClass::Read,
+        "write_file" | "notebook_edit" | "apply_patch" => FileOpClass::Modified,
+        _ => FileOpClass::None,
+    }
+}
+
+/// Pull every workspace-relative file path out of a tool call's JSON
+/// arguments. Only tools known to `classify_file_tool` should reach this
+/// function; for `apply_patch` we also walk both the legacy `patches[]`
+/// shape and the modern `operations[]` shape (including `MoveFile`'s
+/// `from`/`to` pair) so the modified set is exhaustive.
+fn extract_tool_paths(name: &str, arguments: &Value) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        paths.push(path.to_string());
+    }
+    if name == "apply_patch" {
+        if let Some(patches) = arguments.get("patches").and_then(Value::as_array) {
+            for entry in patches {
+                if let Some(path) = entry.get("path").and_then(Value::as_str) {
+                    paths.push(path.to_string());
+                }
+            }
+        }
+        if let Some(ops) = arguments.get("operations").and_then(Value::as_array) {
+            for op in ops {
+                if let Some(path) = op.get("path").and_then(Value::as_str) {
+                    paths.push(path.to_string());
+                }
+                if let Some(from) = op.get("from").and_then(Value::as_str) {
+                    paths.push(from.to_string());
+                }
+                if let Some(to) = op.get("to").and_then(Value::as_str) {
+                    paths.push(to.to_string());
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Pull the line list out of the `<tag>...</tag>` block in
+/// `summary`. Returns an empty vec when the block is missing, empty, or
+/// malformed. The matcher is substring-based, not XML-parsed: pi emits
+/// these tags verbatim, never nests them, and never wraps them in any
+/// other markup, so a substring match is faithful and avoids dragging
+/// in an XML dependency for two well-known tags.
+fn parse_file_lineage_block(summary: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let Some(open_pos) = summary.find(&open) else {
+        return Vec::new();
+    };
+    let body_start = open_pos + open.len();
+    let Some(close_rel) = summary[body_start..].find(&close) else {
+        return Vec::new();
+    };
+    let body = &summary[body_start..body_start + close_rel];
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
@@ -835,6 +1188,10 @@ fn durable_context_lines(items: &[LlmInputItem]) -> Vec<String> {
             // assistant text that follows captures the conclusion; the raw
             // chain-of-thought is intentionally excluded from the summary.
             LlmInputItem::Reasoning(_) => None,
+            // Image attachments don't carry summarisable text; mention the
+            // MIME type so the summary preserves a hint that an image was
+            // shown but skip the raw bytes.
+            LlmInputItem::Image { media_type, .. } => Some(format!("- user image: {media_type}")),
         })
         .take(COMPACTION_DURABLE_LINES_LIMIT)
         .collect()

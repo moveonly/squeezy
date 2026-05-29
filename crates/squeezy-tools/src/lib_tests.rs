@@ -109,6 +109,179 @@ fn registry_with_state_store_and_checkpoints(
 }
 
 #[test]
+fn plan_parallel_batches_coalesces_three_delegate_calls_into_one_concurrent_batch() {
+    // F10: three consecutive `delegate*` calls in the same model turn must
+    // land in a single parallel batch so the dispatcher's
+    // `buffer_unordered(SUBAGENT_MAX_CONCURRENT)` loop can run them
+    // concurrently. Before this change `is_parallel_safe` consulted only
+    // the spec catalog, which has no entry for the synthetic subagent
+    // tools — so the lease pool advertised a 4-way budget that the
+    // dispatcher never used.
+    //
+    // The mix below intentionally covers all three delegate variants
+    // (plain delegate, plan, review) plus `delegate_chain`, which is also
+    // parallel-safe at the registry level because its body runs an
+    // internal step sequence and looks like any other read-only synthetic
+    // tool to the dispatcher.
+    let root = temp_workspace("plan_parallel_batches_delegates");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("d1", "delegate", json!({"prompt": "map module A"})),
+        make_call("d2", "delegate_plan", json!({"goal": "add tracing"})),
+        make_call("d3", "delegate_review", json!({"scope": "src/"})),
+    ];
+
+    for call in &calls {
+        assert!(
+            registry.is_parallel_safe(call),
+            "synthetic delegate tool `{}` must be marked parallel_safe so concurrent dispatch is unlocked",
+            call.name
+        );
+    }
+    assert!(registry.is_parallel_safe(&ToolCall {
+        call_id: "chain".to_string(),
+        name: "delegate_chain".to_string(),
+        arguments: json!({"steps": [{"prompt": "A"}, {"prompt": "B"}]}),
+    }));
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![ParallelExecutionBatch {
+            indices: vec![0, 1, 2],
+            parallel_safe: true,
+        }],
+        "three sibling delegate calls must coalesce into one concurrent batch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_parallel_batches_coalesces_consecutive_parallel_safe_calls() {
+    // Shape the input as a real model turn that emits read-only
+    // navigation calls back-to-back. Every spec involved here is
+    // `parallel_safe: true`, so the planner must produce a single
+    // batch covering all indices so the dispatcher's
+    // `buffer_unordered` loop can run them concurrently instead of
+    // serializing the run.
+    let root = temp_workspace("plan_parallel_batches_safe");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("c1", "read_file", json!({"path": "Cargo.toml"})),
+        make_call("c2", "grep", json!({"pattern": "fn main"})),
+        make_call("c3", "decl_search", json!({"query": "main"})),
+        make_call("c4", "symbol_context", json!({"query": "main"})),
+    ];
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![ParallelExecutionBatch {
+            indices: vec![0, 1, 2, 3],
+            parallel_safe: true,
+        }],
+        "all-parallel-safe calls must coalesce into one concurrent batch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn plan_parallel_batches_serializes_unsafe_calls_between_safe_runs() {
+    // Mix unsafe calls (shell, apply_patch) between read-only ones to
+    // confirm each unsafe call splits the surrounding parallel run.
+    // Each unsafe call must land alone in its own batch, and the
+    // contiguous safe runs on either side must stay coalesced.
+    let root = temp_workspace("plan_parallel_batches_mixed");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("c0", "read_file", json!({"path": "Cargo.toml"})),
+        make_call("c1", "grep", json!({"pattern": "fn main"})),
+        make_call(
+            "c2",
+            "shell",
+            json!({"command": "echo hi", "description": "smoke"}),
+        ),
+        make_call("c3", "read_slice", json!({"path": "src/lib.rs"})),
+        make_call(
+            "c4",
+            "apply_patch",
+            json!({"operations": [{"kind": "create_file", "path": "notes.txt", "contents": "x"}]}),
+        ),
+        make_call("c5", "decl_search", json!({"query": "main"})),
+        make_call("c6", "symbol_context", json!({"query": "main"})),
+    ];
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![
+            ParallelExecutionBatch {
+                indices: vec![0, 1],
+                parallel_safe: true,
+            },
+            ParallelExecutionBatch {
+                indices: vec![2],
+                parallel_safe: false,
+            },
+            ParallelExecutionBatch {
+                indices: vec![3],
+                parallel_safe: true,
+            },
+            ParallelExecutionBatch {
+                indices: vec![4],
+                parallel_safe: false,
+            },
+            ParallelExecutionBatch {
+                indices: vec![5, 6],
+                parallel_safe: true,
+            },
+        ],
+        "unsafe calls must land in singleton batches that split the surrounding parallel runs"
+    );
+
+    // The dispatcher consults is_parallel_safe at execution time. The
+    // matching property here documents that the planner's batch flag
+    // tracks the per-call lookup the dispatcher uses to flush vs.
+    // continue a pending parallel run.
+    for batch in &batches {
+        let expected = batch.parallel_safe;
+        for &idx in &batch.indices {
+            assert_eq!(
+                registry.is_parallel_safe(&calls[idx]),
+                expected,
+                "is_parallel_safe must agree with the planner batch flag for {}",
+                calls[idx].name
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn shell_permission_metadata_detects_destructive_and_compiler_commands() {
     let root = temp_workspace("permission_metadata");
     let registry = registry_with_shell_sandbox_off(&root);
@@ -324,7 +497,7 @@ fn write_file_permission_request_target_matches_suggested_rule_target() {
 
 #[test]
 fn session_approval_extends_to_edit_family_on_optin() {
-    // F04-permission-scope-collapse-edit-family (squeezy-1ro.57): once the
+    // F04-permission-scope-collapse-edit-family: once the
     // user opts into a session rule from one edit-family tool on a given
     // path, the same rule must cover the rest of the family (write_file
     // <-> apply_patch) for that path without re-prompting. The mechanism
@@ -723,6 +896,112 @@ async fn grep_files_with_matches_mode_returns_unique_paths() {
 }
 
 #[tokio::test]
+async fn grep_context_two_emits_five_line_window_around_match() {
+    let root = temp_workspace("grep_context_two");
+    fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\ngamma\nneedle\ndelta\nepsilon\nzeta\n",
+    )
+    .expect("write notes");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_context".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "context": 2}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["metadata"]["context"], json!(2));
+    let matches = result.content["matches"].as_array().expect("matches");
+    assert_eq!(matches.len(), 1);
+
+    let entry = &matches[0];
+    assert_eq!(entry["path"], json!("notes.txt"));
+    assert_eq!(entry["line"], json!(4));
+    assert_eq!(entry["text"], json!("needle"));
+
+    let before = entry["context_before"].as_array().expect("context_before");
+    let after = entry["context_after"].as_array().expect("context_after");
+    assert_eq!(before.len(), 2);
+    assert_eq!(after.len(), 2);
+    let window_len = before.len() + 1 + after.len();
+    assert_eq!(window_len, 5, "context=2 must emit a 5-line window");
+
+    assert_eq!(before[0], json!({"line": 2, "text": "beta"}));
+    assert_eq!(before[1], json!({"line": 3, "text": "gamma"}));
+    assert_eq!(after[0], json!({"line": 5, "text": "delta"}));
+    assert_eq!(after[1], json!({"line": 6, "text": "epsilon"}));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn grep_context_zero_preserves_pre_f13_match_shape() {
+    let root = temp_workspace("grep_context_zero");
+    fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\nneedle\ndelta\nepsilon\n",
+    )
+    .expect("write notes");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let explicit_zero = registry
+        .execute(
+            ToolCall {
+                call_id: "call_zero".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle", "context": 0}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    let default = registry
+        .execute(
+            ToolCall {
+                call_id: "call_default".to_string(),
+                name: "grep".to_string(),
+                arguments: json!({"pattern": "needle"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(explicit_zero.status, ToolStatus::Success);
+    assert_eq!(default.status, ToolStatus::Success);
+    assert_eq!(explicit_zero.content["metadata"]["context"], json!(0));
+    assert_eq!(default.content["metadata"]["context"], json!(0));
+    assert_eq!(
+        explicit_zero.content["matches"], default.content["matches"],
+        "context=0 must match the omitted-arg default"
+    );
+
+    let matches = explicit_zero.content["matches"]
+        .as_array()
+        .expect("matches");
+    assert_eq!(matches.len(), 1);
+    let entry = &matches[0];
+    assert_eq!(entry["path"], json!("notes.txt"));
+    assert_eq!(entry["line"], json!(3));
+    assert_eq!(entry["text"], json!("needle"));
+    assert!(
+        entry.get("context_before").is_none(),
+        "context=0 must not emit context_before; got: {entry}"
+    );
+    assert!(
+        entry.get("context_after").is_none(),
+        "context=0 must not emit context_after; got: {entry}"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn grep_keeps_scanning_after_large_truncated_file() {
     let root = temp_workspace("grep_large_first");
     fs::write(
@@ -782,6 +1061,49 @@ async fn read_file_returns_bounded_content_and_hash() {
         result.receipt.content_sha256,
         Some(sha256_hex("abcdef".as_bytes()))
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_returns_image_payload_when_file_is_png() {
+    use base64::Engine as _;
+    let root = temp_workspace("read_file_image");
+    // Synthetic PNG: 8-byte magic header followed by a minimal IHDR-like
+    // payload. The bytes don't have to form a renderable image — the
+    // tool only inspects magic bytes for MIME detection.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    bytes.extend_from_slice(b"synthetic-image-body");
+    fs::write(root.join("logo.png"), &bytes).expect("write png");
+
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "read_image".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "logo.png"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["image"], true);
+    assert_eq!(result.content["mime_type"], "image/png");
+    assert!(
+        result.content.get("content").is_none(),
+        "image payload must not include raw text `content`: {:?}",
+        result.content,
+    );
+    let encoded = result.content["data_base64"]
+        .as_str()
+        .expect("base64 string");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded, bytes);
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2389,6 +2711,277 @@ async fn apply_patch_does_not_levenshtein_match() {
 }
 
 #[tokio::test]
+async fn apply_patch_recovers_from_nfkc_ligature_drift() {
+    // F01: the file uses the NFKC-decomposable ligature `ﬁ` (U+FB01) but the
+    // model emits ASCII `fi`. The byte-exact lookup misses, the quote-only
+    // fallback also misses (no curly quotes), and the broader
+    // unicode-normalize fallback locates the slice by running NFKC on both
+    // sides. The applied_delta surfaces `fallback: "unicode_normalize"` for
+    // the audit log so the operator can distinguish quote drift from the
+    // wider unicode chain.
+    let root = temp_workspace("apply_patch_nfkc_ligature");
+    let initial = "let con\u{FB01}g = load();\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_nfkc".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "let config = load();",
+                        "replace": "let config = fetch();",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nfkc".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "let config = fetch();\n",
+        "NFKC fallback should replace the entire ligature-containing slice with the model's ASCII replacement",
+    );
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(applied_delta["exact"], false);
+    assert_eq!(applied_delta["operations"][0]["exact"], false);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_recovers_from_em_dash_drift() {
+    // F01: the file has an em-dash (U+2014) but the model emitted ASCII
+    // `--`. The unicode-normalize fallback collapses em-dashes to `--` on
+    // both sides and finds the slice. The original em-dash is replaced by
+    // the model's ASCII text verbatim; we do not try to re-emit the
+    // typographic dash because the broader fallback intentionally tolerates
+    // lossy unicode→ASCII edits.
+    let root = temp_workspace("apply_patch_em_dash");
+    let initial = "see chapter 3\u{2014}intro\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_em_dash".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "chapter 3--intro",
+                        "replace": "chapter 4 -- intro",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-em-dash".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(final_doc, "see chapter 4 -- intro\n");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_recovers_from_nbsp_drift() {
+    // F01: the file has a non-breaking space (U+00A0) where the model
+    // emitted a regular space. Common when prose was pasted from a Word
+    // doc or a CMS that auto-inserts NBSP between a number and a unit. The
+    // unicode-normalize fallback should bridge that gap.
+    let root = temp_workspace("apply_patch_nbsp");
+    let initial = "size\u{00A0}10 MB\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_nbsp".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [{
+                        "kind": "search_replace",
+                        "path": "doc.txt",
+                        "search": "size 10 MB",
+                        "replace": "size 20 MB",
+                        "expected_sha256": on_disk_hash,
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-nbsp".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(final_doc, "size 20 MB\n");
+    let applied_delta = result
+        .content
+        .get("applied_delta")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        applied_delta["operations"][0]["fallback"],
+        "unicode_normalize"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_batched_edits_same_file_apply_in_order() {
+    // F01: the batched form (multiple operations targeting the same file)
+    // must apply edits in array order — each subsequent search_replace runs
+    // against the staged state produced by the previous edit, not the
+    // pristine file. Cheap to verify by chaining two transformations that
+    // are only reachable when the first one already landed.
+    let root = temp_workspace("apply_patch_batch_order");
+    let initial = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_batch_order".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "alpha\n",
+                            "replace": "ALPHA-step1\n",
+                            "expected_sha256": on_disk_hash,
+                        },
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "ALPHA-step1\n",
+                            "replace": "ALPHA-step2\n",
+                            "expected_sha256": on_disk_hash,
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-batch-order".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let final_doc = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        final_doc, "ALPHA-step2\nbeta\ngamma\n",
+        "second edit must see the first edit's output, not the pristine file",
+    );
+    let delta = result
+        .content
+        .get("delta")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .expect("top-level delta array");
+    assert_eq!(delta.len(), 2);
+    assert_eq!(delta[0]["status"], "applied");
+    assert_eq!(delta[1]["status"], "applied");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_batched_edits_fail_atomically_on_missing_search() {
+    // F01: when one edit in a batch fails because its search text is not
+    // found, the whole batch must be rejected and earlier edits must not
+    // touch disk. The error must point at the offending index so the model
+    // can re-emit the right slice without re-deriving which patch was bad.
+    let root = temp_workspace("apply_patch_batch_fail");
+    let initial = "alpha\nbeta\ngamma\n";
+    fs::write(root.join("doc.txt"), initial).expect("seed doc");
+    let on_disk_hash = sha256_hex(initial.as_bytes());
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_batch_fail".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "operations": [
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "alpha\n",
+                            "replace": "ALPHA\n",
+                            "expected_sha256": on_disk_hash,
+                        },
+                        {
+                            "kind": "search_replace",
+                            "path": "doc.txt",
+                            "search": "this-text-is-not-in-the-file\n",
+                            "replace": "anything\n",
+                            "expected_sha256": on_disk_hash,
+                        }
+                    ]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-batch-fail".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Stale, "{:?}", result.content);
+    assert_eq!(result.content["error"], "search text was not found");
+    assert_eq!(
+        result.content["patch_index"], 1,
+        "error must point at the offending batch index",
+    );
+    let unchanged = fs::read_to_string(root.join("doc.txt")).expect("read doc");
+    assert_eq!(
+        unchanged, initial,
+        "batched edits must roll back atomically — first edit's staged write must not hit disk when a later edit fails",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     // Audit F14: a multi-op apply_patch success must expose a per-op `delta`
     // array — one entry per requested op, each `applied` and `exact=true`
@@ -2460,6 +3053,68 @@ async fn apply_patch_returns_per_op_delta_with_exact_flag_on_success() {
     assert_eq!(ops[0]["exact"], true);
     assert_eq!(ops[1]["exact"], true);
     assert_eq!(applied_delta["exact"], true);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn apply_patch_returns_unified_diff_with_hunk_header_and_markers() {
+    // F14 (unified_diff): a successful apply_patch must surface a
+    // `unified_diff` string the caller can pipe through `git apply` to
+    // reconstruct the edit. For a 2-line search/replace the diff must carry
+    // the standard `--- a/<path>` / `+++ b/<path>` headers, a `@@` hunk
+    // header, and matched `-`/`+` line markers around the change.
+    let root = temp_workspace("apply_patch_unified_diff_output");
+    let before = "line-one\nline-two\nline-three\n";
+    fs::write(root.join("sample.txt"), before).expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "patch_unified_diff".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({
+                    "patches": [{
+                        "path": "sample.txt",
+                        "search": "line-one\nline-two\n",
+                        "replace": "line-one-new\nline-two-new\n",
+                        "expected_sha256": sha256_hex(before.as_bytes()),
+                    }]
+                }),
+            },
+            CancellationToken::new(),
+            "turn-unified-diff".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success, "{:?}", result.content);
+    let unified = result
+        .content
+        .get("unified_diff")
+        .and_then(Value::as_str)
+        .expect("unified_diff string");
+    assert!(
+        unified.contains("--- a/sample.txt"),
+        "missing old-file header: {unified}"
+    );
+    assert!(
+        unified.contains("+++ b/sample.txt"),
+        "missing new-file header: {unified}"
+    );
+    assert!(unified.contains("@@"), "missing hunk header: {unified}");
+    assert!(
+        unified.contains("-line-one\n"),
+        "missing `-` marker for removed line: {unified}"
+    );
+    assert!(
+        unified.contains("+line-one-new\n"),
+        "missing `+` marker for added line: {unified}"
+    );
+    assert!(
+        unified.contains("-line-two\n") && unified.contains("+line-two-new\n"),
+        "second changed line should appear as -/+: {unified}"
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -3343,6 +3998,110 @@ async fn absolute_output_dir_overrides_workspace_root() {
     let _ = fs::remove_dir_all(&absolute_dir);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_file_concurrent_distinct_paths_run_in_parallel() {
+    // F01: two `write_file` calls against distinct files must not
+    // serialise. We hold the per-realpath lock for path B externally,
+    // which would block any `write_file` keyed on B; the call against
+    // path A must still complete promptly because the locks are keyed
+    // per-realpath rather than process-wide.
+    let root = temp_workspace("write_file_concurrent_distinct");
+    fs::write(root.join("a.txt"), b"a-before").expect("write a");
+    fs::write(root.join("b.txt"), b"b-before").expect("write b");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let blocked_path = root.join("b.txt");
+    let parked_guard = file_mutation_queue::lock_paths_for_mutation([&blocked_path]).await;
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        registry
+            .execute(
+                ToolCall {
+                    call_id: "write_a".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": "a.txt",
+                        "content": "a-after",
+                        "expected_sha256": sha256_hex(b"a-before"),
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    })
+    .await
+    .expect("write_file against a.txt must not be blocked by an unrelated lock on b.txt");
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        fs::read_to_string(root.join("a.txt")).unwrap(),
+        "a-after",
+        "a.txt should have been written while b.txt's lock was held"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("b.txt")).unwrap(),
+        "b-before",
+        "b.txt must remain untouched because no writer ran against it"
+    );
+
+    drop(parked_guard);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_file_concurrent_same_path_serialises_on_realpath() {
+    // F01: a `write_file` against path P must wait if the per-realpath
+    // lock for P is already held. We park the lock externally, kick off
+    // the writer, observe that it does not complete, then release the
+    // lock and confirm it then completes.
+    let root = temp_workspace("write_file_concurrent_same");
+    fs::write(root.join("shared.txt"), b"v0").expect("write shared");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let blocked_path = root.join("shared.txt");
+    let parked_guard = file_mutation_queue::lock_paths_for_mutation([&blocked_path]).await;
+
+    let registry_clone = registry.clone();
+    let mut writer = tokio::spawn(async move {
+        registry_clone
+            .execute(
+                ToolCall {
+                    call_id: "write_shared".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: json!({
+                        "path": "shared.txt",
+                        "content": "v1",
+                        "expected_sha256": sha256_hex(b"v0"),
+                    }),
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+
+    // The writer must still be blocked on the per-realpath lock.
+    let race = tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer).await;
+    assert!(
+        race.is_err(),
+        "write_file should block while the per-realpath lock is held"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "v0",
+        "file must not have been overwritten while the lock was held"
+    );
+
+    drop(parked_guard);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+        .await
+        .expect("writer must complete once the lock is released")
+        .expect("writer task join");
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(fs::read_to_string(root.join("shared.txt")).unwrap(), "v1");
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn write_file_rejects_stale_expected_hash() {
     let root = temp_workspace("write_file");
@@ -3477,6 +4236,307 @@ async fn checkpointing_is_disabled_by_default_for_mutations() {
     assert_eq!(list.status, ToolStatus::Success);
     assert_eq!(list.content["enabled"], false);
     assert_eq!(list.content["checkpoints"].as_array().unwrap().len(), 0);
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_provider_default_journal_still_records_through_trait() {
+    // F14: when `checkpoints_enabled` is set, the registry must
+    // auto-install the journal-backed CheckpointProvider, and edits must
+    // still flow through it. The shape of the `checkpoint` field on the
+    // tool result is the contract external tooling (TUI, undo flow)
+    // depends on, so we assert both that the bridge fired and that the
+    // record is in the legacy CRUD surface.
+    let root = temp_workspace("checkpoint_provider_default_journal");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    assert!(
+        registry.has_checkpoint_provider(),
+        "registry_with_checkpoints must auto-install the journal provider",
+    );
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-journal".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("default provider must attach a checkpoint field");
+    assert_eq!(checkpoint["tool_name"], "write_file");
+    assert_eq!(checkpoint["group_id"], "turn-journal");
+    assert!(
+        checkpoint["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()),
+        "journal record should list the mutated file: {checkpoint}",
+    );
+
+    let list = registry
+        .execute(
+            ToolCall {
+                call_id: "list".to_string(),
+                name: "checkpoint_list".to_string(),
+                arguments: json!({}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(list.status, ToolStatus::Success);
+    let listed = list.content["checkpoints"]
+        .as_array()
+        .expect("checkpoints array");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["tool_name"], "write_file");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn checkpoint_provider_mock_observes_before_and_after_callbacks() {
+    // F14: an external impl must be able to replace the journal-backed
+    // provider on a stock registry and observe both halves of the bridge.
+    // We construct a registry with checkpoints disabled (so no journal
+    // provider is auto-installed), register a counting mock, and confirm
+    // a single write_file call drives one before_edit / one after_edit
+    // pair with the expected context and that the mock's JSON value is
+    // surfaced under `checkpoint`.
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    #[derive(Default)]
+    struct CountingProvider {
+        before_calls: AtomicUsize,
+        after_calls: AtomicUsize,
+        last_tool: Mutex<Option<String>>,
+        last_group: Mutex<Option<String>>,
+        last_call_id: Mutex<Option<String>>,
+        last_status: Mutex<Option<String>>,
+    }
+
+    impl CheckpointProvider for CountingProvider {
+        fn before_edit(&self) -> squeezy_core::Result<Option<CheckpointSnapshot>> {
+            self.before_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            // Encode a sentinel string in the opaque snapshot so the
+            // matching after_edit can prove the registry round-tripped
+            // the exact value back to us.
+            Ok(Some(CheckpointSnapshot::new(
+                "mock-sentinel-v1".to_string(),
+            )))
+        }
+
+        fn after_edit(
+            &self,
+            before: &CheckpointSnapshot,
+            context: &CheckpointEditContext,
+        ) -> squeezy_core::Result<Option<Value>> {
+            self.after_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            *self.last_tool.lock().unwrap() = Some(context.tool_name.clone());
+            *self.last_group.lock().unwrap() = Some(context.group_id.clone());
+            *self.last_call_id.lock().unwrap() = Some(context.call_id.clone());
+            *self.last_status.lock().unwrap() = Some(context.status.to_string());
+            let sentinel = before
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            Ok(Some(json!({
+                "mock": true,
+                "sentinel": sentinel,
+                "tool_name": context.tool_name,
+                "group_id": context.group_id,
+            })))
+        }
+    }
+
+    let root = temp_workspace("checkpoint_provider_mock");
+    fs::write(root.join("sample.txt"), "before").expect("write sample");
+    // Default-config registry has no journal: the bridge must still
+    // accept an externally-registered provider so a git-stash-style
+    // extension can plug in without forking core.
+    let registry = registry_with_shell_sandbox_off(&root);
+    assert!(
+        !registry.has_checkpoint_provider(),
+        "default registry without checkpoints must start with no provider",
+    );
+
+    let mock = Arc::new(CountingProvider::default());
+    let previous =
+        registry.register_checkpoint_provider(mock.clone() as Arc<dyn CheckpointProvider>);
+    assert!(
+        previous.is_none(),
+        "no provider was installed before this test"
+    );
+    assert!(registry.has_checkpoint_provider());
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "write-mock".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex("before".as_bytes()),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-mock".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(
+        mock.before_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "before_edit must fire exactly once per edit-bearing tool call",
+    );
+    assert_eq!(
+        mock.after_calls.load(AtomicOrdering::SeqCst),
+        1,
+        "after_edit must fire exactly once per edit-bearing tool call",
+    );
+    assert_eq!(
+        mock.last_tool.lock().unwrap().as_deref(),
+        Some("write_file"),
+    );
+    assert_eq!(
+        mock.last_group.lock().unwrap().as_deref(),
+        Some("turn-mock")
+    );
+    assert_eq!(
+        mock.last_call_id.lock().unwrap().as_deref(),
+        Some("write-mock"),
+    );
+    assert_eq!(mock.last_status.lock().unwrap().as_deref(), Some("success"));
+
+    let checkpoint = result
+        .content
+        .get("checkpoint")
+        .expect("mock-provided checkpoint must be attached to the result");
+    assert_eq!(checkpoint["mock"], true);
+    assert_eq!(checkpoint["sentinel"], "mock-sentinel-v1");
+    assert_eq!(checkpoint["tool_name"], "write_file");
+    assert_eq!(checkpoint["group_id"], "turn-mock");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_identical_content_is_noop_and_preserves_mtime() {
+    // F14: writing the same bytes that are already on disk must
+    // short-circuit. The tool result signals `noop=true`, no `fs::write`
+    // occurs (verified by mtime preservation), and the checkpoint layer
+    // does not record a change because the worktree tree is unchanged.
+    let root = temp_workspace("write_file_noop_identical");
+    let target = root.join("sample.txt");
+    fs::write(&target, "same").expect("write sample");
+    let mtime_before = fs::metadata(&target)
+        .expect("metadata")
+        .modified()
+        .expect("mtime supported");
+
+    // Push past the filesystem's mtime resolution so a real write would
+    // land on a strictly later instant. Modern macOS/Linux give sub-ms
+    // precision; the small sleep absorbs the rare low-resolution case
+    // without bloating overall test runtime.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let registry = registry_with_checkpoints(&root);
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "noop-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "same",
+                    "expected_sha256": sha256_hex(b"same"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-noop".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["noop"], json!(true));
+    assert_eq!(result.content["bytes_written"], json!(0));
+    let expected_sha = sha256_hex(b"same");
+    assert_eq!(result.content["before_sha256"], json!(&expected_sha));
+    assert_eq!(result.content["after_sha256"], json!(&expected_sha));
+    assert!(
+        result.content.get("checkpoint").is_none(),
+        "noop write must not emit a checkpoint, got {:?}",
+        result.content.get("checkpoint")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "same");
+
+    let mtime_after = fs::metadata(&target)
+        .expect("metadata")
+        .modified()
+        .expect("mtime supported");
+    assert_eq!(
+        mtime_before, mtime_after,
+        "noop write must not touch the file (mtime should be unchanged)"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn write_file_changed_content_marks_noop_false_and_writes() {
+    // F14 counterpart: a real edit must still proceed and the tool
+    // result must explicitly mark `noop=false` so downstream layers know
+    // a change really did land on disk.
+    let root = temp_workspace("write_file_noop_changed");
+    let target = root.join("sample.txt");
+    fs::write(&target, "before").expect("write sample");
+    let registry = registry_with_checkpoints(&root);
+
+    let result = registry
+        .execute_for_group(
+            ToolCall {
+                call_id: "real-write".to_string(),
+                name: "write_file".to_string(),
+                arguments: json!({
+                    "path": "sample.txt",
+                    "content": "after",
+                    "expected_sha256": sha256_hex(b"before"),
+                }),
+            },
+            CancellationToken::new(),
+            "turn-real".to_string(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["noop"], json!(false));
+    assert_eq!(result.content["bytes_written"], json!("after".len()));
+    assert_eq!(
+        result.content["before_sha256"],
+        json!(sha256_hex(b"before"))
+    );
+    assert_eq!(result.content["after_sha256"], json!(sha256_hex(b"after")));
+    assert!(
+        result.content["checkpoint"]["group_id"].is_string(),
+        "real edit must emit a checkpoint, got {:?}",
+        result.content.get("checkpoint")
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "after");
 
     let _ = fs::remove_dir_all(root);
 }
@@ -4817,6 +5877,244 @@ async fn shaped_shell_spill_handle_reads_raw_unshaped_output() {
     let raw = fetched.content["content"].as_str().expect("content");
     assert!(raw.contains("Compiling crate_a"));
     assert!(!raw.contains("output_shape"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_truncation_spills_full_output_to_tempfile_and_round_trips_via_read_tool_output() {
+    let root = temp_workspace("shell_truncation_tempfile_spill");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    // 200000 bytes of `x\n` capped at 4096 ensures the captured raw
+    // stream both fills the entire byte budget and ALSO drops bytes
+    // past the cap, i.e. the path that the F01 spillover-to-tempfile
+    // finding is asked to preserve.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_spillover".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "yes x | head -c 200000",
+                    "output_byte_cap": 4096,
+                    "description": "exercise tempfile spillover"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+    let spillover = result
+        .content
+        .get("spillover")
+        .expect("truncated shell result must carry spillover metadata");
+    let spill_path = spillover["path"].as_str().expect("spillover.path");
+    let spill_bytes = spillover["bytes"]
+        .as_u64()
+        .expect("spillover.bytes must be numeric");
+    assert!(spill_bytes > 0, "spillover must record non-zero bytes");
+
+    let shaped_stdout = result.content["stdout"].as_str().expect("stdout");
+    let expected_footer = format!(
+        "[truncated; full output: {spill_path} ({spill_bytes} bytes); recover via read_tool_output {{\"path\": \"{spill_path}\"}}]"
+    );
+    assert!(
+        shaped_stdout.contains(&expected_footer),
+        "shaped stdout must surface the spillover path footer naming read_tool_output; got: {shaped_stdout:?}",
+    );
+
+    // Path must live under $TMPDIR/squeezy-spillover/<session>/.
+    let tmp_base = std::env::temp_dir().join("squeezy-spillover");
+    let tmp_canon = tmp_base.canonicalize().expect("canonical tempdir base");
+    let spill_canon = PathBuf::from(spill_path)
+        .canonicalize()
+        .expect("canonical spillover path");
+    assert!(
+        spill_canon.starts_with(&tmp_canon),
+        "spillover path {spill_path:?} must live under {tmp_base:?}",
+    );
+
+    // Roundtrip the spillover via read_tool_output { path }.
+    let fetched = registry
+        .execute(
+            ToolCall {
+                call_id: "call_read_spillover".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": spill_path,
+                    "offset": 0,
+                    "limit": spill_bytes as usize,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(fetched.status, ToolStatus::Success);
+    assert_eq!(fetched.content["bytes_returned"], spill_bytes);
+    assert_eq!(fetched.content["total_bytes"], spill_bytes);
+    let content = fetched.content["content"].as_str().expect("content");
+    let on_disk_bytes = fs::read(spill_path).expect("spillover file readable");
+    assert_eq!(
+        content.as_bytes(),
+        on_disk_bytes.as_slice(),
+        "read_tool_output content must match the spillover file byte-for-byte",
+    );
+    let raw_captured = result.content.get("output_shape").and_then(|shape| {
+        shape
+            .get("raw_stdout_bytes")
+            .and_then(serde_json::Value::as_u64)
+    });
+    if let Some(raw_bytes) = raw_captured {
+        assert_eq!(
+            content.len() as u64,
+            raw_bytes,
+            "spillover size must match the raw captured stdout (stderr is empty for `yes` output)",
+        );
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_truncation_records_spillover_path_under_session_dir_for_raw_output_mode() {
+    let root = temp_workspace("shell_truncation_raw_mode_spill");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_raw_spill".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'A%.0s' $(seq 1 4096)",
+                    "output_byte_cap": 256,
+                    "output_mode": "raw",
+                    "description": "raw spillover sanity"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], true);
+    let spillover = result
+        .content
+        .get("spillover")
+        .expect("raw-mode truncation must also surface a spillover path");
+    let spill_path = spillover["path"].as_str().expect("spillover.path");
+    assert!(
+        PathBuf::from(spill_path).is_file(),
+        "spillover file must exist on disk: {spill_path:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn shell_non_truncated_runs_do_not_spill_to_tempfile() {
+    let root = temp_workspace("shell_no_spill_on_clean_run");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_clean".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command": "printf 'hello\\n'",
+                    "description": "tiny output that fits"
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["truncated"], false);
+    assert!(
+        result.content.get("spillover").is_none(),
+        "spillover field must be absent when truncation did not fire: {:?}",
+        result.content,
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_tool_output_rejects_spillover_paths_outside_the_session_dir() {
+    let root = temp_workspace("read_tool_output_path_safety");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let outside = root.join("not-a-spillover.txt");
+    fs::write(&outside, b"forbidden bytes").expect("write outside file");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_escape".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "path": outside.to_string_lossy(),
+                    "offset": 0,
+                    "limit": 16,
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("outside the session directory") || err.contains("not found"),
+        "expected path-safety rejection, got: {err}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_tool_output_rejects_calls_with_both_handle_and_path() {
+    let root = temp_workspace("read_tool_output_arg_validation");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_both".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({
+                    "handle": "a".repeat(64),
+                    "path": "/tmp/somewhere",
+                }),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("exactly one of `handle` or `path`"),
+        "expected mutual-exclusion error, got: {err}",
+    );
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "call_neither".to_string(),
+                name: "read_tool_output".to_string(),
+                arguments: json!({"offset": 0, "limit": 16}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(result.status, ToolStatus::Error);
+    let err = result.content["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("requires either `handle` or `path`"),
+        "expected missing-arg error, got: {err}",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -8993,4 +10291,164 @@ fn human_label_renders_one_phrase_for_known_tools() {
 fn human_label_falls_back_to_tool_name_when_no_template() {
     let label = crate::human_label_for_call("brand_new_tool", &json!({"x": 1}));
     assert_eq!(label, "brand_new_tool");
+}
+
+#[test]
+fn prepare_arguments_lookup_advertises_only_hooked_tools() {
+    let root = temp_workspace("prepare_arguments_lookup");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    // read_file and shell both ship hooks; tools without spelling drift
+    // (e.g. grep) intentionally leave the slot empty.
+    assert!(
+        registry.prepare_arguments_for("read_file").is_some(),
+        "read_file should advertise a prepare_arguments hook"
+    );
+    assert!(
+        registry.prepare_arguments_for("shell").is_some(),
+        "shell should advertise a prepare_arguments hook"
+    );
+    assert!(
+        registry.prepare_arguments_for("grep").is_none(),
+        "grep does not declare a hook"
+    );
+    assert!(
+        registry
+            .prepare_arguments_for("definitely_not_a_tool")
+            .is_none(),
+        "unknown tool names resolve to None"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_read_file_hook_normalizes_filepath_aliases() {
+    let root = temp_workspace("prepare_arguments_read_file_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry
+        .prepare_arguments_for("read_file")
+        .expect("read_file hook");
+
+    // `filepath`, `file_path`, and `file` all promote to `path`.
+    for alias in ["filepath", "file_path", "file"] {
+        let mut args = json!({ alias: "sample.txt" });
+        hook(&mut args).expect("hook ok");
+        assert_eq!(
+            args,
+            json!({ "path": "sample.txt" }),
+            "alias `{alias}` should normalize to `path`"
+        );
+    }
+
+    // Canonical key wins when both are present — alias is dropped.
+    let mut args = json!({"path": "good.txt", "filepath": "bad.txt"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"path": "good.txt"}));
+
+    // Null placeholder for `path` is treated as missing so an alias can
+    // fill the slot without colliding with the canonical key.
+    let mut args = json!({"path": Value::Null, "filepath": "sample.txt"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"path": "sample.txt"}));
+
+    // Null alias is ignored — we never promote `path = null`.
+    let mut args = json!({"filepath": Value::Null});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({}));
+
+    // Non-object arguments pass through unchanged.
+    let mut args = json!(42);
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!(42));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn prepare_arguments_shell_hook_normalizes_command_aliases() {
+    let root = temp_workspace("prepare_arguments_shell_hook");
+    let registry = ToolRegistry::new(&root).expect("registry");
+    let hook = registry.prepare_arguments_for("shell").expect("shell hook");
+
+    for alias in ["cmd", "shell_command", "bash", "bash_command"] {
+        let mut args = json!({ alias: "ls -la" });
+        hook(&mut args).expect("hook ok");
+        assert_eq!(
+            args,
+            json!({ "command": "ls -la" }),
+            "alias `{alias}` should normalize to `command`"
+        );
+    }
+
+    // Canonical `command` wins over `cmd`.
+    let mut args = json!({"command": "echo good", "cmd": "echo bad"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"command": "echo good"}));
+
+    // Null `command` placeholder is dropped so the alias can land.
+    let mut args = json!({"command": Value::Null, "cmd": "echo recovered"});
+    hook(&mut args).expect("hook ok");
+    assert_eq!(args, json!({"command": "echo recovered"}));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_dispatch_normalizes_filepath_alias_via_hook() {
+    let root = temp_workspace("read_file_filepath_alias");
+    fs::write(root.join("sample.txt"), "hello world").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    // Without the hook, `filepath` would trip `deny_unknown_fields` and
+    // surface an "invalid tool arguments" error. With it, dispatch
+    // succeeds and the typed `ReadFileArgs` deserialization sees the
+    // canonical `path` field.
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "alias_call".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"filepath": "sample.txt", "limit": 11}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Success);
+    assert_eq!(result.content["content"], "hello world");
+    assert_eq!(result.content["path"], "sample.txt");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn read_file_dispatch_misspelled_alias_still_fails() {
+    // Sanity: only the curated aliases are repaired. An arbitrary
+    // misspelling like `pth` is still rejected, which is the behavior we
+    // want so the model is forced to learn the canonical field name
+    // rather than rely on the hook for arbitrary drift.
+    let root = temp_workspace("read_file_bad_alias");
+    fs::write(root.join("sample.txt"), "hello").expect("write sample");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    let result = registry
+        .execute(
+            ToolCall {
+                call_id: "bad_alias".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"pth": "sample.txt"}),
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+    assert_eq!(result.status, ToolStatus::Error);
+    let error = result.content["error"]
+        .as_str()
+        .expect("error message present");
+    assert!(
+        error.contains("invalid tool arguments"),
+        "unexpected error: {error}"
+    );
+
+    let _ = fs::remove_dir_all(root);
 }

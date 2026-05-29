@@ -746,23 +746,73 @@ impl Driver {
     }
 
     async fn dispatch_slash_command(&self, command: &str) -> Result<String, EvalError> {
-        let trimmed = command.trim().trim_start_matches('/');
-        let (name, args) = trimmed.split_once(' ').unwrap_or((trimmed, ""));
-        let outcome = self.agent.dispatch_command(name, args).await;
+        let outcome = self.agent.dispatch_command_raw(command).await;
         let status = match &outcome {
-            squeezy_agent::CommandOutcome::Compacted => "compacted".to_string(),
-            squeezy_agent::CommandOutcome::ModeChanged { mode, changed } => {
+            squeezy_agent::DispatchOutcome::Compacted => "compacted".to_string(),
+            squeezy_agent::DispatchOutcome::CompactedUndo { restored } => {
+                format!("compact_undo:restored={restored}")
+            }
+            squeezy_agent::DispatchOutcome::ModeChanged { mode, changed } => {
                 format!("mode_{mode}_changed={changed}")
             }
-            squeezy_agent::CommandOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
-            squeezy_agent::CommandOutcome::JobsList { count } => format!("jobs_list:{count}"),
-            squeezy_agent::CommandOutcome::PermissionsList { count } => {
+            squeezy_agent::DispatchOutcome::CostSnapshot { .. } => "cost_snapshot".to_string(),
+            squeezy_agent::DispatchOutcome::ContextSnapshot { .. } => {
+                "context_snapshot".to_string()
+            }
+            squeezy_agent::DispatchOutcome::ReviewerSnapshot { count } => {
+                format!("reviewer_snapshot:{count}")
+            }
+            squeezy_agent::DispatchOutcome::JobsList { count } => format!("jobs_list:{count}"),
+            squeezy_agent::DispatchOutcome::TaskDetail { id, found } => {
+                format!("task_detail:{id}:found={found}")
+            }
+            squeezy_agent::DispatchOutcome::TaskCancel { id, cancelled } => {
+                format!("task_cancel:{id}:cancelled={cancelled}")
+            }
+            squeezy_agent::DispatchOutcome::PermissionsList { count } => {
                 format!("permissions_list:{count}")
             }
-            squeezy_agent::CommandOutcome::Unsupported { command } => {
+            squeezy_agent::DispatchOutcome::Forked { new_session_id } => {
+                format!("forked:{new_session_id}")
+            }
+            squeezy_agent::DispatchOutcome::SessionsList { count } => {
+                format!("sessions_list:{count}")
+            }
+            squeezy_agent::DispatchOutcome::SessionDetail { session_id, exists } => {
+                format!("session_detail:{session_id}:exists={exists}")
+            }
+            squeezy_agent::DispatchOutcome::SessionExported { session_id, bytes } => {
+                format!("session_exported:{session_id}:bytes={bytes}")
+            }
+            squeezy_agent::DispatchOutcome::SessionExportedHtml {
+                session_id,
+                path,
+                bytes,
+            } => format!("session_exported_html:{session_id}:path={path}:bytes={bytes}"),
+            squeezy_agent::DispatchOutcome::SessionCleanup { archived, removed } => {
+                format!("session_cleanup:archived={archived}:removed={removed}")
+            }
+            squeezy_agent::DispatchOutcome::Attached { id } => format!("attached:{id}"),
+            squeezy_agent::DispatchOutcome::Detached { id } => format!("detached:{id}"),
+            squeezy_agent::DispatchOutcome::AttachmentsList { count } => {
+                format!("attachments_list:{count}")
+            }
+            squeezy_agent::DispatchOutcome::Pinned { id } => format!("pinned:{id}"),
+            squeezy_agent::DispatchOutcome::Unpinned { id } => format!("unpinned:{id}"),
+            squeezy_agent::DispatchOutcome::PinsList { count } => format!("pins_list:{count}"),
+            squeezy_agent::DispatchOutcome::TuiOnly { command } => {
+                format!("tui_only:{command}")
+            }
+            squeezy_agent::DispatchOutcome::Unsupported { command } => {
                 format!("unsupported_slash_command:{command}")
             }
-            squeezy_agent::CommandOutcome::Error { message, .. } => format!("error:{message}"),
+            squeezy_agent::DispatchOutcome::Error { message, .. } => format!("error:{message}"),
+            squeezy_agent::DispatchOutcome::SessionRenamed { display_name, .. } => {
+                format!("session_renamed:{}", display_name.as_deref().unwrap_or(""))
+            }
+            squeezy_agent::DispatchOutcome::SessionLabelled { labels, .. } => {
+                format!("session_labelled:{}", labels.join(","))
+            }
         };
         Ok(status)
     }

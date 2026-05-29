@@ -432,7 +432,14 @@ fn shape_unstructured_stream(text: &str, truncated: bool, exit_code: Option<i32>
         kept.push(format!("[dropped {dropped} low-signal lines]"));
     }
     if truncated {
-        kept.push("[raw stream was truncated]".to_string());
+        // Name the recovery tool so the model can pivot without inferring
+        // the contract; the literal path lives in the structured
+        // `spillover.path` field and the spillover footer appended after
+        // shaping (see `append_spillover_footer` in `shell.rs`).
+        kept.push(
+            "[raw stream was truncated; recover full bytes via read_tool_output {\"path\": \"<spillover-path>\"}]"
+                .to_string(),
+        );
     }
     if let Some(exit_code) = exit_code
         && exit_code != 0
@@ -485,7 +492,12 @@ fn trim_shaped_block(text: &str, max_chars: usize) -> String {
         return text.trim().to_string();
     }
     let mut output = text.chars().take(max_chars).collect::<String>();
-    output.push_str("\n[truncated shaped block]");
+    // Name the recovery tool so the model knows to fetch the full block
+    // from the shell spillover tempfile (path lives in the structured
+    // `spillover.path` field and the spillover footer below).
+    output.push_str(
+        "\n[truncated shaped block; recover full block via read_tool_output {\"path\": \"<spillover-path>\"}]",
+    );
     output
 }
 

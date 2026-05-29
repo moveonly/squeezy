@@ -239,6 +239,7 @@ pub(crate) fn llm_request_input_bytes(request: &LlmRequest) -> u64 {
         total = total.saturating_add(match item {
             LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => text.len() as u64,
             LlmInputItem::FunctionCallOutput { output, .. } => output.len() as u64,
+            LlmInputItem::Image { bytes, .. } => bytes.len() as u64,
             LlmInputItem::FunctionCall { arguments, .. } => serde_json::to_vec(arguments)
                 .map(|v| v.len() as u64)
                 .unwrap_or(0),

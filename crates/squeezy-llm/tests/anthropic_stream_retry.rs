@@ -132,6 +132,7 @@ fn build_request(model: &str) -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: squeezy_llm::CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -158,6 +159,7 @@ fn provider_for(addr: SocketAddr, stream_max_retries: u8) -> AnthropicProvider {
             request_max_retries: 0,
             stream_max_retries,
             stream_idle_timeout_ms: 5_000,
+            ..ProviderTransportConfig::default()
         },
     };
     AnthropicProvider::from_config(&config).expect("provider")

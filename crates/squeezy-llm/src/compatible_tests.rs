@@ -1,13 +1,25 @@
 use super::*;
-use crate::{LlmEvent, LlmInputItem, LlmToolSpec};
+use crate::{CacheSpec, LlmEvent, LlmInputItem, LlmToolSpec};
 use serde_json::{Value, json};
-use squeezy_core::OpenAiCompatiblePreset;
+use squeezy_core::{
+    DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL, DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL,
+    OpenAiCompatibleConfig, OpenAiCompatiblePreset, ProviderTransportConfig,
+};
 use std::sync::Arc;
 
 fn sample_request() -> LlmRequest {
     LlmRequest {
         model: "anthropic/claude-opus-4-7".to_string().into(),
         instructions: "be brief".to_string().into(),
+        // The orphan `FunctionCallOutput` (no preceding
+        // `FunctionCall` with the same `call_id`) is the cross-model
+        // hazard the F11 normalization handles: after the
+        // `request_body` runs the input through
+        // `normalize_tool_ids_for_replay`, a placeholder
+        // `model_switched` `FunctionCall` is synthesized in front of
+        // this output so the wire format stays well-formed for every
+        // destination provider. Tests assert on the *normalized*
+        // shape (4 input messages, with `tool_call_id = "call_1"`).
         input: Arc::from(vec![
             LlmInputItem::UserText("hello".to_string()),
             LlmInputItem::AssistantText("hi there".to_string()),
@@ -21,6 +33,7 @@ fn sample_request() -> LlmRequest {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "grep".to_string(),
@@ -93,16 +106,30 @@ fn request_body_uses_chat_completions_shape() {
     assert_eq!(body["stream_options"]["include_usage"], true);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 4, "system + 3 input items");
+    // Normalization inserts a synthetic `model_switched` assistant
+    // tool_call ahead of the orphan tool result, so the body now
+    // carries system + user + assistant text + synthetic assistant
+    // tool_calls + tool result = 5 messages.
+    assert_eq!(
+        messages.len(),
+        5,
+        "system + 3 input items + synthetic tool call"
+    );
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], "be brief");
     assert_eq!(messages[1]["role"], "user");
     assert_eq!(messages[1]["content"], "hello");
     assert_eq!(messages[2]["role"], "assistant");
     assert_eq!(messages[2]["content"], "hi there");
-    assert_eq!(messages[3]["role"], "tool");
-    assert_eq!(messages[3]["tool_call_id"], "call_42");
-    assert_eq!(messages[3]["content"], r#"{"result":"ok"}"#);
+    assert_eq!(messages[3]["role"], "assistant");
+    assert_eq!(
+        messages[3]["tool_calls"][0]["function"]["name"],
+        crate::MODEL_SWITCHED_PLACEHOLDER_NAME,
+    );
+    assert_eq!(messages[3]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(messages[4]["role"], "tool");
+    assert_eq!(messages[4]["tool_call_id"], "call_1");
+    assert_eq!(messages[4]["content"], r#"{"result":"ok"}"#);
 
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 1);
@@ -122,7 +149,10 @@ fn request_body_skips_empty_system_message() {
     let body = OpenAiCompatibleProvider::request_body(&request);
 
     let messages = body["messages"].as_array().expect("messages array");
-    assert_eq!(messages.len(), 3);
+    // No system message + 3 original input items + 1 synthetic
+    // `model_switched` assistant tool_call inserted ahead of the
+    // orphan tool result = 4 messages.
+    assert_eq!(messages.len(), 4);
     assert_eq!(messages[0]["role"], "user");
 }
 
@@ -141,6 +171,7 @@ fn request_body_serialises_assistant_function_call_history() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -153,7 +184,12 @@ fn request_body_serialises_assistant_function_call_history() {
     let assistant_call = &messages[1];
     assert_eq!(assistant_call["role"], "assistant");
     let tool_call = &assistant_call["tool_calls"][0];
-    assert_eq!(tool_call["id"], "call_99");
+    // The original `call_99` is canonicalized to `call_1` so a
+    // mid-session model switch can replay this turn against a
+    // provider with stricter id-shape rules (Anthropic regex,
+    // Bedrock pairing, etc.) without rewriting the persisted
+    // history.
+    assert_eq!(tool_call["id"], "call_1");
     assert_eq!(tool_call["type"], "function");
     assert_eq!(tool_call["function"]["name"], "grep");
     let arguments_text = tool_call["function"]["arguments"]
@@ -568,6 +604,105 @@ fn request_body_attaches_anthropic_cache_control_when_cache_key_is_set() {
 }
 
 #[test]
+fn request_body_marks_last_tool_with_cache_control_for_anthropic_routes() {
+    // Regression guard for the per-provider drift the centralized
+    // cache_policy module exists to prevent: the native Anthropic
+    // adapter marks the trailing tool entry with `cache_control`, and
+    // Anthropic-via-aggregator routes must do the same so the cached
+    // tool prefix actually hits on the next turn. Without this the
+    // aggregator route bills the tool list as fresh-input tokens on
+    // every multi-turn coding session.
+    let mut request = sample_request();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0]["function"]["name"], "grep");
+    assert_eq!(
+        tools[0]["cache_control"]["type"], "ephemeral",
+        "Anthropic-via-aggregator route must mark the last tool entry, mirroring native Anthropic"
+    );
+}
+
+#[test]
+fn request_body_marks_last_stable_tool_skipping_trailing_dynamic_mcp_tools() {
+    // The tool registry pushes MCP-sourced tools (whose names carry the
+    // `mcp__` prefix) to the end of the advertised list. The cache
+    // breakpoint must sit on the last first-party tool so an MCP
+    // `tools/list` refresh that reorders or replaces dynamic entries
+    // does not invalidate the cached tool prefix.
+    let mut request = sample_request();
+    request.cache_key = Some("repo-context".to_string());
+    request.tools = Arc::from(vec![
+        LlmToolSpec {
+            name: "grep".to_string(),
+            description: "search files".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "read".to_string(),
+            description: "read file".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+        LlmToolSpec {
+            name: "mcp__github__list_issues".to_string(),
+            description: "list github issues".to_string(),
+            parameters: json!({"type": "object"}),
+            strict: true,
+        }
+        .into(),
+    ]);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools.len(), 3);
+    assert!(tools[0].get("cache_control").is_none());
+    assert_eq!(
+        tools[1]["cache_control"]["type"], "ephemeral",
+        "breakpoint must land on the last first-party tool, not on the MCP tail"
+    );
+    assert!(tools[2].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_omits_tool_cache_control_for_non_anthropic_routes() {
+    // The Anthropic-flavoured cache_control markers must not bleed onto
+    // OpenAI-via-aggregator (or any non-anthropic/* route). Those routes
+    // rely on the top-level `prompt_cache_key` instead — verified by the
+    // separate `request_body_forwards_prompt_cache_key_to_openai_via_openrouter`
+    // test — and OpenAI rejects unknown `cache_control` fields on tool
+    // entries with a 400.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "openai/* aggregator routes must not carry Anthropic-style cache_control"
+    );
+}
+
+#[test]
+fn request_body_omits_tool_cache_control_when_no_cache_key() {
+    // No cache_key on the request → no markers anywhere, including on
+    // the tool list. Avoids billing for cache writes on short, one-shot
+    // calls where reads will not amortize the write cost.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache_key = None;
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let tools = body["tools"].as_array().expect("tools array");
+    assert!(
+        tools[0].get("cache_control").is_none(),
+        "no cache_key → no cache_control on tools"
+    );
+}
+
+#[test]
 fn request_body_skips_cache_control_for_non_anthropic_routes() {
     let mut request = sample_request();
     request.model = "openai/gpt-5.5".to_string().into();
@@ -622,6 +757,171 @@ fn request_body_forwards_prompt_cache_key_alongside_anthropic_cache_control() {
 fn request_body_omits_prompt_cache_key_when_unset() {
     let body = OpenAiCompatibleProvider::request_body(&sample_request());
     assert!(body.get("prompt_cache_key").is_none());
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn request_body_emits_prompt_cache_retention_24h_for_long_retention_openai_route() {
+    // F11: OpenAI-via-OpenRouter (Chat Completions route) must surface
+    // `CacheRetention::Long` as the top-level `prompt_cache_retention: "24h"`
+    // body field so the cached prefix lifetime matches the native OpenAI
+    // provider. Mirrors pi's `streamOpenAICompletions`
+    // (`others/pi/packages/ai/src/providers/openai-completions.ts:517-522`).
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache = crate::CacheSpec {
+        key: Some("repo-context".to_string()),
+        retention: crate::CacheRetention::Long,
+    };
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert_eq!(
+        body["prompt_cache_retention"], "24h",
+        "Long retention must propagate to the chat-completions body field"
+    );
+}
+
+#[test]
+fn request_body_emits_one_hour_ttl_marker_for_long_retention_anthropic_aggregator() {
+    // F11: Anthropic-via-aggregator routes must mirror the native
+    // Anthropic adapter — `CacheRetention::Long` upgrades every breakpoint
+    // marker to `cache_control: { type: "ephemeral", ttl: "1h" }` so the
+    // cached prefix survives Anthropic's default short window.
+    let mut request = sample_request();
+    request.model = "anthropic/claude-opus-4-7".to_string().into();
+    request.cache = crate::CacheSpec {
+        key: Some("repo-context".to_string()),
+        retention: crate::CacheRetention::Long,
+    };
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let system = &body["messages"][0];
+    assert_eq!(system["content"][0]["cache_control"]["ttl"], "1h");
+    let last_user = &body["messages"][1];
+    assert_eq!(last_user["content"][0]["cache_control"]["ttl"], "1h");
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools[0]["cache_control"]["ttl"], "1h");
+}
+
+#[test]
+fn request_body_omits_prompt_cache_retention_for_short_retention_legacy_cache_key() {
+    // Regression guard: callers using the deprecated `cache_key` field
+    // get `Short` retention via `effective_cache_spec()`, which must
+    // leave `prompt_cache_retention` off the wire.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    request.cache_key = Some("repo-context".to_string());
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    assert_eq!(body["prompt_cache_key"], "repo-context");
+    assert!(body.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn request_body_clamps_prompt_cache_key_for_openai_aggregator_route() {
+    // F11: aggregator routes that forward `prompt_cache_key` verbatim to
+    // OpenAI must also clamp to the 64-codepoint limit so the
+    // OpenRouter → OpenAI hop does not silently drop the field.
+    let mut request = sample_request();
+    request.model = "openai/gpt-5.5".to_string().into();
+    let long_key: String = "a".repeat(100);
+    request.cache_key = Some(long_key);
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let emitted = body["prompt_cache_key"]
+        .as_str()
+        .expect("prompt_cache_key must be emitted");
+    assert_eq!(emitted.chars().count(), 64);
+    assert_eq!(emitted, "a".repeat(64));
+}
+
+#[test]
+fn classify_recognizes_known_namespaces() {
+    // The typed compat table is the single source of truth for namespace
+    // → wire-shape decisions. Every known vendor prefix must classify to
+    // its declared flavor so adding/expanding an aggregator only requires
+    // a row in COMPAT_TABLE, not a fresh substring test in request_body.
+    assert_eq!(
+        classify("anthropic/claude-opus-4-7"),
+        CompatFlavor::AnthropicCompat,
+    );
+    assert_eq!(classify("openai/gpt-5.5"), CompatFlavor::OpenAi);
+    assert_eq!(
+        classify("google/gemini-2.5-pro"),
+        CompatFlavor::GoogleCompat
+    );
+    assert_eq!(classify("xai/grok-4"), CompatFlavor::XaiCompat);
+}
+
+#[test]
+fn classify_is_case_insensitive() {
+    // User-supplied model strings (config files, env overrides) can show
+    // up with arbitrary casing. The match runs against the lowercased
+    // form so casing never silently disables a capability flag.
+    assert_eq!(
+        classify("Anthropic/Claude-Opus-4-7"),
+        CompatFlavor::AnthropicCompat,
+    );
+    assert_eq!(classify("OPENAI/GPT-5.5"), CompatFlavor::OpenAi);
+}
+
+#[test]
+fn classify_falls_back_to_generic_for_unknown_namespace() {
+    // Unknown namespaces (custom self-hosted ids, brand-new aggregators)
+    // must fall through to Generic instead of crashing or accidentally
+    // picking up Anthropic-style cache markers. Mirrors pi's behavior in
+    // `others/pi/packages/ai/src/types.ts` where compat overrides default
+    // to "ignore" rather than "panic" for unknown providers.
+    assert_eq!(classify("groq/llama-3.3-70b"), CompatFlavor::Generic);
+    assert_eq!(classify("custom-self-hosted-model"), CompatFlavor::Generic);
+    assert_eq!(classify(""), CompatFlavor::Generic);
+}
+
+#[test]
+fn compat_entry_exposes_capability_flags_for_anthropic() {
+    // Reading the entry directly is the typed alternative to
+    // `model.starts_with("anthropic/")`. Callers that need the cache
+    // flag specifically can branch on the bool without re-deriving the
+    // namespace.
+    let entry =
+        compat_entry("anthropic/claude-3.7-sonnet").expect("anthropic/ prefix must classify");
+    assert_eq!(entry.flavor, CompatFlavor::AnthropicCompat);
+    assert!(entry.supports_cache_control);
+    assert!(entry.supports_tool_calls);
+    assert!(entry.supports_reasoning);
+}
+
+#[test]
+fn compat_entry_marks_non_anthropic_namespaces_as_cache_disabled() {
+    // Behavior parity with the legacy `starts_with("anthropic/")`
+    // substring test: every non-Anthropic namespace must report
+    // `supports_cache_control == false` so request_body never attaches
+    // ephemeral cache markers to a route that would silently drop them.
+    for model in [
+        "openai/gpt-5.5",
+        "google/gemini-2.5-pro",
+        "xai/grok-4",
+        "groq/llama-3.3-70b",
+        "unknown",
+    ] {
+        let cache_control = compat_entry(model).is_some_and(|e| e.supports_cache_control);
+        assert!(
+            !cache_control,
+            "{model} must not opt into anthropic cache_control",
+        );
+    }
+}
+
+#[test]
+fn compat_table_prefixes_are_lowercase() {
+    // Invariant: prefixes must be stored lowercased because lookup
+    // lowercases the input. A capitalized prefix in the table would
+    // silently never match and the row would become dead code.
+    for entry in COMPAT_TABLE {
+        assert_eq!(
+            entry.model_prefix,
+            entry.model_prefix.to_ascii_lowercase(),
+            "compat-table prefix must be lowercase: {}",
+            entry.model_prefix,
+        );
+    }
 }
 
 #[test]
@@ -642,5 +942,148 @@ fn preset_full_tier_matches_documented_set() {
             OpenAiCompatiblePreset::DeepSeek,
             OpenAiCompatiblePreset::Vertex,
         ]
+    );
+}
+
+#[test]
+fn request_body_encodes_image_as_image_url_data_url() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let mut request = sample_request();
+    // Wipe the prior input shape so we can focus on the image encoding;
+    // text-only items already have full coverage above.
+    request.input = Arc::from(vec![
+        LlmInputItem::UserText("what is this?".to_string()),
+        LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: bytes.clone(),
+        },
+    ]);
+
+    let body = OpenAiCompatibleProvider::request_body(&request);
+    let messages = body["messages"].as_array().expect("messages array");
+    // system + user text + user image
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "user");
+    assert_eq!(messages[1]["content"], "what is this?");
+    assert_eq!(messages[2]["role"], "user");
+    let image_part = &messages[2]["content"][0];
+    assert_eq!(image_part["type"], "image_url");
+    let url = image_part["image_url"]["url"]
+        .as_str()
+        .expect("data URL string");
+    assert!(
+        url.starts_with("data:image/png;base64,"),
+        "Chat Completions image must use a data URL: `{url}`"
+    );
+    use base64::Engine as _;
+    let encoded = url
+        .strip_prefix("data:image/png;base64,")
+        .expect("data URL prefix");
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
+}
+
+#[test]
+fn cloudflare_presets_substitute_account_and_gateway_placeholders_in_base_url() {
+    // Both Cloudflare presets ship templated default base URLs so the
+    // configuration layer can flow `account_id` / `gateway_id` through
+    // verbatim and let `OpenAiCompatibleProvider::from_config` resolve
+    // the per-account / per-gateway path right before requests fire.
+    // The resolved URL on the constructed provider must reflect every
+    // placeholder having been replaced — including a trailing-slash
+    // trim — so the chat-completions request format string in
+    // `stream_response` produces a clean URL.
+    let workers_ai = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct-abc".to_string()),
+        gateway_id: None,
+    })
+    .expect("workers AI provider builds with account_id");
+    assert_eq!(
+        workers_ai.base_url(),
+        "https://api.cloudflare.com/client/v4/accounts/acct-abc/ai/v1",
+        "the {{account_id}} placeholder must be substituted into the Workers AI URL",
+    );
+
+    let gateway = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareAiGateway,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_AI_GATEWAY_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("acct-abc".to_string()),
+        gateway_id: Some("my-gateway".to_string()),
+    })
+    .expect("AI Gateway provider builds with account_id + gateway_id");
+    assert_eq!(
+        gateway.base_url(),
+        "https://gateway.ai.cloudflare.com/v1/acct-abc/my-gateway/compat",
+        "both {{account_id}} and {{gateway_id}} must be substituted into the AI Gateway URL",
+    );
+}
+
+#[test]
+fn cloudflare_workers_ai_missing_account_id_fails_with_clear_error() {
+    // Misconfiguration guard: when the base URL still contains a
+    // placeholder but the corresponding `OpenAiCompatibleConfig` field
+    // is unset, `from_config` must surface a `ProviderNotConfigured`
+    // error that names both the offending placeholder and the
+    // TOML / env-var the user has to set. Anything less and the
+    // request would fire against a literal `{account_id}` URL and the
+    // user would see only a 404 from Cloudflare's edge.
+    let error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
+    })
+    .expect_err("missing account_id must fail provider construction");
+    assert!(
+        matches!(error, SqueezyError::ProviderNotConfigured(_)),
+        "missing placeholder must map to ProviderNotConfigured, got: {error:?}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("{account_id}"),
+        "error must name the offending placeholder so the user knows what to set: {message}"
+    );
+    assert!(
+        message.contains("cloudflare_account_id"),
+        "error must point at the TOML field the user can populate: {message}"
+    );
+    assert!(
+        message.contains("CLOUDFLARE_ACCOUNT_ID"),
+        "error must point at the env var the user can populate: {message}"
+    );
+
+    // Whitespace-only `account_id` is treated the same as missing —
+    // `Some(\"   \")` would silently produce a URL with an empty
+    // account segment otherwise.
+    let whitespace_error = OpenAiCompatibleProvider::from_config(&OpenAiCompatibleConfig {
+        preset: OpenAiCompatiblePreset::CloudflareWorkersAi,
+        api_key_env: "CLOUDFLARE_API_KEY".to_string(),
+        api_key: Some("inline-key".to_string()),
+        base_url: DEFAULT_CLOUDFLARE_WORKERS_AI_BASE_URL.to_string(),
+        extra_headers: BTreeMap::new(),
+        transport: ProviderTransportConfig::default(),
+        account_id: Some("   ".to_string()),
+        gateway_id: None,
+    })
+    .expect_err("whitespace-only account_id must also fail");
+    assert!(
+        whitespace_error.to_string().contains("{account_id}"),
+        "whitespace error must also name the placeholder: {whitespace_error}"
     );
 }

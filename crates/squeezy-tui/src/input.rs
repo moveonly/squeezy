@@ -31,16 +31,6 @@ const fn slash(name: &'static str, description: &'static str) -> SlashCommand {
     }
 }
 
-const fn slash_locked(name: &'static str, description: &'static str) -> SlashCommand {
-    SlashCommand {
-        name,
-        description,
-        available_during_task: false,
-        parameter_hint: None,
-        capabilities: &[],
-    }
-}
-
 const fn slash_args(
     name: &'static str,
     description: &'static str,
@@ -232,9 +222,9 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
     ),
     slash_args_caps(
         "/session",
-        "show a saved session",
+        "show a saved session, or rename/label the active one",
         true,
-        "<id>",
+        "<id> | rename <name> | label <name>",
         &[PermissionCapability::Read],
     ),
     slash_args_caps(
@@ -244,15 +234,24 @@ pub(crate) const SLASH_COMMANDS: &[SlashCommand] = &[
         "<id>",
         &[PermissionCapability::Read],
     ),
-    slash_locked(
+    slash_args(
         "/fork",
-        "branch the current session into a sibling with the same transcript",
+        "branch the current session into a sibling (optionally under another workspace)",
+        false,
+        "[<workspace_path>]",
     ),
     slash_args_caps(
         "/session-export",
         "export a saved session",
         false,
         "<id>",
+        &[PermissionCapability::Read, PermissionCapability::Edit],
+    ),
+    slash_args_caps(
+        "/session-export-html",
+        "export a saved session as self-contained HTML",
+        false,
+        "<id> [path]",
         &[PermissionCapability::Read, PermissionCapability::Edit],
     ),
     // Locked + destructive: archives or purges sessions on disk.
@@ -397,7 +396,7 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
     if needs_build {
         app.workspace_file_cache = Some(mention::WorkspaceFileCache::build(root));
     }
-    let matches = app
+    let (matches, total) = app
         .workspace_file_cache
         .as_ref()
         .map(|cache| mention::rank_files(&query.query, cache.files()))
@@ -406,7 +405,7 @@ pub(crate) fn refresh_mention_popup(app: &mut TuiApp) {
         app.mention_popup = None;
         return;
     }
-    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches));
+    app.mention_popup = Some(mention::MentionPopup::from_query(query, matches, total));
 }
 
 pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
@@ -415,7 +414,7 @@ pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     };
     match key.code {
         KeyCode::Esc => {
-            app.overlay = None;
+            close_overlay(app);
             app.status = "overlay cancelled".to_string();
             true
         }
@@ -435,10 +434,19 @@ pub(crate) fn handle_overlay_key(app: &mut TuiApp, key: KeyEvent) -> bool {
     }
 }
 
+/// Close the slash-command overlay and clear the matching dialog-handle
+/// bookkeeping. Centralised so the `overlay` / `overlay_active_id` pair
+/// stays invariant: `active_id` is `Some` iff `overlay` is `Some`.
+pub(crate) fn close_overlay(app: &mut TuiApp) {
+    app.overlay = None;
+    app.overlay_active_id = None;
+}
+
 pub(crate) fn apply_overlay_selection(app: &mut TuiApp) {
     let Some(overlay) = app.overlay.take() else {
         return;
     };
+    app.overlay_active_id = None;
     match overlay {
         overlay::Overlay::Model(picker) => {
             if let Some(entry) = picker.selected() {
@@ -765,16 +773,13 @@ fn is_word_separator(ch: char) -> bool {
 }
 
 pub(crate) fn push_input_history(app: &mut TuiApp, input: String) {
-    if input.trim().is_empty() || input.starts_with('/') {
-        return;
-    }
-    if app.input_history.last().is_some_and(|last| last == &input) {
+    // Slash commands are UI actions, not prompts the user would want to
+    // recall via Up/Down — keep them out of the ring at the TUI seam so
+    // the storage layer stays agnostic of squeezy's command vocabulary.
+    if input.starts_with('/') {
         return;
     }
     app.input_history.push(input);
-    if app.input_history.len() > 100 {
-        app.input_history.remove(0);
-    }
 }
 
 pub(crate) fn reject_unknown_slash_command(app: &mut TuiApp, input: &str) -> bool {
@@ -816,7 +821,9 @@ pub(crate) fn recall_prompt_history(app: &mut TuiApp, direction: HistoryDirectio
         (Some(index), HistoryDirection::Next) => Some(index + 1),
     };
     if let Some(index) = next {
-        set_input(app, app.input_history[index].clone());
+        if let Some(entry) = app.input_history.get(index) {
+            set_input(app, entry.to_string());
+        }
         app.input_history_index = Some(index);
         app.selected_entry = None;
         app.slash_menu_index = 0;
@@ -838,12 +845,12 @@ pub(crate) fn slash_suggestions(input: &str) -> Vec<SlashCommand> {
         .iter()
         .copied()
         .filter_map(|command| {
-            squeezy_rank::fuzzy_score(command.name, needle).map(|score| (command, score))
+            crate::fuzzy::score(command.name, needle).map(|score| (command, score))
         })
         .collect();
-    // Prefix/contiguous hits sort first via the negative bonuses in
-    // `fuzzy_score`; ties broken alphabetically for stable rendering.
-    scored.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.name.cmp(right.0.name)));
+    // Word-boundary / consecutive bonuses keep prefix hits on top;
+    // higher score is better here, ties broken alphabetically.
+    scored.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.name.cmp(right.0.name)));
     scored.into_iter().map(|(cmd, _)| cmd).collect()
 }
 

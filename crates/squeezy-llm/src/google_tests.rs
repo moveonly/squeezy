@@ -2,7 +2,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use super::*;
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 
 #[test]
 fn stream_url_does_not_contain_api_key() {
@@ -31,6 +31,7 @@ fn request_body_uses_generate_content_shape() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
@@ -70,6 +71,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -123,6 +125,7 @@ fn request_body_preserves_function_response_name() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -144,6 +147,7 @@ fn parser_extracts_text_tool_calls_and_usage() {
     let mut cost = CostSnapshot::default();
     let mut last_finish_reason: Option<String> = None;
     let mut reasoning_buf = GoogleReasoningBuffer::default();
+    let mut server_model_slot: Option<String> = None;
     let events = parse_google_event(
         r#"{
           "candidates":[{
@@ -156,11 +160,13 @@ fn parser_extracts_text_tool_calls_and_usage() {
             "promptTokenCount":10,
             "candidatesTokenCount":3,
             "cachedContentTokenCount":2
-          }
+          },
+          "modelVersion":"gemini-2.5-pro-002"
         }"#,
         &mut cost,
         &mut last_finish_reason,
         &mut reasoning_buf,
+        &mut server_model_slot,
     )
     .expect("valid event");
 
@@ -176,4 +182,50 @@ fn parser_extracts_text_tool_calls_and_usage() {
     assert_eq!(cost.input_tokens, Some(10));
     assert_eq!(cost.output_tokens, Some(3));
     assert_eq!(cost.cached_input_tokens, Some(2));
+    assert_eq!(server_model_slot.as_deref(), Some("gemini-2.5-pro-002"));
+}
+
+#[test]
+fn request_body_encodes_image_as_inline_data_part() {
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "gemini-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = GoogleProvider::request_body(&request);
+    let contents = body["contents"].as_array().expect("contents array");
+    assert_eq!(contents.len(), 2);
+    // Text turn.
+    assert_eq!(contents[0]["role"], "user");
+    assert_eq!(contents[0]["parts"][0]["text"], "what is this?");
+    // Image turn.
+    assert_eq!(contents[1]["role"], "user");
+    let inline = &contents[1]["parts"][0]["inlineData"];
+    assert_eq!(inline["mimeType"], "image/png");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(inline["data"].as_str().expect("base64 string"))
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
 }

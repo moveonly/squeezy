@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use aws_config::{BehaviorVersion, SdkConfig};
+use aws_sdk_bedrockruntime::config::{Credentials, Region, SharedCredentialsProvider};
 use aws_sdk_bedrockruntime::types::{
     CachePointType, ContentBlock, ConversationRole, ConverseStreamMetadataEvent,
     ConverseStreamOutput, MessageStopEvent, StopReason, SystemContentBlock, TokenUsage,
@@ -7,10 +10,15 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_smithy_types::{Document, Number};
 use serde_json::json;
+use squeezy_core::SqueezyError;
+
+use aws_sdk_bedrockruntime::operation::converse_stream::builders::ConverseStreamInputBuilder;
+use squeezy_core::{BedrockConfig, ProviderTransportConfig};
 
 use super::{
-    BedrockStreamState, conversation_messages, handle_bedrock_event, json_to_document,
-    system_blocks, tool_configuration,
+    BedrockProvider, BedrockStreamState, bedrock_request_metadata_map, build_bedrock_client,
+    conversation_messages, handle_bedrock_event, json_to_document, system_blocks,
+    tool_configuration,
 };
 use crate::anthropic_betas::bedrock_extra_body_betas;
 use crate::{LlmInputItem, LlmToolSpec};
@@ -320,5 +328,197 @@ fn message_stop_without_metadata_leaves_usage_unset() {
     assert!(
         cost.input_tokens.is_none() && cost.output_tokens.is_none(),
         "cost reports None when Metadata never arrived, signalling missing usage rather than zero"
+    );
+}
+
+#[test]
+fn conversation_messages_emit_image_content_block() {
+    use aws_sdk_bedrockruntime::types::ImageFormat;
+
+    let bytes: Arc<[u8]> = Arc::from(vec![
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3,
+    ]);
+    let messages = conversation_messages(
+        &[
+            LlmInputItem::UserText("describe this".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ],
+        false,
+    )
+    .expect("build messages");
+
+    // User text + image coalesce into a single user message with two
+    // content blocks so the Converse API sees them as one multimodal
+    // turn.
+    assert_eq!(messages.len(), 1);
+    assert_eq!(*messages[0].role(), ConversationRole::User);
+    let content = messages[0].content();
+    assert_eq!(content.len(), 2);
+    assert!(matches!(&content[0], ContentBlock::Text(text) if text == "describe this"));
+    let ContentBlock::Image(image) = &content[1] else {
+        panic!(
+            "expected ContentBlock::Image for image input, got {:?}",
+            content[1]
+        );
+    };
+    assert_eq!(image.format(), &ImageFormat::Png);
+    let source = image.source().expect("image source");
+    let blob = source.as_bytes().expect("Bytes source");
+    assert_eq!(blob.as_ref(), bytes.as_ref());
+}
+
+#[test]
+fn config_request_metadata_appears_on_converse_stream_input() {
+    // Cost-allocation tags supplied on `BedrockConfig.request_metadata`
+    // must round-trip through `BedrockProvider` and land on
+    // `ConverseStreamInput.request_metadata` so AWS billing can group
+    // invocations by the operator's chosen labels. Empty maps stay
+    // unset on the wire (the helper returns `None`) so we keep the
+    // request payload minimal when no tags are configured.
+    let mut tags = BTreeMap::new();
+    tags.insert("team".to_string(), "platform".to_string());
+    tags.insert("env".to_string(), "prod".to_string());
+
+    let provider = BedrockProvider::from_config(&BedrockConfig {
+        region: "us-east-1".to_string(),
+        base_url: None,
+        bearer_token: None,
+        request_metadata: tags.clone(),
+        transport: ProviderTransportConfig::default(),
+    })
+    .expect("provider builds from config with request_metadata");
+
+    let sdk_map = bedrock_request_metadata_map(&provider.request_metadata)
+        .expect("non-empty config tags must produce a HashMap, not None");
+    let input = ConverseStreamInputBuilder::default()
+        .model_id("test-model")
+        .set_request_metadata(Some(sdk_map))
+        .build()
+        .expect("ConverseStreamInputBuilder::build is infallible for valid inputs");
+
+    let echoed = input
+        .request_metadata()
+        .expect("request_metadata must be set on the input");
+    assert_eq!(echoed.len(), 2);
+    assert_eq!(echoed.get("team").map(String::as_str), Some("platform"));
+    assert_eq!(echoed.get("env").map(String::as_str), Some("prod"));
+
+    assert!(
+        bedrock_request_metadata_map(&BTreeMap::new()).is_none(),
+        "empty config tags must skip the field entirely so unconfigured callers don't ship an empty object"
+    );
+}
+
+#[test]
+fn conversation_messages_reject_unknown_image_mime() {
+    let bytes: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4]);
+    let err = conversation_messages(
+        &[LlmInputItem::Image {
+            media_type: "image/avif".to_string(),
+            bytes,
+        }],
+        false,
+    )
+    .expect_err("unsupported MIME must surface an explicit ProviderRequest error");
+    let message = err.to_string();
+    assert!(
+        message.contains("image/avif"),
+        "error must mention the unsupported MIME: {message}"
+    );
+}
+
+#[test]
+fn aws_bearer_token_env_routes_through_bedrock_bearer_auth() {
+    // BedrockConfig carries the `AWS_BEARER_TOKEN_BEDROCK` env-var
+    // value once squeezy-core has lifted it (squeezy-core owns env
+    // discovery; squeezy-llm owns the auth wiring). With a bearer
+    // token in hand the provider must build a Bedrock client even
+    // when the shared SdkConfig has no SigV4 credentials at all —
+    // that is the whole point of the bearer route. We deliberately
+    // build a credential-less SdkConfig so a regression that ignores
+    // the bearer token would surface as the explicit
+    // `ProviderNotConfigured` error rather than an Ok client.
+    let bedrock = squeezy_core::BedrockConfig {
+        region: squeezy_core::DEFAULT_BEDROCK_REGION.to_string(),
+        base_url: None,
+        bearer_token: Some("bedrock-api-key-test".to_string()),
+        request_metadata: BTreeMap::new(),
+        transport: squeezy_core::ProviderTransportConfig::default(),
+    };
+    let provider = crate::BedrockProvider::from_config(&bedrock)
+        .expect("BedrockProvider::from_config must accept a bearer-token-only config");
+    drop(provider);
+
+    let shared = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .build();
+    assert!(
+        shared.credentials_provider().is_none(),
+        "test SdkConfig is intentionally credential-less",
+    );
+    let client = build_bedrock_client(&shared, bedrock.bearer_token.as_deref())
+        .expect("bearer-token path must not require AWS credentials");
+    drop(client);
+
+    // Leading/trailing whitespace from a shell heredoc must not
+    // poison the bearer header — `build_bedrock_client` trims before
+    // wrapping the token in the SDK identity type. An all-whitespace
+    // bearer is treated as "missing token" and surfaces a clean error
+    // instead of an unauthenticated request.
+    let trimmed = build_bedrock_client(&shared, Some("  bedrock-api-key-test\n"))
+        .expect("whitespace-padded bearer token must be normalised, not rejected");
+    drop(trimmed);
+    let empty = build_bedrock_client(&shared, Some("   "))
+        .expect_err("an all-whitespace bearer token must be rejected explicitly");
+    assert!(
+        matches!(&empty, SqueezyError::ProviderNotConfigured(message)
+            if message.contains("AWS_BEARER_TOKEN_BEDROCK")),
+        "empty bearer must surface ProviderNotConfigured mentioning the env var: {empty:?}",
+    );
+}
+
+#[test]
+fn missing_bearer_token_falls_back_to_default_credential_chain() {
+    // Without a bearer token the provider trusts whatever the AWS
+    // default credential chain resolved (env → ~/.aws/credentials →
+    // IMDS / container roles). We exercise both legs of that branch:
+    //
+    // 1. A credential-bearing SdkConfig must yield Ok(client) so the
+    //    SDK can sign with SigV4 the way it always has.
+    // 2. A credential-less SdkConfig must surface ProviderNotConfigured
+    //    with a message that points operators at the recovery paths
+    //    (bearer token env, `aws configure`, AWS_PROFILE, raw env
+    //    vars) — silently returning an unusable client would mask the
+    //    misconfiguration until the first network request.
+    let creds = Credentials::new("AKIDEXAMPLE", "SECRETEXAMPLE", None, None, "squeezy-test");
+    let with_creds = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .credentials_provider(SharedCredentialsProvider::new(creds))
+        .build();
+    let client = build_bedrock_client(&with_creds, None)
+        .expect("default chain with credentials must build a client");
+    drop(client);
+
+    let without_creds = SdkConfig::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .build();
+    let err = build_bedrock_client(&without_creds, None)
+        .expect_err("default chain with no credentials must surface ProviderNotConfigured");
+    let SqueezyError::ProviderNotConfigured(message) = &err else {
+        panic!("expected ProviderNotConfigured, got {err:?}");
+    };
+    assert!(
+        message.contains("AWS_BEARER_TOKEN_BEDROCK"),
+        "error must point operators at the bearer-token recovery path: {message}",
+    );
+    assert!(
+        message.contains("aws configure") || message.contains("AWS_PROFILE"),
+        "error must also point at the standard credential-chain recovery paths: {message}",
     );
 }

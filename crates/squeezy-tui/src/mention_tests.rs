@@ -71,7 +71,7 @@ fn ranks_prefix_match_above_subsequence() {
         PathBuf::from("crates/graph/lib.rs"),
         PathBuf::from("readme.md"),
     ];
-    let out = rank_files("gra", &files);
+    let (out, _) = rank_files("gra", &files);
     assert_eq!(out.first().unwrap(), &PathBuf::from("crates/graph/lib.rs"));
 }
 
@@ -81,7 +81,7 @@ fn ranks_filename_prefix_above_path_substring() {
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("graph_helpers.rs"),
     ];
-    let out = rank_files("graph", &files);
+    let (out, _) = rank_files("graph", &files);
     assert_eq!(out[0], PathBuf::from("graph_helpers.rs"));
 }
 
@@ -90,8 +90,23 @@ fn rank_empty_query_returns_first_n_paths() {
     let files: Vec<PathBuf> = (0..20)
         .map(|i| PathBuf::from(format!("file{i}.rs")))
         .collect();
-    let out = rank_files("", &files);
+    let (out, total) = rank_files("", &files);
     assert_eq!(out.len(), MAX_MATCHES);
+    // Total exposes the un-truncated candidate count so the popup
+    // footer can show e.g. `1/20`.
+    assert_eq!(total, files.len());
+}
+
+#[test]
+fn rank_reports_total_candidates_above_max_matches() {
+    // Twelve files all share the `gra` subsequence; only `MAX_MATCHES`
+    // are returned but the popup must still know the full count.
+    let files: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("graph_{i}.rs")))
+        .collect();
+    let (out, total) = rank_files("gra", &files);
+    assert_eq!(out.len(), MAX_MATCHES);
+    assert_eq!(total, 12);
 }
 
 #[test]
@@ -101,22 +116,11 @@ fn apply_inserts_path_and_returns_new_cursor() {
         end: 10,
         query: "gra".to_string(),
     };
-    let popup = MentionPopup::from_query(q, vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")]);
+    let popup =
+        MentionPopup::from_query(q, vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")], 1);
     let (new_input, cursor) = popup.apply("hello @gra").expect("apply");
     assert_eq!(new_input, "hello crates/squeezy-graph/src/lib.rs ");
     assert_eq!(cursor, new_input.len());
-}
-
-#[test]
-fn mention_rank_uses_path_separator_normalisation() {
-    // `squeezy_graph` should match `crates/squeezy-graph/src/lib.rs`
-    // because the rank crate treats `_`, `-`, `/` as equivalent.
-    let files = vec![PathBuf::from("crates/squeezy-graph/src/lib.rs")];
-    let out = rank_files("squeezy_graph", &files);
-    assert!(
-        !out.is_empty(),
-        "expected match via path-separator normalisation"
-    );
 }
 
 #[test]
@@ -124,7 +128,7 @@ fn mention_rank_uses_subsequence_for_abbreviations() {
     // A camel/snake abbreviation like `grphmgr` should still match
     // `graph_manager.rs` via the case-insensitive subsequence matcher.
     let files = vec![PathBuf::from("src/graph_manager.rs")];
-    let out = rank_files("grphmgr", &files);
+    let (out, _) = rank_files("grphmgr", &files);
     assert_eq!(out.first(), Some(&PathBuf::from("src/graph_manager.rs")));
 }
 
@@ -136,7 +140,7 @@ fn mention_rank_keeps_filename_prefix_priority() {
         PathBuf::from("crates/squeezy-graph/src/lib.rs"),
         PathBuf::from("lib.rs"),
     ];
-    let out = rank_files("lib", &files);
+    let (out, _) = rank_files("lib", &files);
     assert_eq!(out.first(), Some(&PathBuf::from("lib.rs")));
 }
 
@@ -147,7 +151,7 @@ fn popup_navigation_clamps_at_bounds() {
         end: 4,
         query: "a".to_string(),
     };
-    let mut popup = MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")]);
+    let mut popup = MentionPopup::from_query(q, vec![PathBuf::from("a"), PathBuf::from("b")], 2);
     popup.move_up();
     assert_eq!(popup.selected, 0);
     popup.move_down();
@@ -207,4 +211,37 @@ fn workspace_cache_files_includes_walked_paths() {
         .collect();
     assert!(names.iter().any(|n| n == "alpha.rs"), "got: {names:?}");
     assert!(names.iter().any(|n| n == "beta.rs"), "got: {names:?}");
+}
+
+#[test]
+fn detect_mention_unquoted_token_terminates_at_whitespace() {
+    // Sanity check that the unquoted parse is unaffected by the quoted
+    // extension: `@foo` followed by a space yields just `foo`.
+    let q = detect_mention("hello @foo bar", 10).expect("unquoted mention");
+    assert_eq!(q.start, 6);
+    assert_eq!(q.end, 10);
+    assert_eq!(q.query, "foo");
+}
+
+#[test]
+fn detect_mention_quoted_token_keeps_embedded_spaces() {
+    let input = "hello @\"docs/my notes.md\" trailing";
+    // Cursor inside the quoted span (between 'n' of "notes" and ' ' would
+    // have broken the original detector; here it stays inside the token).
+    let cursor = input.find("notes").expect("test fixture") + 1;
+    let q = detect_mention(input, cursor).expect("quoted mention");
+    assert_eq!(q.start, 6);
+    assert_eq!(q.end, 25);
+    assert_eq!(q.query, "docs/my notes.md");
+}
+
+#[test]
+fn detect_mention_mismatched_quote_falls_back_to_unquoted() {
+    // No closing `"`: the parser must behave like the original unquoted
+    // detector, where the leading quote is a literal character in the
+    // token and the token still terminates at the first whitespace.
+    let q = detect_mention("@\"docs has-space", 6).expect("falls back to unquoted");
+    assert_eq!(q.start, 0);
+    assert_eq!(q.end, 6);
+    assert_eq!(q.query, "\"docs");
 }

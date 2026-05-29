@@ -3,6 +3,8 @@ use std::{
     path::Path,
 };
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::Deserialize;
@@ -21,6 +23,28 @@ use crate::{
 
 pub(crate) const DEFAULT_MAX_MATCHES: usize = 100;
 pub(crate) const DEFAULT_OUTPUT_BYTE_CAP: usize = 24_000;
+
+/// Detect the canonical image MIME type from a byte prefix using magic
+/// numbers. Supports PNG, JPEG, GIF (87a/89a), and WEBP (RIFF / WEBP
+/// container) — the set of formats the upstream vision providers
+/// (Anthropic, OpenAI, Google, Bedrock) all accept. Returns `None` when
+/// the prefix does not match a known image format so the caller can
+/// fall back to the default text path.
+pub(crate) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,7 +71,18 @@ pub(crate) struct GrepArgs {
     max_matches: Option<usize>,
     output_byte_cap: Option<usize>,
     offset: Option<usize>,
+    /// F13: optional number of leading + trailing context lines to emit
+    /// around each match (like `rg -C N`). 0 (default) preserves the
+    /// pre-F13 behavior of returning only the matching line. Clamped to
+    /// `MAX_GREP_CONTEXT` defensively in case a non-spec caller sends a
+    /// larger value.
+    context: Option<u32>,
 }
+
+/// Hard cap on grep `context` to keep per-match windows bounded even if
+/// a caller bypasses the JSON-schema `maximum` (e.g. an external client
+/// that does not re-validate). Mirrors the schema's `"maximum": 50`.
+pub(crate) const MAX_GREP_CONTEXT: u32 = 50;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +123,15 @@ pub(crate) struct ReadFileArgs {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadToolOutputArgs {
-    pub(crate) handle: String,
+    /// sha256-keyed handle minted by [`ToolOutputStore::maybe_spill`] for
+    /// any oversized tool result. Mutually exclusive with `path`.
+    pub(crate) handle: Option<String>,
+    /// Spillover tempfile path minted by the shell tool when its
+    /// in-memory output overflows the truncation budget. Must point
+    /// inside the per-session spillover directory; arbitrary
+    /// filesystem locations are rejected. Mutually exclusive with
+    /// `handle`.
+    pub(crate) path: Option<String>,
     offset: Option<usize>,
     limit: Option<usize>,
 }
@@ -261,6 +304,7 @@ impl ToolRegistry {
             .output_byte_cap
             .unwrap_or(DEFAULT_OUTPUT_BYTE_CAP)
             .min(128_000);
+        let context = args.context.unwrap_or(0).min(MAX_GREP_CONTEXT) as usize;
 
         let mut builder = WalkBuilder::new(&start);
         builder
@@ -345,7 +389,12 @@ impl ToolRegistry {
             }
 
             let text = String::from_utf8_lossy(&bytes);
-            for (line_index, line) in text.lines().enumerate() {
+            // F13: collect lines once so we can window into `[i-N, i+N]`
+            // when `context > 0`. Allocating a `Vec<&str>` per file is
+            // cheap relative to the regex scan, and only the
+            // `Content` mode pays for context window construction.
+            let lines: Vec<&str> = text.lines().collect();
+            for (line_index, line) in lines.iter().enumerate() {
                 if !regex.is_match(line) {
                     continue;
                 }
@@ -356,12 +405,41 @@ impl ToolRegistry {
                 count += 1;
                 match output_mode {
                     GrepOutputMode::Content => {
-                        let line = truncate_text(line, 500);
-                        let next = json!({
-                            "path": &rel_str,
-                            "line": line_index + 1,
-                            "text": line,
-                        });
+                        let line_text = truncate_text(line, 500);
+                        let mut next = serde_json::Map::new();
+                        next.insert("path".to_string(), json!(&rel_str));
+                        next.insert("line".to_string(), json!(line_index + 1));
+                        next.insert("text".to_string(), json!(line_text));
+                        if context > 0 {
+                            let before_start = line_index.saturating_sub(context);
+                            let before_lines: Vec<Value> = lines[before_start..line_index]
+                                .iter()
+                                .enumerate()
+                                .map(|(offset_idx, ctx_line)| {
+                                    json!({
+                                        "line": before_start + offset_idx + 1,
+                                        "text": truncate_text(ctx_line, 500),
+                                    })
+                                })
+                                .collect();
+                            let after_end = line_index
+                                .saturating_add(1)
+                                .saturating_add(context)
+                                .min(lines.len());
+                            let after_lines: Vec<Value> = lines[line_index + 1..after_end]
+                                .iter()
+                                .enumerate()
+                                .map(|(offset_idx, ctx_line)| {
+                                    json!({
+                                        "line": line_index + 2 + offset_idx,
+                                        "text": truncate_text(ctx_line, 500),
+                                    })
+                                })
+                                .collect();
+                            next.insert("context_before".to_string(), Value::Array(before_lines));
+                            next.insert("context_after".to_string(), Value::Array(after_lines));
+                        }
+                        let next = Value::Object(next);
                         let next_len = serde_json::to_string(&next).map_or(0, |text| text.len());
                         if cost.output_bytes + next_len as u64 > output_byte_cap as u64 {
                             cost.truncated = true;
@@ -402,6 +480,7 @@ impl ToolRegistry {
         metadata.insert("diff_only".to_string(), json!(diff_only));
         metadata.insert("output_mode".to_string(), json!(output_mode.as_str()));
         metadata.insert("offset".to_string(), json!(offset));
+        metadata.insert("context".to_string(), json!(context));
         metadata.insert(
             "skipped_secret_files".to_string(),
             json!(skipped_secret_files),
@@ -475,6 +554,51 @@ impl ToolRegistry {
         let ignored_reason = self
             .policy_exclusion_for_file(&path, &rel, prefix_bytes.as_deref())
             .map(ExclusionReason::as_str);
+
+        // F18: detect image MIME via magic bytes on the prefix we already
+        // read for policy checks. PNG, JPEG, GIF, and WEBP all surface in
+        // the first 12 bytes, so the policy-prefix read covers detection
+        // without an extra syscall. When the file is an image, return a
+        // structured payload (path / mime / base64 data / sha256) so the
+        // agent can wrap the bytes in `LlmInputItem::Image` instead of
+        // re-serialising binary content as lossy UTF-8 text.
+        if let Some(mime) = prefix_bytes.as_deref().and_then(detect_image_mime) {
+            let bytes = match read_range(&path, 0, total_bytes as usize) {
+                Ok(bytes) => bytes,
+                Err(err) => return tool_error(call, err),
+            };
+            let content_sha256 = match sha256_file(&path) {
+                Ok(hash) => hash,
+                Err(err) => return tool_error(call, err),
+            };
+            let data_base64 = BASE64_STANDARD.encode(&bytes);
+            let encoded_len = data_base64.len() as u64;
+            let mut payload = serde_json::Map::new();
+            payload.insert("path".to_string(), json!(&rel_str));
+            payload.insert("image".to_string(), json!(true));
+            payload.insert("mime_type".to_string(), json!(mime));
+            payload.insert("total_bytes".to_string(), json!(total_bytes));
+            payload.insert("sha256".to_string(), json!(&content_sha256));
+            payload.insert("data_base64".to_string(), Value::String(data_base64));
+            if let Some(reason) = ignored_reason {
+                payload.insert("ignored".to_string(), json!(true));
+                payload.insert("ignored_reason".to_string(), json!(reason));
+            }
+            let cost = ToolCostHint {
+                bytes_read: total_bytes,
+                output_bytes: encoded_len,
+                truncated: false,
+                ..ToolCostHint::default()
+            };
+            return make_result(
+                call,
+                ToolStatus::Success,
+                Value::Object(payload),
+                cost,
+                Some(content_sha256),
+            );
+        }
+
         let offset = args.offset.unwrap_or(0).min(total_bytes as usize);
         let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
 
@@ -569,11 +693,30 @@ impl ToolRegistry {
             Ok(args) => args,
             Err(err) => return tool_arg_error(call, err),
         };
-        let output = match self.output_store.read(
-            &args.handle,
-            args.offset.unwrap_or(0),
-            args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT),
-        ) {
+        let offset = args.offset.unwrap_or(0);
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).min(MAX_READ_LIMIT);
+        match (args.handle.as_deref(), args.path.as_deref()) {
+            (Some(handle), None) => self.read_tool_output_by_handle(call, handle, offset, limit),
+            (None, Some(path)) => self.read_tool_output_by_path(call, path, offset, limit),
+            (Some(_), Some(_)) => tool_error(
+                call,
+                "invalid tool arguments: read_tool_output accepts exactly one of `handle` or `path`",
+            ),
+            (None, None) => tool_error(
+                call,
+                "invalid tool arguments: read_tool_output requires either `handle` or `path`",
+            ),
+        }
+    }
+
+    fn read_tool_output_by_handle(
+        &self,
+        call: &ToolCall,
+        handle: &str,
+        offset: usize,
+        limit: usize,
+    ) -> ToolResult {
+        let output = match self.output_store.read(handle, offset, limit) {
             Ok(output) => output,
             Err(err) => return tool_error(call, err),
         };
@@ -588,7 +731,41 @@ impl ToolRegistry {
             call,
             ToolStatus::Success,
             json!({
-                "handle": args.handle,
+                "handle": handle,
+                "offset": output.offset,
+                "bytes_returned": output.bytes_returned,
+                "total_bytes": output.total_bytes,
+                "sha256": output.sha256,
+                "truncated": output.truncated,
+                "content": output.content,
+            }),
+            cost,
+            None,
+        )
+    }
+
+    fn read_tool_output_by_path(
+        &self,
+        call: &ToolCall,
+        path: &str,
+        offset: usize,
+        limit: usize,
+    ) -> ToolResult {
+        let output = match self.shell_spillover.read_range(path, offset, limit) {
+            Ok(output) => output,
+            Err(err) => return tool_error(call, err),
+        };
+        let cost = ToolCostHint {
+            bytes_read: output.bytes_returned as u64,
+            output_bytes: output.content.len() as u64,
+            truncated: output.truncated,
+            ..ToolCostHint::default()
+        };
+        make_result(
+            call,
+            ToolStatus::Success,
+            json!({
+                "path": output.path.to_string_lossy(),
                 "offset": output.offset,
                 "bytes_returned": output.bytes_returned,
                 "total_bytes": output.total_bytes,

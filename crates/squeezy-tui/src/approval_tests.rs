@@ -242,7 +242,8 @@ fn edit_preview_renders_unified_diff_with_gutter() {
     // syntax-highlighted renderer used by `/diff`. Reviewers approve
     // patches more confidently when sign characters and the diff
     // colouring reach the screen, not just a path list.
-    let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old line\n+new line\n";
+    let diff =
+        "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn old_name() {}\n+fn new_name() {}\n";
     let req = request_with(
         "apply_patch",
         PermissionCapability::Edit,
@@ -251,8 +252,85 @@ fn edit_preview_renders_unified_diff_with_gutter() {
     );
     let lines = render_preview(&req);
     let out = flatten(&lines);
-    assert!(out.contains("-old line"), "missing remove line: {out}");
-    assert!(out.contains("+new line"), "missing add line: {out}");
+    // Sign markers reach the rendered prompt (gutter wiring is live).
+    assert!(out.contains("-fn old_name"), "missing remove line: {out}");
+    assert!(out.contains("+fn new_name"), "missing add line: {out}");
+    // The placeholder text is gone — replaced by the real diff body.
+    assert!(
+        !out.contains("diff line(s)"),
+        "stale 'N diff line(s)' placeholder leaked into preview: {out}"
+    );
+    // Short patches do not get a "… more lines" tail.
+    assert!(
+        !out.contains("more lines"),
+        "short patch should not be capped: {out}"
+    );
+}
+
+#[test]
+fn edit_preview_caps_long_diff_body_with_summary_tail() {
+    // Diff bodies longer than `APPROVAL_DIFF_BODY_CAP` must be
+    // truncated and tagged with a "… (N more lines)" summary so the
+    // approval prompt stays scannable on short terminals. Reviewers
+    // who want the full patch can still run `/diff` after approving.
+    //
+    // The path uses an unrecognised extension so the cap test does not
+    // also exercise the syntax highlighter on every diff line — that
+    // path is covered by `edit_preview_renders_unified_diff_with_gutter`
+    // and the diff_tests suite. Here the contract under test is purely
+    // "cap at N, summarise the rest".
+    let mut diff = String::from("--- a/notes.log\n+++ b/notes.log\n@@ -1,60 +1,60 @@\n");
+    for i in 0..60 {
+        diff.push_str(&format!("-old_line_{i:02}\n"));
+        diff.push_str(&format!("+new_line_{i:02}\n"));
+    }
+    let req = request_with(
+        "apply_patch",
+        PermissionCapability::Edit,
+        "path:notes.log",
+        &[("paths", "notes.log"), ("unified_diff", diff.as_str())],
+    );
+    let lines = render_preview(&req);
+    let out = flatten(&lines);
+    // Earliest lines render (they're inside the cap window).
+    assert!(
+        out.contains("+new_line_00"),
+        "first add line missing: {out}"
+    );
+    // A late line is omitted by the cap.
+    assert!(
+        !out.contains("new_line_59"),
+        "diff was not capped — final line leaked through: {out}"
+    );
+    // The summary tail names the omitted-line count exactly.
+    assert!(
+        out.contains("more lines)"),
+        "cap summary tail missing: {out}"
+    );
+    let total = 60 * 2; // 60 added + 60 removed
+    let expected_more = total - APPROVAL_DIFF_BODY_CAP;
+    assert!(
+        out.contains(&format!("({expected_more} more lines)")),
+        "expected exact summary `({expected_more} more lines)`: {out}"
+    );
+}
+
+#[test]
+fn edit_preview_diff_lines_fallback_when_no_unified_diff() {
+    // Older or partial tool emitters may set only `diff_lines` (a count)
+    // without the full `unified_diff` blob. The preview keeps that
+    // degraded summary so the user still sees an indication of size.
+    let req = request_with(
+        "apply_patch",
+        PermissionCapability::Edit,
+        "path:src/lib.rs",
+        &[("paths", "src/lib.rs"), ("diff_lines", "12")],
+    );
+    let out = flatten(&render_preview(&req));
+    assert!(
+        out.contains("12 diff line(s)"),
+        "fallback summary missing: {out}"
+    );
 }
 
 #[test]

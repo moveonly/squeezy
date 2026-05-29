@@ -1,6 +1,6 @@
 use super::*;
 use crate::anthropic_betas::{anthropic_header_value, bedrock_extra_body_betas};
-use crate::{LlmInputItem, LlmToolCall, LlmToolSpec};
+use crate::{CacheSpec, LlmInputItem, LlmToolCall, LlmToolSpec};
 use std::sync::Arc;
 
 #[test]
@@ -14,6 +14,7 @@ fn request_body_uses_messages_streaming_shape() {
         reasoning_effort: None,
         previous_response_id: Some("ignored".to_string()),
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "read_file".to_string(),
@@ -36,7 +37,7 @@ fn request_body_uses_messages_streaming_shape() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["model"], "claude-test");
     assert_eq!(body["system"], "be brief");
@@ -63,6 +64,7 @@ fn request_body_preserves_function_tool_order() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "write_file".to_string(),
@@ -86,7 +88,7 @@ fn request_body_preserves_function_tool_order() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["tools"][0]["name"], "write_file");
     assert_eq!(body["tools"][1]["name"], "grep");
@@ -103,6 +105,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -111,7 +114,7 @@ fn request_body_uses_model_limit_when_output_cap_unset() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["max_tokens"], 64_000);
 }
@@ -138,6 +141,7 @@ fn request_body_maps_tool_roundtrip_messages() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -146,20 +150,25 @@ fn request_body_maps_tool_roundtrip_messages() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"][0]["text"], "read config");
     assert_eq!(body["messages"][1]["role"], "assistant");
     assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
-    assert_eq!(body["messages"][1]["content"][0]["id"], "toolu_1");
+    // Tool-call ids get canonicalized to `call_<N>` (1-indexed by
+    // first occurrence) so a mid-session model switch can replay
+    // them on any provider — the original `toolu_…` shape would
+    // be rejected by OpenAI/Google, and a 450-char OpenAI id would
+    // be rejected by Anthropic.
+    assert_eq!(body["messages"][1]["content"][0]["id"], "call_1");
     assert_eq!(
         body["messages"][1]["content"][0]["input"]["path"],
         "squeezy.toml"
     );
     assert_eq!(body["messages"][2]["role"], "user");
     assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
-    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "toolu_1");
+    assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
 }
 
 #[test]
@@ -180,6 +189,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -188,7 +198,7 @@ fn request_body_adds_cache_control_markers_when_cache_key_and_capability_enable_
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     // System tail carries an ephemeral cache_control marker.
     assert_eq!(body["system"][0]["type"], "text");
@@ -228,6 +238,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -251,7 +262,7 @@ fn request_body_marks_last_tool_with_cache_control_when_caching_enabled() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
     assert!(
@@ -276,6 +287,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "apply_patch".to_string(),
@@ -313,7 +325,7 @@ fn request_body_places_tool_cache_control_on_last_first_party_tool_when_mcp_tool
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 4);
     assert!(tools[0].get("cache_control").is_none());
@@ -341,6 +353,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "mcp__linear__create_issue".to_string(),
@@ -364,7 +377,7 @@ fn request_body_falls_back_to_last_tool_when_all_advertised_tools_are_mcp() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert_eq!(tools.len(), 2);
     assert!(tools[0].get("cache_control").is_none());
@@ -382,6 +395,7 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(vec![
             LlmToolSpec {
                 name: "tool_a".to_string(),
@@ -398,11 +412,116 @@ fn request_body_omits_tool_cache_control_when_caching_disabled() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     let tools = body["tools"].as_array().expect("tools array");
     assert!(
         tools[0].get("cache_control").is_none(),
         "cache breakpoint must not be emitted without a cache_key"
+    );
+}
+
+#[test]
+fn request_body_emits_one_hour_ttl_marker_for_long_retention() {
+    // F11: `CacheRetention::Long` must surface on the Anthropic Messages
+    // wire as `cache_control: { type: "ephemeral", ttl: "1h" }` on every
+    // breakpoint (system, last user, last stable tool) so the cached
+    // prefix survives Anthropic's default ~5m short window. Mirrors pi's
+    // `cacheRetention = "long"` behavior
+    // (`others/pi/packages/ai/src/providers/anthropic.ts:62-66`).
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("first turn".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: crate::CacheSpec {
+            key: Some("squeezy::session-long".to_string()),
+            retention: crate::CacheRetention::Long,
+        },
+        tools: Arc::from(vec![
+            LlmToolSpec {
+                name: "tool_a".to_string(),
+                description: "first".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+            LlmToolSpec {
+                name: "tool_b".to_string(),
+                description: "second".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+                strict: false,
+            }
+            .into(),
+        ]),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    // System tail: `ttl: "1h"` rides alongside the `ephemeral` marker.
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        body["system"][0]["cache_control"]["ttl"], "1h",
+        "Long retention must extend Anthropic's cached prefix lifetime via ttl=1h"
+    );
+
+    // Last user block: same marker shape.
+    let messages = body["messages"].as_array().expect("messages array");
+    let last_user = messages
+        .iter()
+        .rev()
+        .find(|msg| msg["role"] == "user")
+        .expect("user message");
+    let last_block = last_user["content"]
+        .as_array()
+        .expect("content")
+        .last()
+        .expect("last block");
+    assert_eq!(last_block["cache_control"]["ttl"], "1h");
+
+    // Last stable tool: same marker shape.
+    let tools = body["tools"].as_array().expect("tools array");
+    assert_eq!(tools[1]["cache_control"]["ttl"], "1h");
+    assert!(tools[0].get("cache_control").is_none());
+}
+
+#[test]
+fn request_body_omits_ttl_for_short_retention_via_legacy_cache_key() {
+    // Regression guard for the `From<Option<String>>` lift in
+    // `effective_cache_spec()`: setting only the deprecated `cache_key`
+    // must yield Short retention, leaving the marker bare so Anthropic
+    // applies its built-in short window (~5m).
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "system prompt".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: Some("squeezy::session-1".to_string()),
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+    assert!(
+        body["system"][0]["cache_control"].get("ttl").is_none(),
+        "Short retention (from the legacy cache_key migration path) must not emit a ttl field"
     );
 }
 
@@ -417,6 +536,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -425,7 +545,7 @@ fn request_body_skips_cache_control_when_cache_key_is_absent() {
         beta_headers: std::sync::Arc::from(Vec::new()),
     };
 
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
 
     // Without a cache_key the system field stays a plain string and no
     // cache_control markers appear in messages.
@@ -728,7 +848,12 @@ fn anthropic_messages_attach_thinking_blocks_to_assistant_turn() {
         LlmInputItem::Reasoning(payload),
         LlmInputItem::AssistantText("answer".to_string()),
     ];
-    let messages = anthropic_messages(&input, false, CachePolicy::AUTO);
+    let messages = anthropic_messages(
+        &input,
+        false,
+        CachePolicy::AUTO,
+        crate::CacheRetention::None,
+    );
     let arr = messages.as_array().expect("array");
     assert_eq!(arr.len(), 1, "thinking + text fold into one assistant turn");
     let content = arr[0]["content"].as_array().expect("content array");
@@ -765,6 +890,7 @@ fn beta_headers_route_into_http_header() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -772,7 +898,7 @@ fn beta_headers_route_into_http_header() {
         parallel_tool_calls: None,
         beta_headers: betas,
     };
-    let body = AnthropicProvider::request_body(&request);
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
     assert!(
         body.get("anthropic_beta").is_none(),
         "1P Anthropic transport sends betas via header, never inside the JSON body",
@@ -810,4 +936,170 @@ fn beta_headers_dedup_when_capability_and_request_overlap() {
     ]);
     let header = anthropic_header_value(&betas).expect("non-empty betas yield a header value");
     assert_eq!(header, "a,b,c");
+}
+
+#[test]
+fn oauth_auth_scheme_prepends_claude_code_identity_to_system() {
+    // The OAuth quota check requires every Claude Pro/Max request to
+    // identify itself as Claude Code in the system block. Build a
+    // request body under the OAuth auth scheme and verify the
+    // identity preamble lands ahead of the user's instructions.
+    let request = LlmRequest {
+        model: "claude-opus-4-7".to_string().into(),
+        instructions: "user-supplied instructions".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: Some(64),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::Oauth);
+    let system = body.get("system").expect("system block must be present");
+    let system = system
+        .as_array()
+        .expect("OAuth scheme must serialize `system` as an array");
+    assert!(
+        system
+            .first()
+            .and_then(|item| item.get("text"))
+            .and_then(|text| text.as_str())
+            .is_some_and(|text| text.contains("Claude Code")),
+        "first system block must declare the Claude Code identity, got {system:?}"
+    );
+    assert!(
+        system.iter().any(|item| item
+            .get("text")
+            .and_then(|text| text.as_str())
+            .is_some_and(|text| text == "user-supplied instructions")),
+        "user instructions must still ride alongside the identity preamble: {system:?}"
+    );
+}
+
+#[test]
+fn api_key_auth_scheme_keeps_system_string_unchanged() {
+    // Static-key callers shouldn't see the identity preamble — the
+    // body's `system` stays the same single string the existing tests
+    // already lock in.
+    let request = LlmRequest {
+        model: "claude-opus-4-7".to_string().into(),
+        instructions: "user-supplied instructions".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hello".to_string())]),
+        max_output_tokens: Some(64),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+        cache: CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+    assert_eq!(body["system"], "user-supplied instructions");
+}
+
+#[test]
+fn merge_oauth_beta_header_unions_caller_and_oauth_marker() {
+    // OAuth-driven requests must always carry the Claude Code beta
+    // marker. A caller-supplied beta value should merge without
+    // duplicating entries.
+    let oauth_marker = crate::oauth::anthropic_oauth_beta_header();
+    let merged =
+        super::merge_oauth_beta_header(Some("context-1m-2025-08-07"), AnthropicAuthScheme::Oauth)
+            .expect("oauth scheme must produce a header value");
+    for piece in oauth_marker.split(',') {
+        assert!(
+            merged.contains(piece),
+            "merged header must keep oauth marker {piece}; got {merged}",
+        );
+    }
+    assert!(
+        merged.contains("context-1m-2025-08-07"),
+        "merged header must keep caller beta; got {merged}",
+    );
+    let pieces: Vec<&str> = merged.split(',').collect();
+    let mut dedup = pieces.clone();
+    dedup.sort();
+    dedup.dedup();
+    assert_eq!(
+        pieces.len(),
+        dedup.len(),
+        "merged header must not duplicate entries: {merged}"
+    );
+}
+
+#[test]
+fn merge_oauth_beta_header_returns_none_for_api_key_without_caller() {
+    assert!(
+        super::merge_oauth_beta_header(None, AnthropicAuthScheme::ApiKey).is_none(),
+        "API-key callers with no betas should produce no header"
+    );
+    assert_eq!(
+        super::merge_oauth_beta_header(Some("a,b"), AnthropicAuthScheme::ApiKey),
+        Some("a,b".to_string()),
+        "API-key path passes the caller's value through unchanged"
+    );
+}
+
+#[test]
+fn request_body_encodes_image_as_base64_content_block() {
+    // Synthetic 8-byte PNG-magic prefix; the bytes here don't have to be
+    // a real image because we're only inspecting the wire shape.
+    let bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "claude-test".to_string().into(),
+        instructions: "describe images".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("what is this?".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: bytes.clone(),
+            },
+        ]),
+        max_output_tokens: Some(32),
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let body = AnthropicProvider::request_body(&request, AnthropicAuthScheme::ApiKey);
+
+    // The user text and image must coalesce into one user message with
+    // two content blocks (text then image) so Anthropic sees them as a
+    // single multimodal turn.
+    let content = body["messages"][0]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "base64");
+    assert_eq!(content[1]["source"]["media_type"], "image/png");
+    let encoded = content[1]["source"]["data"]
+        .as_str()
+        .expect("base64 string");
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64");
+    assert_eq!(decoded.as_slice(), bytes.as_ref());
 }

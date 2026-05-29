@@ -1,18 +1,22 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use async_stream::try_stream;
 use aws_config::{BehaviorVersion, SdkConfig};
 use aws_sdk_bedrockruntime::types::ConverseStreamOutput;
 use aws_sdk_bedrockruntime::{
     Client as BedrockClient,
-    config::Region,
+    config::{Region, Token as BedrockToken},
     error::SdkError,
     primitives::event_stream::EventReceiver,
     types::{
         CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
-        ConversationRole, Message, ReasoningContentBlock, ReasoningContentBlockDelta,
-        ReasoningTextBlock, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-        ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+        ConversationRole, ImageBlock, ImageFormat, ImageSource, Message, ReasoningContentBlock,
+        ReasoningContentBlockDelta, ReasoningTextBlock, SystemContentBlock, Tool,
+        ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock,
+        ToolSpecification, ToolUseBlock,
     },
 };
 use aws_smithy_types::{Blob, Document, Number};
@@ -32,6 +36,10 @@ use crate::{
 pub struct BedrockProvider {
     region: String,
     base_url: Option<String>,
+    bearer_token: Option<String>,
+    /// Operator-defined cost-allocation tags forwarded on every
+    /// ConverseStream invocation (F16pi-bedrock-request-metadata-tags).
+    request_metadata: std::collections::BTreeMap<String, String>,
     transport: ProviderTransportConfig,
     shared: Arc<tokio::sync::OnceCell<SdkConfig>>,
 }
@@ -41,6 +49,8 @@ impl BedrockProvider {
         Ok(Self {
             region: config.region.clone(),
             base_url: config.base_url.clone(),
+            bearer_token: config.bearer_token.clone(),
+            request_metadata: config.request_metadata.clone(),
             transport: config.transport,
             shared: Arc::new(tokio::sync::OnceCell::new()),
         })
@@ -53,22 +63,58 @@ impl BedrockProvider {
             .shared
             .get_or_init(|| async move { load_aws_config(region, base_url).await })
             .await;
-        if shared.credentials_provider().is_none() {
-            return Err(SqueezyError::ProviderNotConfigured(
-                "AWS credentials not found; configure with `aws configure`, AWS_PROFILE, or environment variables"
-                    .to_string(),
-            ));
-        }
-        Ok(BedrockClient::new(shared))
+        build_bedrock_client(shared, self.bearer_token.as_deref())
     }
 }
 
 async fn load_aws_config(region: String, base_url: Option<String>) -> SdkConfig {
+    // `aws_config::defaults` already wires the standard credential
+    // provider chain (env → ~/.aws/credentials → IMDS / container
+    // roles). We only override region + optional endpoint here so the
+    // chain itself is whatever the AWS SDK ships as best practice.
     let mut loader = aws_config::defaults(BehaviorVersion::latest()).region(Region::new(region));
     if let Some(url) = base_url {
         loader = loader.endpoint_url(url);
     }
     loader.load().await
+}
+
+/// Choose between bearer-token auth and the AWS default credential
+/// chain when constructing a Bedrock Runtime client.
+///
+/// * When `bearer_token` is `Some(non_empty)` we route through Bedrock's
+///   HTTP bearer-auth scheme — clearing any inherited SigV4 credentials
+///   from the shared `SdkConfig` so the auth-scheme resolver cannot
+///   silently fall back to SigV4 when both routes are present.
+/// * Otherwise we trust whatever `aws_config::defaults` resolved into
+///   the shared config and only surface a `ProviderNotConfigured` error
+///   when the SDK was unable to install a credentials provider at all.
+pub(crate) fn build_bedrock_client(
+    shared: &SdkConfig,
+    bearer_token: Option<&str>,
+) -> Result<BedrockClient> {
+    if let Some(raw) = bearer_token {
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(SqueezyError::ProviderNotConfigured(
+                "AWS_BEARER_TOKEN_BEDROCK is set but empty; unset it or provide a non-empty token"
+                    .to_string(),
+            ));
+        }
+        let mut builder = aws_sdk_bedrockruntime::config::Builder::from(shared);
+        builder.set_credentials_provider(None);
+        let client_config = builder
+            .bearer_token(BedrockToken::new(token.to_string(), None))
+            .build();
+        return Ok(BedrockClient::from_conf(client_config));
+    }
+    if shared.credentials_provider().is_none() {
+        return Err(SqueezyError::ProviderNotConfigured(
+            "AWS credentials not found; set AWS_BEARER_TOKEN_BEDROCK for bearer auth, run `aws configure`, set AWS_PROFILE, or provide AWS environment variables"
+                .to_string(),
+        ));
+    }
+    Ok(BedrockClient::new(shared))
 }
 
 impl LlmProvider for BedrockProvider {
@@ -77,6 +123,9 @@ impl LlmProvider for BedrockProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("bedrock") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let provider = self.clone();
         let transport = provider.transport;
         Box::pin(try_stream! {
@@ -94,7 +143,17 @@ impl LlmProvider for BedrockProvider {
             for block in system_blocks(&request.instructions, prompt_caching)? {
                 builder = builder.system(block);
             }
-            for message in conversation_messages(&request.input, prompt_caching)? {
+            // Canonicalize cross-provider tool-call ids and
+            // synthesize placeholders for orphan tool results before
+            // building Bedrock `toolUse` / `toolResult` blocks.
+            // Bedrock's Converse API enforces the same Anthropic
+            // pairing rules (every `toolResult.toolUseId` must match
+            // a prior `toolUse.toolUseId` in the conversation) so a
+            // mid-session swap from a non-Anthropic provider can
+            // produce ids Bedrock either rejects on shape or fails
+            // to match.
+            let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+            for message in conversation_messages(&normalized_input, prompt_caching)? {
                 builder = builder.messages(message);
             }
             if let Some(config) = tool_configuration(&request.tools, prompt_caching)? {
@@ -134,6 +193,9 @@ impl LlmProvider for BedrockProvider {
             if !extra_fields.is_empty() {
                 builder =
                     builder.additional_model_request_fields(Document::Object(extra_fields));
+            }
+            if let Some(metadata) = bedrock_request_metadata_map(&provider.request_metadata) {
+                builder = builder.set_request_metadata(Some(metadata));
             }
 
             let send_result = tokio::select! {
@@ -458,6 +520,14 @@ pub(crate) fn conversation_messages(
                     ContentBlock::ToolResult(tool_result),
                 )?;
             }
+            LlmInputItem::Image { media_type, bytes } => {
+                let image = bedrock_image_block(media_type, bytes)?;
+                push_message(
+                    &mut messages,
+                    ConversationRole::User,
+                    ContentBlock::Image(image),
+                )?;
+            }
             LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
                 for block in blocks {
                     let reasoning = match block.kind {
@@ -585,6 +655,33 @@ pub(crate) fn tool_configuration(
     Ok(Some(config))
 }
 
+/// Build a Bedrock `ImageBlock` from an `LlmInputItem::Image` payload.
+/// Maps the canonical `image/{png,jpeg,gif,webp}` MIME strings to the
+/// SDK's `ImageFormat` enum and wraps the raw bytes in a `Blob` so the
+/// Converse API receives the binary payload directly (no base64 wrap —
+/// the SDK does that on the wire). Returns a structured error for
+/// unknown MIME types instead of silently dropping the image.
+pub(crate) fn bedrock_image_block(media_type: &str, bytes: &Arc<[u8]>) -> Result<ImageBlock> {
+    let format = match media_type.to_ascii_lowercase().as_str() {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" | "image/jpg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::Webp,
+        other => {
+            return Err(SqueezyError::ProviderRequest(format!(
+                "Bedrock does not support image MIME `{other}`; expected one of image/png, image/jpeg, image/gif, image/webp",
+            )));
+        }
+    };
+    ImageBlock::builder()
+        .format(format)
+        .source(ImageSource::Bytes(Blob::new(bytes.as_ref().to_vec())))
+        .build()
+        .map_err(|err| {
+            SqueezyError::ProviderRequest(format!("failed to build Bedrock image block: {err}"))
+        })
+}
+
 pub(crate) fn json_to_document(value: &Value) -> Document {
     match value {
         Value::Null => Document::Null,
@@ -612,6 +709,27 @@ pub(crate) fn json_to_document(value: &Value) -> Document {
                 .collect(),
         ),
     }
+}
+
+/// Convert configured cost-allocation tags into the SDK shape the
+/// Converse builder accepts. Returns `None` for an empty map so the
+/// provider omits the `requestMetadata` field entirely instead of
+/// sending an empty object — Bedrock treats absent and empty
+/// equivalently, but skipping the field keeps the wire payload
+/// minimal and makes the "no tags configured" case observable in
+/// request logs.
+pub(crate) fn bedrock_request_metadata_map(
+    metadata: &BTreeMap<String, String>,
+) -> Option<HashMap<String, String>> {
+    if metadata.is_empty() {
+        return None;
+    }
+    Some(
+        metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
 }
 
 fn sdk_error_to_squeezy<E: std::fmt::Display, R>(error: SdkError<E, R>) -> SqueezyError {

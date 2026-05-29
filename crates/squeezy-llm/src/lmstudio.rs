@@ -10,6 +10,8 @@
 //! Anthropic cache_control markers).
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -24,6 +26,7 @@ use crate::{
     LlmEvent, LlmInputItem, LlmProvider, LlmRequest, LlmStream, LlmToolCall,
     retry::{RetryPolicy, idle_timeout, send_with_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
 
 /// Default base URL for a freshly installed LM Studio server. The desktop
@@ -77,7 +80,7 @@ impl std::fmt::Debug for LMStudioProvider {
 impl LMStudioProvider {
     pub fn from_config(config: &LMStudioConfig) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: shared_client(&config.transport),
             base_url: config.base_url.trim_end_matches('/').to_string(),
             api_key: config.api_key.clone(),
             transport: config.transport,
@@ -85,7 +88,16 @@ impl LMStudioProvider {
     }
 
     pub(crate) fn request_body(request: &LlmRequest) -> Value {
-        let mut messages = Vec::with_capacity(request.input.len() + 1);
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results so a session that
+        // started on a hosted provider and resumed on the local
+        // LM Studio server still gets a well-formed
+        // `tool_calls`/`tool` pairing. LM Studio echoes whatever id
+        // it sees back to the model, so a 450-char OpenAI Responses
+        // id (or an `ollama_call_N` synthetic) flowing through here
+        // confuses smaller local models.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
+        let mut messages = Vec::with_capacity(normalized_input.len() + 1);
         let trimmed_instructions = request.instructions.trim();
         if !trimmed_instructions.is_empty() {
             messages.push(json!({
@@ -93,7 +105,7 @@ impl LMStudioProvider {
                 "content": &*request.instructions,
             }));
         }
-        for item in request.input.iter() {
+        for item in normalized_input.iter() {
             if let Some(msg) = lmstudio_message(item) {
                 messages.push(msg);
             }
@@ -135,6 +147,9 @@ impl LlmProvider for LMStudioProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("lmstudio") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let transport = self.transport;
@@ -173,6 +188,7 @@ impl LlmProvider for LMStudioProvider {
 
             let mut decoder = SseDecoder::default();
             let mut state = StreamState::default();
+            let mut server_model_echo = crate::ServerModelEcho::default();
             let mut bytes = response.bytes_stream();
 
             loop {
@@ -189,7 +205,13 @@ impl LlmProvider for LMStudioProvider {
                 let Some(chunk) = next else { break; };
                 let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
                 for event in decoder.push(&chunk) {
-                    for emitted in parse_chat_event(&event, &mut state)? {
+                    let parsed = parse_chat_event(&event, &mut state)?;
+                    if let Some(server) = state.server_model.take()
+                        && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                    {
+                        yield echo;
+                    }
+                    for emitted in parsed {
                         yield emitted;
                     }
                     if state.completed_emitted {
@@ -199,7 +221,13 @@ impl LlmProvider for LMStudioProvider {
             }
 
             for event in decoder.finish() {
-                for emitted in parse_chat_event(&event, &mut state)? {
+                let parsed = parse_chat_event(&event, &mut state)?;
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for emitted in parsed {
                     yield emitted;
                 }
                 if state.completed_emitted {
@@ -308,6 +336,18 @@ fn lmstudio_message(item: &LlmInputItem) -> Option<Value> {
             "tool_call_id": call_id,
             "content": output,
         }),
+        LlmInputItem::Image { media_type, bytes } => json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": format!(
+                        "data:{media_type};base64,{}",
+                        BASE64_STANDARD.encode(bytes.as_ref())
+                    ),
+                },
+            }],
+        }),
         // Local OSS models have no signed reasoning replay format; skip.
         LlmInputItem::Reasoning(_) => return None,
     })
@@ -322,6 +362,13 @@ pub(crate) struct StreamState {
     /// Captured OpenAI chat-completions `finish_reason` from the last
     /// streamed choice; mapped to [`crate::StopReason`] at completion.
     finish_reason: Option<String>,
+    /// Stashes the server-echoed top-level `model` the first time it
+    /// appears on a chat-completions chunk. The outer stream loop
+    /// drains the slot and emits `LlmEvent::ServerModel` exactly once
+    /// when LM Studio's reported model id differs from the one the
+    /// request asked for (local server with a renamed model card,
+    /// auto-load swapping in a different quantization, etc.).
+    server_model: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -411,6 +458,13 @@ pub(crate) fn parse_chat_event(data: &str, state: &mut StreamState) -> Result<Ve
 
     if let Some(id) = value.get("id").and_then(Value::as_str) {
         state.response_id.get_or_insert_with(|| id.to_string());
+    }
+
+    if state.server_model.is_none()
+        && let Some(server_model) = value.get("model").and_then(Value::as_str)
+        && !server_model.is_empty()
+    {
+        state.server_model = Some(server_model.to_string());
     }
 
     if let Some(usage) = value.get("usage") {

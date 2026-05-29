@@ -16,6 +16,7 @@ async fn unavailable_provider_reports_configuration_error() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -161,6 +162,7 @@ fn request_context_estimate_reports_budget_when_model_limit_exists() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -207,6 +209,7 @@ fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -244,6 +247,289 @@ fn calibrated_request_context_estimate_uses_provided_bytes_per_token() {
 }
 
 #[test]
+fn normalize_tool_ids_rewrites_paired_call_and_output_to_canonical_form() {
+    // Paired FunctionCall + FunctionCallOutput with a provider-specific id
+    // (here the long OpenAI Responses shape) get rewritten to `call_1`
+    // *and* both sides see the same canonical id so the destination
+    // provider can still pair them. Without this an Anthropic destination
+    // would reject the original id outright (regex + length cap).
+    let openai_responses_id = "fc_abcdEFGHijklMNOP1234567890|qrSTuvWXyzABC|DEFghijklmnop";
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::FunctionCall {
+            call_id: openai_responses_id.to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "todo"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: openai_responses_id.to_string(),
+            output: "match".to_string(),
+        },
+    ]);
+
+    assert_eq!(normalized.len(), 2, "no synthetic placeholder when paired");
+    match &normalized[0] {
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(name, "grep");
+            assert_eq!(arguments, &serde_json::json!({"pattern": "todo"}));
+        }
+        other => panic!("expected FunctionCall, got {other:?}"),
+    }
+    match &normalized[1] {
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(output, "match");
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+}
+
+#[test]
+fn normalize_tool_ids_assigns_distinct_canonical_ids_per_call() {
+    // Two distinct tool turns produce two distinct canonical ids in
+    // first-seen order; each result tracks back to the right call.
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::FunctionCall {
+            call_id: "toolu_abc".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::Value::Object(Default::default()),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "toolu_abc".to_string(),
+            output: "ok".to_string(),
+        },
+        LlmInputItem::FunctionCall {
+            call_id: "google_call_2".to_string(),
+            name: "write".to_string(),
+            arguments: serde_json::Value::Object(Default::default()),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "google_call_2".to_string(),
+            output: "ok".to_string(),
+        },
+    ]);
+
+    let call_ids: Vec<&str> = normalized
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. }
+            | LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(call_ids, vec!["call_1", "call_1", "call_2", "call_2"]);
+}
+
+#[test]
+fn normalize_tool_ids_synthesizes_placeholder_for_orphan_tool_result() {
+    // An orphan tool result (call_id not introduced by a prior
+    // FunctionCall in the same slice) gets a synthesized
+    // `model_switched` FunctionCall inserted ahead of it so the
+    // destination provider sees a well-formed pairing.
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::UserText("look it up".to_string()),
+        LlmInputItem::FunctionCallOutput {
+            call_id: "lost_after_model_swap".to_string(),
+            output: "result".to_string(),
+        },
+        LlmInputItem::UserText("now what?".to_string()),
+    ]);
+
+    assert_eq!(
+        normalized.len(),
+        4,
+        "user + synthetic call + tool result + user"
+    );
+    assert!(matches!(&normalized[0], LlmInputItem::UserText(t) if t == "look it up"));
+    match &normalized[1] {
+        LlmInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(name, MODEL_SWITCHED_PLACEHOLDER_NAME);
+            assert_eq!(arguments, &serde_json::json!({"reason": "model_switched"}));
+        }
+        other => panic!("expected synthesized FunctionCall, got {other:?}"),
+    }
+    match &normalized[2] {
+        LlmInputItem::FunctionCallOutput { call_id, output } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(output, "result");
+        }
+        other => panic!("expected FunctionCallOutput, got {other:?}"),
+    }
+    assert!(matches!(&normalized[3], LlmInputItem::UserText(t) if t == "now what?"));
+}
+
+#[test]
+fn normalize_tool_ids_pairs_orphan_synthesis_with_subsequent_real_calls() {
+    // Mixed history: an orphan tool result followed by a real
+    // call/result pair. The synthetic placeholder takes id `call_1`,
+    // the genuine pair takes the next available canonical id
+    // (`call_2`). This is the realistic mid-session model-switch
+    // shape — the prior model's turn was lost but the new model's
+    // subsequent tool round-trip still flows cleanly.
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::FunctionCallOutput {
+            call_id: "fc_orphan".to_string(),
+            output: "stale".to_string(),
+        },
+        LlmInputItem::FunctionCall {
+            call_id: "toolu_new".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "toolu_new".to_string(),
+            output: "match".to_string(),
+        },
+    ]);
+
+    let ids: Vec<&str> = normalized
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { call_id, .. }
+            | LlmInputItem::FunctionCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["call_1", "call_1", "call_2", "call_2"],
+        "synthetic placeholder gets call_1 paired with the orphan output; the genuine pair takes call_2",
+    );
+
+    // The synthesized placeholder carries the model_switched marker
+    // so review tooling can distinguish it from a real call the
+    // model issued.
+    let names: Vec<&str> = normalized
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::FunctionCall { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec![MODEL_SWITCHED_PLACEHOLDER_NAME, "grep"]);
+}
+
+#[test]
+fn normalize_tool_ids_passes_user_assistant_and_reasoning_items_through() {
+    // Non-tool items must not be mutated or dropped — the
+    // normalization is additive on the tool-call surface only.
+    let reasoning = LlmInputItem::Reasoning(ReasoningPayload::OpenAi {
+        item_id: "rs_1".to_string(),
+        summary: vec!["thinking".to_string()],
+        encrypted_content: None,
+    });
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::UserText("u".to_string()),
+        LlmInputItem::AssistantText("a".to_string()),
+        reasoning.clone(),
+    ]);
+    assert_eq!(normalized.len(), 3);
+    assert!(matches!(&normalized[0], LlmInputItem::UserText(t) if t == "u"));
+    assert!(matches!(&normalized[1], LlmInputItem::AssistantText(t) if t == "a"));
+    assert_eq!(&normalized[2], &reasoning);
+}
+
+#[test]
+fn normalize_tool_ids_is_idempotent_on_already_canonical_input() {
+    // Re-running normalization on a slice that already uses the
+    // canonical `call_<N>` shape yields the same slice. This matters
+    // because each provider's `request_body` calls the helper on
+    // every turn — a persisted-then-replayed history must not be
+    // re-numbered every time it flows through the request path.
+    let canonical = vec![
+        LlmInputItem::FunctionCall {
+            call_id: "call_1".to_string(),
+            name: "grep".to_string(),
+            arguments: serde_json::json!({"pattern": "x"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: "hit".to_string(),
+        },
+        LlmInputItem::FunctionCall {
+            call_id: "call_2".to_string(),
+            name: "read".to_string(),
+            arguments: serde_json::json!({"path": "p"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: "call_2".to_string(),
+            output: "data".to_string(),
+        },
+    ];
+    let once = normalize_tool_ids_for_replay(&canonical);
+    let twice = normalize_tool_ids_for_replay(&once);
+    assert_eq!(
+        once, canonical,
+        "first pass leaves canonical input unchanged"
+    );
+    assert_eq!(twice, once, "second pass is a no-op on canonical input");
+}
+
+#[test]
+fn normalize_tool_ids_simulates_anthropic_to_openai_cross_model_replay() {
+    // End-to-end replay shape: a session that started on Anthropic
+    // (toolu_* ids), got interrupted before the tool result returned
+    // (synthetic placeholder needed), then continued on OpenAI
+    // (fc_*|… ids). The normalized slice has consistent canonical
+    // ids the destination Anthropic provider would accept (regex +
+    // 64-char cap) AND every output has a matching call ahead of
+    // it.
+    let openai_id = "fc_long_responses_id_with|pipe_separator_well_past_64_chars_aaa";
+    let normalized = normalize_tool_ids_for_replay(&[
+        LlmInputItem::UserText("start".to_string()),
+        // Orphaned Anthropic-shaped result — the assistant turn that
+        // would have produced toolu_aaa was discarded mid-session.
+        LlmInputItem::FunctionCallOutput {
+            call_id: "toolu_aaa".to_string(),
+            output: "(stale)".to_string(),
+        },
+        // Subsequent OpenAI Responses turn with its native id shape.
+        LlmInputItem::FunctionCall {
+            call_id: openai_id.to_string(),
+            name: "search".to_string(),
+            arguments: serde_json::json!({"q": "rust"}),
+        },
+        LlmInputItem::FunctionCallOutput {
+            call_id: openai_id.to_string(),
+            output: "found".to_string(),
+        },
+    ]);
+
+    assert_eq!(
+        normalized.len(),
+        5,
+        "user + synthesized placeholder + orphan output + real call + real output"
+    );
+    for item in &normalized {
+        if let LlmInputItem::FunctionCall { call_id, .. }
+        | LlmInputItem::FunctionCallOutput { call_id, .. } = item
+        {
+            // 64-char + regex compliance: every canonical id is short
+            // and matches `^call_[0-9]+$`.
+            assert!(
+                call_id.len() <= 64,
+                "call_id {call_id} must fit Anthropic 64-char cap"
+            );
+            assert!(
+                call_id
+                    .strip_prefix("call_")
+                    .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit())),
+                "call_id {call_id} must match `call_<N>` canonical form",
+            );
+        }
+    }
+}
+
+#[test]
 fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
     // The bundled registry now ships a fallback metadata path so unknown
     // model ids still get useful headroom/budget figures instead of empty
@@ -257,6 +543,7 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
         reasoning_effort: None,
         previous_response_id: None,
         cache_key: None,
+        cache: CacheSpec::default(),
         tools: Arc::from(Vec::new()),
         store: false,
         tool_choice: None,
@@ -274,4 +561,144 @@ fn request_context_estimate_uses_fallback_metadata_for_unknown_models() {
     assert!(estimate.input_budget_tokens.unwrap() > 0);
     assert!(estimate.remaining_input_tokens.is_some());
     assert!(estimate.used_input_percent_x100.is_some());
+}
+
+#[test]
+fn infer_image_mime_detects_canonical_magic_numbers() {
+    let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+    assert_eq!(infer_image_mime(png), Some("image/png"));
+
+    let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10];
+    assert_eq!(infer_image_mime(jpeg), Some("image/jpeg"));
+
+    let gif87a: &[u8] = b"GIF87a\x00\x00";
+    assert_eq!(infer_image_mime(gif87a), Some("image/gif"));
+
+    let gif89a: &[u8] = b"GIF89a\x00\x00";
+    assert_eq!(infer_image_mime(gif89a), Some("image/gif"));
+
+    let mut webp = Vec::with_capacity(20);
+    webp.extend_from_slice(b"RIFF");
+    webp.extend_from_slice(&[0x10, 0x00, 0x00, 0x00]);
+    webp.extend_from_slice(b"WEBPVP8 ");
+    assert_eq!(infer_image_mime(&webp), Some("image/webp"));
+
+    // Non-image bytes don't match.
+    assert_eq!(infer_image_mime(b"plain text content"), None);
+    assert_eq!(infer_image_mime(&[]), None);
+}
+
+#[test]
+fn ensure_vision_support_rejects_text_only_model() {
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: "deepseek-chat".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![
+            LlmInputItem::UserText("describe this".to_string()),
+            LlmInputItem::Image {
+                media_type: "image/png".to_string(),
+                bytes: png_bytes,
+            },
+        ]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    let err = request
+        .ensure_vision_support("deepseek")
+        .expect_err("text-only model must refuse image inputs");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support image inputs"),
+        "error must explain the rejection: got {message}"
+    );
+    assert!(
+        message.contains("deepseek-chat"),
+        "error must mention the rejected model id: got {message}"
+    );
+}
+
+#[test]
+fn ensure_vision_support_accepts_vision_capable_model() {
+    let png_bytes: Arc<[u8]> = Arc::from(vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let request = LlmRequest {
+        model: squeezy_core::DEFAULT_ANTHROPIC_MODEL.to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::Image {
+            media_type: "image/png".to_string(),
+            bytes: png_bytes,
+        }]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    request
+        .ensure_vision_support("anthropic")
+        .expect("vision-capable model must accept image inputs");
+}
+
+#[test]
+fn ensure_vision_support_is_noop_for_text_only_request() {
+    let request = LlmRequest {
+        model: "deepseek-chat".to_string().into(),
+        instructions: "be brief".to_string().into(),
+        input: Arc::from(vec![LlmInputItem::UserText("hi".to_string())]),
+        max_output_tokens: None,
+        response_verbosity: None,
+        reasoning_effort: None,
+        previous_response_id: None,
+        cache_key: None,
+
+        cache: crate::CacheSpec::default(),
+        tools: Arc::from(Vec::new()),
+        store: false,
+        tool_choice: None,
+        output_schema: None,
+        parallel_tool_calls: None,
+        beta_headers: std::sync::Arc::from(Vec::new()),
+    };
+
+    request
+        .ensure_vision_support("deepseek")
+        .expect("text-only request must skip the vision check");
+}
+
+#[test]
+fn llm_input_item_image_round_trips_through_serde() {
+    let original = LlmInputItem::Image {
+        media_type: "image/png".to_string(),
+        bytes: Arc::from(vec![1u8, 2, 3, 4, 5, 6, 7, 8]),
+    };
+    let json = serde_json::to_string(&original).expect("serialize image item");
+    // The wire form stores bytes as a base64 string, not a byte array,
+    // so a JSON checkpoint stays compact and human-debuggable.
+    assert!(
+        json.contains("\"AQIDBAUGBwg=\""),
+        "image bytes must serialize as base64: {json}"
+    );
+    let decoded: LlmInputItem = serde_json::from_str(&json).expect("deserialize image item");
+    assert_eq!(original, decoded);
 }

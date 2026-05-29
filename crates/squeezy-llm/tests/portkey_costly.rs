@@ -44,6 +44,8 @@ async fn portkey_chat_completions_streaming_costly() -> Result<()> {
             .unwrap_or_else(|_| PRESET.default_base_url().to_string()),
         extra_headers,
         transport: ProviderTransportConfig::default(),
+        account_id: None,
+        gateway_id: None,
     })?;
     let output = common::run_echo_smoke(provider, &model, PRESET.display_name()).await?;
     assert!(

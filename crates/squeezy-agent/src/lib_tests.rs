@@ -712,10 +712,49 @@ async fn pasted_context_is_redacted_deduped_and_sent_as_reference() {
 }
 
 #[tokio::test]
-async fn unsupported_image_attachment_is_not_active() {
-    let root = temp_workspace("agent_context_image");
+async fn label_only_image_attachment_stays_unsupported() {
+    // `.heic` extension with non-canonical bytes is recognised as
+    // image-shaped by the label heuristic but its magic bytes never
+    // surface a vision-routable MIME, so the attachment stays
+    // `UnsupportedImage` and never reaches the next request.
+    let root = temp_workspace("agent_context_image_heic");
+    let image = root.join("snap.heic");
+    fs::write(&image, b"not real heic content").expect("write image");
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider);
+
+    let update = agent
+        .attach_file_context(PathBuf::from("snap.heic"))
+        .await
+        .expect("attach image");
+
+    assert!(!update.active);
+    assert_eq!(
+        update.attachment.kind,
+        ContextAttachmentKind::UnsupportedImage
+    );
+    assert!(update.attachment.image_data_base64.is_none());
+    assert!(agent.context_attachments_snapshot().await.is_empty());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn png_file_attachment_routes_to_image_kind() {
+    // PNG magic bytes flip the detection from the legacy
+    // `UnsupportedImage` reject to the F18 `Image` kind so the file
+    // attachment becomes active and carries the bytes through to the
+    // next request.
+    let root = temp_workspace("agent_context_image_png");
     let image = root.join("screenshot.png");
-    fs::write(&image, b"\x89PNG\r\n\x1a\nimage bytes").expect("write image");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    bytes.extend_from_slice(b"trailing png payload");
+    fs::write(&image, &bytes).expect("write image");
     let provider = Arc::new(MockProvider::new(Vec::new()));
     let config = AppConfig {
         workspace_root: root.clone(),
@@ -728,14 +767,118 @@ async fn unsupported_image_attachment_is_not_active() {
         .await
         .expect("attach image");
 
-    assert!(!update.active);
+    assert!(update.active);
+    assert_eq!(update.attachment.kind, ContextAttachmentKind::Image);
     assert_eq!(
-        update.attachment.kind,
-        ContextAttachmentKind::UnsupportedImage
+        update.attachment.image_media_type.as_deref(),
+        Some("image/png")
     );
-    assert!(agent.context_attachments_snapshot().await.is_empty());
+    assert!(update.attachment.image_data_base64.is_some());
+    let snapshot = agent.context_attachments_snapshot().await;
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].kind, ContextAttachmentKind::Image);
 
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn pasted_png_bytes_route_into_llm_image_input_item() {
+    // F18: bytes that arrive through the paste path (`attach_pasted_bytes`)
+    // and trip the PNG magic-byte sniff materialise as a
+    // `LlmInputItem::Image` on the next request — same wire shape the
+    // file-attached path produces, so every provider's multimodal
+    // encoder sees a single uniform input regardless of whether the
+    // image came from disk or the clipboard.
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"clipboard-png-payload");
+    let update = agent
+        .attach_pasted_bytes(png.clone())
+        .await
+        .expect("attach pasted png");
+    assert!(update.active);
+    assert_eq!(update.attachment.kind, ContextAttachmentKind::Image);
+    assert_eq!(
+        update.attachment.image_media_type.as_deref(),
+        Some("image/png")
+    );
+
+    let mut rx = agent.start_turn(
+        "describe the clipboard image".to_string(),
+        CancellationToken::new(),
+    );
+    while rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    let input = &requests[0].input;
+    // The user text leads the request, the image rides immediately
+    // after — this is the order the per-provider encoders rely on to
+    // coalesce text + image into one multimodal user turn.
+    let LlmInputItem::UserText(text) = &input[0] else {
+        panic!("expected user text item, got {:?}", input[0]);
+    };
+    assert!(text.contains("describe the clipboard image"));
+    let image_item = input
+        .iter()
+        .find(|item| matches!(item, LlmInputItem::Image { .. }))
+        .expect("request must carry a LlmInputItem::Image for the pasted PNG");
+    let LlmInputItem::Image { media_type, bytes } = image_item else {
+        unreachable!("matched on Image above");
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(bytes.as_ref(), png.as_slice());
+}
+
+#[tokio::test]
+async fn non_vision_model_rejects_pasted_image_with_clear_error() {
+    // The provider boundary owns the vision gate: `ensure_vision_support`
+    // runs as the first step of every provider's `stream_response`. We
+    // build the same request shape `start_turn` would emit for a
+    // pasted PNG and call the gate against a text-only provider/model
+    // pair (deepseek-chat is registered as `vision: false`) to lock in
+    // the rejection contract end-to-end — the agent's request fans
+    // image bytes through, and a text-only model surfaces the
+    // structured `ProviderRequest` error before any HTTP traffic.
+    let provider = Arc::new(MockProvider::new(vec![vec![Ok(LlmEvent::Completed {
+        response_id: Some("resp_1".to_string()),
+        cost: CostSnapshot::default(),
+        stop_reason: None,
+        reasoning_only_stop: false,
+    })]]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut png = Vec::new();
+    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+    png.extend_from_slice(b"clipboard-png-payload");
+    agent
+        .attach_pasted_bytes(png)
+        .await
+        .expect("attach pasted png");
+
+    let mut rx = agent.start_turn("describe it".to_string(), CancellationToken::new());
+    while rx.recv().await.is_some() {}
+
+    let request = provider.requests().into_iter().next().expect("one request");
+    let err = request
+        .ensure_vision_support("deepseek")
+        .expect_err("non-vision model must reject image inputs");
+    let message = err.to_string();
+    assert!(
+        message.contains("does not support image inputs"),
+        "error must explain the rejection: got {message}"
+    );
+    assert!(
+        message.contains("pick a vision-capable model"),
+        "error must guide the user to a vision model: got {message}"
+    );
 }
 
 #[tokio::test]
@@ -1102,6 +1245,167 @@ async fn shell_tool_emits_job_events_and_session_events() {
     assert!(event_kinds.contains(&"job_queued"));
     assert!(event_kinds.contains(&"job_started"));
     assert!(event_kinds.contains(&"job_finished"));
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// F04 coverage lock: a shell tool whose stdout contains a token-shaped
+/// secret must NOT leak the raw bytes through any of the three downstream
+/// surfaces — the transcript event (`AgentEvent::ToolCallCompleted.result`),
+/// the persisted session log (`SessionStore::show.events` + replay tape),
+/// or the next provider request (`LlmInputItem::FunctionCallOutput.output`
+/// in `provider.requests()[1].input`). Each surface has its own call-site
+/// pass through the `Redactor`, so this test pins all three at once.
+#[tokio::test]
+async fn shell_tool_output_secrets_are_redacted_across_transcript_session_log_and_provider_resend()
+{
+    const SECRET: &str = "ghp_abcdefghijklmnopqrstuvwxyz";
+
+    let root = temp_workspace("agent_shell_output_secret_redaction");
+    // Round 1 emits the shell tool call; round 2 lets the turn terminate
+    // once the tool output has been re-sent to the provider. The second
+    // request is what we inspect for the resend path.
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "call_1".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({
+                    "command":
+                        "echo 'leak ghp_abcdefghijklmnopqrstuvwxyz here'",
+                    "description": "print a fake github token",
+                    "timeout_ms": 10_000,
+                }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![Ok(LlmEvent::Completed {
+            response_id: Some("resp_2".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        })],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            shell: PermissionMode::Allow,
+            shell_sandbox: squeezy_core::ShellSandboxConfig {
+                mode: ShellSandboxMode::Off,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let agent = Agent::new(config, provider.clone());
+    let session_id = agent.session_id().expect("session id");
+
+    let mut rx = agent.start_turn("run shell".to_string(), CancellationToken::new());
+    let mut shell_result = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::ToolCallCompleted { result, .. } = event
+            && result.tool_name == "shell"
+        {
+            shell_result = Some(result);
+        }
+    }
+
+    let shell_result = shell_result.expect("shell ToolCallCompleted event must fire");
+    assert_eq!(shell_result.status, ToolStatus::Success);
+
+    // Path 1: transcript render. The TUI consumes `result.content` from
+    // `AgentEvent::ToolCallCompleted`; that JSON must already be redacted.
+    let transcript_payload =
+        serde_json::to_string(&shell_result.content).expect("serialize tool result content");
+    assert!(
+        !transcript_payload.contains(SECRET),
+        "transcript ToolCallCompleted result leaked the raw secret",
+    );
+    assert!(
+        transcript_payload.contains("<redacted:github_token"),
+        "transcript tool result must carry the github_token redaction marker",
+    );
+    assert!(
+        shell_result.cost_hint.redactions > 0,
+        "tool result cost hint must report at least one redaction",
+    );
+
+    // Path 2: provider resend. After the tool runs the agent loops back
+    // and re-sends the result as a `FunctionCallOutput`. Pull that item
+    // out of the recorded second-round request input.
+    let requests = provider.requests();
+    assert!(
+        requests.len() >= 2,
+        "provider must receive a second-round request that re-sends the tool output",
+    );
+    let resent_output = requests
+        .iter()
+        .flat_map(|request| request.input.iter().cloned())
+        .find_map(|item| match item {
+            LlmInputItem::FunctionCallOutput { output, .. } => Some(output),
+            _ => None,
+        })
+        .expect("expected a FunctionCallOutput in provider request input");
+    assert!(
+        !resent_output.contains(SECRET),
+        "FunctionCallOutput.output leaked the raw secret to the provider",
+    );
+    assert!(
+        resent_output.contains("<redacted:github_token"),
+        "FunctionCallOutput.output must carry the github_token redaction marker",
+    );
+
+    // Path 3: persisted session log + replay tape on disk. Both surfaces
+    // are flushed by `show_session`; nothing in either may contain the
+    // raw secret. Spot-check that the tool_result lifecycle event also
+    // carries the redaction marker so a regression that drops the
+    // log_session_event redactor pass would be caught here.
+    let record = agent.show_session(&session_id).expect("session record");
+    for event in &record.events {
+        let payload_json =
+            serde_json::to_string(&event.payload).expect("serialize session event payload");
+        assert!(
+            !payload_json.contains(SECRET),
+            "session log event {} leaked the raw secret",
+            event.kind,
+        );
+        if let Some(summary) = &event.summary {
+            assert!(
+                !summary.contains(SECRET),
+                "session log event {} summary leaked the raw secret",
+                event.kind,
+            );
+        }
+    }
+    let tool_result_event = record
+        .events
+        .iter()
+        .find(|event| event.kind == "tool_result")
+        .expect("session log must contain a tool_result event");
+    assert!(
+        serde_json::to_string(&tool_result_event.payload)
+            .expect("serialize tool_result payload")
+            .contains("<redacted:github_token"),
+        "tool_result session event must carry the redaction marker",
+    );
+    if let Some(replay) = &record.replay {
+        for event in &replay.events {
+            let payload_json =
+                serde_json::to_string(&event.payload).expect("serialize replay event payload");
+            assert!(
+                !payload_json.contains(SECRET),
+                "session replay event {:?} leaked the raw secret",
+                event.kind,
+            );
+        }
+    }
 
     let _ = fs::remove_dir_all(root);
 }
@@ -1805,6 +2109,180 @@ async fn bang_command_completes_locally_without_provider_request() {
     let completed = completed.expect("ls turn should complete");
     assert!(completed.contains("Cargo.toml"), "{completed}");
     assert!(completed.contains("src"), "{completed}");
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn local_shell_command_parses_single_and_double_bang_prefixes() {
+    let single = local_shell_command("!ls").expect("`!ls` parses as a local shell command");
+    assert_eq!(single.command, "ls");
+    assert!(
+        !single.exclude_from_context,
+        "single-bang must keep the exchange in LLM context",
+    );
+
+    let single_with_lead =
+        local_shell_command("   !git status   ").expect("leading/trailing whitespace ok");
+    assert_eq!(single_with_lead.command, "git status");
+    assert!(!single_with_lead.exclude_from_context);
+
+    let double = local_shell_command("!!git status").expect("`!!git status` is a quiet bang");
+    assert_eq!(double.command, "git status");
+    assert!(
+        double.exclude_from_context,
+        "double-bang must skip the LLM context",
+    );
+
+    let double_with_lead =
+        local_shell_command("  !!  echo hi ").expect("leading/inner whitespace ok");
+    assert_eq!(double_with_lead.command, "echo hi");
+    assert!(double_with_lead.exclude_from_context);
+
+    assert!(local_shell_command("ls").is_none(), "no bang prefix");
+    assert!(local_shell_command("!").is_none(), "bare bang");
+    assert!(local_shell_command("!!").is_none(), "bare double bang");
+    assert!(
+        local_shell_command("!!  ").is_none(),
+        "double bang with no command",
+    );
+    assert!(
+        local_shell_command("!ls\nrm -rf /").is_none(),
+        "multi-line prompts are not local shell commands",
+    );
+}
+
+#[tokio::test]
+async fn double_bang_command_runs_locally_and_skips_llm_context() {
+    let root = temp_workspace("agent_local_double_bang");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("acknowledged".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    // Quiet bang still runs through the shell tool and renders in the TUI…
+    let mut quiet_rx = agent.start_turn("!!ls".to_string(), CancellationToken::new());
+    let mut quiet_tool_result = None;
+    let mut quiet_completed = None;
+    while let Some(event) = quiet_rx.recv().await {
+        match event {
+            AgentEvent::ToolCallCompleted { result, .. } => quiet_tool_result = Some(result),
+            AgentEvent::Completed { message, .. } => quiet_completed = Some(message.content),
+            _ => {}
+        }
+    }
+    let quiet_tool_result =
+        quiet_tool_result.expect("!!ls should still execute the shell tool locally");
+    assert_eq!(quiet_tool_result.status, ToolStatus::Success);
+    assert_eq!(
+        quiet_tool_result.content["policy"]["direct_user_shell"], true,
+        "double-bang must keep the direct-user-shell sandbox bypass",
+    );
+    assert!(
+        quiet_completed
+            .as_deref()
+            .is_some_and(|text| text.contains("Cargo.toml")),
+        "!!ls output must still surface in the TUI transcript: {quiet_completed:?}",
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "!!ls must not trigger an LLM round itself",
+    );
+
+    // …but the next LLM turn must not replay the quiet exchange.
+    let mut llm_rx = agent.start_turn("summarise".to_string(), CancellationToken::new());
+    while llm_rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "follow-up turn should hit the provider");
+    let input_texts: Vec<&str> = requests[0]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        input_texts.contains(&"summarise"),
+        "follow-up user prompt must reach the LLM: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().all(|text| !text.contains("!!ls")),
+        "double-bang prompt must not appear in the LLM input: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().all(|text| !text.contains("Cargo.toml")),
+        "double-bang shell output must not appear in the LLM input: {input_texts:?}",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn single_bang_command_records_exchange_in_llm_context() {
+    let root = temp_workspace("agent_local_single_bang_context");
+    fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").expect("write cargo");
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta("ok".to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("resp_1".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+    let agent = Agent::new(
+        AppConfig {
+            workspace_root: root.clone(),
+            ..AppConfig::default()
+        },
+        provider.clone(),
+    );
+
+    let mut bang_rx = agent.start_turn("!ls".to_string(), CancellationToken::new());
+    while bang_rx.recv().await.is_some() {}
+    assert!(
+        provider.requests().is_empty(),
+        "single-bang itself does not call the model",
+    );
+
+    let mut next_rx = agent.start_turn("recap".to_string(), CancellationToken::new());
+    while next_rx.recv().await.is_some() {}
+
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    let input_texts: Vec<&str> = requests[0]
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            LlmInputItem::UserText(text) | LlmInputItem::AssistantText(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        input_texts.contains(&"!ls"),
+        "single-bang prompt must be replayed in the LLM input: {input_texts:?}",
+    );
+    assert!(
+        input_texts.iter().any(|text| text.contains("Cargo.toml")),
+        "single-bang shell output must be replayed in the LLM input: {input_texts:?}",
+    );
 
     let _ = fs::remove_dir_all(root);
 }
@@ -2562,6 +3040,7 @@ fn control_tools_are_advertised_in_build_and_plan_modes() {
         EXPLORE_TOOL_NAME,
         DELEGATE_PLAN_TOOL_NAME,
         DELEGATE_REVIEW_TOOL_NAME,
+        DELEGATE_CHAIN_TOOL_NAME,
     ];
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build, false);
@@ -2599,6 +3078,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
             DELEGATE_TOOL_NAME.to_string(),
             DELEGATE_PLAN_TOOL_NAME.to_string(),
             DELEGATE_REVIEW_TOOL_NAME.to_string(),
+            DELEGATE_CHAIN_TOOL_NAME.to_string(),
         ]
     );
 }
@@ -3006,7 +3486,10 @@ fn test_advertised_tool(name: &str, capability: PermissionCapability) -> Adverti
         name: name.to_string(),
         description: format!("{name} test tool"),
         capability,
-        parameters: json!({"type": "object"}),
+        parallel_safe: false,
+        parameters: squeezy_tools::parse_strict_tool_parameters(json!({"type": "object"}))
+            .expect("typed tool schema"),
+        prepare_arguments: None,
     })
 }
 
@@ -3176,6 +3659,11 @@ fn config_with_skill_dirs(root: &Path) -> AppConfig {
         skills: SkillsConfig {
             user_dir: root.join("user-skills"),
             compat_user_dir: root.join("compat-skills"),
+            // Skill-activation tests below assert the full skill body
+            // reaches the system prompt; opt into the inline render so
+            // those assertions keep exercising the legacy path now that
+            // metadata-only is the default.
+            inline: true,
             ..Default::default()
         },
         ..Default::default()
@@ -3732,7 +4220,7 @@ impl squeezy_hooks::HookHandler for CompactionHookRecorderRef {
                 self.0
                     .post_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload.clone());
+                *self.0.last_post_payload.lock().unwrap() = Some(ctx.payload_json());
             }
             _ => {}
         }
@@ -3851,19 +4339,12 @@ struct DenyToolByName {
 
 impl squeezy_hooks::HookHandler for DenyToolByName {
     fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
-        if ctx.event != squeezy_hooks::HookEvent::PreToolUse {
-            return squeezy_hooks::HookResult::allow();
+        if let squeezy_hooks::HookPayload::PreToolUse { tool_name, .. } = &ctx.payload
+            && tool_name == self.tool_name
+        {
+            return squeezy_hooks::HookResult::deny(self.reason);
         }
-        let payload_name = ctx
-            .payload
-            .get("tool_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if payload_name == self.tool_name {
-            squeezy_hooks::HookResult::deny(self.reason)
-        } else {
-            squeezy_hooks::HookResult::allow()
-        }
+        squeezy_hooks::HookResult::allow()
     }
 }
 
@@ -4022,6 +4503,274 @@ async fn pretooluse_hook_allow_lets_tool_run() {
     let _ = fs::remove_dir_all(root);
 }
 
+/// Counts every `HookEvent` variant the registry observed. Used by
+/// the expanded-dispatch tests below to assert each new call site
+/// fires the documented variant without coupling to the per-variant
+/// typed payload fields (those are exercised in `squeezy-hooks`).
+struct EventCounter {
+    counts: std::sync::Mutex<BTreeMap<squeezy_hooks::HookEvent, usize>>,
+}
+
+impl EventCounter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            counts: std::sync::Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn count(&self, event: squeezy_hooks::HookEvent) -> usize {
+        self.counts
+            .lock()
+            .unwrap()
+            .get(&event)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+struct EventCounterRef(Arc<EventCounter>);
+
+impl squeezy_hooks::HookHandler for EventCounterRef {
+    fn handle(&self, ctx: &squeezy_hooks::HookContext) -> squeezy_hooks::HookResult {
+        *self.0.counts.lock().unwrap().entry(ctx.event).or_insert(0) += 1;
+        squeezy_hooks::HookResult::allow()
+    }
+}
+
+/// End-to-end check that a clean tool-less turn fans out the new
+/// session-lifecycle hooks: `Setup` + `SessionStart` fire exactly
+/// once on the first turn (after hooks installed via
+/// [`Agent::set_hooks`]), `UserPromptSubmit` fires per turn, and
+/// `Stop` fires once the turn yields back to the user. Guards
+/// against future refactors regressing any of those four call sites
+/// silently.
+#[tokio::test]
+async fn session_lifecycle_hooks_fire_around_clean_turn() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("hello".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("again".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("first turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::Setup),
+        1,
+        "Setup must fire exactly once on the first turn after hooks install",
+    );
+    assert_eq!(
+        counter.count(HookEvent::SessionStart),
+        1,
+        "SessionStart must fire exactly once on the first turn",
+    );
+    assert_eq!(
+        counter.count(HookEvent::UserPromptSubmit),
+        1,
+        "UserPromptSubmit must fire once per turn",
+    );
+    assert_eq!(
+        counter.count(HookEvent::Stop),
+        1,
+        "Stop must fire once at the end of a clean turn",
+    );
+
+    let mut rx = agent.start_turn("second turn".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::Setup),
+        1,
+        "Setup must not fire again on subsequent turns",
+    );
+    assert_eq!(
+        counter.count(HookEvent::SessionStart),
+        1,
+        "SessionStart must not fire again on subsequent turns",
+    );
+    assert_eq!(
+        counter.count(HookEvent::UserPromptSubmit),
+        2,
+        "UserPromptSubmit must fire per turn",
+    );
+    assert_eq!(counter.count(HookEvent::Stop), 2, "Stop must fire per turn",);
+}
+
+/// Verifies the post-tool dispatch sites: every tool call produces
+/// one `PostToolUse` and one `PostTool` event, and a failed tool
+/// status additionally fires `PostToolUseFailure` while leaving the
+/// "result was appended to the conversation" `PostTool` semantics
+/// untouched. The provider drives one happy-path read and a
+/// guaranteed failure (path that does not exist) so the same
+/// registry observes both shapes inside a single turn.
+#[tokio::test]
+async fn post_tool_and_failure_hooks_split_success_and_failure_paths() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let root = temp_workspace("post_tool_and_failure_hooks");
+    fs::write(root.join("README.md"), "hi\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "ok_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            })),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "fail_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "does-not-exist.txt" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Allow,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn(
+        "read README and a missing file".to_string(),
+        CancellationToken::new(),
+    );
+    while let Some(_event) = rx.recv().await {}
+
+    assert_eq!(
+        counter.count(HookEvent::PostToolUse),
+        2,
+        "PostToolUse must fire for every tool call regardless of status",
+    );
+    assert_eq!(
+        counter.count(HookEvent::PostTool),
+        2,
+        "PostTool must fire once per FunctionCallOutput appended to the conversation",
+    );
+    assert_eq!(
+        counter.count(HookEvent::PostToolUseFailure),
+        1,
+        "PostToolUseFailure must fire exactly once, for the failed tool call",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+/// `PermissionRequest` must fire on every permission evaluation, and
+/// `PermissionDenied` must fire whenever the eventual decision is a
+/// deny. We deny via a deny-by-default permission policy so the
+/// evaluator short-circuits to `ApprovalDecision::Denied` without
+/// going through the user-approval round-trip.
+#[tokio::test]
+async fn permission_request_and_denied_hooks_fire_on_policy_deny() {
+    use squeezy_hooks::{HookEvent, HookRegistry};
+
+    let root = temp_workspace("permission_request_denied_hooks");
+    fs::write(root.join("README.md"), "hi\n").expect("write readme");
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::ToolCall(LlmToolCall {
+                call_id: "read_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+            })),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta("done".to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("resp_final".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+    let config = AppConfig {
+        workspace_root: root.clone(),
+        permissions: PermissionPolicy {
+            read: PermissionMode::Deny,
+            ..Default::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut agent = Agent::new(config, provider);
+    let counter = EventCounter::new();
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(EventCounterRef(counter.clone())));
+    agent.set_hooks(Some(Arc::new(registry)));
+
+    let mut rx = agent.start_turn("read the README".to_string(), CancellationToken::new());
+    while let Some(_event) = rx.recv().await {}
+
+    assert!(
+        counter.count(HookEvent::PermissionRequest) >= 1,
+        "PermissionRequest must fire at least once before the policy evaluation runs",
+    );
+    assert!(
+        counter.count(HookEvent::PermissionDenied) >= 1,
+        "PermissionDenied must fire when the policy resolves the request as a deny",
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[test]
 fn compaction_strategy_default_is_extractive() {
     assert_eq!(
@@ -4090,6 +4839,7 @@ fn core_control_tools_includes_new_delegate_planner_reviewer() {
     assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));
     assert!(names.iter().any(|n| n == DELEGATE_PLAN_TOOL_NAME));
     assert!(names.iter().any(|n| n == DELEGATE_REVIEW_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_CHAIN_TOOL_NAME));
 }
 
 #[test]
@@ -4157,7 +4907,7 @@ fn parent_tools_with_mutators() -> Vec<AdvertisedTool> {
 
 #[test]
 fn explore_subagent_cannot_call_write_file() {
-    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the explorer
+    // F10-typed-subagent-permission-derivation: the explorer
     // role is read-only by construction. `subagent_allowed_tools` filters the
     // parent tool advertisement down to Read|Search capability, so even when
     // the parent advertises `write_file`, `apply_patch`, and `shell`, the
@@ -4222,7 +4972,7 @@ fn typed_subagents_filter_to_read_search_capability() {
 
 #[test]
 fn reviewer_subagent_cannot_call_apply_patch_or_shell() {
-    // F10-typed-subagent-permission-derivation (squeezy-1ro.52): the reviewer
+    // F10-typed-subagent-permission-derivation: the reviewer
     // role reviews diffs and must not be able to mutate the working tree or
     // run shell commands, even if the parent advertisement contains those
     // tools.
@@ -4978,6 +5728,280 @@ async fn compact_with_strategy_uses_extractive_when_no_model_configured() {
     );
 }
 
+#[tokio::test]
+async fn compact_with_strategy_accepts_structured_template_output() {
+    // End-to-end: when the model returns a four-slot structured document,
+    // `compact_conversation_with_strategy` accepts it verbatim and stamps
+    // it into both the returned report and the in-memory state. This is
+    // the happy path that F12-pi-iterative-summary-update unlocks; the
+    // legacy "rewrite verbatim" prompt would have accepted any string,
+    // including ones that silently dropped `## Decisions`.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let structured = "## Goal\nbuild a parser\n\n\
+                      ## Progress\n- wrote lexer\n\n\
+                      ## Decisions\n- use tree-sitter\n\n\
+                      ## Next\n- wire grammar tests\n";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(structured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("structured compaction should accept the model output");
+
+    assert_eq!(report.summary.trim(), structured.trim());
+    assert_eq!(state.summary.as_deref(), Some(structured.trim()));
+    assert_eq!(
+        conversation.first().and_then(|item| match item {
+            LlmInputItem::UserText(text) => Some(text.as_str()),
+            _ => None,
+        }),
+        Some(structured.trim()),
+        "synthetic summary head must carry the structured output"
+    );
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "model-assisted compaction issues exactly one request"
+    );
+    let prompt = match requests[0].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+    for slot in ["## Goal", "## Progress", "## Decisions", "## Next"] {
+        assert!(
+            prompt.contains(slot),
+            "model prompt must advertise slot header {slot}"
+        );
+    }
+    assert!(
+        prompt.contains("<new-conversation>"),
+        "model prompt must wrap the extractive output in a `<new-conversation>` block"
+    );
+}
+
+#[tokio::test]
+async fn compact_with_strategy_falls_back_when_model_output_missing_slots() {
+    // The validator is the safety net: if the model returns prose without
+    // all four required slots, `compact_conversation_with_strategy` keeps
+    // the deterministic extractive summary so the file-lineage append pass
+    // still has a stable anchor. Any model that ignored the structured
+    // template instructions would otherwise quietly degrade the summary
+    // chain — the same failure mode F12-pi-iterative-summary-update fixes.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let unstructured = "Here is a freeform summary that drops decisions and next steps entirely.";
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(unstructured.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some("compaction".to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut conversation = mid_turn_test_conversation();
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+    let report = super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("compaction should still produce extractive output");
+
+    assert!(
+        report
+            .summary
+            .contains("Squeezy compacted conversation context"),
+        "missing-slot output must fall back to the extractive summary, got: {}",
+        report.summary,
+    );
+    assert!(
+        !report.summary.contains(unstructured),
+        "unstructured model output must not be promoted to the final summary"
+    );
+}
+
+#[tokio::test]
+async fn compact_with_strategy_passes_previous_summary_block_on_iterative_compaction() {
+    // The iterative-update contract: on the second compaction the prior
+    // summary must reach the model as a *dedicated* `<previous-summary>`
+    // block so it can deterministically carry forward slot contents.
+    // Embedding it only inline inside the extractive output (the legacy
+    // behaviour) is what made the slot chain lose ~60% of content after
+    // a handful of generations.
+    use squeezy_core::Redactor;
+    use std::sync::Arc;
+
+    let structured =
+        "## Goal\ngoal text\n\n## Progress\n- p1\n\n## Decisions\n- d1\n\n## Next\n- n1\n";
+    let provider = Arc::new(MockProvider::new(vec![
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(structured.to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("compaction-1".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+        vec![
+            Ok(LlmEvent::Started),
+            Ok(LlmEvent::TextDelta(structured.to_string())),
+            Ok(LlmEvent::Completed {
+                response_id: Some("compaction-2".to_string()),
+                cost: CostSnapshot::default(),
+                stop_reason: None,
+                reasoning_only_stop: false,
+            }),
+        ],
+    ]));
+
+    let config = AppConfig {
+        context_compaction: ContextCompactionConfig {
+            strategy: CompactionStrategy::ModelAssisted,
+            model_assisted_model: Some("test-model".to_string()),
+            model_assisted_timeout_secs: 5,
+            recent_items: 2,
+            min_items: 4,
+            estimated_tokens: 0,
+            ..ContextCompactionConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let mut state = ContextCompactionState::default();
+    let provider_trait: Arc<dyn LlmProvider> = provider.clone();
+    let redactor = Arc::new(Redactor::default());
+
+    let mut conversation = mid_turn_test_conversation();
+    super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("first compaction");
+    assert_eq!(state.summary.as_deref(), Some(structured.trim()));
+
+    let mut conversation = mid_turn_test_conversation();
+    super::compact_conversation_with_strategy(
+        &mut conversation,
+        &mut state,
+        &[],
+        None,
+        &provider_trait,
+        None,
+        &redactor,
+        &config,
+        ContextCompactionTrigger::Manual,
+        true,
+    )
+    .await
+    .expect("second compaction");
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "each compaction issues exactly one model-assisted request"
+    );
+    let first_prompt = match requests[0].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+    let second_prompt = match requests[1].input.first().expect("input present") {
+        LlmInputItem::UserText(text) => text.as_str(),
+        other => panic!("expected UserText prompt, got {other:?}"),
+    };
+
+    // Match the actual block opening (`<previous-summary>\n`) — the Rules
+    // text also references the tag inside backticks, so the bare string
+    // would over-match on cold start.
+    assert!(
+        !first_prompt.contains("<previous-summary>\n"),
+        "cold-start compaction must not emit a `<previous-summary>` block; got prompt:\n{first_prompt}"
+    );
+    assert!(
+        second_prompt.contains("<previous-summary>\n"),
+        "iterative compaction must surface the prior summary as a `<previous-summary>` block; got prompt:\n{second_prompt}"
+    );
+    assert!(
+        second_prompt.contains("- d1"),
+        "iterative compaction must embed the prior summary's `## Decisions` body verbatim; got prompt:\n{second_prompt}"
+    );
+}
+
 #[test]
 fn parse_subagent_structured_tail_extracts_findings_object() {
     let text = "Here is the plan.\n\n{\"findings\": [{\"finding\": \"missing tracing\", \"recommendation\": \"add span\", \"priority\": \"warning\"}], \"summary\": \"add a tracing span\"}";
@@ -5215,6 +6239,78 @@ fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
     assert!(
         !request.prompt.is_empty(),
         "review should synthesize a default prompt"
+    );
+}
+
+#[test]
+fn delegate_chain_threads_previous_step_summary_into_next_step_prompt() {
+    // F10: the chain helper must replace every literal `{previous}` token
+    // in step N+1's prompt with step N's summary verbatim. Step 0 sees an
+    // empty `previous`, so the leading step's template stays
+    // byte-identical apart from the placeholder being erased — that
+    // matches how peer agents (opencode's `chain` mode) seed the lead-in
+    // step.
+    //
+    // Substitution is exercised through `chain_substitute_previous`
+    // directly so the test does not need a live LLM or subagent registry
+    // — the chain helper IS the contract documented in the
+    // `delegate_chain` tool description, and a regression here would
+    // silently send unrendered `{previous}` text to the model.
+    let step_a = "Summarise the auth module";
+    let step_b_template = "Now critique the summary: {previous}. Flag any missing risks.";
+
+    let step_a_rendered = chain_substitute_previous(step_a, "");
+    assert_eq!(
+        step_a_rendered, step_a,
+        "first step has no prior summary; template must pass through unchanged"
+    );
+
+    let step_a_summary =
+        "Auth uses JWT with HS256, refresh tokens stored in redis, 14d TTL.".to_string();
+    let step_b_rendered = chain_substitute_previous(step_b_template, &step_a_summary);
+    assert_eq!(
+        step_b_rendered,
+        format!(
+            "Now critique the summary: {summary}. Flag any missing risks.",
+            summary = step_a_summary
+        ),
+        "{{previous}} must be replaced verbatim with step A's summary so the chain threads output of A → input of B"
+    );
+    assert!(
+        !step_b_rendered.contains(DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER),
+        "rendered chain prompt must not still contain the literal placeholder"
+    );
+
+    // Also confirm the parser shape so the dispatcher can build the
+    // chained delegate calls without a separate JSON contract round-trip.
+    let chain_call = ToolCall {
+        call_id: "chain_1".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({
+            "steps": [
+                { "prompt": step_a },
+                { "prompt": step_b_template },
+            ]
+        }),
+    };
+    let steps = parse_delegate_chain_steps(&chain_call).expect("chain args valid");
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].prompt, step_a);
+    assert_eq!(steps[1].prompt, step_b_template);
+    assert!(steps[0].scope.is_none());
+    assert!(steps[1].scope.is_none());
+
+    // Missing prompt on a step must surface as an actionable error
+    // before any subagent lease is taken.
+    let bad = ToolCall {
+        call_id: "chain_bad".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({ "steps": [{ "prompt": "" }] }),
+    };
+    let err = parse_delegate_chain_steps(&bad).expect_err("empty prompt must error");
+    assert!(
+        err.contains("prompt"),
+        "error must mention the missing prompt field: {err}"
     );
 }
 
@@ -6152,4 +7248,484 @@ fn assistant_text_has_unresolved_intent_skips_intent_without_action_verb() {
     assert!(!assistant_text_has_unresolved_intent(
         "Let me think about this. The answer depends on what you mean by X.",
     ));
+}
+
+// F17-dispatch-command-completeness: each typed `DispatchCommand`
+// variant lands in `Agent::dispatch_command` with a deterministic
+// outcome. Variants whose effect lives in the TUI return `TuiOnly`;
+// agent-side variants return the structured outcome the caller
+// (eval / RPC) needs.
+
+fn mock_agent_for_dispatch() -> Agent {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    Agent::new(AppConfig::default(), provider)
+}
+
+#[tokio::test]
+async fn dispatch_command_mode_switches() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    // Repeating the call is a no-op: changed=false.
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Plan { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: false } if mode == "plan"
+    ));
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Build { prompt: None })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "build"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_cost_and_context() {
+    let agent = mock_agent_for_dispatch();
+    let cost = agent.dispatch_command(DispatchCommand::Cost).await;
+    assert!(matches!(cost, DispatchOutcome::CostSnapshot { .. }));
+    let ctx = agent.dispatch_command(DispatchCommand::Context).await;
+    assert!(matches!(ctx, DispatchOutcome::ContextSnapshot { .. }));
+}
+
+#[tokio::test]
+async fn dispatch_command_jobs_permissions_reviewer_snapshots_are_empty_by_default() {
+    let agent = mock_agent_for_dispatch();
+    let jobs = agent.dispatch_command(DispatchCommand::Tasks).await;
+    assert!(matches!(jobs, DispatchOutcome::JobsList { count: 0 }));
+    let jobs_alias = agent.dispatch_command(DispatchCommand::Jobs).await;
+    assert!(matches!(jobs_alias, DispatchOutcome::JobsList { count: 0 }));
+    let perms = agent.dispatch_command(DispatchCommand::Permissions).await;
+    assert!(matches!(
+        perms,
+        DispatchOutcome::PermissionsList { count: 0 }
+    ));
+    let reviewer = agent.dispatch_command(DispatchCommand::Reviewer).await;
+    assert!(matches!(
+        reviewer,
+        DispatchOutcome::ReviewerSnapshot { count: 0 }
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_task_lookup_and_cancel_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let detail = agent
+        .dispatch_command(DispatchCommand::Task {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        detail,
+        DispatchOutcome::TaskDetail { ref id, found: false } if id == "99"
+    ));
+    let cancel = agent
+        .dispatch_command(DispatchCommand::TaskCancel {
+            id: "99".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        cancel,
+        DispatchOutcome::TaskCancel { ref id, cancelled: false } if id == "99"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_attachments_default_to_empty() {
+    let agent = mock_agent_for_dispatch();
+    let attachments = agent.dispatch_command(DispatchCommand::Attachments).await;
+    assert!(matches!(
+        attachments,
+        DispatchOutcome::AttachmentsList { count: 0 }
+    ));
+    let pins = agent.dispatch_command(DispatchCommand::Pins).await;
+    assert!(matches!(pins, DispatchOutcome::PinsList { count: 0 }));
+}
+
+#[tokio::test]
+async fn dispatch_command_unpin_missing_returns_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Unpin {
+            id: "pin-missing".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/unpin"));
+}
+
+#[tokio::test]
+async fn dispatch_command_attach_path_propagates_error() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Attach {
+            path: "/path/that/does/not/exist".to_string(),
+        })
+        .await;
+    assert!(matches!(outcome, DispatchOutcome::Error { ref command, .. } if command == "/attach"));
+}
+
+#[tokio::test]
+async fn dispatch_command_session_lookup_for_missing_id() {
+    let agent = mock_agent_for_dispatch();
+    let outcome = agent
+        .dispatch_command(DispatchCommand::Session {
+            id: "missing".to_string(),
+        })
+        .await;
+    assert!(matches!(
+        outcome,
+        DispatchOutcome::SessionDetail { ref session_id, exists: false } if session_id == "missing"
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_command_tui_only_for_renderer_owned_commands() {
+    let agent = mock_agent_for_dispatch();
+    let cases: &[(DispatchCommand, &str)] = &[
+        (DispatchCommand::Diff, "diff"),
+        (DispatchCommand::Keymap, "keymap"),
+        (DispatchCommand::Statusline, "statusline"),
+        (DispatchCommand::Help { topic: None }, "help"),
+        (DispatchCommand::Config { section: None }, "config"),
+        (DispatchCommand::Model, "model"),
+        (
+            DispatchCommand::Plans {
+                args: String::new(),
+            },
+            "plans",
+        ),
+        (DispatchCommand::Copy { target: None }, "copy"),
+        (DispatchCommand::Collapse { category: None }, "collapse"),
+        (DispatchCommand::Expand { category: None }, "expand"),
+        (
+            DispatchCommand::Feedback {
+                args: String::new(),
+            },
+            "feedback",
+        ),
+        (
+            DispatchCommand::Report {
+                args: String::new(),
+            },
+            "report",
+        ),
+        (DispatchCommand::Effort { value: None }, "effort"),
+        (DispatchCommand::Verbosity { value: None }, "verbosity"),
+        (
+            DispatchCommand::ToolVerbosity { value: None },
+            "tool-verbosity",
+        ),
+        (
+            DispatchCommand::Theme {
+                theme: "dark".to_string(),
+            },
+            "theme",
+        ),
+        (DispatchCommand::Fork, "fork"),
+        (
+            DispatchCommand::Resume {
+                id: "sess".to_string(),
+            },
+            "resume",
+        ),
+        (DispatchCommand::Checkpoints, "checkpoints"),
+        (
+            DispatchCommand::Checkpoint {
+                id: "ck".to_string(),
+            },
+            "checkpoint",
+        ),
+        (DispatchCommand::Undo, "undo"),
+        (
+            DispatchCommand::RevertTurn {
+                group_id: "t".to_string(),
+            },
+            "revert-turn",
+        ),
+        (
+            DispatchCommand::SessionExportHtml {
+                id: "s".to_string(),
+                path: None,
+            },
+            "session-export-html",
+        ),
+        (
+            DispatchCommand::SessionCleanup {
+                args: String::new(),
+            },
+            "session-cleanup",
+        ),
+        (DispatchCommand::Pin { target: None }, "pin"),
+    ];
+    for (cmd, expected_kind) in cases {
+        let outcome = agent.dispatch_command(cmd.clone()).await;
+        match outcome {
+            DispatchOutcome::TuiOnly { command } => {
+                assert_eq!(command, *expected_kind, "TuiOnly kind mismatch for {cmd:?}");
+            }
+            other => panic!("expected TuiOnly for {cmd:?}, got {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatch_command_raw_routes_through_parser() {
+    let agent = mock_agent_for_dispatch();
+    let plan = agent.dispatch_command_raw("/plan").await;
+    assert!(matches!(
+        plan,
+        DispatchOutcome::ModeChanged { ref mode, changed: true } if mode == "plan"
+    ));
+    let unknown = agent.dispatch_command_raw("/no-such-command").await;
+    assert!(matches!(
+        unknown,
+        DispatchOutcome::Unsupported { ref command } if command == "/no-such-command"
+    ));
+    let attach = agent.dispatch_command_raw("/attach").await;
+    assert!(matches!(
+        attach,
+        DispatchOutcome::Error { ref command, .. } if command == "/attach"
+    ));
+}
+
+fn completed_turn_response(text: &str, response_id: &str) -> Vec<Result<LlmEvent>> {
+    vec![
+        Ok(LlmEvent::Started),
+        Ok(LlmEvent::TextDelta(text.to_string())),
+        Ok(LlmEvent::Completed {
+            response_id: Some(response_id.to_string()),
+            cost: CostSnapshot::default(),
+            stop_reason: None,
+            reasoning_only_stop: false,
+        }),
+    ]
+}
+
+#[tokio::test]
+async fn next_turn_dispatches_through_start_turn() {
+    // `next_turn` is the typed entry point for "start a fresh user
+    // turn". It must run the full LLM-turn loop and surface the same
+    // event stream as `start_turn`, with the supplied input reaching
+    // the provider as a `UserText` item.
+    let provider = Arc::new(MockProvider::new(vec![completed_turn_response(
+        "ok",
+        "resp_next",
+    )]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.next_turn("kick off a new turn".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed {
+            message,
+            response_id,
+            ..
+        } = event
+        {
+            completed = Some((message.content, response_id));
+        }
+    }
+
+    assert_eq!(
+        completed,
+        Some(("ok".to_string(), Some("resp_next".to_string()))),
+        "next_turn should drive the LLM loop to completion just like start_turn"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "next_turn should issue exactly one provider request"
+    );
+    assert!(
+        requests[0].input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::UserText(text) if text == "kick off a new turn"
+        )),
+        "next_turn input should reach the provider as a UserText item, got {:?}",
+        requests[0].input
+    );
+}
+
+#[tokio::test]
+async fn follow_up_appends_user_text_without_running_a_turn() {
+    // `follow_up` is the typed entry point for "extend the current
+    // turn with another user message". It must push the text onto the
+    // conversation queue (the same path as `queue_user_message`) and
+    // it must NOT spawn a new turn — the provider should see zero
+    // requests until a turn is started.
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    agent
+        .follow_up("more context for the running turn".to_string())
+        .await;
+
+    let conversation = agent.conversation_state.lock().await.conversation.clone();
+    assert_eq!(
+        conversation.len(),
+        1,
+        "follow_up should push exactly one item onto the conversation queue"
+    );
+    assert!(
+        matches!(
+            &conversation[0],
+            LlmInputItem::UserText(text) if text == "more context for the running turn"
+        ),
+        "follow_up should dispatch through the conversation-queue path as a UserText item, got {:?}",
+        conversation[0]
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "follow_up must not start a new turn"
+    );
+}
+
+#[tokio::test]
+async fn steer_aliases_next_turn_until_interrupt_semantics_land() {
+    // `steer` is the typed entry point for "interrupt the running
+    // turn with new input". The agent has no mid-turn-interrupt
+    // primitive yet, so `steer` is documented as an alias for
+    // `next_turn`: it must drive a fresh turn to completion and
+    // surface the input to the provider exactly like `next_turn`
+    // does, so call sites can adopt the typed name today and pick up
+    // real interrupt semantics for free when they land.
+    let provider = Arc::new(MockProvider::new(vec![completed_turn_response(
+        "steered",
+        "resp_steer",
+    )]));
+    let agent = Agent::new(AppConfig::default(), provider.clone());
+
+    let mut rx = agent.steer("change direction".to_string(), CancellationToken::new());
+    let mut completed = None;
+    while let Some(event) = rx.recv().await {
+        if let AgentEvent::Completed {
+            message,
+            response_id,
+            ..
+        } = event
+        {
+            completed = Some((message.content, response_id));
+        }
+    }
+
+    assert_eq!(
+        completed,
+        Some(("steered".to_string(), Some("resp_steer".to_string()))),
+        "steer should currently behave like next_turn and run a turn to completion"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "steer should issue exactly one provider request via the next_turn path"
+    );
+    assert!(
+        requests[0].input.iter().any(|item| matches!(
+            item,
+            LlmInputItem::UserText(text) if text == "change direction"
+        )),
+        "steer input should reach the provider as a UserText item, got {:?}",
+        requests[0].input
+    );
+}
+
+// F08-session-lifecycle-events-cancelable: `Agent::switch_session`
+// consults the typed `AgentHookBus` before swapping the active
+// session, and a `Decision::Deny` from any registered handler aborts
+// the swap before `resume_current` runs. The two tests below pin both
+// halves of that contract — allow proceeds to `resume_current`, which
+// then fails with the synthetic id; deny short-circuits with the hook
+// message and leaves the in-process session id untouched.
+
+struct AllowSwitchHook;
+
+impl squeezy_hooks::AgentHook for AllowSwitchHook {
+    fn before_session_switch<'a>(
+        &'a self,
+        _target_id: &'a str,
+    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
+        Box::pin(async { squeezy_hooks::Decision::Allow })
+    }
+}
+
+struct DenySwitchHook {
+    reason: &'static str,
+}
+
+impl squeezy_hooks::AgentHook for DenySwitchHook {
+    fn before_session_switch<'a>(
+        &'a self,
+        _target_id: &'a str,
+    ) -> squeezy_hooks::HookFuture<'a, squeezy_hooks::Decision> {
+        let message = self.reason.to_string();
+        Box::pin(async move { squeezy_hooks::Decision::Deny { message } })
+    }
+}
+
+#[tokio::test]
+async fn switch_session_allow_hook_proceeds_to_resume_current() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    let mut bus = squeezy_hooks::AgentHookBus::new();
+    bus.register(Box::new(AllowSwitchHook));
+    agent.set_agent_hook_bus(Some(Arc::new(bus)));
+
+    // The synthetic id has no on-disk session, so `resume_current`
+    // will reject the swap once it actually runs. The exact disk-level
+    // failure mode varies by environment (io::ErrorKind::NotFound, an
+    // explicit "is not resumable" message, etc.), so the assertion
+    // anchors on the *negative* shape that uniquely identifies the
+    // hook deny path. If allow ever leaks the deny message we'd see
+    // "denied by hook" instead of a resume-current error.
+    let result = agent.switch_session("nonexistent-session-id-allow").await;
+    let err = result.expect_err("nonexistent synthetic session must fail to resume");
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("denied by hook"),
+        "allow hook must never short-circuit to a deny error: {msg}",
+    );
+    assert!(
+        !msg.is_empty(),
+        "resume_current must surface its disk-level failure, got empty error",
+    );
+}
+
+#[tokio::test]
+async fn switch_session_deny_hook_aborts_before_resume_current() {
+    let provider = Arc::new(MockProvider::new(Vec::new()));
+    let mut agent = Agent::new(AppConfig::default(), provider);
+    let initial_session_id = agent.session_id();
+
+    let mut bus = squeezy_hooks::AgentHookBus::new();
+    bus.register(Box::new(DenySwitchHook {
+        reason: "unsaved work",
+    }));
+    agent.set_agent_hook_bus(Some(Arc::new(bus)));
+
+    let result = agent.switch_session("any-target-session-id").await;
+    let err = result.expect_err("denying hook must abort the switch");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("denied by hook") && msg.contains("unsaved work"),
+        "expected deny error from hook, got {msg}",
+    );
+    assert!(
+        !msg.contains("not resumable"),
+        "deny must short-circuit before resume_current touches disk: {msg}",
+    );
+    assert_eq!(
+        agent.session_id(),
+        initial_session_id,
+        "deny must leave the in-process session id untouched",
+    );
 }

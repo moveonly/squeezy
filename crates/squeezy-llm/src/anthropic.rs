@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_stream::try_stream;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -12,19 +15,37 @@ use crate::{
     AnthropicThinkingBlock, AnthropicThinkingKind, LlmEvent, LlmInputItem, LlmProvider, LlmRequest,
     LlmStream, LlmToolCall, ReasoningKind, ReasoningPayload,
     anthropic_betas::anthropic_header_value,
-    cache_policy::{CachePolicy, json_markers, should_apply_caching},
-    credentials::resolve_api_key_with_inline,
-    retry::{RetryPolicy, idle_timeout, send_with_retry, with_stream_retry},
+    cache_policy::{CachePolicy, CacheRetention, json_markers, should_apply_caching},
+    credentials::{ApiKeySource, resolve_api_key_with_inline, static_api_key_source},
+    oauth::{anthropic_oauth_beta_header, is_anthropic_oauth_token},
+    overflow::{OverflowSignal, Usage as OverflowUsage, classify_terminal},
+    retry::{RetryPolicy, idle_timeout, send_with_auth_retry, with_stream_retry},
     sse::SseDecoder,
+    transport::shared_client,
 };
+
+const ANTHROPIC_PROVIDER_NAME: &str = "anthropic";
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS: u64 = 64_000;
 
+/// Identity preamble Anthropic requires on OAuth-driven requests so
+/// the call counts against the Claude Pro/Max subscription quota
+/// rather than failing the OAuth quota check. Mirrors pi's verbatim
+/// string. The user's real instructions ride after this in a second
+/// system block.
+const OAUTH_SYSTEM_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/// `User-Agent` value that marks a Squeezy-issued OAuth request as
+/// Claude-Code-compatible. Anthropic gates the OAuth quota on this
+/// identity envelope (beta header + UA + `x-app`); changing the
+/// values risks the platform rejecting the request.
+const OAUTH_USER_AGENT: &str = "claude-cli/2.1.0";
+
 #[derive(Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     base_url: String,
     transport: ProviderTransportConfig,
 }
@@ -33,7 +54,7 @@ impl std::fmt::Debug for AnthropicProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnthropicProvider")
             .field("client", &self.client)
-            .field("api_key", &"<redacted>")
+            .field("api_key", &self.api_key)
             .field("base_url", &self.base_url)
             .field("transport", &self.transport)
             .finish()
@@ -44,17 +65,43 @@ impl AnthropicProvider {
     pub fn from_config(config: &AnthropicConfig) -> Result<Self> {
         let api_key =
             resolve_api_key_with_inline(config.api_key.as_deref(), &config.api_key_env)?.value;
-        Ok(Self {
-            client: reqwest::Client::new(),
-            api_key,
-            base_url: config.base_url.trim_end_matches('/').to_string(),
-            transport: config.transport,
-        })
+        Ok(Self::with_api_key_source(
+            static_api_key_source(api_key, "anthropic"),
+            config.base_url.trim_end_matches('/').to_string(),
+            config.transport,
+        ))
     }
 
-    pub(crate) fn request_body(request: &LlmRequest) -> Value {
+    /// Construct the provider against an already-built credential
+    /// source. Used by the OAuth subscription providers (Claude
+    /// Pro/Max) so a rotating access token can flow through the same
+    /// HTTP path without rebuilding the client on every refresh.
+    pub fn with_api_key_source(
+        api_key: Arc<dyn ApiKeySource>,
+        base_url: String,
+        transport: ProviderTransportConfig,
+    ) -> Self {
+        Self {
+            client: shared_client(&transport),
+            api_key,
+            base_url,
+            transport,
+        }
+    }
+
+    /// Build the `/messages` JSON body. Parameterized on the auth
+    /// scheme so the OAuth (Claude Pro/Max) path can prepend the
+    /// Claude Code identity preamble to `system`: Anthropic gates
+    /// the OAuth quota on this envelope; the API-key path doesn't
+    /// need it.
+    pub(crate) fn request_body(request: &LlmRequest, auth: AnthropicAuthScheme) -> Value {
         let policy = CachePolicy::AUTO;
         let prompt_caching = should_apply_caching("anthropic", request);
+        let retention = if prompt_caching {
+            request.effective_cache_spec().retention
+        } else {
+            CacheRetention::None
+        };
         let max_tokens = request
             .max_output_tokens
             .map(u64::from)
@@ -64,10 +111,24 @@ impl AnthropicProvider {
                     .map(|limits| limits.max_output_tokens)
             })
             .unwrap_or(DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS);
+        // Canonicalize cross-provider tool-call ids and synthesize
+        // placeholders for orphan tool results BEFORE the
+        // Anthropic-specific message rewrite. Anthropic rejects raw
+        // OpenAI Responses `fc_…|…` ids (regex + length cap) and
+        // rejects `tool_result` blocks whose `tool_use_id` has no
+        // matching `tool_use` earlier in the same conversation; both
+        // failure modes are common after a mid-session
+        // `anthropic/claude-X → openai/gpt-Y → anthropic/...` swap.
+        let normalized_input = crate::normalize_tool_ids_for_replay(&request.input);
         let mut body = json!({
             "model": request.model,
-            "system": anthropic_system(&request.instructions, prompt_caching && policy.system),
-            "messages": anthropic_messages(&request.input, prompt_caching, policy),
+            "system": anthropic_system(
+                &request.instructions,
+                prompt_caching && policy.system,
+                auth,
+                retention,
+            ),
+            "messages": anthropic_messages(&normalized_input, prompt_caching, policy, retention),
             "max_tokens": max_tokens,
             "stream": true,
         });
@@ -95,17 +156,7 @@ impl AnthropicProvider {
                 })
                 .collect();
             if prompt_caching && policy.tools {
-                let breakpoint_idx = request
-                    .tools
-                    .iter()
-                    .rposition(|tool| !tool.name.starts_with("mcp__"))
-                    .unwrap_or(request.tools.len().saturating_sub(1));
-                if let Some(obj) = tool_values
-                    .get_mut(breakpoint_idx)
-                    .and_then(Value::as_object_mut)
-                {
-                    obj.insert("cache_control".to_string(), json!({ "type": "ephemeral" }));
-                }
+                json_markers::mark_last_stable_tool(&mut tool_values, retention);
             }
             body["tools"] = Value::Array(tool_values);
         }
@@ -113,14 +164,101 @@ impl AnthropicProvider {
     }
 }
 
-fn anthropic_system(instructions: &str, prompt_caching: bool) -> Value {
-    if !prompt_caching {
-        return json!(instructions);
-    }
-    json_markers::system_array_with_marker(instructions)
+/// Identifies whether the next HTTP attempt will authenticate with a
+/// raw API key (`x-api-key`) or an OAuth bearer token. Used to drive
+/// the OAuth identity envelope — Anthropic gates the Claude Pro/Max
+/// quota on a Claude-Code-shaped request, so OAuth-driven requests
+/// have to prepend a fixed system preamble, set
+/// `Authorization: Bearer`, and stamp the Claude Code beta header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnthropicAuthScheme {
+    ApiKey,
+    Oauth,
 }
 
-fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: CachePolicy) -> Value {
+impl AnthropicAuthScheme {
+    fn for_key(key: &str) -> Self {
+        if is_anthropic_oauth_token(key) {
+            Self::Oauth
+        } else {
+            Self::ApiKey
+        }
+    }
+}
+
+/// Combine the caller's `anthropic-beta` header value with the OAuth
+/// beta opt-in. The OAuth marker has to be present on every Claude
+/// Pro/Max request or Anthropic will route the call to the API-key
+/// quota (or reject it). Returns `None` when neither side has any
+/// value so the caller can skip the header entirely.
+fn merge_oauth_beta_header(caller: Option<&str>, auth: AnthropicAuthScheme) -> Option<String> {
+    match auth {
+        AnthropicAuthScheme::ApiKey => caller.map(str::to_string),
+        AnthropicAuthScheme::Oauth => {
+            let oauth = anthropic_oauth_beta_header();
+            let merged = match caller {
+                Some(value) if !value.trim().is_empty() => {
+                    let mut seen: Vec<&str> = Vec::new();
+                    for token in oauth.split(',').chain(value.split(',')) {
+                        let trimmed = token.trim();
+                        if trimmed.is_empty() || seen.contains(&trimmed) {
+                            continue;
+                        }
+                        seen.push(trimmed);
+                    }
+                    seen.join(",")
+                }
+                _ => oauth.to_string(),
+            };
+            Some(merged)
+        }
+    }
+}
+
+fn anthropic_system(
+    instructions: &str,
+    prompt_caching: bool,
+    auth: AnthropicAuthScheme,
+    retention: CacheRetention,
+) -> Value {
+    let identity_first = matches!(auth, AnthropicAuthScheme::Oauth);
+    if !prompt_caching {
+        if identity_first {
+            return Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": OAUTH_SYSTEM_IDENTITY,
+                }),
+                json!({
+                    "type": "text",
+                    "text": instructions,
+                }),
+            ]);
+        }
+        return json!(instructions);
+    }
+    if identity_first {
+        let mut blocks = vec![json!({
+            "type": "text",
+            "text": OAUTH_SYSTEM_IDENTITY,
+        })];
+        let with_user = json_markers::system_array_with_marker(instructions, retention);
+        if let Value::Array(items) = with_user {
+            blocks.extend(items);
+        } else {
+            blocks.push(with_user);
+        }
+        return Value::Array(blocks);
+    }
+    json_markers::system_array_with_marker(instructions, retention)
+}
+
+fn anthropic_messages(
+    input: &[LlmInputItem],
+    prompt_caching: bool,
+    policy: CachePolicy,
+    retention: CacheRetention,
+) -> Value {
     let mut messages = Vec::new();
     for item in input {
         match item {
@@ -163,6 +301,18 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: Cach
                     "content": output,
                 })],
             ),
+            LlmInputItem::Image { media_type, bytes } => push_anthropic_message(
+                &mut messages,
+                "user",
+                vec![json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": BASE64_STANDARD.encode(bytes.as_ref()),
+                    },
+                })],
+            ),
             LlmInputItem::Reasoning(ReasoningPayload::Anthropic { blocks }) => {
                 let blocks_json: Vec<Value> = blocks
                     .iter()
@@ -196,7 +346,7 @@ fn anthropic_messages(input: &[LlmInputItem], prompt_caching: bool, policy: Cach
     if prompt_caching {
         match policy.messages {
             crate::cache_policy::MessageStrategy::LatestUserMessage => {
-                json_markers::mark_last_user_block(&mut messages);
+                json_markers::mark_last_user_block(&mut messages, retention);
             }
         }
     }
@@ -224,12 +374,15 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn stream_response(&self, request: LlmRequest, cancel: CancellationToken) -> LlmStream {
+        if let Err(err) = request.ensure_vision_support("anthropic") {
+            return Box::pin(futures_util::stream::once(async move { Err(err) }));
+        }
         let client = self.client.clone();
         let api_key = self.api_key.clone();
         let url = format!("{}/messages", self.base_url);
-        let body = Self::request_body(&request);
-        let beta_header = anthropic_header_value(&request.beta_headers);
+        let caller_beta_header = anthropic_header_value(&request.beta_headers);
         let transport = self.transport;
+        let request_for_attempts = request.clone();
 
         let attempt_cancel = cancel.clone();
         let make_attempt = move || -> LlmStream {
@@ -237,8 +390,8 @@ impl LlmProvider for AnthropicProvider {
                 client.clone(),
                 api_key.clone(),
                 url.clone(),
-                body.clone(),
-                beta_header.clone(),
+                request_for_attempts.clone(),
+                caller_beta_header.clone(),
                 transport,
                 attempt_cancel.clone(),
             )
@@ -255,24 +408,38 @@ impl LlmProvider for AnthropicProvider {
 
 fn anthropic_stream_attempt(
     client: reqwest::Client,
-    api_key: String,
+    api_key: Arc<dyn ApiKeySource>,
     url: String,
-    body: Value,
-    beta_header: Option<String>,
+    request: LlmRequest,
+    caller_beta_header: Option<String>,
     transport: ProviderTransportConfig,
     cancel: CancellationToken,
 ) -> LlmStream {
     Box::pin(try_stream! {
-        let response = send_with_retry(RetryPolicy::provider_requests(transport), &cancel, || {
-            let mut builder = client
-                .post(&url)
-                .header("x-api-key", api_key.clone())
-                .header("anthropic-version", ANTHROPIC_VERSION);
-            if let Some(value) = beta_header.as_deref() {
-                builder = builder.header("anthropic-beta", value);
-            }
-            builder.json(&body)
-        }).await?;
+        let response = send_with_auth_retry(
+            &api_key,
+            RetryPolicy::provider_requests(transport),
+            &cancel,
+            |key| {
+                let auth = AnthropicAuthScheme::for_key(key);
+                let body = AnthropicProvider::request_body(&request, auth);
+                let beta_header = merge_oauth_beta_header(caller_beta_header.as_deref(), auth);
+                let mut builder = client
+                    .post(&url)
+                    .header("anthropic-version", ANTHROPIC_VERSION);
+                builder = match auth {
+                    AnthropicAuthScheme::Oauth => builder
+                        .header("authorization", format!("Bearer {key}"))
+                        .header("user-agent", OAUTH_USER_AGENT)
+                        .header("x-app", "cli"),
+                    AnthropicAuthScheme::ApiKey => builder.header("x-api-key", key),
+                };
+                if let Some(value) = beta_header.as_deref() {
+                    builder = builder.header("anthropic-beta", value);
+                }
+                builder.json(&body)
+            },
+        ).await?;
 
         let status = response.status();
         let response = if status == StatusCode::OK {
@@ -282,7 +449,24 @@ fn anthropic_stream_attempt(
                 .text()
                 .await
                 .unwrap_or_else(|_| "failed to read error response".to_string());
-            Err(SqueezyError::ProviderRequest(format!("{status}: {message}")))?;
+            let formatted = format!("{status}: {message}");
+            // Pre-stream HTTP error path. Anthropic surfaces overflow as a
+            // 400 with `prompt is too long: …` in the body; emit the
+            // classifier signal additively before propagating the error
+            // so the agent can react instead of looping into the same call.
+            if let Some(signal) = classify_terminal(
+                ANTHROPIC_PROVIDER_NAME,
+                None,
+                Some(&formatted),
+                None,
+                true,
+            ) {
+                yield LlmEvent::ContextOverflow {
+                    provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+                    signal,
+                };
+            }
+            Err(SqueezyError::ProviderRequest(formatted))?;
             unreachable!("provider error returned above");
         };
 
@@ -290,7 +474,15 @@ fn anthropic_stream_attempt(
 
         let mut decoder = SseDecoder::default();
         let mut state = AnthropicStreamState::default();
+        let mut server_model_echo = crate::ServerModelEcho::default();
         let mut saw_completed = false;
+        let mut saw_visible_output = false;
+        // Resolved context window for the SilentUsage path. `None` when the
+        // model is unknown to the local registry (e.g. an aggregator alias);
+        // the classifier just skips the usage path in that case.
+        let max_window = crate::model_info_for(ANTHROPIC_PROVIDER_NAME, &request.model)
+            .and_then(|info| info.limits)
+            .map(|limits| limits.context_window_tokens);
         let mut bytes = response.bytes_stream();
         loop {
             let polled = tokio::select! {
@@ -306,9 +498,33 @@ fn anthropic_stream_attempt(
             let Some(chunk) = next else { break; };
             let chunk = chunk.map_err(|err| SqueezyError::ProviderStream(err.to_string()))?;
             for event in decoder.push(&chunk) {
-                for llm_event in parse_anthropic_event(&event, &mut state)? {
-                    if matches!(llm_event, LlmEvent::Completed { .. }) {
-                        saw_completed = true;
+                let parsed = parse_anthropic_event(&event, &mut state)?;
+                // `message_start` populates `state.server_model` but
+                // yields no `LlmEvent`s, so drain the field at the
+                // frame boundary rather than per-event to make sure
+                // `ServerModel` lands even on the first frame.
+                if let Some(server) = state.server_model.take()
+                    && let Some(echo) = server_model_echo.observe(&request.model, &server)
+                {
+                    yield echo;
+                }
+                for llm_event in parsed {
+                    match &llm_event {
+                        LlmEvent::TextDelta(text) if !text.is_empty() => {
+                            saw_visible_output = true;
+                        }
+                        LlmEvent::ToolCall(_) => {
+                            saw_visible_output = true;
+                        }
+                        LlmEvent::Completed { .. } => {
+                            saw_completed = true;
+                            if let Some(event) =
+                                overflow_event_for_completed(&state, max_window, saw_visible_output)
+                            {
+                                yield event;
+                            }
+                        }
+                        _ => {}
                     }
                     yield llm_event;
                 }
@@ -316,9 +532,29 @@ fn anthropic_stream_attempt(
         }
 
         for event in decoder.finish() {
-            for llm_event in parse_anthropic_event(&event, &mut state)? {
-                if matches!(llm_event, LlmEvent::Completed { .. }) {
-                    saw_completed = true;
+            let parsed = parse_anthropic_event(&event, &mut state)?;
+            if let Some(server) = state.server_model.take()
+                && let Some(echo) = server_model_echo.observe(&request.model, &server)
+            {
+                yield echo;
+            }
+            for llm_event in parsed {
+                match &llm_event {
+                    LlmEvent::TextDelta(text) if !text.is_empty() => {
+                        saw_visible_output = true;
+                    }
+                    LlmEvent::ToolCall(_) => {
+                        saw_visible_output = true;
+                    }
+                    LlmEvent::Completed { .. } => {
+                        saw_completed = true;
+                        if let Some(event) =
+                            overflow_event_for_completed(&state, max_window, saw_visible_output)
+                        {
+                            yield event;
+                        }
+                    }
+                    _ => {}
                 }
                 yield llm_event;
             }
@@ -329,6 +565,38 @@ fn anthropic_stream_attempt(
                 "Anthropic stream ended without message_stop".to_string(),
             ))?;
         }
+    })
+}
+
+/// Run the triple-path overflow classifier against the Anthropic
+/// stream state at `message_stop`. Returns an additive
+/// [`LlmEvent::ContextOverflow`] when any path fires; the caller
+/// yields it immediately before the canonical [`LlmEvent::Completed`].
+///
+/// `used` totals reported `input_tokens + output_tokens` so a turn
+/// that fills the prompt budget *or* spends the budget on output
+/// can both surface as `SilentUsage` when the result equals or
+/// exceeds the model's context window.
+fn overflow_event_for_completed(
+    state: &AnthropicStreamState,
+    max_window: Option<u64>,
+    saw_visible_output: bool,
+) -> Option<LlmEvent> {
+    let used = state
+        .input_tokens
+        .unwrap_or(0)
+        .saturating_add(state.output_tokens.unwrap_or(0));
+    let usage = max_window.map(|max| OverflowUsage { used, max });
+    let signal: OverflowSignal = classify_terminal(
+        ANTHROPIC_PROVIDER_NAME,
+        state.stop_reason.as_deref(),
+        None,
+        usage.as_ref(),
+        !saw_visible_output,
+    )?;
+    Some(LlmEvent::ContextOverflow {
+        provider: ANTHROPIC_PROVIDER_NAME.to_string(),
+        signal,
     })
 }
 
@@ -344,6 +612,14 @@ struct AnthropicStreamState {
     thinking_blocks: BTreeMap<u64, AnthropicThinkingBlock>,
     finished_thinking: Vec<AnthropicThinkingBlock>,
     emitted_reasoning_done: bool,
+    /// Server-echoed model id captured from `message_start.message.model`
+    /// the first time the field is seen. Drained by the outer attempt
+    /// loop to drive [`crate::ServerModelEcho`] before any other event
+    /// is yielded downstream. `None` until Anthropic announces the
+    /// chosen model (the docs guarantee `message_start` is the first
+    /// SSE frame of every successful turn) and once the outer loop
+    /// has drained it, it stays `None` for the rest of the stream.
+    server_model: Option<String>,
 }
 
 impl AnthropicStreamState {
@@ -382,6 +658,17 @@ fn parse_anthropic_event(data: &str, state: &mut AnthropicStreamState) -> Result
             if let Some(message) = value.get("message") {
                 state.response_id = message
                     .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                // Capture the server-chosen model id so the outer
+                // attempt loop can compare it against `request.model`
+                // and emit `LlmEvent::ServerModel` when Anthropic
+                // silently substitutes (regional fallback, alias
+                // resolution, etc.). The parser writes the field
+                // here; the outer loop drains it before any other
+                // event is yielded downstream.
+                state.server_model = message
+                    .get("model")
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 merge_usage(state, message.get("usage"));

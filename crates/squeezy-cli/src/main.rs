@@ -9,34 +9,37 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use futures_util::StreamExt;
-use squeezy_agent::Agent;
+use squeezy_agent::{Agent, AgentEvent, RequestUserInputResponse, ToolApprovalDecision};
 use squeezy_core::{
-    AppConfig, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport, ModelProfile,
-    OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
-    ResponseVerbosity, SessionMode, SettingsFile, SqueezyError, default_settings_path,
-    find_project_settings_path, project_settings_template, user_settings_template,
+    AppConfig, CostSnapshot, DEFAULT_OLLAMA_BASE_URL, MODEL_SELECTION_VERSION, McpTransport,
+    ModelProfile, OpenAiCompatiblePreset, PROJECT_SETTINGS_FILE, PermissionMode, ReasoningEffort,
+    SessionMode, SettingsFile, SqueezyError, default_settings_path, find_project_settings_path,
+    project_settings_template, user_settings_template,
 };
 use squeezy_llm::{
-    LlmEvent, LlmInputItem, LlmProvider, LlmRequest, ModelInfo, PROVIDERS, UnavailableProvider,
-    capabilities_for, fetch_ollama_model_names, models_for_provider, provider_from_config,
+    LlmProvider, ModelInfo, PROVIDERS, UnavailableProvider, capabilities_for,
+    fetch_ollama_model_names, models_for_provider, provider_from_config,
 };
 
 mod auth;
+mod config_browse;
 mod doctor;
+mod print_mode;
 mod providers;
 mod update;
 use auth::handle_auth_command;
+use config_browse::handle_browse_command;
 use doctor::DoctorArgs;
 use providers::{ProvidersCommand, handle_providers_command};
 use squeezy_store::{
-    BugReportOptions, CleanupMode, RepoProfileLoad, ResumeItem, SemanticSupport, SessionEvent,
-    SessionMetadata, SessionQuery, SessionResumeState, SessionStatus, SessionStore,
-    default_bug_report_path, ensure_repo_profile, parse_bug_report_section, refresh_repo_profile,
+    BugReportOptions, CleanupMode, RepoProfileLoad, SemanticSupport, SessionMetadata, SessionQuery,
+    SessionStatus, SessionStore, default_bug_report_path, ensure_repo_profile,
+    parse_bug_report_section, refresh_repo_profile,
 };
 use squeezy_telemetry::{
     FeedbackClient, ReportUpload, TelemetryClient, TelemetryEvent, prepare_feedback,
 };
+use squeezy_tools::{McpElicitationResponse, ToolCall, ToolResult, ToolStatus};
 use tokio_util::sync::CancellationToken;
 use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
 
@@ -76,12 +79,21 @@ struct Cli {
     max_output_tokens: Option<u32>,
     #[arg(long, help = "Start session mode: plan or build")]
     mode: Option<String>,
+    #[arg(
+        long = "session-dir",
+        value_name = "PATH",
+        help = "Directory for session traces; overrides [session].log_dir and SQUEEZY_SESSION_DIR"
+    )]
+    session_dir: Option<PathBuf>,
     #[arg(long, help = "List configured built-in providers")]
     list_providers: bool,
     #[arg(long, help = "List built-in model metadata")]
     list_models: bool,
-    #[arg(long, help = "Run one non-interactive prompt and print streamed text")]
-    prompt: Option<String>,
+    #[arg(
+        long,
+        help = "Run a non-interactive prompt and print streamed text. Repeat --prompt to queue prompts sequentially; use --prompt @path to expand a utf-8 file's contents, and --prompt - to consume piped stdin. Piped stdin is also read automatically and prepended to the first prompt when --prompt - is absent."
+    )]
+    prompt: Vec<String>,
     #[arg(
         long,
         value_name = "FORMAT",
@@ -111,6 +123,11 @@ struct Cli {
         help = "Resume an explicit session id"
     )]
     session: Option<String>,
+    #[arg(
+        long = "force-cross-project",
+        help = "Bypass the cross-project confirmation when resuming a session whose recorded cwd differs from the current one"
+    )]
+    force_cross_project: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -120,7 +137,7 @@ enum Command {
     #[command(about = "Inspect or initialize Squeezy configuration")]
     Config {
         #[command(subcommand)]
-        command: ConfigCommand,
+        command: Option<ConfigCommand>,
     },
     #[command(about = "Inspect or refresh the local generated repo profile")]
     Repo {
@@ -182,6 +199,10 @@ struct AskArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    #[command(
+        about = "List discoverable resources (skills, providers, sessions, prompt templates)"
+    )]
+    Browse(ConfigBrowseArgs),
     #[command(about = "Print the effective merged configuration with secrets redacted")]
     Inspect,
     #[command(about = "Create a default user or project settings file")]
@@ -191,6 +212,12 @@ enum ConfigCommand {
         #[arg(long, help = "Overwrite an existing file")]
         force: bool,
     },
+}
+
+#[derive(Debug, Args, Default)]
+pub(crate) struct ConfigBrowseArgs {
+    #[arg(long, help = "Emit machine-readable JSON instead of the human listing")]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -273,7 +300,15 @@ enum SessionsCommand {
     #[command(about = "Show a local session summary")]
     Show { id: String },
     #[command(about = "Resume a local session in the TUI")]
-    Resume { id: String },
+    Resume {
+        id: String,
+        /// Bypass the cross-project confirmation prompt when the recorded
+        /// `metadata.cwd` differs from the current working directory.
+        /// Equivalent to typing `y` at the prompt; useful for scripted
+        /// callers that intentionally resume sessions across checkouts.
+        #[arg(long = "force-cross-project")]
+        force_cross_project: bool,
+    },
     #[command(about = "Fork a local session into a new child and resume it in the TUI")]
     Fork { id: String },
     #[command(about = "Replay a recorded local session deterministically")]
@@ -282,8 +317,10 @@ enum SessionsCommand {
         #[arg(long, help = "Print replay report as JSON")]
         json: bool,
     },
-    #[command(about = "Export a redacted local session bundle as JSON")]
-    Export { id: String },
+    #[command(
+        about = "Export a redacted local session bundle (JSON by default, --html for shareable HTML)"
+    )]
+    Export(SessionExportArgs),
     #[command(about = "Preview, save, or send a redacted bug-report archive")]
     Report(SessionReportArgs),
     #[command(
@@ -346,6 +383,48 @@ struct FeedbackArgs {
 }
 
 #[derive(Debug, Args)]
+struct SessionExportArgs {
+    /// Session id to export. The session must exist either under the live
+    /// session root or in the `archived/` tree.
+    id: String,
+    /// Render a self-contained HTML document (inline CSS, no external
+    /// resources) instead of the default JSON bundle. The output is
+    /// safe to share over email or attach to a bug report.
+    #[arg(long)]
+    html: bool,
+    /// Optional output path. When omitted JSON goes to stdout; HTML
+    /// goes to `squeezy-session-<id>.html` in the current directory.
+    #[arg(long)]
+    output: Option<PathBuf>,
+    /// Color theme baked into the exported HTML. Defaults to dark.
+    /// Ignored unless `--html` is set.
+    #[arg(long, value_enum, default_value_t = HtmlThemeArg::Dark)]
+    theme: HtmlThemeArg,
+    /// Drop tool calls and tool outputs from the export. Useful when
+    /// the conversation is the interesting part and the tool output
+    /// would otherwise dominate the document. Ignored unless `--html`
+    /// is set.
+    #[arg(long = "no-tool-outputs", default_value_t = false)]
+    no_tool_outputs: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum HtmlThemeArg {
+    Dark,
+    Light,
+}
+
+impl HtmlThemeArg {
+    fn to_theme(self) -> squeezy_agent::ExportTheme {
+        match self {
+            Self::Dark => squeezy_agent::ExportTheme::Dark,
+            Self::Light => squeezy_agent::ExportTheme::Light,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
 struct SessionReportArgs {
     id: String,
     #[arg(long, help = "Write archive to this path")]
@@ -369,14 +448,18 @@ async fn main() -> squeezy_core::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    if cli.format == PromptFormat::Json && cli.prompt.is_none() {
+    let stdin_is_tty = print_mode::stdin_is_tty();
+    let prompt_mode_active = !cli.prompt.is_empty() || !stdin_is_tty;
+    if cli.format == PromptFormat::Json && !prompt_mode_active {
         return Err(SqueezyError::Config(
-            "--format json requires --prompt; interactive sessions and subcommands only emit human-formatted output"
+            "--format json requires --prompt or piped stdin; interactive sessions and subcommands only emit human-formatted output"
                 .to_string(),
         ));
     }
     match &cli.command {
-        Some(Command::Config { command }) => return handle_config_command(command, &cli),
+        Some(Command::Config { command }) => {
+            return handle_config_command(command.as_ref(), &cli);
+        }
         Some(Command::Repo { command }) => return handle_repo_command(command, &cli),
         Some(Command::Sessions { command }) => {
             return handle_sessions_command(command, &cli).await;
@@ -384,7 +467,7 @@ async fn main() -> squeezy_core::Result<()> {
         Some(Command::Feedback(args)) => return handle_feedback_command(args, &cli).await,
         Some(Command::Mcp { command }) => return handle_mcp_command(command, &cli),
         Some(Command::Ask(args)) => return handle_ask_command(args).await,
-        Some(Command::Auth { command }) => return handle_auth_command(command),
+        Some(Command::Auth { command }) => return handle_auth_command(command).await,
         Some(Command::Doctor(args)) => {
             let report = doctor::run(args).await?;
             report.print();
@@ -460,9 +543,23 @@ async fn main() -> squeezy_core::Result<()> {
     telemetry.record(TelemetryEvent::app_started(&config)).await;
 
     let provider = provider_from_app_config(&config);
+    // Resolve `--session <prefix>` against the on-disk session store
+    // before any downstream code sees it, so the user can pass a short
+    // unique prefix (`squeezy --session abc12`) the same way `squeezy
+    // sessions resume abc12` works. Ambiguous and unknown prefixes
+    // fail fast with a clear message instead of being forwarded into a
+    // generic "session not found" later.
+    let resolved_session_id: Option<String> = match cli.session.as_deref() {
+        Some(id) => Some(
+            SessionStore::open(&config)
+                .resolve_session_id_prefix(id)
+                .map_err(|err| SqueezyError::Tool(format!("--session: {err}")))?,
+        ),
+        None => None,
+    };
     let resume_flag = if cli.continue_session {
         ResumeFlag::Continue
-    } else if let Some(id) = cli.session.as_deref() {
+    } else if let Some(id) = resolved_session_id.as_deref() {
         ResumeFlag::Explicit(id)
     } else {
         ResumeFlag::None
@@ -482,7 +579,49 @@ async fn main() -> squeezy_core::Result<()> {
     if let Some(note) = &resume_resolution.note {
         eprintln!("{note}");
     }
-    if let Some(prompt) = cli.prompt {
+    // F07: gate cross-project resumes behind a y/N prompt so that
+    // `squeezy --session <id>` (or `--continue` falling back to an
+    // arbitrary id) cannot silently drag a session into an unrelated
+    // checkout. `--continue` already filters by cwd equality, so this
+    // is effectively a no-op for that path — the lookup is only on the
+    // explicit `--session <id>` flow in practice.
+    let resume_session_id_opt = if let Some(id) = resume_resolution.session_id.as_deref() {
+        let store = SessionStore::open(&config);
+        if !confirm_cross_project_resume_stdio(&store, id, cli.force_cross_project)? {
+            println!("resume cancelled");
+            let _ = telemetry.flush().await;
+            return Ok(());
+        }
+        Some(id.to_string())
+    } else {
+        None
+    };
+    if prompt_mode_active {
+        let prompts = print_mode::resolve_prompt_inputs(
+            &cli.prompt,
+            stdin_is_tty,
+            print_mode::read_stdin_to_string,
+            print_mode::read_prompt_file,
+        )?;
+        if prompts.is_empty() {
+            return Err(SqueezyError::Config(
+                "no prompts to send: piped stdin was empty and no --prompt was supplied"
+                    .to_string(),
+            ));
+        }
+        // Recognise the `!!` exclude-from-context prefix on each resolved
+        // prompt before we hand them to the agent loop. Detection is the
+        // CLI sibling of pi's TUI bang-bang shortcut (audit-07 finding
+        // F07-print-mode-exclude-from-context); the runtime side is
+        // pending the F01-exclude-from-context-bang-bang sibling work
+        // that adds an Agent-level `local_shell_command(input,
+        // exclude_from_context=true)` entry point, so for now `!!cmd`
+        // prompts get a visible deferral notice and are intentionally
+        // skipped from the LLM transcript.
+        let typed_prompts: Vec<print_mode::PromptInput> = prompts
+            .into_iter()
+            .map(print_mode::classify_prompt)
+            .collect();
         // Non-interactive prompt mode has no TUI to seed the summary into,
         // so surface it on stderr before the streamed completion lands on
         // stdout. The TUI path skips this print because it shows the same
@@ -490,10 +629,10 @@ async fn main() -> squeezy_core::Result<()> {
         if let Some(summary) = &onboarding.visible_summary {
             eprintln!("{summary}");
         }
-        let result = run_prompt(
+        let result = run_prompts(
             config,
             provider,
-            prompt,
+            typed_prompts,
             cli.format,
             resume_resolution.session_id,
         )
@@ -507,7 +646,7 @@ async fn main() -> squeezy_core::Result<()> {
     // startups; the banner stays quiet unless GitHub reports a new release
     // we haven't already nagged the user about.
     let update_banner = update::banner_for_startup(&update::check_for_update().await);
-    let resume_session_id = resume_resolution.session_id;
+    let resume_session_id = resume_session_id_opt;
     let skip_resume_picker = cli.no_resume_picker || resume_session_id.is_some();
     let result = squeezy_tui::run_with_startup_profile(
         config,
@@ -553,20 +692,34 @@ fn config_from_cli(cli: &Cli) -> squeezy_core::Result<AppConfig> {
             ))
         })?;
     }
+    if let Some(session_dir) = &cli.session_dir {
+        cli_used = true;
+        config.session_logs.log_dir = Some(session_dir.clone());
+    }
     if cli_used && !config.config_sources.iter().any(|source| source == "cli") {
         config.config_sources.push("cli".to_string());
     }
     Ok(config)
 }
 
-fn handle_config_command(command: &ConfigCommand, cli: &Cli) -> squeezy_core::Result<()> {
+fn handle_config_command(command: Option<&ConfigCommand>, cli: &Cli) -> squeezy_core::Result<()> {
     match command {
-        ConfigCommand::Inspect => {
+        // `squeezy config` with no subcommand mirrors pi's `pi config browse`
+        // and lands on the resource picker.
+        None => {
+            let config = config_from_cli(cli)?;
+            handle_browse_command(&config, &ConfigBrowseArgs::default())
+        }
+        Some(ConfigCommand::Browse(args)) => {
+            let config = config_from_cli(cli)?;
+            handle_browse_command(&config, args)
+        }
+        Some(ConfigCommand::Inspect) => {
             let config = config_from_cli(cli)?;
             print!("{}", config.inspect_redacted());
             Ok(())
         }
-        ConfigCommand::Init { scope, force } => {
+        Some(ConfigCommand::Init { scope, force }) => {
             let (path, template) = if scope.user {
                 (default_settings_path(), user_settings_template())
             } else {
@@ -1078,9 +1231,33 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             Ok(())
         }
-        SessionsCommand::Resume { id } => {
+        SessionsCommand::Resume {
+            id,
+            force_cross_project,
+        } => {
+            // Pi-style prefix resolution: the user can type a short
+            // unique prefix of a session id (e.g. `squeezy sessions
+            // resume abc12`) and the store expands it to the full id
+            // before we hand it to the TUI. Ambiguous and unknown
+            // prefixes surface as actionable errors instead of being
+            // forwarded as-is into a "session not found" downstream.
+            let resolved = store
+                .resolve_session_id_prefix(id)
+                .map_err(|err| SqueezyError::Tool(err.to_string()))?;
+            // F07: when the recorded `metadata.cwd` differs from the
+            // caller's current directory, gate the resume behind a y/N
+            // prompt so a stray `squeezy sessions resume <id>` from an
+            // unrelated checkout cannot silently mutate a session that
+            // expected a different repo. `--force-cross-project` on
+            // either the top-level CLI or this subcommand bypasses the
+            // prompt for scripted callers.
+            let force = cli.force_cross_project || *force_cross_project;
+            if !confirm_cross_project_resume_stdio(&store, &resolved, force)? {
+                println!("resume cancelled");
+                return Ok(());
+            }
             let provider = provider_from_app_config(&config);
-            squeezy_tui::resume(config, provider, id.clone()).await
+            squeezy_tui::resume(config, provider, resolved).await
         }
         SessionsCommand::Fork { id } => {
             // Offline fork: stamp a child with the parent's resume state
@@ -1112,16 +1289,7 @@ async fn handle_sessions_command(command: &SessionsCommand, cli: &Cli) -> squeez
             }
             Ok(())
         }
-        SessionsCommand::Export { id } => {
-            let value = store.export(id)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&value).map_err(|err| {
-                    SqueezyError::Tool(format!("failed to serialize session export: {err}"))
-                })?
-            );
-            Ok(())
-        }
+        SessionsCommand::Export(args) => handle_session_export_command(&store, args),
         SessionsCommand::Report(args) => handle_session_report_command(args, &config).await,
         SessionsCommand::Cleanup {
             ids,
@@ -1177,6 +1345,38 @@ async fn handle_feedback_command(args: &FeedbackArgs, cli: &Cli) -> squeezy_core
         .await
         .map_err(|error| SqueezyError::Tool(error.to_string()))?;
     println!("feedback sent: {}", result.id);
+    Ok(())
+}
+
+fn handle_session_export_command(
+    store: &SessionStore,
+    args: &SessionExportArgs,
+) -> squeezy_core::Result<()> {
+    if args.html {
+        let record = store.show(&args.id)?;
+        let opts = squeezy_agent::ExportOpts {
+            include_tool_outputs: !args.no_tool_outputs,
+            theme: args.theme.to_theme(),
+        };
+        let html = squeezy_agent::export_session_to_html(&record, &opts)
+            .map_err(|err| SqueezyError::Tool(format!("failed to render session html: {err}")))?;
+        let target = args
+            .output
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("squeezy-session-{}.html", args.id)));
+        fs::write(&target, &html)?;
+        println!("wrote {} ({} bytes)", target.display(), html.len());
+        return Ok(());
+    }
+    let value = store.export(&args.id)?;
+    let json = serde_json::to_string_pretty(&value)
+        .map_err(|err| SqueezyError::Tool(format!("failed to serialize session export: {err}")))?;
+    if let Some(target) = args.output.as_ref() {
+        fs::write(target, json.as_bytes())?;
+        println!("wrote {} ({} bytes)", target.display(), json.len());
+    } else {
+        println!("{json}");
+    }
     Ok(())
 }
 
@@ -1257,6 +1457,91 @@ fn confirm(prompt: &str) -> squeezy_core::Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+/// Render the cross-project resume prompt body when the recorded
+/// session cwd differs from the caller's current cwd; return `None`
+/// when the two refer to the same location so callers can skip the
+/// confirmation entirely.
+///
+/// Kept pure (no I/O) so it round-trips cleanly in unit tests and can be
+/// reused by any future surface (e.g. TUI) that needs the same warning
+/// string. Trailing path separators are trimmed before comparison so a
+/// recorded `"/repo"` and a current `"/repo/"` are treated as equal —
+/// the message itself preserves the original strings so the operator
+/// can spot the discrepancy.
+fn cross_project_resume_prompt(session_cwd: &str, current_cwd: &str) -> Option<String> {
+    fn normalize(value: &str) -> &str {
+        value.trim_end_matches(['/', std::path::MAIN_SEPARATOR])
+    }
+    if normalize(session_cwd) == normalize(current_cwd) {
+        return None;
+    }
+    Some(format!(
+        "Resume session from {session_cwd} in current cwd {current_cwd}? [y/N] "
+    ))
+}
+
+/// Drive a y/N confirmation through caller-supplied I/O. Returns `true`
+/// when the resume should proceed: the cwd already matches, the caller
+/// passed `force = true` (matching `--force-cross-project`), or the
+/// operator typed `y`/`yes`. Any other input — including end-of-stream
+/// — defaults to declining the resume, matching the documented "[y/N]"
+/// shape.
+fn confirm_cross_project_resume<R, W>(
+    session_cwd: &str,
+    current_cwd: &str,
+    force: bool,
+    reader: &mut R,
+    writer: &mut W,
+) -> io::Result<bool>
+where
+    R: io::BufRead,
+    W: Write,
+{
+    if force {
+        return Ok(true);
+    }
+    let Some(prompt) = cross_project_resume_prompt(session_cwd, current_cwd) else {
+        return Ok(true);
+    };
+    writer.write_all(prompt.as_bytes())?;
+    writer.flush()?;
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// `confirm_cross_project_resume` wired to real `stdin`/`stderr`. Looks
+/// up the session metadata via [`SessionStore::read_metadata`] so the
+/// caller only needs to know the resolved session id, and resolves
+/// `current_cwd` through `std::env::current_dir()` (falling back to
+/// `"."` if the process has no working directory — same fallback
+/// `SessionMetadata::new` uses when recording the original cwd).
+fn confirm_cross_project_resume_stdio(
+    store: &SessionStore,
+    session_id: &str,
+    force: bool,
+) -> squeezy_core::Result<bool> {
+    let metadata = store.read_metadata(session_id)?;
+    let current_cwd = env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .display()
+        .to_string();
+    let stdin = io::stdin();
+    let stderr = io::stderr();
+    let mut reader = stdin.lock();
+    let mut writer = stderr.lock();
+    Ok(confirm_cross_project_resume(
+        &metadata.cwd,
+        &current_cwd,
+        force,
+        &mut reader,
+        &mut writer,
+    )?)
 }
 
 fn parse_excluded_sections(values: &[String]) -> squeezy_core::Result<BTreeSet<String>> {
@@ -1382,7 +1667,7 @@ struct StartupModelSelection {
 }
 
 fn should_run_startup_model_selector(cli: &Cli, config: &AppConfig) -> squeezy_core::Result<bool> {
-    if cli.prompt.is_some() || cli.list_models || cli.list_providers {
+    if !cli.prompt.is_empty() || cli.list_models || cli.list_providers {
         return Ok(false);
     }
     if !io::stdin().is_terminal() {
@@ -1939,171 +2224,341 @@ fn format_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_string(), |value| value.to_string())
 }
 
-async fn run_prompt(
+async fn run_prompts(
     config: AppConfig,
     provider: Arc<dyn LlmProvider>,
-    prompt: String,
+    prompts: Vec<print_mode::PromptInput>,
     format: PromptFormat,
     resume_session_id: Option<String>,
 ) -> squeezy_core::Result<()> {
-    let redactor = config.redaction.redactor()?;
-    let store = SessionStore::open(&config);
-    // When `--continue` or `--session` resolved to an existing session,
-    // append onto it instead of spawning a fresh row. The previous
-    // response id (if any) is fed back so a server-side conversation
-    // thread carries over even though prompt mode runs single-shot.
-    let (session, previous_response_id) = if let Some(id) = resume_session_id {
-        let handle = store.open_session(id);
-        let previous = store
-            .show(handle.session_id())
-            .ok()
-            .and_then(|record| record.resume_state)
-            .and_then(|state| state.previous_response_id);
-        (Some(handle), previous)
+    // Print mode used to skip the agent loop entirely and stream the
+    // provider response with `tools: []`, which meant the model couldn't
+    // call `read_file`, `apply_patch`, `bash`, MCP, or anything else. CI
+    // and scripted callers therefore got an LLM-only single-shot — not
+    // the agent they expected from `--prompt`. Routing through
+    // `Agent::new` / `Agent::resume` mirrors what the TUI does, so the
+    // same tool registry (semantic graph tools, file ops, shell, MCP,
+    // skills) is available; session persistence and redaction now live
+    // inside the agent and don't need to be re-implemented here.
+    let agent = if let Some(id) = resume_session_id {
+        Agent::resume(config, provider, &id)?.0
     } else {
-        (
-            store
-                .start_session(SessionMetadata::new(&config, provider.name()))
-                .ok(),
-            None,
-        )
+        Agent::new(config, provider)
     };
-    let mut redactions: u64 = 0;
-    let redacted_prompt = redactor.redact(&prompt);
-    redactions = redactions.saturating_add(redacted_prompt.redactions);
-    let redacted_prompt = redacted_prompt.text;
-    let redacted_instructions = redactor.redact(&config.instructions);
-    redactions = redactions.saturating_add(redacted_instructions.redactions);
-    let redacted_instructions = redacted_instructions.text;
-    if let Some(session) = &session {
-        let _ = session.append_event(SessionEvent::new(
-            "user_message",
-            None,
-            Some(redacted_prompt.clone()),
-            serde_json::json!({}),
-        ));
-    }
-    let request = LlmRequest {
-        model: Arc::from(config.model.as_str()),
-        instructions: Arc::from(redacted_instructions),
-        input: Arc::from(vec![LlmInputItem::UserText(redacted_prompt.clone())]),
-        max_output_tokens: config.max_output_tokens,
-        response_verbosity: request_response_verbosity(&config, provider.name()),
-        reasoning_effort: request_reasoning_effort(&config, provider.name()),
-        previous_response_id,
-        cache_key: session
-            .as_ref()
-            .map(|session| format!("squeezy::{}", session.session_id())),
-        tools: Arc::from(Vec::new()),
-        store: config.store_responses,
-        tool_choice: None,
-        output_schema: None,
-        parallel_tool_calls: None,
-        beta_headers: std::sync::Arc::from(Vec::new()),
-    };
-    let mut stream = provider.stream_response(request, CancellationToken::new());
-    let mut stdout = io::stdout().lock();
-    let mut assistant = String::new();
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut stdout = stdout.lock();
+    let mut stderr = stderr.lock();
+    pump_prompts(&agent, prompts, format, &mut stdout, &mut stderr).await
+}
 
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        if format == PromptFormat::Json {
-            // Emit one JSON object per line for every event. The schema is
-            // `LlmEvent`'s serde tag/data form: `{"type":"text_delta",
-            // "data":"..."}`, `{"type":"completed","data":{...}}`, etc.
-            // Newline-delimited so callers can `jq -c` or `read -r` line
-            // by line; flushing on every line keeps the pipe responsive
-            // when the consumer is a long-running script.
-            let line = serde_json::to_string(&event).map_err(|err| {
-                SqueezyError::Parse(format!("failed to serialize prompt event: {err}"))
-            })?;
-            writeln!(stdout, "{line}")?;
-            stdout.flush()?;
+/// Walk the resolved print-mode prompts and drive each one through the
+/// agent, honoring the per-prompt `exclude_from_context` flag on the way.
+/// Extracted from `run_prompts` so `main_tests.rs` can exercise the `!!`
+/// skip-the-agent semantic against a scripted provider without paying
+/// the cost of building a real session log root.
+async fn pump_prompts<O, E>(
+    agent: &Agent,
+    prompts: Vec<print_mode::PromptInput>,
+    format: PromptFormat,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> squeezy_core::Result<()>
+where
+    O: Write,
+    E: Write,
+{
+    for prompt in prompts {
+        if prompt.exclude_from_context {
+            announce_excluded_prompt(&prompt.content, format, stdout, stderr)?;
+            continue;
         }
+        let rx = agent.start_turn(prompt.content, CancellationToken::new());
+        pump_prompt_events(rx, format, stdout, stderr).await?;
+    }
+    Ok(())
+}
+
+/// Surface a `!!`-prefixed print-mode prompt without dispatching it to
+/// the agent.
+///
+/// The runtime side of this flag — actually executing the command via a
+/// shell-tool entry point that marks the result as
+/// `exclude_from_context = true` — depends on the sibling
+/// F01-exclude-from-context-bang-bang work (audit-07,
+/// `audits/pi-comparison-2026-05-27/07-ux-and-workflows.md`). Until that
+/// lands, the print-mode bang-bang flow:
+///
+/// * recognises the prefix at argument-parse time so the rest of the
+///   `--prompt` UX (mention expansion, stdin chaining) keeps working,
+/// * intentionally **does not** call `Agent::start_turn` with the
+///   bang-bang body, which guarantees the command text never reaches the
+///   LLM transcript that subsequent prompts will see, and
+/// * tells the operator (via stderr in text mode, via a typed wire event
+///   in JSON mode) that the local execution is deferred so they aren't
+///   left wondering why their `!!cmd` "did nothing".
+///
+/// When F01-bang lands, swap this stub for a call into the new
+/// agent-level local-shell entry point that records the execution with
+/// `exclude_from_context = true`.
+fn announce_excluded_prompt<O, E>(
+    command: &str,
+    format: PromptFormat,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> squeezy_core::Result<()>
+where
+    O: Write,
+    E: Write,
+{
+    const DEFERRAL_NOTE: &str = "local-shell runtime is pending the F01-bang sibling; the prefix was recognised but the command was not executed and was kept out of the LLM transcript";
+    match format {
+        PromptFormat::Default => {
+            writeln!(
+                stderr,
+                "!! exclude-from-context prompt acknowledged: {command:?}; {DEFERRAL_NOTE}",
+            )?;
+            stderr.flush()?;
+        }
+        PromptFormat::Json => {
+            emit_prompt_event(
+                stdout,
+                &PromptWireEvent::ExcludedFromContext {
+                    command: command.to_string(),
+                    note: DEFERRAL_NOTE.to_string(),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Drive a single `Agent::start_turn` mpsc receiver to completion and
+/// surface the relevant events on `stdout`/`stderr`. Extracted so
+/// `main_tests.rs` can exercise the end-to-end print-mode wiring with
+/// captured writers and a scripted provider — verifying that print mode
+/// actually runs tools end-to-end.
+async fn pump_prompt_events<O, E>(
+    mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    format: PromptFormat,
+    stdout: &mut O,
+    stderr: &mut E,
+) -> squeezy_core::Result<()>
+where
+    O: Write,
+    E: Write,
+{
+    let mut result: squeezy_core::Result<()> = Ok(());
+    let mut completed = false;
+
+    while let Some(event) = rx.recv().await {
         match event {
-            LlmEvent::Started => {}
-            LlmEvent::TextDelta(delta) => {
-                assistant.push_str(&delta);
-                if format == PromptFormat::Default {
+            AgentEvent::Started { .. } if format == PromptFormat::Json => {
+                emit_prompt_event(stdout, &PromptWireEvent::Started)?;
+            }
+            AgentEvent::Started { .. } => {}
+            AgentEvent::AssistantDelta { delta, .. } => match format {
+                PromptFormat::Default => {
                     write!(stdout, "{delta}")?;
                     stdout.flush()?;
                 }
-            }
-            LlmEvent::ToolCall(tool_call) => {
-                if format == PromptFormat::Default {
-                    eprintln!(
-                        "tool call requested but prompt mode has no tools: {}",
-                        tool_call.name
-                    );
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::TextDelta(delta))?;
                 }
+            },
+            AgentEvent::ReasoningDelta { delta, .. } if format == PromptFormat::Json => {
+                emit_prompt_event(stdout, &PromptWireEvent::ReasoningDelta(delta))?;
             }
-            LlmEvent::Completed {
+            AgentEvent::ReasoningDelta { .. } => {}
+            AgentEvent::ToolCallStarted { call, .. } => match format {
+                PromptFormat::Default => {
+                    let label = squeezy_tools::human_label_for_call(&call.name, &call.arguments);
+                    writeln!(stderr, "tool: {} {label}", call.name)?;
+                    stderr.flush()?;
+                }
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::ToolCallStarted(call))?;
+                }
+            },
+            AgentEvent::ToolCallCompleted {
+                result: tool_result,
+                ..
+            } => match format {
+                PromptFormat::Default => {
+                    writeln!(
+                        stderr,
+                        "tool: {} -> {}",
+                        tool_result.tool_name,
+                        tool_status_label(tool_result.status),
+                    )?;
+                    stderr.flush()?;
+                }
+                PromptFormat::Json => {
+                    emit_prompt_event(stdout, &PromptWireEvent::ToolCallCompleted(tool_result))?;
+                }
+            },
+            AgentEvent::ApprovalRequested {
+                request,
+                decision_tx,
+                ..
+            } => {
+                // There is nobody to prompt in print mode. The
+                // permission policy already filtered out the
+                // hard-default deny cases (read=Allow, edit=Allow),
+                // so anything that reaches here was flagged Ask by
+                // configuration. Approving once keeps CI moving;
+                // operators who want stricter control can set
+                // permission rules in settings.toml or pin Plan
+                // mode via `--mode plan`.
+                let tool_name = request.tool_name.clone();
+                let reason = request.reason.clone();
+                match format {
+                    PromptFormat::Default => {
+                        writeln!(stderr, "approval: auto-approving {tool_name} ({reason})")?;
+                        stderr.flush()?;
+                    }
+                    PromptFormat::Json => {
+                        emit_prompt_event(
+                            stdout,
+                            &PromptWireEvent::ApprovalAutoApproved { tool_name, reason },
+                        )?;
+                    }
+                }
+                let _ = decision_tx.send(ToolApprovalDecision::AllowOnce);
+            }
+            AgentEvent::McpElicitationRequested { response_tx, .. } => {
+                let _ = response_tx.send(McpElicitationResponse::cancel());
+            }
+            AgentEvent::RequestUserInputRequested { response_tx, .. } => {
+                let _ = response_tx.send(RequestUserInputResponse::cancelled());
+            }
+            AgentEvent::Completed {
                 response_id, cost, ..
             } => {
-                if format == PromptFormat::Default {
-                    writeln!(stdout)?;
-                    stdout.flush()?;
-                }
-                let redacted_assistant = redactor.redact(&assistant);
-                redactions = redactions.saturating_add(redacted_assistant.redactions);
-                let redacted_assistant = redacted_assistant.text;
-                if let Some(session) = &session {
-                    let _ = session.append_event(SessionEvent::new(
-                        "assistant_completed",
-                        None,
-                        Some(redacted_assistant.clone()),
-                        serde_json::json!({ "response_id": response_id, "cost": cost }),
-                    ));
-                    let _ = session.write_resume_state(&SessionResumeState {
-                        resume_available: true,
-                        previous_response_id: response_id,
-                        conversation: vec![
-                            ResumeItem::UserText {
-                                text: redacted_prompt.clone(),
-                            },
-                            ResumeItem::AssistantText {
-                                text: redacted_assistant.clone(),
-                            },
-                        ],
-                        transcript: vec![
-                            squeezy_core::TranscriptItem::user(redacted_prompt.clone()),
-                            squeezy_core::TranscriptItem::assistant(redacted_assistant.clone()),
-                        ],
-                        context_attachments: Vec::new(),
-                        context_compaction: Default::default(),
-                    });
-                    let metrics = squeezy_core::SessionMetrics {
-                        turns: 1,
-                        model_output_bytes: redacted_assistant.len() as u64,
-                        redactions,
-                        provider: cost.clone(),
-                        ..squeezy_core::SessionMetrics::default()
-                    };
-                    let _ =
-                        session.finish(SessionStatus::Completed, cost.clone(), metrics, redactions);
-                }
-                if format == PromptFormat::Default {
-                    eprintln!(
-                        "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
-                        format_token(cost.input_tokens),
-                        format_token(cost.output_tokens),
-                        format_token(cost.cached_input_tokens),
-                        format_token(cost.cache_write_input_tokens),
-                        format_usd_micros(cost.estimated_usd_micros)
-                    );
-                }
-            }
-            LlmEvent::Cancelled => {
-                if format == PromptFormat::Default {
-                    eprintln!("cancelled");
+                completed = true;
+                match format {
+                    PromptFormat::Default => {
+                        writeln!(stdout)?;
+                        stdout.flush()?;
+                        writeln!(
+                            stderr,
+                            "tokens: input={} output={} cached={} cache_write={} cost_usd={}",
+                            format_token(cost.input_tokens),
+                            format_token(cost.output_tokens),
+                            format_token(cost.cached_input_tokens),
+                            format_token(cost.cache_write_input_tokens),
+                            format_usd_micros(cost.estimated_usd_micros),
+                        )?;
+                        stderr.flush()?;
+                    }
+                    PromptFormat::Json => {
+                        emit_prompt_event(
+                            stdout,
+                            &PromptWireEvent::Completed { response_id, cost },
+                        )?;
+                    }
                 }
                 break;
             }
-            LlmEvent::ReasoningDelta { .. } | LlmEvent::ReasoningDone(_) => {}
+            AgentEvent::Failed { error, .. } => {
+                if format == PromptFormat::Json {
+                    let _ = emit_prompt_event(stdout, &PromptWireEvent::Failed(error.to_string()));
+                } else {
+                    let _ = writeln!(stderr, "error: {error}");
+                    let _ = stderr.flush();
+                }
+                result = Err(error);
+                break;
+            }
+            AgentEvent::Cancelled { .. } => {
+                if format == PromptFormat::Json {
+                    let _ = emit_prompt_event(stdout, &PromptWireEvent::Cancelled);
+                } else {
+                    let _ = writeln!(stderr, "cancelled");
+                    let _ = stderr.flush();
+                }
+                break;
+            }
+            // Bookkeeping events (job notifications, MCP status, cost
+            // updates, context compactions, sub-agent lifecycle, etc.)
+            // are silent in print mode. They are still recorded in the
+            // session log that the agent maintains internally, so
+            // `squeezy sessions show <id>` keeps the full record for
+            // post-mortem.
+            _ => {}
         }
     }
 
+    if !completed && result.is_ok() && format == PromptFormat::Default {
+        // Receiver closed without a Completed event (e.g. the agent
+        // dropped the channel because the user hit Ctrl-C externally).
+        // Make sure stdout ends on a newline so the shell prompt is not
+        // glued to the last assistant token.
+        let _ = writeln!(stdout);
+        let _ = stdout.flush();
+    }
+    result
+}
+
+/// Wire-friendly subset of `AgentEvent` used by `--prompt --format
+/// json`. Keeps the `{"type": ..., "data": ...}` tag/content shape that
+/// the previous `LlmEvent`-based stream documented; adds `tool_*` and
+/// `approval_auto_approved` entries so callers can observe the new
+/// tool-loop behaviour. Schema is still labeled experimental in the CLI
+/// help — additive changes are fine, but breaking ones should bump that
+/// disclaimer.
+///
+/// The `excluded_from_context` variant marks a `!!`-prefixed print-mode
+/// prompt that was recognised at parse time but not dispatched to the
+/// agent. It pre-stakes the JSON-mode contract for the future RPC
+/// `bash` command's `excludeFromContext` field
+/// (`packages/coding-agent/src/modes/rpc/rpc-types.ts:52` in pi's
+/// reference implementation) so callers can already observe the
+/// distinction between "this prompt populates the transcript" and "this
+/// prompt is intentionally invisible to subsequent turns".
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum PromptWireEvent {
+    Started,
+    TextDelta(String),
+    ReasoningDelta(String),
+    ToolCallStarted(ToolCall),
+    ToolCallCompleted(ToolResult),
+    ApprovalAutoApproved {
+        tool_name: String,
+        reason: String,
+    },
+    Completed {
+        response_id: Option<String>,
+        cost: CostSnapshot,
+    },
+    Failed(String),
+    Cancelled,
+    ExcludedFromContext {
+        command: String,
+        note: String,
+    },
+}
+
+fn emit_prompt_event<W: Write>(
+    writer: &mut W,
+    event: &PromptWireEvent,
+) -> squeezy_core::Result<()> {
+    let line = serde_json::to_string(event)
+        .map_err(|err| SqueezyError::Parse(format!("failed to serialize prompt event: {err}")))?;
+    writeln!(writer, "{line}")?;
+    writer.flush()?;
     Ok(())
+}
+
+fn tool_status_label(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Success => "ok",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Stale => "stale",
+        ToolStatus::Cancelled => "cancelled",
+    }
 }
 
 fn format_token(value: Option<u64>) -> String {
@@ -2135,22 +2590,6 @@ fn config_from_cli_provider(
         return AppConfig::from_env_and_settings();
     };
     AppConfig::from_env_and_settings_with_provider(provider)
-}
-
-fn request_response_verbosity(
-    config: &AppConfig,
-    provider_name: &str,
-) -> Option<ResponseVerbosity> {
-    capabilities_for(provider_name, &config.model)
-        .filter(|capabilities| capabilities.text_verbosity)
-        .map(|_| config.tui.response_verbosity)
-}
-
-fn request_reasoning_effort(config: &AppConfig, provider_name: &str) -> Option<ReasoningEffort> {
-    let effort = config.reasoning_effort?;
-    capabilities_for(provider_name, &config.model)
-        .filter(|capabilities| capabilities.reasoning_effort)
-        .map(|_| effort)
 }
 
 fn show_telemetry_notice_once(config: &AppConfig) {
