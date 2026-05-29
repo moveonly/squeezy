@@ -1287,14 +1287,9 @@ async fn handle_key(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) -> Resul
         return Ok(false);
     }
 
-    // Readline-style line-end. The `ExpandSelectedTranscriptEntry`
-    // keymap action handles Ctrl+E when the composer is empty; when
-    // text is present it returns `false` after setting a hint status,
-    // and we end up here so the cursor-move semantics still work.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('e') {
-        move_input_cursor_line_end(app);
-        return Ok(false);
-    }
+    // (Old `Ctrl+E` readline line-end is gone — that key now toggles
+    // expand-all unconditionally via the keymap. Use `End` /
+    // `Cmd+Right` for cursor-to-line-end.)
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k') {
         delete_to_line_end(app);
@@ -1685,10 +1680,6 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
             }
         }
         keymap::Action::ExpandSelectedTranscriptEntry => {
-            // Trace every press so a user running with
-            // `RUST_LOG=squeezy_tui=debug` can see exactly which branch
-            // fires (composer state, overlay state, etc.). Cheap to
-            // emit; only active when a subscriber is attached.
             tracing::debug!(
                 target: "squeezy_tui::keymap",
                 action = "expand_selected_transcript_entry",
@@ -1697,25 +1688,14 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 status_line_setup_open = app.status_line_setup.is_some(),
                 key_modifiers = ?key.modifiers,
                 key_code = ?key.code,
-                "Ctrl+E dispatched"
+                "Ctrl+O dispatched"
             );
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
             }
-            // Match the existing TranscriptHome/TranscriptEnd dual-mode
-            // semantics: when the composer has text, fall through so
-            // readline `move_input_cursor_line_end` keeps working.
-            // Otherwise expand the selected (or latest collapsed)
-            // transcript entry.
-            if !app.input.is_empty() {
-                // Helpful one-shot status hint so the user knows why
-                // Ctrl+E didn't expand — composer state is the most
-                // common reason this surface appears "broken".
-                app.status =
-                    "Ctrl+E moves to end-of-line in the composer · clear input, press Alt+E, or run /expand all to expand transcript"
-                        .to_string();
-                return false;
-            }
+            // `Ctrl+O` is dedicated — fires regardless of composer
+            // state. No need for the readline-line-end fall-through
+            // the previous `Ctrl+E` binding required.
             toggle_selected_transcript_entry(app);
             true
         }
@@ -1728,7 +1708,7 @@ fn dispatch_keymap_action(app: &mut TuiApp, agent: &mut Agent, key: KeyEvent) ->
                 status_line_setup_open = app.status_line_setup.is_some(),
                 key_modifiers = ?key.modifiers,
                 key_code = ?key.code,
-                "Alt+E dispatched"
+                "Ctrl+E dispatched"
             );
             if app.config_screen.is_some() || app.status_line_setup.is_some() {
                 return false;
@@ -3379,7 +3359,7 @@ fn toggle_selected_transcript_entry(app: &mut TuiApp) {
     entry.collapsed = !entry.collapsed;
     entry.bump_revision();
     app.status = format!(
-        "{} transcript entry {} · Alt+E expand all",
+        "{} transcript entry {} · Ctrl+E expand all",
         if entry.collapsed {
             "collapsed"
         } else {
@@ -3427,9 +3407,9 @@ fn toggle_expand_all_transcript_entries(app: &mut TuiApp) {
         }
     }
     app.status = if target_collapsed {
-        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+E expand one")
+        format!("collapsed {changed} of {total_toggleable} transcript entries · Ctrl+O expand one")
     } else {
-        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+E collapse one")
+        format!("expanded {changed} of {total_toggleable} transcript entries · Ctrl+O collapse one")
     };
 }
 
@@ -9828,7 +9808,7 @@ fn format_status_hints(app: &TuiApp) -> String {
             .to_string();
     } else if app.cancel.is_some() {
         let mut hint = String::from(
-            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
+            "Ctrl-C/Esc interrupt · Enter queue · Ctrl+J newline · Ctrl-P task · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · Ctrl-Y copy · /help",
         );
         if !app.prompt_queue.is_empty() {
             hint.push_str(&format!(" · Ctrl+X Q reorder ({})", app.prompt_queue.len()));
@@ -9843,10 +9823,10 @@ fn format_status_hints(app: &TuiApp) -> String {
         return "Ctrl-R restore last prompt · Enter send · Ctrl+J newline · /help".to_string();
     }
     let mut base = if app.alternate_scroll_enabled {
-        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Wheel/PgUp/PgDn scroll · Up/Down menu · Alt+Up/Down history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
             .to_string()
     } else {
-        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-E expand · Alt-E expand all · Ctrl-T transcript · /help"
+        "Enter send · !cmd shell · Up/Down menu/history · Ctrl+J newline · Ctrl-O expand · Ctrl-E expand all · Ctrl-T transcript · /help"
             .to_string()
     };
     if app.context_compaction_threshold > 0

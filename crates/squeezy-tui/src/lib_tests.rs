@@ -2264,14 +2264,16 @@ async fn prompt_line_editing_matches_common_terminal_shortcuts() {
     .expect("ctrl-a");
     assert_eq!(app.input_cursor, "alpha\n".len());
 
+    // Ctrl+E is no longer line-end (now toggles expand-all). `End`
+    // is the canonical cursor-to-line-end on every platform.
     app.input_cursor = "alpha\nbr".len();
     handle_key(
         &mut app,
         &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
     )
     .await
-    .expect("ctrl-e");
+    .expect("End");
     assert_eq!(app.input_cursor, app.input.len());
 
     set_input(&mut app, "alpha\nbravo".to_string());
@@ -2288,7 +2290,9 @@ async fn prompt_line_editing_matches_common_terminal_shortcuts() {
 }
 
 #[tokio::test]
-async fn prompt_ctrl_e_keeps_expansion_shortcut_when_prompt_is_empty() {
+async fn prompt_ctrl_o_expands_single_entry() {
+    // Ctrl+O is dedicated to single-entry expand. It fires regardless
+    // of composer state — no more dual-mode readline fall-through.
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
@@ -2296,23 +2300,24 @@ async fn prompt_ctrl_e_keeps_expansion_shortcut_when_prompt_is_empty() {
     handle_key(
         &mut app,
         &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
     )
     .await
-    .expect("ctrl-e expands");
+    .expect("ctrl-o expands");
     assert!(!app.transcript[0].collapsed);
 
+    // With text in the composer, Ctrl+O still toggles the entry.
     set_input(&mut app, "abc".to_string());
     app.input_cursor = 0;
     handle_key(
         &mut app,
         &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
     )
     .await
-    .expect("ctrl-e moves to end");
-    assert_eq!(app.input_cursor, app.input.len());
-    assert!(!app.transcript[0].collapsed);
+    .expect("ctrl-o collapses");
+    assert!(app.transcript[0].collapsed);
+    assert_eq!(app.input, "abc", "composer must be untouched by Ctrl+O");
 }
 
 #[tokio::test]
@@ -3277,7 +3282,7 @@ fn tool_result_entries_collapse_by_default_and_expand_when_toggled() {
 }
 
 #[test]
-fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
+fn toggle_selected_without_selection_toggles_latest_transcript_entry() {
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
 
@@ -3286,18 +3291,21 @@ fn ctrl_e_without_selection_toggles_latest_transcript_entry() {
 
     toggle_selected_transcript_entry(&mut app);
     assert!(!app.transcript[0].collapsed);
-    assert_eq!(app.status, "expanded transcript entry 1 · Alt+E expand all");
+    assert_eq!(
+        app.status,
+        "expanded transcript entry 1 · Ctrl+E expand all"
+    );
 
     toggle_selected_transcript_entry(&mut app);
     assert!(app.transcript[0].collapsed);
     assert_eq!(
         app.status,
-        "collapsed transcript entry 1 · Alt+E expand all"
+        "collapsed transcript entry 1 · Ctrl+E expand all"
     );
 }
 
 #[test]
-fn ctrl_e_without_selection_skips_prompt_rows_and_expands_collapsed_content() {
+fn toggle_selected_skips_prompt_rows_and_expands_collapsed_content() {
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
     app.push_transcript_item(TranscriptItem::user("next prompt"));
@@ -3308,7 +3316,10 @@ fn ctrl_e_without_selection_skips_prompt_rows_and_expands_collapsed_content() {
     toggle_selected_transcript_entry(&mut app);
 
     assert!(!app.transcript[0].collapsed);
-    assert_eq!(app.status, "expanded transcript entry 1 · Alt+E expand all");
+    assert_eq!(
+        app.status,
+        "expanded transcript entry 1 · Ctrl+E expand all"
+    );
 }
 
 #[test]
@@ -3372,7 +3383,7 @@ fn failed_tool_result_starts_expanded_so_error_is_visible() {
 }
 
 #[tokio::test]
-async fn alt_e_dispatches_expand_all() {
+async fn ctrl_e_dispatches_expand_all() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
@@ -3381,14 +3392,14 @@ async fn alt_e_dispatches_expand_all() {
     handle_key(
         &mut app,
         &mut agent,
-        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT),
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
     )
     .await
-    .expect("alt+e fires expand-all");
+    .expect("ctrl+e fires expand-all");
 
     assert!(
         app.transcript.iter().all(|e| !e.collapsed),
-        "Alt+E should expand both transcript entries"
+        "Ctrl+E should expand both transcript entries"
     );
     assert!(app.status.contains("expanded"));
 }
@@ -3407,7 +3418,9 @@ fn parse_transcript_category_accepts_reasoning_and_thinking_aliases() {
 }
 
 #[tokio::test]
-async fn ctrl_e_with_composer_text_keeps_line_end_and_emits_hint() {
+async fn ctrl_e_with_composer_text_still_expands_transcript() {
+    // Ctrl+E now fires expand-all unconditionally — composer state
+    // does not gate it (use `End` for cursor-to-line-end).
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
     app.push_tool_result(sample_tool_result("grep", "needle found"));
@@ -3420,17 +3433,14 @@ async fn ctrl_e_with_composer_text_keeps_line_end_and_emits_hint() {
         KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
     )
     .await
-    .expect("ctrl-e with text moves cursor and emits hint");
+    .expect("ctrl-e expands transcript");
 
-    assert_eq!(app.input_cursor, app.input.len(), "cursor moved to end");
     assert!(
-        app.transcript[0].collapsed,
-        "transcript should not change when composer has text"
+        !app.transcript[0].collapsed,
+        "Ctrl+E should expand the tool result"
     );
-    assert!(
-        app.status.contains("Alt+E"),
-        "status should hint Alt+E for transcript expansion"
-    );
+    assert_eq!(app.input, "abc", "composer text untouched");
+    assert_eq!(app.input_cursor, 0, "composer cursor untouched");
 }
 
 #[tokio::test]

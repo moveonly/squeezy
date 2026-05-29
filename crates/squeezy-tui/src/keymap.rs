@@ -121,16 +121,21 @@ impl Action {
             }
             Self::TranscriptHome => KeyBinding::new(KeyCode::Home, KeyModifiers::NONE),
             Self::TranscriptEnd => KeyBinding::new(KeyCode::End, KeyModifiers::NONE),
+            // `Ctrl+O` is virtually unused in modern terminal apps and
+            // every terminal we care about delivers it as a plain
+            // `Char('o') + CONTROL` after normalisation, so single-entry
+            // expand stays one keystroke without needing the
+            // "Use Option as Meta key" preference that `Alt+letter`
+            // requires on default macOS Terminal.app.
             Self::ExpandSelectedTranscriptEntry => {
-                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
+                KeyBinding::new(KeyCode::Char('o'), KeyModifiers::CONTROL)
             }
-            // `Alt+e` is reachable on every terminal we care about
-            // (macOS Terminal, iTerm2, kitty, Alacritty, Windows Terminal,
-            // tmux pass-through). Ctrl+Shift+E is not — many terminals
-            // can't disambiguate it from plain Ctrl+E because Shift on
-            // alphabetic codes is terminal-dependent.
+            // `Ctrl+E` for "expand all" instead of `Alt+E` for the same
+            // terminal-portability reason. Trades the readline
+            // line-end-of-line convention away in this app — `End` /
+            // `Cmd+Right` still work.
             Self::ExpandAllTranscriptEntries => {
-                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::ALT)
+                KeyBinding::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
             }
         }
     }
