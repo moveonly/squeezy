@@ -125,6 +125,23 @@ pub(crate) fn extract_js_ts_import_export(
     let is_reexport = raw.starts_with("export");
     let imports = js_ts_imports_from_statement(raw);
     for (path, alias, is_glob) in imports {
+        let leaf = last_path_segment(&path);
+        let kind = if is_glob {
+            ImportKind::Wildcard
+        } else if leaf == "default" {
+            ImportKind::Default
+        } else if alias.is_some() && leaf == "*" {
+            ImportKind::Namespace
+        } else {
+            ImportKind::Named
+        };
+        let imported_name = if is_glob || kind == ImportKind::Namespace {
+            None
+        } else if kind == ImportKind::Default {
+            Some("default".to_string())
+        } else {
+            Some(leaf)
+        };
         ctx.imports.push(ParsedImport {
             file_id: ctx.file.id.clone(),
             owner_id: owner_id.clone(),
@@ -135,6 +152,9 @@ pub(crate) fn extract_js_ts_import_export(
             is_static: false,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-js-ts", "import/export declaration"),
+            kind,
+            imported_name,
+            is_global: false,
         });
     }
 }
@@ -332,6 +352,9 @@ pub(crate) fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
                     is_static: false,
                     span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
                     provenance: Provenance::new("tree-sitter-js-ts", "commonjs require"),
+                    kind: ImportKind::Namespace,
+                    imported_name: None,
+                    is_global: false,
                 });
             }
         }
@@ -340,6 +363,7 @@ pub(crate) fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
         {
             let exported = exported.trim().trim_end_matches(';').trim();
             if is_js_ts_identifier(exported) {
+                let imported_name = Some(exported.to_string());
                 ctx.imports.push(ParsedImport {
                     file_id: ctx.file.id.clone(),
                     owner_id: None,
@@ -350,6 +374,9 @@ pub(crate) fn extract_js_ts_commonjs_facts(ctx: &mut ExtractContext<'_>) {
                     is_static: false,
                     span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
                     provenance: Provenance::new("tree-sitter-js-ts", "commonjs export"),
+                    kind: ImportKind::Named,
+                    imported_name,
+                    is_global: false,
                 });
             }
         }

@@ -211,6 +211,7 @@ pub(crate) fn go_function_symbol(
         provenance: Provenance::new("tree-sitter-go", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
@@ -257,6 +258,7 @@ pub(crate) fn go_type_symbol(
         provenance: Provenance::new("tree-sitter-go", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
@@ -327,6 +329,7 @@ pub(crate) fn go_field_symbols(
                 provenance: Provenance::new("tree-sitter-go", "field declaration"),
                 confidence: Confidence::ExactSyntax,
                 freshness: Freshness::Fresh,
+                arity: None,
             }
         })
         .collect()
@@ -371,6 +374,7 @@ pub(crate) fn extract_go_value_declarations(
                 ),
                 confidence: Confidence::ExactSyntax,
                 freshness: Freshness::Fresh,
+                arity: None,
             });
         }
     }
@@ -421,6 +425,16 @@ pub(crate) fn extract_go_import(
 ) {
     let raw = node_text(node, ctx.source).unwrap_or_default();
     for (path, alias, is_glob, span) in go_import_specs(node, raw, ctx.source) {
+        let kind = if is_glob {
+            ImportKind::Wildcard
+        } else {
+            ImportKind::Namespace
+        };
+        let imported_name = if is_glob {
+            None
+        } else {
+            Some(last_path_segment(&path))
+        };
         ctx.imports.push(ParsedImport {
             file_id: ctx.file.id.clone(),
             owner_id: owner_id.clone(),
@@ -431,6 +445,9 @@ pub(crate) fn extract_go_import(
             is_static: false,
             span,
             provenance: Provenance::new("tree-sitter-go", "import declaration"),
+            kind,
+            imported_name,
+            is_global: false,
         });
     }
 }

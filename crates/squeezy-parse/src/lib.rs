@@ -77,6 +77,33 @@ pub struct ParsedSymbol {
     pub provenance: Provenance,
     pub confidence: Confidence,
     pub freshness: Freshness,
+    /// Fixed positional parameter count for `Function`/`Method`/`Constructor`
+    /// symbols. `None` for everything else and for parsers that cannot
+    /// observe the parameter list (e.g. heuristic-only extractors). Variadic
+    /// and default-argument fuzz is intentionally not captured here; the
+    /// resolver only uses this as a tiebreaker when one candidate matches
+    /// the call's arity exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arity: Option<u8>,
+}
+
+/// Shape of an import binding, classified so the cross-file resolver can
+/// route the binding through the right path-resolution rule.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ImportKind {
+    /// Untyped/legacy: parser did not classify the binding shape.
+    #[default]
+    Unspecified,
+    /// `import { foo } from 'm'`, `from m import foo`, `use m::foo`.
+    Named,
+    /// `import foo from 'm'`.
+    Default,
+    /// `import * as ns from 'm'`, `use m::*` aliased to a namespace.
+    Namespace,
+    /// `import static a.b.C.foo;`, `using static N.C;`.
+    Static,
+    /// `from m import *`, `use m::*`, `#include "x.h"`, `using namespace N;`.
+    Wildcard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +117,21 @@ pub struct ParsedImport {
     pub is_static: bool,
     pub span: SourceSpan,
     pub provenance: Provenance,
+    /// Structured classification of the import binding. Lets the cross-file
+    /// resolver pick the right path-resolution rule without re-parsing the
+    /// source. Defaults to `Unspecified` for back-compat with persisted
+    /// `ParsedFile` JSON written by older binaries.
+    #[serde(default)]
+    pub kind: ImportKind,
+    /// For `Named`/`Default`/`Static` imports, the leaf identifier as it
+    /// appears on the import side (e.g. `foo` in `import { foo as bar }`).
+    /// `None` for `Namespace`/`Wildcard` and parsers that don't capture it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_name: Option<String>,
+    /// `true` only for C# `global using …;` directives. Lets the resolver
+    /// propagate the binding to every compilation unit in the project.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_global: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -35,7 +35,7 @@ pub use reports::*;
 pub use sessions::*;
 
 pub const CRATE_NAME: &str = "squeezy-store";
-pub const SCHEMA_VERSION: u64 = 1;
+pub const SCHEMA_VERSION: u64 = 2;
 
 #[cfg(test)]
 #[path = "lib_tests.rs"]
@@ -50,6 +50,19 @@ const OBSERVATIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("observa
 const OBSERVATION_INDEX: TableDefinition<&str, &[u8]> = TableDefinition::new("observation_index");
 const COMPACTION_CHECKPOINTS: TableDefinition<&str, &[u8]> =
     TableDefinition::new("compaction_checkpoints");
+/// Per-file resolver snapshot: exports, imports, supertypes, builder
+/// snapshot. Keyed by `FileId.0`. Sits alongside `GRAPH_PARTITIONS`,
+/// which already caches per-file parse output; this table caches the
+/// resolver-layer derivatives so warm start after a process restart can
+/// reuse the previous run's cross-file work.
+const RESOLVER_SNAPSHOT_PER_FILE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("resolver_snapshot_per_file");
+/// Single-blob persistent snapshot of the file-level import adjacency
+/// graph that the phased scheduler discovers. Stored under one key
+/// (`"resolver_import_graph"`) so the import adjacency loads in one
+/// table read instead of a per-file scan.
+const RESOLVER_IMPORT_GRAPH: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("resolver_import_graph");
 
 /// Default retention for `compaction_checkpoints`. Mirrors the VCS
 /// checkpoint TTL; intentionally duplicated so this crate does not depend
@@ -188,6 +201,89 @@ impl SqueezyStore {
             }
         }
         write.commit().map_err(store_error)
+    }
+
+    /// Upsert a per-file resolver snapshot into the V2 resolver cache.
+    /// Callers should fingerprint the file (modified-time + size) into the
+    /// stored value so a later open can decide whether the snapshot is
+    /// still authoritative.
+    pub fn put_resolver_entry<T: Serialize>(&self, file_id: &FileId, entry: &T) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write
+                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+                .map_err(store_error)?;
+            insert_json(&mut table, file_id.0.as_str(), entry)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    pub fn resolver_entry<T: DeserializeOwned>(&self, file_id: &FileId) -> Result<Option<T>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_table_json(&table, file_id.0.as_str())
+    }
+
+    pub fn resolver_entries_for<T: DeserializeOwned>(
+        &self,
+        file_ids: &[FileId],
+    ) -> Result<Vec<(FileId, T)>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(RESOLVER_SNAPSHOT_PER_FILE) {
+            Ok(table) => table,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out = Vec::with_capacity(file_ids.len());
+        for file_id in file_ids {
+            if let Some(value) = read_table_json(&table, file_id.0.as_str())? {
+                out.push((file_id.clone(), value));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn remove_resolver_entry(&self, file_id: &FileId) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write
+                .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+                .map_err(store_error)?;
+            table.remove(file_id.0.as_str()).map_err(store_error)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    pub fn clear_resolver_entries(&self) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            clear_table(&write, RESOLVER_SNAPSHOT_PER_FILE)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    /// Replace the persisted file-level import adjacency blob. Stored under
+    /// one key so reading on warm-start is a single table get.
+    pub fn put_import_graph<T: Serialize>(&self, graph: &T) -> Result<()> {
+        let write = self.begin_write()?;
+        {
+            let mut table = write
+                .open_table(RESOLVER_IMPORT_GRAPH)
+                .map_err(store_error)?;
+            insert_json(&mut table, "resolver_import_graph", graph)?;
+        }
+        write.commit().map_err(store_error)
+    }
+
+    pub fn import_graph<T: DeserializeOwned>(&self) -> Result<Option<T>> {
+        let read = self.database.begin_read().map_err(store_error)?;
+        let table = match read.open_table(RESOLVER_IMPORT_GRAPH) {
+            Ok(table) => table,
+            Err(_) => return Ok(None),
+        };
+        read_table_json(&table, "resolver_import_graph")
     }
 
     pub fn put_tool_receipt(&self, receipt: &StoredToolReceipt) -> Result<()> {
@@ -681,6 +777,12 @@ pub(crate) fn initialize_schema(database: &Database) -> Result<()> {
     write.open_table(OBSERVATION_INDEX).map_err(store_error)?;
     write
         .open_table(COMPACTION_CHECKPOINTS)
+        .map_err(store_error)?;
+    write
+        .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+        .map_err(store_error)?;
+    write
+        .open_table(RESOLVER_IMPORT_GRAPH)
         .map_err(store_error)?;
     write.commit().map_err(store_error)
 }

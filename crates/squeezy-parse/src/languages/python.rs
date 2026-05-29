@@ -66,6 +66,7 @@ pub(crate) fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
             continue;
         };
         for exported in python_string_list_values(right) {
+            let imported_name = Some(exported.clone());
             ctx.imports.push(ParsedImport {
                 file_id: ctx.file.id.clone(),
                 owner_id: None,
@@ -76,6 +77,9 @@ pub(crate) fn extract_python_module_exports(ctx: &mut ExtractContext<'_>) {
                 is_static: false,
                 span: SourceSpan::new(0, 0, SourcePoint::new(0, 0), SourcePoint::new(0, 0)),
                 provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+                kind: ImportKind::Named,
+                imported_name,
+                is_global: false,
             });
         }
     }
@@ -172,6 +176,11 @@ pub(crate) fn extract_python_import(
     };
 
     for (path, alias, is_glob) in imports {
+        let imported_name = if is_glob {
+            None
+        } else {
+            Some(last_path_segment(&path))
+        };
         ctx.imports.push(ParsedImport {
             file_id: ctx.file.id.clone(),
             owner_id: owner_id.clone(),
@@ -182,6 +191,13 @@ pub(crate) fn extract_python_import(
             is_static: false,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-python", "import declaration"),
+            kind: if is_glob {
+                ImportKind::Wildcard
+            } else {
+                ImportKind::Named
+            },
+            imported_name,
+            is_global: false,
         });
     }
 }
@@ -273,6 +289,7 @@ pub(crate) fn extract_python_field_symbol(
         provenance: Provenance::new("tree-sitter-python", "class field assignment"),
         confidence: Confidence::Heuristic,
         freshness: Freshness::Fresh,
+        arity: None,
     });
 }
 
@@ -345,6 +362,7 @@ pub(crate) fn extract_python_assignment(
     let right = right.trim();
     if left == "__all__" {
         for exported in python_string_list_values(right) {
+            let imported_name = Some(exported.clone());
             ctx.imports.push(ParsedImport {
                 file_id: ctx.file.id.clone(),
                 owner_id: owner_id.clone(),
@@ -355,6 +373,9 @@ pub(crate) fn extract_python_assignment(
                 is_static: false,
                 span: span_from_node(node),
                 provenance: Provenance::new("tree-sitter-python", "__all__ export"),
+                kind: ImportKind::Named,
+                imported_name,
+                is_global: false,
             });
         }
         return;
@@ -370,6 +391,7 @@ pub(crate) fn extract_python_assignment(
         return;
     }
 
+    let imported_name = Some(last_path_segment(&target));
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
         owner_id,
@@ -380,6 +402,9 @@ pub(crate) fn extract_python_assignment(
         is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-python", "assignment alias"),
+        kind: ImportKind::Named,
+        imported_name,
+        is_global: false,
     });
 }
 

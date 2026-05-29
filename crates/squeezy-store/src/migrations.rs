@@ -27,9 +27,19 @@
 
 use std::{fs, path::Path};
 
+use redb::TableDefinition;
 use squeezy_core::Result;
 
-use crate::{SCHEMA_VERSION, current_schema_version, initialize_schema, open_database, state_path};
+use crate::{current_schema_version, initialize_schema, open_database, state_path};
+
+/// Tables added by [`V2AddResolverTables`]. Duplicated here so the
+/// migration is self-contained even if the table constants in
+/// [`crate`] move; the redb-layer constants drive the runtime accessors.
+const RESOLVER_SNAPSHOT_PER_FILE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("resolver_snapshot_per_file");
+const RESOLVER_IMPORT_GRAPH: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("resolver_import_graph");
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 /// A single forward migration step.
 ///
@@ -140,6 +150,7 @@ impl MigrationRegistry {
 pub fn default_registry() -> MigrationRegistry {
     let mut registry = MigrationRegistry::new();
     registry.register(InitializeStoreSchemaV1);
+    registry.register(V2AddResolverTables);
     registry
 }
 
@@ -189,7 +200,7 @@ pub struct InitializeStoreSchemaV1;
 
 impl Migration for InitializeStoreSchemaV1 {
     fn version(&self) -> u64 {
-        SCHEMA_VERSION
+        1
     }
 
     fn migrate(&self, cwd: &Path) -> Result<()> {
@@ -198,7 +209,84 @@ impl Migration for InitializeStoreSchemaV1 {
             fs::create_dir_all(parent)?;
         }
         let database = open_database(&path)?;
+        // Bootstrap a fresh store at v1 first; the v2 migration stamps
+        // its own version + opens the new tables on top.
+        let write = database.begin_write().map_err(store_error)?;
+        {
+            let mut meta = write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new("meta"))
+                .map_err(store_error)?;
+            let encoded = serde_json::to_vec(&1u64).map_err(|err| {
+                squeezy_core::SqueezyError::Tool(format!("store encode failed: {err}"))
+            })?;
+            meta.insert("schema_version", encoded.as_slice())
+                .map_err(store_error)?;
+        }
+        for table in [
+            "graph_partitions",
+            "tool_receipts",
+            "read_snapshots",
+            "mcp_tool_cache",
+            "observations",
+            "observation_index",
+            "compaction_checkpoints",
+        ] {
+            write
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(table))
+                .map_err(store_error)?;
+        }
+        write.commit().map_err(store_error)?;
+        // Defensive: ensure the store-level initialiser still runs so any
+        // future tables added directly to `initialize_schema` (rather
+        // than through their own migration) come online on first boot.
         initialize_schema(&database)
+    }
+}
+
+fn store_error(error: impl std::fmt::Display) -> squeezy_core::SqueezyError {
+    squeezy_core::SqueezyError::Tool(format!("store error: {error}"))
+}
+
+/// Add the resolver-cache tables introduced by Item 2 PR-1. Idempotent —
+/// opening a table inside a write transaction creates it on first run
+/// and is a no-op on every subsequent run. Re-stamps the
+/// `schema_version` key so a later `current_schema_version` read sees
+/// the updated target.
+pub struct V2AddResolverTables;
+
+impl Migration for V2AddResolverTables {
+    fn version(&self) -> u64 {
+        2
+    }
+
+    fn migrate(&self, cwd: &Path) -> Result<()> {
+        let path = state_path(cwd, None);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let database = open_database(&path)?;
+        let write = database
+            .begin_write()
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        write
+            .open_table(RESOLVER_SNAPSHOT_PER_FILE)
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        write
+            .open_table(RESOLVER_IMPORT_GRAPH)
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        {
+            let mut meta = write
+                .open_table(META)
+                .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+            let encoded = serde_json::to_vec(&2u64).map_err(|err| {
+                squeezy_core::SqueezyError::Tool(format!("store encode failed: {err}"))
+            })?;
+            meta.insert("schema_version", encoded.as_slice())
+                .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))?;
+        }
+        write
+            .commit()
+            .map_err(|err| squeezy_core::SqueezyError::Tool(format!("store error: {err}")))
     }
 }
 

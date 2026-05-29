@@ -19,3 +19,8 @@ squeezy-core.workspace = true
 squeezy-store.workspace = true
 squeezy-parse.workspace = true
 squeezy-workspace.workspace = true
+# Cross-platform file-system watcher: FSEvents on macOS, inotify on
+# Linux, ReadDirectoryChangesW on Windows, plus the debouncer that lets
+# us batch rapid edits before invalidating the graph.
+notify-debouncer-full = "0.5"
+tracing = "0.1"

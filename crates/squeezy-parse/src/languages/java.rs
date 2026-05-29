@@ -159,6 +159,12 @@ pub(crate) fn java_symbol_from_node(
     let signature = signature_text(node, body, ctx.source);
     let parent_id = parent_symbol.map(|(id, _)| id.clone());
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
+    let arity = if matches!(kind, SymbolKind::Method) {
+        node.child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
+    } else {
+        None
+    };
     let mut attributes = java_attributes_for_node(node, ctx.source);
     if is_java_test_symbol(&ctx.file.relative_path, kind, &name, &attributes) {
         attributes.push("java:test".to_string());
@@ -192,6 +198,7 @@ pub(crate) fn java_symbol_from_node(
         provenance: Provenance::new("tree-sitter-java", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity,
     })
 }
 
@@ -250,6 +257,7 @@ pub(crate) fn java_field_symbols_from_node(
             provenance: Provenance::new("tree-sitter-java", "field_declaration declaration"),
             confidence: Confidence::ExactSyntax,
             freshness: Freshness::Fresh,
+            arity: None,
         });
     }
     symbols
@@ -275,6 +283,9 @@ pub(crate) fn extract_java_package(node: Node<'_>, ctx: &mut ExtractContext<'_>)
         is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-java", "package declaration"),
+        kind: ImportKind::Unspecified,
+        imported_name: None,
+        is_global: false,
     });
 }
 
@@ -299,6 +310,18 @@ pub(crate) fn extract_java_import(
         return;
     }
     let is_glob = path.ends_with(".*");
+    let kind = if is_glob {
+        ImportKind::Wildcard
+    } else if is_static {
+        ImportKind::Static
+    } else {
+        ImportKind::Named
+    };
+    let imported_name = if is_glob {
+        None
+    } else {
+        Some(last_path_segment(&path))
+    };
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
         owner_id,
@@ -316,6 +339,9 @@ pub(crate) fn extract_java_import(
                 "import declaration"
             },
         ),
+        kind,
+        imported_name,
+        is_global: false,
     });
 }
 

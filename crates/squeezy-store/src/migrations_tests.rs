@@ -6,7 +6,8 @@ use std::{
 use squeezy_core::Result;
 
 use crate::migrations::{
-    InitializeStoreSchemaV1, Migration, MigrationRegistry, default_registry, run_registry,
+    InitializeStoreSchemaV1, Migration, MigrationRegistry, V2AddResolverTables, default_registry,
+    run_registry,
 };
 
 fn temp_workspace(label: &str) -> PathBuf {
@@ -50,14 +51,15 @@ impl Migration for RecordingMigration {
 fn run_migrations_is_no_op_when_already_at_target() {
     let cwd = temp_workspace("noop-at-target");
     let registry = default_registry();
+    let target = registry.target_version();
     assert!(
-        registry.target_version() >= 1,
+        target >= 1,
         "default registry should ship at least the v1 initialiser",
     );
     let first = run_registry(&registry, &cwd).expect("first run bootstraps store");
     assert_eq!(
-        first, 1,
-        "first run on a fresh workspace should apply exactly one migration (v1)",
+        first as u64, target,
+        "first run on a fresh workspace should apply every registered migration",
     );
     let second = run_registry(&registry, &cwd).expect("second run reads target version from store");
     assert_eq!(
@@ -110,10 +112,16 @@ fn registering_duplicate_versions_panics() {
 }
 
 #[test]
-fn initialize_store_schema_v1_targets_schema_version_constant() {
+fn default_registry_target_version_matches_schema_constant() {
     assert_eq!(
-        InitializeStoreSchemaV1.version(),
+        default_registry().target_version(),
         crate::SCHEMA_VERSION,
-        "v1 initialiser must stay aligned with the published SCHEMA_VERSION constant",
+        "the highest registered migration must land the store at SCHEMA_VERSION",
     );
+}
+
+#[test]
+fn v1_and_v2_migrations_are_distinct() {
+    assert_eq!(InitializeStoreSchemaV1.version(), 1);
+    assert_eq!(V2AddResolverTables.version(), 2);
 }

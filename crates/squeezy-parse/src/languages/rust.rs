@@ -141,6 +141,15 @@ pub(crate) fn symbol_from_node(
     let signature = signature_text(node, body, ctx.source);
     let visibility = visibility_text(node, ctx.source);
     let id = symbol_id(&ctx.file, parent_symbol.as_ref(), kind, &name, span);
+    let arity = if matches!(
+        kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+    ) {
+        node.child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
+    } else {
+        None
+    };
 
     Some(ParsedSymbol {
         id,
@@ -158,6 +167,7 @@ pub(crate) fn symbol_from_node(
         provenance: Provenance::new("tree-sitter-rust", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity,
     })
 }
 
@@ -205,6 +215,15 @@ pub(crate) fn python_symbol_from_node(
     attributes.extend(python_test_attributes(&ctx.file.relative_path, kind, &name));
     attributes.sort();
     attributes.dedup();
+    let arity = if matches!(
+        kind,
+        SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+    ) {
+        node.child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
+    } else {
+        None
+    };
 
     Some(ParsedSymbol {
         id,
@@ -222,6 +241,7 @@ pub(crate) fn python_symbol_from_node(
         provenance: Provenance::new("tree-sitter-python", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity,
     })
 }
 
@@ -285,6 +305,11 @@ pub(crate) fn js_ts_symbol_from_node(
     let mut attributes = js_ts_attributes_for_symbol(node, kind, &name, ctx);
     attributes.sort();
     attributes.dedup();
+    let arity = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+        js_ts_arity_for_node(node)
+    } else {
+        None
+    };
 
     Some(ParsedSymbol {
         id,
@@ -302,7 +327,21 @@ pub(crate) fn js_ts_symbol_from_node(
         provenance: Provenance::new("tree-sitter-js-ts", format!("{} declaration", node.kind())),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity,
     })
+}
+
+/// Count fixed positional parameters on a JS/TS function/method node. Tries
+/// the `parameters` field first; falls back to scanning for a
+/// `formal_parameters` child to cover variable declarators whose value is an
+/// arrow function or function expression.
+pub(crate) fn js_ts_arity_for_node(node: Node<'_>) -> Option<u8> {
+    if let Some(params) = node.child_by_field_name("parameters") {
+        return Some(u8::try_from(named_child_count(params)).unwrap_or(u8::MAX));
+    }
+    let value = node.child_by_field_name("value")?;
+    let params = value.child_by_field_name("parameters")?;
+    Some(u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
 }
 
 pub(crate) fn js_ts_variable_symbol_kind(node: Node<'_>, source: &str) -> Option<SymbolKind> {
@@ -499,6 +538,7 @@ pub(crate) fn js_ts_declare_global_symbol(
                 ),
                 confidence: Confidence::ExactSyntax,
                 freshness: Freshness::Fresh,
+                arity: None,
             });
         }
         return None;
@@ -570,6 +610,7 @@ pub(crate) fn js_ts_using_binding_symbol(
         provenance: Provenance::new("tree-sitter-js-ts", "using declaration".to_string()),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
@@ -1668,6 +1709,16 @@ pub(crate) fn extract_import(
     let raw = node_text(node, ctx.source).unwrap_or_default();
     let is_reexport = raw.trim_start().starts_with("pub");
     for import in expand_use_declaration(raw) {
+        let kind = if import.is_glob {
+            ImportKind::Wildcard
+        } else {
+            ImportKind::Named
+        };
+        let imported_name = if import.is_glob {
+            None
+        } else {
+            Some(last_path_segment(&import.path))
+        };
         ctx.imports.push(ParsedImport {
             file_id: ctx.file.id.clone(),
             owner_id: owner_id.clone(),
@@ -1678,6 +1729,9 @@ pub(crate) fn extract_import(
             alias: import.alias,
             span: span_from_node(node),
             provenance: Provenance::new("tree-sitter-rust", "use declaration"),
+            kind,
+            imported_name,
+            is_global: false,
         });
     }
 }

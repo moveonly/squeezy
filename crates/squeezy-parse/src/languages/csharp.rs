@@ -246,6 +246,7 @@ pub(crate) fn csharp_namespace_symbol(
         ),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
@@ -339,6 +340,15 @@ fn csharp_symbol_from_node(
     let visibility = csharp_visibility(&modifiers);
     let id = symbol_id(&ctx.file, parent_id.as_ref(), kind, &name, span);
     let language_identity = csharp_language_identity(node, kind, &name, &modifiers, scope);
+    let arity = if matches!(
+        kind,
+        SymbolKind::Method | SymbolKind::Function | SymbolKind::Test
+    ) {
+        node.child_by_field_name("parameters")
+            .map(|params| u8::try_from(named_child_count(params)).unwrap_or(u8::MAX))
+    } else {
+        None
+    };
 
     Some(ParsedSymbol {
         id,
@@ -359,6 +369,7 @@ fn csharp_symbol_from_node(
         ),
         confidence: Confidence::ExactSyntax,
         freshness: Freshness::Fresh,
+        arity,
     })
 }
 
@@ -758,6 +769,16 @@ pub(crate) fn extract_csharp_using_directive(
     if path.is_empty() {
         return;
     }
+    let kind = if is_static {
+        ImportKind::Static
+    } else {
+        ImportKind::Namespace
+    };
+    let imported_name = if is_static {
+        None
+    } else {
+        Some(last_path_segment(&path))
+    };
     let mut import = ParsedImport {
         file_id: ctx.file.id.clone(),
         owner_id: owner_id.clone(),
@@ -768,6 +789,9 @@ pub(crate) fn extract_csharp_using_directive(
         is_static,
         span: span_from_node(node),
         provenance: Provenance::new("tree-sitter-c-sharp", "using directive"),
+        kind,
+        imported_name,
+        is_global,
     };
     if is_static {
         import.path = format!("{}.*", import.path);
@@ -1027,6 +1051,7 @@ fn extract_csharp_field_symbols(
                 provenance: Provenance::new("tree-sitter-c-sharp", "field declaration"),
                 confidence: Confidence::ExactSyntax,
                 freshness: Freshness::Fresh,
+                arity: None,
             });
             if let Some(type_text) = type_text.clone() {
                 ctx.references.push(ParsedReference {

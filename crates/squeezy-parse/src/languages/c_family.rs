@@ -290,6 +290,7 @@ pub(crate) fn c_family_symbol_from_node(
         ),
         confidence,
         freshness: Freshness::Fresh,
+        arity: None,
     })
 }
 
@@ -372,6 +373,9 @@ pub(crate) fn extract_c_include(
         is_static: false,
         span: span_from_node(node),
         provenance: Provenance::new(c_family_parser_name(ctx.file.language), "include directive"),
+        kind: ImportKind::Wildcard,
+        imported_name: None,
+        is_global: false,
     });
 }
 
@@ -420,6 +424,16 @@ pub(crate) fn extract_c_using(
     if path.is_empty() {
         return;
     }
+    let kind = if is_namespace {
+        ImportKind::Wildcard
+    } else {
+        ImportKind::Named
+    };
+    let imported_name = if is_namespace {
+        None
+    } else {
+        Some(last_path_segment(&path))
+    };
     ctx.imports.push(ParsedImport {
         file_id: ctx.file.id.clone(),
         owner_id,
@@ -437,6 +451,9 @@ pub(crate) fn extract_c_using(
                 "using declaration"
             },
         ),
+        kind,
+        imported_name,
+        is_global: false,
     });
 }
 
