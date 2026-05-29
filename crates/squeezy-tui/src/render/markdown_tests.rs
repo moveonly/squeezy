@@ -1,4 +1,6 @@
 use super::render_markdown;
+use crate::render::palette;
+use ratatui::style::Modifier;
 use ratatui::text::Line;
 
 fn line_text(line: &Line<'_>) -> String {
@@ -25,6 +27,87 @@ fn markdown_renders_inline_link_text_and_url() {
         joined.contains("here (https://example.com)"),
         "link should render as `text (url)`: {joined}"
     );
+}
+
+#[test]
+fn markdown_truncates_long_link_urls() {
+    let lines = render_markdown(
+        "See [trace](https://example.com/some/really/long/path/that/would/wrap/badly/in/a/narrow/terminal?with=query).",
+    );
+    let joined: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+    assert!(
+        joined.contains("trace (https://example.com/some/really/long/path/tha..."),
+        "{joined}"
+    );
+    assert!(
+        !joined.contains("wrap/badly/in/a/narrow"),
+        "long url should be abbreviated in the terminal render: {joined}"
+    );
+}
+
+#[test]
+fn markdown_heading_style_does_not_leak_into_following_blocks() {
+    let lines =
+        render_markdown("# Heading\n\nNormal paragraph\n\n| A | B |\n|---|---|\n| C | D |\n");
+    let heading = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "Heading")
+        .expect("heading span");
+    assert!(heading.style.add_modifier.contains(Modifier::BOLD));
+
+    let normal = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref().contains("Normal paragraph"))
+        .expect("paragraph span");
+    assert!(
+        !normal.style.add_modifier.contains(Modifier::BOLD),
+        "paragraph after heading should not inherit heading style"
+    );
+
+    let table = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref().contains("A") && span.content.as_ref().contains("B"))
+        .expect("table header span");
+    assert!(
+        !table.style.add_modifier.contains(Modifier::BOLD),
+        "table after heading should not inherit heading style"
+    );
+}
+
+#[test]
+fn markdown_caps_table_column_width_for_narrow_terminals() {
+    let source = "\
+| Path | Symptom | Fix |
+|---|---|---|
+| crates/squeezy-tui/src/render/markdown.rs | heading style leaks into every following row | pop heading style |
+";
+    let lines = render_markdown(source);
+    let texts: Vec<String> = lines.iter().map(line_text).collect();
+    let longest = texts.iter().map(String::len).max().unwrap_or(0);
+    assert!(
+        longest <= 60,
+        "rendered table rows should stay compact for 64-col captures:\n{}",
+        texts.join("\n")
+    );
+    assert!(
+        texts.iter().any(|line| line.contains("crates/squeezy-...")),
+        "long table cells should be visibly abbreviated:\n{}",
+        texts.join("\n")
+    );
+}
+
+#[test]
+fn markdown_colors_standalone_confidence_labels_in_prose() {
+    let lines = render_markdown("The graph label is label_missing in this response.");
+    let span = lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .find(|span| span.content.as_ref() == "label_missing")
+        .expect("standalone confidence label span");
+    assert_eq!(span.style.fg, Some(palette::ERROR_RED));
 }
 
 #[test]

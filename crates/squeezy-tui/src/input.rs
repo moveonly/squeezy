@@ -926,14 +926,6 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
             true
         }
         KeyCode::Enter => {
-            if choice_count > 0
-                && let Some(choice) = pending.request.choices.get(pending.selection_index)
-            {
-                let response = RequestUserInputResponse::choice(choice.value.clone());
-                let _ = pending.response_tx.send(response);
-                app.status = format!("answered: {}", choice.label);
-                return true;
-            }
             if allow_freeform && !pending.answer.trim().is_empty() {
                 let text = std::mem::take(&mut pending.answer);
                 pending.answer_cursor = 0;
@@ -941,6 +933,14 @@ pub(crate) fn handle_request_user_input_key(app: &mut TuiApp, key: KeyEvent) -> 
                     .response_tx
                     .send(RequestUserInputResponse::freeform(text));
                 app.status = "answered with free-form text".to_string();
+                return true;
+            }
+            if choice_count > 0
+                && let Some(choice) = pending.request.choices.get(pending.selection_index)
+            {
+                let response = RequestUserInputResponse::choice(choice.value.clone());
+                let _ = pending.response_tx.send(response);
+                app.status = format!("answered: {}", choice.label);
                 return true;
             }
             // Nothing to send yet — keep the modal up.

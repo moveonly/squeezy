@@ -20,6 +20,12 @@ pub struct FrameRecord {
     /// Concatenation of all assistant text deltas for this turn, in order.
     pub assistant_text: String,
     pub tool_calls: Vec<ToolCallSummary>,
+    /// Tool calls queued by the agent before execution. This can be
+    /// larger than `tool_calls` when a provider stream fails after
+    /// emitting calls but before the agent starts them, which is exactly
+    /// the failure shape users need eval frames to make visible.
+    #[serde(default)]
+    pub queued_tool_calls: Vec<ToolCallSummary>,
     pub tool_errors: Vec<String>,
     pub elapsed_ms: u64,
     pub input_tokens: u64,

@@ -140,7 +140,7 @@ pub enum EvalEventKind {
     /// `Snapshot{snapshot_kind:"mcp_status"}` in v2.
     McpStatusUpdated {
         servers: Value,
-        generated_unix_millis: u128,
+        generated_unix_millis: u64,
     },
     /// Schema v3+. Typed JobUpdated with structured snapshot fields.
     /// Was folded into `Snapshot{snapshot_kind:"job"}` in v2.
@@ -156,7 +156,7 @@ pub enum EvalEventKind {
         status: String,
         title: String,
         summary: String,
-        ts_unix_ms: u64,
+        notification_ts_unix_ms: u64,
     },
     /// Schema v3+. Typed CostWarning carrying the broker's structured
     /// CostCapStatus (`spent_usd_micros`, `cap_usd_micros`, `percent`).

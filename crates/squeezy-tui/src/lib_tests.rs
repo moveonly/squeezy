@@ -213,6 +213,41 @@ async fn freeform_modal_keeps_typing_out_of_main_composer() {
 }
 
 #[tokio::test]
+async fn freeform_modal_enter_submits_typed_answer_before_selected_choice() {
+    let mut agent = test_agent(SessionMode::Build);
+    let mut app = test_app(SessionMode::Plan);
+    let request = RequestUserInputRequest {
+        question: "Where to next?".to_string(),
+        choices: vec![squeezy_agent::RequestUserInputChoice {
+            label: "Default".to_string(),
+            value: "default".to_string(),
+        }],
+        allow_freeform: true,
+    };
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    app.pending_request_user_input = Some(PendingRequestUserInput {
+        request,
+        response_tx,
+        selection_index: 0,
+        answer: "typed answer".to_string(),
+        answer_cursor: "typed answer".len(),
+    });
+
+    handle_key(
+        &mut app,
+        &mut agent,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+    )
+    .await
+    .expect("handle enter");
+
+    let response = response_rx.await.expect("response");
+    assert_eq!(response.choice_value, None);
+    assert_eq!(response.freeform.as_deref(), Some("typed answer"));
+    assert!(app.pending_request_user_input.is_none());
+}
+
+#[tokio::test]
 async fn enter_during_running_turn_enqueues_prompt() {
     let mut agent = test_agent(SessionMode::Build);
     let mut app = test_app(SessionMode::Build);
@@ -2789,6 +2824,23 @@ fn slash_suggestion_line_contents_match_command_capabilities() {
         !cost_line.contains('['),
         "/cost should not render a capability badge: {cost_line}"
     );
+}
+
+#[test]
+fn slash_suggestion_lines_cap_description_width() {
+    let mut app = test_app(SessionMode::Build);
+    set_input(&mut app, "/".to_string());
+    for line in slash_suggestion_lines(&app) {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            text.chars().count() <= 140,
+            "slash menu line should stay bounded: {text}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -9255,6 +9307,24 @@ fn status_line_configured_replaces_overview_dir_and_branch() {
         Some(crate::render::palette::ACCENT_CYAN),
         "provider-and-model should paint with the Model accent (cyan)"
     );
+}
+
+#[test]
+fn status_line_items_stay_compact_for_paths_tokens_and_session_ids() {
+    use crate::status::StatusLineItem;
+    let mut app = test_app(SessionMode::Build);
+    app.directory =
+        "/Users/example/workspaces/squeezy-with-a-very-long-path/crates/squeezy-tui/src".into();
+    app.session_id = Some("019e57d8-dbf1-79c2-ae5a-cc67e93f3a34".into());
+    app.metrics.bytes_read = 2_500_000;
+
+    let dir = status::resolve_status_item(&app, StatusLineItem::CurrentDir).expect("dir");
+    let session = status::resolve_status_item(&app, StatusLineItem::SessionId).expect("session");
+    let bytes = status::resolve_status_item(&app, StatusLineItem::BytesRead).expect("bytes");
+
+    assert!(dir.len() <= 52, "{dir}");
+    assert!(session.len() <= 24, "{session}");
+    assert_eq!(bytes, "read 2.4MB");
 }
 
 #[test]

@@ -1041,6 +1041,9 @@ impl Driver {
                 AgentEvent::ToolCallQueued { turn_id, call } => {
                     let turn_str = format!("{turn_id:?}");
                     let value = serde_json::to_value(&call).unwrap_or(Value::Null);
+                    frame
+                        .queued_tool_calls
+                        .push(ToolCallSummary::from_call(&call.name, &call.arguments));
                     self.capture.record(
                         Some(turn_str),
                         EvalEventKind::ToolCallQueued {
@@ -1274,7 +1277,10 @@ impl Driver {
                         Some(turn_str),
                         EvalEventKind::McpStatusUpdated {
                             servers,
-                            generated_unix_millis: snapshot.generated_unix_millis,
+                            generated_unix_millis: snapshot
+                                .generated_unix_millis
+                                .min(u64::MAX as u128)
+                                as u64,
                         },
                     )?;
                 }
@@ -1318,7 +1324,7 @@ impl Driver {
                             status: notification.status.as_str().to_string(),
                             title: notification.title.clone(),
                             summary: notification.summary.clone(),
-                            ts_unix_ms: notification.ts_unix_ms,
+                            notification_ts_unix_ms: notification.ts_unix_ms,
                         },
                     )?;
                 }

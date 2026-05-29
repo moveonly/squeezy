@@ -11,7 +11,8 @@ fn definition_prompt_compiles_to_graph_first_tools() {
             .iter()
             .map(|call| call.name.as_str())
             .collect::<Vec<_>>(),
-        vec!["definition_search", "symbol_context"]
+        vec!["definition_search"],
+        "plain definition lookup should not preflight relationship context"
     );
     assert!(plan.guard_raw_reads);
 }

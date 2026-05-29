@@ -325,16 +325,13 @@ pub(crate) fn read_tool_output_spec() -> ToolSpec {
         parameters: tool_schema(json!({
             "type": "object",
             "additionalProperties": false,
+            "description": "Pass exactly one of `handle` or `path`; calls with both or neither are rejected at execution time.",
             "properties": {
                 "handle": {"type": "string", "description": "Tool output handle from a spilled generic-tool result."},
                 "path": {"type": "string", "description": "Absolute path to a shell spillover tempfile under $TMPDIR/squeezy-spillover/<session>/. Must be the path returned by an earlier shell result; arbitrary filesystem paths are rejected."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Byte offset to start reading from."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": MAX_READ_LIMIT, "description": "Maximum bytes to return."}
-            },
-            "oneOf": [
-                {"required": ["handle"]},
-                {"required": ["path"]}
-            ]
+            }
         })),
         prepare_arguments: None,
     }
@@ -361,7 +358,7 @@ pub(crate) fn repo_map_spec() -> ToolSpec {
 pub(crate) fn decl_search_spec() -> ToolSpec {
     ToolSpec {
         name: "decl_search".to_string(),
-        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use filter-only queries for questions like counting Java callables. Returns evidence packets plus total/facet counts.".to_string(),
+        description: "Search or count graph-backed declarations by signature/name or filters such as kind, language, path, visibility, and attribute. Use this for broad lists/counts; for a single defining file prefer definition_search. Do not call decl_search plus definition_search or symbol_context with the same query in one turn unless the first result is ambiguous.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -385,7 +382,7 @@ pub(crate) fn decl_search_spec() -> ToolSpec {
 pub(crate) fn definition_search_spec() -> ToolSpec {
     ToolSpec {
         name: "definition_search".to_string(),
-        description: "Resolve likely definitions from a symbol_id or declaration query. Use before flow tools when a name may be ambiguous.".to_string(),
+        description: "Resolve likely definitions from a symbol_id or declaration query. Best first tool for 'where is X defined?' or 'name one nearby declaration'. Use before flow tools when a name may be ambiguous, but do not also call decl_search or symbol_context for the same query unless this result is insufficient.".to_string(),
         capability: PermissionCapability::Search,
         parallel_safe: true,
         parameters: tool_schema(json!({
@@ -527,7 +524,7 @@ pub(crate) fn read_slice_spec() -> ToolSpec {
 pub(crate) fn symbol_context_spec() -> ToolSpec {
     ToolSpec {
         name: "symbol_context".to_string(),
-        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets.".to_string(),
+        description: "Return compact graph-backed context for symbols matching a declaration query, including callers, callees, references, dirty/diff annotations, and evidence packets. Use when the user asks for relationships, callers, references, or impact. Avoid for simple definition/file lookup already answered by definition_search.".to_string(),
         capability: PermissionCapability::Read,
         parallel_safe: true,
         parameters: tool_schema(json!({

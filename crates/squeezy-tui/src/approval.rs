@@ -20,7 +20,7 @@ use crate::{AMBER, GOLD, QUIET, compact_text};
 /// Anything beyond this is summarised by a "… (N more lines)" tail so the
 /// prompt stays scannable on short terminals — reviewers can still see the
 /// full patch via `/diff` once the call lands.
-const APPROVAL_DIFF_BODY_CAP: usize = 40;
+const APPROVAL_DIFF_BODY_CAP: usize = 18;
 
 /// Render the preview block above the option menu.
 pub(crate) fn render_preview(request: &ToolApprovalRequest) -> Vec<Line<'static>> {

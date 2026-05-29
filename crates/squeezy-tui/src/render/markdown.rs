@@ -59,6 +59,9 @@ struct CodeBlock {
     source: String,
 }
 
+const MAX_TABLE_COLUMN_WIDTH: usize = 18;
+const MAX_LINK_URL_CHARS: usize = 48;
+
 /// Accumulator for GFM tables. Cells are collected as plain strings (style is
 /// dropped for the table render) so that columns can be width-padded and
 /// joined with ` | ` separators. A `---` divider is emitted between header
@@ -122,6 +125,7 @@ impl TableBuilder {
                 let body_cell = row.get(i).map(String::as_str).unwrap_or("");
                 *width = (*width).max(body_cell.chars().count());
             }
+            *width = (*width).min(MAX_TABLE_COLUMN_WIDTH);
         }
 
         let render_row = |row: &[String]| -> Line<'static> {
@@ -131,7 +135,8 @@ impl TableBuilder {
                     buf.push_str(" | ");
                 }
                 let cell = row.get(i).map(String::as_str).unwrap_or("");
-                buf.push_str(cell);
+                let cell = truncate_chars(cell, *width);
+                buf.push_str(&cell);
                 let cell_width = cell.chars().count();
                 if cell_width < *width {
                     buf.extend(std::iter::repeat_n(' ', *width - cell_width));
@@ -290,7 +295,11 @@ impl Writer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => self.finish_line(),
+            TagEnd::Paragraph | TagEnd::Item => self.finish_line(),
+            TagEnd::Heading(_) => {
+                self.finish_line();
+                self.pop_style();
+            }
             TagEnd::BlockQuote(_) => {
                 self.finish_line();
                 self.quote_depth = self.quote_depth.saturating_sub(1);
@@ -310,7 +319,7 @@ impl Writer {
                 if let Some(url) = self.link_stack.pop()
                     && !url.is_empty()
                 {
-                    let text = format!(" ({url})");
+                    let text = format!(" ({})", display_link_url(&url));
                     if let Some(table) = self.table.as_mut() {
                         table.push_text(&text);
                     } else {
@@ -515,6 +524,7 @@ fn inline_code_style() -> Style {
 /// (`exact_syntax`, `import_resolved`, `candidate_set`, `external`,
 /// `unknown`, `label_missing`). The renderer highlights any of these
 /// when they appear:
+///   * as a standalone prose token (`label_missing`),
 ///   * preceded by an em dash and space (`X — exact_syntax`), or
 ///   * wrapped in square brackets (`[exact_syntax]`).
 ///
@@ -556,15 +566,20 @@ fn find_next_confidence_label(text: &str, from: usize) -> Option<(usize, usize, 
     let haystack = &text[from..];
     let mut best: Option<(usize, usize, &'static str)> = None;
     for &label in CONFIDENCE_LABELS {
-        // `— label` form: match the literal " — label" or " — label" with
-        // an em dash; require a leading separator so we don't colour
-        // bare matches inside identifiers (`my_exact_syntax_test`).
+        if let Some(off) = haystack.find(label) {
+            let label_start = from + off;
+            let label_end = label_start + label.len();
+            if is_identifier_boundary(text, label_start, label_end) {
+                pick_earliest(&mut best, (label_start, label_end, label));
+            }
+        }
+        // `— label` form: match the literal " — label" with an em dash.
         let with_em_dash = format!(" — {label}");
         if let Some(off) = haystack.find(&with_em_dash) {
             // Highlight just the label, not the em-dash separator.
             let label_start = from + off + with_em_dash.len() - label.len();
             let label_end = label_start + label.len();
-            if !is_identifier_continuation(text, label_end) {
+            if is_identifier_boundary(text, label_start, label_end) {
                 pick_earliest(&mut best, (label_start, label_end, label));
             }
         }
@@ -591,14 +606,37 @@ fn pick_earliest<'a>(
     }
 }
 
-/// Returns true when the byte after `end` is alphanumeric or `_` — i.e.
-/// we're still inside an identifier, so the apparent label is actually
-/// the prefix of a longer word (`exact_syntax_foo`).
-fn is_identifier_continuation(text: &str, end: usize) -> bool {
-    text.as_bytes()
-        .get(end)
-        .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        .unwrap_or(false)
+fn is_identifier_boundary(text: &str, start: usize, end: usize) -> bool {
+    !text
+        .as_bytes()
+        .get(start.saturating_sub(1))
+        .filter(|_| start > 0)
+        .is_some_and(is_identifier_byte)
+        && !text.as_bytes().get(end).is_some_and(is_identifier_byte)
+}
+
+fn is_identifier_byte(byte: &u8) -> bool {
+    byte.is_ascii_alphanumeric() || *byte == b'_'
+}
+
+fn display_link_url(url: &str) -> String {
+    truncate_chars(url, MAX_LINK_URL_CHARS)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return text.to_string();
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() && max_chars >= 3 {
+        out.truncate(out.len().saturating_sub(3));
+        out.push_str("...");
+    }
+    out
 }
 
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {

@@ -218,6 +218,27 @@ fn redundant_graph_lookup_quiet_for_single_tool() {
 }
 
 #[test]
+fn redundant_graph_lookup_quiet_for_definition_plus_context_pair() {
+    let events = vec![
+        tool_call(
+            1,
+            "T(1)",
+            "definition_search",
+            serde_json::json!({"query": "Agent"}),
+        ),
+        tool_call(
+            2,
+            "T(1)",
+            "symbol_context",
+            serde_json::json!({"query": "Agent", "max_results": 1}),
+        ),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = RedundantGraphLookup.check(&ctx, &empty_scenario());
+    assert!(out.is_empty());
+}
+
+#[test]
 fn deep_chain_expansion_flags_six_reads_and_grep() {
     let events = vec![
         tool_call(1, "T(1)", "read_slice", serde_json::json!({"path": "a.rs"})),
@@ -346,6 +367,76 @@ fn trivial_answer_over_fetch_quiet_for_long_answers() {
     let ctx = ctx_from_events(events);
     assert!(
         TrivialAnswerOverFetch
+            .check(&ctx, &empty_scenario())
+            .is_empty()
+    );
+}
+
+#[test]
+fn expensive_short_answer_over_fetch_flags_costly_short_answer() {
+    let mut events = Vec::new();
+    for seq in 1..=6 {
+        events.push(tool_call(
+            seq,
+            "T(1)",
+            if seq % 2 == 0 {
+                "definition_search"
+            } else {
+                "grep"
+            },
+            serde_json::json!({"query": "Agent", "seq": seq}),
+        ));
+    }
+    events.push(EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: 7,
+        turn_id: Some("T(1)".into()),
+        kind: EvalEventKind::TurnCompleted {
+            metrics: serde_json::json!({}),
+            cost: serde_json::json!({"output_tokens": 1300, "input_tokens": 69000}),
+            stop_reason: None,
+            reasoning_only_stop: false,
+            message: None,
+            response_id: None,
+            context_estimate: None,
+        },
+    });
+    let ctx = ctx_from_events(events);
+    let out = ExpensiveShortAnswerOverFetch.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1);
+    assert!(out[0].summary.contains("69000 input tokens"));
+    assert!(out[0].summary.contains("6 tool calls"));
+}
+
+#[test]
+fn expensive_short_answer_over_fetch_quiet_under_token_threshold() {
+    let events = vec![
+        tool_call(1, "T(1)", "grep", serde_json::json!({"query": "A"})),
+        tool_call(2, "T(1)", "grep", serde_json::json!({"query": "B"})),
+        tool_call(3, "T(1)", "grep", serde_json::json!({"query": "C"})),
+        tool_call(4, "T(1)", "grep", serde_json::json!({"query": "D"})),
+        tool_call(5, "T(1)", "grep", serde_json::json!({"query": "E"})),
+        tool_call(6, "T(1)", "grep", serde_json::json!({"query": "F"})),
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 7,
+            turn_id: Some("T(1)".into()),
+            kind: EvalEventKind::TurnCompleted {
+                metrics: serde_json::json!({}),
+                cost: serde_json::json!({"output_tokens": 1300, "input_tokens": 49000}),
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        },
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        ExpensiveShortAnswerOverFetch
             .check(&ctx, &empty_scenario())
             .is_empty()
     );
@@ -501,6 +592,58 @@ fn ungrounded_citation_quiet_for_no_path() {
     ];
     let ctx = ctx_from_events(events);
     assert!(UngroundedCitation.check(&ctx, &empty_scenario()).is_empty());
+}
+
+fn scenario_with_synthetic_render_prompt() -> Scenario {
+    toml::from_str(
+        r#"
+id = "render"
+title = "render"
+description = "Terminal rendering fixture"
+[workspace]
+local = "/tmp/r"
+[[steps]]
+kind = "prompt"
+text = "Do not inspect files. Produce a compact markdown sample for testing terminal rendering with paths and exact_syntax labels."
+"#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn ungrounded_citation_quiet_for_synthetic_render_sample() {
+    let events = vec![
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 5,
+            turn_id: Some("T(2)".into()),
+            kind: EvalEventKind::AssistantDelta {
+                delta: "| Path |\n|---|\n| `/var/tmp/render/sample.md` |".into(),
+            },
+        },
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 6,
+            turn_id: Some("T(2)".into()),
+            kind: EvalEventKind::TurnCompleted {
+                metrics: serde_json::json!({}),
+                cost: serde_json::json!({"input_tokens": 9000, "output_tokens": 20}),
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        },
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        UngroundedCitation
+            .check(&ctx, &scenario_with_synthetic_render_prompt())
+            .is_empty()
+    );
 }
 
 fn scenario_with_label_prompt() -> Scenario {
@@ -709,6 +852,42 @@ fn exact_syntax_without_source_quiet_when_read_slice_ran() {
     );
 }
 
+#[test]
+fn exact_syntax_without_source_quiet_for_synthetic_render_sample() {
+    let events = vec![
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 4,
+            turn_id: Some("T(3)".into()),
+            kind: EvalEventKind::AssistantDelta {
+                delta: "Render label text `exact_syntax` in a synthetic table.".into(),
+            },
+        },
+        EvalEvent {
+            schema_version: 2,
+            ts_unix_ms: 0,
+            sequence: 5,
+            turn_id: Some("T(3)".into()),
+            kind: EvalEventKind::TurnCompleted {
+                metrics: serde_json::json!({}),
+                cost: serde_json::json!({}),
+                stop_reason: None,
+                reasoning_only_stop: false,
+                message: None,
+                response_id: None,
+                context_estimate: None,
+            },
+        },
+    ];
+    let ctx = ctx_from_events(events);
+    assert!(
+        ExactSyntaxWithoutSource
+            .check(&ctx, &scenario_with_synthetic_render_prompt())
+            .is_empty()
+    );
+}
+
 fn assistant_delta(seq: u64, turn: &str, text: &str) -> EvalEvent {
     EvalEvent {
         schema_version: 2,
@@ -716,6 +895,18 @@ fn assistant_delta(seq: u64, turn: &str, text: &str) -> EvalEvent {
         sequence: seq,
         turn_id: Some(turn.into()),
         kind: EvalEventKind::AssistantDelta { delta: text.into() },
+    }
+}
+
+fn turn_failed(seq: u64, turn: &str, error: &str) -> EvalEvent {
+    EvalEvent {
+        schema_version: 2,
+        ts_unix_ms: 0,
+        sequence: seq,
+        turn_id: Some(turn.into()),
+        kind: EvalEventKind::TurnFailed {
+            error: error.into(),
+        },
     }
 }
 
@@ -751,6 +942,50 @@ fn turn_completed_with(
             context_estimate: None,
         },
     }
+}
+
+#[test]
+fn max_tokens_turn_failure_flags_failed_turn() {
+    let events = vec![turn_failed(
+        8,
+        "T(1)",
+        "agent error: model response stopped after max_tokens before completing",
+    )];
+    let ctx = ctx_from_events(events);
+    let out = MaxTokensTurnFailure.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rule_id, "max_tokens_turn_failure");
+}
+
+#[test]
+fn glued_progress_preamble_flags_concatenated_status_text() {
+    let events = vec![
+        tool_call(1, "T(1)", "repo_map", serde_json::json!({})),
+        tool_call(2, "T(1)", "read_slice", serde_json::json!({"path": "x"})),
+        assistant_delta(
+            3,
+            "T(1)",
+            "Locating `Agent`...Finding methods...Reading source...Checking references...",
+        ),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = GluedProgressPreamble.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].category, "ux");
+}
+
+#[test]
+fn failed_turn_missing_cost_flags_tool_heavy_failed_turn() {
+    let events = vec![
+        tool_call(1, "T(1)", "repo_map", serde_json::json!({})),
+        tool_call(2, "T(1)", "read_slice", serde_json::json!({"path": "x"})),
+        tool_call(3, "T(1)", "grep", serde_json::json!({"pattern": "x"})),
+        turn_failed(4, "T(1)", "response truncated by max_tokens"),
+    ];
+    let ctx = ctx_from_events(events);
+    let out = FailedTurnMissingCost.check(&ctx, &empty_scenario());
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].rule_id, "failed_turn_missing_cost");
 }
 
 #[test]

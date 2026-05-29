@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::render::palette::{ACCENT_CYAN, ACCENT_GREEN, ACCENT_MAGENTA};
-use crate::{TuiApp, context_window_pct};
+use crate::{TuiApp, compact_text, context_window_pct};
 
 /// Separator drawn between rendered items.
 const STATUS_LINE_SEPARATOR: &str = " · ";
@@ -336,17 +336,20 @@ pub(crate) fn render_status_detail_line(
 /// Resolve a single item to its display string. `None` hides the item.
 pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<String> {
     match item {
-        StatusLineItem::Model => Some(app.model.clone()),
+        StatusLineItem::Model => Some(compact_text(&app.model, 40)),
         StatusLineItem::ModelWithReasoning => {
             let frag = crate::reasoning_status_fragment(app);
             if frag.is_empty() {
-                Some(app.model.clone())
+                Some(compact_text(&app.model, 40))
             } else {
-                Some(format!("{}{}", app.model, frag))
+                Some(compact_text(&format!("{}{}", app.model, frag), 48))
             }
         }
-        StatusLineItem::ProviderAndModel => Some(format!("{}:{}", app.provider_name, app.model)),
-        StatusLineItem::CurrentDir => Some(app.directory.clone()),
+        StatusLineItem::ProviderAndModel => Some(compact_text(
+            &format!("{}:{}", app.provider_name, app.model),
+            54,
+        )),
+        StatusLineItem::CurrentDir => Some(compact_text(&app.directory, 48)),
         StatusLineItem::ProjectName => {
             let name = app
                 .workspace_root
@@ -355,13 +358,18 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
                 .map(str::to_string);
             name.filter(|n| !n.is_empty())
         }
-        StatusLineItem::GitBranch => app.repo.branch.clone().or_else(|| {
-            if app.repo.available {
-                Some("detached".to_string())
-            } else {
-                None
-            }
-        }),
+        StatusLineItem::GitBranch => app
+            .repo
+            .branch
+            .clone()
+            .map(|b| compact_text(&b, 32))
+            .or_else(|| {
+                if app.repo.available {
+                    Some("detached".to_string())
+                } else {
+                    None
+                }
+            }),
         StatusLineItem::PullRequestNumber => {
             app.repo.pull_request.map(|number| format!("PR #{number}"))
         }
@@ -411,7 +419,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             .cache_write_input_tokens
             .map(|tokens| format!("cache_write {tokens}")),
         StatusLineItem::Tools => Some(format!("tools {}", app.metrics.tool_calls)),
-        StatusLineItem::BytesRead => Some(format!("read {}B", app.metrics.bytes_read)),
+        StatusLineItem::BytesRead => Some(format!("read {}", format_bytes(app.metrics.bytes_read))),
         StatusLineItem::Cost => Some(format_cost_segment(&app.cost, app.cost_cap_usd_micros)),
         StatusLineItem::CostCap => app
             .cost_cap_usd_micros
@@ -419,7 +427,7 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
             .map(|cap| format!("cap ${:.2}", cap as f64 / 1_000_000.0)),
         StatusLineItem::Budget => Some(format_budget(app)),
         StatusLineItem::SqueezyVersion => Some(format!("v{}", app.version)),
-        StatusLineItem::SessionId => app.session_id.clone(),
+        StatusLineItem::SessionId => app.session_id.as_ref().map(|id| compact_text(id, 18)),
         StatusLineItem::ConfigSources => Some(format!("cfg {}", app.config_sources)),
         StatusLineItem::Telemetry => Some(format!("telemetry {}", app.telemetry.as_str())),
         StatusLineItem::Permissions => Some(app.permissions.compact()),
@@ -435,7 +443,20 @@ pub(crate) fn resolve_status_item(app: &TuiApp, item: StatusLineItem) -> Option<
         StatusLineItem::CompactGeneration => {
             Some(format!("compact {}", app.context_compaction.generation))
         }
-        StatusLineItem::TaskProgress => app.latest_plan_progress.clone(),
+        StatusLineItem::TaskProgress => app
+            .latest_plan_progress
+            .as_ref()
+            .map(|progress| compact_text(progress, 60)),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1}KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes}B")
     }
 }
 

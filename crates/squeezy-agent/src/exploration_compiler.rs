@@ -213,21 +213,19 @@ pub(crate) fn compile_exploration_plan(input: &str) -> Option<ExplorationPlan> {
     if definition_intent(&lowered)
         && let Some(query) = symbolic_query
     {
+        // A plain "which file defines X?" prompt only needs the
+        // definition packet. Extra context tools are reserved for
+        // relationship/member questions so the preflight does not seed a
+        // costly fan-out before the model has seen whether one result is
+        // already enough.
         return Some(ExplorationPlan {
             intent: ExplorationIntent::FindDefinition,
             query: Some(query.clone()),
-            calls: vec![
-                tool_call(
-                    "planner_definition_search",
-                    "definition_search",
-                    json!({"query": query.clone(), "max_results": 8}),
-                ),
-                tool_call(
-                    "planner_symbol_context",
-                    "symbol_context",
-                    json!({"query": query.clone(), "max_results": 8, "max_references": 12}),
-                ),
-            ],
+            calls: vec![tool_call(
+                "planner_definition_search",
+                "definition_search",
+                json!({"query": query.clone(), "max_results": 8}),
+            )],
             guard_raw_reads: true,
         });
     }

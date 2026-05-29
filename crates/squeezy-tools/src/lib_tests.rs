@@ -7475,6 +7475,25 @@ fn tool_specs_are_sorted_by_name() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[test]
+fn tool_specs_avoid_provider_rejected_top_level_schema_keywords() {
+    let root = temp_workspace("tool_specs_provider_schema");
+    let registry = ToolRegistry::new(&root).expect("registry");
+
+    for spec in registry.specs().iter() {
+        let schema = serde_json::to_value(&spec.parameters).expect("schema serializes");
+        for keyword in ["oneOf", "anyOf", "allOf", "enum", "not"] {
+            assert!(
+                schema.get(keyword).is_none(),
+                "{} must not put {keyword} at the top level of its provider-facing schema: {schema}",
+                spec.name
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(root);
+}
+
 #[tokio::test]
 async fn tool_registry_specs_returns_same_arc_until_refresh() {
     // F04: per-turn `specs()` must reuse the same allocation across calls

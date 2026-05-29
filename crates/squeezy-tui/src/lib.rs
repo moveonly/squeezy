@@ -9344,10 +9344,10 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
                 ),
                 Span::styled(command.name, name_style),
                 Span::styled(command_padding, Style::default().fg(QUIET)),
-                Span::styled(command.description, description_style),
+                Span::styled(compact_text(command.description, 72), description_style),
             ];
             if let Some(hint) = command.parameter_hint {
-                let hint_text = format!(" {hint}");
+                let hint_text = format!(" {}", compact_text(hint, 36));
                 spans.push(Span::styled(
                     hint_text,
                     Style::default()
@@ -9358,7 +9358,7 @@ fn slash_suggestion_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let badges = command.capability_badges();
             if !badges.is_empty() {
                 spans.push(Span::styled(
-                    format!("  [{}]", badges.join("|")),
+                    format!("  [{}]", compact_text(&badges.join("|"), 32)),
                     Style::default()
                         .fg(if dimmed { QUIET } else { AMBER })
                         .add_modifier(if dimmed {

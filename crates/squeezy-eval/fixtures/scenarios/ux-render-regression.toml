@@ -1,0 +1,68 @@
+id = "ux-render-regression"
+title = "Deterministic UX render and trace regression fixture"
+description = """
+Offline fixture for the UX failures found by live evals: dense markdown
+rendering, glued progress preambles, and max-token-style turn failures.
+"""
+
+[workspace]
+local = "."
+
+[squeezy]
+provider = "mock"
+mode = "build"
+permission_mode = "allow"
+
+[[steps]]
+kind = "prompt"
+text = "Render a compact UX report with heading, table, link, and confidence labels."
+
+[[steps]]
+kind = "prompt"
+text = "Probe glued progress preambles while using one local search tool."
+
+[[steps]]
+kind = "prompt"
+text = "Probe failed max-token accounting after tool work."
+
+[expect]
+max_wall_clock_seconds = 30
+
+[mock]
+default_text = "(mock fallback)"
+
+[[mock.turns]]
+text = """
+# UX Render Sample
+
+The graph label is label_missing and the exact claim is [exact_syntax].
+
+| Path | Symptom | Fix |
+|---|---|---|
+| crates/squeezy-tui/src/render/markdown.rs | heading style leaks into every following row | pop heading style |
+| https://example.com/some/really/long/path/that/would/wrap/badly | long URLs flood narrow panes | abbreviate URLs |
+
+1. Add a 64-column fixture.
+2. Add a confidence-label fixture.
+3. Add a long-link fixture.
+"""
+input_tokens = 80
+output_tokens = 90
+
+[[mock.turns]]
+text = "Locating render code...Finding table paths...Reading source...Checking style state..."
+tool_calls = [{ name = "grep", arguments = { pattern = "render_markdown", path = "crates/squeezy-tui/src" } }]
+input_tokens = 80
+output_tokens = 20
+
+[[mock.turns]]
+text = "intermediate"
+tool_calls = [
+  { name = "grep", arguments = { pattern = "render_markdown", path = "crates/squeezy-tui/src" } },
+  { name = "grep", arguments = { pattern = "confidence", path = "crates/squeezy-tui/src" } },
+  { name = "grep", arguments = { pattern = "table", path = "crates/squeezy-tui/src" } },
+]
+error = { message = "model response stopped after max_tokens before completing" }
+
+[triage]
+enabled = false

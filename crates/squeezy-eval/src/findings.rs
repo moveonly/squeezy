@@ -562,6 +562,9 @@ impl Rule for RedundantGraphLookup {
                 let mut distinct_tools: Vec<&str> = hits.iter().map(|(n, _)| n.as_str()).collect();
                 distinct_tools.sort();
                 distinct_tools.dedup();
+                if is_complementary_definition_context_pair(&distinct_tools) {
+                    continue;
+                }
                 if distinct_tools.len() >= 2 {
                     out.push(Finding {
                         rule_id: "redundant_graph_lookup".into(),
@@ -588,6 +591,10 @@ impl Rule for RedundantGraphLookup {
         }
         out
     }
+}
+
+fn is_complementary_definition_context_pair(tools: &[&str]) -> bool {
+    tools.len() == 2 && tools == ["definition_search", "symbol_context"]
 }
 
 /// Detects the "deep chain trace" pattern: a single turn fires ≥ 4
@@ -750,6 +757,67 @@ impl Rule for TrivialAnswerOverFetch {
     }
 }
 
+/// Detects "expensive short-answer over-fetch": a completed turn that
+/// used a large tool/input-token budget but produced only a short final
+/// answer. This catches live runs where the answer is not tiny enough
+/// for `TrivialAnswerOverFetch`, but the retrieval path is still far
+/// too costly for the result.
+pub struct ExpensiveShortAnswerOverFetch;
+impl Rule for ExpensiveShortAnswerOverFetch {
+    fn rule_id(&self) -> &'static str {
+        "expensive_short_answer_over_fetch"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            let crate::capture::EvalEventKind::TurnCompleted { cost, .. } = &event.kind else {
+                continue;
+            };
+            let Some(turn) = event.turn_id.as_deref() else {
+                continue;
+            };
+            let input_tokens = cost
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output_tokens = cost
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let tool_count = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if tool_count >= 6 && input_tokens >= 50_000 && output_tokens <= 1_500 {
+                out.push(Finding {
+                    rule_id: "expensive_short_answer_over_fetch".into(),
+                    severity: Severity::Major,
+                    category: "perf".into(),
+                    summary: format!(
+                        "Turn {turn}: planner spent {input_tokens} input tokens and \
+                         {tool_count} tool calls for a short {output_tokens}-token answer."
+                    ),
+                    evidence: ctx
+                        .tool_calls_by_turn
+                        .get(turn)
+                        .map(|v| {
+                            v.iter()
+                                .take(8)
+                                .map(|(_, _, seq)| EvidencePointer {
+                                    trace_event: Some(*seq),
+                                    frame: None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        out
+    }
+}
+
 /// Detects "ungrounded citation": a turn that fires zero tool calls but
 /// whose assistant_text contains a file-path-shaped substring (looks
 /// like `something/something.ext` or `path:line`). The agent answered
@@ -760,8 +828,11 @@ impl Rule for UngroundedCitation {
     fn rule_id(&self) -> &'static str {
         "ungrounded_citation"
     }
-    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
         use std::collections::{BTreeMap, BTreeSet};
+        if scenario_requests_synthetic_render_sample(scenario) {
+            return Vec::new();
+        }
         // Group assistant_delta by turn.
         let mut text_per_turn: BTreeMap<String, String> = BTreeMap::new();
         let mut completed_turns: BTreeMap<String, u64> = BTreeMap::new();
@@ -976,7 +1047,10 @@ impl Rule for ExactSyntaxWithoutSource {
     fn rule_id(&self) -> &'static str {
         "exact_syntax_without_source"
     }
-    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+    fn check(&self, ctx: &TraceContext, scenario: &Scenario) -> Vec<Finding> {
+        if scenario_requests_synthetic_render_sample(scenario) {
+            return Vec::new();
+        }
         let mut text_per_turn: std::collections::BTreeMap<String, String> = Default::default();
         let mut completed_turns: std::collections::BTreeMap<String, u64> = Default::default();
         for event in &ctx.events {
@@ -1025,6 +1099,177 @@ impl Rule for ExactSyntaxWithoutSource {
                     frame: None,
                 }],
             });
+        }
+        out
+    }
+}
+
+fn scenario_requests_synthetic_render_sample(scenario: &Scenario) -> bool {
+    let mut haystack = String::new();
+    if let Some(description) = &scenario.description {
+        haystack.push_str(description);
+        haystack.push('\n');
+    }
+    for step in &scenario.steps {
+        if let crate::scenario::Step::Prompt { text, .. } = step {
+            haystack.push_str(text);
+            haystack.push('\n');
+        }
+    }
+    let haystack = haystack.to_ascii_lowercase();
+    haystack.contains("do not inspect files")
+        && (haystack.contains("terminal rendering")
+            || haystack.contains("markdown sample")
+            || haystack.contains("render sample"))
+}
+
+/// A live turn failed because the provider hit the output-token cap.
+/// This differs from `LengthTruncation`: some providers surface the
+/// cap as a turn failure before a normal `TurnCompleted` event exists.
+pub struct MaxTokensTurnFailure;
+impl Rule for MaxTokensTurnFailure {
+    fn rule_id(&self) -> &'static str {
+        "max_tokens_turn_failure"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        ctx.turn_failures
+            .iter()
+            .filter(|(_, error)| {
+                let lower = error.to_ascii_lowercase();
+                lower.contains("max_tokens") || lower.contains("maximum output")
+            })
+            .map(|(seq, error)| Finding {
+                rule_id: "max_tokens_turn_failure".into(),
+                severity: Severity::Major,
+                category: "correctness".into(),
+                summary: format!(
+                    "Turn failed after hitting the output-token cap: {}",
+                    error.chars().take(180).collect::<String>()
+                ),
+                evidence: vec![EvidencePointer {
+                    trace_event: Some(*seq),
+                    frame: None,
+                }],
+            })
+            .collect()
+    }
+}
+
+/// Detects assistant text made mostly of glued progress preambles such
+/// as "Locating...Finding...Reading..." with no final answer shape.
+pub struct GluedProgressPreamble;
+impl Rule for GluedProgressPreamble {
+    fn rule_id(&self) -> &'static str {
+        "glued_progress_preamble"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        const CUES: &[&str] = &[
+            "Locating",
+            "Finding",
+            "Looking up",
+            "Tracing",
+            "Reading",
+            "Inspecting",
+            "Checking",
+            "Creating",
+        ];
+        let mut out = Vec::new();
+        for (turn, text) in &ctx.assistant_text_by_turn {
+            let cue_hits: usize = CUES.iter().map(|cue| text.matches(cue).count()).sum();
+            if cue_hits < 3 {
+                continue;
+            }
+            let newline_count = text.matches('\n').count();
+            let started = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|calls| calls.len())
+                .unwrap_or(0);
+            let queued = ctx
+                .events
+                .iter()
+                .filter(|queued_event| {
+                    queued_event.turn_id.as_deref() == Some(turn)
+                        && matches!(queued_event.kind, EvalEventKind::ToolCallQueued { .. })
+                })
+                .count();
+            let tool_count = started.max(queued);
+            if newline_count <= 1 && tool_count > 0 {
+                let seq = ctx
+                    .events
+                    .iter()
+                    .find(|event| {
+                        event.turn_id.as_deref() == Some(turn)
+                            && matches!(event.kind, EvalEventKind::AssistantDelta { .. })
+                    })
+                    .map(|event| event.sequence);
+                out.push(Finding {
+                    rule_id: "glued_progress_preamble".into(),
+                    severity: Severity::Minor,
+                    category: "ux".into(),
+                    summary: format!(
+                        "Turn {turn}: assistant output is mostly {cue_hits} glued progress preambles with little line structure"
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: seq,
+                        frame: None,
+                    }],
+                });
+            }
+        }
+        out
+    }
+}
+
+/// A failed turn with substantial tool activity but no completed-turn
+/// cost record makes eval cost reporting misleading.
+pub struct FailedTurnMissingCost;
+impl Rule for FailedTurnMissingCost {
+    fn rule_id(&self) -> &'static str {
+        "failed_turn_missing_cost"
+    }
+    fn check(&self, ctx: &TraceContext, _: &Scenario) -> Vec<Finding> {
+        let completed_turns: std::collections::BTreeSet<&str> =
+            ctx.turn_finish_states.keys().map(String::as_str).collect();
+        let mut out = Vec::new();
+        for event in &ctx.events {
+            if !matches!(event.kind, EvalEventKind::TurnFailed { .. }) {
+                continue;
+            }
+            let Some(turn) = event.turn_id.as_deref() else {
+                continue;
+            };
+            if completed_turns.contains(turn) {
+                continue;
+            }
+            let started = ctx
+                .tool_calls_by_turn
+                .get(turn)
+                .map(|calls| calls.len())
+                .unwrap_or(0);
+            let queued = ctx
+                .events
+                .iter()
+                .filter(|queued_event| {
+                    queued_event.turn_id.as_deref() == Some(turn)
+                        && matches!(queued_event.kind, EvalEventKind::ToolCallQueued { .. })
+                })
+                .count();
+            let tool_count = started.max(queued);
+            if tool_count >= 3 {
+                out.push(Finding {
+                    rule_id: "failed_turn_missing_cost".into(),
+                    severity: Severity::Minor,
+                    category: "cost".into(),
+                    summary: format!(
+                        "Turn {turn} failed after {tool_count} tool call(s) without a completed-turn cost record"
+                    ),
+                    evidence: vec![EvidencePointer {
+                        trace_event: Some(event.sequence),
+                        frame: None,
+                    }],
+                });
+            }
         }
         out
     }
@@ -1252,9 +1497,13 @@ pub fn default_rules() -> Vec<Box<dyn Rule>> {
         Box::new(DeepChainExpansion),
         Box::new(HeavyAndTargetedRedundant),
         Box::new(TrivialAnswerOverFetch),
+        Box::new(ExpensiveShortAnswerOverFetch),
         Box::new(UngroundedCitation),
         Box::new(IncompleteConfidenceLabels),
         Box::new(ExactSyntaxWithoutSource),
+        Box::new(MaxTokensTurnFailure),
+        Box::new(GluedProgressPreamble),
+        Box::new(FailedTurnMissingCost),
         Box::new(StopWithIntentTextNoToolCall),
         Box::new(ExpectFinishReasonNot),
         Box::new(ExpectationsAsFindings),
