@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -11,6 +11,7 @@ mod languages;
 mod references;
 mod resolution;
 pub mod resolver_cache;
+pub mod watcher;
 
 use serde::{Deserialize, Serialize};
 use squeezy_core::{
@@ -1657,7 +1658,15 @@ pub struct GraphManager {
     store_metadata: Option<GraphStoreMetadata>,
     last_refresh: Instant,
     build_report: GraphBuildReport,
-    pending_changed_paths: HashSet<PathBuf>,
+    /// Paths the next `refresh_now` should treat as authoritatively changed.
+    /// Wrapped in `Arc<Mutex<>>` so a background [`watcher::FileWatcher`]
+    /// can push paths from its own thread; writers push, the single reader
+    /// drains during refresh, so a plain mutex is sufficient.
+    pending_changed_paths: Arc<Mutex<HashSet<PathBuf>>>,
+    /// Optional running file-system watcher whose lifetime is tied to this
+    /// manager. `RAII` drop stops it. `None` for one-shot CLI callers that
+    /// open the graph without watching the filesystem.
+    _watcher: Option<watcher::FileWatcher>,
 }
 
 impl GraphManager {
@@ -1706,6 +1715,33 @@ impl GraphManager {
         store: Option<Arc<SqueezyStore>>,
     ) -> Result<Self> {
         Self::open_with_optional_store(root, config, crawl_options, store)
+    }
+
+    /// Open a `GraphManager` and attach a background
+    /// [`watcher::FileWatcher`] so the workspace's file changes accumulate
+    /// in `pending_changed_paths` without polling. The next
+    /// `refresh_before_query` drains them. Long-lived processes (agent,
+    /// TUI) should prefer this constructor; one-shot CLI invocations
+    /// should not, because the OS watch tear-down adds startup cost they
+    /// will never amortise.
+    pub fn open_watching(
+        root: impl AsRef<Path>,
+        config: RefreshConfig,
+        crawl_options: CrawlOptions,
+        store: Option<Arc<SqueezyStore>>,
+        watcher_config: watcher::WatcherConfig,
+    ) -> Result<Self> {
+        let mut manager = Self::open_with_optional_store(root, config, crawl_options, store)?;
+        let handle = Arc::clone(&manager.pending_changed_paths);
+        let file_watcher = watcher::FileWatcher::start(watcher_config, move |batch| {
+            if let Ok(mut paths) = handle.lock() {
+                for path in batch.modified.into_iter().chain(batch.removed.into_iter()) {
+                    paths.insert(path);
+                }
+            }
+        })?;
+        manager._watcher = Some(file_watcher);
+        Ok(manager)
     }
 
     fn open_with_optional_store(
@@ -1772,7 +1808,8 @@ impl GraphManager {
             store_metadata,
             last_refresh: Instant::now(),
             build_report,
-            pending_changed_paths: HashSet::new(),
+            pending_changed_paths: Arc::new(Mutex::new(HashSet::new())),
+            _watcher: None,
         })
     }
 
@@ -1789,17 +1826,31 @@ impl GraphManager {
     }
 
     pub fn record_changed_path(&mut self, path: impl Into<PathBuf>) {
-        self.pending_changed_paths.insert(path.into());
+        if let Ok(mut paths) = self.pending_changed_paths.lock() {
+            paths.insert(path.into());
+        }
     }
 
     pub fn record_changed_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
-        self.pending_changed_paths.extend(paths);
+        if let Ok(mut set) = self.pending_changed_paths.lock() {
+            set.extend(paths);
+        }
+    }
+
+    /// Borrow a clone of the `Arc<Mutex<_>>` so a background watcher
+    /// thread can push paths into the pending set without holding `&mut
+    /// self`. The next `refresh_before_query` drains the set.
+    pub fn pending_changed_paths_handle(&self) -> Arc<Mutex<HashSet<PathBuf>>> {
+        Arc::clone(&self.pending_changed_paths)
     }
 
     pub fn refresh_before_query(&mut self) -> Result<RefreshReport> {
-        if self.pending_changed_paths.is_empty()
-            && self.last_refresh.elapsed() < self.config.idle_refresh_interval
-        {
+        let pending_empty = self
+            .pending_changed_paths
+            .lock()
+            .map(|paths| paths.is_empty())
+            .unwrap_or(true);
+        if pending_empty && self.last_refresh.elapsed() < self.config.idle_refresh_interval {
             return Ok(RefreshReport {
                 refreshed: false,
                 changed_files: Vec::new(),
@@ -1901,7 +1952,11 @@ impl GraphManager {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let pending_changed_paths = self.pending_changed_paths.clone();
+        let pending_changed_paths = self
+            .pending_changed_paths
+            .lock()
+            .map(|paths| paths.clone())
+            .unwrap_or_default();
         let mut supported_changed_records = current
             .values()
             .filter(|record| record.language != LanguageKind::Unsupported)
@@ -2032,7 +2087,9 @@ impl GraphManager {
             let _ = store.apply_graph_batch(&graph_batch);
         }
 
-        self.pending_changed_paths.clear();
+        if let Ok(mut paths) = self.pending_changed_paths.lock() {
+            paths.clear();
+        }
         self.last_refresh = Instant::now();
         Ok(RefreshReport {
             refreshed: reparsed_files > 0 || !removed_files.is_empty() || metadata_refresh_needed,
