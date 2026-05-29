@@ -116,7 +116,19 @@ const DELEGATE_TOOL_NAME: &str = "delegate";
 const EXPLORE_TOOL_NAME: &str = "explore";
 const DELEGATE_PLAN_TOOL_NAME: &str = "delegate_plan";
 const DELEGATE_REVIEW_TOOL_NAME: &str = "delegate_review";
+const DELEGATE_CHAIN_TOOL_NAME: &str = "delegate_chain";
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+/// Placeholder substituted in each chain step's prompt with the prior
+/// step's summary. Documented here so the constant is the single source
+/// of truth for both the tool description and the runtime substitution.
+const DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER: &str = "{previous}";
+/// Hard cap on the number of steps a single `delegate_chain` call may
+/// declare. Each step burns a full subagent lease + LLM round, so the
+/// chain is intentionally narrower than the parent agent's per-turn tool
+/// budget. Eight steps is enough to thread a non-trivial multi-stage
+/// research workflow without letting the model commit the entire turn
+/// budget to one chain.
+const DELEGATE_CHAIN_MAX_STEPS: usize = 8;
 pub const MAX_JOB_NOTIFICATIONS: usize = 20;
 pub const MAX_JOBS_RETAINED: usize = 200;
 const JOB_CANCEL_GRACE: Duration = Duration::from_millis(250);
@@ -6524,15 +6536,6 @@ fn record_subagent_call(metrics: &mut TurnMetrics, kind: SubagentKind) {
     }
 }
 
-/// Pairs the global `subagent_failures` bump with the per-kind bucket
-/// so the totals match every early-return path in `handle_subagent_call`.
-fn record_subagent_failure(metrics: &mut TurnMetrics, kind: SubagentKind) {
-    metrics.subagent_failures += 1;
-    if let Some(bucket) = metrics.subagent_by_kind.bucket_mut(kind.as_str()) {
-        bucket.failures += 1;
-    }
-}
-
 fn record_subagent_kind_execution(
     metrics: &mut TurnMetrics,
     kind: SubagentKind,
@@ -6545,6 +6548,59 @@ fn record_subagent_kind_execution(
     }
 }
 
+/// Outcome of a single subagent dispatch produced by
+/// [`run_subagent_dispatch`].
+///
+/// Carries the synthesised `ToolResult` together with the broker-mutation
+/// deltas that the parent caller must fold into its `CostBroker` after
+/// the dispatch resolves. Separating the work future from the broker
+/// mutation lets the parent fan out multiple delegate dispatches via
+/// `buffer_unordered` without two concurrent futures racing on
+/// `&mut CostBroker`.
+struct SubagentDispatchOutcome {
+    /// The user-facing result for the parent tool loop.
+    result: ToolResult,
+    /// Final summary text from the subagent's execution, or empty for
+    /// pre-execution failures. `delegate_chain` reads this verbatim when
+    /// it substitutes `{previous}` into the next step's prompt, so the
+    /// summary stays accessible without re-parsing the `ToolResult`
+    /// content JSON.
+    summary: String,
+    /// Execution metrics from a real subagent run. `Some` only when the
+    /// subagent actually ran; `None` for pre-execution failures
+    /// (subagents disabled, malformed arguments, lease cap rejection).
+    execution_metrics: Option<TurnMetrics>,
+    /// Bump the global `subagent_failures` counter post-await.
+    global_failure: bool,
+    /// Bump the per-kind `bucket.failures` counter post-await. The
+    /// historical lease-cap path bumps only the global counter, so this
+    /// stays `false` for that branch to preserve telemetry counts.
+    bucket_failure: bool,
+}
+
+/// Apply broker-mutation deltas captured by a [`SubagentDispatchOutcome`].
+///
+/// Runs serially after the concurrent dispatch resolves so two parallel
+/// delegate futures never race on `&mut CostBroker`.
+fn apply_subagent_dispatch(
+    broker: &mut CostBroker,
+    kind: SubagentKind,
+    outcome: &SubagentDispatchOutcome,
+) {
+    if let Some(metrics) = outcome.execution_metrics.as_ref() {
+        broker.metrics.merge_subagent_tool_metrics(metrics);
+        record_subagent_kind_execution(&mut broker.metrics, kind, metrics);
+    }
+    if outcome.global_failure {
+        broker.metrics.subagent_failures += 1;
+    }
+    if outcome.bucket_failure
+        && let Some(bucket) = broker.metrics.subagent_by_kind.bucket_mut(kind.as_str())
+    {
+        bucket.failures += 1;
+    }
+}
+
 async fn handle_subagent_call(
     context: &ToolExecutionContext<'_>,
     call: &ToolCall,
@@ -6552,39 +6608,35 @@ async fn handle_subagent_call(
     broker: &mut CostBroker,
 ) -> ToolResult {
     record_subagent_call(&mut broker.metrics, kind);
+    let outcome = run_subagent_dispatch(context, call, kind).await;
+    apply_subagent_dispatch(broker, kind, &outcome);
+    outcome.result
+}
+
+/// Run one subagent dispatch end-to-end *without* touching the broker.
+///
+/// Identical to the prior body of `handle_subagent_call` minus the
+/// counter mutations, which are returned as a [`SubagentDispatchOutcome`]
+/// for the caller to apply once the concurrent dispatch resolves. The
+/// pre-call `subagent_calls` bump still happens in the caller before this
+/// function is awaited so the in-flight counter is always conservative.
+async fn run_subagent_dispatch(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+    kind: SubagentKind,
+) -> SubagentDispatchOutcome {
     if !context.config.subagents.enabled
         || (kind == SubagentKind::Explore && !context.config.subagents.explore_enabled)
     {
-        record_subagent_failure(&mut broker.metrics, kind);
-        return subagent_control_result(
-            call,
-            kind,
-            SubagentExecution {
-                status: ToolStatus::Denied,
-                summary: String::new(),
-                status_label: "disabled",
-                error: Some("subagent is disabled by configuration".to_string()),
-                metrics: TurnMetrics::default(),
-                supporting_receipts: Vec::new(),
-                model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                structured_output: None,
-                files_touched: Vec::new(),
-                transcript: Vec::new(),
-            },
-        );
-    }
-    let request = match parse_subagent_request(call, kind) {
-        Ok(request) => request,
-        Err(error) => {
-            record_subagent_failure(&mut broker.metrics, kind);
-            return subagent_control_result(
+        return SubagentDispatchOutcome {
+            result: subagent_control_result(
                 call,
                 kind,
                 SubagentExecution {
-                    status: ToolStatus::Error,
+                    status: ToolStatus::Denied,
                     summary: String::new(),
-                    status_label: "invalid_request",
-                    error: Some(error),
+                    status_label: "disabled",
+                    error: Some("subagent is disabled by configuration".to_string()),
                     metrics: TurnMetrics::default(),
                     supporting_receipts: Vec::new(),
                     model: subagent_model_for_kind(context.provider.name(), context.config, kind),
@@ -6592,7 +6644,42 @@ async fn handle_subagent_call(
                     files_touched: Vec::new(),
                     transcript: Vec::new(),
                 },
-            );
+            ),
+            summary: String::new(),
+            execution_metrics: None,
+            global_failure: true,
+            bucket_failure: true,
+        };
+    }
+    let request = match parse_subagent_request(call, kind) {
+        Ok(request) => request,
+        Err(error) => {
+            return SubagentDispatchOutcome {
+                result: subagent_control_result(
+                    call,
+                    kind,
+                    SubagentExecution {
+                        status: ToolStatus::Error,
+                        summary: String::new(),
+                        status_label: "invalid_request",
+                        error: Some(error),
+                        metrics: TurnMetrics::default(),
+                        supporting_receipts: Vec::new(),
+                        model: subagent_model_for_kind(
+                            context.provider.name(),
+                            context.config,
+                            kind,
+                        ),
+                        structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
+                    },
+                ),
+                summary: String::new(),
+                execution_metrics: None,
+                global_failure: true,
+                bucket_failure: true,
+            };
         }
     };
     let child_cancel = context.cancel.child_token();
@@ -6604,7 +6691,6 @@ async fn handle_subagent_call(
     ) {
         Ok(lease) => lease,
         Err(start_error) => {
-            broker.metrics.subagent_failures += 1;
             let error_message = start_error.as_message();
             log_session_event(
                 context.session_log.as_ref(),
@@ -6638,22 +6724,32 @@ async fn handle_subagent_call(
                     active: start_error.active,
                 })
                 .await;
-            return subagent_control_result(
-                call,
-                kind,
-                SubagentExecution {
-                    status: ToolStatus::Denied,
-                    summary: String::new(),
-                    status_label: "capped",
-                    error: Some(error_message),
-                    metrics: TurnMetrics::default(),
-                    supporting_receipts: Vec::new(),
-                    model: subagent_model_for_kind(context.provider.name(), context.config, kind),
-                    structured_output: None,
-                    files_touched: Vec::new(),
-                    transcript: Vec::new(),
-                },
-            );
+            return SubagentDispatchOutcome {
+                result: subagent_control_result(
+                    call,
+                    kind,
+                    SubagentExecution {
+                        status: ToolStatus::Denied,
+                        summary: String::new(),
+                        status_label: "capped",
+                        error: Some(error_message),
+                        metrics: TurnMetrics::default(),
+                        supporting_receipts: Vec::new(),
+                        model: subagent_model_for_kind(
+                            context.provider.name(),
+                            context.config,
+                            kind,
+                        ),
+                        structured_output: None,
+                        files_touched: Vec::new(),
+                        transcript: Vec::new(),
+                    },
+                ),
+                summary: String::new(),
+                execution_metrics: None,
+                global_failure: true,
+                bucket_failure: false,
+            };
         }
     };
 
@@ -6704,13 +6800,8 @@ async fn handle_subagent_call(
             execution.status_label,
         );
     }
-    broker
-        .metrics
-        .merge_subagent_tool_metrics(&execution.metrics);
-    record_subagent_kind_execution(&mut broker.metrics, kind, &execution.metrics);
-    if execution.status != ToolStatus::Success {
-        record_subagent_failure(&mut broker.metrics, kind);
-    }
+    let execution_metrics = execution.metrics.clone();
+    let status_is_failure = execution.status != ToolStatus::Success;
     let event_payload = json!({
         "agent": kind.as_str(),
         "status": execution.status_label,
@@ -6771,7 +6862,14 @@ async fn handle_subagent_call(
         }
     }
 
-    subagent_control_result(call, kind, execution)
+    let summary = execution.summary.clone();
+    SubagentDispatchOutcome {
+        result: subagent_control_result(call, kind, execution),
+        summary,
+        execution_metrics: Some(execution_metrics),
+        global_failure: status_is_failure,
+        bucket_failure: status_is_failure,
+    }
 }
 
 fn parse_subagent_request(call: &ToolCall, kind: SubagentKind) -> Result<SubagentRequest, String> {
@@ -7495,6 +7593,276 @@ fn subagent_control_result(
     control_tool_result(call, execution.status, content)
 }
 
+/// One parsed step inside a `delegate_chain` invocation. Mirrors the
+/// shape of the advertised schema in [`delegate_chain_advertised_tool`].
+///
+/// `model` is currently informational — per-step model overrides are not
+/// wired through `subagent_model_for_kind` yet, so the dispatcher falls
+/// back to the configured delegate model for every step. Keeping the
+/// field on the parsed shape lets us validate the JSON contract up front
+/// and unblocks a future per-step override without another schema
+/// migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DelegateChainStep {
+    prompt: String,
+    scope: Option<String>,
+    model: Option<String>,
+}
+
+/// Parse the `steps` array of a `delegate_chain` call into typed
+/// [`DelegateChainStep`]s. Returns an actionable error message that
+/// surfaces to the model when the contract is violated (missing/empty
+/// `steps`, non-string fields, more than [`DELEGATE_CHAIN_MAX_STEPS`]).
+///
+/// Validation runs before any subagent leases are taken so a malformed
+/// chain never consumes the per-kind concurrency budget or bumps
+/// subagent counters mid-way through the chain.
+fn parse_delegate_chain_steps(call: &ToolCall) -> Result<Vec<DelegateChainStep>, String> {
+    let steps_value = call.arguments.get("steps").ok_or_else(|| {
+        "delegate_chain requires a `steps` array of `{prompt, model?, scope?}` objects.".to_string()
+    })?;
+    let steps_array = steps_value.as_array().ok_or_else(|| {
+        "delegate_chain `steps` must be an array of `{prompt, model?, scope?}` objects.".to_string()
+    })?;
+    if steps_array.is_empty() {
+        return Err("delegate_chain `steps` must contain at least one step.".to_string());
+    }
+    if steps_array.len() > DELEGATE_CHAIN_MAX_STEPS {
+        return Err(format!(
+            "delegate_chain `steps` may not exceed {DELEGATE_CHAIN_MAX_STEPS} steps, got {len}.",
+            len = steps_array.len()
+        ));
+    }
+    let mut steps = Vec::with_capacity(steps_array.len());
+    for (idx, raw) in steps_array.iter().enumerate() {
+        let object = raw.as_object().ok_or_else(|| {
+            format!(
+                "delegate_chain step {idx} must be a JSON object with a required `prompt` field."
+            )
+        })?;
+        let prompt = object
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "delegate_chain step {idx} requires a non-empty string `prompt`. The prompt may include `{placeholder}` to substitute the prior step's summary.",
+                    placeholder = DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER,
+                )
+            })?
+            .to_string();
+        let scope = match object.get("scope") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if value.trim().is_empty() => None,
+            Some(Value::String(value)) => Some(value.trim().to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "delegate_chain step {idx} `scope` must be a string or null."
+                ));
+            }
+        };
+        let model = match object.get("model") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if value.trim().is_empty() => None,
+            Some(Value::String(value)) => Some(value.trim().to_string()),
+            Some(_) => {
+                return Err(format!(
+                    "delegate_chain step {idx} `model` must be a string or null."
+                ));
+            }
+        };
+        steps.push(DelegateChainStep {
+            prompt,
+            scope,
+            model,
+        });
+    }
+    Ok(steps)
+}
+
+/// Substitute every literal occurrence of [`DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER`]
+/// in `template` with `previous`.
+///
+/// Done verbatim — no regex, no formatting — so a step that does not
+/// mention `{previous}` stays byte-identical and a step that mentions it
+/// multiple times sees every instance replaced. The first step's
+/// `previous` is the empty string, which mirrors how chained models in
+/// peer agents (e.g. opencode's `chain` mode) seed the placeholder for
+/// the leading step.
+fn chain_substitute_previous(template: &str, previous: &str) -> String {
+    template.replace(DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER, previous)
+}
+
+/// Roll one step's [`TurnMetrics`] into a chain-wide aggregate so the
+/// chain's synthesised `subagent_control_result` reports total tool /
+/// I/O / cost across every step. The per-step metrics are already merged
+/// into the parent broker via `apply_subagent_dispatch`; this aggregate
+/// is purely for the chain's own JSON payload.
+fn chain_accumulate_metrics(total: &mut TurnMetrics, step: &TurnMetrics) {
+    total.tool_calls += step.tool_calls;
+    total.tool_successes += step.tool_successes;
+    total.tool_errors += step.tool_errors;
+    total.tool_denials += step.tool_denials;
+    total.tool_cancellations += step.tool_cancellations;
+    total.files_scanned += step.files_scanned;
+    total.bytes_read += step.bytes_read;
+    total.matches_returned += step.matches_returned;
+    total.model_output_bytes += step.model_output_bytes;
+    total.receipt_stub_hits += step.receipt_stub_hits;
+    total.negative_receipt_hits += step.negative_receipt_hits;
+    total.spill_writes += step.spill_writes;
+    total.spill_reads += step.spill_reads;
+    total.budget_denials += step.budget_denials;
+    total.redactions += step.redactions;
+    total.record_provider(&step.provider);
+}
+
+/// Execute a `delegate_chain` call sequentially.
+///
+/// Each step is dispatched through [`run_subagent_dispatch`] as a
+/// `Delegate` subagent. The chain threads `{previous}` substitution
+/// between steps, aborts on the first non-success step, and synthesises
+/// an aggregate [`SubagentExecution`] so the parent's tool loop receives
+/// a single `subagent_control_result` describing the full chain.
+///
+/// Broker mutations are applied serially per step (chain runs in the
+/// validation loop, not the concurrent delegate batch) so the broker's
+/// per-kind bucket counts every chained subagent invocation even when
+/// the chain aborts mid-way.
+async fn handle_delegate_chain_call(
+    context: &ToolExecutionContext<'_>,
+    call: &ToolCall,
+    broker: &mut CostBroker,
+) -> ToolResult {
+    let steps = match parse_delegate_chain_steps(call) {
+        Ok(steps) => steps,
+        Err(error) => {
+            // Mirror the `invalid_request` shape from `run_subagent_dispatch`
+            // so the model sees the same envelope as a malformed `delegate`
+            // call. No broker mutations on this path — the parse failed
+            // before any subagent was started.
+            return subagent_control_result(
+                call,
+                SubagentKind::Delegate,
+                SubagentExecution {
+                    status: ToolStatus::Error,
+                    summary: String::new(),
+                    status_label: "invalid_request",
+                    error: Some(error),
+                    metrics: TurnMetrics::default(),
+                    supporting_receipts: Vec::new(),
+                    model: subagent_model_for_kind(
+                        context.provider.name(),
+                        context.config,
+                        SubagentKind::Delegate,
+                    ),
+                    structured_output: None,
+                    files_touched: Vec::new(),
+                    transcript: Vec::new(),
+                },
+            );
+        }
+    };
+
+    let mut previous_summary = String::new();
+    let mut combined_metrics = TurnMetrics::default();
+    let mut combined_receipts: Vec<Value> = Vec::new();
+    let mut combined_files: Vec<String> = Vec::new();
+    let mut step_payloads: Vec<Value> = Vec::with_capacity(steps.len());
+    let mut chain_status = ToolStatus::Success;
+    let mut chain_status_label: &'static str = "success";
+    let mut chain_error: Option<String> = None;
+    let mut last_model = subagent_model_for_kind(
+        context.provider.name(),
+        context.config,
+        SubagentKind::Delegate,
+    );
+
+    for (step_idx, step) in steps.iter().enumerate() {
+        if context.cancel.is_cancelled() {
+            chain_status = ToolStatus::Cancelled;
+            chain_status_label = "cancelled";
+            break;
+        }
+        let substituted = chain_substitute_previous(&step.prompt, &previous_summary);
+        let mut step_args = json!({ "prompt": substituted });
+        if let Some(scope) = &step.scope {
+            step_args["scope"] = Value::String(scope.clone());
+        }
+        let step_call = ToolCall {
+            call_id: format!("{}#step_{step_idx}", call.call_id),
+            name: DELEGATE_TOOL_NAME.to_string(),
+            arguments: step_args,
+        };
+        record_subagent_call(&mut broker.metrics, SubagentKind::Delegate);
+        let outcome = run_subagent_dispatch(context, &step_call, SubagentKind::Delegate).await;
+        apply_subagent_dispatch(broker, SubagentKind::Delegate, &outcome);
+        if let Some(metrics) = outcome.execution_metrics.as_ref() {
+            chain_accumulate_metrics(&mut combined_metrics, metrics);
+        }
+        if let Some(receipts) = outcome.result.content.get("supporting_receipts").cloned()
+            && let Value::Array(items) = receipts
+        {
+            combined_receipts.extend(items);
+        }
+        if let Some(files) = outcome
+            .result
+            .content
+            .get("files_touched")
+            .and_then(Value::as_array)
+        {
+            for entry in files {
+                if let Some(path) = entry.as_str()
+                    && !combined_files.iter().any(|existing| existing == path)
+                {
+                    combined_files.push(path.to_string());
+                }
+            }
+        }
+        if let Some(model) = outcome.result.content.get("model").and_then(Value::as_str) {
+            last_model = model.to_string();
+        }
+
+        step_payloads.push(json!({
+            "step": step_idx,
+            "prompt": substituted,
+            "summary": outcome.summary,
+            "status": tool_status_label(outcome.result.status),
+            "model_hint": step.model,
+        }));
+
+        previous_summary = outcome.summary.clone();
+
+        if outcome.result.status != ToolStatus::Success {
+            chain_status = outcome.result.status;
+            chain_status_label = "chain_aborted";
+            chain_error = outcome
+                .result
+                .content
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(format!("step {step_idx} did not complete successfully")));
+            break;
+        }
+    }
+
+    let execution = SubagentExecution {
+        status: chain_status,
+        summary: previous_summary,
+        status_label: chain_status_label,
+        error: chain_error,
+        metrics: combined_metrics,
+        supporting_receipts: combined_receipts,
+        model: last_model,
+        structured_output: Some(json!({ "chain_steps": step_payloads })),
+        files_touched: combined_files,
+        transcript: Vec::new(),
+    };
+    subagent_control_result(call, SubagentKind::Delegate, execution)
+}
+
 fn subagent_supporting_receipt(result: &ToolResult, path: Option<&str>) -> Value {
     let mut value = json!({
         "tool": result.tool_name,
@@ -8058,6 +8426,13 @@ async fn execute_tool_calls(
     let mut approved = Vec::new();
     let mut results: Vec<Option<ToolResult>> = vec![None; calls.len()];
     let mut recorded = vec![false; calls.len()];
+    // Buffered `delegate*` calls (excluding `delegate_chain`, which runs
+    // its own internal step sequence). The validation loop collects
+    // these so they can run concurrently bounded by
+    // `SUBAGENT_MAX_CONCURRENT` once the loop finishes, closing the gap
+    // where the lease pool advertised a 4-way budget that the
+    // single-shot dispatcher never used.
+    let mut delegate_batch_calls: Vec<(usize, ToolCall, SubagentKind)> = Vec::new();
 
     for (index, call) in calls.iter().enumerate() {
         if context.cancel.is_cancelled() {
@@ -8118,14 +8493,14 @@ async fn execute_tool_calls(
             recorded[index] = true;
             continue;
         }
-        let subagent_kind = match call.name.as_str() {
-            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
-            EXPLORE_TOOL_NAME => Some(SubagentKind::Explore),
-            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
-            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
-            _ => None,
-        };
-        if let Some(kind) = subagent_kind {
+        if call.name == DELEGATE_CHAIN_TOOL_NAME {
+            // `delegate_chain` manages its own internal step sequencing and
+            // bookkeeping; it does NOT join the concurrent `delegate_batch`
+            // because each step would otherwise need to lock the broker
+            // mid-future. The chain still ships through the
+            // `record_and_emit_progress` flow so chain completions look
+            // identical to single delegates from the parent's telemetry
+            // perspective.
             let _ = context
                 .tx
                 .send(AgentEvent::ToolCallStarted {
@@ -8134,7 +8509,57 @@ async fn execute_tool_calls(
                     origin: context.origin,
                 })
                 .await;
-            let result = Box::pin(handle_subagent_call(&context, call, kind, broker)).await;
+            let result = Box::pin(handle_delegate_chain_call(&context, call, broker)).await;
+            record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallCompleted {
+                    turn_id: context.turn_id,
+                    result: result.clone(),
+                })
+                .await;
+            results[index] = Some(result);
+            recorded[index] = true;
+            continue;
+        }
+        let delegate_batch_kind = match call.name.as_str() {
+            DELEGATE_TOOL_NAME => Some(SubagentKind::Delegate),
+            DELEGATE_PLAN_TOOL_NAME => Some(SubagentKind::Plan),
+            DELEGATE_REVIEW_TOOL_NAME => Some(SubagentKind::Review),
+            _ => None,
+        };
+        if let Some(kind) = delegate_batch_kind {
+            // Pre-bump the `subagent_calls` counter before the future
+            // is spawned so the in-flight tally stays conservative even
+            // while several delegates run concurrently. Per-outcome
+            // mutations (failure counters, kind-bucket execution rollup)
+            // are deferred to `apply_subagent_dispatch` after each future
+            // resolves so concurrent futures never race on the broker.
+            record_subagent_call(&mut broker.metrics, kind);
+            delegate_batch_calls.push((index, call.clone(), kind));
+            continue;
+        }
+        if call.name == EXPLORE_TOOL_NAME {
+            // `explore` keeps the original single-shot path. The task
+            // scope only marks `delegate*` variants as parallel-safe; the
+            // explore tool stays serial so its broader research session
+            // (tool budget, exploration-state lock) doesn't have to
+            // coordinate with itself across concurrent futures.
+            let _ = context
+                .tx
+                .send(AgentEvent::ToolCallStarted {
+                    turn_id: context.turn_id,
+                    call: redact_tool_call(call.clone(), &context.redactor),
+                    origin: context.origin,
+                })
+                .await;
+            let result = Box::pin(handle_subagent_call(
+                &context,
+                call,
+                SubagentKind::Explore,
+                broker,
+            ))
+            .await;
             record_and_emit_progress(broker, &result, &context.tx, context.turn_id).await;
             let _ = context
                 .tx
@@ -8254,6 +8679,17 @@ async fn execute_tool_calls(
                 );
             }
         }
+    }
+
+    if !delegate_batch_calls.is_empty() {
+        flush_delegate_batch(
+            &context,
+            broker,
+            &mut results,
+            &mut recorded,
+            std::mem::take(&mut delegate_batch_calls),
+        )
+        .await;
     }
 
     let mut parallel_batch = Vec::new();
@@ -8415,6 +8851,72 @@ fn collect_recorded_results(
 
 fn cancelled_tool_result(result: &ToolResult) -> bool {
     result.status == ToolStatus::Cancelled
+}
+
+/// Fan out a batch of `delegate*` calls (sans `delegate_chain`) and
+/// resolve them concurrently bounded by [`SUBAGENT_MAX_CONCURRENT`].
+///
+/// Each future calls [`run_subagent_dispatch`] independently — the
+/// broker borrow stays serial because every future returns a
+/// [`SubagentDispatchOutcome`] that the caller folds back via
+/// [`apply_subagent_dispatch`] after collection. Pre-bumped
+/// `subagent_calls` counters happen in the validation loop before we
+/// reach this helper.
+///
+/// `recorded` mirrors the caller's tracking vec; entries are marked
+/// `true` here so the surrounding pipeline does not re-emit a deny /
+/// approval event for these slots.
+async fn flush_delegate_batch(
+    context: &ToolExecutionContext<'_>,
+    broker: &mut CostBroker,
+    results: &mut [Option<ToolResult>],
+    recorded: &mut [bool],
+    calls: Vec<(usize, ToolCall, SubagentKind)>,
+) {
+    if calls.is_empty() {
+        return;
+    }
+
+    // Emit `ToolCallStarted` for each delegate call in input order so the
+    // TUI / event subscribers still see the start lines before the model
+    // turn proceeds. The actual subagent work happens inside the
+    // buffered futures below.
+    for (_, call, _) in &calls {
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallStarted {
+                turn_id: context.turn_id,
+                call: redact_tool_call(call.clone(), &context.redactor),
+                origin: context.origin,
+            })
+            .await;
+    }
+
+    let cap = SUBAGENT_MAX_CONCURRENT.max(1);
+    let completions = futures_util::stream::iter(calls.into_iter().map(|(index, call, kind)| {
+        let context = context.clone();
+        async move {
+            let outcome = run_subagent_dispatch(&context, &call, kind).await;
+            (index, kind, outcome)
+        }
+    }))
+    .buffer_unordered(cap)
+    .collect::<Vec<_>>()
+    .await;
+
+    for (index, kind, outcome) in completions {
+        apply_subagent_dispatch(broker, kind, &outcome);
+        record_and_emit_progress(broker, &outcome.result, &context.tx, context.turn_id).await;
+        let _ = context
+            .tx
+            .send(AgentEvent::ToolCallCompleted {
+                turn_id: context.turn_id,
+                result: outcome.result.clone(),
+            })
+            .await;
+        results[index] = Some(outcome.result);
+        recorded[index] = true;
+    }
 }
 
 async fn flush_parallel_batch(
@@ -10231,6 +10733,7 @@ fn core_control_tools(
         }
         tools.push(delegate_plan_advertised_tool());
         tools.push(delegate_review_advertised_tool());
+        tools.push(delegate_chain_advertised_tool());
     }
     if session_mode == SessionMode::Plan {
         tools.push(request_user_input_advertised_tool());
@@ -10349,6 +10852,52 @@ fn delegate_review_advertised_tool() -> AdvertisedTool {
     }
 }
 
+fn delegate_chain_advertised_tool() -> AdvertisedTool {
+    AdvertisedTool {
+        capability: PermissionCapability::Read,
+        spec: Arc::new(LlmToolSpec {
+            name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+            description: format!(
+                "Run a sequential chain of Delegate subagents. Each step's `prompt` may include the literal substring `{placeholder}`, which is replaced verbatim with the prior step's summary before the subagent is invoked. Use this when later steps must consume earlier output; for independent fanouts, issue multiple `delegate` calls in the same turn instead — they run in parallel. Chain length is capped at {max_steps} steps.",
+                placeholder = DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER,
+                max_steps = DELEGATE_CHAIN_MAX_STEPS,
+            ),
+            parameters: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered list of delegate steps to run sequentially.",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Required: instruction for this step. May include `{previous}` to substitute the prior step's summary."
+                                },
+                                "model": {
+                                    "type": ["string", "null"],
+                                    "description": "Optional per-step model override; defaults to the parent's delegate model when omitted."
+                                },
+                                "scope": {
+                                    "type": ["string", "null"],
+                                    "description": "Optional bounded scope passed through to the subagent for this step."
+                                }
+                            },
+                            "required": ["prompt"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+            strict: false,
+        }),
+    }
+}
+
 /// Plan-mode tool that lets the model pause the turn and ask the user a
 /// clarifying multiple-choice (or free-form) question. The capability is
 /// `Read` so it survives Plan-mode tool filtering; mode gating happens at
@@ -10454,6 +11003,7 @@ fn synthetic_tool_by_name(name: &str) -> Option<AdvertisedTool> {
         EXPLORE_TOOL_NAME => Some(explore_advertised_tool()),
         DELEGATE_PLAN_TOOL_NAME => Some(delegate_plan_advertised_tool()),
         DELEGATE_REVIEW_TOOL_NAME => Some(delegate_review_advertised_tool()),
+        DELEGATE_CHAIN_TOOL_NAME => Some(delegate_chain_advertised_tool()),
         LOAD_TOOL_SCHEMA_TOOL_NAME => Some(load_tool_schema_advertised_tool()),
         REQUEST_USER_INPUT_TOOL_NAME => Some(request_user_input_advertised_tool()),
         _ => None,

@@ -2897,6 +2897,7 @@ fn control_tools_are_advertised_in_build_and_plan_modes() {
         EXPLORE_TOOL_NAME,
         DELEGATE_PLAN_TOOL_NAME,
         DELEGATE_REVIEW_TOOL_NAME,
+        DELEGATE_CHAIN_TOOL_NAME,
     ];
 
     let build_specs = advertised_tool_specs(&tools, SessionMode::Build, false);
@@ -2934,6 +2935,7 @@ fn core_control_tools_filter_subagents_when_disabled() {
             DELEGATE_TOOL_NAME.to_string(),
             DELEGATE_PLAN_TOOL_NAME.to_string(),
             DELEGATE_REVIEW_TOOL_NAME.to_string(),
+            DELEGATE_CHAIN_TOOL_NAME.to_string(),
         ]
     );
 }
@@ -4694,6 +4696,7 @@ fn core_control_tools_includes_new_delegate_planner_reviewer() {
     assert!(names.iter().any(|n| n == EXPLORE_TOOL_NAME));
     assert!(names.iter().any(|n| n == DELEGATE_PLAN_TOOL_NAME));
     assert!(names.iter().any(|n| n == DELEGATE_REVIEW_TOOL_NAME));
+    assert!(names.iter().any(|n| n == DELEGATE_CHAIN_TOOL_NAME));
 }
 
 #[test]
@@ -6093,6 +6096,78 @@ fn parse_subagent_request_requires_goal_for_plan_and_allows_empty_review() {
     assert!(
         !request.prompt.is_empty(),
         "review should synthesize a default prompt"
+    );
+}
+
+#[test]
+fn delegate_chain_threads_previous_step_summary_into_next_step_prompt() {
+    // F10: the chain helper must replace every literal `{previous}` token
+    // in step N+1's prompt with step N's summary verbatim. Step 0 sees an
+    // empty `previous`, so the leading step's template stays
+    // byte-identical apart from the placeholder being erased — that
+    // matches how peer agents (opencode's `chain` mode) seed the lead-in
+    // step.
+    //
+    // Substitution is exercised through `chain_substitute_previous`
+    // directly so the test does not need a live LLM or subagent registry
+    // — the chain helper IS the contract documented in the
+    // `delegate_chain` tool description, and a regression here would
+    // silently send unrendered `{previous}` text to the model.
+    let step_a = "Summarise the auth module";
+    let step_b_template = "Now critique the summary: {previous}. Flag any missing risks.";
+
+    let step_a_rendered = chain_substitute_previous(step_a, "");
+    assert_eq!(
+        step_a_rendered, step_a,
+        "first step has no prior summary; template must pass through unchanged"
+    );
+
+    let step_a_summary =
+        "Auth uses JWT with HS256, refresh tokens stored in redis, 14d TTL.".to_string();
+    let step_b_rendered = chain_substitute_previous(step_b_template, &step_a_summary);
+    assert_eq!(
+        step_b_rendered,
+        format!(
+            "Now critique the summary: {summary}. Flag any missing risks.",
+            summary = step_a_summary
+        ),
+        "{{previous}} must be replaced verbatim with step A's summary so the chain threads output of A → input of B"
+    );
+    assert!(
+        !step_b_rendered.contains(DELEGATE_CHAIN_PREVIOUS_PLACEHOLDER),
+        "rendered chain prompt must not still contain the literal placeholder"
+    );
+
+    // Also confirm the parser shape so the dispatcher can build the
+    // chained delegate calls without a separate JSON contract round-trip.
+    let chain_call = ToolCall {
+        call_id: "chain_1".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({
+            "steps": [
+                { "prompt": step_a },
+                { "prompt": step_b_template },
+            ]
+        }),
+    };
+    let steps = parse_delegate_chain_steps(&chain_call).expect("chain args valid");
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].prompt, step_a);
+    assert_eq!(steps[1].prompt, step_b_template);
+    assert!(steps[0].scope.is_none());
+    assert!(steps[1].scope.is_none());
+
+    // Missing prompt on a step must surface as an actionable error
+    // before any subagent lease is taken.
+    let bad = ToolCall {
+        call_id: "chain_bad".to_string(),
+        name: DELEGATE_CHAIN_TOOL_NAME.to_string(),
+        arguments: json!({ "steps": [{ "prompt": "" }] }),
+    };
+    let err = parse_delegate_chain_steps(&bad).expect_err("empty prompt must error");
+    assert!(
+        err.contains("prompt"),
+        "error must mention the missing prompt field: {err}"
     );
 }
 

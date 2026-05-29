@@ -109,6 +109,62 @@ fn registry_with_state_store_and_checkpoints(
 }
 
 #[test]
+fn plan_parallel_batches_coalesces_three_delegate_calls_into_one_concurrent_batch() {
+    // F10: three consecutive `delegate*` calls in the same model turn must
+    // land in a single parallel batch so the dispatcher's
+    // `buffer_unordered(SUBAGENT_MAX_CONCURRENT)` loop can run them
+    // concurrently. Before this change `is_parallel_safe` consulted only
+    // the spec catalog, which has no entry for the synthetic subagent
+    // tools — so the lease pool advertised a 4-way budget that the
+    // dispatcher never used.
+    //
+    // The mix below intentionally covers all three delegate variants
+    // (plain delegate, plan, review) plus `delegate_chain`, which is also
+    // parallel-safe at the registry level because its body runs an
+    // internal step sequence and looks like any other read-only synthetic
+    // tool to the dispatcher.
+    let root = temp_workspace("plan_parallel_batches_delegates");
+    let registry = registry_with_shell_sandbox_off(&root);
+
+    let make_call = |id: &str, name: &str, args: Value| ToolCall {
+        call_id: id.to_string(),
+        name: name.to_string(),
+        arguments: args,
+    };
+    let calls = vec![
+        make_call("d1", "delegate", json!({"prompt": "map module A"})),
+        make_call("d2", "delegate_plan", json!({"goal": "add tracing"})),
+        make_call("d3", "delegate_review", json!({"scope": "src/"})),
+    ];
+
+    for call in &calls {
+        assert!(
+            registry.is_parallel_safe(call),
+            "synthetic delegate tool `{}` must be marked parallel_safe so concurrent dispatch is unlocked",
+            call.name
+        );
+    }
+    assert!(registry.is_parallel_safe(&ToolCall {
+        call_id: "chain".to_string(),
+        name: "delegate_chain".to_string(),
+        arguments: json!({"steps": [{"prompt": "A"}, {"prompt": "B"}]}),
+    }));
+
+    let batches = registry.plan_parallel_batches(&calls);
+
+    assert_eq!(
+        batches,
+        vec![ParallelExecutionBatch {
+            indices: vec![0, 1, 2],
+            parallel_safe: true,
+        }],
+        "three sibling delegate calls must coalesce into one concurrent batch"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn plan_parallel_batches_coalesces_consecutive_parallel_safe_calls() {
     // Shape the input as a real model turn that emits read-only
     // navigation calls back-to-back. Every spec involved here is

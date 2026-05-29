@@ -194,6 +194,22 @@ impl ToolRegistryRuntime {
 pub const SQUEEZY_ASK_SOCKET_ENV: &str = "SQUEEZY_ASK_SOCKET";
 pub const SQUEEZY_ASK_CALL_ID_ENV: &str = "SQUEEZY_ASK_CALL_ID";
 
+/// Synthetic subagent control tool names that live in `squeezy-agent` but
+/// must be parallel-safe from the registry's perspective so multiple
+/// in-flight delegations in the same model turn can run concurrently.
+///
+/// `delegate_chain` is included even though its body runs steps
+/// sequentially: chaining is internal to the call, and from the parent
+/// dispatcher's view a single `delegate_chain` invocation is just another
+/// read-only synthetic tool that doesn't race with sibling navigation
+/// calls.
+pub const SUBAGENT_PARALLEL_SAFE_TOOL_NAMES: &[&str] = &[
+    "delegate",
+    "delegate_plan",
+    "delegate_review",
+    "delegate_chain",
+];
+
 pub type ShellAskFuture = Pin<Box<dyn Future<Output = ShellAskDecision> + Send>>;
 pub type ShellAskApprover = Arc<dyn Fn(ShellAskRequest) -> ShellAskFuture + Send + Sync>;
 
@@ -1850,7 +1866,22 @@ impl ToolRegistry {
     /// per-tool parallelism contract single-sourced from the
     /// `crate::specs` constructors instead of duplicating the safe-set in
     /// a hardcoded match here.
+    ///
+    /// Synthetic subagent control tools (`delegate`, `delegate_plan`,
+    /// `delegate_review`, `delegate_chain`) live in the agent crate and
+    /// never enter the registry's `specs()` table, so the spec lookup
+    /// would always return `false` for them. They are read-only from the
+    /// dispatcher's perspective (each spawns an isolated subagent that
+    /// runs in its own LLM stream and lease slot) and the
+    /// `SUBAGENT_MAX_CONCURRENT` lease pool already caps total fanout, so
+    /// the registry promotes them to parallel-safe explicitly. This
+    /// closes the gap where multiple delegate calls in the same model
+    /// turn were serialised even though the lease pool advertised a
+    /// 4-way concurrency budget.
     pub fn is_parallel_safe(&self, call: &ToolCall) -> bool {
+        if SUBAGENT_PARALLEL_SAFE_TOOL_NAMES.contains(&call.name.as_str()) {
+            return true;
+        }
         self.specs()
             .iter()
             .find(|spec| spec.name == call.name)
