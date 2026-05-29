@@ -4177,7 +4177,9 @@ fn format_mcp_elicitation_menu_lines(
         Span::raw("  "),
         Span::styled(
             compact_text(&request.message, 180),
-            Style::default().fg(Color::White),
+            Style::default()
+                .fg(MODE_PURPLE)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     match request.kind {
@@ -4214,7 +4216,7 @@ fn format_mcp_elicitation_menu_lines(
         let is_selected = index == selected.min(mcp_elicitation_options().len() - 1);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default().fg(GOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -4269,7 +4271,7 @@ fn format_plan_choice_menu_lines(pending: &PendingPlanChoice) -> Vec<Line<'stati
         let is_selected = idx == selected;
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default().fg(GOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -4310,14 +4312,16 @@ fn format_request_user_input_menu_lines(
         Span::raw("  "),
         Span::styled(
             compact_text(&request.question, 240),
-            Style::default().fg(Color::White),
+            Style::default()
+                .fg(MODE_PURPLE)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     for (index, choice) in request.choices.iter().enumerate() {
         let is_selected = index == selected.min(request.choices.len().saturating_sub(1));
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default().fg(GOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -4339,16 +4343,9 @@ fn format_request_user_input_menu_lines(
     if request.allow_freeform {
         // Dedicated answer-entry box. Lives inside the modal area so the
         // main composer below stays untouched for the user's next prompt.
-        let entry_style = Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD);
-        let label_style = Style::default()
-            .fg(Color::Indexed(33))
-            .add_modifier(Modifier::BOLD);
-        let cursor_style = Style::default()
-            .fg(Color::Black)
-            .bg(Color::Indexed(33))
-            .add_modifier(Modifier::BOLD);
+        let entry_style = Style::default().fg(Color::White);
+        let label_style = Style::default().fg(Color::Indexed(33));
+        let cursor_style = Style::default().fg(Color::Black).bg(Color::Indexed(33));
         let mut spans = vec![Span::raw("  "), Span::styled("Answer › ", label_style)];
         if input.is_empty() {
             spans.push(Span::styled(
@@ -4381,7 +4378,7 @@ fn format_approval_menu_lines(
         let is_selected = index == selected.min(max_index);
         let marker = if is_selected { "› " } else { "  " };
         let label_style = if is_selected {
-            Style::default().fg(GOLD).add_modifier(Modifier::BOLD)
+            Style::default().fg(GOLD)
         } else {
             Style::default().fg(Color::White)
         };
@@ -5424,17 +5421,6 @@ fn pending_assistant_lines(app: &TuiApp) -> Vec<Line<'static>> {
     lines
 }
 
-fn mouse_capture_hint() -> String {
-    let enabled = std::env::var_os("SQUEEZY_MOUSE_CAPTURE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    if enabled {
-        "capture on · click buttons · Shift+drag selects · Shift+wheel scrollback".to_string()
-    } else {
-        "native scroll & select · SQUEEZY_MOUSE_CAPTURE=1 for clickable buttons".to_string()
-    }
-}
-
 fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
     let card_width = width.clamp(36, 64) as usize;
     let inner = card_width.saturating_sub(2);
@@ -5469,12 +5455,6 @@ fn startup_card_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
             "languages",
             app.language_summary.clone(),
             Style::default().fg(Color::White),
-        ),
-        startup_card_row(
-            inner,
-            "mouse",
-            mouse_capture_hint(),
-            Style::default().fg(QUIET),
         ),
         Line::from(Span::styled(
             format!("╰{border}╯"),
